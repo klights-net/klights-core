@@ -652,9 +652,18 @@ async fn list_cr_inner(
         } else {
             "custom_resource"
         };
+        // A scoped watch (namespace and/or label/field selector) must anchor its
+        // periodic BOOKMARK to the highest RV it has actually emitted for that
+        // scope, not the global cursor/collection RV. See
+        // `resolve_periodic_bookmark_rv` for the invariant.
+        let has_scope_filter = watch_ns.is_some() || has_selector;
 
         let stream = async_stream::stream! {
             let mut initial_list_rv = requested_rv;
+            // Highest RV this watch has actually emitted for its scope. A scoped
+            // watch BOOKMARK must never advertise an RV beyond this, or client-go
+            // resuming from it skips still-undelivered in-scope events.
+            let mut last_delivered_scoped_rv = requested_rv;
             let mut matched_selector_keys: std::collections::HashSet<(Option<String>, String)> =
                 std::collections::HashSet::new();
 
@@ -707,6 +716,10 @@ async fn list_cr_inner(
                                     ) else {
                                         continue;
                                     };
+                                    if let Some(delivered_rv) = event.resource_version() {
+                                        last_delivered_scoped_rv =
+                                            last_delivered_scoped_rv.max(delivered_rv);
+                                    }
                                     let mut json = serde_json::to_vec(&event).unwrap_or_default();
                                     json.push(b'\n');
                                     yield Ok::<_, std::convert::Infallible>(json);
@@ -747,6 +760,10 @@ async fn list_cr_inner(
                             ) else {
                                 continue;
                             };
+                            if let Some(delivered_rv) = event.resource_version() {
+                                last_delivered_scoped_rv =
+                                    last_delivered_scoped_rv.max(delivered_rv);
+                            }
                             let mut json = serde_json::to_vec(&event).unwrap_or_default();
                             json.push(b'\n');
                             yield Ok::<_, std::convert::Infallible>(json);
@@ -825,6 +842,9 @@ async fn list_cr_inner(
                         ) else {
                             continue;
                         };
+                        if let Some(delivered_rv) = event.resource_version() {
+                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(delivered_rv);
+                        }
                         baseline_delivered_rvs.push(rv);
                         let mut json = serde_json::to_vec(&event).unwrap_or_default();
                         json.push(b'\n');
@@ -898,6 +918,9 @@ async fn list_cr_inner(
                         ) else {
                             continue;
                         };
+                        if let Some(delivered_rv) = event.resource_version() {
+                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(delivered_rv);
+                        }
                         let mut json = serde_json::to_vec(&event).unwrap_or_default();
                         json.push(b'\n');
                         yield Ok::<_, std::convert::Infallible>(json);
@@ -1026,16 +1049,33 @@ async fn list_cr_inner(
                         ) else {
                             continue;
                         };
+                        if let Some(delivered_rv) = event.resource_version() {
+                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(delivered_rv);
+                        }
                         let mut json = serde_json::to_vec(&event).unwrap_or_default();
                         json.push(b'\n');
                         yield Ok::<_, std::convert::Infallible>(json);
                     }
                     Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
-                        let rv = db.list_resources(&av, &kind, watch_ns.as_deref(), crate::datastore::ResourceListQuery::new(None, None, Some(1), None)).await.map(|l| l.resource_version).unwrap_or(0);
+                        let rv = crate::api::watch_stream::resolve_periodic_bookmark_rv(
+                            crate::api::watch_stream::PeriodicBookmarkContext {
+                                db: &db,
+                                api_version: &av,
+                                kind: &kind,
+                                watch_namespace: watch_ns.as_deref(),
+                                label_selector: label_selector.as_deref(),
+                                field_selector: field_selector.as_deref(),
+                                requested_rv,
+                                has_scope_filter,
+                                cursor_high_water_rv: cursor.high_water_rv(),
+                                last_delivered_scoped_rv,
+                            },
+                        )
+                        .await;
                         let event = WatchEvent::bookmark_typed(rv, &av, &kind);
-                        let mut json = serde_json::to_vec(&event).unwrap_or_default();
-                        json.push(b'\n');
-                        yield Ok::<_, std::convert::Infallible>(json);
+                        yield Ok::<_, std::convert::Infallible>(
+                            crate::api::watch_stream::serialize_watch_event_line(event, &kind, false),
+                        );
                     }
                 }
             }

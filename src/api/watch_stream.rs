@@ -303,7 +303,7 @@ pub async fn recv_bookmark_tick(rx: &mut Option<mpsc::Receiver<()>>) -> Option<(
     }
 }
 
-fn bookmark_rv_for_watch_scope(
+pub(crate) fn bookmark_rv_for_watch_scope(
     has_scope_filter: bool,
     cursor_high_water_rv: i64,
     last_delivered_scoped_rv: i64,
@@ -313,6 +313,109 @@ fn bookmark_rv_for_watch_scope(
     } else {
         cursor_high_water_rv
     }
+}
+
+/// Resolve the resourceVersion a periodic watch BOOKMARK must carry.
+///
+/// Shared by every client-facing watch builder -- `build_label_selector_watch_stream`
+/// for built-in kinds and the custom-resource watch in `custom_resources.rs` --
+/// so the scoped-bookmark invariant lives in exactly one place.
+///
+/// A BOOKMARK promises the client: "you have received every event for this
+/// watch's scope with rv <= bookmark_rv; you may resume from it." The serving
+/// cursor can observe higher RVs that this HTTP watch later filters out by
+/// namespace, label, or field selector, so a *scoped* watch must bookmark only
+/// the highest RV it has actually emitted for its scope
+/// (`last_delivered_scoped_rv`) -- otherwise client-go reconnects from the
+/// too-high bookmark and skips still-undelivered in-scope events (the flaky
+/// `[sig-cli] Kubectl client Guestbook application ... readiness-timeout` and
+/// the `repro_scoped_watch_bookmark.py` oracle).
+///
+/// A selector-free watch bookmarks the cursor's full high-water RV; when even
+/// that is 0 (a quiet, freshly-established watch that has observed nothing)
+/// this falls back to a fresh collection snapshot read so the client still gets
+/// a valid, advancing resume point.
+/// Inputs shared by every periodic-watch-BOOKMARK emission site, bundled so the
+/// shared resolver stays under clippy's argument limit and call sites read by
+/// named field.
+pub(crate) struct PeriodicBookmarkContext<'a> {
+    pub db: &'a DatastoreHandle,
+    pub api_version: &'a str,
+    pub kind: &'a str,
+    pub watch_namespace: Option<&'a str>,
+    pub label_selector: Option<&'a str>,
+    pub field_selector: Option<&'a str>,
+    pub requested_rv: i64,
+    pub has_scope_filter: bool,
+    pub cursor_high_water_rv: i64,
+    pub last_delivered_scoped_rv: i64,
+}
+
+/// Resolve the resourceVersion a periodic watch BOOKMARK must carry.
+///
+/// Shared by every client-facing watch builder -- `build_label_selector_watch_stream`
+/// for built-in kinds and the custom-resource watch in `custom_resources.rs` --
+/// so the scoped-bookmark invariant lives in exactly one place.
+///
+/// A BOOKMARK promises the client: "you have received every event for this
+/// watch's scope with rv <= bookmark_rv; you may resume from it." The serving
+/// cursor can observe higher RVs that this HTTP watch later filters out by
+/// namespace, label, or field selector, so a *scoped* watch must bookmark only
+/// the highest RV it has actually emitted for its scope
+/// (`last_delivered_scoped_rv`) -- otherwise client-go reconnects from the
+/// too-high bookmark and skips still-undelivered in-scope events (the flaky
+/// `[sig-cli] Kubectl client Guestbook application ... readiness-timeout` and
+/// the `repro_scoped_watch_bookmark.py` oracle).
+///
+/// A selector-free watch bookmarks the cursor's full high-water RV; when even
+/// that is 0 (a quiet, freshly-established watch that has observed nothing)
+/// this falls back to a fresh collection snapshot read so the client still gets
+/// a valid, advancing resume point.
+pub(crate) async fn resolve_periodic_bookmark_rv(ctx: PeriodicBookmarkContext<'_>) -> i64 {
+    let PeriodicBookmarkContext {
+        db,
+        api_version,
+        kind,
+        watch_namespace,
+        label_selector,
+        field_selector,
+        requested_rv,
+        has_scope_filter,
+        cursor_high_water_rv,
+        last_delivered_scoped_rv,
+    } = ctx;
+    let mut rv = bookmark_rv_for_watch_scope(
+        has_scope_filter,
+        cursor_high_water_rv,
+        last_delivered_scoped_rv,
+    );
+    if has_scope_filter && cursor_high_water_rv > rv {
+        tracing::warn!(
+            target: "klights::watch_diag",
+            api_version = %api_version,
+            kind = %kind,
+            namespace = watch_namespace.unwrap_or(""),
+            label_selector = label_selector.unwrap_or(""),
+            field_selector = field_selector.unwrap_or(""),
+            requested_rv,
+            bookmark_rv = rv,
+            cursor_high_water_rv,
+            "scoped watch bookmark held at delivered scoped rv"
+        );
+    }
+    if rv <= 0 && !has_scope_filter {
+        rv = db
+            .list_resources(
+                api_version,
+                kind,
+                watch_namespace,
+                crate::datastore::ResourceListQuery::new(None, None, Some(1), None),
+            )
+            .await
+            .map(|list| list.resource_version)
+            .unwrap_or(0);
+    }
+    rv
 }
 
 pub async fn maybe_spawn_watch_timeout_stream(
@@ -781,42 +884,19 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                     }
                 }
                 Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
-                    // A watch BOOKMARK promises the client: "you have received
-                    // every event for this watch's scope with rv <= bookmark_rv,
-                    // so you may resume from it." The cursor can observe higher
-                    // RVs that this HTTP watch later filters out by namespace,
-                    // label, or field selector. A scoped watch must therefore
-                    // bookmark only the RV actually emitted for this selected
-                    // scope; otherwise client-go may reconnect past an
-                    // out-of-order selected event that has not been delivered yet.
-                    let cursor_high_water_rv = cursor.high_water_rv();
-                    let mut rv = bookmark_rv_for_watch_scope(
+                    let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
+                        db: &db,
+                        api_version: &api_version,
+                        kind: &kind,
+                        watch_namespace: watch_namespace.as_deref(),
+                        label_selector: label_selector.as_deref(),
+                        field_selector: field_selector.as_deref(),
+                        requested_rv,
                         has_scope_filter,
-                        cursor_high_water_rv,
+                        cursor_high_water_rv: cursor.high_water_rv(),
                         last_delivered_scoped_rv,
-                    );
-                    if has_scope_filter && cursor_high_water_rv > rv {
-                        tracing::warn!(
-                            target: "klights::watch_diag",
-                            api_version = %api_version,
-                            kind = %kind,
-                            namespace = watch_namespace.as_deref().unwrap_or(""),
-                            label_selector = label_selector.as_deref().unwrap_or(""),
-                            field_selector = field_selector.as_deref().unwrap_or(""),
-                            requested_rv,
-                            bookmark_rv = rv,
-                            cursor_high_water_rv,
-                            "scoped watch bookmark held at delivered scoped rv"
-                        );
-                    }
-                    if rv <= 0 && !has_scope_filter {
-                        rv = db
-                            .list_resources(&api_version, &kind, watch_namespace.clone().as_deref(), crate::datastore::ResourceListQuery::new(None, None, Some(1), None))
-                            .await
-                            .map(|l| l.resource_version)
-                            .unwrap_or(0);
-                    }
-
+                    })
+                    .await;
                     let event = WatchEvent::bookmark_typed(rv, &api_version, &kind);
                     yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
                         event,
@@ -893,6 +973,124 @@ mod tests {
             bookmark_rv_for_watch_scope(false, 91, 42),
             91,
             "selector-free watches can bookmark the cursor's full high-water RV"
+        );
+    }
+
+    /// Regression guard for the custom-resource watch builder, which used to mint
+    /// every periodic BOOKMARK from `db.list_resources(...).resource_version` --
+    /// the GLOBAL storage snapshot RV. Out-of-scope churn (other namespaces or
+    /// labels) pushed that global RV far past the last in-scope event the watch
+    /// had actually delivered, so client-go resumed from the bookmark and skipped
+    /// still-undelivered in-scope events (the flaky `[sig-cli] Kubectl Guestbook
+    /// ... readiness-timeout` and the `repro_scoped_watch_bookmark.py` oracle).
+    /// A scoped watch must bookmark only the highest RV it has emitted for its
+    /// scope, ignoring both the cursor high-water and a fresh collection read.
+    #[tokio::test]
+    async fn resolve_periodic_bookmark_rv_scoped_anchors_to_delivered_frontier() {
+        let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        // Seed unrelated objects so a naive "collection RV" read would return a
+        // large global value; the scoped resolver must NOT touch it.
+        for i in 0..10 {
+            ds.create_resource(
+                "v1",
+                "ConfigMap",
+                Some("noise"),
+                &format!("n{i}"),
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": format!("n{i}"), "namespace": "noise"}
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let collection_rv = handle.get_current_resource_version().await.unwrap();
+        assert!(
+            collection_rv > 1,
+            "test fixture: global RV must be non-trivial, got {collection_rv}"
+        );
+
+        let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
+            db: &handle,
+            api_version: "v1",
+            kind: "ConfigMap",
+            watch_namespace: Some("watched"),
+            label_selector: Some("tier=frontend"),
+            field_selector: None,
+            requested_rv: 1,
+            has_scope_filter: true,
+            cursor_high_water_rv: collection_rv,
+            last_delivered_scoped_rv: 1,
+        })
+        .await;
+        assert_eq!(
+            rv, 1,
+            "scoped watch bookmark must stay at the delivered scope frontier (1), \
+             not the global cursor/collection RV ({collection_rv})"
+        );
+        let _ = ds;
+    }
+
+    #[tokio::test]
+    async fn resolve_periodic_bookmark_rv_selector_free_uses_cursor_high_water() {
+        let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
+            db: &handle,
+            api_version: "v1",
+            kind: "ConfigMap",
+            watch_namespace: None,
+            label_selector: None,
+            field_selector: None,
+            requested_rv: 1,
+            has_scope_filter: false,
+            cursor_high_water_rv: 500,
+            last_delivered_scoped_rv: 42,
+        })
+        .await;
+        assert_eq!(
+            rv, 500,
+            "selector-free watch may bookmark the cursor's full high-water RV"
+        );
+        let _ = ds;
+    }
+
+    #[tokio::test]
+    async fn resolve_periodic_bookmark_rv_selector_free_falls_back_to_collection_when_zero() {
+        let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        ds.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "seed",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "seed", "namespace": "default"}
+            }),
+        )
+        .await
+        .unwrap();
+        let collection_rv = handle.get_current_resource_version().await.unwrap();
+
+        // A selector-free watch that has observed nothing yet (quiet,
+        // freshly established) must still emit a valid, advancing resume point.
+        let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
+            db: &handle,
+            api_version: "v1",
+            kind: "ConfigMap",
+            watch_namespace: None,
+            label_selector: None,
+            field_selector: None,
+            requested_rv: 0,
+            has_scope_filter: false,
+            cursor_high_water_rv: 0,
+            last_delivered_scoped_rv: 0,
+        })
+        .await;
+        assert_eq!(
+            rv, collection_rv,
+            "selector-free watch with no observed RV falls back to a fresh collection snapshot RV"
         );
     }
 
