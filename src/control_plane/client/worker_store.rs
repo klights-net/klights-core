@@ -510,7 +510,17 @@ impl DatastoreBackend for WorkerStoreAdapter {
     }
 
     async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
-        self.get_resource("v1", "Namespace", None, name).await
+        let key = ResourceKey {
+            api_version: "v1".to_string(),
+            kind: "Namespace".to_string(),
+            namespace: None,
+            name: name.to_string(),
+        };
+        let resource = self.cluster_api.get_resource_fresh(key).await?;
+        if let Some(resource) = &resource {
+            self.observe_rv(resource.resource_version);
+        }
+        Ok(resource)
     }
 
     async fn list_namespaces_page(
@@ -1091,6 +1101,9 @@ mod tests {
     #[async_trait]
     impl LeaderApiClient for HandoffLeaderApi {
         async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
+            if key.api_version == "v1" && key.kind == "Namespace" && key.name == "fresh-events" {
+                return Ok(None);
+            }
             if key.api_version == "v1" && key.kind == "Pod" && key.name == "cached-deleted" {
                 return Ok(Some(Resource {
                     id: 1,
@@ -1120,6 +1133,27 @@ mod tests {
         }
 
         async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
+            if key.api_version == "v1" && key.kind == "Namespace" && key.name == "fresh-events" {
+                return Ok(Some(Resource {
+                    id: 2,
+                    api_version: "v1".to_string(),
+                    kind: "Namespace".to_string(),
+                    namespace: None,
+                    name: "fresh-events".to_string(),
+                    uid: "uid-fresh-events".to_string(),
+                    resource_version: 13,
+                    data: Arc::new(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": {
+                            "name": "fresh-events",
+                            "uid": "uid-fresh-events",
+                            "resourceVersion": "13"
+                        },
+                        "status": {"phase": "Active"}
+                    })),
+                }));
+            }
             if key.api_version == "v1" && key.kind == "Pod" && key.name == "cached-deleted" {
                 return Ok(None);
             }
@@ -1288,6 +1322,63 @@ mod tests {
             Some("uid-cached"),
             "worker pod get must read the worker cache and avoid a fresh leader unary read"
         );
+    }
+
+    #[tokio::test]
+    async fn worker_store_pod_events_use_fresh_namespace_state_before_outbox_enqueue() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-event-namespace-fresh-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(
+            Arc::new(HandoffLeaderApi),
+            node_local.clone(),
+            "worker-a".to_string(),
+        );
+        let outbox = crate::kubelet::outbox::Outbox::new(node_local.clone());
+        let pod = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "fresh-events",
+                "name": "sysctl-pod",
+                "uid": "uid-sysctl-pod"
+            },
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "test-container", "image": "busybox"}]
+            }
+        });
+
+        crate::kubelet::events::emit_pod_event_with_outbox(
+            &adapter,
+            Some(&outbox),
+            crate::kubelet::events::PodEventRecord {
+                pod: &pod,
+                reason: "Started",
+                message: "Started container test-container",
+                event_type: "Normal",
+                reporting_component: "klights-kubelet",
+                reporting_instance: "worker-a",
+            },
+        )
+        .await
+        .expect("worker-store event emission should enqueue event");
+
+        let row = node_local
+            .claim_next_due_outbox(i64::MAX / 2, 1_000, "event-test")
+            .await
+            .expect("claim outbox")
+            .expect("event outbox row should be enqueued");
+        assert_eq!(row.operation, "EventCreate");
+        assert_eq!(row.subject_namespace.as_deref(), Some("fresh-events"));
+        assert_eq!(row.subject_kind, "Event");
     }
 
     #[tokio::test]
