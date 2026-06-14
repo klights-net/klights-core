@@ -177,7 +177,7 @@ use crate::kubelet::pod_runtime::hooks::{HookOutcome, PodHookRuntime};
 use crate::kubelet::pod_runtime::hostports::HostPortRuntime;
 use crate::kubelet::pod_runtime::network::PodNetworkRuntime;
 use crate::kubelet::pod_runtime::probes::{ProbeRuntime, StartupFinalizationAction};
-use crate::kubelet::pod_runtime::repository::PodRuntimeRepository;
+use crate::kubelet::pod_runtime::repository::{LivePodUidCheck, PodRuntimeRepository};
 use crate::kubelet::pod_runtime::status_emitter::PodStatusEmitter;
 use crate::kubelet::pod_runtime::status_helpers::{
     json_number_as_i64, replace_container_status, restart_last_state_from_reconciled_status,
@@ -1655,8 +1655,8 @@ impl PodRuntimeService for RealPodRuntimeService {
         pod: Option<serde_json::Value>,
         cancel: CancellationToken,
     ) -> anyhow::Result<PodStartResult> {
-        let pod = match pod {
-            Some(p) => p,
+        let (pod, from_snapshot) = match pod {
+            Some(p) => (p, true),
             None => {
                 let resource = self
                     .repository
@@ -1671,7 +1671,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                             key.uid
                         )
                     })?;
-                (*resource.data).clone()
+                ((*resource.data).clone(), false)
             }
         };
 
@@ -1687,15 +1687,18 @@ impl PodRuntimeService for RealPodRuntimeService {
                 key.uid, pod_uid
             )));
         }
-
-        crate::kubelet::pod_runtime::repository::ensure_live_pod_uid(
-            self.repository.as_ref(),
-            &key.namespace,
-            &key.name,
-            &key.uid,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("UID verification failed: {:#}", e))?;
+        if from_snapshot
+            && let LivePodUidCheck::Different { live_uid } = self
+                .repository
+                .check_live_pod_uid(&key.namespace, &key.name, &key.uid)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to verify live pod identity: {:#}", e))?
+        {
+            return Ok(PodStartResult::Failed(format!(
+                "UID mismatch: key {} != live pod {}",
+                key.uid, live_uid
+            )));
+        }
 
         // Node ownership check: worker starts only pods assigned to this node.
         if !self.node_view.owns_pod_runtime(&pod) {

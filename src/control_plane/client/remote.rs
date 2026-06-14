@@ -356,18 +356,27 @@ fn watch_error_requires_relist(err: &anyhow::Error) -> bool {
 #[async_trait]
 impl LeaderApiClient for RemoteApiClient {
     async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-        let cached = self.cache.get(&key).await;
-        Ok(if let Some(resource) = cached {
-            Some(resource)
-        } else if let Some(grpc) = &self.grpc {
-            let resource = grpc.get_resource_rpc(key.clone()).await?;
-            if let Some(resource) = &resource {
-                self.cache.insert(resource.clone()).await;
-            }
-            resource
-        } else {
-            None
-        })
+        if let Some(resource) = self.cache.get(&key).await {
+            return Ok(Some(resource));
+        }
+        let req = ListRequest {
+            api_version: key.api_version.clone(),
+            kind: key.kind.clone(),
+            namespace: key.namespace.clone(),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+        };
+        let scope = scope_for_request(&req);
+        if self.cache.is_ready(&scope).await {
+            return Ok(None);
+        }
+        if self.grpc.is_some() {
+            self.prime_list_scope(req).await?;
+            return Ok(self.cache.get(&key).await);
+        }
+        Ok(None)
     }
 
     async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
@@ -763,7 +772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_unary_fallback_on_cache_miss() {
+    async fn grpc_cache_read_primes_unready_scope_before_reporting_miss() {
         let (client, db, handle) = remote_client_and_leader_db().await;
         db.create_resource(
             "v1",
@@ -778,8 +787,8 @@ mod tests {
         let pod = client
             .get_pod("default", "web")
             .await
-            .expect("remote get pod")
-            .expect("pod should be fetched from leader");
+            .expect("remote cache-prime get pod")
+            .expect("unready cache scope should be synchronously primed before reporting absence");
         assert_eq!(pod.uid, "uid-1");
 
         db.update_status_only_with_preconditions(

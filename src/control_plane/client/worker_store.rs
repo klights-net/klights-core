@@ -23,8 +23,8 @@ use crate::watch::{EventType, WatchBus, WatchEvent, WatchReceiver, WatchTopic};
 /// Worker-local compatibility store for legacy kubelet call sites.
 ///
 /// This type deliberately does not open or own `cluster.db`. Cluster resource
-/// reads are served through `LeaderApiClient`; node-local runtime/network rows
-/// are served through `NodeLocalBackend`.
+/// reads are served through the node/worker cache exposed by `LeaderApiClient`;
+/// node-local runtime/network rows are served through `NodeLocalBackend`.
 pub struct WorkerStoreAdapter {
     cluster_api: Arc<dyn LeaderApiClient>,
     node_local: NodeLocalHandle,
@@ -359,11 +359,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
             namespace: namespace.map(str::to_string),
             name: name.to_string(),
         };
-        let resource = if Self::is_pod_resource(api_version, kind) {
-            self.cluster_api.get_resource_fresh(key).await?
-        } else {
-            self.cluster_api.get_resource(key).await?
-        };
+        let resource = self.cluster_api.get_resource(key).await?;
         if Self::is_pod_resource(api_version, kind)
             && resource
                 .as_ref()
@@ -1265,7 +1261,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_pod_get_uses_fresh_leader_state_to_extinguish_stale_cache() {
+    async fn worker_pod_get_uses_worker_cache_not_fresh_leader_state() {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
@@ -1287,9 +1283,10 @@ mod tests {
             .await
             .expect("fresh pod get should succeed");
 
-        assert!(
-            pod.is_none(),
-            "worker pod get must not return a stale cached pod after the leader no longer has it"
+        assert_eq!(
+            pod.as_ref().map(|resource| resource.uid.as_str()),
+            Some("uid-cached"),
+            "worker pod get must read the worker cache and avoid a fresh leader unary read"
         );
     }
 
@@ -1327,7 +1324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_cluster_objects_through_leader_api_and_runtime_rows_from_node_local() {
+    async fn reads_cluster_objects_through_worker_cache_and_runtime_rows_from_node_local() {
         let cluster_db = crate::datastore::test_support::in_memory().await;
         cluster_db
             .create_resource(

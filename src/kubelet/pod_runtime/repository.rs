@@ -2,6 +2,13 @@ use crate::datastore::Resource;
 use crate::kubelet::pod_repository::{PodRepository, PodStatusUpdate, RuntimeReconcileStatus};
 use crate::kubelet::pod_startup_error::PodStartupErrorKind;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivePodUidCheck {
+    Matches,
+    Different { live_uid: String },
+    Missing,
+}
+
 #[async_trait::async_trait]
 pub trait PodRuntimeRepository: Send + Sync {
     async fn get_pod_for_uid(
@@ -74,6 +81,13 @@ pub trait PodRuntimeRepository: Send + Sync {
         terminated: serde_json::Value,
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Option<Resource>>;
+
+    async fn check_live_pod_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+    ) -> anyhow::Result<LivePodUidCheck>;
 }
 
 #[async_trait::async_trait]
@@ -220,6 +234,23 @@ impl PodRuntimeRepository for PodRepository {
             expected_rv,
         )
         .await
+    }
+
+    async fn check_live_pod_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+    ) -> anyhow::Result<LivePodUidCheck> {
+        let Some(pod) = crate::kubelet::pod_repository::PodReader::get_pod(self, ns, name).await?
+        else {
+            return Ok(LivePodUidCheck::Missing);
+        };
+        if pod.uid == pod_uid {
+            Ok(LivePodUidCheck::Matches)
+        } else {
+            Ok(LivePodUidCheck::Different { live_uid: pod.uid })
+        }
     }
 }
 

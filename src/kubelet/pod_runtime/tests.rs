@@ -1162,6 +1162,166 @@ async fn real_pod_runtime_service_constructs_from_mock_dependencies() {
 use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
 
+struct SnapshotOnlyStartRepository {
+    inner: Arc<crate::kubelet::pod_repository::PodRepository>,
+}
+
+#[async_trait::async_trait]
+impl crate::kubelet::pod_runtime::repository::PodRuntimeRepository for SnapshotOnlyStartRepository {
+    async fn get_pod_for_uid(
+        &self,
+        _ns: &str,
+        _name: &str,
+        _pod_uid: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        Ok(None)
+    }
+
+    async fn set_pod_status_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        update: crate::kubelet::pod_repository::PodStatusUpdate,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        crate::kubelet::pod_repository::PodStatusWriter::set_pod_status_for_uid(
+            self.inner.as_ref(),
+            ns,
+            name,
+            pod_uid,
+            update,
+            expected_rv,
+        )
+        .await
+    }
+
+    async fn apply_runtime_reconcile_status_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        update: crate::kubelet::pod_repository::RuntimeReconcileStatus,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        crate::kubelet::pod_repository::PodStatusWriter::apply_runtime_reconcile_status_for_uid(
+            self.inner.as_ref(),
+            ns,
+            name,
+            pod_uid,
+            update,
+            expected_rv,
+        )
+        .await
+    }
+
+    async fn mark_start_pending_for_retry_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        error_message: &str,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        crate::kubelet::pod_repository::PodStatusWriter::mark_start_pending_for_retry_for_uid(
+            self.inner.as_ref(),
+            ns,
+            name,
+            pod_uid,
+            error_message,
+        )
+        .await
+    }
+
+    async fn set_probe_readiness_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        container_name: &str,
+        ready: bool,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        crate::kubelet::pod_repository::PodStatusWriter::set_probe_readiness_for_uid(
+            self.inner.as_ref(),
+            ns,
+            name,
+            pod_uid,
+            container_name,
+            ready,
+            expected_rv,
+        )
+        .await
+    }
+
+    async fn set_deadline_exceeded_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        message: String,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        crate::kubelet::pod_repository::PodStatusWriter::set_deadline_exceeded_for_uid(
+            self.inner.as_ref(),
+            ns,
+            name,
+            pod_uid,
+            message,
+            expected_rv,
+        )
+        .await
+    }
+
+    async fn apply_ephemeral_container_statuses_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        statuses: Vec<serde_json::Value>,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        crate::kubelet::pod_repository::PodStatusWriter::apply_ephemeral_container_statuses_for_uid(
+            self.inner.as_ref(),
+            ns,
+            name,
+            pod_uid,
+            statuses,
+            expected_rv,
+        )
+        .await
+    }
+
+    async fn note_container_restart_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        pod_uid: &str,
+        container_name: &str,
+        terminated: serde_json::Value,
+        expected_rv: Option<i64>,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        crate::kubelet::pod_repository::PodStatusWriter::note_container_restart_for_uid(
+            self.inner.as_ref(),
+            ns,
+            name,
+            pod_uid,
+            container_name,
+            terminated,
+            expected_rv,
+        )
+        .await
+    }
+
+    async fn check_live_pod_uid(
+        &self,
+        _ns: &str,
+        _name: &str,
+        _pod_uid: &str,
+    ) -> anyhow::Result<crate::kubelet::pod_runtime::repository::LivePodUidCheck> {
+        Ok(crate::kubelet::pod_runtime::repository::LivePodUidCheck::Missing)
+    }
+}
+
 #[tokio::test]
 async fn real_runtime_start_pod_rejects_uid_mismatch_before_cri() {
     let harness = PodRuntimeHarness::new().await;
@@ -1253,6 +1413,67 @@ async fn real_runtime_start_pod_writes_pending_status_before_pull() {
         .iter()
         .any(|c| matches!(c.operation, MockCriOperation::RunPodSandbox));
     assert!(has_sandbox, "sandbox must be created after image pull");
+}
+
+#[tokio::test]
+async fn real_runtime_start_pod_uses_provided_snapshot_without_fresh_liveness_read() {
+    let harness = PodRuntimeHarness::new().await;
+    let pod = crate::kubelet::pod_runtime::test_support::pod_json(
+        "ns",
+        "cached-pod",
+        "uid-cache",
+        "nginx:latest",
+    );
+    harness
+        .repo
+        .create_controller_pod("ns", "cached-pod", "test-node", pod.clone())
+        .await
+        .unwrap();
+
+    let runtime = crate::kubelet::pod_runtime::service::RealPodRuntimeService::new(
+        RealPodRuntimeServiceDependencies {
+            cri: harness.cri.clone(),
+            container_control: harness.container_control.clone(),
+            network: harness.network.clone(),
+            store: harness.store.clone(),
+            slot_admission: harness.slot_admission.clone(),
+            repository: Arc::new(SnapshotOnlyStartRepository {
+                inner: harness.repo.clone(),
+            }),
+            filesystem: harness.filesystem.clone(),
+            volumes: harness.volumes.clone(),
+            probes: harness.probes.clone(),
+            hostports: harness.hostports.clone(),
+            events: harness.events.clone(),
+            hooks: harness.hooks.clone(),
+            env_source: harness.env_source.clone(),
+            finalizer: harness.finalizer.clone(),
+            supervisor: harness.supervisor.clone(),
+            config: crate::kubelet::pod_runtime::service::RuntimeConfig {
+                node_name: "test-node".to_string(),
+                service_cidr: "10.43.128.0/17".to_string(),
+                containerd_namespace: "klights-test".to_string(),
+            },
+            node_view: harness.node_view.clone(),
+            cluster_view: Arc::new(
+                crate::kubelet::pod_cluster_runtime::WorkerClusterRuntimeView::new(
+                    harness.repo.clone(),
+                    "test-node".to_string(),
+                ),
+            ),
+        },
+    );
+
+    let result = runtime
+        .start_pod(
+            PodRuntimeKey::new("ns", "cached-pod", "uid-cache"),
+            Some(pod),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("start pod from supplied snapshot");
+
+    assert!(matches!(result, PodStartResult::Started { .. }));
 }
 
 #[tokio::test]
