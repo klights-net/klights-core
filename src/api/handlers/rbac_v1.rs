@@ -1,0 +1,59 @@
+use crate::api::*;
+
+pub fn rbac_v1_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/roles", get(list_all_roles))
+        .route("/rolebindings", get(list_all_rolebindings))
+        .route(
+            "/namespaces/{namespace}/roles",
+            get(list_roles)
+                .post(create_role)
+                .delete(delete_collection_roles),
+        )
+        .route(
+            "/namespaces/{namespace}/roles/{name}",
+            get(get_role)
+                .put(update_role)
+                .patch(patch_role)
+                .delete(delete_role),
+        )
+        .route(
+            "/namespaces/{namespace}/rolebindings",
+            get(list_rolebindings)
+                .post(create_rolebinding)
+                .delete(delete_collection_rolebindings),
+        )
+        .route(
+            "/namespaces/{namespace}/rolebindings/{name}",
+            get(get_rolebinding)
+                .put(update_rolebinding)
+                .patch(patch_rolebinding)
+                .delete(delete_rolebinding),
+        )
+        .route(
+            "/clusterroles",
+            get(list_clusterroles)
+                .post(create_clusterrole)
+                .delete(delete_collection_clusterroles),
+        )
+        .route(
+            "/clusterroles/{name}",
+            get(get_clusterrole)
+                .put(update_clusterrole)
+                .patch(patch_clusterrole)
+                .delete(delete_clusterrole),
+        )
+        .route(
+            "/clusterrolebindings",
+            get(list_clusterrolebindings)
+                .post(create_clusterrolebinding)
+                .delete(delete_collection_clusterrolebindings),
+        )
+        .route(
+            "/clusterrolebindings/{name}",
+            get(get_clusterrolebinding)
+                .put(update_clusterrolebinding)
+                .patch(patch_clusterrolebinding)
+                .delete(delete_clusterrolebinding),
+        )
+}

@@ -1,0 +1,61 @@
+pub mod cgroup_cleanup;
+pub mod containerd_manager;
+pub mod context;
+pub mod cri;
+pub mod cri_events;
+pub mod events;
+pub mod file_blocking;
+pub mod lifecycle;
+pub mod log_rotation;
+pub mod node;
+pub mod node_ip;
+pub mod outbox;
+pub mod pod_cluster_runtime;
+pub mod pod_container_config;
+pub mod pod_creation_state;
+pub mod pod_dns;
+pub mod pod_endpoints;
+pub mod pod_env;
+pub mod pod_field_ref;
+pub mod pod_fs;
+pub mod pod_hosts;
+pub mod pod_manager;
+// pub mod pod_owner_reconcile; // removed — events flow top-down only
+pub mod pod_api;
+pub mod pod_repository;
+pub mod pod_resources;
+#[cfg(test)]
+pub mod pod_runtime_state;
+pub mod pod_sandbox;
+pub mod pod_sandbox_config;
+pub mod pod_service_envs;
+pub mod pod_startup_error;
+pub mod pod_status_builders;
+pub mod pod_status_logic;
+#[cfg(test)]
+pub mod pod_status_test;
+pub mod pod_status_writer;
+pub mod pod_subsystem;
+pub mod pod_termination;
+pub mod pod_volume_manager;
+pub mod pod_watch_handlers;
+pub mod probe_manager;
+pub mod probes;
+pub mod projected_sa_token_refresh;
+pub mod reconciler;
+pub mod rootless_runc_wrapper;
+pub mod volume_registry;
+pub mod volume_sources;
+pub mod volumes;
+
+pub use containerd_manager::ContainerdManager;
+pub use cri::CriClient;
+pub use node::register_node;
+pub use pod_manager::run_pod_watcher;
+pub use probe_manager::ProbeManager;
+
+pub mod pod_lifecycle_actor;
+pub mod pod_lifecycle_core;
+pub mod pod_lifecycle_router;
+pub mod pod_lifecycle_service;
+pub mod pod_runtime;

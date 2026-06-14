@@ -1,0 +1,1668 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
+use serde_json::Value;
+use tokio::sync::broadcast;
+
+use crate::control_plane::client::{LeaderApiClient, ListRequest, ResourceKey, WatchRequest};
+use crate::datastore::command::{CommandMeta, StorageCommand};
+use crate::datastore::node_local::NodeLocalHandle;
+use crate::datastore::{
+    AppliedOutboxRecord, CatchUpResource, DatastoreBackend, ListPageRequest, NodeSubnet, PatchKind,
+    PendingWatchEvent, PodCleanupIntent, PodEndpointEvent, PodEndpointRow,
+    PodNetworkAllocationLink, PodNetworkAllocationPod, PodNetworkAllocationRequest,
+    PodNetworkAllocationSubnet, PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult,
+    PodWorkqueueEntry, PodWorkqueueKind, Resource, ResourceList, ResourcePatchRequest,
+    ResourcePreconditions, SandboxRef, WatchTarget, WatchTargetScope,
+};
+use crate::networking::VtepMac;
+use crate::watch::{EventType, WatchBus, WatchEvent, WatchReceiver, WatchTopic};
+
+/// Worker-local compatibility store for legacy kubelet call sites.
+///
+/// This type deliberately does not open or own `cluster.db`. Cluster resource
+/// reads are served through `LeaderApiClient`; node-local runtime/network rows
+/// are served through `NodeLocalBackend`.
+pub struct WorkerStoreAdapter {
+    cluster_api: Arc<dyn LeaderApiClient>,
+    node_local: NodeLocalHandle,
+    watch_bus: Arc<WatchBus>,
+    node_name: String,
+    current_rv: AtomicI64,
+}
+
+impl WorkerStoreAdapter {
+    pub fn new(
+        cluster_api: Arc<dyn LeaderApiClient>,
+        node_local: NodeLocalHandle,
+        node_name: String,
+    ) -> Self {
+        Self {
+            cluster_api,
+            node_local,
+            watch_bus: Arc::new(WatchBus::new(1024)),
+            node_name,
+            current_rv: AtomicI64::new(0),
+        }
+    }
+
+    pub async fn start_watch_mirrors(
+        self: &Arc<Self>,
+        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<crate::task_supervisor::SupervisedJoinHandle<()>>> {
+        let mut handles = Vec::new();
+        for req in self.worker_watch_requests() {
+            let this = self.clone();
+            let cancel = cancel.clone();
+            let spawn_supervisor = supervisor.clone();
+            let mirror_supervisor = supervisor.clone();
+            handles.push(
+                spawn_supervisor
+                    .spawn_async(
+                        crate::task_supervisor::TaskCategory::Network,
+                        "worker_store_watch_mirror",
+                        async move {
+                            this.run_watch_mirror(req, mirror_supervisor, cancel).await;
+                        },
+                    )
+                    .await?,
+            );
+        }
+        Ok(handles)
+    }
+
+    pub fn watch_topic(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
+        self.watch_bus.subscribe(topic)
+    }
+
+    fn worker_watch_requests(&self) -> Vec<WatchRequest> {
+        let mut reqs = vec![WatchRequest {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: None,
+            label_selector: None,
+            field_selector: Some(format!("spec.nodeName={}", self.node_name)),
+            start_resource_version: None,
+        }];
+        for (api_version, kind, namespace) in [
+            ("v1", "Namespace", None),
+            ("v1", "ConfigMap", None),
+            ("v1", "Secret", None),
+            ("v1", "PersistentVolumeClaim", None),
+            ("v1", "PersistentVolume", None),
+            ("v1", "Node", None),
+            ("coordination.k8s.io/v1", "Lease", Some("kube-node-lease")),
+        ] {
+            reqs.push(WatchRequest {
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: namespace.map(str::to_string),
+                label_selector: None,
+                field_selector: None,
+                start_resource_version: None,
+            });
+        }
+        reqs
+    }
+
+    async fn run_watch_mirror(
+        self: Arc<Self>,
+        req: WatchRequest,
+        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let mut next_resource_version = req.start_resource_version;
+        // Consecutive failed reconnects; reset to 0 once the stream delivers an
+        // event (progress). Drives the shared exponential reconnect backoff so
+        // a sustained leader/WAN outage cannot become a fixed-interval
+        // reconnect storm across every watch scope.
+        let mut reconnect_attempt: u32 = 0;
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            if next_resource_version.is_none() {
+                match self.publish_initial_watch_snapshot(&req).await {
+                    Ok(resource_version) => {
+                        next_resource_version = Some(resource_version);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "worker store watch mirror initial list failed");
+                        if !sleep_before_watch_mirror_reconnect(
+                            &supervisor,
+                            &cancel,
+                            reconnect_attempt,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        continue;
+                    }
+                }
+            }
+
+            let mut watch_req = req.clone();
+            watch_req.start_resource_version = next_resource_version;
+            match self.cluster_api.watch_resources(watch_req).await {
+                Ok(mut stream) => {
+                    use futures::StreamExt;
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            event = stream.next() => {
+                                match event {
+                                    Some(Ok(event)) => {
+                                        reconnect_attempt = 0;
+                                        if let Some(rv) = event.event.resource_version() {
+                                            next_resource_version =
+                                                Some(next_resource_version.unwrap_or(0).max(rv));
+                                        }
+                                        self.publish_watch(event.event);
+                                    }
+                                    Some(Err(err)) => {
+                                        tracing::warn!(error = %err, "worker store watch mirror failed");
+                                        break;
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "worker store watch mirror could not open stream");
+                }
+            }
+            if !sleep_before_watch_mirror_reconnect(&supervisor, &cancel, reconnect_attempt).await {
+                return;
+            }
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+        }
+    }
+
+    async fn publish_initial_watch_snapshot(&self, req: &WatchRequest) -> Result<i64> {
+        let list = self
+            .cluster_api
+            .list_resources(ListRequest {
+                api_version: req.api_version.clone(),
+                kind: req.kind.clone(),
+                namespace: req.namespace.clone(),
+                label_selector: req.label_selector.clone(),
+                field_selector: req.field_selector.clone(),
+                limit: None,
+                continue_token: None,
+            })
+            .await?;
+        self.observe_rv(list.resource_version);
+        let resource_version = list.resource_version;
+        for resource in list.items {
+            self.publish_watch(WatchEvent {
+                event_type: EventType::Added,
+                object: resource.data.clone(),
+                encoded_payload: None,
+            });
+        }
+        Ok(resource_version)
+    }
+
+    fn publish_watch(&self, event: WatchEvent) {
+        if let Some(rv) = event
+            .object
+            .pointer("/metadata/resourceVersion")
+            .and_then(|rv| rv.as_i64().or_else(|| rv.as_str()?.parse::<i64>().ok()))
+        {
+            self.observe_rv(rv);
+        }
+        self.watch_bus.publish(event.clone());
+    }
+
+    fn is_pod_resource(api_version: &str, kind: &str) -> bool {
+        api_version == "v1" && kind == "Pod"
+    }
+
+    fn pod_belongs_to_local_node(&self, resource: &Resource) -> bool {
+        resource
+            .data
+            .pointer("/spec/nodeName")
+            .and_then(|node| node.as_str())
+            .is_some_and(|node| node == self.node_name)
+    }
+
+    fn local_pod_field_selector(&self, field_selector: Option<&str>) -> String {
+        let local_selector = format!("spec.nodeName={}", self.node_name);
+        match field_selector
+            .map(str::trim)
+            .filter(|selector| !selector.is_empty())
+        {
+            Some(selector)
+                if selector
+                    .split(',')
+                    .any(|part| part.trim() == local_selector) =>
+            {
+                selector.to_string()
+            }
+            Some(selector) => format!("{selector},{local_selector}"),
+            None => local_selector,
+        }
+    }
+
+    fn observe_rv(&self, rv: i64) {
+        let mut current = self.current_rv.load(Ordering::Relaxed);
+        while rv > current {
+            match self.current_rv.compare_exchange_weak(
+                current,
+                rv,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    async fn list_for_target(&self, target: &WatchTarget) -> Result<ResourceList> {
+        let namespace = match &target.scope {
+            WatchTargetScope::Cluster => None,
+            WatchTargetScope::Namespaced(namespace) => namespace.clone(),
+        };
+        let field_selector = if target.api_version == "v1" && target.kind == "Pod" {
+            Some(format!("spec.nodeName={}", self.node_name))
+        } else {
+            None
+        };
+        self.cluster_api
+            .list_resources(ListRequest {
+                api_version: target.api_version.clone(),
+                kind: target.kind.clone(),
+                namespace,
+                label_selector: None,
+                field_selector,
+                limit: None,
+                continue_token: None,
+            })
+            .await
+    }
+
+    fn unsupported<T>(&self, operation: &str) -> Result<T> {
+        Err(anyhow!(
+            "worker-local store does not support direct cluster datastore operation {operation}"
+        ))
+    }
+}
+
+async fn sleep_before_watch_mirror_reconnect(
+    supervisor: &crate::task_supervisor::TaskSupervisor,
+    cancel: &tokio_util::sync::CancellationToken,
+    attempt: u32,
+) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = supervisor.sleep(
+            "worker_store_watch_mirror_reconnect",
+            crate::utils::watch_reconnect_delay(attempt),
+        ) => true,
+    }
+}
+
+#[async_trait]
+impl DatastoreBackend for WorkerStoreAdapter {
+    fn close(&self) {
+        self.node_local.close();
+    }
+
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
+        self.watch_bus.subscribe(topic)
+    }
+
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
+        self.watch_bus.subscribe_many(topics)
+    }
+
+    fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+        self.publish_watch(pending.event);
+    }
+
+    async fn apply_raft_log_apply_commit(
+        &self,
+        _commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
+        self.unsupported("apply_raft_log_apply_commit")
+    }
+
+    async fn create_resource(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _data: Value,
+    ) -> Result<Resource> {
+        self.unsupported("create_resource")
+    }
+
+    async fn get_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Resource>> {
+        let key = ResourceKey {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+        };
+        let resource = if Self::is_pod_resource(api_version, kind) {
+            self.cluster_api.get_resource_fresh(key).await?
+        } else {
+            self.cluster_api.get_resource(key).await?
+        };
+        if Self::is_pod_resource(api_version, kind)
+            && resource
+                .as_ref()
+                .is_some_and(|resource| !self.pod_belongs_to_local_node(resource))
+        {
+            return Ok(None);
+        }
+        if let Some(resource) = &resource {
+            self.observe_rv(resource.resource_version);
+        }
+        Ok(resource)
+    }
+
+    async fn list_resources_page(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        page: ListPageRequest,
+    ) -> Result<ResourceList> {
+        let field_selector = if Self::is_pod_resource(api_version, kind) {
+            Some(self.local_pod_field_selector(field_selector))
+        } else {
+            field_selector.map(str::to_string)
+        };
+        let mut list = self
+            .cluster_api
+            .list_resources(ListRequest {
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: namespace.map(str::to_string),
+                label_selector: label_selector.map(str::to_string),
+                field_selector,
+                limit: page.limit(),
+                continue_token: page.continue_token().map(str::to_string),
+            })
+            .await?;
+        self.observe_rv(list.resource_version);
+        if page.limit().is_some() || page.continue_token().is_some() {
+            list = page.apply_to_sorted_resource_list(list);
+        }
+        Ok(list)
+    }
+
+    async fn list_resource_keys_for_scope(
+        &self,
+        api_version: String,
+        kind: String,
+        namespaced: bool,
+    ) -> Result<Vec<(Option<String>, String)>> {
+        let list = self
+            .list_resources(
+                &api_version,
+                &kind,
+                None,
+                crate::datastore::ResourceListQuery::all(),
+            )
+            .await?;
+        Ok(list
+            .items
+            .into_iter()
+            .map(|resource| {
+                (
+                    namespaced.then_some(resource.namespace).flatten(),
+                    resource.name,
+                )
+            })
+            .collect())
+    }
+
+    async fn update_resource(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _data: Value,
+        _expected_rv: i64,
+    ) -> Result<Resource> {
+        self.unsupported("update_resource")
+    }
+
+    async fn update_resource_with_preconditions(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _data: Value,
+        _preconditions: ResourcePreconditions,
+    ) -> Result<Resource> {
+        self.unsupported("update_resource_with_preconditions")
+    }
+
+    async fn update_status_only(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _status: Value,
+        _expected_rv: Option<i64>,
+    ) -> Result<Resource> {
+        self.unsupported("update_status_only")
+    }
+
+    async fn update_status_only_with_preconditions(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _status: Value,
+        _preconditions: ResourcePreconditions,
+    ) -> Result<Resource> {
+        self.unsupported("update_status_only_with_preconditions")
+    }
+
+    async fn delete_resource(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+    ) -> Result<()> {
+        self.unsupported("delete_resource")
+    }
+
+    async fn delete_resource_with_preconditions(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _preconditions: ResourcePreconditions,
+    ) -> Result<()> {
+        self.unsupported("delete_resource_with_preconditions")
+    }
+
+    async fn get_current_resource_version(&self) -> Result<i64> {
+        Ok(self.current_rv.load(Ordering::Relaxed))
+    }
+
+    async fn create_namespace(&self, _name: &str, _data: Value) -> Result<Resource> {
+        self.unsupported("create_namespace")
+    }
+
+    async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
+        self.get_resource("v1", "Namespace", None, name).await
+    }
+
+    async fn list_namespaces_page(
+        &self,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        page: ListPageRequest,
+    ) -> Result<ResourceList> {
+        self.list_resources_page(
+            "v1",
+            "Namespace",
+            None,
+            label_selector,
+            field_selector,
+            page,
+        )
+        .await
+    }
+
+    async fn update_namespace(
+        &self,
+        _name: &str,
+        _data: Value,
+        _expected_rv: i64,
+    ) -> Result<Resource> {
+        self.unsupported("update_namespace")
+    }
+
+    async fn delete_namespace_contents(&self, _name: &str) -> Result<()> {
+        self.unsupported("delete_namespace_contents")
+    }
+
+    async fn delete_namespace(&self, _name: &str) -> Result<()> {
+        self.unsupported("delete_namespace")
+    }
+
+    async fn pod_workqueue_enqueue(
+        &self,
+        kind: PodWorkqueueKind,
+        pod: &crate::pod_identity::PodIdentity,
+        payload: Value,
+        attempt_count: i64,
+        min_delay_ms: i64,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        self.node_local
+            .enqueue_workqueue(kind, pod, payload, attempt_count, min_delay_ms, last_error)
+            .await
+    }
+
+    async fn pod_workqueue_peek_next_due(&self) -> Result<Option<i64>> {
+        self.node_local.peek_workqueue_next_due().await
+    }
+
+    async fn pod_workqueue_claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
+        self.node_local.claim_workqueue_due(now_ms).await
+    }
+
+    async fn pod_workqueue_complete(&self, id: i64) -> Result<()> {
+        self.node_local.complete_workqueue(id).await
+    }
+
+    async fn pod_workqueue_record_failure(
+        &self,
+        row: PodWorkqueueEntry,
+        min_delay_ms: i64,
+        error: &str,
+    ) -> Result<()> {
+        let pod = crate::pod_identity::PodIdentity::new(&row.namespace, &row.name, &row.uid);
+        self.node_local
+            .enqueue_workqueue(
+                row.kind,
+                &pod,
+                row.payload,
+                row.attempt_count.saturating_add(1),
+                min_delay_ms,
+                Some(error),
+            )
+            .await
+    }
+
+    async fn pod_workqueue_dead_letter(&self, id: i64, _error: &str) -> Result<()> {
+        self.node_local.complete_workqueue(id).await
+    }
+
+    async fn record_sandbox(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        sandbox_id: &str,
+    ) -> Result<()> {
+        self.node_local
+            .admit_pod_runtime(pod_uid, namespace, pod_name, &self.node_name)
+            .await?;
+        self.node_local.record_sandbox(pod_uid, sandbox_id).await
+    }
+
+    async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
+        Ok(self
+            .node_local
+            .list_pod_runtime_by_namespace(namespace)
+            .await?
+            .into_iter()
+            .find(|row| row.pod_name == pod_name)
+            .and_then(|row| row.sandbox_id))
+    }
+
+    async fn get_sandbox_for_uid(
+        &self,
+        _namespace: &str,
+        _pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .node_local
+            .get_pod_runtime(pod_uid)
+            .await?
+            .and_then(|row| row.sandbox_id))
+    }
+
+    async fn delete_sandbox(&self, namespace: &str, pod_name: &str) -> Result<()> {
+        for row in self
+            .node_local
+            .list_pod_runtime_by_namespace(namespace)
+            .await?
+            .into_iter()
+            .filter(|row| row.pod_name == pod_name)
+        {
+            self.node_local
+                .delete_pod_runtime_for_uid(&row.pod_uid)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_sandbox_for_uid(
+        &self,
+        _namespace: &str,
+        _pod_name: &str,
+        pod_uid: &str,
+        _sandbox_id: &str,
+    ) -> Result<()> {
+        self.node_local.delete_pod_runtime_for_uid(pod_uid).await
+    }
+
+    async fn delete_pod_network(&self, sandbox_id: &str) -> Result<()> {
+        self.node_local.delete_network_for_sandbox(sandbox_id).await
+    }
+
+    async fn find_owned_resources(
+        &self,
+        _owner_uid: &str,
+        _namespace: Option<&str>,
+    ) -> Result<Vec<Resource>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_resources_by_owner_uid(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _owner_uid: &str,
+    ) -> Result<Vec<Resource>> {
+        Ok(Vec::new())
+    }
+
+    async fn find_owned_by_name_kind_empty_uid(
+        &self,
+        _owner_api_version: &str,
+        _owner_name: &str,
+        _owner_kind: &str,
+        _namespace: Option<&str>,
+    ) -> Result<Vec<Resource>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_cluster_resources_modified_since(
+        &self,
+        api_version: &str,
+        kind: &str,
+        _since_rv: i64,
+    ) -> Result<Vec<CatchUpResource>> {
+        let list = self
+            .list_resources(
+                api_version,
+                kind,
+                None,
+                crate::datastore::ResourceListQuery::all(),
+            )
+            .await?;
+        Ok(list
+            .items
+            .into_iter()
+            .map(|resource| CatchUpResource {
+                resource,
+                event_type: std::borrow::Cow::Borrowed("ADDED"),
+            })
+            .collect())
+    }
+
+    async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
+        self.unsupported("list_cluster_resources")
+    }
+
+    async fn list_resources_modified_since(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        _since_rv: i64,
+    ) -> Result<Vec<CatchUpResource>> {
+        let list = self
+            .list_resources(
+                api_version,
+                kind,
+                namespace,
+                crate::datastore::ResourceListQuery::all(),
+            )
+            .await?;
+        Ok(list
+            .items
+            .into_iter()
+            .map(|resource| CatchUpResource {
+                resource,
+                event_type: std::borrow::Cow::Borrowed("ADDED"),
+            })
+            .collect())
+    }
+
+    async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
+        self.observe_rv(min_rv);
+        Ok(self.current_rv.load(Ordering::Relaxed))
+    }
+
+    async fn list_namespace_resources(&self, _namespace: &str) -> Result<Vec<Resource>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_namespace_resources_of_kind(
+        &self,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<Vec<Resource>> {
+        Ok(self
+            .list_resources(
+                "v1",
+                kind,
+                Some(namespace),
+                crate::datastore::ResourceListQuery::all(),
+            )
+            .await?
+            .items)
+    }
+
+    async fn list_namespace_resources_excluding_kind(
+        &self,
+        _namespace: &str,
+        _kind: &str,
+    ) -> Result<Vec<Resource>> {
+        Ok(Vec::new())
+    }
+
+    async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
+        Ok(self.list_namespace_resources(namespace).await?.len() as i64)
+    }
+
+    async fn list_watch_events_since(
+        &self,
+        targets: &[WatchTarget],
+        _since_rv: i64,
+    ) -> Result<Vec<CatchUpResource>> {
+        let mut events = Vec::new();
+        for target in targets {
+            let list = self.list_for_target(target).await?;
+            self.observe_rv(list.resource_version);
+            events.extend(list.items.into_iter().map(|resource| CatchUpResource {
+                resource,
+                event_type: std::borrow::Cow::Borrowed("ADDED"),
+            }));
+        }
+        Ok(events)
+    }
+
+    async fn list_all_watch_events_since(&self, _since_rv: i64) -> Result<Vec<CatchUpResource>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_deleted_watch_events_since(
+        &self,
+        _since_rv: i64,
+    ) -> Result<Vec<CatchUpResource>> {
+        Ok(Vec::new())
+    }
+
+    async fn allocate_node_subnet(
+        &self,
+        node_name: &str,
+        cluster_cidr: &str,
+        node_ip: &str,
+    ) -> Result<NodeSubnet> {
+        self.cluster_api
+            .allocate_node_subnet(node_name, cluster_cidr, node_ip)
+            .await
+    }
+
+    async fn update_node_vtep_mac(&self, _node_name: &str, _vtep_mac: &VtepMac) -> Result<()> {
+        Ok(())
+    }
+
+    async fn update_node_peer_attributes(
+        &self,
+        _node_name: &str,
+        _mode: crate::controllers::annotations::NodePeerMode,
+        _hostport_range: Option<crate::networking::types::HostPortRange>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn update_node_dataplane(
+        &self,
+        _metadata: crate::networking::wireguard::DataplanePeerMetadata,
+    ) -> Result<()> {
+        self.unsupported("update_node_dataplane")
+    }
+
+    async fn get_node_dataplane(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+        self.cluster_api.get_node_dataplane(node_name).await
+    }
+
+    async fn list_pod_cleanup_intents_for_node(
+        &self,
+        node_name: &str,
+    ) -> Result<Vec<PodCleanupIntent>> {
+        self.cluster_api
+            .list_pod_cleanup_intents_for_node(node_name)
+            .await
+    }
+
+    async fn delete_pod_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.cluster_api
+            .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
+            .await
+    }
+
+    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+        self.cluster_api.get_node_subnet(node_name).await
+    }
+
+    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
+        self.cluster_api.list_peer_subnets(my_node_name).await
+    }
+
+    async fn delete_node_subnet(&self, _node_name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn pod_slot_try_admit(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotAdmissionResult> {
+        self.node_local
+            .admit_pod_runtime(pod_uid, namespace, pod_name, node_name)
+            .await?;
+        Ok(PodSlotAdmissionResult::Admitted {
+            resource_version: 0,
+        })
+    }
+
+    async fn pod_slot_mark_terminating(
+        &self,
+        _namespace: &str,
+        _pod_name: &str,
+        _pod_uid: &str,
+        _node_name: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn pod_slot_clear_if_uid(
+        &self,
+        _namespace: &str,
+        _pod_name: &str,
+        pod_uid: &str,
+        _node_name: &str,
+    ) -> Result<()> {
+        self.node_local.delete_pod_runtime_for_uid(pod_uid).await
+    }
+
+    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
+        self.node_local.subscribe_pod_slot_admissions()
+    }
+
+    async fn patch_resource_latest(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _patch_kind: PatchKind,
+        _patch: Value,
+    ) -> Result<Option<Resource>> {
+        self.unsupported("patch_resource_latest")
+    }
+
+    async fn patch_resource_latest_with_preconditions(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _request: ResourcePatchRequest,
+    ) -> Result<Option<Resource>> {
+        self.unsupported("patch_resource_latest_with_preconditions")
+    }
+
+    async fn get_pod_network(&self, sandbox_id: &str) -> Result<Option<PodNetworkEndpoint>> {
+        self.node_local.get_network_for_sandbox(sandbox_id).await
+    }
+
+    async fn get_pod_network_for_pod(
+        &self,
+        _namespace: &str,
+        _pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<PodNetworkEndpoint>> {
+        self.node_local.get_network_for_uid(pod_uid).await
+    }
+
+    async fn ipam_allocate_and_record_pod_network(
+        &self,
+        sandbox_id: &str,
+        pod: &crate::pod_identity::PodIdentity,
+        subnet_base_int: u32,
+        subnet_size: u32,
+        veth_host: &str,
+        netns_path: &str,
+    ) -> Result<(String, u32)> {
+        self.node_local
+            .reserve_ip_and_insert_network(PodNetworkAllocationRequest::new(
+                sandbox_id,
+                PodNetworkAllocationPod::new(&pod.namespace, &pod.name, &pod.uid),
+                PodNetworkAllocationSubnet::new(subnet_base_int, subnet_size),
+                PodNetworkAllocationLink::new(veth_host, netns_path),
+            ))
+            .await
+    }
+
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRef>> {
+        Ok(self
+            .node_local
+            .list_pod_runtime()
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                Some(SandboxRef {
+                    namespace: row.namespace,
+                    pod_name: row.pod_name,
+                    pod_uid: row.pod_uid,
+                    sandbox_id: row.sandbox_id?,
+                })
+            })
+            .collect())
+    }
+
+    async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
+        self.node_local.list_networks().await
+    }
+
+    async fn gc_watch_events(&self, _max_rows: i64, _batch_cap: i64) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn pod_endpoint_get_by_pod_ip(
+        &self,
+        pod_ip: std::net::Ipv4Addr,
+    ) -> Result<Option<PodEndpointRow>> {
+        self.node_local.get_endpoint_by_pod_ip(pod_ip).await
+    }
+
+    async fn pod_endpoint_list_all(&self) -> Result<Vec<PodEndpointRow>> {
+        self.node_local.list_endpoints_all().await
+    }
+
+    fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
+        self.node_local.subscribe_pod_endpoints()
+    }
+
+    async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
+        self.node_local.get_node_meta(key).await
+    }
+
+    async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.node_local.set_node_meta(key, value).await
+    }
+
+    async fn get_applied_outbox(
+        &self,
+        _idempotency_key: &str,
+    ) -> Result<Option<AppliedOutboxRecord>> {
+        Ok(None)
+    }
+
+    async fn insert_applied_outbox(&self, _record: AppliedOutboxRecord) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn apply_outbox_transactionally(
+        &self,
+        _idempotency_key: &str,
+        _operation: &str,
+        _payload: &[u8],
+        _authoring_node: &str,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+            "worker-local store does not support leader-side outbox apply".to_string(),
+        ))
+    }
+
+    async fn build_log_apply_commit_for_outbox(
+        &self,
+        _idempotency_key: &str,
+        _operation: &str,
+        _payload: &[u8],
+        _authoring_node: &str,
+    ) -> std::result::Result<
+        crate::datastore::sqlite::BuildOutboxOutcome,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+            "worker-local store does not support leader-side outbox build".to_string(),
+        ))
+    }
+
+    async fn gc_applied_outbox(&self, _now_ms: i64, _ttl_ms: i64) -> Result<usize> {
+        Ok(0)
+    }
+
+    async fn apply_replicated_command(
+        &self,
+        _command: StorageCommand,
+        _meta: CommandMeta,
+    ) -> Result<()> {
+        self.unsupported("apply_replicated_command")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control_plane::client::local::LocalApiClient;
+    use crate::control_plane::client::{
+        CacheScope, ConfigMap, Node, Pod, ResourceEvent, Secret, WatchStream,
+    };
+    use crate::datastore::DatastoreBackend;
+    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+
+    #[derive(Default)]
+    struct HandoffLeaderApi;
+
+    #[async_trait]
+    impl LeaderApiClient for HandoffLeaderApi {
+        async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
+            if key.api_version == "v1" && key.kind == "Pod" && key.name == "cached-deleted" {
+                return Ok(Some(Resource {
+                    id: 1,
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "cached-deleted".to_string(),
+                    uid: "uid-cached".to_string(),
+                    resource_version: 12,
+                    data: Arc::new(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "namespace": "default",
+                            "name": "cached-deleted",
+                            "uid": "uid-cached",
+                            "resourceVersion": "12"
+                        },
+                        "spec": {
+                            "nodeName": "worker-a",
+                            "containers": [{"name": "app", "image": "nginx"}]
+                        }
+                    })),
+                }));
+            }
+            unreachable!("handoff test does not use get_resource for {key:?}")
+        }
+
+        async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
+            if key.api_version == "v1" && key.kind == "Pod" && key.name == "cached-deleted" {
+                return Ok(None);
+            }
+            self.get_resource(key).await
+        }
+
+        async fn list_resources(&self, req: ListRequest) -> Result<ResourceList> {
+            let resource_version = if req.api_version == "v1" && req.kind == "Pod" {
+                assert_eq!(
+                    req.field_selector.as_deref(),
+                    Some("spec.nodeName=worker-a")
+                );
+                41
+            } else {
+                0
+            };
+            Ok(ResourceList {
+                items: Vec::new(),
+                resource_version,
+                continue_token: None,
+                remaining_item_count: None,
+            })
+        }
+
+        async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
+            if req.api_version == "v1" && req.kind == "Pod" {
+                assert_eq!(req.start_resource_version, Some(41));
+                let event = ResourceEvent {
+                    event: WatchEvent::modified(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "namespace": "default",
+                            "name": "bound-during-handoff",
+                            "uid": "uid-handoff",
+                            "resourceVersion": "42"
+                        },
+                        "spec": {
+                            "nodeName": "worker-a",
+                            "containers": [{"name": "app", "image": "nginx"}]
+                        },
+                        "status": {"phase": "Pending"}
+                    })),
+                };
+                return Ok(Box::pin(futures::stream::once(async move { Ok(event) })));
+            }
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_pod(&self, _ns: &str, _name: &str) -> Result<Option<Pod>> {
+            unreachable!("handoff test does not use get_pod")
+        }
+
+        async fn get_pod_for_uid(&self, _ns: &str, _name: &str, _uid: &str) -> Result<Option<Pod>> {
+            unreachable!("handoff test does not use get_pod_for_uid")
+        }
+
+        async fn watch_pods_on_node(&self, _node_name: &str) -> Result<WatchStream<Pod>> {
+            unreachable!("handoff test does not use watch_pods_on_node")
+        }
+
+        async fn list_pods_on_node(&self, _node_name: &str) -> Result<Vec<Pod>> {
+            unreachable!("handoff test does not use list_pods_on_node")
+        }
+
+        async fn get_configmap(&self, _ns: &str, _name: &str) -> Result<Option<ConfigMap>> {
+            unreachable!("handoff test does not use get_configmap")
+        }
+
+        async fn get_secret(&self, _ns: &str, _name: &str) -> Result<Option<Secret>> {
+            unreachable!("handoff test does not use get_secret")
+        }
+
+        async fn get_node(&self, _name: &str) -> Result<Node> {
+            unreachable!("handoff test does not use get_node")
+        }
+
+        async fn watch_node(&self, _name: &str) -> Result<WatchStream<Node>> {
+            unreachable!("handoff test does not use watch_node")
+        }
+
+        async fn allocate_node_subnet(
+            &self,
+            _node_name: &str,
+            _cluster_cidr: &str,
+            _node_ip: &str,
+        ) -> Result<NodeSubnet> {
+            unreachable!("handoff test does not use allocate_node_subnet")
+        }
+
+        async fn get_node_subnet(&self, _node_name: &str) -> Result<Option<NodeSubnet>> {
+            unreachable!("handoff test does not use get_node_subnet")
+        }
+
+        async fn list_peer_subnets(&self, _my_node_name: &str) -> Result<Vec<NodeSubnet>> {
+            unreachable!("handoff test does not use list_peer_subnets")
+        }
+
+        async fn get_node_dataplane(
+            &self,
+            _node_name: &str,
+        ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+            unreachable!("handoff test does not use get_node_dataplane")
+        }
+
+        async fn list_pod_cleanup_intents_for_node(
+            &self,
+            _node_name: &str,
+        ) -> Result<Vec<PodCleanupIntent>> {
+            unreachable!("handoff test does not use list_pod_cleanup_intents_for_node")
+        }
+
+        async fn delete_pod_cleanup_intent(
+            &self,
+            _node_name: &str,
+            _namespace: &str,
+            _pod_name: &str,
+            _pod_uid: &str,
+            _reason: &str,
+        ) -> Result<()> {
+            unreachable!("handoff test does not use delete_pod_cleanup_intent")
+        }
+
+        async fn apply_outbox(
+            &self,
+            _idempotency_key: &str,
+            _operation: crate::kubelet::outbox::payload::OutboxOperation,
+            _payload: bytes::Bytes,
+        ) -> std::result::Result<
+            crate::kubelet::outbox::OutboxApplyResult,
+            crate::kubelet::outbox::OutboxApplyError,
+        > {
+            unreachable!("handoff test does not use apply_outbox")
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_pod_get_uses_fresh_leader_state_to_extinguish_stale_cache() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-pod-get-fresh-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(
+            Arc::new(HandoffLeaderApi),
+            node_local,
+            "worker-a".to_string(),
+        );
+
+        let pod = adapter
+            .get_resource("v1", "Pod", Some("default"), "cached-deleted")
+            .await
+            .expect("fresh pod get should succeed");
+
+        assert!(
+            pod.is_none(),
+            "worker pod get must not return a stale cached pod after the leader no longer has it"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_pod_lists_are_constrained_to_local_node() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-pod-list-local-node-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(
+            Arc::new(HandoffLeaderApi),
+            node_local,
+            "worker-a".to_string(),
+        );
+
+        let list = adapter
+            .list_resources_page(
+                "v1",
+                "Pod",
+                Some("default"),
+                None,
+                None,
+                ListPageRequest::unbounded(),
+            )
+            .await
+            .expect("list local pods");
+
+        assert_eq!(list.resource_version, 41);
+    }
+
+    #[tokio::test]
+    async fn reads_cluster_objects_through_leader_api_and_runtime_rows_from_node_local() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        cluster_db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "web",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "web",
+                        "uid": "uid-1"
+                    },
+                    "spec": {
+                        "nodeName": "worker-a",
+                        "containers": [{"name": "app", "image": "nginx"}]
+                    }
+                }),
+            )
+            .await
+            .expect("create cluster pod");
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db.clone()),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter =
+            WorkerStoreAdapter::new(cluster_api, node_local.clone(), "worker-a".to_string());
+
+        let pod = adapter
+            .get_resource("v1", "Pod", Some("default"), "web")
+            .await
+            .expect("get pod through leader api")
+            .expect("pod exists");
+        assert_eq!(pod.uid, "uid-1");
+
+        adapter
+            .record_sandbox("default", "web", "uid-1", "sandbox-1")
+            .await
+            .expect("record sandbox in node-local store");
+        assert_eq!(
+            adapter
+                .get_sandbox_for_uid("default", "web", "uid-1")
+                .await
+                .expect("read worker sandbox"),
+            Some("sandbox-1".to_string())
+        );
+        assert_eq!(
+            cluster_db
+                .get_sandbox_for_uid("default", "web", "uid-1")
+                .await
+                .expect("cluster runtime lookup must stay empty"),
+            None,
+            "worker runtime rows must not be written to cluster storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_mirror_publishes_existing_node_pods_on_startup() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        cluster_db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "already-bound",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "already-bound",
+                        "uid": "uid-bound"
+                    },
+                    "spec": {
+                        "nodeName": "worker-a",
+                        "containers": [{"name": "app", "image": "nginx"}]
+                    },
+                    "status": {"phase": "Pending"}
+                }),
+            )
+            .await
+            .expect("create cluster pod");
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db.clone()),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor.clone(),
+            None,
+            "sqlite:worker-store-watch-bootstrap-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = Arc::new(WorkerStoreAdapter::new(
+            cluster_api,
+            node_local,
+            "worker-a".to_string(),
+        ));
+        let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Pod"));
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let handles = adapter
+            .start_watch_mirrors(supervisor.clone(), cancel.clone())
+            .await
+            .expect("start watch mirrors");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), watch_rx.recv())
+            .await
+            .expect("existing node pod should be replayed into worker watch")
+            .expect("watch channel should remain open");
+        cancel.cancel();
+        for handle in handles {
+            let _ = handle.join().await;
+        }
+
+        assert_eq!(event.event_type, crate::watch::EventType::Added);
+        assert_eq!(
+            event
+                .object
+                .pointer("/metadata/name")
+                .and_then(|v| v.as_str()),
+            Some("already-bound")
+        );
+        assert_eq!(
+            event
+                .object
+                .pointer("/spec/nodeName")
+                .and_then(|v| v.as_str()),
+            Some("worker-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_mirror_publishes_namespace_events_on_startup() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        cluster_db
+            .create_namespace(
+                "terminating-ns",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {
+                        "name": "terminating-ns",
+                        "uid": "ns-uid",
+                        "deletionTimestamp": "2026-05-18T20:06:06Z"
+                    },
+                    "spec": {"finalizers": ["kubernetes"]},
+                    "status": {"phase": "Terminating"}
+                }),
+            )
+            .await
+            .expect("create terminating namespace");
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db.clone()),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor.clone(),
+            None,
+            "sqlite:worker-store-namespace-watch-bootstrap-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = Arc::new(WorkerStoreAdapter::new(
+            cluster_api,
+            node_local,
+            "worker-a".to_string(),
+        ));
+        let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Namespace"));
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let handles = adapter
+            .start_watch_mirrors(supervisor.clone(), cancel.clone())
+            .await
+            .expect("start watch mirrors");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let event = watch_rx
+                    .recv()
+                    .await
+                    .expect("watch channel should remain open");
+                if event.object.get("kind").and_then(|value| value.as_str()) == Some("Namespace") {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("terminating namespace should be replayed into worker watch");
+        cancel.cancel();
+        for handle in handles {
+            let _ = handle.join().await;
+        }
+
+        assert_eq!(event.event_type, crate::watch::EventType::Added);
+        assert_eq!(
+            event
+                .object
+                .pointer("/metadata/name")
+                .and_then(|value| value.as_str()),
+            Some("terminating-ns")
+        );
+        assert_eq!(
+            event
+                .object
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(|value| value.as_str()),
+            Some("2026-05-18T20:06:06Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_store_requeues_node_local_pod_workqueue_failures() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-workqueue-retry-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(
+            Arc::new(HandoffLeaderApi),
+            node_local,
+            "worker-a".to_string(),
+        );
+
+        let pod = crate::pod_identity::PodIdentity::new("default", "stuck", "uid-stuck");
+        adapter
+            .pod_workqueue_enqueue(
+                PodWorkqueueKind::Pod,
+                &pod,
+                serde_json::json!({"source": "test"}),
+                3,
+                0,
+                None,
+            )
+            .await
+            .expect("enqueue workqueue row");
+        let claimed = adapter
+            .pod_workqueue_claim_due(i64::MAX)
+            .await
+            .expect("claim workqueue row")
+            .expect("workqueue row exists");
+
+        adapter
+            .pod_workqueue_record_failure(claimed, 0, "missed delete")
+            .await
+            .expect("record worker-local failure");
+
+        let retried = adapter
+            .pod_workqueue_claim_due(i64::MAX)
+            .await
+            .expect("claim retried workqueue row")
+            .expect("failure must requeue worker-local pod delete work");
+        assert_eq!(retried.kind, PodWorkqueueKind::Pod);
+        assert_eq!(retried.namespace, "default");
+        assert_eq!(retried.name, "stuck");
+        assert_eq!(retried.uid, "uid-stuck");
+        assert_eq!(retried.attempt_count, 4);
+        assert_eq!(retried.payload, serde_json::json!({"source": "test"}));
+    }
+
+    #[tokio::test]
+    async fn watch_mirror_replays_pods_bound_between_initial_list_and_watch() {
+        let cluster_api = Arc::new(HandoffLeaderApi);
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor.clone(),
+            None,
+            "sqlite:worker-store-watch-handoff-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = Arc::new(WorkerStoreAdapter::new(
+            cluster_api,
+            node_local,
+            "worker-a".to_string(),
+        ));
+        let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Pod"));
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let handles = adapter
+            .start_watch_mirrors(supervisor.clone(), cancel.clone())
+            .await
+            .expect("start watch mirrors");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), watch_rx.recv())
+            .await
+            .expect("pod bound after the initial list should be replayed from list RV")
+            .expect("watch channel should remain open");
+        cancel.cancel();
+        for handle in handles {
+            let _ = handle.join().await;
+        }
+
+        assert_eq!(event.event_type, crate::watch::EventType::Modified);
+        assert_eq!(
+            event
+                .object
+                .pointer("/metadata/name")
+                .and_then(|v| v.as_str()),
+            Some("bound-during-handoff")
+        );
+        assert_eq!(
+            event
+                .object
+                .pointer("/metadata/resourceVersion")
+                .and_then(|v| v.as_str()),
+            Some("42")
+        );
+    }
+}

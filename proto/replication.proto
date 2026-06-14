@@ -1,0 +1,554 @@
+syntax = "proto3";
+
+package klights.replication;
+
+service Replication {
+  rpc Connect(stream FollowerMessage) returns (stream LeaderMessage);
+  rpc Snapshot(SnapshotRequest) returns (stream ReplicationEntry);
+  rpc GetMetadata(MetadataRequest) returns (MetadataResponse);
+  rpc GetClusterMembership(ClusterMembershipRequest) returns (ClusterMembershipResponse);
+  rpc GetResource(GetResourceRequest) returns (GetResourceResponse);
+  rpc ListResources(ListResourcesRequest) returns (ListResourcesResponse);
+  rpc WatchResources(WatchResourcesRequest) returns (stream WatchEvent);
+  rpc ProjectedServiceAccountToken(ProjectedServiceAccountTokenRequest) returns (ProjectedServiceAccountTokenResponse);
+  rpc ApplyOutbox(ApplyOutboxRequest) returns (ApplyOutboxResponse);
+  rpc RenewNodeLease(RenewNodeLeaseRequest) returns (RenewNodeLeaseResponse);
+  rpc AllocateNodeSubnet(AllocateNodeSubnetRequest) returns (NodeSubnetResponse);
+  rpc GetNodeSubnet(GetNodeSubnetRequest) returns (GetNodeSubnetResponse);
+  rpc ListPeerSubnets(ListPeerSubnetsRequest) returns (ListPeerSubnetsResponse);
+  rpc GetNodeDataplane(GetNodeDataplaneRequest) returns (GetNodeDataplaneResponse);
+  rpc ObservePeerEndpoint(ObservePeerEndpointRequest) returns (ObservePeerEndpointResponse);
+  rpc ListPodCleanupIntentsForNode(ListPodCleanupIntentsForNodeRequest) returns (ListPodCleanupIntentsForNodeResponse);
+  rpc DeletePodCleanupIntent(DeletePodCleanupIntentRequest) returns (DeletePodCleanupIntentResponse);
+
+  // Phase 3 Raft consensus RPCs. Each request carries an opaque envelope
+  // of the openraft RPC payload (serialized via serde); the server
+  // deserializes and hands it to the local Raft<TypeConfig> instance.
+  // Responses carry the openraft response struct, also serde-encoded.
+  // See src/datastore/raft/grpc_network.rs for the client side and
+  // src/replication/grpc/server.rs::Replication for the server side.
+  rpc RaftAppendEntries(RaftAppendEntriesRequest) returns (RaftAppendEntriesResponse);
+  rpc RaftVote(RaftVoteRequest) returns (RaftVoteResponse);
+  rpc RaftInstallSnapshot(RaftInstallSnapshotRequest) returns (RaftInstallSnapshotResponse);
+
+  // Phase 3 controlplane growth: a newly-started `klights controlplane
+  // --leader X` sends this to its configured peer. If the receiver is
+  // the current Raft leader, it runs `RaftNode::add_voter` and replies
+  // `accepted`. If it's a follower, it replies `redirect_to_leader`
+  // with the current leader's id/addr. If no leader is currently
+  // elected, it replies `denied` with a transient reason.
+  rpc JoinAsControlplane(JoinAsControlplaneRequest) returns (JoinAsControlplaneResponse);
+
+  // CSR-based cert signing for joining controlplanes. Called BEFORE
+  // JoinAsControlplane so the joiner has a properly signed server cert
+  // before the leader's raft transport tries to connect. Authenticated
+  // via join token in metadata.
+  rpc SignControlplaneCsr(SignControlplaneCsrRequest) returns (SignControlplaneCsrResponse);
+}
+
+message FollowerMessage {
+  // Tag 2 reserved: was `ForwardCommand forward` — the legacy generic
+  // storage-forward shim removed in T6. All worker writes now go via
+  // outbox -> ApplyOutbox.
+  reserved 2;
+  reserved "forward";
+  oneof payload {
+    JoinRequest join = 1;
+    StreamAck ack = 3;
+    NodeExecSyncResponse node_exec_sync_response = 4;
+    PodLogResponse pod_log_response = 5;
+    NodeExecStreamFrame node_exec_stream_frame = 6;
+    ObservedLeaderEndpoint observed_leader_endpoint = 7;
+  }
+}
+
+message LeaderMessage {
+  // Tag 2 reserved: was `ForwardResponse forward_response` — see T6.
+  reserved 2;
+  reserved "forward_response";
+  oneof payload {
+    JoinResponse join_response = 1;
+    StreamItem stream_item = 3;
+    NodeExecSyncRequest node_exec_sync_request = 4;
+    PodLogRequest pod_log_request = 5;
+    NodeExecRequest node_exec_request = 6;
+    NodeExecStreamFrame node_exec_stream_frame = 7;
+    ObserveLeaderEndpointRequest observe_leader_endpoint_request = 8;
+  }
+}
+
+message JoinRequest {
+  string token = 1;
+  string node_name = 2;
+  JoinRole role = 3;
+  string dataplane_public_key = 4;
+  string dataplane_endpoint = 5;
+  uint32 dataplane_port = 6;
+  string dataplane_mode = 7;
+  string dataplane_encryption = 8;
+  reserved 9;
+}
+
+// Worker replication stream join role. Control-plane learners join through
+// JoinAsControlplane with as_learner=true.
+enum JoinRole {
+  JOIN_ROLE_UNSPECIFIED = 0;
+  WORKER = 1;
+}
+
+message JoinResponse {
+  oneof result {
+    JoinAccepted accepted = 1;
+    JoinRejected rejected = 2;
+  }
+}
+
+message JoinAccepted {
+  string cluster_id = 1;
+  int64 leader_epoch = 2;
+  int64 current_rv = 3;
+  repeated DataplanePeer peers = 4;
+}
+
+message JoinRejected {
+  string reason = 1;
+}
+
+message StreamAck {
+  int64 applied_rv = 1;
+}
+
+message ObservedLeaderEndpoint {
+  string endpoint = 1;
+}
+
+message ObserveLeaderEndpointRequest {}
+
+message StreamItem {
+  oneof item {
+    ReplicationEntry entry = 1;
+    Heartbeat heartbeat = 2;
+  }
+}
+
+message PodLogRequest {
+  string request_id = 1;
+  string node_name = 2;
+  string namespace = 3;
+  string pod_name = 4;
+  string pod_uid = 5;
+  string container_name = 6;
+  optional string tail_lines = 7;
+  optional string timestamps = 8;
+  optional string since_time = 9;
+  optional int64 since_seconds = 10;
+  optional int64 limit_bytes = 11;
+  optional string previous = 12;
+  optional string follow = 13;
+}
+
+message PodLogResponse {
+  string request_id = 1;
+  bytes log_content = 2;
+  optional string error = 3;
+  bool fin = 4;
+}
+
+message Heartbeat {
+  int64 current_rv = 1;
+}
+
+// `ForwardCommand` and `ForwardResponse` removed in T6 — the legacy
+// generic storage-forward shim. All kubelet writes route through
+// outbox -> ApplyOutbox; no other production caller remains.
+
+message NodeExecSyncRequest {
+  string request_id = 1;
+  string node_name = 2;
+  string namespace = 3;
+  string pod_name = 4;
+  string container_id = 5;
+  repeated string command = 6;
+  int64 timeout_seconds = 7;
+}
+
+message NodeExecSyncResponse {
+  string request_id = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+  int32 exit_code = 4;
+  optional string error = 5;
+}
+
+message NodeExecRequest {
+  string request_id = 1;
+  string node_name = 2;
+  string namespace = 3;
+  string pod_name = 4;
+  string container_id = 5;
+  repeated string command = 6;
+  bool tty = 7;
+  bool stdin = 8;
+  bool stdout = 9;
+  bool stderr = 10;
+}
+
+message NodeExecStreamFrame {
+  string request_id = 1;
+  string channel = 2;
+  bytes data = 3;
+  bool fin = 4;
+}
+
+message SnapshotRequest {
+  int64 last_applied_rv = 1;
+}
+
+message MetadataRequest {}
+
+message MetadataResponse {
+  string cluster_id = 1;
+  int64 leader_epoch = 2;
+  int64 current_rv = 3;
+  int64 current_log_index = 4;
+}
+
+message ClusterMembershipRequest {}
+
+message ClusterMembershipResponse {
+  string cluster_id = 1;
+  repeated string voters = 2;
+  int64 term = 3;
+  string leader_hint = 4;
+}
+
+message ReplicationEntry {
+  bytes command_protobuf = 1;
+  bytes meta_protobuf = 2;
+  int64 log_index = 3;
+  int64 term = 4;
+  bytes commit_protobuf = 5;
+}
+
+// `ForwardedResource`, `ForwardedNodeSubnet`, `ForwardedPodSlotAdmission`
+// removed in T6 — they were ForwardResponse sub-payloads.
+
+message DataplanePeer {
+  string node_name = 1;
+  string pod_cidr = 2;
+  string public_key = 3;
+  string endpoint = 4;
+  uint32 port = 5;
+  string mode = 6;
+  string encryption = 7;
+}
+
+message GetResourceRequest {
+  string api_version = 1;
+  string kind = 2;
+  optional string namespace = 3;
+  string name = 4;
+}
+
+message GetResourceResponse {
+  bool found = 1;
+  optional ResourceObject resource = 2;
+}
+
+message ResourceObject {
+  string api_version = 1;
+  string kind = 2;
+  optional string namespace = 3;
+  string name = 4;
+  string uid = 5;
+  int64 resource_version = 6;
+  bytes data_json = 7;
+}
+
+message ListResourcesRequest {
+  string api_version = 1;
+  string kind = 2;
+  optional string namespace = 3;
+  optional string label_selector = 4;
+  optional string field_selector = 5;
+  optional int64 limit = 6;
+  optional string continue_token = 7;
+}
+
+message ListResourcesResponse {
+  repeated ResourceObject items = 1;
+  int64 total = 2;
+  optional string continue_token = 3;
+  int64 resource_version = 4;
+  optional int64 remaining_item_count = 5;
+}
+
+message WatchResourcesRequest {
+  string api_version = 1;
+  string kind = 2;
+  optional string namespace = 3;
+  optional string field_selector = 4;
+  int64 start_resource_version = 5;
+  optional string label_selector = 6;
+}
+
+message WatchEvent {
+  string event_type = 1;
+  ResourceObject resource = 2;
+}
+
+message ProjectedServiceAccountTokenRequest {
+  string namespace = 1;
+  string service_account_name = 2;
+  repeated string audiences = 3;
+  int64 expiration_seconds = 4;
+  optional string bound_pod_name = 5;
+  optional string bound_pod_uid = 6;
+  optional string bound_node_name = 7;
+  optional string bound_node_uid = 8;
+}
+
+message ProjectedServiceAccountTokenResponse {
+  string token = 1;
+}
+
+message ApplyOutboxRequest {
+  string idempotency_key = 1;
+  string operation = 2;
+  bytes payload_proto = 3;
+  string authoring_node = 4;
+}
+
+message ApplyOutboxResponse {
+  bool already_applied = 1;
+  int64 applied_rv = 2;
+  optional string error = 3;
+  optional string error_type = 4;
+}
+
+message RenewNodeLeaseRequest {
+  string node_name = 1;
+  string renew_time = 2;
+  int64 lease_duration_seconds = 3;
+}
+
+message RenewNodeLeaseResponse {}
+
+message AllocateNodeSubnetRequest {
+  string node_name = 1;
+  string cluster_cidr = 2;
+  string node_ip = 3;
+}
+
+message GetNodeSubnetRequest {
+  string node_name = 1;
+}
+
+message ListPeerSubnetsRequest {
+  string my_node_name = 1;
+}
+
+message NodeSubnetObject {
+  string node_name = 1;
+  string subnet = 2;
+  uint32 subnet_base_int = 3;
+  string vtep_ip = 4;
+  optional string vtep_mac = 5;
+  string node_ip = 6;
+  string mode = 7;
+  optional string hostport_range = 8;
+}
+
+message NodeSubnetResponse {
+  NodeSubnetObject subnet = 1;
+}
+
+message GetNodeSubnetResponse {
+  bool found = 1;
+  optional NodeSubnetObject subnet = 2;
+}
+
+message ListPeerSubnetsResponse {
+  repeated NodeSubnetObject items = 1;
+}
+
+message GetNodeDataplaneRequest {
+  string node_name = 1;
+}
+
+message DataplaneMetadataObject {
+  string node_name = 1;
+  string mode = 2;
+  string encryption = 3;
+  optional string public_key = 4;
+  string endpoint = 5;
+  optional uint32 port = 6;
+}
+
+message GetNodeDataplaneResponse {
+  bool found = 1;
+  optional DataplaneMetadataObject metadata = 2;
+}
+
+message ObservePeerEndpointRequest {
+  string node_name = 1;
+}
+
+message ObservePeerEndpointResponse {
+  bool found = 1;
+  string endpoint = 2;
+}
+
+message PodCleanupIntentObject {
+  string node_name = 1;
+  string namespace = 2;
+  string pod_name = 3;
+  string pod_uid = 4;
+  string reason = 5;
+  int64 resource_version = 6;
+  int64 created_at_ms = 7;
+  bytes pod_data_json = 8;
+}
+
+message ListPodCleanupIntentsForNodeRequest {
+  string node_name = 1;
+}
+
+message ListPodCleanupIntentsForNodeResponse {
+  repeated PodCleanupIntentObject items = 1;
+}
+
+message DeletePodCleanupIntentRequest {
+  string node_name = 1;
+  string namespace = 2;
+  string pod_name = 3;
+  string pod_uid = 4;
+  string reason = 5;
+}
+
+message DeletePodCleanupIntentResponse {}
+
+// ===================================================================
+// Phase 3 Raft RPC envelopes
+// ===================================================================
+
+message RaftAppendEntriesRequest {
+  // Serde-encoded openraft::AppendEntriesRequest<TypeConfig>.
+  bytes payload = 1;
+}
+
+message RaftAppendEntriesResponse {
+  // Serde-encoded openraft::AppendEntriesResponse<NodeId>, OR a server-side
+  // error (e.g. RaftRpcRouter not installed). Mutually exclusive.
+  oneof result {
+    bytes ok = 1;
+    string error = 2;
+  }
+}
+
+message RaftVoteRequest {
+  // Serde-encoded openraft::VoteRequest<NodeId>.
+  bytes payload = 1;
+}
+
+message RaftVoteResponse {
+  oneof result {
+    bytes ok = 1;
+    string error = 2;
+  }
+}
+
+message RaftInstallSnapshotRequest {
+  // Serde-encoded openraft::InstallSnapshotRequest<TypeConfig>.
+  bytes payload = 1;
+}
+
+message RaftInstallSnapshotResponse {
+  oneof result {
+    bytes ok = 1;
+    string error = 2;
+  }
+}
+
+// ===================================================================
+// Phase 3 controlplane growth (P3-11c)
+// ===================================================================
+
+message JoinAsControlplaneRequest {
+  uint64 node_id = 1;
+  string addr = 2;       // peer's API/Raft RPC URL (e.g. "https://10.99.0.14:7679")
+  string node_name = 3;
+  // T1.5.x: when true, the leader admits this node as a raft LEARNER
+  // (add_learner_only) instead of a voter. Learners receive
+  // AppendEntries and apply through the same state-machine code as
+  // voters but do not count toward quorum and do not vote. Replicas
+  // join through this flag.
+  bool as_learner = 4;
+  string dataplane_public_key = 5;
+  string dataplane_endpoint = 6;
+  uint32 dataplane_port = 7;
+  string dataplane_mode = 8;
+  string dataplane_encryption = 9;
+  string node_internal_ip = 10;
+}
+
+message JoinAsControlplaneResponse {
+  oneof result {
+    JoinAsControlplaneAccepted accepted = 1;
+    JoinAsControlplaneRedirect redirect_to_leader = 2;
+    JoinAsControlplaneDenied denied = 3;
+  }
+}
+
+message JoinAsControlplaneAccepted {
+  // Membership size after add_voter completed. For learner joins
+  // (as_learner=true) this is the unchanged voter count — learners
+  // don't affect quorum.
+  uint32 voter_count_after = 1;
+  // T1.5.x: true when the leader admitted this node as a learner
+  // rather than a voter. Lets the client tell whether its `as_learner`
+  // request was honored (vs being silently treated as a voter join).
+  bool admitted_as_learner = 2;
+  // Cluster CA cert PEM (plaintext). Joining node writes to etc/ca.crt.
+  string ca_cert_pem = 3;
+  // Cluster CA key PEM, AES-256-GCM encrypted with a key derived from
+  // the join token. Joining node decrypts and writes to etc/ca.key.
+  // Only populated for voter/learner joins (controlplane/replica).
+  bytes encrypted_ca_key = 4;
+  // AES-GCM nonce (12 bytes) used to encrypt encrypted_ca_key.
+  bytes ca_key_nonce = 5;
+}
+
+message JoinAsControlplaneRedirect {
+  uint64 leader_id = 1;
+  string leader_addr = 2;
+}
+
+message JoinAsControlplaneDenied {
+  string reason = 1;
+}
+
+// CSR-based cert signing request from a joining controlplane.
+message SignControlplaneCsrRequest {
+  string node_name = 1;
+  // PEM-encoded CSR for the server certificate.
+  // CN=klights-server, SANs include the node's IPs + DNS names.
+  bytes server_csr = 2;
+}
+
+// Response: signed server cert + cluster CA material.
+message SignControlplaneCsrResponse {
+  // PEM-encoded server certificate signed by the cluster CA.
+  string signed_server_cert = 1;
+  // Cluster CA cert PEM (plaintext).
+  string ca_cert_pem = 2;
+  // Cluster CA key PEM, AES-256-GCM encrypted with the join token.
+  bytes encrypted_ca_key = 3;
+  // AES-GCM nonce (12 bytes).
+  bytes ca_key_nonce = 4;
+  // ServiceAccount signing key PEM, AES-256-GCM encrypted with the join token.
+  // Only populated for controlplane/replica CSR bootstrap.
+  bytes encrypted_service_account_signing_key = 5;
+  // AES-GCM nonce (12 bytes) used to encrypt encrypted_service_account_signing_key.
+  bytes service_account_signing_key_nonce = 6;
+}
