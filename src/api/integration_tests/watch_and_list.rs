@@ -5771,3 +5771,314 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
     );
     assert_eq!(recovery_next_data.rv.to_string(), recovery_rv);
 }
+
+fn list_item_names(list: &serde_json::Value) -> Vec<String> {
+    list["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .map(|i| {
+            i["metadata"]["name"]
+                .as_str()
+                .expect("item name")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Pods are the most-paginated kind. A paginated Pod LIST must serve pages 2+
+/// from the snapshot pinned on page 1, not from current state — otherwise an
+/// object created mid-pagination leaks into a later page and the reported
+/// resourceVersion drifts. Regression for the chunked-list snapshot gap.
+#[tokio::test]
+async fn test_pod_pagination_serves_consistent_snapshot_across_pages() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+
+    let pod_body = |name: &str| {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {"containers": [{"name": "main", "image": "registry.k8s.io/pause:3.10"}]}
+        })
+    };
+    for i in 0..4 {
+        let name = format!("pod-{i:02}");
+        db.create_resource("v1", "Pod", Some("default"), &name, pod_body(&name))
+            .await
+            .unwrap();
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/namespaces/default/pods?limit=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let page1: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_item_names(&page1), vec!["pod-00", "pod-01"]);
+    let rv1 = page1["metadata"]["resourceVersion"]
+        .as_str()
+        .expect("page 1 resourceVersion")
+        .to_string();
+    let token = page1["metadata"]["continue"]
+        .as_str()
+        .expect("page 1 continue token")
+        .to_string();
+
+    // Mutate mid-pagination: create a Pod that sorts into the page-2 window.
+    db.create_resource("v1", "Pod", Some("default"), "pod-01a", pod_body("pod-01a"))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/namespaces/default/pods?limit=2&continue={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let page2: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        list_item_names(&page2),
+        vec!["pod-02", "pod-03"],
+        "page 2 must serve the pinned snapshot, not leak pod-01a created mid-pagination"
+    );
+    assert_eq!(
+        page2["metadata"]["resourceVersion"].as_str().unwrap(),
+        rv1,
+        "paginated Pod pages must keep the snapshot resourceVersion"
+    );
+}
+
+/// Namespaces persist in a dedicated table but must still serve consistent
+/// paginated snapshots. Regression: the namespace list handler previously
+/// re-encoded the session token but served page bodies from current state.
+#[tokio::test]
+async fn test_namespace_pagination_serves_consistent_snapshot_across_pages() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+
+    let ns_body = |name: &str| {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": name, "labels": {"snaptest": "yes"}}
+        })
+    };
+    for suffix in ["a", "b", "c", "d"] {
+        let name = format!("ns-{suffix}");
+        db.create_namespace(&name, ns_body(&name)).await.unwrap();
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/namespaces?labelSelector=snaptest%3Dyes&limit=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let page1: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_item_names(&page1), vec!["ns-a", "ns-b"]);
+    let rv1 = page1["metadata"]["resourceVersion"]
+        .as_str()
+        .expect("page 1 resourceVersion")
+        .to_string();
+    let token = page1["metadata"]["continue"]
+        .as_str()
+        .expect("page 1 continue token")
+        .to_string();
+
+    // Mutate mid-pagination: create a labeled namespace sorting into page 2.
+    db.create_namespace("ns-bx", ns_body("ns-bx"))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/namespaces?labelSelector=snaptest%3Dyes&limit=2&continue={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let page2: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        list_item_names(&page2),
+        vec!["ns-c", "ns-d"],
+        "page 2 must serve the pinned namespace snapshot, not leak ns-bx"
+    );
+    assert_eq!(
+        page2["metadata"]["resourceVersion"].as_str().unwrap(),
+        rv1,
+        "paginated namespace pages must keep the snapshot resourceVersion"
+    );
+}
+
+/// Non-conversion custom resources live in the generic resource table and must
+/// pin a real historical snapshot across pages, exactly like the core kinds.
+#[tokio::test]
+async fn test_crd_pagination_serves_consistent_snapshot_across_pages() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use hyper::header::CONTENT_TYPE;
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+
+    let crd_yaml = r#"
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: widgets.example.com
+spec:
+  group: example.com
+  scope: Namespaced
+  names:
+    kind: Widget
+    plural: widgets
+    singular: widget
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+        properties:
+          spec:
+            type: object
+            properties:
+              size:
+                type: string
+"#;
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/apis/apiextensions.k8s.io/v1/customresourcedefinitions/widgets.example.com")
+                .header(CONTENT_TYPE, "application/apply-patch+yaml")
+                .body(Body::from(crd_yaml))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "CRD apply failed: {}",
+        resp.status()
+    );
+
+    let widget_body = |name: &str| {
+        serde_json::json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": name, "namespace": "default"},
+            "spec": {"size": "m"}
+        })
+    };
+    for i in 0..4 {
+        let name = format!("w-{i:02}");
+        db.create_resource(
+            "example.com/v1",
+            "Widget",
+            Some("default"),
+            &name,
+            widget_body(&name),
+        )
+        .await
+        .unwrap();
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/apis/example.com/v1/namespaces/default/widgets?limit=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let page1: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(list_item_names(&page1), vec!["w-00", "w-01"]);
+    let rv1 = page1["metadata"]["resourceVersion"]
+        .as_str()
+        .expect("page 1 resourceVersion")
+        .to_string();
+    let token = page1["metadata"]["continue"]
+        .as_str()
+        .expect("page 1 continue token")
+        .to_string();
+
+    // Mutate mid-pagination: create a CR sorting into the page-2 window.
+    db.create_resource(
+        "example.com/v1",
+        "Widget",
+        Some("default"),
+        "w-01a",
+        widget_body("w-01a"),
+    )
+    .await
+    .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/apis/example.com/v1/namespaces/default/widgets?limit=2&continue={token}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let page2: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        list_item_names(&page2),
+        vec!["w-02", "w-03"],
+        "page 2 must serve the pinned CRD snapshot, not leak w-01a"
+    );
+    assert_eq!(
+        page2["metadata"]["resourceVersion"].as_str().unwrap(),
+        rv1,
+        "paginated CRD pages must keep the snapshot resourceVersion"
+    );
+}

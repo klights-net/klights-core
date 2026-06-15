@@ -84,6 +84,9 @@ impl Datastore {
         let k = kind.to_string();
         let ns_owned = namespace.map(str::to_string);
         let namespaced = use_namespaced_table(api_version, kind, &namespace);
+        // Namespaces are cluster-scoped but persist in their own `namespaces`
+        // table rather than the generic cluster_resources table.
+        let is_namespace = api_version == "v1" && kind == "Namespace";
         let n = snapshot_rv;
 
         let raw = self
@@ -107,9 +110,40 @@ impl Datastore {
                 }
 
                 // 1. Live rows for the target (with created_rv to tell apart
-                //    "existed at N" from "created after N").
-                let mut current: HashMap<String, (i64, i64, Resource)> = HashMap::new();
-                if namespaced {
+                //    "existed at N" from "created after N"). Namespaces live in
+                //    a dedicated table without a created_rv column, so their
+                //    existence at N is derived from watch_events history instead
+                //    (created_rv = None).
+                let mut current: HashMap<String, (i64, Option<i64>, Resource)> = HashMap::new();
+                if is_namespace {
+                    let mut stmt = tx.prepare(
+                        "SELECT name, resource_version, uid, data FROM namespaces",
+                    )?;
+                    let rows = stmt.query_map([], |row| {
+                        let name: String = row.get(0)?;
+                        let rv: i64 = row.get(1)?;
+                        let uid: String = row.get(2)?;
+                        let data = Arc::new(json_from_bytes(row.get(3)?)?);
+                        Ok((
+                            name.clone(),
+                            rv,
+                            Resource {
+                                id: 0,
+                                api_version: av.clone(),
+                                kind: k.clone(),
+                                namespace: None,
+                                name,
+                                uid,
+                                resource_version: rv,
+                                data,
+                            },
+                        ))
+                    })?;
+                    for row in rows {
+                        let (name, rv, res) = row?;
+                        current.insert(name, (rv, None, res));
+                    }
+                } else if namespaced {
                     let mut sql = "SELECT name, namespace, resource_version, created_rv, uid, data \
                          FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2"
                         .to_string();
@@ -146,7 +180,7 @@ impl Datastore {
                     })?;
                     for row in rows {
                         let (name, rv, created_rv, res) = row?;
-                        current.insert(name, (rv, created_rv, res));
+                        current.insert(name, (rv, Some(created_rv), res));
                     }
                 } else {
                     let mut stmt = tx.prepare(
@@ -177,7 +211,7 @@ impl Datastore {
                     })?;
                     for row in rows {
                         let (name, rv, created_rv, res) = row?;
-                        current.insert(name, (rv, created_rv, res));
+                        current.insert(name, (rv, Some(created_rv), res));
                     }
                 }
 
@@ -239,7 +273,22 @@ impl Datastore {
                         }
                         Some(_) => { /* deleted at/before N, re-created after: absent */ }
                         None => {
-                            if *created_rv <= n {
+                            // Did this key exist at N? The live row changed after
+                            // N (rv > N), so every one of its post-N events is
+                            // retained (window floor <= N+1) and earliest_gt_n is
+                            // populated. With a created_rv column we trust it;
+                            // otherwise (namespaces) the earliest retained change
+                            // being its creation (ADDED) means it was born after N.
+                            let existed_at_n = match created_rv {
+                                Some(crv) => *crv <= n,
+                                None => {
+                                    histories
+                                        .get(name)
+                                        .and_then(|h| h.earliest_gt_n_type.as_deref())
+                                        != Some("ADDED")
+                                }
+                            };
+                            if existed_at_n {
                                 // Existed at N but its pre-N history was compacted.
                                 expired = true;
                             }
@@ -557,5 +606,95 @@ mod tests {
             "page 2 must contain c,d from the historical set (not the later e)"
         );
         assert_eq!(list.continue_token, None);
+    }
+
+    async fn put_ns(db: &Datastore, name: &str, label: &str) -> i64 {
+        let r = db
+            .create_namespace(
+                name,
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {"name": name, "labels": {"k": label}}
+                }),
+            )
+            .await
+            .unwrap();
+        r.resource_version
+    }
+
+    /// Namespaces persist in their own table (no created_rv column), so their
+    /// snapshot reconstruction must read that table for live rows and derive
+    /// existence-at-N from watch_events history. This mirrors
+    /// `snapshot_reconstructs_state_at_past_rv` for the Namespace kind.
+    #[tokio::test]
+    async fn snapshot_reconstructs_namespace_state_at_past_rv() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        put_ns(&db, "a", "old").await;
+        let rb = put_ns(&db, "b", "bee").await; // snapshot point: {a:old, b}
+
+        // Mutations after the snapshot point must not leak into the snapshot.
+        let cur_a = db.get_namespace("a").await.unwrap().unwrap();
+        db.update_namespace(
+            "a",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "a", "labels": {"k": "new"}}
+            }),
+            cur_a.resource_version,
+        )
+        .await
+        .unwrap();
+        db.delete_namespace("b").await.unwrap();
+        put_ns(&db, "c", "see").await;
+
+        let snap = db
+            .snapshot_resources_at_rv("v1", "Namespace", None, ResourceListQuery::all(), rb)
+            .await
+            .unwrap();
+        let list = match snap {
+            SnapshotAtRv::List(l) => l,
+            other => panic!("expected List, got {other:?}"),
+        };
+        assert_eq!(
+            sorted_names(&list),
+            vec!["a".to_string(), "b".to_string()],
+            "namespace snapshot at rb must contain a and b, not the later c"
+        );
+        assert_eq!(list.resource_version, rb);
+        let a = list.items.iter().find(|r| r.name == "a").unwrap();
+        assert_eq!(
+            a.data
+                .pointer("/metadata/labels/k")
+                .and_then(|v| v.as_str()),
+            Some("old"),
+            "namespace a must show its pre-update value at the snapshot rv"
+        );
+    }
+
+    /// A namespace created entirely after the snapshot rv must be absent (not
+    /// erroneously treated as expired) even though the namespaces table has no
+    /// created_rv column — the earliest-retained ADDED event proves it was born
+    /// after N.
+    #[tokio::test]
+    async fn snapshot_namespace_created_after_rv_is_absent() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let rb = put_ns(&db, "a", "old").await; // snapshot point: {a}
+        put_ns(&db, "z", "new").await; // created after the snapshot
+
+        let snap = db
+            .snapshot_resources_at_rv("v1", "Namespace", None, ResourceListQuery::all(), rb)
+            .await
+            .unwrap();
+        let list = match snap {
+            SnapshotAtRv::List(l) => l,
+            other => panic!("expected List, got {other:?}"),
+        };
+        assert_eq!(
+            sorted_names(&list),
+            vec!["a".to_string()],
+            "namespace z created after N must be absent from the snapshot, not expired"
+        );
     }
 }

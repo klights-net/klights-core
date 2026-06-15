@@ -335,7 +335,7 @@ pub async fn list_inner(
         .is_some_and(|t| !t.is_empty());
     let rv_match = query.resolve_resource_version_match(has_continue)?;
 
-    let (db_continue_name, mut continue_resource_version) =
+    let (db_continue_name, continue_resource_version) =
         process_continue_token(query.continue_token)?;
 
     let list_query = crate::datastore::ResourceListQuery::new(
@@ -345,60 +345,33 @@ pub async fn list_inner(
         db_continue_name.as_deref(),
     );
 
-    // A historical snapshot is required when the read pins an older
-    // resourceVersion: an explicit `resourceVersionMatch=Exact`, or a paginated
-    // continuation carrying its session rv (so every page reflects one
-    // consistent view). NotOlderThan/Any are served live (a single consistent
-    // store is always at least as fresh as any past rv).
-    let snapshot_rv = match rv_match {
-        crate::api::query::ListResourceVersionMatch::Exact(rv) => Some(rv),
-        _ => match continue_resource_version {
-            crate::api::query::ContinueResourceVersion::Session(rv) => Some(rv),
-            _ => None,
+    // Consistent-snapshot selection (pin Exact / session continuations, downgrade
+    // a continuation that outran the retained window, honor resourceVersionMatch)
+    // is shared across every list handler — see `query::resolve_list_page`.
+    let db_for_snapshot = state.db.clone();
+    let db_for_live = state.db.clone();
+    let crate::api::query::ResolvedListPage {
+        list,
+        response_rv,
+        continue_resource_version,
+    } = crate::api::query::resolve_list_page(
+        state.db.as_ref(),
+        rv_match,
+        continue_resource_version,
+        |srv| async move {
+            db_for_snapshot
+                .snapshot_resources_at_rv(api_version, kind, ns, list_query, srv)
+                .await
+                .map_err(AppError::from)
         },
-    };
-
-    let snapshot_list = if let Some(srv) = snapshot_rv {
-        match state
-            .db
-            .snapshot_resources_at_rv(api_version, kind, ns, list_query, srv)
-            .await?
-        {
-            crate::datastore::SnapshotAtRv::List(list) => Some(list),
-            // rv is at/after current state — fall through to the live list.
-            crate::datastore::SnapshotAtRv::Current => None,
-            crate::datastore::SnapshotAtRv::Expired => {
-                match rv_match {
-                    crate::api::query::ListResourceVersionMatch::Exact(rv) => {
-                        return Err(AppError::expired(format!(
-                            "too old resource version: {rv} (the requested resourceVersion is older than the server's retained history)"
-                        )));
-                    }
-                    // A still-fresh paginated continuation can outlive the
-                    // retained watch_events window under unrelated API churn.
-                    // Continue from the last key against current state and keep
-                    // subsequent page tokens marked inconsistent.
-                    _ => {
-                        continue_resource_version =
-                            crate::api::query::ContinueResourceVersion::InconsistentSession(srv);
-                        None
-                    }
-                }
-            }
-        }
-    } else {
-        None
-    };
-
-    let list = match snapshot_list {
-        Some(list) => list,
-        None => {
-            state
-                .db
+        || async move {
+            db_for_live
                 .list_resources(api_version, kind, ns, list_query)
-                .await?
-        }
-    };
+                .await
+                .map_err(AppError::from)
+        },
+    )
+    .await?;
 
     let mut items: Vec<Value> = Vec::with_capacity(list.items.len());
     for r in list.items {
@@ -406,22 +379,6 @@ pub async fn list_inner(
         normalize_resource_for_read(api_version, kind, &mut data);
         inject_node_last_heartbeat_on_leader(&state, api_version, kind, &mut data).await;
         items.push(data);
-    }
-    let mut response_rv = resolve_list_response_resource_version(
-        state.db.as_ref(),
-        continue_resource_version,
-        list.resource_version,
-    )
-    .await?;
-    // resourceVersionMatch handling. Exact pins the reported list rv to the
-    // requested version; NotOlderThan guarantees the response is at least that
-    // fresh (always true here — a single consistent store serves current state).
-    match rv_match {
-        crate::api::query::ListResourceVersionMatch::Exact(rv) => response_rv = rv,
-        crate::api::query::ListResourceVersionMatch::NotOlderThan(rv) => {
-            response_rv = response_rv.max(rv)
-        }
-        crate::api::query::ListResourceVersionMatch::Any => {}
     }
     let resource_version = response_rv.to_string();
 

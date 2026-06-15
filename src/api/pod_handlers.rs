@@ -87,17 +87,57 @@ pub async fn list_pods(
 
     let normalized_limit = query.normalized_limit()?;
 
+    let has_continue = query
+        .continue_token
+        .as_deref()
+        .is_some_and(|t| !t.is_empty());
+    let rv_match = query.resolve_resource_version_match(has_continue)?;
+
     // Decode continue token: check TTL and extract name for DB filter.
     let (db_continue_name, continue_resource_version) =
         process_continue_token(query.continue_token)?;
 
-    let list = crate::kubelet::pod_repository::PodReader::list_pods(
-        state.pod_repository.as_ref(),
-        Some(&namespace),
+    let list_query = crate::datastore::ResourceListQuery::new(
         query.label_selector.as_deref(),
         query.field_selector.as_deref(),
         normalized_limit,
         db_continue_name.as_deref(),
+    );
+
+    // Pin paginated continuations / Exact reads to a consistent snapshot, shared
+    // with every other list handler. Pods live in the generic resource table, so
+    // the snapshot side reads `("v1","Pod")` directly; the live side stays on the
+    // PodReader port. See `query::resolve_list_page`.
+    let db_for_snapshot = state.db.clone();
+    let pod_repository = state.pod_repository.clone();
+    let ns_for_snapshot = namespace.clone();
+    let ns_for_live = namespace.clone();
+    let crate::api::query::ResolvedListPage {
+        list,
+        response_rv,
+        continue_resource_version,
+    } = crate::api::query::resolve_list_page(
+        state.db.as_ref(),
+        rv_match,
+        continue_resource_version,
+        |srv| async move {
+            db_for_snapshot
+                .snapshot_resources_at_rv("v1", "Pod", Some(&ns_for_snapshot), list_query, srv)
+                .await
+                .map_err(AppError::from)
+        },
+        || async move {
+            crate::kubelet::pod_repository::PodReader::list_pods(
+                pod_repository.as_ref(),
+                Some(&ns_for_live),
+                list_query.label_selector,
+                list_query.field_selector,
+                list_query.limit,
+                list_query.continue_token,
+            )
+            .await
+            .map_err(AppError::from)
+        },
     )
     .await?;
 
@@ -110,13 +150,6 @@ pub async fn list_pods(
             data
         })
         .collect();
-    // Use session RV for consistent multi-page lists; current RV otherwise.
-    let response_rv = resolve_list_response_resource_version(
-        state.db.as_ref(),
-        continue_resource_version,
-        list.resource_version,
-    )
-    .await?;
     let resource_version = response_rv.to_string();
 
     // Return Table format if requested by kubectl
@@ -508,17 +541,53 @@ pub async fn list_all_pods(
 
     let normalized_limit = query.normalized_limit()?;
 
+    let has_continue = query
+        .continue_token
+        .as_deref()
+        .is_some_and(|t| !t.is_empty());
+    let rv_match = query.resolve_resource_version_match(has_continue)?;
+
     // Decode continue token: check TTL and extract name for DB filter.
     let (db_continue_name, continue_resource_version) =
         process_continue_token(query.continue_token)?;
 
-    let list = crate::kubelet::pod_repository::PodReader::list_pods(
-        state.pod_repository.as_ref(),
-        None, // All namespaces
+    let list_query = crate::datastore::ResourceListQuery::new(
         query.label_selector.as_deref(),
         query.field_selector.as_deref(),
         normalized_limit,
         db_continue_name.as_deref(),
+    );
+
+    // Cluster-wide Pod list: same consistent-snapshot path as the namespaced
+    // handler, with no namespace scope. See `query::resolve_list_page`.
+    let db_for_snapshot = state.db.clone();
+    let pod_repository = state.pod_repository.clone();
+    let crate::api::query::ResolvedListPage {
+        list,
+        response_rv,
+        continue_resource_version,
+    } = crate::api::query::resolve_list_page(
+        state.db.as_ref(),
+        rv_match,
+        continue_resource_version,
+        |srv| async move {
+            db_for_snapshot
+                .snapshot_resources_at_rv("v1", "Pod", None, list_query, srv)
+                .await
+                .map_err(AppError::from)
+        },
+        || async move {
+            crate::kubelet::pod_repository::PodReader::list_pods(
+                pod_repository.as_ref(),
+                None, // All namespaces
+                list_query.label_selector,
+                list_query.field_selector,
+                list_query.limit,
+                list_query.continue_token,
+            )
+            .await
+            .map_err(AppError::from)
+        },
     )
     .await?;
 
@@ -527,13 +596,6 @@ pub async fn list_all_pods(
         .into_iter()
         .map(|r| inject_resource_version(r.data, r.resource_version))
         .collect();
-    // Use session RV for consistent multi-page lists; current RV otherwise.
-    let response_rv = resolve_list_response_resource_version(
-        state.db.as_ref(),
-        continue_resource_version,
-        list.resource_version,
-    )
-    .await?;
     let resource_version = response_rv.to_string();
 
     // Return Table format if requested by kubectl

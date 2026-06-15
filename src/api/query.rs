@@ -1,6 +1,7 @@
 use crate::api::AppError;
-use crate::datastore::DatastoreBackend;
+use crate::datastore::{DatastoreBackend, ResourceList, SnapshotAtRv};
 use serde::Deserialize;
+use std::future::Future;
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -386,6 +387,142 @@ mod list_rv_match_tests {
     }
 }
 
+#[cfg(test)]
+mod resolve_list_page_tests {
+    use super::*;
+    use crate::datastore::sqlite::Datastore;
+
+    fn empty_list(rv: i64, continue_token: Option<&str>) -> ResourceList {
+        ResourceList {
+            items: Vec::new(),
+            resource_version: rv,
+            continue_token: continue_token.map(str::to_string),
+            remaining_item_count: continue_token.map(|_| 1),
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_serves_snapshot_and_pins_response_rv() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let page = resolve_list_page(
+            &db,
+            ListResourceVersionMatch::Exact(7),
+            ContinueResourceVersion::Current,
+            |srv| async move {
+                assert_eq!(srv, 7);
+                Ok(SnapshotAtRv::List(empty_list(7, None)))
+            },
+            || async { panic!("live_fetch must not run when a snapshot is served") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.response_rv, 7);
+        assert_eq!(
+            page.continue_resource_version,
+            ContinueResourceVersion::Current
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_against_expired_window_is_410() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let err = resolve_list_page(
+            &db,
+            ListResourceVersionMatch::Exact(3),
+            ContinueResourceVersion::Current,
+            |_srv| async { Ok(SnapshotAtRv::Expired) },
+            || async { panic!("live_fetch must not run") },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AppError::Status {
+                code: axum::http::StatusCode::GONE,
+                reason: "Expired",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_continuation_uses_snapshot() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let page = resolve_list_page(
+            &db,
+            ListResourceVersionMatch::Any,
+            ContinueResourceVersion::Session(42),
+            |srv| async move {
+                assert_eq!(srv, 42);
+                Ok(SnapshotAtRv::List(empty_list(42, Some("z"))))
+            },
+            || async { panic!("live_fetch must not run when a snapshot is served") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.response_rv, 42);
+        assert_eq!(
+            page.continue_resource_version,
+            ContinueResourceVersion::Session(42)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_continuation_after_compaction_downgrades_to_inconsistent() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let page = resolve_list_page(
+            &db,
+            ListResourceVersionMatch::Any,
+            ContinueResourceVersion::Session(42),
+            |_srv| async { Ok(SnapshotAtRv::Expired) },
+            || async { Ok(empty_list(99, Some("z"))) },
+        )
+        .await
+        .unwrap();
+        // Downgraded continuation pins the original session rv and is reported
+        // as inconsistent so subsequent page tokens stay inconsistent.
+        assert_eq!(page.response_rv, 42);
+        assert_eq!(
+            page.continue_resource_version,
+            ContinueResourceVersion::InconsistentSession(42)
+        );
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_falls_through_to_live() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let page = resolve_list_page(
+            &db,
+            ListResourceVersionMatch::Exact(5),
+            ContinueResourceVersion::Current,
+            |_srv| async { Ok(SnapshotAtRv::Current) },
+            || async { Ok(empty_list(5, None)) },
+        )
+        .await
+        .unwrap();
+        // Exact still pins the reported rv even when served live.
+        assert_eq!(page.response_rv, 5);
+    }
+
+    #[tokio::test]
+    async fn not_older_than_is_served_live_and_floored() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let page = resolve_list_page(
+            &db,
+            ListResourceVersionMatch::NotOlderThan(100),
+            ContinueResourceVersion::Current,
+            |_srv| async { panic!("NotOlderThan must not pin a snapshot") },
+            || async { Ok(empty_list(50, None)) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.response_rv, 100,
+            "response rv must be floored to NotOlderThan"
+        );
+    }
+}
+
 pub async fn resolve_list_response_resource_version(
     db: &dyn DatastoreBackend,
     continue_resource_version: ContinueResourceVersion,
@@ -402,4 +539,114 @@ pub async fn resolve_list_response_resource_version(
         }
         ContinueResourceVersion::InconsistentSession(rv) => Ok(rv),
     }
+}
+
+/// The consistent page a plain (non-watch) LIST resolved to, plus the metadata
+/// every list handler needs to render its response identically.
+#[derive(Debug)]
+pub struct ResolvedListPage {
+    /// The page of resources to serve — from a pinned historical snapshot when
+    /// the read is consistent, otherwise from the live store.
+    pub list: ResourceList,
+    /// The `metadata.resourceVersion` to report (already adjusted for
+    /// `resourceVersionMatch` and continuation-session pinning).
+    pub response_rv: i64,
+    /// The continuation mode to encode into the next page's `continue` token.
+    /// May have been downgraded to inconsistent if the snapshot window expired.
+    pub continue_resource_version: ContinueResourceVersion,
+}
+
+/// Shared consistent-snapshot selection for plain (non-watch) LISTs.
+///
+/// This centralizes the consistency logic that previously lived only in the
+/// generated list handler (`generated_handlers::inners::list_inner`). Every
+/// list handler — generated, Pods, Namespaces, and custom resources — must run
+/// pages 2+ through this so the page body and the reported `resourceVersion`
+/// come from the same consistency mode.
+///
+/// A historical snapshot is pinned when the read references an older
+/// `resourceVersion`: an explicit `resourceVersionMatch=Exact`, or a paginated
+/// continuation carrying its session rv (so every page reflects one consistent
+/// view). `NotOlderThan`/`Any` are served live (a single consistent store is
+/// always at least as fresh as any past rv).
+///
+/// When the pinned snapshot can no longer be reconstructed
+/// ([`SnapshotAtRv::Expired`]): an explicit `Exact` answers `410 Gone`, while a
+/// still-fresh paginated continuation that merely outran the retained
+/// watch-event window continues from the last key against the live state and
+/// keeps subsequent page tokens marked inconsistent.
+///
+/// `snapshot_fetch` is invoked only when a pin is required; callers without a
+/// real reconstruction (e.g. conversion-backed CRDs) may return
+/// [`SnapshotAtRv::Expired`] to opt into the inconsistent-continuation
+/// fallback. `live_fetch` is invoked only when no pinned snapshot is served.
+pub async fn resolve_list_page<SFut, LFut>(
+    db: &dyn DatastoreBackend,
+    rv_match: ListResourceVersionMatch,
+    mut continue_resource_version: ContinueResourceVersion,
+    snapshot_fetch: impl FnOnce(i64) -> SFut,
+    live_fetch: impl FnOnce() -> LFut,
+) -> Result<ResolvedListPage, AppError>
+where
+    SFut: Future<Output = Result<SnapshotAtRv, AppError>>,
+    LFut: Future<Output = Result<ResourceList, AppError>>,
+{
+    let snapshot_rv = match rv_match {
+        ListResourceVersionMatch::Exact(rv) => Some(rv),
+        _ => match continue_resource_version {
+            ContinueResourceVersion::Session(rv) => Some(rv),
+            _ => None,
+        },
+    };
+
+    let snapshot_list = if let Some(srv) = snapshot_rv {
+        match snapshot_fetch(srv).await? {
+            SnapshotAtRv::List(list) => Some(list),
+            // rv is at/after current state — fall through to the live list.
+            SnapshotAtRv::Current => None,
+            SnapshotAtRv::Expired => match rv_match {
+                ListResourceVersionMatch::Exact(rv) => {
+                    return Err(AppError::expired(format!(
+                        "too old resource version: {rv} (the requested resourceVersion is older than the server's retained history)"
+                    )));
+                }
+                // A still-fresh paginated continuation can outlive the retained
+                // watch_events window under unrelated API churn. Continue from
+                // the last key against current state and keep subsequent page
+                // tokens marked inconsistent.
+                _ => {
+                    continue_resource_version = ContinueResourceVersion::InconsistentSession(srv);
+                    None
+                }
+            },
+        }
+    } else {
+        None
+    };
+
+    let list = match snapshot_list {
+        Some(list) => list,
+        None => live_fetch().await?,
+    };
+
+    let mut response_rv = resolve_list_response_resource_version(
+        db,
+        continue_resource_version,
+        list.resource_version,
+    )
+    .await?;
+    // resourceVersionMatch handling. Exact pins the reported list rv to the
+    // requested version; NotOlderThan guarantees the response is at least that
+    // fresh (always true here — a single consistent store serves current state).
+    match rv_match {
+        ListResourceVersionMatch::Exact(rv) => response_rv = rv,
+        ListResourceVersionMatch::NotOlderThan(rv) => response_rv = response_rv.max(rv),
+        ListResourceVersionMatch::Any => {}
+    }
+
+    Ok(ResolvedListPage {
+        list,
+        response_rv,
+        continue_resource_version,
+    })
 }

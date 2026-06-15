@@ -94,22 +94,52 @@ pub async fn list_namespaces(
     }
 
     let normalized_limit = query.normalized_limit()?;
+    let has_continue = query
+        .continue_token
+        .as_deref()
+        .is_some_and(|t| !t.is_empty());
+    let rv_match = query.resolve_resource_version_match(has_continue)?;
     let (db_continue_name, continue_resource_version) =
         process_continue_token(query.continue_token.clone())?;
-    let page = ListPageRequest::try_new(normalized_limit, db_continue_name)?;
 
-    let list_response = state
-        .db
-        .list_namespaces_page(
-            query.label_selector.clone().as_deref(),
-            query.field_selector.clone().as_deref(),
-            page,
-        )
-        .await?;
-    let response_rv = resolve_list_response_resource_version(
-        state.db.as_ref(),
+    let list_query = crate::datastore::ResourceListQuery::new(
+        query.label_selector.as_deref(),
+        query.field_selector.as_deref(),
+        normalized_limit,
+        db_continue_name.as_deref(),
+    );
+
+    // Namespaces persist in their own table but back a real consistent snapshot
+    // (the sqlite reconstructor reads that table when kind == Namespace), so the
+    // shared helper pins paginated continuations / Exact reads exactly like every
+    // other kind. See `query::resolve_list_page`.
+    let db_for_snapshot = state.db.clone();
+    let db_for_live = state.db.clone();
+    let crate::api::query::ResolvedListPage {
+        list: list_response,
+        response_rv,
         continue_resource_version,
-        list_response.resource_version,
+    } = crate::api::query::resolve_list_page(
+        state.db.as_ref(),
+        rv_match,
+        continue_resource_version,
+        |srv| async move {
+            db_for_snapshot
+                .snapshot_resources_at_rv("v1", "Namespace", None, list_query, srv)
+                .await
+                .map_err(AppError::from)
+        },
+        || async move {
+            let page = ListPageRequest::try_new(
+                list_query.limit,
+                list_query.continue_token.map(str::to_string),
+            )
+            .map_err(AppError::from)?;
+            db_for_live
+                .list_namespaces_page(list_query.label_selector, list_query.field_selector, page)
+                .await
+                .map_err(AppError::from)
+        },
     )
     .await?;
 

@@ -547,6 +547,39 @@ pub async fn proxy_cluster_custom_resource_subresource(
     Ok(response)
 }
 
+/// Wrap a converted custom-resource object back into a [`Resource`] so the
+/// conversion-backed list path can flow through the shared
+/// [`crate::api::query::resolve_list_page`] helper. Only `data` is consumed
+/// downstream (the unified item-render loop), but identity fields are populated
+/// from the object for completeness.
+fn synthetic_cr_resource(
+    api_version: &str,
+    kind: &str,
+    data: Value,
+    resource_version: i64,
+) -> crate::datastore::Resource {
+    let name = data
+        .pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let namespace = data
+        .pointer("/metadata/namespace")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let data = std::sync::Arc::new(data);
+    crate::datastore::Resource {
+        id: 0,
+        api_version: api_version.to_string(),
+        kind: kind.to_string(),
+        namespace,
+        name,
+        uid: crate::datastore::Resource::uid_from_data(&data),
+        resource_version,
+        data,
+    }
+}
+
 async fn list_cr_inner(
     state: &Arc<AppState>,
     request: CustomResourceListRequest<'_>,
@@ -1090,6 +1123,11 @@ async fn list_cr_inner(
     }
 
     let normalized_limit = query.normalized_limit()?;
+    let has_continue = query
+        .continue_token
+        .as_deref()
+        .is_some_and(|t| !t.is_empty());
+    let rv_match = query.resolve_resource_version_match(has_continue)?;
     let (db_continue_name, continue_resource_version) =
         process_continue_token(query.continue_token.clone())?;
 
@@ -1097,126 +1135,163 @@ async fn list_cr_inner(
         .as_ref()
         .is_some_and(|c| c.served_versions.len() > 1 || c.strategy.as_deref() == Some("Webhook"));
 
-    let (items, resource_version, continue_token, remaining_item_count) = if needs_conversion {
-        let conversion = conversion
-            .as_ref()
-            .expect("needs_conversion implies conversion is Some");
-        let (resources, rv) = gather_custom_resources_across_served_versions(
-            state.db.as_ref(),
-            conversion,
-            group,
-            &info.kind,
-            ns.map(str::to_string),
-            query.label_selector.clone(),
-        )
-        .await?;
+    let list_query = crate::datastore::ResourceListQuery::new(
+        query.label_selector.as_deref(),
+        query.field_selector.as_deref(),
+        normalized_limit,
+        db_continue_name.as_deref(),
+    );
 
-        let mut objects: Vec<Value> = resources
-            .into_iter()
-            .map(|r| std::sync::Arc::unwrap_or_clone(r.data))
-            .collect();
-        objects = convert_crd_objects_to_requested_version(
-            state.db.as_ref(),
-            conversion,
-            group,
-            plural,
-            &api_version,
-            objects,
-        )
-        .await?;
-        objects.retain(|object| {
-            object_matches_field_selector(object, query.field_selector.as_deref())
-        });
-
-        // Conversion-backed CRDs: stable sort by name, then apply
-        // client-side pagination after the merged view is built.
-        objects.sort_by(|a, b| {
-            let na = a
-                .pointer("/metadata/name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let nb = b
-                .pointer("/metadata/name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            na.cmp(nb)
-        });
-
-        // Apply continue token offset by name.
-        let start_offset = match db_continue_name.as_ref() {
-            Some(name) => objects.partition_point(|o| {
-                o.pointer("/metadata/name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    <= name.as_str()
-            }),
-            None => 0,
-        };
-        let sliced = if start_offset < objects.len() {
-            &objects[start_offset..]
-        } else {
-            &[]
-        };
-
-        let (page, cont, remaining) = if let Some(lim) = normalized_limit {
-            if sliced.len() > lim as usize {
-                let last_name = sliced[lim as usize - 1]
-                    .pointer("/metadata/name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                (
-                    sliced[..lim as usize].to_vec(),
-                    Some(last_name.to_string()),
-                    None, // Exact remaining count would require converting all remaining objects
-                )
-            } else {
-                (sliced.to_vec(), None, None)
-            }
-        } else {
-            (sliced.to_vec(), None, None)
-        };
-
-        let mut items: Vec<Value> = Vec::with_capacity(page.len());
-        for mut data in page {
-            apply_crd_defaults(state.db.as_ref(), group, version, &info.kind, &mut data).await;
-            items.push(data);
-        }
-        (items, rv, cont, remaining)
-    } else {
-        let resource_list = state
-            .db
-            .list_resources(
-                &api_version,
-                &info.kind,
-                ns,
-                crate::datastore::ResourceListQuery::new(
-                    query.label_selector.as_deref(),
-                    query.field_selector.as_deref(),
-                    normalized_limit,
-                    db_continue_name.as_deref(),
-                ),
-            )
-            .await?;
-
-        let mut items: Vec<Value> = Vec::with_capacity(resource_list.items.len());
-        for r in resource_list.items {
-            let mut data = std::sync::Arc::unwrap_or_clone(r.data);
-            apply_crd_defaults(state.db.as_ref(), group, version, &info.kind, &mut data).await;
-            items.push(data);
-        }
-        (
-            items,
-            resource_list.resource_version,
-            resource_list.continue_token.clone(),
-            resource_list.remaining_item_count,
-        )
-    };
-    let response_rv = resolve_list_response_resource_version(
-        state.db.as_ref(),
+    // Shared consistent-snapshot selection. Non-conversion CRDs live in the
+    // generic resource table and pin a real historical snapshot just like the
+    // core kinds. Conversion-backed CRDs build a merged cross-version view
+    // client-side and cannot pin a historical snapshot, so they report `Expired`
+    // to opt into the inconsistent-continuation fallback (Exact => 410). See
+    // `query::resolve_list_page`.
+    let crate::api::query::ResolvedListPage {
+        list,
+        response_rv,
         continue_resource_version,
-        resource_version,
-    )
-    .await?;
+    } = if needs_conversion {
+        let conv = conversion
+            .clone()
+            .expect("needs_conversion implies conversion is Some");
+        let state_conv = state.clone();
+        let group_owned = group.to_string();
+        let plural_owned = plural.to_string();
+        let api_version_owned = api_version.clone();
+        let kind_owned = info.kind.clone();
+        crate::api::query::resolve_list_page(
+            state.db.as_ref(),
+            rv_match,
+            continue_resource_version,
+            |_srv| async { Ok(crate::datastore::SnapshotAtRv::Expired) },
+            || async move {
+                let (resources, rv) = gather_custom_resources_across_served_versions(
+                    state_conv.db.as_ref(),
+                    &conv,
+                    &group_owned,
+                    &kind_owned,
+                    ns.map(str::to_string),
+                    list_query.label_selector.map(str::to_string),
+                )
+                .await?;
+
+                let mut objects: Vec<Value> = resources
+                    .into_iter()
+                    .map(|r| std::sync::Arc::unwrap_or_clone(r.data))
+                    .collect();
+                objects = convert_crd_objects_to_requested_version(
+                    state_conv.db.as_ref(),
+                    &conv,
+                    &group_owned,
+                    &plural_owned,
+                    &api_version_owned,
+                    objects,
+                )
+                .await?;
+                objects.retain(|object| {
+                    object_matches_field_selector(object, list_query.field_selector)
+                });
+
+                // Conversion-backed CRDs: stable sort by name, then apply
+                // client-side pagination after the merged view is built.
+                objects.sort_by(|a, b| {
+                    let na = a
+                        .pointer("/metadata/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let nb = b
+                        .pointer("/metadata/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    na.cmp(nb)
+                });
+
+                // Apply continue token offset by name.
+                let start_offset = match list_query.continue_token {
+                    Some(name) => objects.partition_point(|o| {
+                        o.pointer("/metadata/name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            <= name
+                    }),
+                    None => 0,
+                };
+                let sliced = if start_offset < objects.len() {
+                    &objects[start_offset..]
+                } else {
+                    &[]
+                };
+
+                let (page, cont, remaining) = if let Some(lim) = list_query.limit {
+                    if sliced.len() > lim as usize {
+                        let last_name = sliced[lim as usize - 1]
+                            .pointer("/metadata/name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        (
+                            sliced[..lim as usize].to_vec(),
+                            Some(last_name.to_string()),
+                            None, // Exact remaining count would require converting all remaining objects
+                        )
+                    } else {
+                        (sliced.to_vec(), None, None)
+                    }
+                } else {
+                    (sliced.to_vec(), None, None)
+                };
+
+                let items = page
+                    .into_iter()
+                    .map(|data| synthetic_cr_resource(&api_version_owned, &kind_owned, data, rv))
+                    .collect();
+                Ok(crate::datastore::ResourceList {
+                    items,
+                    resource_version: rv,
+                    continue_token: cont,
+                    remaining_item_count: remaining,
+                })
+            },
+        )
+        .await?
+    } else {
+        let db_for_snapshot = state.db.clone();
+        let db_for_live = state.db.clone();
+        let av_snap = api_version.clone();
+        let av_live = api_version.clone();
+        let kind_snap = info.kind.clone();
+        let kind_live = info.kind.clone();
+        crate::api::query::resolve_list_page(
+            state.db.as_ref(),
+            rv_match,
+            continue_resource_version,
+            |srv| async move {
+                db_for_snapshot
+                    .snapshot_resources_at_rv(&av_snap, &kind_snap, ns, list_query, srv)
+                    .await
+                    .map_err(AppError::from)
+            },
+            || async move {
+                db_for_live
+                    .list_resources(&av_live, &kind_live, ns, list_query)
+                    .await
+                    .map_err(AppError::from)
+            },
+        )
+        .await?
+    };
+
+    // Unified item rendering: CRD defaults are applied to every served object,
+    // whether it came from a live list, a pinned snapshot, or a converted view.
+    let mut items: Vec<Value> = Vec::with_capacity(list.items.len());
+    for r in list.items {
+        let mut data = std::sync::Arc::unwrap_or_clone(r.data);
+        apply_crd_defaults(state.db.as_ref(), group, version, &info.kind, &mut data).await;
+        items.push(data);
+    }
+    let continue_token = list.continue_token;
+    let remaining_item_count = list.remaining_item_count;
     let mut metadata = serde_json::json!({
         "resourceVersion": response_rv.to_string()
     });
