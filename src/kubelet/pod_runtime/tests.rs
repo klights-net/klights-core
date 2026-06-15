@@ -723,7 +723,7 @@ async fn mock_volume_runtime_records_process_and_cleanup() {
     let pod = crate::kubelet::pod_runtime::test_support::pod_json("ns", "pod", "uid-1", "img");
 
     vol.process_volumes(&key, &pod).await.unwrap();
-    vol.cleanup_volumes(&key, &pod).await.unwrap();
+    vol.cleanup_volumes(&key).await.unwrap();
 
     let calls = vol.recorded_calls();
     assert_eq!(calls.len(), 2);
@@ -3296,6 +3296,49 @@ async fn real_runtime_stop_pod_releases_hostports_and_cleans_volumes() {
     );
 }
 
+/// The orphan/cold-sandbox stop path has no deleted-Pod snapshot, so it calls
+/// `cleanup_pod_local_artifacts(key, None)`. It must STILL unmount and remove
+/// the pod's volumes — `cleanup_volumes` needs only the key, not the pod spec.
+/// Regression: the artifact helper gated `cleanup_volumes` on a `Some(pod)`
+/// snapshot, so the orphan path skipped the unmount and leaked tmpfs/bind
+/// mounts (then `remove_dir_all` ran over the live mount).
+#[tokio::test]
+async fn real_runtime_stop_orphan_pod_cleans_volumes() {
+    let harness = PodRuntimeHarness::new().await;
+    let key = PodRuntimeKey::new("ns", "orphan-vol", "uid-ov");
+    let sandbox_id = "sb-ov";
+
+    harness
+        .store
+        .record_sandbox(&key, sandbox_id)
+        .await
+        .unwrap();
+
+    harness
+        .runtime
+        .stop_orphan_pod(&key, Some(sandbox_id.into()))
+        .await
+        .unwrap();
+
+    // Volumes must be unmounted/removed on the orphan path too.
+    let vol_calls = harness.volumes.recorded_calls();
+    assert!(
+        vol_calls
+            .iter()
+            .any(|s| s.contains("cleanup_volumes") && s.contains("uid-ov")),
+        "orphan stop must clean up volumes (unmount before pod-root removal), got: {vol_calls:?}"
+    );
+
+    // The pod root must still be removed after the volume unmount/removal.
+    let fs_calls = harness.filesystem.recorded_calls();
+    assert!(
+        fs_calls
+            .iter()
+            .any(|s| s.contains("cleanup_fs") && s.contains("uid-ov")),
+        "orphan stop must clean up the pod filesystem root"
+    );
+}
+
 // --- Task 10.1: PodDeletionFinalizer trait and mock ---
 
 #[tokio::test]
@@ -4221,7 +4264,7 @@ async fn mock_dependency_matrix_volume() {
     let pod = serde_json::json!({"spec": {"volumes": []}});
 
     mock.process_volumes(&key, &pod).await.unwrap();
-    mock.cleanup_volumes(&key, &pod).await.unwrap();
+    mock.cleanup_volumes(&key).await.unwrap();
 
     let calls = mock.recorded_calls();
     assert_eq!(calls.len(), 2);

@@ -123,6 +123,15 @@ impl PodStatusService {
             "v1/Pod/{}/{}/{}",
             namespace, pod_resource.name, pod_resource.uid
         );
+        // The stamp is only consumed by the leader's outbox-apply lost-update
+        // gate, so it is issued only when an outbox is present (worker / outbox
+        // leader). It must come from the durable per-node allocator so it stays
+        // monotonic across worker restarts. Direct (outbox-less) writes never
+        // reach the gate, so they carry no stamp.
+        let observed_status_stamp = match self.outbox.as_deref() {
+            Some(outbox) => Some(outbox.next_status_stamp().await?),
+            None => None,
+        };
         let command = crate::datastore::command::StorageCommand::UpdateStatus {
             api_version: "v1".to_string(),
             kind: "Pod".to_string(),
@@ -134,7 +143,7 @@ impl PodStatusService {
                 uid: Some(pod_resource.uid.clone()),
                 resource_version: expected_rv,
             },
-            observed_status_stamp: Some(next_pod_status_stamp()),
+            observed_status_stamp,
         };
         let synthetic = synthetic_status_resource(pod_resource, &status);
         let sent = self
@@ -1476,38 +1485,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
-}
-
-/// Strictly-monotonic, per-worker stamp for a Pod status outbox snapshot.
-///
-/// Each call returns a value strictly greater than every prior call in this
-/// process. The counter is seeded from the wall clock in microseconds so it
-/// keeps advancing across a worker restart (no node-local persistence needed):
-/// after a restart the seed is the current time, which is larger than any
-/// stamp issued before the restart. Because a Pod is owned by exactly one
-/// worker (`spec.nodeName`), every status snapshot for a given Pod UID is
-/// stamped by the same monotonic source, so the leader can compare stamps to
-/// drop a stale snapshot that a retry/backoff let overtake a newer one.
-fn next_pod_status_stamp() -> i64 {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static LAST_STATUS_STAMP: AtomicI64 = AtomicI64::new(0);
-    let now_us = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_micros().min(i64::MAX as u128) as i64)
-        .unwrap_or(0);
-    let mut last = LAST_STATUS_STAMP.load(Ordering::Relaxed);
-    loop {
-        let next = now_us.max(last.saturating_add(1));
-        match LAST_STATUS_STAMP.compare_exchange_weak(
-            last,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return next,
-            Err(observed) => last = observed,
-        }
-    }
 }
 
 fn pod_ready_for_rollout(pod: &Value) -> bool {

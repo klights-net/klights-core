@@ -1047,7 +1047,6 @@ impl crate::kubelet::pod_runtime::volumes::PodVolumeRuntime for MockPodVolumeRun
     async fn cleanup_volumes(
         &self,
         key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
-        _pod: &serde_json::Value,
     ) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push(format!(
             "cleanup_volumes:{}/{}/{}",

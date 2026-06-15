@@ -112,7 +112,7 @@ impl RealPodRuntimeService {
         if !sandbox_ids.is_empty() {
             let _ = self.store.delete_sandbox(key).await;
         }
-        self.cleanup_pod_local_artifacts(key, None).await;
+        self.cleanup_pod_local_artifacts(key).await;
         let _ = self.slot_admission.clear_slot(key).await;
         Ok(())
     }

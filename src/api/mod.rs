@@ -111,10 +111,11 @@ pub use query::{
     CONTINUE_TOKEN_TTL_SECS, ContinueTokenData, encode_continue_token,
     encode_inconsistent_continue_token,
 };
-use query::{
-    CreateUpdateQuery, DeleteCollectionQuery, ListQuery, process_continue_token,
-    resolve_list_response_resource_version,
-};
+use query::{CreateUpdateQuery, DeleteCollectionQuery, ListQuery, process_continue_token};
+// Used only by mod_tests; the production list handlers now go through
+// `query::resolve_list_page`, which calls this internally.
+#[cfg(test)]
+use query::resolve_list_response_resource_version;
 pub use quotas::{check_resource_quota_for_creation, check_resource_quota_for_pod_update};
 pub use response::K8sResponse;
 #[cfg(test)]

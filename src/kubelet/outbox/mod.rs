@@ -154,7 +154,28 @@ impl OutboxApplyClient for LeaderApiOutboxClient {
 pub struct Outbox {
     node_db: NodeLocalHandle,
     notify: Arc<Notify>,
+    stamp: Arc<tokio::sync::Mutex<StampState>>,
 }
+
+/// In-memory state of the per-node status-stamp allocator. `next` is the last
+/// stamp issued; `reserved` is the durable ceiling persisted to node-local meta
+/// (see [`Outbox::next_status_stamp`]). `seeded` guards the one-time load of the
+/// persisted ceiling on first use.
+#[derive(Default)]
+struct StampState {
+    seeded: bool,
+    next: i64,
+    reserved: i64,
+}
+
+/// Node-local meta key holding the durable status-stamp high-water (the reserved
+/// ceiling). Survives worker process restarts so stamps never regress.
+const STATUS_STAMP_META_KEY: &str = "pod_status_stamp_high_water";
+/// Headroom (in stamp units) reserved per node-local persistence write. The
+/// ceiling is persisted at most once per this many issued stamps (or per this
+/// many microseconds of wall-clock advance), bounding node-local writes while
+/// keeping idle cost at zero.
+const STATUS_STAMP_RESERVE_BLOCK: i64 = 5_000_000;
 
 pub struct OutboxSubject {
     pub key: String,
@@ -215,7 +236,63 @@ impl Outbox {
     }
 
     pub fn with_notify(node_db: NodeLocalHandle, notify: Arc<Notify>) -> Self {
-        Self { node_db, notify }
+        Self {
+            node_db,
+            notify,
+            stamp: Arc::new(tokio::sync::Mutex::new(StampState::default())),
+        }
+    }
+
+    /// Issue a strictly-monotonic per-node status stamp for an outbound Pod
+    /// status snapshot.
+    ///
+    /// The leader drops an outbox status whose stamp is `<=` the one it last
+    /// applied for that Pod (the lost-update gate), so a stamp that regressed
+    /// across a worker restart — e.g. an NTP step-back or VM clock skew — would
+    /// make a genuinely newer status look stale and be silently discarded. To
+    /// stay monotonic independent of the wall clock we persist a reserved
+    /// ceiling to node-local meta *before* issuing any stamp that reaches it
+    /// (a hi/lo allocator), so the seed on the next boot is always `>=` every
+    /// stamp already issued. A wall-clock floor keeps freshly issued stamps
+    /// comparable in magnitude with rows written before this allocator existed.
+    pub async fn next_status_stamp(&self) -> Result<i64> {
+        let now_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros().min(i64::MAX as u128) as i64)
+            .unwrap_or(0);
+        self.next_status_stamp_with_clock(now_us).await
+    }
+
+    /// Clock-injected core of [`Outbox::next_status_stamp`] for deterministic
+    /// tests (including simulated clock regression across restart).
+    async fn next_status_stamp_with_clock(&self, now_us: i64) -> Result<i64> {
+        let mut st = self.stamp.lock().await;
+        if !st.seeded {
+            let persisted = self
+                .node_db
+                .get_node_meta(STATUS_STAMP_META_KEY)
+                .await?
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            // Seed both the issue cursor and the reserved ceiling from the
+            // persisted high-water so the first stamp after restart exceeds
+            // every previously issued stamp even if the clock has regressed.
+            st.next = persisted;
+            st.reserved = persisted;
+            st.seeded = true;
+        }
+        let candidate = now_us.max(st.next.saturating_add(1));
+        if candidate >= st.reserved {
+            // Reserve and durably persist a new ceiling BEFORE issuing, so a
+            // crash can never lose a stamp below what was already handed out.
+            let new_reserved = candidate.saturating_add(STATUS_STAMP_RESERVE_BLOCK);
+            self.node_db
+                .set_node_meta(STATUS_STAMP_META_KEY, &new_reserved.to_string())
+                .await?;
+            st.reserved = new_reserved;
+        }
+        st.next = candidate;
+        Ok(candidate)
     }
 
     /// Create an outbox backed by an in-memory node-local store.
@@ -842,6 +919,44 @@ mod tests {
         )
         .await
         .expect("open node-local test db")
+    }
+
+    /// A worker restart resets the in-memory stamp allocator, and the host
+    /// wall clock can step backward across that restart (NTP correction / VM
+    /// skew). The leader drops a status whose stamp regressed, so the stamp
+    /// MUST stay strictly monotonic across restart regardless of the clock.
+    /// The shared node-local handle plays the role of node.db surviving the
+    /// restart; the second `Outbox` is the post-restart process.
+    #[tokio::test]
+    async fn status_stamp_stays_monotonic_across_restart_under_clock_regression() {
+        let handle = node_db().await;
+
+        let outbox1 = Outbox::with_notify(handle.clone(), Arc::new(tokio::sync::Notify::new()));
+        let s1 = outbox1
+            .next_status_stamp_with_clock(1_000_000)
+            .await
+            .unwrap();
+        let s2 = outbox1
+            .next_status_stamp_with_clock(2_000_000)
+            .await
+            .unwrap();
+        assert!(s2 > s1, "stamps must increase while issuing: {s1} -> {s2}");
+
+        // Restart: brand-new in-memory allocator over the SAME node-local store,
+        // with a wall clock that has stepped backward below the last stamp.
+        let outbox2 = Outbox::with_notify(handle.clone(), Arc::new(tokio::sync::Notify::new()));
+        let s3 = outbox2.next_status_stamp_with_clock(500_000).await.unwrap();
+        assert!(
+            s3 > s2,
+            "stamp must stay strictly monotonic across restart even when the clock regresses: last={s2} after_restart={s3}"
+        );
+
+        // And it must keep advancing after the restart too.
+        let s4 = outbox2.next_status_stamp_with_clock(500_001).await.unwrap();
+        assert!(
+            s4 > s3,
+            "post-restart stamps must keep increasing: {s3} -> {s4}"
+        );
     }
 
     fn pod_status_command(namespace: &str, name: &str, uid: &str) -> StorageCommand {

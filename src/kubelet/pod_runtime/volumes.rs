@@ -17,12 +17,11 @@ pub trait PodVolumeRuntime: Send + Sync {
         pod: &serde_json::Value,
     ) -> anyhow::Result<HashMap<String, String>>;
 
-    /// Clean up volumes for a terminated pod.
-    async fn cleanup_volumes(
-        &self,
-        key: &PodRuntimeKey,
-        pod: &serde_json::Value,
-    ) -> anyhow::Result<()>;
+    /// Clean up volumes for a terminated pod. Unmounts every mount under the
+    /// pod's volumes dir and removes it. Derived entirely from `key`, so it
+    /// runs unchanged on the orphan/cold-sandbox path that has no deleted-Pod
+    /// snapshot.
+    async fn cleanup_volumes(&self, key: &PodRuntimeKey) -> anyhow::Result<()>;
 }
 
 // --- Production adapter ---
@@ -115,11 +114,7 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
         Ok(volume_paths)
     }
 
-    async fn cleanup_volumes(
-        &self,
-        key: &PodRuntimeKey,
-        _pod: &serde_json::Value,
-    ) -> anyhow::Result<()> {
+    async fn cleanup_volumes(&self, key: &PodRuntimeKey) -> anyhow::Result<()> {
         self.cancel_projected_sa_refresh(key);
         let pod_dir_id = format!("{}_{}", key.namespace, key.name);
         let pod_volumes_dir = crate::paths::volumes_root_path(&self.containerd_namespace)
@@ -177,7 +172,7 @@ mod tests {
         std::fs::write(pod_volumes_dir.join("empty-dir/file.txt"), b"test").expect("write file");
 
         runtime
-            .cleanup_volumes(&key, &serde_json::json!({}))
+            .cleanup_volumes(&key)
             .await
             .expect("cleanup volumes");
 

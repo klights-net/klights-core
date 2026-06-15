@@ -1475,17 +1475,17 @@ impl RealPodRuntimeService {
         let _ = self.cri.remove_pod_sandbox(sandbox_id).await;
         let _ = self.filesystem.cleanup_cgroup(key, sandbox_id).await;
         let _ = self.store.delete_sandbox(key).await;
-        self.cleanup_pod_local_artifacts(key, None).await;
+        self.cleanup_pod_local_artifacts(key).await;
     }
 
-    pub(super) async fn cleanup_pod_local_artifacts(
-        &self,
-        key: &PodRuntimeKey,
-        pod: Option<&serde_json::Value>,
-    ) {
-        if let Some(pod) = pod {
-            let _ = self.volumes.cleanup_volumes(key, pod).await;
-        }
+    /// Shared local-artifact teardown for every pod stop path (normal delete,
+    /// failed-create rollback, orphan/cold-sandbox finalize). Unmounts and
+    /// removes the pod's volumes first, then the pod filesystem root, so the
+    /// recursive root removal never runs over a still-live mount. Both steps
+    /// derive entirely from `key` and are idempotent, so this path needs no
+    /// deleted-Pod snapshot and is safe to re-run after a timed-out finalize.
+    pub(super) async fn cleanup_pod_local_artifacts(&self, key: &PodRuntimeKey) {
+        let _ = self.volumes.cleanup_volumes(key).await;
         let _ = self.filesystem.cleanup_pod_filesystem(key).await;
     }
 
@@ -2768,7 +2768,7 @@ impl PodRuntimeService for RealPodRuntimeService {
         // Remove hostPort rules.
         let _ = self.hostports.remove_host_ports(&key, &pod).await;
 
-        self.cleanup_pod_local_artifacts(&key, Some(&pod)).await;
+        self.cleanup_pod_local_artifacts(&key).await;
 
         // Clear pod slot by UID.
         let _ = self.slot_admission.clear_slot(&key).await;

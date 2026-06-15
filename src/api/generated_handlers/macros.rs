@@ -1102,25 +1102,57 @@ macro_rules! cluster_wide_list_handler {
 
             let normalized_limit = query.normalized_limit()?;
 
+            let has_continue = query
+                .continue_token
+                .as_deref()
+                .is_some_and(|t| !t.is_empty());
+            let rv_match = query.resolve_resource_version_match(has_continue)?;
+
             // Decode continue token: check TTL and extract name for DB filter.
             let (db_continue_name, continue_resource_version) =
                 process_continue_token(query.continue_token)?;
 
-            let list = state.db.list_resources($api_version, $kind, None, crate::datastore::ResourceListQuery::new(// All namespaces
-                query.label_selector.as_deref(), query.field_selector.as_deref(), normalized_limit, db_continue_name.as_deref())).await?;
+            let list_query = crate::datastore::ResourceListQuery::new(
+                query.label_selector.as_deref(),
+                query.field_selector.as_deref(),
+                normalized_limit,
+                db_continue_name.as_deref(),
+            );
+
+            // Cluster-wide (all-namespaces) collection: same consistent-snapshot
+            // path as the namespaced handler, with no namespace scope. Pages 2+
+            // are served from the pinned session snapshot, not current state.
+            // See `query::resolve_list_page`.
+            let db_for_snapshot = state.db.clone();
+            let db_for_live = state.db.clone();
+            let crate::api::query::ResolvedListPage {
+                list,
+                response_rv,
+                continue_resource_version,
+            } = crate::api::query::resolve_list_page(
+                state.db.as_ref(),
+                rv_match,
+                continue_resource_version,
+                |srv| async move {
+                    db_for_snapshot
+                        .snapshot_resources_at_rv($api_version, $kind, None, list_query, srv)
+                        .await
+                        .map_err(AppError::from)
+                },
+                || async move {
+                    db_for_live
+                        .list_resources($api_version, $kind, None, list_query)
+                        .await
+                        .map_err(AppError::from)
+                },
+            )
+            .await?;
 
             let items: Vec<Value> = list
                 .items
                 .into_iter()
                 .map(|r| inject_resource_version(r.data, r.resource_version))
                 .collect();
-            // Use session RV for consistent multi-page lists; current RV otherwise.
-            let response_rv = resolve_list_response_resource_version(
-                state.db.as_ref(),
-                continue_resource_version,
-                list.resource_version,
-            )
-            .await?;
             let resource_version = response_rv.to_string();
 
             // Return Table format if requested by kubectl
