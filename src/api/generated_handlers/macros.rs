@@ -1051,22 +1051,17 @@ macro_rules! cluster_wide_list_handler {
                         .as_deref()
                         .is_some_and(|s| !s.trim().is_empty());
 
-                // Gap-free establishment floor captured BEFORE subscribing (see
-                // list_inner for the rationale). Selector-less rv-less watches
-                // pin requested_rv to it; selector rv-less watches pass it as
-                // rv_less_floor so the live floor is anchored below the
-                // post-subscribe baseline collection rv.
-                let mut rv_less_floor: i64 = 0;
+                // Selector-less rv-less watches pin requested_rv to the
+                // pre-subscribe global rv so the stream starts "from now";
+                // selector rv-less watches keep the floor at 0 and dedup the
+                // baseline by exact rv in the stream builder.
                 if requested_rv <= 0
                     && !send_initial_events
+                    && !has_selector
                     && let Ok(floor) = state.db.get_current_resource_version().await
                     && floor > 0
                 {
-                    if has_selector {
-                        rv_less_floor = floor;
-                    } else {
-                        requested_rv = floor;
-                    }
+                    requested_rv = floor;
                 }
 
                 let rx = crate::watch::WatchReceiver::from_receiver(
@@ -1084,7 +1079,6 @@ macro_rules! cluster_wide_list_handler {
                     kind,
                     watch_namespace: None,
                     requested_rv,
-                    rv_less_floor,
                     send_initial_events,
                     send_bookmarks,
                     label_selector,

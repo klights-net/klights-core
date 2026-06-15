@@ -49,18 +49,15 @@ pub async fn list_namespaces(
                 .as_deref()
                 .is_some_and(|s| !s.trim().is_empty());
 
-        // Gap-free establishment floor captured BEFORE subscribing.
-        let mut rv_less_floor: i64 = 0;
+        // Selector-less rv-less watches pin the live floor to "now"; selector
+        // watches keep the floor at 0 and dedup the baseline by exact rv.
         if requested_rv <= 0
             && !send_initial_events
+            && !has_selector
             && let Ok(floor) = state.db.get_current_resource_version().await
             && floor > 0
         {
-            if has_selector {
-                rv_less_floor = floor;
-            } else {
-                requested_rv = floor;
-            }
+            requested_rv = floor;
         }
 
         let rx = crate::watch::WatchReceiver::from_receiver(
@@ -77,7 +74,6 @@ pub async fn list_namespaces(
             kind: "Namespace".to_string(),
             watch_namespace: None,
             requested_rv,
-            rv_less_floor,
             send_initial_events,
             send_bookmarks,
             label_selector,

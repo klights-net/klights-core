@@ -6208,6 +6208,138 @@ async fn register_selw_crd(app: &axum::Router) {
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
+/// Regression (B1): a CRD WatchList (`sendInitialEvents=true`) must terminate
+/// the initial ADDED stream with an `initial-events-end` BOOKMARK carrying the
+/// snapshot resourceVersion, so the client knows where to resume. The built-in
+/// watch builder emits this; the CR builder previously omitted it entirely,
+/// leaving WatchList clients against CRDs unable to learn a resume point. Also
+/// covers the empty-collection case (finding #2): the bookmark RV must be the
+/// real snapshot RV, not the stale requested RV (0).
+#[tokio::test]
+async fn test_crd_watchlist_emits_initial_events_end_bookmark() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    let namespace = "crd-watchlist-bookmark";
+    let mk = |method: &str, uri: String, body: Option<Vec<u8>>| {
+        let mut request = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            request = request.header("content-type", "application/json");
+        }
+        request
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap()
+    };
+
+    let ns_resp = app
+        .clone()
+        .oneshot(mk(
+            "POST",
+            "/api/v1/namespaces".to_string(),
+            Some(
+                serde_json::to_vec(&json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {"name": namespace}
+                }))
+                .unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+    register_selw_crd(&app).await;
+
+    // One existing CR object so the initial list is non-empty.
+    let create_rv = db
+        .get_current_resource_version()
+        .await
+        .unwrap()
+        .saturating_add(1);
+    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(
+        &crate::datastore::Resource {
+            id: 0,
+            api_version: "selwatch.example.com/v1".into(),
+            kind: "Selw".into(),
+            namespace: Some(namespace.to_string()),
+            name: "obj-a".into(),
+            uid: "selw-bookmark-a".into(),
+            resource_version: create_rv,
+            data: Arc::new(json!({
+                "apiVersion": "selwatch.example.com/v1",
+                "kind": "Selw",
+                "metadata": {"name": "obj-a", "namespace": namespace, "uid": "selw-bookmark-a"}
+            })),
+        },
+    ))
+    .await
+    .expect("seed CR object");
+
+    let watch_resp = app
+        .clone()
+        .oneshot(mk(
+            "GET",
+            format!(
+                "/apis/selwatch.example.com/v1/namespaces/{namespace}/selws?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true"
+            ),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+    let mut stream = watch_resp.into_body().into_data_stream();
+
+    let mut saw_added = false;
+    let mut bookmark_rv: Option<i64> = None;
+    for _ in 0..8 {
+        let chunk = match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            _ => break,
+        };
+        for line in chunk.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let event: serde_json::Value = serde_json::from_slice(line).unwrap();
+            if event["type"] == "ADDED"
+                && event
+                    .pointer("/object/metadata/name")
+                    .and_then(|v| v.as_str())
+                    == Some("obj-a")
+            {
+                saw_added = true;
+            }
+            if event["type"] == "BOOKMARK"
+                && event
+                    .pointer("/object/metadata/annotations/k8s.io~1initial-events-end")
+                    .and_then(|v| v.as_str())
+                    == Some("true")
+            {
+                bookmark_rv = event
+                    .pointer("/object/metadata/resourceVersion")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<i64>().ok());
+            }
+        }
+        if saw_added && bookmark_rv.is_some() {
+            break;
+        }
+    }
+
+    assert!(saw_added, "WatchList must deliver the existing CR as ADDED");
+    let rv = bookmark_rv.expect("CRD WatchList must emit an initial-events-end BOOKMARK");
+    assert!(
+        rv >= create_rv,
+        "initial-events-end bookmark RV {rv} must report the snapshot RV (>= {create_rv}), not the stale requested RV"
+    );
+}
+
 /// Regression (CR watch builder bug 1): an rv-less label-selector custom-resource
 /// watch must keep its live-delivery floor at 0 so a genuinely live ADDED whose
 /// replicated commit broadcasts below the establishment floor still reaches the

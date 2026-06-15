@@ -3710,6 +3710,40 @@ async fn worker_runtime_does_not_start_same_name_replacement_for_stale_uid() {
     );
 }
 
+/// F1 companion: the no-snapshot start path (`pod = None`) must ALSO reject a
+/// same-name replacement. With no snapshot, start_pod fetches the pod fresh by
+/// UID (`get_pod_for_uid`); a replacement carrying a different live UID resolves
+/// to None ("not found for uid"), so the stale-UID start fails and never touches
+/// CRI. Locks in that the guard does not depend on a snapshot being supplied.
+#[tokio::test]
+async fn worker_runtime_rejects_same_name_replacement_without_snapshot() {
+    let (cri, runtime, repo) = fixture_runtime_with_node("worker-1", RuntimeNodeRole::Worker).await;
+
+    // Live pod has the NEW uid (the replacement); the start request carries the
+    // OLD uid via the key and no snapshot.
+    let new_pod = scheduled_pod_json("ns", "test-pod", "new-uid", "worker-1");
+    repo.create_controller_pod("ns", "test-pod", "worker-1", new_pod)
+        .await
+        .unwrap();
+
+    let old_key = PodRuntimeKey::new("ns", "test-pod", "old-uid");
+    let result = runtime
+        .start_pod(old_key, None, CancellationToken::new())
+        .await;
+
+    match result {
+        Ok(PodStartResult::Failed(_)) | Err(_) => {}
+        other => panic!(
+            "expected failure for stale UID without snapshot, got {:?}",
+            other
+        ),
+    }
+    assert!(
+        cri.recorded_calls().is_empty(),
+        "CRI must not be called for a same-name replacement when starting without a snapshot"
+    );
+}
+
 // --- Task 12.2: Multi-node status writes use cluster boundary ---
 
 /// Build a RealPodRuntimeService with a FakeCluster for status-forwarding tests.

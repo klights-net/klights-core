@@ -466,6 +466,14 @@ pub async fn unmount_volume_mounts_under(root: &str) -> Result<()> {
             "kubelet_unmount_volume_target",
             target.clone(),
             move || {
+                // INVARIANT (D4): the `-l` (lazy) flag is load-bearing for the
+                // unmount-before-remove safety in pod cleanup. Even if a mount is
+                // EBUSY, lazy detach removes it from the namespace immediately, so
+                // the caller's subsequent `remove_dir_all` over the pod dir never
+                // recurses into a still-live mount. `-R` recursively detaches
+                // submounts. Do not drop either flag without re-introducing an
+                // explicit "verify unmounted before remove" step. Guarded by
+                // scripts/check_supervisor_spawn.sh.
                 let output = std::process::Command::new("umount")
                     .arg("-R")
                     .arg("-l")

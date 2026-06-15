@@ -262,25 +262,18 @@ pub async fn list_inner(
                 .field_selector
                 .as_deref()
                 .is_some_and(|s| !s.trim().is_empty());
-        // Gap-free establishment floor captured BEFORE subscribing. For a
-        // selector-less rv-less watch we pin requested_rv to it (the original
-        // B1 fix). For a selector rv-less watch we must keep requested_rv <= 0
-        // (so the stream still emits existing matches as ADDED), but we hand
-        // the pre-subscribe floor to the stream as `rv_less_floor` so the live
-        // floor is anchored to it instead of the post-subscribe baseline
-        // collection rv — otherwise an object created in the establishment
-        // window is skipped as `rv <= floor`.
-        let mut rv_less_floor: i64 = 0;
+        // For a selector-less rv-less watch we pin requested_rv to the
+        // pre-subscribe global rv so the stream starts "from now" (the original
+        // B1 fix). A selector rv-less watch keeps requested_rv <= 0 (so the
+        // stream still emits existing matches as ADDED) and keeps its live floor
+        // at 0, deduping the baseline by exact rv in the stream builder.
         if requested_rv <= 0
             && !send_initial_events
+            && !has_selector
             && let Ok(floor) = state.db.get_current_resource_version().await
             && floor > 0
         {
-            if has_selector {
-                rv_less_floor = floor;
-            } else {
-                requested_rv = floor;
-            }
+            requested_rv = floor;
         }
 
         let rx = crate::watch::WatchReceiver::from_receiver(
@@ -308,7 +301,6 @@ pub async fn list_inner(
             kind: kind_owned,
             watch_namespace: ns_owned,
             requested_rv,
-            rv_less_floor,
             send_initial_events,
             send_bookmarks,
             label_selector,

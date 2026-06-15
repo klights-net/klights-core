@@ -124,6 +124,31 @@ pub async fn emit_pod_event_with_outbox(
     emit_pod_event_impl(ds, outbox, record).await
 }
 
+/// Outcome of the namespace preflight before emitting a pod event.
+#[derive(Debug, PartialEq, Eq)]
+enum NamespacePreflight {
+    /// Namespace is present (or the check could not be performed) — emit the
+    /// event.
+    Proceed,
+    /// Namespace is definitively missing or terminating — suppress the event.
+    SkipTerminating,
+}
+
+/// Classify the namespace preflight result. A definitive `Forbidden` (missing or
+/// terminating namespace) suppresses the event; ANY other error fails OPEN and
+/// proceeds. Failing open matters on workers: the preflight reads namespace state
+/// through a fresh leader RPC, so a transient leader blip / connection drop would
+/// otherwise silently drop the event BEFORE it is durably enqueued. The leader
+/// re-validates the namespace when it applies the EventCreate outbox entry, so
+/// proceeding is safe and strictly better than dropping.
+fn classify_namespace_preflight(result: Result<(), crate::api::AppError>) -> NamespacePreflight {
+    match result {
+        Ok(()) => NamespacePreflight::Proceed,
+        Err(crate::api::AppError::Forbidden(_)) => NamespacePreflight::SkipTerminating,
+        Err(_) => NamespacePreflight::Proceed,
+    }
+}
+
 async fn emit_pod_event_impl(
     ds: &dyn DatastoreBackend,
     outbox: Option<&Outbox>,
@@ -152,9 +177,22 @@ async fn emit_pod_event_impl(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Pod missing metadata.uid"))?;
 
-    match crate::api::reject_if_namespace_missing_or_terminating(ds, namespace).await {
-        Ok(()) => {}
-        Err(crate::api::AppError::Forbidden(_)) => {
+    let preflight = crate::api::reject_if_namespace_missing_or_terminating(ds, namespace).await;
+    if let Err(err) = &preflight
+        && !matches!(err, crate::api::AppError::Forbidden(_))
+    {
+        // Fail open: do not drop the event on a transport/DB error. The leader
+        // re-validates the namespace when it applies the EventCreate.
+        tracing::warn!(
+            namespace = %namespace,
+            pod = %pod_name,
+            "namespace preflight failed (transport/db error); emitting event anyway: {:?}",
+            err
+        );
+    }
+    match classify_namespace_preflight(preflight) {
+        NamespacePreflight::Proceed => {}
+        NamespacePreflight::SkipTerminating => {
             tracing::debug!(
                 namespace = %namespace,
                 pod = %pod_name,
@@ -162,12 +200,6 @@ async fn emit_pod_event_impl(
                 "skipping pod event in terminating namespace"
             );
             return Ok(non_persisted_event(reason, message, event_type));
-        }
-        Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to check namespace termination before pod event: {:?}",
-                err
-            ));
         }
     }
 
@@ -280,6 +312,36 @@ fn epoch_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_preflight_fails_open_on_transport_error() {
+        // Present namespace -> emit.
+        assert_eq!(
+            classify_namespace_preflight(Ok(())),
+            NamespacePreflight::Proceed
+        );
+        // Definitive missing/terminating -> suppress.
+        assert_eq!(
+            classify_namespace_preflight(Err(crate::api::AppError::Forbidden(
+                "namespace foo is being terminated".into()
+            ))),
+            NamespacePreflight::SkipTerminating
+        );
+        // Transport / DB error must FAIL OPEN (proceed) so a leader blip never
+        // silently drops a pod event before it is durably enqueued.
+        assert_eq!(
+            classify_namespace_preflight(Err(crate::api::AppError::Internal(
+                "connection reset by peer".into()
+            ))),
+            NamespacePreflight::Proceed
+        );
+        assert_eq!(
+            classify_namespace_preflight(Err(crate::api::AppError::ServiceUnavailable(
+                "leader not ready".into()
+            ))),
+            NamespacePreflight::Proceed
+        );
+    }
 
     fn create_test_pod() -> Value {
         serde_json::json!({

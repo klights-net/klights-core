@@ -705,7 +705,51 @@ async fn list_cr_inner(
             // transition (e.g. a replicated DELETED tombstone) still reaches the
             // client. Mirrors `build_label_selector_watch_stream`.
             let mut baseline_low_rv_allowlist: Vec<((Option<String>, String), i64)> = Vec::new();
+
+            // Read-freshness: a follower can receive a WATCH whose resume RV was
+            // minted on the leader; serving the catch-up below against
+            // not-yet-applied follower state would miss events. Event-driven and
+            // bounded; a no-op on a fresh node. Mirrors
+            // `build_label_selector_watch_stream` (the built-in path) — the CR
+            // builder previously omitted it, so a multinode CR watch resuming
+            // from a leader-minted RV could serve catch-up against stale state.
+            crate::api::watch_stream::wait_until_datastore_fresh(
+                &db,
+                requested_rv,
+                crate::watch::WatchTopic::new(&av, &kind),
+                &task_supervisor,
+            )
+            .await;
+
+            // If the resume point predates the retained watch-event window, the
+            // catch-up below (current state of modified resources) cannot replay
+            // deletions that have aged out — the client would keep phantom
+            // entries. Per Kubernetes "too old resource version" semantics, answer
+            // 410 Gone up front so the reflector performs a fresh list+watch.
+            // Mirrors the built-in path; the CR builder previously only surfaced
+            // 410 reactively if the live cursor later hit Expired.
+            if !send_initial_events
+                && requested_rv > 0
+                && let Ok(Some(earliest)) = db.earliest_watch_event_rv().await
+                && requested_rv + 1 < earliest
+            {
+                yield Ok::<_, std::convert::Infallible>(
+                    crate::api::watch_stream::serialize_watch_status_line(
+                        410,
+                        "Expired",
+                        "too old resource version: requested resourceVersion is older than the watch history window",
+                    ),
+                );
+                return;
+            }
+
             if send_initial_events {
+                // RV at which the initial collection snapshot was taken. Anchors
+                // both the live-event floor and the `initial-events-end` bookmark
+                // so a WatchList client can resume even when the initial list is
+                // empty or fully filtered. Mirrors the built-in path's snapshot-RV
+                // anchoring (`last_rv.max(list.resource_version)`).
+                let mut send_initial_snapshot_rv = requested_rv;
                 if let Some(conversion) = conversion_for_watch.as_ref() {
                     let initial_list = gather_custom_resources_across_served_versions(
                         db.as_ref(),
@@ -716,7 +760,7 @@ async fn list_cr_inner(
                         label_selector.clone(),
                     )
                     .await;
-                    if let Ok((resources, _)) = initial_list {
+                    if let Ok((resources, snapshot_rv)) = initial_list {
                         let mut last_rv = 0i64;
                         let objects: Vec<Value> = resources
                             .into_iter()
@@ -769,7 +813,9 @@ async fn list_cr_inner(
                                 );
                             }
                         }
-                        initial_list_rv = initial_list_rv.max(last_rv);
+                        let snap = snapshot_rv.max(last_rv);
+                        initial_list_rv = initial_list_rv.max(snap);
+                        send_initial_snapshot_rv = send_initial_snapshot_rv.max(snap);
                     }
                 } else {
                     let initial_list = db.list_resources(&av, &kind, watch_ns.as_deref(), crate::datastore::ResourceListQuery::new(label_selector.as_deref(), field_selector.as_deref(), None, None)).await;
@@ -802,9 +848,23 @@ async fn list_cr_inner(
                             json.push(b'\n');
                             yield Ok::<_, std::convert::Infallible>(json);
                         }
-                        initial_list_rv = initial_list_rv.max(last_rv).max(list.resource_version);
+                        let snap = last_rv.max(list.resource_version);
+                        initial_list_rv = initial_list_rv.max(snap);
+                        send_initial_snapshot_rv = send_initial_snapshot_rv.max(snap);
                     }
                 }
+                // Anchor the scoped resume floor to the snapshot RV and emit the
+                // terminating `initial-events-end` bookmark so a WatchList client
+                // learns the RV to resume from — required even when the initial
+                // list was empty/filtered. The built-in path emits this; the CR
+                // builder previously omitted it entirely.
+                last_delivered_scoped_rv = last_delivered_scoped_rv.max(send_initial_snapshot_rv);
+                initial_list_rv = initial_list_rv.max(send_initial_snapshot_rv);
+                let bookmark =
+                    WatchEvent::bookmark_initial_events_end(send_initial_snapshot_rv, &av, &kind);
+                yield Ok::<_, std::convert::Infallible>(
+                    crate::api::watch_stream::serialize_watch_event_line(bookmark, &kind, false),
+                );
             } else if has_selector && requested_rv <= 0 {
                 // rv-less selector custom-resource watch: emit existing matches
                 // as a baseline ADDED list, mirroring
@@ -888,10 +948,10 @@ async fn list_cr_inner(
                 // Keep the live-delivery floor at 0 (requested_rv <= 0 here): the
                 // baseline items just emitted are deduped by exact rv via the
                 // cursor seed below, so no numeric floor is needed. Anchoring the
-                // floor to a pre-subscribe rv (`rv_less_floor`) or a
-                // post-subscribe collection rv can drop a genuinely live ADDED
-                // whose replicated commit broadcasts after establishment with a
-                // lower rv — the same regression fixed on the built-in path.
+                // floor to a pre-subscribe rv or a post-subscribe collection rv
+                // can drop a genuinely live ADDED whose replicated commit
+                // broadcasts after establishment with a lower rv — the same
+                // regression fixed on the built-in path.
             } else if requested_rv > 0 {
                 let missed = if let Some(conversion) = conversion_for_watch.as_ref() {
                     gather_custom_resource_events_across_served_versions(

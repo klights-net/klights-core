@@ -82,6 +82,17 @@ pub trait PodRuntimeRepository: Send + Sync {
         expected_rv: Option<i64>,
     ) -> anyhow::Result<Option<Resource>>;
 
+    /// Resolve the live identity of the `(ns, name)` slot to gate same-name
+    /// replacement.
+    ///
+    /// INVARIANT (F1): the implementation MUST read live identity from fresh
+    /// leader state, never a worker informer cache. The same-name-replacement
+    /// guard depends on distinguishing a replacement (`Different`) from the
+    /// tracked pod (`Matches`); a stale cache still showing the OLD uid would
+    /// falsely return `Matches`, letting a deleted pod's actor act on a slot the
+    /// replacement now owns. The production `PodRepository` impl satisfies this by
+    /// routing through `PodReader::get_pod` → `get_resource_fresh` on workers. Do
+    /// not migrate this to a cached read.
     async fn check_live_pod_uid(
         &self,
         ns: &str,

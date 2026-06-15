@@ -491,14 +491,6 @@ pub struct LabelSelectorWatchStreamRequest<'a> {
     pub kind: String,
     pub watch_namespace: Option<String>,
     pub requested_rv: i64,
-    /// For an rv-less (`resourceVersion=""`) label/field-selector watch, the
-    /// global resourceVersion captured BEFORE this watch subscribed to the
-    /// broadcast bus. The live-delivery floor is anchored to this instead of
-    /// the post-subscribe baseline-list collection rv, so an object created in
-    /// the establishment window (after subscribe, before the baseline list)
-    /// is still delivered live rather than skipped as `rv <= floor`. 0 when
-    /// not applicable (resume watch, send_initial_events, or selector-less).
-    pub rv_less_floor: i64,
     pub send_initial_events: bool,
     pub send_bookmarks: bool,
     pub label_selector: Option<String>,
@@ -517,7 +509,6 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         kind,
         watch_namespace,
         requested_rv,
-        rv_less_floor: _rv_less_floor,
         send_initial_events,
         send_bookmarks,
         label_selector,
