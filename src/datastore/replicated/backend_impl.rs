@@ -270,6 +270,7 @@ impl DatastoreBackend for ReplicatedDatastore {
                 uid: None,
                 resource_version: expected_rv,
             },
+            observed_status_stamp: None,
         };
         self.propose_command_via_raft(&proposer, command).await?;
         self
@@ -301,6 +302,7 @@ impl DatastoreBackend for ReplicatedDatastore {
             status,
             expected_rv,
             preconditions,
+            observed_status_stamp: None,
         };
         self.propose_command_via_raft(&proposer, command).await?;
         self

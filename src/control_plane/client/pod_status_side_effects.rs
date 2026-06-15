@@ -296,6 +296,7 @@ mod tests {
                 uid: Some("pod-uid".to_string()),
                 resource_version: None,
             },
+            observed_status_stamp: None,
         };
         let resource = ForwardedResource {
             api_version: "v1".to_string(),
@@ -346,6 +347,7 @@ mod tests {
                 uid: Some("pod-uid".to_string()),
                 resource_version: None,
             },
+            observed_status_stamp: None,
         };
         let resource = ForwardedResource {
             api_version: "v1".to_string(),
@@ -461,6 +463,7 @@ mod tests {
                 uid: Some("pod-web-uid".to_string()),
                 resource_version: None,
             },
+            observed_status_stamp: None,
         };
         let resource = ForwardedResource {
             api_version: "v1".to_string(),

@@ -563,6 +563,7 @@ mod inner_gate_tests {
                 uid: Some("uid-1".to_string()),
                 resource_version: None,
             },
+            observed_status_stamp: None,
         };
         bytes::Bytes::from(
             OutboxPayload::from_command(command)

@@ -48,6 +48,7 @@ fn pod_status_payload_bytes(namespace: &str, name: &str, uid: &str) -> Vec<u8> {
             uid: Some(uid.to_string()),
             resource_version: None,
         },
+        observed_status_stamp: None,
     };
     OutboxPayload::from_command(command)
         .encode_protobuf()

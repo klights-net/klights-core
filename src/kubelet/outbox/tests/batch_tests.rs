@@ -44,6 +44,7 @@ fn pod_status_command(namespace: &str, name: &str, uid: &str) -> StorageCommand 
             uid: Some(uid.to_string()),
             resource_version: None,
         },
+        observed_status_stamp: None,
     }
 }
 

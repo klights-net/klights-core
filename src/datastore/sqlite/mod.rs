@@ -458,6 +458,7 @@ impl Datastore {
             return Ok(BuildOutboxOutcome::LeaseRenewShortcircuit);
         }
         let subject_key = subject_key_for_command(&decoded.command);
+        let status_stamp = Self::pod_status_stamp_of(&decoded.command);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -536,6 +537,7 @@ impl Datastore {
                             resource_version: 0,
                         })
                         .unwrap_or_default(),
+                        status_stamp,
                     },
                 ));
 
@@ -584,6 +586,7 @@ impl Datastore {
             return Ok(OutboxApplyResult::Applied { applied_rv: 0 });
         }
         let subject_key = subject_key_for_command(&decoded.command);
+        let status_stamp = Self::pod_status_stamp_of(&decoded.command);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -646,7 +649,8 @@ impl Datastore {
                         &claim_key,
                         subject_key,
                         mutation.applied_rv,
-                        mutation.result_proto
+                        mutation.result_proto,
+                        status_stamp
                     ],
                 )?;
                 if tx.changes() == 0 {
@@ -897,6 +901,7 @@ impl Datastore {
                 status,
                 expected_rv,
                 preconditions,
+                observed_status_stamp,
             } => {
                 let apply_against_latest = Self::should_apply_outbox_status_against_latest(
                     operation,
@@ -918,6 +923,38 @@ impl Datastore {
                     };
                     validate_resource_preconditions(&uid_preconditions, Some(&live_uid), live_rv)
                         .map_err(Self::sqlite_conversion_error)?;
+                    // Lost-update guard for pipelined status dispatch. The
+                    // status outbox drops the live-RV precondition (so a slow
+                    // status no longer stalls behind a newer RV), which
+                    // reopened the classic "an older snapshot retried after a
+                    // newer one applied clobbers it" race. Each worker stamps
+                    // its status snapshots monotonically; the leader records
+                    // the highest stamp applied per Pod subject and no-ops any
+                    // snapshot whose stamp is older-or-equal. UID is already
+                    // validated above, so same-name replacement Pods (distinct
+                    // subject key) are unaffected.
+                    if let Some(incoming_stamp) = observed_status_stamp {
+                        let subject_key = Self::pod_status_subject_key(
+                            &api_version,
+                            &kind,
+                            namespace.as_deref(),
+                            &name,
+                            preconditions.uid.as_deref(),
+                        );
+                        let last_applied_stamp: Option<i64> = tx.query_row(
+                            queries::APPLIED_OUTBOX_MAX_STATUS_STAMP_FOR_SUBJECT,
+                            rusqlite::params![subject_key],
+                            |row| row.get::<_, Option<i64>>(0),
+                        )?;
+                        if last_applied_stamp.is_some_and(|last| incoming_stamp <= last) {
+                            // Stale snapshot: produce a commit with no resource
+                            // mutation so the live status is preserved and no
+                            // watch event is emitted. The outer apply still
+                            // records the idempotency ledger row so the worker
+                            // row completes instead of retrying forever.
+                            return Ok((LogApplyCommit::new(rv, Vec::new()), rv));
+                        }
+                    }
                 } else {
                     validate_resource_preconditions(&preconditions, Some(&live_uid), live_rv)
                         .map_err(Self::sqlite_conversion_error)?;
@@ -1497,6 +1534,40 @@ impl Datastore {
                     && api_version == "coordination.k8s.io/v1"
                     && kind == "Lease"
                     && namespace == Some("kube-node-lease")))
+    }
+
+    /// Reconstruct the applied_outbox `subject_key` for a Pod status command,
+    /// matching `subject_key_for_command` so the stale-stamp gate reads the
+    /// same ledger rows the outbox apply writes.
+    fn pod_status_subject_key(
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        uid: Option<&str>,
+    ) -> String {
+        let mut key = match namespace {
+            Some(namespace) => format!("{api_version}/{kind}/{namespace}/{name}"),
+            None => format!("{api_version}/{kind}/{name}"),
+        };
+        if let Some(uid) = uid.filter(|uid| !uid.is_empty()) {
+            key.push('/');
+            key.push_str(uid);
+        }
+        key
+    }
+
+    /// Worker-observed status stamp carried by a Pod status outbox command, if
+    /// any. Used by the outer apply paths to persist the stamp in the
+    /// idempotency ledger so the gate can compare future snapshots.
+    fn pod_status_stamp_of(command: &crate::datastore::command::StorageCommand) -> Option<i64> {
+        match command {
+            crate::datastore::command::StorageCommand::UpdateStatus {
+                observed_status_stamp,
+                ..
+            } => *observed_status_stamp,
+            _ => None,
+        }
     }
 
     fn should_apply_outbox_status_against_latest(

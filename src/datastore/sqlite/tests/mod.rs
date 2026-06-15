@@ -23,6 +23,7 @@ mod ipam_and_network_tests;
 mod namespace_and_watch_tests;
 mod owner_reference_query_tests;
 mod pod_endpoints_tests;
+mod pod_status_stamp_tests;
 mod pod_workqueue_tests;
 mod selector_index_tests;
 mod selectors_and_filter_tests;

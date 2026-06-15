@@ -214,6 +214,7 @@ pub async fn apply_forwarded_command(
             status,
             expected_rv,
             preconditions,
+            observed_status_stamp,
         } => {
             let mut preconditions = preconditions;
             if preconditions.resource_version.is_none() {
@@ -242,6 +243,7 @@ pub async fn apply_forwarded_command(
                         .unwrap_or(serde_json::Value::Null),
                     expected_rv,
                     preconditions,
+                    observed_status_stamp,
                 },
                 &resource,
                 authoring_node,
@@ -903,6 +905,7 @@ mod tests {
                     uid: Some("uid-starting-pod".into()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             },
             "worker-1".into(),
         )
@@ -1001,6 +1004,7 @@ mod tests {
                     uid: Some("uid-reconnected-pod".into()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             },
             "worker-1".into(),
         )
@@ -1076,6 +1080,7 @@ mod tests {
                     uid: Some("uid-fresh-true-pod".into()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             },
             "worker-1".into(),
         )
@@ -1143,6 +1148,7 @@ mod tests {
                     uid: Some("uid-fresh-false-pod".into()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             },
             "worker-1".into(),
         )
@@ -1244,6 +1250,7 @@ mod tests {
                     uid: Some("uid-same-container-terminal-pod".into()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             },
             "worker-1".into(),
         )
@@ -1335,6 +1342,7 @@ mod tests {
                     uid: Some("uid-same-count-restart-pod".into()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             },
             "worker-1".into(),
         )
@@ -1414,6 +1422,7 @@ mod tests {
                     uid: Some("uid-term-pod".into()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             },
             "worker-1".into(),
         )

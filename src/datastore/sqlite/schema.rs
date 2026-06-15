@@ -191,7 +191,8 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
             operation       TEXT NOT NULL,
             first_seen_ms   INTEGER NOT NULL,
             applied_rv      INTEGER,
-            result_proto    BLOB NOT NULL
+            result_proto    BLOB NOT NULL,
+            status_stamp    INTEGER
         )",
         [],
     )?;

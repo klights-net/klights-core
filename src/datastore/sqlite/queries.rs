@@ -128,14 +128,21 @@ pub(super) const APPLIED_OUTBOX_INSERT: &str = "INSERT OR IGNORE INTO applied_ou
      VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 
 pub(super) const APPLIED_OUTBOX_UPSERT_EXACT: &str = "INSERT INTO applied_outbox \
-     (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+     (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
      ON CONFLICT(idempotency_key) DO UPDATE SET \
        subject_key = excluded.subject_key, \
        operation = excluded.operation, \
        first_seen_ms = excluded.first_seen_ms, \
        applied_rv = excluded.applied_rv, \
-       result_proto = excluded.result_proto";
+       result_proto = excluded.result_proto, \
+       status_stamp = excluded.status_stamp";
+
+/// Highest worker-observed status stamp already recorded for a Pod status
+/// subject. The leader compares an incoming status snapshot's stamp against
+/// this to drop a stale snapshot that a retry let overtake a newer one.
+pub(super) const APPLIED_OUTBOX_MAX_STATUS_STAMP_FOR_SUBJECT: &str =
+    "SELECT MAX(status_stamp) FROM applied_outbox WHERE subject_key = ?1";
 
 // ---------------------------------------------------------------------------
 // pod_cleanup_intents
@@ -550,7 +557,7 @@ pub(super) const UPSERT_KLIGHTS_META: &str =
     "INSERT OR REPLACE INTO _klights_meta (key, value) VALUES (?1, ?2)";
 
 pub(super) const APPLIED_OUTBOX_UPDATE_RESULT: &str = "UPDATE applied_outbox \
-     SET subject_key = ?2, applied_rv = ?3, result_proto = ?4 \
+     SET subject_key = ?2, applied_rv = ?3, result_proto = ?4, status_stamp = ?5 \
      WHERE idempotency_key = ?1";
 pub(super) const APPLIED_OUTBOX_DELETE_STALE_PLACEHOLDERS: &str = "DELETE FROM applied_outbox \
      WHERE applied_rv IS NULL

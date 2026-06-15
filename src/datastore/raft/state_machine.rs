@@ -268,6 +268,7 @@ mod tests {
                     uid: Some("uid-coredns".to_string()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             }),
             "worker-1",
         )
@@ -374,6 +375,7 @@ mod tests {
                     uid: Some("uid-coredns".to_string()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             }),
             "mn-controlplane2",
         )

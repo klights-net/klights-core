@@ -134,6 +134,7 @@ impl PodStatusService {
                 uid: Some(pod_resource.uid.clone()),
                 resource_version: expected_rv,
             },
+            observed_status_stamp: Some(next_pod_status_stamp()),
         };
         let synthetic = synthetic_status_resource(pod_resource, &status);
         let sent = self
@@ -1475,6 +1476,38 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
+}
+
+/// Strictly-monotonic, per-worker stamp for a Pod status outbox snapshot.
+///
+/// Each call returns a value strictly greater than every prior call in this
+/// process. The counter is seeded from the wall clock in microseconds so it
+/// keeps advancing across a worker restart (no node-local persistence needed):
+/// after a restart the seed is the current time, which is larger than any
+/// stamp issued before the restart. Because a Pod is owned by exactly one
+/// worker (`spec.nodeName`), every status snapshot for a given Pod UID is
+/// stamped by the same monotonic source, so the leader can compare stamps to
+/// drop a stale snapshot that a retry/backoff let overtake a newer one.
+fn next_pod_status_stamp() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST_STATUS_STAMP: AtomicI64 = AtomicI64::new(0);
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    let mut last = LAST_STATUS_STAMP.load(Ordering::Relaxed);
+    loop {
+        let next = now_us.max(last.saturating_add(1));
+        match LAST_STATUS_STAMP.compare_exchange_weak(
+            last,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => last = observed,
+        }
+    }
 }
 
 fn pod_ready_for_rollout(pod: &Value) -> bool {

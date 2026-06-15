@@ -405,6 +405,7 @@ where
             status,
             expected_rv,
             preconditions,
+            observed_status_stamp: _,
         } => {
             let current = backend
                 .get_resource(&api_version, &kind, namespace.as_deref(), &name)

@@ -95,6 +95,7 @@ impl DatastoreApplier for Datastore {
                 status,
                 expected_rv,
                 preconditions,
+                observed_status_stamp: _,
             } => {
                 let mut preconditions = preconditions;
                 if preconditions.resource_version.is_none() {

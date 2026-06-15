@@ -382,6 +382,7 @@ mod tests {
                 uid: Some("u-4".into()),
                 resource_version: Some(7),
             },
+            observed_status_stamp: None,
         };
         assert_eq!(subject_key_for_command(&cmd), "v1/Pod/default/p/u-4");
     }

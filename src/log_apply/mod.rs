@@ -340,6 +340,11 @@ pub struct LogApplyAppliedOutboxRow {
     pub first_seen_ms: i64,
     pub applied_rv: Option<i64>,
     pub result_proto: Vec<u8>,
+    /// Worker-observed monotonic stamp of the Pod status snapshot this ledger
+    /// row recorded (`None` for non-status operations). Replicated so any raft
+    /// member that becomes leader can keep gating stale status snapshots.
+    #[serde(default)]
+    pub status_stamp: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -413,6 +418,10 @@ impl From<AppliedOutboxRecord> for LogApplyAppliedOutboxRow {
             first_seen_ms: record.first_seen_ms,
             applied_rv: record.applied_rv,
             result_proto: record.result_proto,
+            // AppliedOutboxRecord is the read/snapshot view and does not carry
+            // the status stamp; snapshot restore falls back to no gate until
+            // fresh status snapshots re-establish stamps.
+            status_stamp: None,
         }
     }
 }
@@ -664,6 +673,8 @@ struct ProtoLogApplyAppliedOutboxRow {
     applied_rv: Option<i64>,
     #[prost(bytes = "vec", tag = "6")]
     result_proto: Vec<u8>,
+    #[prost(int64, optional, tag = "7")]
+    status_stamp: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1081,6 +1092,7 @@ impl From<LogApplyAppliedOutboxRow> for ProtoLogApplyAppliedOutboxRow {
             first_seen_ms: row.first_seen_ms,
             applied_rv: row.applied_rv,
             result_proto: row.result_proto,
+            status_stamp: row.status_stamp,
         }
     }
 }
@@ -1094,6 +1106,7 @@ impl From<ProtoLogApplyAppliedOutboxRow> for LogApplyAppliedOutboxRow {
             first_seen_ms: row.first_seen_ms,
             applied_rv: row.applied_rv,
             result_proto: row.result_proto,
+            status_stamp: row.status_stamp,
         }
     }
 }
@@ -1291,6 +1304,7 @@ mod parity_tests {
                 first_seen_ms: 1_700_000_000_000,
                 applied_rv: Some(42),
                 result_proto: vec![0u8, 1, 2, 3, 4],
+                status_stamp: Some(7),
             }),
             "DeleteAppliedOutbox" => LogApplyMutation::DeleteAppliedOutbox {
                 idempotency_key: "cmd-1".to_string(),

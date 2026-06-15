@@ -192,6 +192,7 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         }),
         expected_rv: Some(created.resource_version),
         preconditions: ResourcePreconditions::from_resource(&created),
+        observed_status_stamp: None,
     };
     let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
@@ -648,6 +649,7 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
             uid: Some("status-metadata-race-uid".to_string()),
             resource_version: None,
         },
+        observed_status_stamp: None,
     };
     let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()

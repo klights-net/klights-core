@@ -30,6 +30,7 @@ mod tests {
                     uid: Some(uid.to_string()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             },
         )
         .encode_protobuf()

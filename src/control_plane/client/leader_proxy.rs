@@ -1091,6 +1091,7 @@ mod tests {
                 uid: Some("absent-uid".to_string()),
                 resource_version: None,
             },
+            observed_status_stamp: None,
         };
         Bytes::from(
             OutboxPayload::from_command(command)

@@ -309,6 +309,7 @@ mod cases {
                     uid: Some("uid-stale".into()),
                     resource_version: None,
                 },
+                observed_status_stamp: None,
             },
             "worker-1".into(),
         )
@@ -364,6 +365,7 @@ mod cases {
                 uid: Some("uid-codec".into()),
                 resource_version: None,
             },
+            observed_status_stamp: None,
         };
         let encoded = crate::datastore::command::encode_command_protobuf(&command).unwrap();
         let decoded = crate::datastore::command::decode_command_protobuf(&encoded).unwrap();

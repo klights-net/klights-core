@@ -1309,7 +1309,8 @@ fn put_applied_outbox_row(
             row.operation,
             row.first_seen_ms,
             row.applied_rv,
-            row.result_proto
+            row.result_proto,
+            row.status_stamp
         ],
     )?;
     Ok(())

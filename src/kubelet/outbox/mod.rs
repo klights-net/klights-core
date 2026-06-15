@@ -856,6 +856,7 @@ mod tests {
                 uid: Some(uid.to_string()),
                 resource_version: None,
             },
+            observed_status_stamp: None,
         }
     }
 
@@ -1626,6 +1627,7 @@ mod tests {
                 uid: Some("uid-deadline-web".to_string()),
                 resource_version: Some(created.resource_version),
             },
+            observed_status_stamp: None,
         };
         outbox
             .enqueue_command(OutboxCommand::new(

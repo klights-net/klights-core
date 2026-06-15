@@ -208,6 +208,7 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 status,
                 expected_rv,
                 preconditions,
+                observed_status_stamp,
             } => proto_storage_command::Command::UpdateStatus(ProtoUpdateStatus {
                 api_version,
                 kind,
@@ -216,6 +217,7 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 status: json_to_bytes(&status),
                 expected_rv,
                 preconditions: Some(preconditions.into()),
+                observed_status_stamp,
             }),
             StorageCommand::CreateNamespace { name, data } => {
                 proto_storage_command::Command::CreateNamespace(ProtoCreateNamespace {
@@ -442,6 +444,7 @@ impl TryFrom<ProtoStorageCommand> for StorageCommand {
                 status: bytes_to_json(&p.status),
                 expected_rv: p.expected_rv,
                 preconditions: decode_preconditions(p.preconditions, "UpdateStatus")?,
+                observed_status_stamp: p.observed_status_stamp,
             },
             proto_storage_command::Command::CreateNamespace(p) => StorageCommand::CreateNamespace {
                 name: p.name,
@@ -773,6 +776,7 @@ mod tests {
                         uid: Some("uid-abc-123".into()),
                         resource_version: Some(42),
                     },
+                    observed_status_stamp: Some(7),
                 },
                 "UpdateStatus",
             ),
@@ -1573,6 +1577,7 @@ mod tests {
             status: json!({"phase": "Pending"}),
             expected_rv: None,
             preconditions: uid_preconditions("uid-abc-123"),
+            observed_status_stamp: None,
         };
         // JSON
         let encoded = encode_command_json(&cmd).unwrap();
@@ -1607,6 +1612,7 @@ mod tests {
                 status: json!({"phase": "Running"}),
                 expected_rv: None,
                 preconditions: uid_preconditions("uid-a"),
+                observed_status_stamp: None,
             },
             StorageCommand::PatchResource {
                 api_version: "v1".into(),

@@ -166,6 +166,16 @@ pub enum StorageCommand {
         status: serde_json::Value,
         expected_rv: Option<i64>,
         preconditions: ResourcePreconditions,
+        /// Worker-observed monotonic stamp for the Pod status snapshot this
+        /// command carries. Producers (the kubelet status outbox) stamp each
+        /// snapshot with a strictly increasing per-worker value so the leader
+        /// can drop a stale snapshot that a retry/backoff lets overtake a
+        /// newer one (the pipelined "resend arrives after a newer update"
+        /// lost-update race). `None` for non-outbox writes (direct API/status
+        /// updates, leases, nodes) which keep their existing ordering
+        /// semantics. See the leader-side gate in the SQLite backend.
+        #[serde(default)]
+        observed_status_stamp: Option<i64>,
     },
 
     // -- Namespace operations (ClusterReplicated) --
@@ -400,6 +410,7 @@ impl StorageCommand {
                 uid: None,
                 resource_version: expected_rv,
             },
+            observed_status_stamp: None,
         }
     }
 

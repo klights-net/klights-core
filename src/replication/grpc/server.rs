@@ -4242,6 +4242,7 @@ mod tests {
                 uid: Some("pod-uid".to_string()),
                 resource_version: None,
             },
+            observed_status_stamp: None,
         };
         let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
