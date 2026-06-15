@@ -445,8 +445,9 @@ impl NftServiceRouter {
         request: NftServiceRouterDefaultBoot<'_>,
     ) -> Result<std::sync::Arc<Self>> {
         let table_name = request.table.table_name.to_string();
+        let bridge_ifname = request.table.bridge_ifname.to_string();
         let pod_subnet = request.network.pod_subnet.to_string();
-        ensure_service_routing_sysctls(&request.task_supervisor).await?;
+        ensure_service_routing_sysctls(&request.task_supervisor, &bridge_ifname).await?;
         let rt = Self::boot(request.into_boot()).await.with_context(|| {
             format!("boot NftServiceRouter for inet {table_name} (pod subnet {pod_subnet})")
         })?;
@@ -810,10 +811,28 @@ const REQUIRED_SERVICE_ROUTING_SYSCTLS: &[(&str, &str)] = &[
     ("/proc/sys/net/ipv4/ip_forward", "1\n"),
     ("/proc/sys/net/bridge/bridge-nf-call-iptables", "1\n"),
     ("/proc/sys/net/ipv4/conf/all/route_localnet", "1\n"),
+    ("/proc/sys/net/ipv4/conf/default/route_localnet", "1\n"),
 ];
+
+fn required_service_routing_sysctl_entries(bridge_ifname: &str) -> Vec<(String, &'static str)> {
+    let mut entries = Vec::with_capacity(REQUIRED_SERVICE_ROUTING_SYSCTLS.len() + 1);
+    entries.extend(
+        REQUIRED_SERVICE_ROUTING_SYSCTLS
+            .iter()
+            .map(|(path, value)| ((*path).to_string(), *value)),
+    );
+    if !bridge_ifname.is_empty() {
+        entries.push((
+            format!("/proc/sys/net/ipv4/conf/{bridge_ifname}/route_localnet"),
+            "1\n",
+        ));
+    }
+    entries
+}
 
 async fn ensure_service_routing_sysctls(
     task_supervisor: &std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    bridge_ifname: &str,
 ) -> Result<()> {
     let modprobe = task_supervisor
         .run_blocking_file("service_routing_modprobe_br_netfilter", || {
@@ -837,8 +856,8 @@ async fn ensure_service_routing_sysctls(
         _ => {}
     }
 
-    for (path, value) in REQUIRED_SERVICE_ROUTING_SYSCTLS {
-        ensure_sysctl_value(path, value).await?;
+    for (path, value) in required_service_routing_sysctl_entries(bridge_ifname) {
+        ensure_sysctl_value(&path, value).await?;
     }
     Ok(())
 }
@@ -1195,6 +1214,31 @@ mod tests {
                         && *value == "1\n"
                 ),
             "service routing must enable route_localnet for loopback hostPort DNAT; got {REQUIRED_SERVICE_ROUTING_SYSCTLS:?}"
+        );
+    }
+
+    #[test]
+    fn required_sysctls_enable_default_route_localnet_for_new_links() {
+        assert!(
+            REQUIRED_SERVICE_ROUTING_SYSCTLS
+                .iter()
+                .any(
+                    |(path, value)| *path == "/proc/sys/net/ipv4/conf/default/route_localnet"
+                        && *value == "1\n"
+                ),
+            "service routing must enable default route_localnet so hostPort loopback DNAT works on newly-created bridge links; got {REQUIRED_SERVICE_ROUTING_SYSCTLS:?}"
+        );
+    }
+
+    #[test]
+    fn required_sysctls_enable_bridge_route_localnet_for_hostport_loopback_dnat() {
+        let entries = required_service_routing_sysctl_entries("klights0");
+
+        assert!(
+            entries.iter().any(|(path, value)| {
+                path == "/proc/sys/net/ipv4/conf/klights0/route_localnet" && *value == "1\n"
+            }),
+            "service routing must enable route_localnet on the pod bridge for loopback hostPort DNAT; got {entries:?}"
         );
     }
 }
