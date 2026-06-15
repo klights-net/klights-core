@@ -53,6 +53,7 @@ pub struct BootstrapRunArgs<'a> {
     pub kubelet_uses_worker_store_adapter: bool,
     pub db: &'a dyn crate::datastore::DatastoreBackend,
     pub cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
+    pub remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
     pub _node_local: crate::datastore::node_local::handle::NodeLocalHandle,
     pub replication_service_for_router: Option<Arc<crate::replication::ReplicationService>>,
     pub outbox_runtime: Arc<crate::kubelet::outbox::Outbox>,
@@ -98,6 +99,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         kubelet_uses_worker_store_adapter,
         db,
         cluster_api,
+        remote_api_client,
         _node_local,
         replication_service_for_router,
         outbox_runtime,
@@ -325,6 +327,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         lease_client.set_current_leader_endpoint(Some(leader_addr.clone()));
     }
     let (leader_addr_tx, leader_addr_rx) = tokio::sync::watch::channel(initial_leader_addr);
+    start_controlplane_remote_informers_if_present(remote_api_client, shutdown_token.clone())
+        .await
+        .context("control-plane remote API informers")?;
     // Load the cluster CA cert once: the follower proxy uses it to verify the
     // leader's serving cert, and the leader uses it to cryptographically
     // re-authenticate client certificates forwarded by follower proxies.
@@ -877,4 +882,105 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         dispatcher_for_worker,
         app,
     })
+}
+
+pub(crate) async fn start_controlplane_remote_informers_if_present(
+    remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
+    shutdown_token: CancellationToken,
+) -> Result<Vec<SupervisedJoinHandle<()>>> {
+    match remote_api_client {
+        Some(remote_api_client) => {
+            remote_api_client
+                .start_required_worker_informers(shutdown_token)
+                .await
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::control_plane::client::remote::RemoteApiClient;
+    use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
+    use crate::replication::grpc::client::{
+        GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
+    };
+    use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
+    use crate::replication::protocol::JoinRole;
+    use crate::task_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
+
+    fn remote_client_for_informer_start_test(
+        supervisor: Arc<TaskSupervisor>,
+    ) -> Arc<RemoteApiClient> {
+        let grpc = Arc::new(ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: "https://127.0.0.1:16443".to_string(),
+                token: String::new(),
+                node_name: "cp1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: JoinDataplaneMetadata {
+                    endpoint: String::new(),
+                    port: None,
+                    mode: DataplaneMode::Root,
+                    encryption: DataplaneEncryption::Disabled,
+                    public_key: None,
+                },
+                ca_cert_path: None,
+                skip_ca: true,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor.clone(),
+            GrpcTransportPolicy::shared_default(),
+        ));
+        Arc::new(RemoteApiClient::from_grpc(
+            grpc,
+            supervisor,
+            "cp1".to_string(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn cp_boot_starts_required_worker_informers() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let remote_api_client = remote_client_for_informer_start_test(supervisor.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let handles = super::start_controlplane_remote_informers_if_present(
+            Some(remote_api_client.clone()),
+            cancel.clone(),
+        )
+        .await
+        .expect("start informers");
+
+        assert!(
+            !handles.is_empty(),
+            "control-plane boot must start remote API informer tasks"
+        );
+        assert!(
+            supervisor
+                .active_tasks(Some(TaskCategory::Network))
+                .iter()
+                .any(|task| task.name == "remote_api_informer_watch"),
+            "remote informer tasks must be registered with TaskSupervisor"
+        );
+
+        let duplicate = super::start_controlplane_remote_informers_if_present(
+            Some(remote_api_client),
+            cancel.clone(),
+        )
+        .await
+        .expect("duplicate start");
+        assert!(
+            duplicate.is_empty(),
+            "informer startup must be idempotent when worker-store setup already started it"
+        );
+
+        cancel.cancel();
+        for handle in handles {
+            handle.abort();
+        }
+    }
 }

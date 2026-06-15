@@ -910,6 +910,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         kubelet_uses_worker_store_adapter,
         db,
         cluster_api: cluster_api.clone(),
+        remote_api_client: remote_api_client.clone(),
         _node_local: node_local.clone(),
         replication_service_for_router: replication_service_for_router.clone(),
         outbox_runtime: outbox_runtime.clone(),

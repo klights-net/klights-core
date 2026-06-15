@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -70,6 +71,7 @@ pub struct RemoteApiClient {
     grpc: Option<Arc<ReplicationGrpcClient>>,
     supervisor: Option<Arc<TaskSupervisor>>,
     cache: InformerCache,
+    worker_informers_started: Arc<AtomicBool>,
     /// bug-grpc: per-stream idle timeout; overridable in tests.
     watch_idle_timeout: std::time::Duration,
 }
@@ -81,6 +83,7 @@ impl RemoteApiClient {
             grpc: None,
             supervisor: None,
             cache: InformerCache::new(),
+            worker_informers_started: Arc::new(AtomicBool::new(false)),
             watch_idle_timeout: WATCH_IDLE_TIMEOUT,
         }
     }
@@ -95,6 +98,7 @@ impl RemoteApiClient {
             grpc: Some(grpc),
             supervisor: Some(supervisor),
             cache: InformerCache::new(),
+            worker_informers_started: Arc::new(AtomicBool::new(false)),
             watch_idle_timeout: WATCH_IDLE_TIMEOUT,
         }
     }
@@ -132,21 +136,34 @@ impl RemoteApiClient {
             .as_ref()
             .ok_or_else(|| anyhow!("RemoteApiClient missing TaskSupervisor"))?
             .clone();
+        if self
+            .worker_informers_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(Vec::new());
+        }
         let mut handles = Vec::new();
         for req in self.required_worker_list_requests() {
             let client = self.clone();
             let cancel = cancel.clone();
-            handles.push(
-                supervisor
-                    .spawn_async(
-                        TaskCategory::Network,
-                        "remote_api_informer_watch",
-                        async move {
-                            client.run_watch_driver(req, cancel).await;
-                        },
-                    )
-                    .await?,
-            );
+            match supervisor
+                .spawn_async(
+                    TaskCategory::Network,
+                    "remote_api_informer_watch",
+                    async move {
+                        client.run_watch_driver(req, cancel).await;
+                    },
+                )
+                .await
+            {
+                Ok(handle) => handles.push(handle),
+                Err(err) => {
+                    self.worker_informers_started
+                        .store(false, Ordering::Release);
+                    return Err(err);
+                }
+            }
         }
         Ok(handles)
     }
@@ -617,7 +634,7 @@ mod tests {
     use serde_json::json;
 
     use crate::control_plane::client::remote::RemoteApiClient;
-    use crate::control_plane::client::{LeaderApiClient, WatchRequest};
+    use crate::control_plane::client::{CacheScope, LeaderApiClient, ResourceKey, WatchRequest};
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend::DatastoreHandle;
     use crate::datastore::command::StorageCommand;
@@ -1020,6 +1037,38 @@ mod tests {
         let result = client.get_pod("default", "web").await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_some(), "cache hit should return pod");
+    }
+
+    #[tokio::test]
+    async fn cache_based_get_resource_returns_primed_value() {
+        let client = RemoteApiClient::new_for_tests("worker-1");
+        let scope = CacheScope::Resource {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+        };
+        let pod = make_pod("default", "web", "uid-1", "worker-1", "Running");
+        client.cache_prime_scope(scope).await;
+        client.cache_insert_pod(pod.clone()).await;
+
+        let fetched = client
+            .get_resource(ResourceKey {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+            })
+            .await
+            .expect("get_resource");
+
+        assert_eq!(
+            fetched.as_ref().map(|resource| resource.uid.as_str()),
+            Some("uid-1")
+        );
+        assert_eq!(
+            fetched.as_ref().map(|resource| resource.resource_version),
+            Some(pod.resource_version)
+        );
     }
 
     #[tokio::test]

@@ -4,9 +4,10 @@
 //! binding — a `LeaderProxyApiClient` that wraps a local
 //! `LocalApiClient` and a remote forwarder. Per-call dispatch:
 //!
-//! - **Kubernetes API reads** always go to the local client. Non-leader members serve
-//!   reads from their own raft-applied `cluster.db`. Reads are not
-//!   forwarded across the network on every call.
+//! - **Kubernetes API reads and watches** go to the elected leader. When this
+//!   member is leader they use the local client; otherwise they use the remote
+//!   forwarder. Followers do not serve application reads from their local
+//!   raft-applied `cluster.db`.
 //! - **Pod cleanup intent reads/deletes** prefer the remote leader path.
 //!   Startup recovery may run before a rejoining old leader has observed
 //!   its demotion, so the local leadership watch can briefly be stale.
@@ -18,7 +19,7 @@
 //!
 //! Leadership change is a state flip on the same instance — no
 //! re-construction, no rewiring. The proxy reads `is_leader_rx` per
-//! call, so the next write after promotion / demotion picks the new
+//! call, so the next read or write after promotion / demotion picks the new
 //! dispatch target without any setup.
 //!
 //! Both `local` and `remote` are `Arc<dyn LeaderApiClient>` so the
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt as _;
 use tokio::sync::watch;
 
 use crate::control_plane::client::{
@@ -77,85 +79,122 @@ impl LeaderProxyApiClient {
         *self.is_leader_rx.borrow()
     }
 
-    fn write_target(&self) -> &Arc<dyn LeaderApiClient> {
+    fn leader_target(&self) -> &Arc<dyn LeaderApiClient> {
         if self.is_leader() {
             &self.local
         } else {
             &self.remote
         }
     }
+
+    fn terminate_watch_on_leadership_change<T>(&self, stream: WatchStream<T>) -> WatchStream<T>
+    where
+        T: Send + 'static,
+    {
+        terminate_watch_on_leadership_change(stream, self.is_leader_rx.clone(), self.is_leader())
+    }
+}
+
+fn terminate_watch_on_leadership_change<T>(
+    stream: WatchStream<T>,
+    leadership_rx: watch::Receiver<bool>,
+    initial_is_leader: bool,
+) -> WatchStream<T>
+where
+    T: Send + 'static,
+{
+    Box::pin(futures::stream::unfold(
+        (stream, leadership_rx),
+        move |(mut stream, mut leadership_rx)| async move {
+            loop {
+                tokio::select! {
+                    changed = leadership_rx.changed() => {
+                        if changed.is_err() || *leadership_rx.borrow() != initial_is_leader {
+                            return None;
+                        }
+                    }
+                    item = stream.next() => {
+                        return item.map(|item| (item, (stream, leadership_rx)));
+                    }
+                }
+            }
+        },
+    ))
 }
 
 #[async_trait]
 impl LeaderApiClient for LeaderProxyApiClient {
-    // --- Kubernetes API reads go to local storage ---
+    // --- Kubernetes API reads and watches go to the elected leader ---
 
     async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-        self.local.get_resource(key).await
+        self.leader_target().get_resource(key).await
     }
 
     async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
-        self.local.get_resource_fresh(key).await
+        self.leader_target().get_resource_fresh(key).await
     }
 
     async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
-        self.local.list_resources(req).await
+        self.leader_target().list_resources(req).await
     }
 
     async fn list_resources_fresh(&self, req: ListRequest) -> Result<ListResponse> {
-        self.local.list_resources_fresh(req).await
+        self.leader_target().list_resources_fresh(req).await
     }
 
     async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-        self.local.watch_resources(req).await
+        let stream = self.leader_target().watch_resources(req).await?;
+        Ok(self.terminate_watch_on_leadership_change(stream))
     }
 
     async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()> {
-        self.local.wait_cache_ready(scope).await
+        self.leader_target().wait_cache_ready(scope).await
     }
 
     async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Pod>> {
-        self.local.get_pod(ns, name).await
+        self.leader_target().get_pod(ns, name).await
     }
 
     async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Pod>> {
-        self.local.get_pod_for_uid(ns, name, uid).await
+        self.leader_target().get_pod_for_uid(ns, name, uid).await
     }
 
     async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Pod>> {
-        self.local.watch_pods_on_node(node_name).await
+        let stream = self.leader_target().watch_pods_on_node(node_name).await?;
+        Ok(self.terminate_watch_on_leadership_change(stream))
     }
 
     async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Pod>> {
-        self.local.list_pods_on_node(node_name).await
+        self.leader_target().list_pods_on_node(node_name).await
     }
 
     async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<ConfigMap>> {
-        self.local.get_configmap(ns, name).await
+        self.leader_target().get_configmap(ns, name).await
     }
 
     async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
-        self.local.get_secret(ns, name).await
+        self.leader_target().get_secret(ns, name).await
     }
 
     async fn get_node(&self, name: &str) -> Result<Node> {
-        self.local.get_node(name).await
+        self.leader_target().get_node(name).await
     }
 
     async fn watch_node(&self, name: &str) -> Result<WatchStream<Node>> {
-        self.local.watch_node(name).await
+        let stream = self.leader_target().watch_node(name).await?;
+        Ok(self.terminate_watch_on_leadership_change(stream))
     }
 
     async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-        self.local.get_node_subnet(node_name).await
+        self.leader_target().get_node_subnet(node_name).await
     }
 
     async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        self.local.list_peer_subnets(my_node_name).await
+        self.leader_target().list_peer_subnets(my_node_name).await
     }
 
     async fn get_node_dataplane(&self, node_name: &str) -> Result<Option<DataplanePeerMetadata>> {
-        self.local.get_node_dataplane(node_name).await
+        self.leader_target().get_node_dataplane(node_name).await
     }
 
     async fn list_pod_cleanup_intents_for_node(
@@ -205,6 +244,8 @@ impl LeaderApiClient for LeaderProxyApiClient {
     async fn get_cluster_membership(
         &self,
     ) -> Result<crate::control_plane::client::membership::ClusterMembership> {
+        // Membership is the carve-out: followers need local raft topology to
+        // locate the elected leader before they can forward ordinary API calls.
         self.local.get_cluster_membership().await
     }
 
@@ -214,7 +255,7 @@ impl LeaderApiClient for LeaderProxyApiClient {
         &self,
         request: ProjectedServiceAccountTokenRequest,
     ) -> Result<ProjectedServiceAccountToken> {
-        self.write_target()
+        self.leader_target()
             .projected_service_account_token(request)
             .await
     }
@@ -225,7 +266,7 @@ impl LeaderApiClient for LeaderProxyApiClient {
         cluster_cidr: &str,
         node_ip: &str,
     ) -> Result<NodeSubnet> {
-        self.write_target()
+        self.leader_target()
             .allocate_node_subnet(node_name, cluster_cidr, node_ip)
             .await
     }
@@ -236,7 +277,7 @@ impl LeaderApiClient for LeaderProxyApiClient {
         operation: OutboxOperation,
         payload: Bytes,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        self.write_target()
+        self.leader_target()
             .apply_outbox(idempotency_key, operation, payload)
             .await
     }
@@ -382,8 +423,12 @@ mod tests {
         name: &'static str,
         get_resource: AtomicUsize,
         list_resources: AtomicUsize,
+        watch_resources: AtomicUsize,
         get_pod: AtomicUsize,
         get_node: AtomicUsize,
+        watch_pods_on_node: AtomicUsize,
+        watch_node: AtomicUsize,
+        get_cluster_membership: AtomicUsize,
         projected_service_account_token: AtomicUsize,
         allocate_node_subnet: AtomicUsize,
         list_pod_cleanup_intents: AtomicUsize,
@@ -423,7 +468,8 @@ mod tests {
         }
 
         async fn watch_resources(&self, _req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-            anyhow::bail!("{} watch_resources not used in dispatch tests", self.name)
+            self.watch_resources.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::pin(futures::stream::pending()))
         }
 
         async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
@@ -440,10 +486,8 @@ mod tests {
         }
 
         async fn watch_pods_on_node(&self, _node: &str) -> Result<WatchStream<Pod>> {
-            anyhow::bail!(
-                "{} watch_pods_on_node not used in dispatch tests",
-                self.name
-            )
+            self.watch_pods_on_node.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::pin(futures::stream::pending()))
         }
 
         async fn list_pods_on_node(&self, _node: &str) -> Result<Vec<Pod>> {
@@ -473,7 +517,8 @@ mod tests {
         }
 
         async fn watch_node(&self, _name: &str) -> Result<WatchStream<Node>> {
-            anyhow::bail!("{} watch_node not used in dispatch tests", self.name)
+            self.watch_node.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::pin(futures::stream::pending()))
         }
 
         async fn projected_service_account_token(
@@ -535,10 +580,13 @@ mod tests {
         }
 
         async fn get_cluster_membership(&self) -> Result<ClusterMembership> {
-            anyhow::bail!(
-                "{} get_cluster_membership not used in dispatch tests",
-                self.name
-            )
+            self.get_cluster_membership.fetch_add(1, Ordering::Relaxed);
+            Ok(ClusterMembership {
+                cluster_id: format!("{}-cluster", self.name),
+                voters: vec![self.name.to_string()],
+                term: 1,
+                leader_hint: Some(self.name.to_string()),
+            })
         }
 
         async fn apply_outbox(
@@ -725,15 +773,40 @@ mod tests {
         assert_eq!(local.delete_pod_cleanup_intents.load(Ordering::Relaxed), 0);
     }
 
-    /// Kubernetes API reads always go local regardless of leadership. Non-leader
-    /// members serve reads from their raft-replicated local
-    /// `cluster.db`; reads do not round-trip to the leader.
     #[tokio::test]
-    async fn leader_proxy_reads_always_dispatch_to_local() {
+    async fn leader_proxy_reads_dispatch_remote_when_follower_local_when_leader() {
         let local = RecordingApiClient::new("local");
         let remote = RecordingApiClient::new("remote");
         let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), false);
 
+        exercise_read_dispatch(&proxy).await;
+
+        assert_eq!(remote.get_resource.load(Ordering::Relaxed), 1);
+        assert_eq!(remote.get_pod.load(Ordering::Relaxed), 1);
+        assert_eq!(remote.get_node.load(Ordering::Relaxed), 1);
+        assert_eq!(remote.list_resources.load(Ordering::Relaxed), 1);
+        assert_eq!(local.get_resource.load(Ordering::Relaxed), 0);
+        assert_eq!(local.get_pod.load(Ordering::Relaxed), 0);
+        assert_eq!(local.get_node.load(Ordering::Relaxed), 0);
+        assert_eq!(local.list_resources.load(Ordering::Relaxed), 0);
+
+        let local = RecordingApiClient::new("local");
+        let remote = RecordingApiClient::new("remote");
+        let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), true);
+
+        exercise_read_dispatch(&proxy).await;
+
+        assert_eq!(local.get_resource.load(Ordering::Relaxed), 1);
+        assert_eq!(local.get_pod.load(Ordering::Relaxed), 1);
+        assert_eq!(local.get_node.load(Ordering::Relaxed), 1);
+        assert_eq!(local.list_resources.load(Ordering::Relaxed), 1);
+        assert_eq!(remote.get_resource.load(Ordering::Relaxed), 0);
+        assert_eq!(remote.get_pod.load(Ordering::Relaxed), 0);
+        assert_eq!(remote.get_node.load(Ordering::Relaxed), 0);
+        assert_eq!(remote.list_resources.load(Ordering::Relaxed), 0);
+    }
+
+    async fn exercise_read_dispatch(proxy: &LeaderProxyApiClient) {
         proxy
             .get_resource(ResourceKey {
                 api_version: "v1".into(),
@@ -757,15 +830,65 @@ mod tests {
             })
             .await
             .expect("list");
+    }
 
-        assert_eq!(local.get_resource.load(Ordering::Relaxed), 1);
-        assert_eq!(local.get_pod.load(Ordering::Relaxed), 1);
-        assert_eq!(local.get_node.load(Ordering::Relaxed), 1);
-        assert_eq!(local.list_resources.load(Ordering::Relaxed), 1);
-        assert_eq!(remote.get_resource.load(Ordering::Relaxed), 0);
-        assert_eq!(remote.get_pod.load(Ordering::Relaxed), 0);
-        assert_eq!(remote.get_node.load(Ordering::Relaxed), 0);
-        assert_eq!(remote.list_resources.load(Ordering::Relaxed), 0);
+    #[tokio::test]
+    async fn leader_proxy_membership_read_stays_local() {
+        for is_leader in [false, true] {
+            let local = RecordingApiClient::new("local");
+            let remote = RecordingApiClient::new("remote");
+            let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), is_leader);
+
+            let membership = proxy
+                .get_cluster_membership()
+                .await
+                .expect("cluster membership");
+
+            assert_eq!(membership.cluster_id, "local-cluster");
+            assert_eq!(local.get_cluster_membership.load(Ordering::Relaxed), 1);
+            assert_eq!(remote.get_cluster_membership.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn leader_proxy_watch_terminates_on_leadership_change() {
+        use futures::StreamExt as _;
+        use tokio::time::{Duration, timeout};
+
+        for initial_leader in [false, true] {
+            let local = RecordingApiClient::new("local");
+            let remote = RecordingApiClient::new("remote");
+            let (proxy, tx) = make_proxy(local.clone(), remote.clone(), initial_leader);
+            let mut stream = proxy
+                .watch_resources(WatchRequest {
+                    api_version: "v1".into(),
+                    kind: "Pod".into(),
+                    namespace: None,
+                    label_selector: None,
+                    field_selector: None,
+                    start_resource_version: None,
+                })
+                .await
+                .expect("watch");
+
+            if initial_leader {
+                assert_eq!(local.watch_resources.load(Ordering::Relaxed), 1);
+                assert_eq!(remote.watch_resources.load(Ordering::Relaxed), 0);
+            } else {
+                assert_eq!(remote.watch_resources.load(Ordering::Relaxed), 1);
+                assert_eq!(local.watch_resources.load(Ordering::Relaxed), 0);
+            }
+
+            tx.send(!initial_leader).expect("flip leadership");
+
+            let ended = timeout(Duration::from_millis(100), stream.next())
+                .await
+                .expect("watch should end promptly after leadership change");
+            assert!(
+                ended.is_none(),
+                "watch stream should terminate so callers reconnect against the new leader target"
+            );
+        }
     }
 
     /// Leader-change is a state flip on the same instance: same
