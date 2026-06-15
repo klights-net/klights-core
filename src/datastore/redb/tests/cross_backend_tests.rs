@@ -192,6 +192,7 @@ parametrize_backends!(applied_outbox_gc_prunes_all_expired_records, |db| {
         first_seen_ms: expired_ms,
         applied_rv: Some(10),
         result_proto: Vec::new(),
+        status_stamp: None,
     })
     .await
     .unwrap();
@@ -202,6 +203,7 @@ parametrize_backends!(applied_outbox_gc_prunes_all_expired_records, |db| {
         first_seen_ms: recent_ms,
         applied_rv: Some(11),
         result_proto: Vec::new(),
+        status_stamp: None,
     })
     .await
     .unwrap();
@@ -212,6 +214,7 @@ parametrize_backends!(applied_outbox_gc_prunes_all_expired_records, |db| {
         first_seen_ms: expired_ms,
         applied_rv: Some(12),
         result_proto: Vec::new(),
+        status_stamp: None,
     })
     .await
     .unwrap();
@@ -222,6 +225,7 @@ parametrize_backends!(applied_outbox_gc_prunes_all_expired_records, |db| {
         first_seen_ms: expired_ms,
         applied_rv: Some(13),
         result_proto: Vec::new(),
+        status_stamp: None,
     })
     .await
     .unwrap();

@@ -1412,6 +1412,7 @@ fn applied_outbox_record_in_tx(
             first_seen_ms: row.get(3)?,
             applied_rv: row.get(4)?,
             result_proto: row.get(5)?,
+            status_stamp: row.get(6)?,
         })
     })
     .optional()

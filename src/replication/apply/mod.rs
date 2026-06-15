@@ -56,6 +56,7 @@ pub async fn apply_forwarded_command_with_meta(
             first_seen_ms: current_epoch_millis(),
             applied_rv,
             result_proto,
+            status_stamp: None,
         })
         .await?;
     if inserted {

@@ -542,6 +542,7 @@ async fn outbox_apply_recovers_from_stale_placeholder() {
         first_seen_ms: now_ms - 120_000,
         applied_rv: None,
         result_proto: vec![],
+        status_stamp: None,
     })
     .await
     .expect("insert stale placeholder");
@@ -662,6 +663,7 @@ async fn applied_outbox_gc_prunes_ttl_expired() {
         first_seen_ms: old_ms,
         applied_rv: Some(1),
         result_proto: vec![],
+        status_stamp: None,
     })
     .await
     .expect("insert old record");
@@ -674,6 +676,7 @@ async fn applied_outbox_gc_prunes_ttl_expired() {
         first_seen_ms: recent_ms,
         applied_rv: Some(2),
         result_proto: vec![],
+        status_stamp: None,
     })
     .await
     .expect("insert recent record");
@@ -710,6 +713,7 @@ async fn applied_outbox_gc_does_not_touch_recent() {
             first_seen_ms: now_ms - 11 * 60 * 60 * 1000,
             applied_rv: Some(i),
             result_proto: vec![],
+            status_stamp: None,
         })
         .await
         .expect("insert");
@@ -743,6 +747,7 @@ async fn cleanup_uncommitted_outbox_claim_deletes_only_placeholder_rows() {
         first_seen_ms: 1,
         applied_rv: None,
         result_proto: Vec::new(),
+        status_stamp: None,
     })
     .await
     .expect("insert placeholder");
@@ -753,6 +758,7 @@ async fn cleanup_uncommitted_outbox_claim_deletes_only_placeholder_rows() {
         first_seen_ms: 1,
         applied_rv: Some(42),
         result_proto: vec![1, 2, 3],
+        status_stamp: None,
     })
     .await
     .expect("insert final row");
@@ -802,6 +808,7 @@ async fn applied_outbox_gc_prunes_event_create_and_unknown_operations() {
         first_seen_ms: old_ms,
         applied_rv: Some(1),
         result_proto: vec![],
+        status_stamp: None,
     })
     .await
     .expect("insert event record");
@@ -812,6 +819,7 @@ async fn applied_outbox_gc_prunes_event_create_and_unknown_operations() {
         first_seen_ms: old_ms,
         applied_rv: Some(2),
         result_proto: vec![],
+        status_stamp: None,
     })
     .await
     .expect("insert future record");
@@ -883,6 +891,7 @@ async fn idempotency_survives_gc_replay() {
         first_seen_ms: old_ms,
         applied_rv: Some(1),
         result_proto: vec![],
+        status_stamp: None,
     })
     .await
     .expect("insert old ledger record");

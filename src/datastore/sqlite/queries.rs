@@ -118,14 +118,14 @@ pub(super) const WATCH_EVENTS_GC: &str = "DELETE FROM watch_events
 // ---------------------------------------------------------------------------
 
 pub(super) const APPLIED_OUTBOX_GET: &str = "SELECT idempotency_key, subject_key, operation, \
-     first_seen_ms, applied_rv, result_proto FROM applied_outbox WHERE idempotency_key = ?1";
+     first_seen_ms, applied_rv, result_proto, status_stamp FROM applied_outbox WHERE idempotency_key = ?1";
 
 pub(super) const APPLIED_OUTBOX_LIST_ALL: &str = "SELECT idempotency_key, subject_key, operation, \
-     first_seen_ms, applied_rv, result_proto FROM applied_outbox ORDER BY idempotency_key";
+     first_seen_ms, applied_rv, result_proto, status_stamp FROM applied_outbox ORDER BY idempotency_key";
 
 pub(super) const APPLIED_OUTBOX_INSERT: &str = "INSERT OR IGNORE INTO applied_outbox \
-     (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+     (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
 pub(super) const APPLIED_OUTBOX_UPSERT_EXACT: &str = "INSERT INTO applied_outbox \
      (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp) \

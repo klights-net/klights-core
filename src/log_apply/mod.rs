@@ -418,10 +418,7 @@ impl From<AppliedOutboxRecord> for LogApplyAppliedOutboxRow {
             first_seen_ms: record.first_seen_ms,
             applied_rv: record.applied_rv,
             result_proto: record.result_proto,
-            // AppliedOutboxRecord is the read/snapshot view and does not carry
-            // the status stamp; snapshot restore falls back to no gate until
-            // fresh status snapshots re-establish stamps.
-            status_stamp: None,
+            status_stamp: record.status_stamp,
         }
     }
 }
@@ -435,6 +432,7 @@ impl From<LogApplyAppliedOutboxRow> for AppliedOutboxRecord {
             first_seen_ms: row.first_seen_ms,
             applied_rv: row.applied_rv,
             result_proto: row.result_proto,
+            status_stamp: row.status_stamp,
         }
     }
 }
@@ -1530,5 +1528,24 @@ mod parity_tests {
             decode_commit_protobuf(&encode_commit_protobuf(&commit).unwrap()).unwrap();
         assert_eq!(from_json, commit, "JSON must preserve status_only");
         assert_eq!(from_proto, commit, "protobuf must preserve status_only");
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_applied_outbox_status_stamp() {
+        let record = AppliedOutboxRecord {
+            idempotency_key: "status-key".to_string(),
+            subject_key: "v1:Pod:default:web:uid-1".to_string(),
+            operation: "PodStatus".to_string(),
+            first_seen_ms: 1_700_000_000_000,
+            applied_rv: Some(42),
+            result_proto: vec![1, 2, 3],
+            status_stamp: Some(99),
+        };
+
+        let row: LogApplyAppliedOutboxRow = record.into();
+        assert_eq!(row.status_stamp, Some(99));
+
+        let restored: AppliedOutboxRecord = row.into();
+        assert_eq!(restored.status_stamp, Some(99));
     }
 }

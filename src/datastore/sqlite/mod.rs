@@ -217,6 +217,7 @@ impl Datastore {
                     first_seen_ms: row.get(3)?,
                     applied_rv: row.get(4)?,
                     result_proto: row.get(5)?,
+                    status_stamp: row.get(6)?,
                 })
             })
             .optional()
@@ -236,7 +237,8 @@ impl Datastore {
                     record.operation,
                     record.first_seen_ms,
                     record.applied_rv,
-                    record.result_proto
+                    record.result_proto,
+                    record.status_stamp
                 ],
             )?;
             Ok(changed > 0)
@@ -257,6 +259,7 @@ impl Datastore {
                         first_seen_ms: row.get(3)?,
                         applied_rv: row.get(4)?,
                         result_proto: row.get(5)?,
+                        status_stamp: row.get(6)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -485,6 +488,7 @@ impl Datastore {
                             first_seen_ms: row.get(3)?,
                             applied_rv: row.get(4)?,
                             result_proto: row.get(5)?,
+                            status_stamp: row.get(6)?,
                         })
                     })
                     .optional()?;
@@ -510,7 +514,8 @@ impl Datastore {
                         &claim_operation,
                         now,
                         Option::<i64>::None,
-                        Vec::<u8>::new()
+                        Vec::<u8>::new(),
+                        Option::<i64>::None
                     ],
                 )?;
 
@@ -609,6 +614,7 @@ impl Datastore {
                             first_seen_ms: row.get(3)?,
                             applied_rv: row.get(4)?,
                             result_proto: row.get(5)?,
+                            status_stamp: row.get(6)?,
                         })
                     })
                     .optional()?;
@@ -634,7 +640,8 @@ impl Datastore {
                         &claim_operation,
                         now,
                         Option::<i64>::None,
-                        Vec::<u8>::new()
+                        Vec::<u8>::new(),
+                        Option::<i64>::None
                     ],
                 )?;
                 let mutation = Self::apply_outbox_command_in_tx(
@@ -663,6 +670,7 @@ impl Datastore {
                                 first_seen_ms: row.get(3)?,
                                 applied_rv: row.get(4)?,
                                 result_proto: row.get(5)?,
+                                status_stamp: row.get(6)?,
                             })
                         })
                         .optional()?;

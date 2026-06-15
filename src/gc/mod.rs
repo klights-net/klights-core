@@ -181,6 +181,7 @@ mod tests {
             first_seen_ms: expired_ms,
             applied_rv: Some(1),
             result_proto: vec![],
+            status_stamp: None,
         })
         .await
         .unwrap();
@@ -191,6 +192,7 @@ mod tests {
             first_seen_ms: recent_ms,
             applied_rv: Some(2),
             result_proto: vec![],
+            status_stamp: None,
         })
         .await
         .unwrap();
@@ -201,6 +203,7 @@ mod tests {
             first_seen_ms: expired_ms,
             applied_rv: Some(3),
             result_proto: vec![],
+            status_stamp: None,
         })
         .await
         .unwrap();

@@ -923,6 +923,116 @@ mod tests {
         assert_eq!(loaded.resource_version, applied);
     }
 
+    fn pod_status_payload(status: serde_json::Value, uid: &str, stamp: i64) -> Vec<u8> {
+        use crate::datastore::ResourcePreconditions;
+        use crate::datastore::command::StorageCommand;
+        use crate::kubelet::outbox::payload::OutboxPayload;
+
+        let command = StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web".to_string(),
+            status,
+            expected_rv: None,
+            preconditions: ResourcePreconditions {
+                uid: Some(uid.to_string()),
+                resource_version: None,
+            },
+            observed_status_stamp: Some(stamp),
+        };
+        OutboxPayload::from_command(command)
+            .encode_protobuf()
+            .expect("encode pod status payload")
+    }
+
+    async fn create_pod_for_status_snapshot(db: &crate::datastore::sqlite::Datastore, uid: &str) {
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "web",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"namespace": "default", "name": "web", "uid": uid},
+                "spec": {
+                    "nodeName": "worker-a",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .expect("create pod");
+    }
+
+    async fn pod_status_message(db: &crate::datastore::sqlite::Datastore) -> Option<String> {
+        db.get_resource("v1", "Pod", Some("default"), "web")
+            .await
+            .expect("read pod")
+            .expect("pod exists")
+            .data
+            .pointer("/status/message")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn stale_pod_status_replay_rejected_after_snapshot_install() {
+        let leader = crate::datastore::test_support::in_memory().await;
+        create_pod_for_status_snapshot(&leader, "uid-1").await;
+
+        leader
+            .apply_outbox_transactionally(
+                "status-newer",
+                crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                &pod_status_payload(
+                    serde_json::json!({"phase": "Running", "message": "newer"}),
+                    "uid-1",
+                    200,
+                ),
+                "worker-a",
+            )
+            .await
+            .expect("apply newer status");
+        assert_eq!(pod_status_message(&leader).await.as_deref(), Some("newer"));
+
+        let leader_rv = leader.get_current_resource_version().await.unwrap();
+        let snapshot = generate_snapshot(&leader, 0).await.unwrap();
+
+        let follower = crate::datastore::test_support::in_memory().await;
+        follower
+            .replace_replicated_resource_state(snapshot, leader_rv, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pod_status_message(&follower).await.as_deref(),
+            Some("newer"),
+            "snapshot must carry the live newer status"
+        );
+
+        follower
+            .apply_outbox_transactionally(
+                "status-stale-after-snapshot",
+                crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                &pod_status_payload(
+                    serde_json::json!({"phase": "Running", "message": "stale"}),
+                    "uid-1",
+                    100,
+                ),
+                "worker-a",
+            )
+            .await
+            .expect("stale status replay should complete as a no-op");
+
+        assert_eq!(
+            pod_status_message(&follower).await.as_deref(),
+            Some("newer"),
+            "snapshot restore must preserve applied-outbox status stamps so stale status replays no-op"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_after_rv_is_still_authoritative_for_destructive_restore() {
         let leader = crate::datastore::test_support::in_memory().await;

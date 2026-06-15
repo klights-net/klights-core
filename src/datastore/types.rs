@@ -714,6 +714,8 @@ pub struct AppliedOutboxRecord {
     pub first_seen_ms: i64,
     pub applied_rv: Option<i64>,
     pub result_proto: Vec<u8>,
+    #[serde(default)]
+    pub status_stamp: Option<i64>,
 }
 
 /// Internal-only event emitted by `pod_endpoints` CRUD calls.
