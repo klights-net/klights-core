@@ -127,6 +127,33 @@ pub fn resource_to_seen_key(resource: &crate::datastore::Resource) -> (Option<St
     (namespace, resource.name.clone())
 }
 
+/// Seed a freshly-created [`WatchCursor`] from a selector watch's baseline.
+///
+/// Two establishment-window fixes, applied identically by the built-in and
+/// custom-resource watch builders (the latter previously diverged and missed
+/// both):
+///
+/// * `delivered_rvs` — rvs already emitted to the client as ADDED from the
+///   rv-less baseline list. Marking them delivered lets the live floor stay low
+///   (so a genuinely live ADDED broadcast below the collection rv is not
+///   dropped) without re-delivering the baseline items.
+/// * `low_rv_allowlist` — `((namespace, name), baseline_rv)` for each current
+///   selector member of a `resourceVersion>0` watch. It grants a per-key
+///   exception so a later transition (e.g. a replicated DELETED tombstone whose
+///   broadcast rv lands below the resume floor) still reaches the client.
+pub fn seed_watch_cursor_baseline<S: crate::watch::WatchReplaySource>(
+    cursor: &mut WatchCursor<S>,
+    delivered_rvs: Vec<i64>,
+    low_rv_allowlist: Vec<((Option<String>, String), i64)>,
+) {
+    for rv in delivered_rvs {
+        cursor.mark_delivered(rv);
+    }
+    for ((namespace, name), after_rv) in low_rv_allowlist {
+        cursor.allow_low_rv_for_key(namespace, name, after_rv);
+    }
+}
+
 pub fn apply_selector_transition_event(
     mut event: WatchEvent,
     matches_selector: bool,
@@ -742,14 +769,9 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         };
         let replay_source = DatastoreWatchReplaySource::new(db.clone(), vec![replay_target]);
         let mut cursor = WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv));
-        // Dedup the baseline matches already emitted as ADDED so the
-        // (intentionally lower) live floor does not re-deliver them.
-        for rv in baseline_delivered_rvs {
-            cursor.mark_delivered(rv);
-        }
-        for ((namespace, name), after_rv) in baseline_low_rv_allowlist {
-            cursor.allow_low_rv_for_key(namespace, name, after_rv);
-        }
+        // Dedup baseline ADDEDs and grant per-key low-rv exceptions; shared with
+        // the custom-resource watch builder via `seed_watch_cursor_baseline`.
+        seed_watch_cursor_baseline(&mut cursor, baseline_delivered_rvs, baseline_low_rv_allowlist);
         if requested_rv > 0 {
             match cursor.prime_replay_or_expired().await {
                 Ok(_) => {}

@@ -81,6 +81,35 @@ pub trait CriRuntimeContainerEventStream: Send {
     async fn next_event(&mut self) -> anyhow::Result<Option<CriRuntimeContainerEvent>>;
 }
 
+/// A CRI pod sandbox with the pod identity labels CRI stamped at creation.
+///
+/// Startup/reconnect reconcilers use this to route a *cold* (CRI-present but
+/// untracked) sandbox through actor-owned orphan cleanup, which reclaims the pod
+/// dir, cgroup, and volumes — not just the CRI sandbox. Identity fields are
+/// empty when the sandbox carries no metadata.
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct CriPodSandboxSummary {
+    pub sandbox_id: String,
+    pub namespace: String,
+    pub name: String,
+    pub uid: String,
+}
+
+/// Project a raw CRI `PodSandbox` to a [`CriPodSandboxSummary`], lifting the
+/// pod identity out of its metadata (empty when the sandbox has none).
+fn cri_pod_sandbox_summary_from(sb: k8s_cri::v1::PodSandbox) -> CriPodSandboxSummary {
+    let (namespace, name, uid) = sb
+        .metadata
+        .map(|m| (m.namespace, m.name, m.uid))
+        .unwrap_or_default();
+    CriPodSandboxSummary {
+        sandbox_id: sb.id,
+        namespace,
+        name,
+        uid,
+    }
+}
+
 /// CRI-compatible container runtime port used by `PodRuntimeService`.
 /// Production adapter wraps `SharedCriClient`; tests may model dockerd-like
 /// behavior behind this port.
@@ -107,6 +136,11 @@ pub trait CriRuntime: Send + Sync {
         &self,
         pod_uid_filter: Option<&str>,
     ) -> anyhow::Result<Vec<(String, String)>>;
+
+    /// List all pod sandboxes with the pod identity (namespace/name/uid) CRI
+    /// stamped at creation. Used by startup/reconnect reconcilers so a cold
+    /// (untracked) sandbox can be routed through actor-owned orphan cleanup.
+    async fn list_pod_sandbox_summaries(&self) -> anyhow::Result<Vec<CriPodSandboxSummary>>;
 
     /// Create a container inside a sandbox. Returns the container id.
     async fn create_container(
@@ -245,6 +279,15 @@ impl CriRuntime for SharedCriRuntime {
         Ok(items
             .into_iter()
             .map(|sb| (sb.id, format!("{}", sb.state)))
+            .collect())
+    }
+
+    async fn list_pod_sandbox_summaries(&self) -> anyhow::Result<Vec<CriPodSandboxSummary>> {
+        let mut client = self.shared.client();
+        let items = crate::kubelet::cri::CriClient::list_pod_sandboxes(&mut client, None).await?;
+        Ok(items
+            .into_iter()
+            .map(cri_pod_sandbox_summary_from)
             .collect())
     }
 
@@ -414,6 +457,15 @@ impl CriRuntime for crate::kubelet::cri::CriClient {
         Ok(items
             .into_iter()
             .map(|sb| (sb.id, format!("{}", sb.state)))
+            .collect())
+    }
+
+    async fn list_pod_sandbox_summaries(&self) -> anyhow::Result<Vec<CriPodSandboxSummary>> {
+        let mut client = self.clone();
+        let items = crate::kubelet::cri::CriClient::list_pod_sandboxes(&mut client, None).await?;
+        Ok(items
+            .into_iter()
+            .map(cri_pod_sandbox_summary_from)
             .collect())
     }
 

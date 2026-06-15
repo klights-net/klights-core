@@ -62,17 +62,13 @@ impl StartupReconciler {
             .into_iter()
             .map(|pod| (*pod.data).clone())
             .collect::<Vec<_>>();
-        let sandbox_ids = self
+        let sandboxes = self
             .cri
-            .list_pod_sandboxes(None)
+            .list_pod_sandbox_summaries()
             .await
-            .context("list CRI pod sandboxes")?
-            .into_iter()
-            .map(|(sandbox_id, _state)| sandbox_id)
-            .collect::<Vec<_>>();
+            .context("list CRI pod sandboxes")?;
 
-        let mut actions =
-            plan_startup_actions(true, &runtime_rows, &leader_pods, &sandbox_ids, &[]);
+        let mut actions = plan_startup_actions(true, &runtime_rows, &leader_pods, &sandboxes, &[]);
         let cleanup_intents = self
             .cluster_api
             .list_pod_cleanup_intents_for_node(&self.node_name)
@@ -108,9 +104,14 @@ impl StartupReconciler {
                 StartupAction::FinalizeOrphan { key, reason } => {
                     enqueue_orphan_finalize(self.router.as_ref(), key.clone(), *reason).await?;
                 }
-                StartupAction::KillColdSandbox { sandbox_id } => {
-                    let _ = self.cri.stop_pod_sandbox(sandbox_id).await;
-                    let _ = self.cri.remove_pod_sandbox(sandbox_id).await;
+                StartupAction::KillColdSandbox { sandbox_id, key } => {
+                    crate::kubelet::reconciler::cri_inventory::cleanup_cold_sandbox(
+                        self.router.as_ref(),
+                        self.cri.as_ref(),
+                        sandbox_id,
+                        key.as_ref(),
+                    )
+                    .await?;
                 }
                 StartupAction::DropLocalRows { key } => {
                     self.node_local.delete_pod_runtime_for_uid(&key.uid).await?;
@@ -159,7 +160,7 @@ fn append_cleanup_intent_actions(
 
 #[cfg(test)]
 mod tests {
-    use crate::kubelet::reconciler::cri_inventory::tests::{pod, runtime_row};
+    use crate::kubelet::reconciler::cri_inventory::tests::{pod, runtime_row, sandbox};
     use serde_json::json;
 
     use super::*;
@@ -170,7 +171,7 @@ mod tests {
             true,
             &[runtime_row("old-uid", "default", "web", Some("sb-old"))],
             &[pod("default", "web", "new-uid")],
-            &["sb-old".to_string()],
+            &[sandbox("sb-old", "default", "web", "old-uid")],
             &[],
         );
 
@@ -191,7 +192,7 @@ mod tests {
             false,
             &[runtime_row("uid-a", "default", "web", Some("sb-a"))],
             &[],
-            &["sb-a".to_string()],
+            &[sandbox("sb-a", "default", "web", "uid-a")],
             &[],
         );
 

@@ -214,6 +214,11 @@ mod tests {
         ) -> Result<Vec<(String, String)>> {
             Ok(Vec::new())
         }
+        async fn list_pod_sandbox_summaries(
+            &self,
+        ) -> Result<Vec<crate::kubelet::pod_runtime::cri::CriPodSandboxSummary>> {
+            Ok(Vec::new())
+        }
         async fn create_container(
             &self,
             _container_config: k8s_cri::v1::ContainerConfig,

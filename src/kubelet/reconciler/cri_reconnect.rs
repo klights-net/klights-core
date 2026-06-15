@@ -9,7 +9,7 @@ use crate::kubelet::pod_lifecycle_core::message::LifecycleMessage;
 use crate::kubelet::pod_lifecycle_router::{PodLifecycleRouter, enqueue_orphan_finalize};
 use crate::kubelet::pod_runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use crate::kubelet::reconciler::cri_inventory::{
-    CriContainerInventory, CriInventoryAction, diff_cri_inventory,
+    CriContainerInventory, CriInventoryAction, cleanup_cold_sandbox, diff_cri_inventory,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,22 +67,16 @@ impl CriReconnectReconciler {
             .into_iter()
             .map(|pod| (*pod.data).clone())
             .collect::<Vec<_>>();
-        let sandbox_ids = self
-            .cri
-            .list_pod_sandboxes(None)
-            .await?
-            .into_iter()
-            .map(|(sandbox_id, _)| sandbox_id)
-            .collect::<Vec<_>>();
+        let sandboxes = self.cri.list_pod_sandbox_summaries().await?;
         let mut containers = Vec::new();
-        for sandbox_id in &sandbox_ids {
+        for sandbox in &sandboxes {
             for (container_id, state) in self
                 .container_control
-                .list_containers(Some(sandbox_id))
+                .list_containers(Some(&sandbox.sandbox_id))
                 .await?
             {
                 containers.push(CriContainerInventory {
-                    sandbox_id: sandbox_id.clone(),
+                    sandbox_id: sandbox.sandbox_id.clone(),
                     container_id,
                     state,
                 });
@@ -90,7 +84,7 @@ impl CriReconnectReconciler {
         }
 
         let actions =
-            diff_cri_inventory(true, &runtime_rows, &leader_pods, &sandbox_ids, &containers);
+            diff_cri_inventory(true, &runtime_rows, &leader_pods, &sandboxes, &containers);
         self.apply_actions(&actions).await?;
         Ok(actions)
     }
@@ -101,9 +95,14 @@ impl CriReconnectReconciler {
                 CriInventoryAction::FinalizeOrphan { key, reason } => {
                     enqueue_orphan_finalize(self.router.as_ref(), key.clone(), *reason).await?;
                 }
-                CriInventoryAction::KillColdSandbox { sandbox_id } => {
-                    let _ = self.cri.stop_pod_sandbox(sandbox_id).await;
-                    let _ = self.cri.remove_pod_sandbox(sandbox_id).await;
+                CriInventoryAction::KillColdSandbox { sandbox_id, key } => {
+                    cleanup_cold_sandbox(
+                        self.router.as_ref(),
+                        self.cri.as_ref(),
+                        sandbox_id,
+                        key.as_ref(),
+                    )
+                    .await?;
                 }
                 CriInventoryAction::DropLocalRows { key } => {
                     self.node_local.delete_pod_runtime_for_uid(&key.uid).await?;

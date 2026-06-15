@@ -176,6 +176,20 @@ fn should_retry_service_proxy_transient_failure(method: &axum::http::Method) -> 
         || *method == axum::http::Method::OPTIONS
 }
 
+/// Resolve the `(max_attempts, retry_delay)` for proxying an upstream request.
+///
+/// A transient upstream failure (connection refused / not-ready) is only safe
+/// to retry for idempotent methods; retrying a slow-but-successful mutating
+/// request would duplicate it on the target. Shared by the pod-proxy and
+/// service-proxy readiness-retry paths so both gate retries identically.
+fn proxy_retry_policy(method: &axum::http::Method) -> (usize, std::time::Duration) {
+    if should_retry_service_proxy_transient_failure(method) {
+        (8, std::time::Duration::from_millis(250))
+    } else {
+        (1, std::time::Duration::ZERO)
+    }
+}
+
 /// GET/POST/PUT/DELETE/PATCH /api/v1/namespaces/{ns}/pods/{name}/proxy
 pub async fn pod_proxy(
     State(state): State<Arc<AppState>>,
@@ -314,13 +328,18 @@ async fn pod_proxy_request_with_readiness_retries(
     allow_fallback_8080: bool,
     task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
 ) -> Result<Response, AppError> {
+    // Gate readiness retries to idempotent methods, like the service-proxy path.
+    // The route accepts POST/PUT/PATCH/DELETE; retrying a slow-but-successful
+    // mutating request would duplicate it. The within-attempt 8080 port fallback
+    // is unaffected (it only fires on a connection-level failure).
+    let (max_attempts, retry_delay) = proxy_retry_policy(req.method());
     proxy_request_with_fallback_port_and_retries(
         req,
         target_url,
         allow_fallback_8080,
         8080,
-        8,
-        std::time::Duration::from_millis(250),
+        max_attempts,
+        retry_delay,
         task_supervisor,
     )
     .await
@@ -331,13 +350,7 @@ async fn service_proxy_request_with_readiness_retries(
     target_url: &str,
     task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
 ) -> Result<Response, AppError> {
-    let retry_transient_failure = should_retry_service_proxy_transient_failure(req.method());
-    let max_attempts = if retry_transient_failure { 8 } else { 1 };
-    let retry_delay = if retry_transient_failure {
-        std::time::Duration::from_millis(250)
-    } else {
-        std::time::Duration::ZERO
-    };
+    let (max_attempts, retry_delay) = proxy_retry_policy(req.method());
 
     proxy_request_with_fallback_port_and_retries(
         req,
@@ -1102,4 +1115,29 @@ pub async fn service_proxy_inner(
             namespace, name
         ))
     }))
+}
+
+#[cfg(test)]
+mod retry_policy_tests {
+    use super::proxy_retry_policy;
+    use axum::http::Method;
+
+    #[test]
+    fn idempotent_methods_retry_transient_failures() {
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            let (attempts, delay) = proxy_retry_policy(&method);
+            assert_eq!(attempts, 8, "{method} should retry transient failures");
+            assert_eq!(delay, std::time::Duration::from_millis(250));
+        }
+    }
+
+    #[test]
+    fn mutating_methods_are_not_retried() {
+        // A slow-but-successful POST/PUT/PATCH/DELETE must not be duplicated.
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            let (attempts, delay) = proxy_retry_policy(&method);
+            assert_eq!(attempts, 1, "{method} must not retry (non-idempotent)");
+            assert_eq!(delay, std::time::Duration::ZERO);
+        }
+    }
 }

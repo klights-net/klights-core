@@ -346,6 +346,26 @@ impl crate::kubelet::pod_runtime::cri::CriRuntime for MockCriRuntime {
             .collect())
     }
 
+    async fn list_pod_sandbox_summaries(
+        &self,
+    ) -> anyhow::Result<Vec<crate::kubelet::pod_runtime::cri::CriPodSandboxSummary>> {
+        self.record(MockCriOperation::ListPodSandboxes(None))?;
+        Ok(self
+            .pod_sandboxes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, namespace, name, uid, _state)| {
+                crate::kubelet::pod_runtime::cri::CriPodSandboxSummary {
+                    sandbox_id: id.clone(),
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    uid: uid.clone(),
+                }
+            })
+            .collect())
+    }
+
     async fn create_container(
         &self,
         container_config: ContainerConfig,

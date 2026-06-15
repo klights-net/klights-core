@@ -6082,3 +6082,341 @@ spec:
         "paginated CRD pages must keep the snapshot resourceVersion"
     );
 }
+
+/// Register a single-version Namespaced CRD `selws.selwatch.example.com`
+/// (kind `Selw`) used by the custom-resource selector-watch regressions.
+async fn register_selw_crd(app: &axum::Router) {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    let crd = serde_json::json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "selws.selwatch.example.com"},
+        "spec": {
+            "group": "selwatch.example.com",
+            "scope": "Namespaced",
+            "names": {"plural": "selws", "singular": "selw", "kind": "Selw"},
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}
+            }]
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/apiextensions.k8s.io/v1/customresourcedefinitions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&crd).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+/// Regression (CR watch builder bug 1): an rv-less label-selector custom-resource
+/// watch must keep its live-delivery floor at 0 so a genuinely live ADDED whose
+/// replicated commit broadcasts below the establishment floor still reaches the
+/// client. The divergent CR builder previously pinned the floor to
+/// `rv_less_floor`, dropping it — the fix the built-in path already had.
+#[tokio::test]
+async fn test_rv_less_selector_cr_watch_delivers_live_added_below_establishment_floor() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    let namespace = "crd-rvless-low-added";
+    let mk = |method: &str, uri: String, body: Option<Vec<u8>>| {
+        let mut request = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            request = request.header("content-type", "application/json");
+        }
+        request
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap()
+    };
+
+    let ns_resp = app
+        .clone()
+        .oneshot(mk(
+            "POST",
+            "/api/v1/namespaces".to_string(),
+            Some(
+                serde_json::to_vec(&json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {"name": namespace}
+                }))
+                .unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+    register_selw_crd(&app).await;
+
+    let floor = db
+        .advance_resource_version_after(
+            db.get_current_resource_version()
+                .await
+                .unwrap()
+                .saturating_add(20),
+        )
+        .await
+        .unwrap();
+
+    let watch_resp = app
+        .clone()
+        .oneshot(mk(
+            "GET",
+            format!(
+                "/apis/selwatch.example.com/v1/namespaces/{namespace}/selws?watch=true&labelSelector=race%3Dbelow-floor"
+            ),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+    let mut stream = watch_resp.into_body().into_data_stream();
+    // Park on the live cursor after the empty baseline list.
+    let _ = tokio::time::timeout(Duration::from_millis(200), stream.next()).await;
+
+    let create_rv = floor - 1;
+    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(
+        &crate::datastore::Resource {
+            id: 0,
+            api_version: "selwatch.example.com/v1".into(),
+            kind: "Selw".into(),
+            namespace: Some(namespace.to_string()),
+            name: "live-low".into(),
+            uid: "selw-low-added".into(),
+            resource_version: create_rv,
+            data: Arc::new(json!({
+                "apiVersion": "selwatch.example.com/v1",
+                "kind": "Selw",
+                "metadata": {
+                    "name": "live-low",
+                    "namespace": namespace,
+                    "uid": "selw-low-added",
+                    "labels": {"race": "below-floor"}
+                }
+            })),
+        },
+    ))
+    .await
+    .expect("replicated CR create below establishment floor");
+
+    let mut saw_added = false;
+    for _ in 0..6 {
+        let chunk = match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            _ => break,
+        };
+        for line in chunk.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let event: serde_json::Value = serde_json::from_slice(line).unwrap();
+            if event["type"] == "ADDED"
+                && event
+                    .pointer("/object/metadata/name")
+                    .and_then(|v| v.as_str())
+                    == Some("live-low")
+            {
+                saw_added = true;
+                break;
+            }
+        }
+        if saw_added {
+            break;
+        }
+    }
+    assert!(
+        saw_added,
+        "rv-less selector CR watch must deliver live ADDED rv={create_rv} below establishment floor rv={floor}"
+    );
+}
+
+/// Regression (CR watch builder bug 2): a `resourceVersion>0` label-selector
+/// custom-resource watch must register its baseline members and grant each a
+/// per-key low-rv exception, so a below-floor DELETED tombstone for a baseline
+/// member still reaches the client. The divergent CR builder had no allowlist,
+/// so the tombstone was silently swallowed and the client kept a phantom member.
+#[tokio::test]
+async fn test_rv_selector_cr_watch_delivers_baseline_delete_below_floor() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    let namespace = "crd-selector-low-rv-delete";
+    let mk = |method: &str, uri: String, body: Option<Vec<u8>>| {
+        let mut request = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            request = request.header("content-type", "application/json");
+        }
+        request
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap()
+    };
+
+    let ns_resp = app
+        .clone()
+        .oneshot(mk(
+            "POST",
+            "/api/v1/namespaces".to_string(),
+            Some(
+                serde_json::to_vec(&json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {"name": namespace}
+                }))
+                .unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+    register_selw_crd(&app).await;
+
+    let create_rv = db.get_current_resource_version().await.unwrap() + 1;
+    let cr = crate::datastore::Resource {
+        id: 0,
+        api_version: "selwatch.example.com/v1".into(),
+        kind: "Selw".into(),
+        namespace: Some(namespace.into()),
+        name: "watched".into(),
+        uid: "selw-low-rv-delete".into(),
+        resource_version: create_rv,
+        data: Arc::new(json!({
+            "apiVersion": "selwatch.example.com/v1",
+            "kind": "Selw",
+            "metadata": {
+                "name": "watched",
+                "namespace": namespace,
+                "uid": "selw-low-rv-delete",
+                "labels": {"race": "below-floor"}
+            }
+        })),
+    };
+    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::put_resource(&cr))
+        .await
+        .expect("replicated CR create apply");
+
+    let inflated_rv = db
+        .advance_resource_version_after(create_rv + 20)
+        .await
+        .expect("inflate global rv");
+    assert!(inflated_rv > create_rv);
+
+    let list_resp = app
+        .clone()
+        .oneshot(mk(
+            "GET",
+            format!(
+                "/apis/selwatch.example.com/v1/namespaces/{namespace}/selws?labelSelector=race%3Dbelow-floor&limit=500&resourceVersion=0"
+            ),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+    let list_json: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    assert_eq!(
+        list_json
+            .pointer("/items/0/metadata/name")
+            .and_then(|v| v.as_str()),
+        Some("watched")
+    );
+    let list_rv = list_json
+        .pointer("/metadata/resourceVersion")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<i64>().ok())
+        .expect("list resourceVersion");
+    assert!(list_rv > create_rv);
+
+    let watch_resp = app
+        .clone()
+        .oneshot(mk(
+            "GET",
+            format!(
+                "/apis/selwatch.example.com/v1/namespaces/{namespace}/selws?watch=true&resourceVersion={list_rv}&labelSelector=race%3Dbelow-floor"
+            ),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+    let mut stream = watch_resp.into_body().into_data_stream();
+    let reader = tokio::spawn(async move {
+        let mut seen = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some(Ok(chunk))) =
+                tokio::time::timeout(Duration::from_millis(500), stream.next()).await
+            else {
+                continue;
+            };
+            for line in chunk.split(|byte| *byte == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let event: serde_json::Value = serde_json::from_slice(line).unwrap();
+                if event
+                    .pointer("/object/metadata/name")
+                    .and_then(|v| v.as_str())
+                    != Some("watched")
+                {
+                    continue;
+                }
+                let ty = event["type"].as_str().unwrap_or("").to_string();
+                seen.push(ty.clone());
+                if ty == "DELETED" {
+                    return seen;
+                }
+            }
+        }
+        seen
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let delete_rv = list_rv - 1;
+    assert!(delete_rv > create_rv);
+    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
+        delete_rv,
+        vec![crate::log_apply::LogApplyMutation::DeleteResource(
+            crate::log_apply::LogApplyResourceKey {
+                api_version: "selwatch.example.com/v1".to_string(),
+                kind: "Selw".to_string(),
+                namespace: Some(namespace.to_string()),
+                name: "watched".to_string(),
+                uid: "selw-low-rv-delete".to_string(),
+                precondition_resource_version: None,
+            },
+        )],
+    ))
+    .await
+    .expect("replicated CR delete below list rv");
+
+    let seen = reader.await.expect("watch reader task");
+    assert!(
+        seen.iter().any(|ty| ty == "DELETED"),
+        "rv>0 selector CR watch from list rv={list_rv} must deliver delete rv={delete_rv} for baseline member; saw {seen:?}"
+    );
+}

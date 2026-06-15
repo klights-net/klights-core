@@ -630,26 +630,22 @@ async fn list_cr_inner(
         // `build_label_selector_watch_stream` for the full rationale). A
         // selector-less rv-less custom-resource watch starts "from now" — pin
         // `requested_rv` to the floor. A selector rv-less watch must instead
-        // keep `requested_rv <= 0` (so the stream emits existing matches as a
-        // baseline ADDED list) and anchor the live-delivery floor to this
-        // pre-subscribe rv via `rv_less_floor`. Anchoring the live floor to the
-        // post-subscribe collection rv (or to `requested_rv = floor`) drops the
-        // ADDED of a matching object whose rv is at/below the floor — the
-        // object committed before the floor read but whose post-commit live
-        // broadcast arrives below it — which is the flaky
-        // `[sig-api-machinery] CustomResourceFieldSelectors MUST list and watch`
-        // conformance failure under parallel load + replication latency.
-        let mut rv_less_floor: i64 = 0;
+        // keep `requested_rv <= 0` so the stream emits existing matches as a
+        // baseline ADDED list AND keeps the live-delivery floor at 0; the
+        // baseline rvs are deduped via the cursor seed, and a numeric floor (a
+        // pre-subscribe rv or the post-subscribe collection rv) would drop the
+        // ADDED of a matching object whose rv is at/below the floor — the object
+        // committed before the floor read but whose post-commit live broadcast
+        // arrives below it — which is the flaky `[sig-api-machinery]
+        // CustomResourceFieldSelectors MUST list and watch` conformance failure
+        // under parallel load + replication latency.
         if requested_rv <= 0
             && !send_initial_events
+            && !has_selector
             && let Ok(floor) = state.db.get_current_resource_version().await
             && floor > 0
         {
-            if has_selector {
-                rv_less_floor = floor;
-            } else {
-                requested_rv = floor;
-            }
+            requested_rv = floor;
         }
 
         let rx = state.db.subscribe_watch_many(crd_watch_topics(
@@ -704,6 +700,11 @@ async fn list_cr_inner(
             // selector baseline list below; used to seed the cursor so the
             // (intentionally low) live floor does not re-deliver them.
             let mut baseline_delivered_rvs: Vec<i64> = Vec::new();
+            // Per-key low-rv exceptions for the current selector members of a
+            // resourceVersion>0 watch; seeds the cursor so a below-floor live
+            // transition (e.g. a replicated DELETED tombstone) still reaches the
+            // client. Mirrors `build_label_selector_watch_stream`.
+            let mut baseline_low_rv_allowlist: Vec<((Option<String>, String), i64)> = Vec::new();
             if send_initial_events {
                 if let Some(conversion) = conversion_for_watch.as_ref() {
                     let initial_list = gather_custom_resources_across_served_versions(
@@ -884,13 +885,13 @@ async fn list_cr_inner(
                         yield Ok::<_, std::convert::Infallible>(json);
                     }
                 }
-                // Anchor the live-delivery floor to the pre-subscribe rv — NOT a
-                // max-baseline-item rv (a freshly created match can carry a
-                // lower rv than a recently-modified existing match) and NOT a
-                // post-subscribe collection rv. Baseline items are deduped via
-                // the cursor seed below so the lower floor cannot re-deliver
-                // them.
-                initial_list_rv = rv_less_floor;
+                // Keep the live-delivery floor at 0 (requested_rv <= 0 here): the
+                // baseline items just emitted are deduped by exact rv via the
+                // cursor seed below, so no numeric floor is needed. Anchoring the
+                // floor to a pre-subscribe rv (`rv_less_floor`) or a
+                // post-subscribe collection rv can drop a genuinely live ADDED
+                // whose replicated commit broadcasts after establishment with a
+                // lower rv — the same regression fixed on the built-in path.
             } else if requested_rv > 0 {
                 let missed = if let Some(conversion) = conversion_for_watch.as_ref() {
                     gather_custom_resource_events_across_served_versions(
@@ -959,6 +960,60 @@ async fn list_cr_inner(
                         yield Ok::<_, std::convert::Infallible>(json);
                     }
                 }
+
+                // Register the current selector members and grant each a per-key
+                // low-rv exception, mirroring `build_label_selector_watch_stream`.
+                // Without this, a resourceVersion>0 selector CR watch never
+                // tracks baseline membership, so a later below-floor transition
+                // (e.g. a replicated DELETED tombstone broadcast with rv <
+                // requested_rv) is swallowed — the client keeps a phantom member.
+                if has_selector {
+                    let members = if let Some(conversion) = conversion_for_watch.as_ref() {
+                        gather_custom_resources_across_served_versions(
+                            db.as_ref(),
+                            conversion,
+                            &group_for_watch,
+                            &kind,
+                            watch_ns.clone(),
+                            label_selector.clone(),
+                        )
+                        .await
+                        .map(|(items, _)| items)
+                    } else {
+                        db.list_resources(
+                            &av,
+                            &kind,
+                            watch_ns.as_deref(),
+                            crate::datastore::ResourceListQuery::new(
+                                label_selector.as_deref(),
+                                field_selector.as_deref(),
+                                None,
+                                None,
+                            ),
+                        )
+                        .await
+                        .map(|list| list.items)
+                        .map_err(AppError::from)
+                    };
+                    if let Ok(members) = members {
+                        for resource in members {
+                            // `gather` applies only the label selector; the field
+                            // selector still has to be matched for conversion CRDs
+                            // (the non-conversion list already applied both).
+                            if conversion_for_watch.is_some()
+                                && !crate::api::watch_stream::object_matches_field_selector(
+                                    &resource.data,
+                                    field_selector.as_deref(),
+                                )
+                            {
+                                continue;
+                            }
+                            let key = crate::api::watch_stream::resource_to_seen_key(&resource);
+                            matched_selector_keys.insert(key.clone());
+                            baseline_low_rv_allowlist.push((key, resource.resource_version));
+                        }
+                    }
+                }
             }
 
             let watch_versions =
@@ -993,11 +1048,13 @@ async fn list_cr_inner(
                 replay_targets,
             );
             let mut cursor = WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv));
-            // Dedup the baseline matches already emitted as ADDED so the
-            // (intentionally low) rv-less live floor cannot re-deliver them.
-            for rv in &baseline_delivered_rvs {
-                cursor.mark_delivered(*rv);
-            }
+            // Dedup baseline ADDEDs and grant per-key low-rv exceptions; shared
+            // with the built-in watch builder via `seed_watch_cursor_baseline`.
+            crate::api::watch_stream::seed_watch_cursor_baseline(
+                &mut cursor,
+                baseline_delivered_rvs,
+                baseline_low_rv_allowlist,
+            );
             let bookmark_task_name = format!(
                 "{}_watch_bookmarks_{}_{}",
                 task_prefix, group_for_watch, plural_for_watch
