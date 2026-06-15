@@ -402,6 +402,31 @@ async fn watch_cursor_ordered_replay_keeps_live_jump_when_replay_omits_it() {
 }
 
 #[tokio::test]
+async fn watch_cursor_ordered_replay_does_not_expire_rv_less_watch() {
+    let (tx, rx) = broadcast::channel(8);
+    let replay_source = WindowedReplaySource { earliest: Some(6) };
+    let mut cursor = WatchCursor::new(rx, replay_source, 0).with_ordered_replay();
+
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "frontend",
+            "namespace": "default",
+            "resourceVersion": "12"
+        }
+    })))
+    .unwrap();
+
+    let supervisor = test_task_supervisor();
+    let event = cursor
+        .next_event(&supervisor)
+        .await
+        .expect("rv-less watches must not expire from the retained history floor");
+    assert_eq!(event.resource_version(), Some(12));
+}
+
+#[tokio::test]
 async fn watch_cursor_target_field_selector_skips_nonmatching_pods_only() {
     let (tx, rx) = broadcast::channel(8);
     let replay_source = FixedReplaySource::new(Vec::new());

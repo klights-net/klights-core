@@ -143,11 +143,13 @@ impl<S: WatchReplaySource> WatchCursor<S> {
     }
 
     /// Preserve client-facing Kubernetes watch ordering by replaying durable
-    /// history before emitting a live event that jumped past the processed
-    /// floor. Internal controllers may intentionally use the default recovery
-    /// behavior, which can accept late lower-RV live events.
+    /// history before emitting a live event that jumped past a positive
+    /// processed floor. RV-less watches have no continuity contract from RV 0,
+    /// so they keep the default live behavior until a replay/list floor exists.
+    /// Internal controllers may intentionally use the default recovery behavior,
+    /// which can accept late lower-RV live events.
     pub fn with_ordered_replay(mut self) -> Self {
-        self.ordered_replay = true;
+        self.ordered_replay = self.floor_rv > 0;
         self
     }
 
