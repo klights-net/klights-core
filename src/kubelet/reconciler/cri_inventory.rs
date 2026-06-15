@@ -145,6 +145,66 @@ pub fn diff_cri_inventory(
     actions
 }
 
+/// Pure: given on-disk pod artifact dir ids (`<namespace>_<name>`) and the set
+/// of live `(namespace, name)` slots, return the dir ids that belong to no live
+/// pod. Dirs whose name does not match the `<ns>_<name>` layout are never
+/// returned (conservative: an unrecognized dir is left untouched). Kubernetes
+/// namespace and pod names cannot contain `_`, so the first `_` unambiguously
+/// separates the two segments.
+pub fn orphaned_pod_dir_ids(
+    dir_ids: &[String],
+    live_slots: &HashSet<(String, String)>,
+) -> Vec<String> {
+    dir_ids
+        .iter()
+        .filter(|id| match id.split_once('_') {
+            Some((ns, name)) if !ns.is_empty() && !name.is_empty() => {
+                !live_slots.contains(&(ns.to_string(), name.to_string()))
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Startup-only on-disk GC for leaked pod artifact dirs. After a crash where a
+/// CRI sandbox lost its identity stamp (or any path that left a pod dir behind
+/// without a tracked sandbox/row), the pod's `volumes/` mounts and root dir can
+/// leak permanently — nothing else ever revisits the directory. At startup the
+/// full live set (leader pods ∪ CRI sandboxes ∪ runtime rows) is authoritatively
+/// known and no new pods are being created yet, so removing dirs with no live
+/// owner is race-free. Each orphan's `volumes/` mounts are lazily unmounted
+/// before the recursive root removal, so it never deletes over a live mount.
+/// Returns the number of orphan dirs removed.
+pub async fn sweep_orphan_pod_artifacts(
+    containerd_ns: &str,
+    live_slots: &HashSet<(String, String)>,
+) -> anyhow::Result<usize> {
+    let pods_root = crate::paths::volumes_root_path(containerd_ns);
+    let dir_ids = crate::kubelet::pod_fs::PodFs::list_subdir_names(pods_root.clone()).await?;
+
+    let orphans = orphaned_pod_dir_ids(&dir_ids, live_slots);
+    let mut removed = 0usize;
+    for dir_id in &orphans {
+        let pod_root = pods_root.join(dir_id);
+        let volumes_dir = pod_root.join("volumes");
+        if let Err(e) =
+            crate::kubelet::volumes::unmount_volume_mounts_under(&volumes_dir.to_string_lossy())
+                .await
+        {
+            tracing::warn!(dir = %dir_id, "orphan pod artifact sweep: unmount failed, skipping: {e:#}");
+            continue;
+        }
+        if let Err(e) = crate::utils::remove_dir_all_if_exists_async(&pod_root).await {
+            tracing::warn!(dir = %dir_id, "orphan pod artifact sweep: remove failed, skipping: {e:#}");
+            continue;
+        }
+        removed += 1;
+        tracing::info!(dir = %dir_id, "orphan pod artifact sweep: removed leaked pod dir with no live owner");
+    }
+    Ok(removed)
+}
+
 /// Tear down a cold (CRI-present but untracked) sandbox surfaced by
 /// [`CriInventoryAction::KillColdSandbox`].
 ///
@@ -210,6 +270,30 @@ pub mod tests {
             "metadata": {"namespace": namespace, "name": name, "uid": uid},
             "spec": {"nodeName": "worker-a", "containers": [{"name": "app", "image": "nginx"}]},
         })
+    }
+
+    #[test]
+    fn orphaned_pod_dir_ids_keeps_live_and_returns_orphans() {
+        // B3: a startup on-disk sweep must remove pod artifact dirs with no live
+        // owner (leaked after a crash that lost the CRI identity stamp) while
+        // never touching live dirs or dirs whose layout it does not recognize.
+        let mut live = HashSet::new();
+        live.insert(("default".to_string(), "web".to_string()));
+        let dirs = vec![
+            "default_web".to_string(),         // live -> kept
+            "default_gone".to_string(),        // orphan
+            "kube-system_coredns".to_string(), // orphan
+            "no-separator".to_string(),        // unrecognized layout -> never touched
+        ];
+        let mut orphans = super::orphaned_pod_dir_ids(&dirs, &live);
+        orphans.sort();
+        assert_eq!(
+            orphans,
+            vec![
+                "default_gone".to_string(),
+                "kube-system_coredns".to_string()
+            ]
+        );
     }
 
     #[test]

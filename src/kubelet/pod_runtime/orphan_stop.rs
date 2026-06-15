@@ -106,7 +106,6 @@ impl RealPodRuntimeService {
             }
             let _ = self.cri.stop_pod_sandbox(sandbox_id).await;
             let _ = self.cri.remove_pod_sandbox(sandbox_id).await;
-            let _ = self.filesystem.cleanup_cgroup(key, sandbox_id).await;
             let _ = self.network.release_sandbox_network(key, sandbox_id).await;
         }
         if !sandbox_ids.is_empty() {

@@ -6,7 +6,9 @@ use tokio::sync::mpsc;
 use crate::control_plane::client::{CacheScope, LeaderApiClient};
 use crate::datastore::node_local::NodeLocalHandle;
 use crate::kubelet::pod_lifecycle_core::message::LifecycleMessage;
-use crate::kubelet::pod_lifecycle_router::{PodLifecycleRouter, enqueue_orphan_finalize};
+use crate::kubelet::pod_lifecycle_router::{
+    OrphanReason, PodLifecycleRouter, enqueue_orphan_finalize,
+};
 use crate::kubelet::pod_runtime::cri::{ContainerRuntimeControl, CriRuntime};
 use crate::kubelet::reconciler::cri_inventory::{
     CriContainerInventory, CriInventoryAction, cleanup_cold_sandbox, diff_cri_inventory,
@@ -105,6 +107,17 @@ impl CriReconnectReconciler {
                     .await?;
                 }
                 CriInventoryAction::DropLocalRows { key } => {
+                    // The sandbox is gone from CRI and the leader has no Pod, but
+                    // on-disk artifacts (volumes, cgroup, pod dir) may still be
+                    // present. Reclaim them via actor-owned orphan finalize — the
+                    // cleanup is UID-keyed and idempotent, so it works whether or
+                    // not the bookkeeping rows still exist — then drop the rows.
+                    enqueue_orphan_finalize(
+                        self.router.as_ref(),
+                        key.clone(),
+                        OrphanReason::LeaderDeletedWhileDown,
+                    )
+                    .await?;
                     self.node_local.delete_pod_runtime_for_uid(&key.uid).await?;
                     self.node_local.delete_endpoint_for_uid(&key.uid).await?;
                 }

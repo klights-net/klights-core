@@ -960,11 +960,10 @@ impl crate::kubelet::pod_runtime::filesystem::PodFilesystem for MockPodFilesyste
     async fn cleanup_cgroup(
         &self,
         key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
-        sandbox_id: &str,
     ) -> anyhow::Result<()> {
         self.calls.lock().unwrap().push(format!(
-            "cleanup_cgroup:{}/{}/{}/{}",
-            key.namespace, key.name, key.uid, sandbox_id
+            "cleanup_cgroup:{}/{}/{}",
+            key.namespace, key.name, key.uid
         ));
         Ok(())
     }

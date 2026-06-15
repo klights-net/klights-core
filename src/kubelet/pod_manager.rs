@@ -337,6 +337,7 @@ async fn run_pod_watcher_with_runtime(
     if let Some(node_local) = state.node_local.clone() {
         let reconciler = crate::kubelet::reconciler::startup::StartupReconciler::new(
             config.node_name.clone(),
+            config.containerd_namespace.clone(),
             state.cluster_api.clone(),
             node_local.clone(),
             cri_runtime.clone(),

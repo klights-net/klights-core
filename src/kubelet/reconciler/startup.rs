@@ -16,6 +16,7 @@ pub use crate::kubelet::reconciler::cri_inventory::{
 
 pub struct StartupReconciler {
     node_name: String,
+    containerd_ns: String,
     cluster_api: Arc<dyn LeaderApiClient>,
     node_local: NodeLocalHandle,
     cri: Arc<dyn CriRuntime>,
@@ -25,6 +26,7 @@ pub struct StartupReconciler {
 impl StartupReconciler {
     pub fn new(
         node_name: String,
+        containerd_ns: String,
         cluster_api: Arc<dyn LeaderApiClient>,
         node_local: NodeLocalHandle,
         cri: Arc<dyn CriRuntime>,
@@ -32,6 +34,7 @@ impl StartupReconciler {
     ) -> Self {
         Self {
             node_name,
+            containerd_ns,
             cluster_api,
             node_local,
             cri,
@@ -67,6 +70,38 @@ impl StartupReconciler {
             .list_pod_sandbox_summaries()
             .await
             .context("list CRI pod sandboxes")?;
+
+        // B3: reclaim leaked on-disk pod artifact dirs (volumes + root) whose
+        // (namespace, name) slot belongs to no live pod — leader Pod, CRI
+        // sandbox, or node-local runtime row. Safe to delete here because the
+        // full live set is known and no new pods are being created yet.
+        let live_slots: std::collections::HashSet<(String, String)> = runtime_rows
+            .iter()
+            .map(|row| (row.namespace.clone(), row.pod_name.clone()))
+            .chain(
+                sandboxes
+                    .iter()
+                    .map(|s| (s.namespace.clone(), s.name.clone())),
+            )
+            .chain(leader_pods.iter().filter_map(|pod| {
+                let meta = pod.get("metadata")?;
+                let ns = meta.get("namespace")?.as_str()?;
+                let name = meta.get("name")?.as_str()?;
+                Some((ns.to_string(), name.to_string()))
+            }))
+            .collect();
+        match crate::kubelet::reconciler::cri_inventory::sweep_orphan_pod_artifacts(
+            &self.containerd_ns,
+            &live_slots,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(removed) => {
+                tracing::info!(removed, "startup reconcile swept leaked pod artifact dirs")
+            }
+            Err(err) => tracing::warn!("startup orphan pod artifact sweep failed: {err:#}"),
+        }
 
         let mut actions = plan_startup_actions(true, &runtime_rows, &leader_pods, &sandboxes, &[]);
         let cleanup_intents = self
@@ -114,6 +149,17 @@ impl StartupReconciler {
                     .await?;
                 }
                 StartupAction::DropLocalRows { key } => {
+                    // The sandbox is gone from CRI and the leader has no Pod, but
+                    // on-disk artifacts (volumes, cgroup, pod dir) may still be
+                    // present. Reclaim them via actor-owned orphan finalize — the
+                    // cleanup is UID-keyed and idempotent, so it works whether or
+                    // not the bookkeeping rows still exist — then drop the rows.
+                    enqueue_orphan_finalize(
+                        self.router.as_ref(),
+                        key.clone(),
+                        OrphanReason::LeaderDeletedWhileDown,
+                    )
+                    .await?;
                     self.node_local.delete_pod_runtime_for_uid(&key.uid).await?;
                     self.node_local.delete_endpoint_for_uid(&key.uid).await?;
                 }

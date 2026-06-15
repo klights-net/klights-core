@@ -230,6 +230,68 @@ async fn leader_batch_respects_subject_fifo() {
     );
 }
 
+#[tokio::test]
+async fn batch_claim_blocks_younger_same_subject_while_older_leased() {
+    // Lost-update regression (D1/A1/C1): the batch claim must enforce the SAME
+    // strict per-subject single-in-flight invariant as the single-row claim.
+    // While an older same-subject row is leased (in-flight on a slow WAN apply),
+    // a younger same-subject row must NOT be claimable — otherwise two snapshots
+    // for one Pod go in flight concurrently and can apply in raft order != stamp
+    // order, clobbering the newer status.
+    use crate::datastore::node_local::OutboxInsert;
+
+    let node_db = node_db().await;
+    let subject = "v1/Pod/default/web/uid-web";
+    let insert = |key: &str, enqueued: i64| OutboxInsert {
+        idempotency_key: key.to_string(),
+        enqueued_ms: enqueued,
+        subject_key: subject.to_string(),
+        subject_api_version: "v1".to_string(),
+        subject_kind: "Pod".to_string(),
+        subject_namespace: Some("default".to_string()),
+        subject_name: "web".to_string(),
+        subject_uid: Some("uid-web".to_string()),
+        pod_uid: "uid-web".to_string(),
+        operation: OutboxOperation::PodStatus.as_str().to_string(),
+        payload_proto: Vec::new(),
+        next_due_ms: enqueued,
+    };
+    // Older row A, then younger row B, same subject.
+    node_db
+        .enqueue_outbox(insert("older-A", 100))
+        .await
+        .unwrap();
+    node_db
+        .enqueue_outbox(insert("younger-B", 101))
+        .await
+        .unwrap();
+
+    let now = 200i64;
+    // First batch claims only the oldest row A and leases it for a long time
+    // (simulating an in-flight apply that hasn't completed/acked yet).
+    let first = node_db
+        .claim_due_outbox_batch(now, 16, 10_000, "dispatcher-1")
+        .await
+        .expect("first batch claim");
+    assert_eq!(first.len(), 1, "only oldest per subject claimed");
+    assert_eq!(first[0].idempotency_key, "older-A");
+
+    // Second batch while A is still leased: B must remain blocked, because an
+    // older same-subject row still exists. Current buggy SQL claims B here.
+    let second = node_db
+        .claim_due_outbox_batch(now + 1, 16, 10_000, "dispatcher-2")
+        .await
+        .expect("second batch claim");
+    assert!(
+        second.is_empty(),
+        "younger same-subject row must not be claimed while older is leased/in-flight, got {:?}",
+        second
+            .iter()
+            .map(|r| &r.idempotency_key)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// Client that simulates a crash after cluster apply but before
 /// node-db complete. First call succeeds (simulates cluster apply),
 /// second call for the same key returns AlreadyApplied (ledger replay).

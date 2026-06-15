@@ -31,8 +31,10 @@ pub trait PodFilesystem: Send + Sync {
         exit_code: i32,
     ) -> String;
 
-    /// Clean up cgroup for a pod sandbox.
-    async fn cleanup_cgroup(&self, key: &PodRuntimeKey, sandbox_id: &str) -> anyhow::Result<()>;
+    /// Clean up the pod cgroup tree. UID-keyed and idempotent — derives the
+    /// cgroup path purely from `key.uid`, so it is safe to run on every stop
+    /// path regardless of whether a sandbox could be resolved.
+    async fn cleanup_cgroup(&self, key: &PodRuntimeKey) -> anyhow::Result<()>;
 
     /// Apply fsGroup to pod volumes.
     async fn apply_fs_group(
@@ -157,8 +159,7 @@ impl PodFilesystem for RealPodFilesystem {
         .await
     }
 
-    async fn cleanup_cgroup(&self, key: &PodRuntimeKey, sandbox_id: &str) -> anyhow::Result<()> {
-        let _ = sandbox_id;
+    async fn cleanup_cgroup(&self, key: &PodRuntimeKey) -> anyhow::Result<()> {
         crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup(&self.containerd_ns, &key.uid).await?;
         Ok(())
     }

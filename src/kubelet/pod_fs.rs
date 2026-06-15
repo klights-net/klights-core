@@ -19,6 +19,30 @@ impl PodFs {
         .await
     }
 
+    /// List the immediate subdirectory names under `root` (supervised blocking
+    /// fs read). Returns an empty vec when `root` does not exist. Used by the
+    /// startup orphan-pod-artifact sweep to enumerate `<ns>_<name>` pod dirs.
+    pub async fn list_subdir_names(root: PathBuf) -> Result<Vec<String>> {
+        crate::kubelet::file_blocking::run_blocking_file("podfs_list_subdir_names", move || {
+            let mut names = Vec::new();
+            match std::fs::read_dir(&root) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if entry.path().is_dir()
+                            && let Some(name) = entry.file_name().to_str()
+                        {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(anyhow::anyhow!("read dir {}: {e}", root.display())),
+            }
+            Ok(names)
+        })
+        .await
+    }
+
     /// Ensure termination log file exists with mode 0o666. Always returns the path.
     pub async fn ensure_termination_log(path: PathBuf) -> String {
         let ret = path.to_string_lossy().into_owned();

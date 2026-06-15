@@ -556,7 +556,7 @@ async fn mock_filesystem_records_hosts_logs_cgroups_and_fsgroup() {
         fs.read_termination_message(&key, "app", "File", 0).await,
         "done"
     );
-    fs.cleanup_cgroup(&key, "sb-1").await.unwrap();
+    fs.cleanup_cgroup(&key).await.unwrap();
     fs.apply_fs_group(&key, &pod).await.unwrap();
     fs.cleanup_pod_filesystem(&key).await.unwrap();
 
@@ -3339,6 +3339,32 @@ async fn real_runtime_stop_orphan_pod_cleans_volumes() {
     );
 }
 
+/// C4/B2 regression: cgroup teardown is UID-keyed and idempotent, so it must run
+/// on every stop path via `cleanup_pod_local_artifacts` — even when no sandbox
+/// can be resolved (CRI unreachable, store row gone). Previously cgroup cleanup
+/// was gated inside the per-sandbox loop, so a no-sandbox stop leaked the pod
+/// cgroup tree.
+#[tokio::test]
+async fn real_runtime_stop_pod_cleans_cgroup_even_without_sandbox() {
+    let harness = PodRuntimeHarness::new().await;
+    let key = PodRuntimeKey::new("ns", "nocg", "uid-nocg");
+
+    // No sandbox hint, no store row, CRI reports none.
+    harness
+        .runtime
+        .stop_pod(key.clone(), None, None)
+        .await
+        .unwrap();
+
+    let fs_calls = harness.filesystem.recorded_calls();
+    assert!(
+        fs_calls
+            .iter()
+            .any(|c| c.starts_with("cleanup_cgroup:ns/nocg/uid-nocg")),
+        "cgroup must be cleaned even without a resolved sandbox: {fs_calls:?}"
+    );
+}
+
 // --- Task 10.1: PodDeletionFinalizer trait and mock ---
 
 #[tokio::test]
@@ -4238,7 +4264,7 @@ async fn mock_dependency_matrix_filesystem() {
 
     mock.create_log_directory(&key).await.unwrap();
     mock.write_hosts(&key, &pod).await.unwrap();
-    mock.cleanup_cgroup(&key, "sb-fs").await.unwrap();
+    mock.cleanup_cgroup(&key).await.unwrap();
     mock.apply_fs_group(&key, &pod).await.unwrap();
 
     let calls = mock.recorded_calls();

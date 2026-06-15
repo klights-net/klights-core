@@ -492,7 +492,10 @@ impl SqliteNodeLocalDb {
     }
 
     /// Claim up to `limit` due outbox rows in a single transaction.
-    /// Preserves per-subject_key FIFO: at most one row per subject per batch.
+    /// Preserves strict per-subject_key FIFO single-in-flight: a row is never
+    /// claimed while an older row for the same subject still exists (whether due
+    /// or leased), so at most one row per subject is ever in flight across
+    /// batches. Cross-subject rows still pipeline freely.
     pub async fn claim_due_outbox_batch(
         &self,
         now_ms: i64,

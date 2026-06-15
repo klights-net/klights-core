@@ -69,6 +69,15 @@ pub(super) const OUTBOX_MARK_FAILED: &str = "UPDATE outbox \
      WHERE id = ?1 AND lease_token = ?2";
 pub(super) const OUTBOX_COMPLETE: &str = "DELETE FROM outbox WHERE id = ?1 AND lease_token = ?2";
 pub(super) const OUTBOX_COMPLETE_BY_ID: &str = "DELETE FROM outbox WHERE id = ?1";
+// Strict per-subject single-in-flight: a candidate is excluded if ANY older
+// same-subject row exists, regardless of whether that older row is currently
+// due or leased. This matches OUTBOX_CLAIM_NEXT_DUE exactly so the batch and
+// single-row claim share one per-subject FIFO invariant. Without it, a younger
+// same-subject row would be claimable while an older retry is leased/in-flight,
+// putting two snapshots of one Pod in flight concurrently — they can then apply
+// in raft order != stamp order and clobber the newer status (lost update under
+// WAN latency / packet loss). Cross-subject pipelining is preserved because the
+// exclusion only ever fires for the SAME subject_key.
 pub(super) const OUTBOX_CLAIM_DUE_BATCH: &str = "SELECT id FROM outbox candidate \
      WHERE candidate.next_due_ms <= ?1 \
        AND (candidate.leased_until_ms = 0 OR candidate.leased_until_ms <= ?1) \
@@ -76,8 +85,6 @@ pub(super) const OUTBOX_CLAIM_DUE_BATCH: &str = "SELECT id FROM outbox candidate
            SELECT 1 FROM outbox older \
            WHERE older.subject_key = candidate.subject_key \
              AND older.id < candidate.id \
-             AND older.next_due_ms <= ?1 \
-             AND (older.leased_until_ms = 0 OR older.leased_until_ms <= ?1) \
        ) \
      ORDER BY CASE candidate.operation \
            WHEN 'LeaseRenew' THEN 0 \
