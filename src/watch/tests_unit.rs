@@ -286,6 +286,122 @@ async fn test_watch_cursor_replay_keeps_lower_late_rv_after_observed_higher_rv()
 }
 
 #[tokio::test]
+async fn watch_cursor_ordered_replay_drains_gap_before_live_jump() {
+    let (tx, rx) = broadcast::channel(8);
+    let replay_source = FixedReplaySource::new(vec![
+        WatchEvent::modified(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "frontend",
+                "namespace": "default",
+                "resourceVersion": "11"
+            },
+            "status": {"phase": "Pending"}
+        })),
+        WatchEvent::modified(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "frontend",
+                "namespace": "default",
+                "resourceVersion": "12"
+            },
+            "status": {"phase": "Running"}
+        })),
+    ]);
+    let mut cursor = WatchCursor::new(rx, replay_source, 10).with_ordered_replay();
+
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "frontend",
+            "namespace": "default",
+            "resourceVersion": "12"
+        },
+        "status": {"phase": "Running"}
+    })))
+    .unwrap();
+
+    let supervisor = test_task_supervisor();
+    let first = cursor.next_event(&supervisor).await.unwrap();
+    assert_eq!(first.resource_version(), Some(11));
+    assert_eq!(first.object["status"]["phase"], "Pending");
+
+    let second = cursor.next_event(&supervisor).await.unwrap();
+    assert_eq!(second.resource_version(), Some(12));
+    assert_eq!(second.object["status"]["phase"], "Running");
+
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "frontend",
+            "namespace": "default",
+            "resourceVersion": "11"
+        },
+        "status": {"phase": "Pending"}
+    })))
+    .unwrap();
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "frontend",
+            "namespace": "default",
+            "resourceVersion": "13"
+        },
+        "status": {"phase": "Running"}
+    })))
+    .unwrap();
+
+    let third = tokio::time::timeout(Duration::from_secs(1), cursor.next_event(&supervisor))
+        .await
+        .expect("ordered cursor should skip the late stale live event")
+        .unwrap();
+    assert_eq!(third.resource_version(), Some(13));
+    assert_eq!(third.object["status"]["phase"], "Running");
+}
+
+#[tokio::test]
+async fn watch_cursor_ordered_replay_keeps_live_jump_when_replay_omits_it() {
+    let (tx, rx) = broadcast::channel(8);
+    let replay_source = FixedReplaySource::new(vec![WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "frontend",
+            "namespace": "default",
+            "resourceVersion": "11"
+        },
+        "status": {"phase": "Pending"}
+    }))]);
+    let mut cursor = WatchCursor::new(rx, replay_source, 10).with_ordered_replay();
+
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "frontend",
+            "namespace": "default",
+            "resourceVersion": "12"
+        },
+        "status": {"phase": "Running"}
+    })))
+    .unwrap();
+
+    let supervisor = test_task_supervisor();
+    let first = cursor.next_event(&supervisor).await.unwrap();
+    assert_eq!(first.resource_version(), Some(11));
+    assert_eq!(first.object["status"]["phase"], "Pending");
+
+    let second = cursor.next_event(&supervisor).await.unwrap();
+    assert_eq!(second.resource_version(), Some(12));
+    assert_eq!(second.object["status"]["phase"], "Running");
+}
+
+#[tokio::test]
 async fn watch_cursor_target_field_selector_skips_nonmatching_pods_only() {
     let (tx, rx) = broadcast::channel(8);
     let replay_source = FixedReplaySource::new(Vec::new());

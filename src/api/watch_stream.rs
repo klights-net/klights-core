@@ -759,7 +759,9 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             (WatchCatchUpMode::ClusterOnly, _) => WatchTarget::cluster(api_version.clone(), kind.clone()),
         };
         let replay_source = DatastoreWatchReplaySource::new(db.clone(), vec![replay_target]);
-        let mut cursor = WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv));
+        let mut cursor =
+            WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv))
+                .with_ordered_replay();
         // Dedup baseline ADDEDs and grant per-key low-rv exceptions; shared with
         // the custom-resource watch builder via `seed_watch_cursor_baseline`.
         seed_watch_cursor_baseline(&mut cursor, baseline_delivered_rvs, baseline_low_rv_allowlist);

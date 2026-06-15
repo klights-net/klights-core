@@ -107,6 +107,7 @@ pub struct WatchCursor<S> {
     pending: VecDeque<WatchEvent>,
     pending_replay_floor_rv: Option<i64>,
     filter: WatchEventFilter,
+    ordered_replay: bool,
     /// Set when replay is required but hasn't succeeded yet.
     replay_required: bool,
     /// Current backoff duration for replay retry.
@@ -130,6 +131,7 @@ impl<S: WatchReplaySource> WatchCursor<S> {
             pending: VecDeque::new(),
             pending_replay_floor_rv: None,
             filter: WatchEventFilter::new(),
+            ordered_replay: false,
             replay_required: false,
             replay_backoff: INITIAL_REPLAY_BACKOFF,
         }
@@ -137,6 +139,15 @@ impl<S: WatchReplaySource> WatchCursor<S> {
 
     pub fn with_event_filter(mut self, filter: WatchEventFilter) -> Self {
         self.filter = filter;
+        self
+    }
+
+    /// Preserve client-facing Kubernetes watch ordering by replaying durable
+    /// history before emitting a live event that jumped past the processed
+    /// floor. Internal controllers may intentionally use the default recovery
+    /// behavior, which can accept late lower-RV live events.
+    pub fn with_ordered_replay(mut self) -> Self {
+        self.ordered_replay = true;
         self
     }
 
@@ -221,11 +232,27 @@ impl<S: WatchReplaySource> WatchCursor<S> {
 
             match self.rx.recv().await {
                 Ok(event) => {
+                    if self.ordered_replay && self.live_event_requires_ordered_replay(&event) {
+                        let since = self.replay_since_rv();
+                        if self.replay_gap_detected(since).await {
+                            return Err(WatchCursorError::Expired);
+                        }
+                        match self.replay_source.replay_since(since).await {
+                            Ok(replay) => {
+                                self.queue_ordered_replay_with_live(replay, event);
+                                continue;
+                            }
+                            Err(e) => {
+                                self.replay_required = true;
+                                return Err(WatchCursorError::Replay(e));
+                            }
+                        }
+                    }
                     if self.should_skip(&event) {
                         self.log_skipped_added("live", &event);
                         continue;
                     }
-                    self.observe(&event);
+                    self.observe_live(&event);
                     if !self.filter.matches(&event) {
                         continue;
                     }
@@ -427,6 +454,16 @@ impl<S: WatchReplaySource> WatchCursor<S> {
         }
     }
 
+    fn queue_ordered_replay_with_live(&mut self, replay: Vec<WatchEvent>, live: WatchEvent) {
+        let live_rv = live.resource_version();
+        self.queue_replay(replay);
+        self.pending.push_back(live);
+        if let Some(rv) = live_rv {
+            self.pending_replay_floor_rv =
+                Some(self.pending_replay_floor_rv.map_or(rv, |old| old.max(rv)));
+        }
+    }
+
     fn apply_pending_replay_floor_if_drained(&mut self) {
         if !self.pending.is_empty() {
             return;
@@ -492,6 +529,21 @@ impl<S: WatchReplaySource> WatchCursor<S> {
             .is_none_or(|after_rv| rv <= *after_rv)
     }
 
+    fn live_event_requires_ordered_replay(&self, event: &WatchEvent) -> bool {
+        let Some(rv) = event.resource_version() else {
+            return false;
+        };
+        if rv <= self.floor_rv + 1 || self.seen_rvs.contains(&rv) {
+            return false;
+        }
+        let Some(key) = event_key(event) else {
+            return true;
+        };
+        self.low_rv_allowlist
+            .get(&key)
+            .is_none_or(|after_rv| rv > *after_rv)
+    }
+
     fn observe(&mut self, event: &WatchEvent) {
         if let Some(rv) = event.resource_version() {
             if self.seen_rvs.insert(rv) {
@@ -503,6 +555,16 @@ impl<S: WatchReplaySource> WatchCursor<S> {
                 }
             }
             self.last_rv = self.last_rv.max(rv);
+        }
+    }
+
+    fn observe_live(&mut self, event: &WatchEvent) {
+        self.observe(event);
+        if self.ordered_replay
+            && let Some(rv) = event.resource_version()
+            && rv == self.floor_rv + 1
+        {
+            self.floor_rv = rv;
         }
     }
 

@@ -1107,7 +1107,8 @@ async fn list_cr_inner(
                 db.clone(),
                 replay_targets,
             );
-            let mut cursor = WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv));
+            let mut cursor = WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv))
+                .with_ordered_replay();
             // Dedup baseline ADDEDs and grant per-key low-rv exceptions; shared
             // with the built-in watch builder via `seed_watch_cursor_baseline`.
             crate::api::watch_stream::seed_watch_cursor_baseline(
