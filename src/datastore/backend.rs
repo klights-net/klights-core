@@ -712,6 +712,11 @@ pub trait DatastoreBackend: Send + Sync {
     /// Delete old watch events to keep the retention table bounded.
     async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize>;
 
+    /// Count how many watch events would be removed by `gc_watch_events`
+    /// without mutating storage. Used by raft-mode maintenance to avoid
+    /// proposing no-op GC entries on idle clusters.
+    async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize>;
+
     /// Look up the pod_endpoints row for `pod_ip`. Returns `None` when no
     /// pod currently advertises that address. Phase 1 has no production
     /// consumer beyond the SqlitePodEndpointResolver; Phase 2 hybrid
@@ -1184,6 +1189,7 @@ pub trait WatchHistoryStore: Send + Sync {
     async fn list_all_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>>;
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>>;
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64>;
+    async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize>;
     async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize>;
 }
 
@@ -1226,6 +1232,10 @@ impl<T: DatastoreBackend + ?Sized> WatchHistoryStore for T {
 
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
         DatastoreBackend::advance_resource_version_after(self, min_rv).await
+    }
+
+    async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
+        DatastoreBackend::watch_events_gc_prunable_count(self, max_rows, batch_cap).await
     }
 
     async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {

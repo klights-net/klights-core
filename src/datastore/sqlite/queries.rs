@@ -113,6 +113,13 @@ pub(super) const WATCH_EVENTS_GC: &str = "DELETE FROM watch_events
          LIMIT ?2
      )";
 
+pub(super) const WATCH_EVENTS_GC_PRUNABLE_COUNT: &str = "SELECT COUNT(*) FROM (
+         SELECT id FROM watch_events
+         WHERE id <= COALESCE((SELECT MAX(id) FROM watch_events), 0) - ?1
+         ORDER BY id ASC
+         LIMIT ?2
+     )";
+
 // ---------------------------------------------------------------------------
 // applied_outbox
 // ---------------------------------------------------------------------------

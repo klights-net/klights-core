@@ -617,6 +617,9 @@ impl DatastoreBackend for RedbDatastore {
     async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
         self.network.list_pnet_sandbox_ids().await
     }
+    async fn watch_events_gc_prunable_count(&self, m: i64, b: i64) -> Result<usize> {
+        self.watch_store.gc_watch_prunable_count(m, b).await
+    }
     async fn gc_watch_events(&self, m: i64, b: i64) -> Result<usize> {
         self.watch_store.gc_watch(m, b).await
     }

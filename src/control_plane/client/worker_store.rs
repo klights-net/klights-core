@@ -1015,6 +1015,14 @@ impl DatastoreBackend for WorkerStoreAdapter {
         self.node_local.list_networks().await
     }
 
+    async fn watch_events_gc_prunable_count(
+        &self,
+        _max_rows: i64,
+        _batch_cap: i64,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
     async fn gc_watch_events(&self, _max_rows: i64, _batch_cap: i64) -> Result<usize> {
         Ok(0)
     }

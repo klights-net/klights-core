@@ -224,6 +224,19 @@ impl RedbWatchStore {
         })
         .await
     }
+
+    pub async fn gc_watch_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
+        self.db_call("gc_watch_prunable_count", move |db| {
+            let r = db.begin_read()?;
+            let tbl = r.open_table(tables::WATCH_EVENTS)?;
+            let count = tbl.iter()?.count();
+            if count <= max_rows as usize {
+                return Ok(0);
+            }
+            Ok((count - max_rows as usize).min(batch_cap as usize))
+        })
+        .await
+    }
 }
 
 #[cfg(test)]

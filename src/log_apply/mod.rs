@@ -224,6 +224,10 @@ pub enum LogApplyMutation {
         cutoff_ms: i64,
         operations: Vec<String>,
     },
+    GcWatchEvents {
+        max_rows: i64,
+        batch_cap: i64,
+    },
     PutWatchEvent(LogApplyWatchEventRow),
     AdvanceResourceVersion {
         resource_version: i64,
@@ -467,7 +471,7 @@ struct ProtoLogApplyCommit {
 struct ProtoLogApplyMutation {
     #[prost(
         oneof = "proto_log_apply_mutation::Mutation",
-        tags = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20"
+        tags = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21"
     )]
     mutation: Option<proto_log_apply_mutation::Mutation>,
 }
@@ -483,6 +487,14 @@ struct ProtoLogApplyKlightsMeta {
     key: String,
     #[prost(string, tag = "2")]
     value: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProtoLogApplyWatchEventsGc {
+    #[prost(int64, tag = "1")]
+    max_rows: i64,
+    #[prost(int64, tag = "2")]
+    batch_cap: i64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -538,6 +550,8 @@ mod proto_log_apply_mutation {
         AllocateNodeSubnet(super::ProtoLogApplyNodeSubnetAllocation),
         #[prost(message, tag = "20")]
         PatchResourceLatest(super::ProtoLogApplyResourcePatch),
+        #[prost(message, tag = "21")]
+        GcWatchEvents(super::ProtoLogApplyWatchEventsGc),
     }
 }
 
@@ -802,6 +816,13 @@ impl From<LogApplyMutation> for ProtoLogApplyMutation {
                 cutoff_ms,
                 operations,
             }),
+            LogApplyMutation::GcWatchEvents {
+                max_rows,
+                batch_cap,
+            } => Mutation::GcWatchEvents(ProtoLogApplyWatchEventsGc {
+                max_rows,
+                batch_cap,
+            }),
             LogApplyMutation::PutWatchEvent(row) => Mutation::PutWatchEvent(row.into()),
             LogApplyMutation::PutKlightsMeta { key, value } => {
                 Mutation::PutKlightsMeta(ProtoLogApplyKlightsMeta { key, value })
@@ -867,6 +888,10 @@ impl TryFrom<ProtoLogApplyMutation> for LogApplyMutation {
                 Mutation::GcAppliedOutbox(gc) => LogApplyMutation::GcAppliedOutbox {
                     cutoff_ms: gc.cutoff_ms,
                     operations: gc.operations,
+                },
+                Mutation::GcWatchEvents(gc) => LogApplyMutation::GcWatchEvents {
+                    max_rows: gc.max_rows,
+                    batch_cap: gc.batch_cap,
                 },
                 Mutation::PutWatchEvent(row) => LogApplyMutation::PutWatchEvent(row.try_into()?),
                 Mutation::PutKlightsMeta(meta) => LogApplyMutation::PutKlightsMeta {
@@ -1311,6 +1336,10 @@ mod parity_tests {
                 cutoff_ms: 1_700_000_000_000,
                 operations: vec!["CreateResource".to_string(), "DeleteResource".to_string()],
             },
+            "GcWatchEvents" => LogApplyMutation::GcWatchEvents {
+                max_rows: 100_000,
+                batch_cap: 5_000,
+            },
             "PutWatchEvent" => LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
@@ -1380,6 +1409,7 @@ mod parity_tests {
             "PutAppliedOutbox",
             "DeleteAppliedOutbox",
             "GcAppliedOutbox",
+            "GcWatchEvents",
             "PutWatchEvent",
             "AdvanceResourceVersion",
             "PutKlightsMeta",
@@ -1407,12 +1437,13 @@ mod parity_tests {
             LogApplyMutation::PutAppliedOutbox(_) => 11,
             LogApplyMutation::DeleteAppliedOutbox { .. } => 12,
             LogApplyMutation::GcAppliedOutbox { .. } => 13,
-            LogApplyMutation::PutWatchEvent(_) => 14,
-            LogApplyMutation::AdvanceResourceVersion { .. } => 15,
-            LogApplyMutation::PutKlightsMeta { .. } => 16,
-            LogApplyMutation::PutPodCleanupIntent(_) => 17,
-            LogApplyMutation::DeletePodCleanupIntent(_) => 18,
-            LogApplyMutation::DeletePodCleanupIntentsForNode { .. } => 19,
+            LogApplyMutation::GcWatchEvents { .. } => 14,
+            LogApplyMutation::PutWatchEvent(_) => 15,
+            LogApplyMutation::AdvanceResourceVersion { .. } => 16,
+            LogApplyMutation::PutKlightsMeta { .. } => 17,
+            LogApplyMutation::PutPodCleanupIntent(_) => 18,
+            LogApplyMutation::DeletePodCleanupIntent(_) => 19,
+            LogApplyMutation::DeletePodCleanupIntentsForNode { .. } => 20,
         };
         names
     }

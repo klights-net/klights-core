@@ -969,22 +969,29 @@ impl DatastoreBackend for ReplicatedDatastore {
     async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
         self.inner.list_pod_network_sandbox_ids().await
     }
+    async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
+        self.inner
+            .watch_events_gc_prunable_count(max_rows, batch_cap)
+            .await
+    }
     async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
-        let before_rv = self.inner.get_current_resource_version().await.unwrap_or(0);
-        let removed = self.inner.gc_watch_events(max_rows, batch_cap).await?;
-        if removed == 0 {
+        let prunable = self
+            .inner
+            .watch_events_gc_prunable_count(max_rows, batch_cap)
+            .await?;
+        if prunable == 0 {
             return Ok(0);
         }
-        let rv = resource_version_after_non_resource_write(self.inner.as_ref(), before_rv).await?;
-        self.notify_if_configured(
+        let proposer = self.require_raft_proposer()?;
+        self.propose_command_via_raft(
+            &proposer,
             StorageCommand::GcWatchEvents {
                 max_rows,
                 batch_cap,
             },
-            self.meta_for_rv(rv, None),
         )
-        .await;
-        Ok(removed)
+        .await?;
+        Ok(prunable)
     }
     async fn pod_endpoint_get_by_pod_ip(&self, pod_ip: Ipv4Addr) -> Result<Option<PodEndpointRow>> {
         self.inner.pod_endpoint_get_by_pod_ip(pod_ip).await

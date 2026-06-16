@@ -91,6 +91,24 @@ impl Datastore {
     /// Workers that fall behind this window get `RecvError::Lagged` → replay
     /// via `DatastoreWatchReplaySource`; workers further behind than the
     /// persisted window get `410 Gone` and relist.
+    pub async fn watch_events_gc_prunable_count(
+        &self,
+        max_rows: i64,
+        batch_cap: i64,
+    ) -> Result<usize> {
+        let count = self
+            .db_call("watch_events_gc_prunable_count", move |conn| {
+                Ok(conn.query_row::<i64, _, _>(
+                    queries::WATCH_EVENTS_GC_PRUNABLE_COUNT,
+                    rusqlite::params![max_rows, batch_cap],
+                    |row| row.get(0),
+                )? as usize)
+            })
+            .await
+            .map_err(|e| anyhow!("Failed to count prunable watch_events: {}", e))?;
+        Ok(count)
+    }
+
     pub async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
         let deleted = self
             .db_call("gc_watch_events", move |conn| {

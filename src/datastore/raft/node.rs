@@ -798,6 +798,41 @@ impl RaftNodeJoinHandler {
         )
         .await
     }
+
+    async fn refresh_cluster_membership_metadata(
+        &self,
+        admitted_node_name: &str,
+        as_learner: bool,
+    ) -> anyhow::Result<()> {
+        let mut membership = match crate::bootstrap::cluster_meta::read_cluster_membership(
+            self.db.as_ref(),
+        )
+        .await
+        {
+            Ok(membership) => membership,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "JoinAsControlplane: cluster membership metadata unavailable; skipping voter metadata refresh"
+                );
+                return Ok(());
+            }
+        };
+
+        if !as_learner {
+            membership.voters.push(admitted_node_name.to_string());
+            membership.voters.sort();
+            membership.voters.dedup();
+        }
+        membership.leader_hint = Some(self.node.authoring_node.clone());
+        crate::bootstrap::cluster_meta::write_cluster_membership(self.db.as_ref(), &membership)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to refresh cluster membership metadata after admitting {admitted_node_name}"
+                )
+            })
+    }
 }
 
 #[async_trait]
@@ -880,6 +915,11 @@ impl crate::replication::grpc::raft_rpc::ControlplaneJoinHandler for RaftNodeJoi
                 .voter_ids()
                 .count() as u32
         };
+        self.refresh_cluster_membership_metadata(&node_name, as_learner)
+            .await
+            .map_err(|err| {
+                RaftRpcRouterError::Dispatch(format!("refresh cluster membership metadata: {err}"))
+            })?;
         Ok(ControlplaneJoinOutcome::Accepted {
             voter_count_after,
             admitted_as_learner: as_learner,
@@ -1798,6 +1838,68 @@ mod tests {
             }
             other => panic!("expected Accepted, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn join_handler_voter_admission_updates_cluster_membership_metadata() {
+        use crate::datastore::raft::network::LoopbackRegistry;
+        use crate::replication::grpc::raft_rpc::{
+            ControlplaneJoinHandler, ControlplaneJoinOutcome,
+        };
+        let registry = LoopbackRegistry::new();
+        let leader = Arc::new(fresh_voter_in_registry(52, &registry).await);
+        let _follower = fresh_voter_in_registry(53, &registry).await;
+        leader
+            .bootstrap_single_voter("https://10.99.0.52:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&leader, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let leader_db = test_db().await;
+        crate::bootstrap::cluster_meta::write_cluster_membership(
+            leader_db.as_ref(),
+            &crate::control_plane::client::membership::ClusterMembership {
+                cluster_id: "cluster-a".to_string(),
+                voters: vec!["mn-controlplane1".to_string()],
+                term: 0,
+                leader_hint: Some("mn-controlplane1".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let handler = RaftNodeJoinHandler::new(leader.clone(), leader_db.clone());
+        let outcome = handler
+            .join(
+                53,
+                "https://10.99.0.53:7679".into(),
+                "mn-controlplane2".into(),
+                false,
+                None,
+            )
+            .await
+            .expect("leader runs add_voter");
+        assert!(
+            matches!(
+                outcome,
+                ControlplaneJoinOutcome::Accepted {
+                    admitted_as_learner: false,
+                    ..
+                }
+            ),
+            "expected voter Accepted, got {outcome:?}"
+        );
+
+        let membership =
+            crate::bootstrap::cluster_meta::read_cluster_membership(leader_db.as_ref())
+                .await
+                .unwrap();
+        assert_eq!(
+            membership.voters,
+            vec!["mn-controlplane1", "mn-controlplane2"],
+            "admitted voters must be reflected in replicated membership metadata"
+        );
     }
 
     #[tokio::test]

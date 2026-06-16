@@ -393,6 +393,18 @@ fn apply_commit_in_tx_with_watch_events(
                     rusqlite::params![cutoff_ms],
                 )?;
             }
+            LogApplyMutation::GcWatchEvents {
+                max_rows,
+                batch_cap,
+            } => {
+                let removed = tx.execute(
+                    queries::WATCH_EVENTS_GC,
+                    rusqlite::params![max_rows, batch_cap],
+                )?;
+                if removed > 0 {
+                    let _ = tx.execute("PRAGMA incremental_vacuum(1000)", []);
+                }
+            }
             LogApplyMutation::PutWatchEvent(row) => pending.push(put_watch_event_row(tx, row)?),
             LogApplyMutation::AdvanceResourceVersion { .. } => {}
             LogApplyMutation::PutKlightsMeta { key, value } => {

@@ -278,6 +278,51 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn raft_mode_watch_events_gc_routes_through_proposer_and_prunes_via_apply() {
+        let (ds, calls) = make_ds_with_inline_proposer().await;
+        for i in 0..12 {
+            ds.create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                &format!("gc-via-raft-{i}"),
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": format!("gc-via-raft-{i}")
+                    }
+                }),
+            )
+            .await
+            .expect("seed watch event");
+        }
+        calls.lock().unwrap().clear();
+
+        let removed = ds
+            .gc_watch_events(5, 100)
+            .await
+            .expect("watch-events GC must commit through raft");
+
+        assert!(removed > 0, "GC should report pruned watch events");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["GcWatchEvents"],
+            "watch-events GC must route through the raft proposer instead of writing locally"
+        );
+        let retained = ds
+            .list_resources_modified_since("v1", "ConfigMap", Some("default"), 0)
+            .await
+            .expect("list retained watch events");
+        assert!(
+            retained.len() <= 5,
+            "raft-applied GC must prune the watch table to the retained window; got {} events",
+            retained.len()
+        );
+    }
+
+    #[tokio::test]
     async fn leader_rejects_forwarded_write_with_stale_uid() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(

@@ -1330,7 +1330,16 @@ impl Datastore {
                 )
             }
 
-            StorageCommand::GcWatchEvents { .. } => LogApplyCommit::new(rv, Vec::new()),
+            StorageCommand::GcWatchEvents {
+                max_rows,
+                batch_cap,
+            } => LogApplyCommit::new(
+                rv,
+                vec![LogApplyMutation::GcWatchEvents {
+                    max_rows,
+                    batch_cap,
+                }],
+            ),
 
             StorageCommand::AdvanceResourceVersion { min_rv: _, new_rv } => LogApplyCommit::new(
                 rv,
@@ -2562,6 +2571,10 @@ impl DatastoreBackend for Datastore {
 
     async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
         Datastore::list_pod_network_sandbox_ids(self).await
+    }
+
+    async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
+        Datastore::watch_events_gc_prunable_count(self, max_rows, batch_cap).await
     }
 
     async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
