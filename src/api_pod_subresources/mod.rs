@@ -17,6 +17,7 @@ use crate::api::{AppError, AppState, build_admission_context, run_admission_for_
 // `authorize_request` middleware chokepoint (see src/auth/middleware.rs);
 // handlers no longer authorize individually.
 
+mod binding;
 mod ephemeral;
 mod eviction;
 mod exec;
@@ -30,6 +31,7 @@ mod status;
 #[cfg(test)]
 mod tests;
 
+pub use self::binding::*;
 pub use self::ephemeral::*;
 pub use self::eviction::*;
 pub use self::exec::*;

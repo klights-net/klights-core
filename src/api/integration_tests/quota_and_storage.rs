@@ -2157,6 +2157,249 @@ async fn test_pod_attach_validating_webhook_denies_before_stream_upgrade() {
 }
 
 #[tokio::test]
+async fn test_pod_binding_validating_webhook_denies_before_bind() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tower::ServiceExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 32768];
+        let n = stream.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let body_start = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
+        let review_req: serde_json::Value = serde_json::from_str(&req[body_start..]).unwrap();
+        let uid = review_req["request"]["uid"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let deny = review_req["request"]["name"] == "bind-denied"
+            && review_req["request"]["resource"]["resource"] == "pods"
+            && review_req["request"]["subResource"] == "binding"
+            && review_req["request"]["object"]["target"]["name"] == "worker-a";
+
+        let response_body = if deny {
+            json!({
+                "apiVersion": "admission.k8s.io/v1",
+                "kind": "AdmissionReview",
+                "response": {
+                    "uid": uid,
+                    "allowed": false,
+                    "status": {"message": "binding pod 'bind-denied' is not allowed"}
+                }
+            })
+        } else {
+            json!({
+                "apiVersion": "admission.k8s.io/v1",
+                "kind": "AdmissionReview",
+                "response": {
+                    "uid": uid,
+                    "allowed": true
+                }
+            })
+        };
+        let payload = serde_json::to_string(&response_body).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    });
+
+    let state = build_test_app_state().await;
+    state
+        .db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "bind-denied",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "bind-denied", "namespace": "default", "uid": "bind-denied-uid"},
+                "spec": {"containers": [{"name": "c", "image": "busybox"}]},
+                "status": {"phase": "Pending", "conditions": []}
+            }),
+        )
+        .await
+        .unwrap();
+    let app = crate::api::build_router(state.clone());
+
+    let ns_create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default","labels":{"webhook-match":"yes"}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ns_create.status(), StatusCode::CREATED);
+
+    let create_vwc = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "apiVersion": "admissionregistration.k8s.io/v1",
+                        "kind": "ValidatingWebhookConfiguration",
+                        "metadata": {"name": "binding-deny"},
+                        "webhooks": [{
+                            "name": "deny-binding-pod.k8s.io",
+                            "rules": [{
+                                "operations": ["CREATE"],
+                                "apiGroups": [""],
+                                "apiVersions": ["v1"],
+                                "resources": ["pods/binding"]
+                            }],
+                            "clientConfig": {"url": format!("http://127.0.0.1:{}/pods/binding", port)},
+                            "sideEffects": "None",
+                            "admissionReviewVersions": ["v1"],
+                            "namespaceSelector": {"matchLabels": {"webhook-match": "yes"}}
+                        }]
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_vwc.status(), StatusCode::CREATED);
+
+    let binding = json!({
+        "apiVersion": "v1",
+        "kind": "Binding",
+        "metadata": {"name": "bind-denied", "namespace": "default"},
+        "target": {"apiVersion": "v1", "kind": "Node", "name": "worker-a"}
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/pods/bind-denied/binding")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&binding).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "validating webhook deny must be returned for pods/binding before binding"
+    );
+    let message = value["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("binding pod 'bind-denied' is not allowed"),
+        "expected binding webhook denial message, got: {message}"
+    );
+    let pod = state
+        .db
+        .get_resource("v1", "Pod", Some("default"), "bind-denied")
+        .await
+        .unwrap()
+        .expect("denied pod must remain present");
+    assert!(pod.data.pointer("/spec/nodeName").is_none());
+}
+
+#[tokio::test]
+async fn test_pod_binding_subresource_binds_unassigned_pod() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    state
+        .db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "bind-target",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "bind-target", "namespace": "default", "uid": "bind-target-uid"},
+                "spec": {"containers": [{"name": "c", "image": "busybox"}]},
+                "status": {"phase": "Pending", "conditions": []}
+            }),
+        )
+        .await
+        .unwrap();
+    let app = crate::api::build_router(state.clone());
+
+    let binding = json!({
+        "apiVersion": "v1",
+        "kind": "Binding",
+        "metadata": {"name": "bind-target", "namespace": "default"},
+        "target": {"apiVersion": "v1", "kind": "Node", "name": "worker-a"}
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/pods/bind-target/binding")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&binding).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["kind"], "Status");
+    assert_eq!(value["status"], "Success");
+
+    let pod = state
+        .db
+        .get_resource("v1", "Pod", Some("default"), "bind-target")
+        .await
+        .unwrap()
+        .expect("bound pod must remain present");
+    assert_eq!(pod.data["spec"]["nodeName"], "worker-a");
+    let scheduled = pod
+        .data
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array())
+        .and_then(|conditions| {
+            conditions.iter().find(|condition| {
+                condition.get("type").and_then(|v| v.as_str()) == Some("PodScheduled")
+            })
+        })
+        .expect("PodScheduled condition must be present");
+    assert_eq!(scheduled["status"], "True");
+}
+
+#[tokio::test]
 async fn test_mutating_webhook_pod_create_applies_init_container_defaults_after_mutation() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

@@ -134,6 +134,10 @@ pub fn api_v1_routes() -> Router<Arc<AppState>> {
             get(pod_portforward).post(pod_portforward),
         )
         .route(
+            "/namespaces/{namespace}/pods/{name}/binding",
+            post(pod_binding),
+        )
+        .route(
             "/namespaces/{namespace}/pods/{name}/status",
             get(get_pod_status)
                 .put(update_pod_status_subresource)

@@ -781,6 +781,18 @@ impl PodRepository {
             .map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
+    pub async fn bind_pod_from_api(
+        &self,
+        namespace: &str,
+        name: &str,
+        binding: serde_json::Value,
+        dry_run: bool,
+    ) -> Result<(), crate::api::AppError> {
+        self.api
+            .bind_pod_from_api(namespace, name, binding, dry_run)
+            .await
+    }
+
     pub async fn schedule_all_unbound_pods(&self) -> Result<()> {
         self.api
             .schedule_all_unbound_pods()

@@ -181,8 +181,8 @@ use crate::api_discovery::{
 };
 use crate::api_pod_subresources::{
     get_pod_ephemeral_containers, get_pod_log, get_pod_status, node_proxy, node_proxy_with_path,
-    patch_pod_ephemeral_containers, patch_pod_status_subresource, pod_attach, pod_eviction,
-    pod_exec, pod_portforward, pod_proxy, pod_proxy_with_path, service_proxy,
+    patch_pod_ephemeral_containers, patch_pod_status_subresource, pod_attach, pod_binding,
+    pod_eviction, pod_exec, pod_portforward, pod_proxy, pod_proxy_with_path, service_proxy,
     service_proxy_with_path, update_pod_ephemeral_containers, update_pod_status_subresource,
 };
 use crate::api_status::{

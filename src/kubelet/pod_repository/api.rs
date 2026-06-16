@@ -777,6 +777,73 @@ impl PodApiService {
         Ok(live_decision.node_name.as_deref() == Some(planned_node))
     }
 
+    pub async fn bind_pod_from_api(
+        &self,
+        namespace: &str,
+        name: &str,
+        binding: Value,
+        dry_run: bool,
+    ) -> Result<(), AppError> {
+        validate_pod_binding_object(namespace, name, &binding)?;
+        let target_node = binding
+            .pointer("/target/name")
+            .and_then(|v| v.as_str())
+            .expect("validate_pod_binding_object requires target.name")
+            .to_string();
+
+        let current = self
+            .store
+            .get(namespace, name)
+            .await
+            .map_err(|e| -> AppError { e.into() })?
+            .ok_or_else(|| AppError::NotFound(format!("pods \"{}\" not found", name)))?;
+        ensure_resource_preconditions_match(&current, &binding_resource_preconditions(&binding)?)?;
+        if current
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some_and(|v| !v.is_null())
+        {
+            return Err(AppError::Conflict(format!(
+                "pod {namespace}/{name} is being deleted"
+            )));
+        }
+        if current
+            .data
+            .pointer("/spec/nodeName")
+            .and_then(|v| v.as_str())
+            .is_some_and(|node_name| !node_name.is_empty())
+        {
+            return Err(AppError::Conflict(format!(
+                "pod {namespace}/{name} is already assigned to a node"
+            )));
+        }
+        if current
+            .data
+            .pointer("/spec/schedulingGates")
+            .and_then(|v| v.as_array())
+            .is_some_and(|gates| !gates.is_empty())
+        {
+            return Err(AppError::Conflict(format!(
+                "pod {namespace}/{name} has scheduling gates"
+            )));
+        }
+
+        let mut body: Value = (*current.data).clone();
+        merge_binding_annotations(&mut body, &binding);
+        set_bound_node_name(&mut body, &target_node)?;
+        upsert_pod_scheduled_true(&mut body)?;
+
+        if dry_run {
+            return Ok(());
+        }
+
+        self.store
+            .update_including_status_for_scheduler(namespace, name, body, current.resource_version)
+            .await
+            .map_err(|e| -> AppError { e.into() })?;
+        Ok(())
+    }
+
     /// Body of the macro's Pod-update branch (today inlined into
     /// `pod_handlers::update_pod`). Runs Pod-specific validation,
     /// admission, immutability + quota checks, normalization, then
@@ -1748,6 +1815,171 @@ fn preempted_status(data: &Value, preemptor_namespace: &str, preemptor_name: &st
         }
     }
     status
+}
+
+fn validate_pod_binding_object(
+    namespace: &str,
+    name: &str,
+    binding: &Value,
+) -> Result<(), AppError> {
+    if binding.get("kind").and_then(|v| v.as_str()) != Some("Binding") {
+        return Err(AppError::BadRequest(
+            "Binding.kind must be \"Binding\"".to_string(),
+        ));
+    }
+    if binding.get("apiVersion").and_then(|v| v.as_str()) != Some("v1") {
+        return Err(AppError::BadRequest(
+            "Binding.apiVersion must be \"v1\"".to_string(),
+        ));
+    }
+    let metadata_name = binding
+        .pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("Binding.metadata.name is required".to_string()))?;
+    if metadata_name != name {
+        return Err(AppError::BadRequest(format!(
+            "Binding.metadata.name must match URL pod name \"{name}\""
+        )));
+    }
+    if let Some(metadata_namespace) = binding
+        .pointer("/metadata/namespace")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        && metadata_namespace != namespace
+    {
+        return Err(AppError::BadRequest(format!(
+            "Binding.metadata.namespace must match URL namespace \"{namespace}\""
+        )));
+    }
+    if binding.pointer("/target/kind").and_then(|v| v.as_str()) != Some("Node") {
+        return Err(AppError::BadRequest(
+            "Binding.target.kind must be \"Node\"".to_string(),
+        ));
+    }
+    if let Some(target_api_version) = binding
+        .pointer("/target/apiVersion")
+        .and_then(|v| v.as_str())
+        && !target_api_version.is_empty()
+        && target_api_version != "v1"
+    {
+        return Err(AppError::BadRequest(
+            "Binding.target.apiVersion must be \"v1\"".to_string(),
+        ));
+    }
+    let target_name = binding
+        .pointer("/target/name")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest("Binding.target.name is required".to_string()))?;
+    if !validate_dns_subdomain(target_name) {
+        return Err(AppError::BadRequest(format!(
+            "Binding.target.name \"{target_name}\" is not a valid node name"
+        )));
+    }
+    Ok(())
+}
+
+fn binding_resource_preconditions(binding: &Value) -> Result<ResourcePreconditions, AppError> {
+    let uid = binding
+        .pointer("/metadata/uid")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let resource_version = match binding.pointer("/metadata/resourceVersion") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) if raw.is_empty() => None,
+        Some(Value::String(raw)) => Some(raw.parse::<i64>().map_err(|_| {
+            AppError::BadRequest(format!(
+                "Invalid value: \"{raw}\": resourceVersion must be an integer"
+            ))
+        })?),
+        Some(Value::Number(number)) => Some(number.as_i64().ok_or_else(|| {
+            AppError::BadRequest(
+                "Invalid value: metadata.resourceVersion must be an integer".to_string(),
+            )
+        })?),
+        Some(_) => {
+            return Err(AppError::BadRequest(
+                "Invalid value: metadata.resourceVersion must be a string".to_string(),
+            ));
+        }
+    };
+    Ok(ResourcePreconditions {
+        uid,
+        resource_version,
+    })
+}
+
+fn merge_binding_annotations(pod: &mut Value, binding: &Value) {
+    let Some(binding_annotations) = binding
+        .pointer("/metadata/annotations")
+        .and_then(|v| v.as_object())
+    else {
+        return;
+    };
+    if binding_annotations.is_empty() {
+        return;
+    }
+    let Some(pod_object) = pod.as_object_mut() else {
+        return;
+    };
+    let metadata = pod_object
+        .entry("metadata".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(metadata_object) = metadata.as_object_mut() else {
+        return;
+    };
+    let annotations = metadata_object
+        .entry("annotations".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(annotations_object) = annotations.as_object_mut() else {
+        return;
+    };
+    for (key, value) in binding_annotations {
+        annotations_object.insert(key.clone(), value.clone());
+    }
+}
+
+fn set_bound_node_name(pod: &mut Value, node_name: &str) -> Result<(), AppError> {
+    let pod_object = pod
+        .as_object_mut()
+        .ok_or_else(|| AppError::BadRequest("Pod body must be an object".to_string()))?;
+    let spec = pod_object
+        .entry("spec".to_string())
+        .or_insert_with(|| json!({}));
+    let spec_object = spec
+        .as_object_mut()
+        .ok_or_else(|| AppError::BadRequest("Pod.spec must be an object".to_string()))?;
+    spec_object.insert("nodeName".to_string(), json!(node_name));
+    Ok(())
+}
+
+fn upsert_pod_scheduled_true(pod: &mut Value) -> Result<(), AppError> {
+    let pod_object = pod
+        .as_object_mut()
+        .ok_or_else(|| AppError::BadRequest("Pod body must be an object".to_string()))?;
+    let status = pod_object
+        .entry("status".to_string())
+        .or_insert_with(|| json!({}));
+    let status_object = status
+        .as_object_mut()
+        .ok_or_else(|| AppError::BadRequest("Pod.status must be an object".to_string()))?;
+    status_object.remove("nominatedNodeName");
+    let conditions = status_object
+        .entry("conditions".to_string())
+        .or_insert_with(|| json!([]));
+    let conditions_array = conditions.as_array_mut().ok_or_else(|| {
+        AppError::BadRequest("Pod.status.conditions must be an array".to_string())
+    })?;
+    conditions_array
+        .retain(|condition| condition.get("type").and_then(|v| v.as_str()) != Some("PodScheduled"));
+    conditions_array.push(json!({
+        "type": "PodScheduled",
+        "status": "True",
+        "lastTransitionTime": crate::utils::k8s_timestamp()
+    }));
+    Ok(())
 }
 
 fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds: i64) -> Value {
