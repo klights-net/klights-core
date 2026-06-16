@@ -1,7 +1,7 @@
 # klights
 
 klights is a resource-efficient, event-driven Kubernetes-compatible cluster
-runtime.
+runtime. `klights` is pronounced **K-light-s**.
 
 The goal is to build a resource-efficient Kubernetes API-compatible
 implementation that can run real development workloads with near-zero idle CPU,
