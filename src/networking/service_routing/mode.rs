@@ -1,7 +1,7 @@
 //! Mode + device wiring for service routing (F2-03).
 //!
-//! `KlightsTable` previously hardcoded the VXLAN forward rule's interface name
-//! to `crate::networking::vxlan::DEFAULT_DEVICE`. That breaks two ways:
+//! `KlightsTable` previously hardcoded the overlay forward rule's interface name
+//! to the project default device. That breaks two ways:
 //!   1. Rootless mode never owns a VXLAN device, so the rule matches an
 //!      interface that does not exist in the user namespace.
 //!   2. Test instances and operators that override `KLIGHTS_VXLAN_DEVICE`
@@ -30,7 +30,10 @@ impl ServiceRoutingMode {
     /// mode's behavior. Pinned to root + the project default device name.
     #[cfg(test)]
     pub fn default_root_for_test() -> Self {
-        Self::new(NodeMode::Root, crate::networking::vxlan::DEFAULT_DEVICE)
+        Self::new(
+            NodeMode::Root,
+            crate::networking::DEFAULT_POD_OVERLAY_DEVICE,
+        )
     }
 
     /// True when the forward chain should accept packets arriving on the

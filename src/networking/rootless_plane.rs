@@ -405,8 +405,7 @@ impl crate::networking::peer_router::PeerRouter for RootlessNetworkPlane {
             crate::networking::NodeEndpoint::UnencryptedDirect(plan) => {
                 crate::networking::wireguard::apply_unencrypted_direct_route(&self.rt, plan).await
             }
-            crate::networking::NodeEndpoint::Vxlan(_)
-            | crate::networking::NodeEndpoint::Rootless { .. } => Ok(()),
+            crate::networking::NodeEndpoint::Rootless { .. } => Ok(()),
         }
     }
 
@@ -431,8 +430,7 @@ impl crate::networking::peer_router::PeerRouter for RootlessNetworkPlane {
             crate::networking::NodeEndpoint::UnencryptedDirect(plan) => {
                 crate::networking::wireguard::remove_unencrypted_direct_route(&self.rt, plan).await
             }
-            crate::networking::NodeEndpoint::Vxlan(_)
-            | crate::networking::NodeEndpoint::Rootless { .. } => Ok(()),
+            crate::networking::NodeEndpoint::Rootless { .. } => Ok(()),
         }
     }
 }

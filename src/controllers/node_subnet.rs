@@ -1123,11 +1123,13 @@ mod tests {
                 allowed_pod_cidr
             } if node_name == "node-b" && node_ip == "10.0.0.2" && allowed_pod_cidr == "10.42.1.0/24"
         )));
-        assert!(
-            !calls
+        assert_eq!(
+            calls
                 .iter()
-                .any(|call| matches!(call, NetworkCall::ApplyPeerEndpoint { .. })),
-            "explicit disabled mode must not reuse VXLAN fallback: {calls:?}"
+                .filter(|call| matches!(call, NetworkCall::ApplyUnencryptedPeerEndpoint { .. }))
+                .count(),
+            1,
+            "explicit disabled mode should apply only the direct route: {calls:?}"
         );
     }
 
@@ -1383,13 +1385,13 @@ mod tests {
                 allowed_pod_cidr
             } if node_name == "rootless-b" && endpoint == "10.0.0.9:51820" && allowed_pod_cidr == "10.42.1.0/24"
         )), "rootless peer must dispatch to WireGuard, got {calls:?}");
-        // No Vxlan call must have been made for the rootless peer.
-        assert!(
-            !calls.iter().any(|c| matches!(
-                c,
-                NetworkCall::ApplyPeerEndpoint { node_name, .. } if node_name == "rootless-b"
-            )),
-            "rootless peer must NOT take the Vxlan apply path, got {calls:?}"
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| matches!(c, NetworkCall::ApplyWireGuardPeerEndpoint { node_name, .. } if node_name == "rootless-b"))
+                .count(),
+            1,
+            "rootless peer must dispatch exactly once to WireGuard, got {calls:?}"
         );
         let entry = applied
             .get("rootless-b")

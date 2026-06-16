@@ -204,13 +204,16 @@ impl KlightsConfig {
             containerd_socket: std::env::var("KLIGHTS_CONTAINERD_SOCKET").ok(),
             node_name,
             node_ip: parse_optional_ipv4_env("KLIGHTS_NODE_IP")?,
-            vxlan_vni: parse_u32_env("KLIGHTS_VXLAN_VNI", crate::networking::vxlan::DEFAULT_VNI)
-                .context("KLIGHTS_VXLAN_VNI must be a valid u32")?,
+            vxlan_vni: parse_u32_env(
+                "KLIGHTS_VXLAN_VNI",
+                crate::networking::DEFAULT_POD_OVERLAY_VNI,
+            )
+            .context("KLIGHTS_VXLAN_VNI must be a valid u32")?,
             vxlan_port: parse_u16_env(
                 "KLIGHTS_VXLAN_PORT",
-                crate::networking::vxlan::DEFAULT_PORT,
+                crate::networking::DEFAULT_POD_OVERLAY_PORT,
             )?,
-            vxlan_device: parse_vxlan_device_env(crate::networking::vxlan::DEFAULT_DEVICE)?,
+            vxlan_device: parse_vxlan_device_env(crate::networking::DEFAULT_POD_OVERLAY_DEVICE)?,
             dataplane_encryption: parse_dataplane_encryption_env()?,
             external_endpoint: parse_optional_trimmed_env("KLIGHTS_EXTERNAL_ENDPOINT"),
             worker_dataplane_no_ingress: parse_bool_env(
@@ -895,7 +898,10 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_klights_env();
         let cfg = KlightsConfig::from_env().expect("default config must build");
-        assert_eq!(cfg.vxlan_device, crate::networking::vxlan::DEFAULT_DEVICE);
+        assert_eq!(
+            cfg.vxlan_device,
+            crate::networking::DEFAULT_POD_OVERLAY_DEVICE
+        );
     }
 
     #[test]

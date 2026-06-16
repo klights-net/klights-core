@@ -24,7 +24,7 @@ async fn test_replicaset_scale_subresource() {
             node_ip: None,
             vxlan_vni: 1228,
             vxlan_port: 8472,
-            vxlan_device: crate::networking::vxlan::DEFAULT_DEVICE.to_string(),
+            vxlan_device: crate::networking::DEFAULT_POD_OVERLAY_DEVICE.to_string(),
             dataplane_encryption: crate::networking::wireguard::DataplaneEncryption::Enabled,
             external_endpoint: None,
             worker_dataplane_no_ingress: false,

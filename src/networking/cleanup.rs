@@ -78,7 +78,7 @@ impl NetworkCleanup {
         let bridge_name = bridge_name.into();
         Self::root_with_runtime(
             bridge_name.clone(),
-            crate::networking::vxlan::DEFAULT_DEVICE.to_string(),
+            crate::networking::DEFAULT_POD_OVERLAY_DEVICE.to_string(),
             crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
             bridge_name,
         )

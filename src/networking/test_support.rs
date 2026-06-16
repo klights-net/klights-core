@@ -17,14 +17,6 @@ pub enum NetworkCall {
     CniDel {
         sandbox_id: String,
     },
-    ApplyPeerEndpoint {
-        node_name: String,
-        subnet: String,
-    },
-    RemovePeerEndpoint {
-        node_name: String,
-        subnet: String,
-    },
     ApplyWireGuardPeerEndpoint {
         node_name: String,
         endpoint: String,
@@ -172,15 +164,6 @@ impl crate::networking::datapath::Datapath for MockNetworkProvider {
 impl crate::networking::peer_router::PeerRouter for MockNetworkProvider {
     async fn apply_peer_endpoint(&self, peer: &NodeEndpoint) -> anyhow::Result<()> {
         match peer {
-            NodeEndpoint::Vxlan(subnet) => {
-                self.calls
-                    .lock()
-                    .expect("network calls mutex poisoned")
-                    .push(NetworkCall::ApplyPeerEndpoint {
-                        node_name: subnet.node_name.to_string(),
-                        subnet: subnet.subnet.to_string(),
-                    });
-            }
             NodeEndpoint::WireGuard(plan) => {
                 self.calls
                     .lock()
@@ -219,15 +202,6 @@ impl crate::networking::peer_router::PeerRouter for MockNetworkProvider {
 
     async fn remove_peer_endpoint(&self, peer: &NodeEndpoint) -> anyhow::Result<()> {
         match peer {
-            NodeEndpoint::Vxlan(subnet) => {
-                self.calls
-                    .lock()
-                    .expect("network calls mutex poisoned")
-                    .push(NetworkCall::RemovePeerEndpoint {
-                        node_name: subnet.node_name.to_string(),
-                        subnet: subnet.subnet.to_string(),
-                    });
-            }
             NodeEndpoint::WireGuard(plan) => {
                 self.calls
                     .lock()
@@ -390,77 +364,24 @@ impl crate::networking::ServiceRouter for MockServiceRouter {
 #[cfg(test)]
 mod peer_endpoint_tests {
     use super::*;
-    use crate::datastore::NodeSubnet;
-    use crate::networking::peer_router::PeerRouter;
-    use crate::networking::types::{NodeName, PodSubnet, VtepMac};
-
-    fn sample_subnet() -> NodeSubnet {
-        NodeSubnet {
-            node_name: NodeName::parse("peer-node").unwrap(),
-            subnet: PodSubnet::parse("10.42.7.0/24").unwrap(),
-            subnet_base_int: 0,
-            vtep_ip: Ipv4Addr::new(10, 42, 7, 0),
-            vtep_mac: Some(VtepMac::parse("aa:bb:cc:11:22:33").unwrap()),
-            node_ip: Ipv4Addr::new(192, 168, 1, 5),
-            mode: crate::controllers::annotations::NodePeerMode::Root,
-            hostport_range: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_apply_peer_endpoint_vxlan_programs_fdb_entry() {
-        // The MockNetworkProvider stands in for NetworkPlane in unit tests
-        // (real netlink/FDB programming requires CAP_NET_ADMIN). Successful
-        // dispatch from `apply_peer_endpoint(NodeEndpoint::Vxlan(_))` to the
-        // FDB-programming code path is observed via the recorded NetworkCall.
-        let mock = MockNetworkProvider::new();
-        let endpoint = NodeEndpoint::Vxlan(sample_subnet());
-        mock.apply_peer_endpoint(&endpoint).await.unwrap();
-
-        let calls = mock.calls();
-        assert_eq!(calls.len(), 1, "exactly one call recorded");
-        match &calls[0] {
-            NetworkCall::ApplyPeerEndpoint { node_name, subnet } => {
-                assert_eq!(node_name, "peer-node");
-                assert_eq!(subnet, "10.42.7.0/24");
-            }
-            other => panic!("expected ApplyPeerEndpoint, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_remove_peer_endpoint_vxlan_removes_fdb_entry() {
-        let mock = MockNetworkProvider::new();
-        let endpoint = NodeEndpoint::Vxlan(sample_subnet());
-        mock.remove_peer_endpoint(&endpoint).await.unwrap();
-
-        let calls = mock.calls();
-        assert_eq!(calls.len(), 1);
-        match &calls[0] {
-            NetworkCall::RemovePeerEndpoint { node_name, subnet } => {
-                assert_eq!(node_name, "peer-node");
-                assert_eq!(subnet, "10.42.7.0/24");
-            }
-            other => panic!("expected RemovePeerEndpoint, got {other:?}"),
-        }
-    }
 
     #[test]
     fn test_node_endpoint_is_non_exhaustive() {
         // Guards the `#[non_exhaustive]` shape: in-crate matches must
         // cover every known variant; external matches need a wildcard.
-        // `as_vxlan` returns Some for Vxlan and None for Rootless.
-        let endpoint = NodeEndpoint::Vxlan(sample_subnet());
+        let endpoint = NodeEndpoint::Rootless {
+            node_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+            hostport_range: crate::networking::types::HostPortRange {
+                start: 31000,
+                end: 31999,
+            },
+        };
         match &endpoint {
-            NodeEndpoint::Vxlan(subnet) => {
-                assert_eq!(subnet.subnet.to_string(), "10.42.7.0/24")
-            }
             NodeEndpoint::WireGuard(_) | NodeEndpoint::UnencryptedDirect(_) => {
-                panic!("constructed Vxlan, not direct endpoint")
+                panic!("constructed Rootless, not direct endpoint")
             }
-            NodeEndpoint::Rootless { .. } => panic!("constructed Vxlan, not Rootless"),
+            NodeEndpoint::Rootless { .. } => {}
         }
-        assert!(endpoint.as_vxlan().is_some());
     }
 
     // ---------- trait-split tests (Task 4) ----------

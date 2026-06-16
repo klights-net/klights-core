@@ -88,13 +88,8 @@ pub struct NetworkPlane {
     host_ip: Ipv4Addr,
     _vxlan_vni: u32,
     _vxlan_port: u16,
-    /// Resolved VXLAN device name (defaults to `klights.vxlan`; overridable
-    /// via `KLIGHTS_VXLAN_DEVICE` so multiple klights processes can coexist
-    /// in one host network namespace, each with a distinct link name).
-    vxlan_device: String,
     wireguard_device: String,
     bridge_idx: OnceLock<u32>,
-    vxlan_idx: OnceLock<u32>,
     wireguard_idx: OnceLock<u32>,
     wireguard: OnceLock<Arc<crate::networking::wireguard::WireGuardController>>,
     health: DataplaneHealth,
@@ -162,10 +157,8 @@ impl NetworkPlane {
             host_ip,
             _vxlan_vni: cfg.vxlan_vni,
             _vxlan_port: cfg.vxlan_port,
-            vxlan_device: cfg.vxlan_device.clone(),
             wireguard_device: cfg.wireguard_device.clone(),
             bridge_idx: OnceLock::new(),
-            vxlan_idx: OnceLock::new(),
             wireguard_idx: OnceLock::new(),
             wireguard: OnceLock::new(),
             health: DataplaneHealth::new_healthy(),
@@ -619,12 +612,6 @@ impl NetworkPlane {
     ) -> Result<()> {
         use crate::networking::types::NodeEndpoint;
         match peer {
-            NodeEndpoint::Vxlan(subnet) => {
-                let idx = self
-                    .link_index_cached(&self.vxlan_device, &self.vxlan_idx)
-                    .await?;
-                crate::networking::vxlan_fdb::apply_peer_subnet(&self.rt, idx, subnet).await
-            }
             NodeEndpoint::WireGuard(plan) => {
                 let controller = self
                     .wireguard
@@ -655,12 +642,6 @@ impl NetworkPlane {
     ) -> Result<()> {
         use crate::networking::types::NodeEndpoint;
         match peer {
-            NodeEndpoint::Vxlan(subnet) => {
-                let idx = self
-                    .link_index_cached(&self.vxlan_device, &self.vxlan_idx)
-                    .await?;
-                crate::networking::vxlan_fdb::remove_peer_subnet(&self.rt, idx, subnet).await
-            }
             NodeEndpoint::WireGuard(plan) => {
                 let idx = self
                     .link_index_cached(&self.wireguard_device, &self.wireguard_idx)

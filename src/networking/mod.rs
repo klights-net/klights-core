@@ -18,8 +18,6 @@ pub mod service_routing;
 #[cfg(test)]
 pub mod test_support;
 pub mod types;
-pub mod vxlan;
-pub mod vxlan_fdb;
 pub mod wireguard;
 
 use anyhow::Context;
@@ -35,10 +33,18 @@ pub use rootless_plane::RootlessNetworkPlane;
 pub use service_router::ServiceRouter;
 pub use types::{BridgeName, ClusterCidr, NodeEndpoint, NodeName, PodSubnet, VtepMac};
 
+/// Default root-mode pod overlay device name retained for config compatibility
+/// while the legacy VXLAN-specific knobs are unwired.
+pub const DEFAULT_POD_OVERLAY_DEVICE: &str = "klights.vxlan";
+pub const DEFAULT_POD_OVERLAY_VNI: u32 = 1228;
+pub const DEFAULT_POD_OVERLAY_PORT: u16 = 8472;
+/// Historical pod-link MTU used when encryption is disabled.
+pub const POD_OVERLAY_MTU: u32 = 1450;
+
 pub fn pod_link_mtu_for_encryption(encryption: wireguard::DataplaneEncryption) -> u32 {
     match encryption {
         wireguard::DataplaneEncryption::Enabled => wireguard::WIREGUARD_MTU,
-        wireguard::DataplaneEncryption::Disabled => vxlan::VXLAN_MTU,
+        wireguard::DataplaneEncryption::Disabled => POD_OVERLAY_MTU,
     }
 }
 
@@ -130,10 +136,10 @@ mod network_facade_tests {
         );
         assert_eq!(
             pod_link_mtu_for_encryption(wireguard::DataplaneEncryption::Disabled),
-            vxlan::VXLAN_MTU
+            POD_OVERLAY_MTU
         );
         const _: () = assert!(
-            wireguard::WIREGUARD_MTU <= vxlan::VXLAN_MTU,
+            wireguard::WIREGUARD_MTU <= POD_OVERLAY_MTU,
             "encrypted pod links must not exceed the lower WireGuard transport MTU"
         );
     }

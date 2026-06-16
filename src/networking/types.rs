@@ -8,8 +8,6 @@ use std::net::Ipv4Addr;
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 
-use crate::datastore::NodeSubnet;
-
 /// Identifier for a peer node from the perspective of `PeerRouter` /
 /// `NetworkProvider::apply_peer_endpoint`.
 ///
@@ -18,9 +16,6 @@ use crate::datastore::NodeSubnet;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeEndpoint {
-    /// Peer reachable via VXLAN overlay; carries the peer's NodeSubnet
-    /// (subnet, vtep_ip, vtep_mac, node_ip).
-    Vxlan(NodeSubnet),
     /// Peer reachable through the klights-managed WireGuard overlay.
     /// This is the default cross-node pod dataplane when encryption is
     /// enabled.
@@ -73,18 +68,6 @@ impl HostPortRange {
 impl fmt::Display for HostPortRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}-{}", self.start, self.end)
-    }
-}
-
-impl NodeEndpoint {
-    /// Borrow the underlying VXLAN subnet, if this endpoint is a VXLAN
-    /// peer. Returns `None` for non-VXLAN endpoints (today: `Rootless`).
-    pub fn as_vxlan(&self) -> Option<&NodeSubnet> {
-        match self {
-            NodeEndpoint::Vxlan(subnet) => Some(subnet),
-            NodeEndpoint::WireGuard(_) | NodeEndpoint::UnencryptedDirect(_) => None,
-            NodeEndpoint::Rootless { .. } => None,
-        }
     }
 }
 
