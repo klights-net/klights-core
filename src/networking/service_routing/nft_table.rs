@@ -618,7 +618,7 @@ impl KlightsTable {
         // RST, fragments outside a flow, etc.) — defense-in-depth that
         // costs one extra rule evaluation per forwarded packet. Standard
         // kube-proxy / Calico / firewall pattern.
-        let mut forward_rules = vec![
+        let forward_rules = vec![
             self.rule_ct_invalid_drop(&forward),
             self.rule_jump_service_ct_guard_for_iif(&forward),
             self.rule_jump_service_ct_guard_for_oif(&forward),
@@ -626,13 +626,6 @@ impl KlightsTable {
             self.rule_ip_in_subnet(&forward, Ipv4HeaderField::Saddr, CmpOp::Eq, Verdict::Accept),
             self.rule_ip_in_subnet(&forward, Ipv4HeaderField::Daddr, CmpOp::Eq, Verdict::Accept),
         ];
-        // F2-03: only emit the VXLAN ingress accept rule in modes that
-        // actually own a VXLAN device (root). Rootless boots in a user
-        // namespace where the overlay device does not exist; matching on it
-        // would be a no-op rule pinned to a non-existent interface.
-        if self.mode.vxlan_rule_enabled() {
-            forward_rules.push(self.rule_vxlan_iifname_accept(&forward));
-        }
         self.nf
             .replace_chain(&forward, &forward_rules)
             .await
@@ -1276,20 +1269,6 @@ impl KlightsTable {
         // reject adding IPS_DST_NAT_DONE to this mask in forward-chain rules.
         rule.add_expr(&Bitwise::new(ConntrackStatus::DST_NAT.bits(), 0u32));
         rule.add_expr(&Cmp::new(CmpOp::Neq, 0u32));
-    }
-
-    /// `iifname "<vxlan_device>" accept` — allow VXLAN-decapsulated packets
-    /// arriving on the configured overlay device to pass through the forward
-    /// chain. The interface name flows in from `ServiceRoutingMode` so tests
-    /// and cleanup paths can keep one routing-mode contract.
-    fn rule_vxlan_iifname_accept<'a>(&self, chain: &'a Chain<'a>) -> Rule<'a> {
-        let mut rule = Rule::new(chain);
-        rule.add_expr(&Meta::IifName);
-        let vxlan_iface = CString::new(self.mode.vxlan_device())
-            .expect("overlay device name must not contain NUL bytes");
-        rule.add_expr(&Cmp::new(CmpOp::Eq, InterfaceName::Exact(vxlan_iface)));
-        rule.add_expr(&nft_expr!(verdict accept));
-        rule
     }
 
     /// Adds the `payload + bitwise + cmp` triplet for matching one IP
@@ -2059,10 +2038,6 @@ mod kernel_compat_tests {
                     CmpOp::Eq,
                     Verdict::Accept,
                 ),
-            ),
-            (
-                "vxlan-iif-accept",
-                table_handle.rule_vxlan_iifname_accept(&chain),
             ),
         ];
 

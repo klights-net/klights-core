@@ -33,9 +33,6 @@ pub use rootless_plane::RootlessNetworkPlane;
 pub use service_router::ServiceRouter;
 pub use types::{BridgeName, ClusterCidr, NodeEndpoint, NodeName, PodSubnet};
 
-/// Default root-mode pod overlay device name retained for config compatibility
-/// while the legacy VXLAN-specific knobs are unwired.
-pub const DEFAULT_POD_OVERLAY_DEVICE: &str = "klights.vxlan";
 /// Historical pod-link MTU used when encryption is disabled.
 pub const POD_OVERLAY_MTU: u32 = 1450;
 

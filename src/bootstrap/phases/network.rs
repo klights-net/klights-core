@@ -96,10 +96,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let service_cidr = networking::ClusterCidr::parse(&config.service_cidr)
         .map_err(|e| anyhow::anyhow!("bad service_cidr '{}': {}", config.service_cidr, e))?;
 
-    let srm = networking::service_routing::ServiceRoutingMode::new(
-        node_mode.clone(),
-        networking::DEFAULT_POD_OVERLAY_DEVICE,
-    );
+    let srm = networking::service_routing::ServiceRoutingMode::new(node_mode.clone());
     let services: Arc<dyn networking::ServiceRouter> =
         networking::service_routing::NftServiceRouter::boot_with_defaults(
             networking::service_routing::NftServiceRouterDefaultBoot::new(

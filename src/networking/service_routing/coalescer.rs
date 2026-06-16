@@ -548,8 +548,7 @@ impl ServiceRouter for NftServiceRouter {
         let placeholder_service = ClusterCidr::parse("0.0.0.0/0").expect("static placeholder");
         // Cleanup only deletes the table; the mode field never drives kernel
         // calls on the cleanup path, so a default placeholder is safe here.
-        let placeholder_mode =
-            ServiceRoutingMode::new(crate::bootstrap::NodeMode::Root, "klights.vxlan");
+        let placeholder_mode = ServiceRoutingMode::new(crate::bootstrap::NodeMode::Root);
         let table = KlightsTable::with_name_and_bridge(
             nf,
             &self.table_name_str,
