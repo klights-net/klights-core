@@ -540,8 +540,7 @@ mod tests {
         ) -> Result<NodeSubnet> {
             self.allocate_node_subnet.fetch_add(1, Ordering::Relaxed);
             // Dispatch tests assert on the counter; return a synthetic
-            // error so we don't need to construct a real NodeSubnet
-            // (heavy: requires PodSubnet + Ipv4Addr + VtepMac plumbing).
+            // error so we don't need to construct a real NodeSubnet.
             anyhow::bail!("recording client {} allocate_node_subnet", self.name)
         }
 

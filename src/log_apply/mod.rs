@@ -117,7 +117,6 @@ impl LogApplyCommit {
                 subnet: row.subnet.to_string(),
                 subnet_base_int: row.subnet_base_int,
                 vtep_ip: row.vtep_ip.to_string(),
-                vtep_mac: row.vtep_mac.as_ref().map(|mac| mac.to_string()),
                 node_ip: row.node_ip.to_string(),
                 mode: match row.mode {
                     crate::controllers::annotations::NodePeerMode::Root => "root".to_string(),
@@ -334,7 +333,6 @@ pub struct LogApplyNodeSubnetRow {
     pub subnet: String,
     pub subnet_base_int: u32,
     pub vtep_ip: String,
-    pub vtep_mac: Option<String>,
     pub node_ip: String,
     pub mode: String,
     pub hostport_range: Option<String>,
@@ -676,8 +674,6 @@ struct ProtoLogApplyNodeSubnetRow {
     subnet_base_int: u32,
     #[prost(string, tag = "4")]
     vtep_ip: String,
-    #[prost(string, optional, tag = "5")]
-    vtep_mac: Option<String>,
     #[prost(string, tag = "6")]
     node_ip: String,
     #[prost(string, tag = "7")]
@@ -1088,7 +1084,6 @@ impl From<LogApplyNodeSubnetRow> for ProtoLogApplyNodeSubnetRow {
             subnet: row.subnet,
             subnet_base_int: row.subnet_base_int,
             vtep_ip: row.vtep_ip,
-            vtep_mac: row.vtep_mac,
             node_ip: row.node_ip,
             mode: row.mode,
             hostport_range: row.hostport_range,
@@ -1103,7 +1098,6 @@ impl From<ProtoLogApplyNodeSubnetRow> for LogApplyNodeSubnetRow {
             subnet: row.subnet,
             subnet_base_int: row.subnet_base_int,
             vtep_ip: row.vtep_ip,
-            vtep_mac: row.vtep_mac,
             node_ip: row.node_ip,
             mode: row.mode,
             hostport_range: row.hostport_range,
@@ -1335,7 +1329,6 @@ mod parity_tests {
                 subnet: "10.42.1.0/24".to_string(),
                 subnet_base_int: 0x0a2a0100,
                 vtep_ip: "10.42.1.0".to_string(),
-                vtep_mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
                 node_ip: "192.168.0.10".to_string(),
                 mode: "root".to_string(),
                 hostport_range: Some("30000-32767".to_string()),

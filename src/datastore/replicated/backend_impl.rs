@@ -11,7 +11,6 @@ use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::command::CommandMeta;
 use crate::datastore::command::StorageCommand;
 use crate::datastore::types::*;
-use crate::networking::VtepMac;
 use crate::watch::{WatchSignal, WatchTopic};
 
 use super::ReplicatedDatastore;
@@ -689,18 +688,6 @@ impl DatastoreBackend for ReplicatedDatastore {
                 "raft-routed allocate_node_subnet: row missing after commit for {node_name}"
             )
         })
-    }
-    async fn update_node_vtep_mac(&self, node_name: &str, vtep_mac: &VtepMac) -> Result<()> {
-        let proposer = self.require_raft_proposer()?;
-        self.propose_command_via_raft(
-            &proposer,
-            StorageCommand::UpdateNodeVtepMac {
-                node_name: node_name.to_string(),
-                vtep_mac: vtep_mac.to_string(),
-            },
-        )
-        .await?;
-        Ok(())
     }
     async fn update_node_peer_attributes(
         &self,

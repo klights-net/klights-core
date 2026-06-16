@@ -353,7 +353,6 @@ message NodeSubnetObject {
   string subnet = 2;
   uint32 subnet_base_int = 3;
   string vtep_ip = 4;
-  optional string vtep_mac = 5;
   string node_ip = 6;
   string mode = 7;
   optional string hostport_range = 8;

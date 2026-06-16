@@ -59,11 +59,8 @@ impl Datastore {
                 let vtep_ip_typed = Ipv4Addr::from(base);
                 let vtep_ip_str = vtep_ip_typed.to_string();
 
-                // F2-04: vtep_mac is NULL until the local node ensures the
-                // VXLAN device (root mode) or stays NULL forever for
-                // rootless peers. mode + hostport_range default to root /
-                // unknown and are reconciled from Node annotations by
-                // run_peer_watch.
+                // mode + hostport_range default to root / unknown and are
+                // reconciled from Node annotations by run_peer_watch.
                 let result = conn.execute(
                     queries::NODE_SUBNET_INSERT_OR_IGNORE,
                     rusqlite::params![
@@ -82,7 +79,6 @@ impl Datastore {
                         subnet: subnet_typed,
                         subnet_base_int: base,
                         vtep_ip: vtep_ip_typed,
-                        vtep_mac: None,
                         node_ip: node_ip_typed,
                         mode: crate::controllers::annotations::NodePeerMode::Root,
                         hostport_range: None,
@@ -96,21 +92,6 @@ impl Datastore {
         })
         .await
         .map_err(|e| anyhow!("node_subnet allocation failed: {}", e))
-    }
-
-    /// Update the VTEP MAC for a node after the VXLAN device is created.
-    pub async fn update_node_vtep_mac(&self, node_name: &str, vtep_mac: &VtepMac) -> Result<()> {
-        let node_name = node_name.to_string();
-        let vtep_mac = vtep_mac.to_string();
-        self.db_call("db_query", move |conn| {
-            conn.execute(
-                queries::NODE_SUBNET_UPDATE_VTEP_MAC,
-                rusqlite::params![vtep_mac, node_name],
-            )?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("Failed to update vtep_mac: {}", e))
     }
 
     /// Get the subnet record for a specific node.
@@ -131,10 +112,8 @@ impl Datastore {
 
     /// List all peer node subnets (everyone except `my_node_name`).
     ///
-    /// F2-04: no longer filters by `vtep_mac IS NOT NULL`. Rootless peers do
-    /// not own a VXLAN device and would have been silently dropped by the
-    /// legacy filter. The controller decides per-peer whether to install a
-    /// route based on the projected `mode` + `vtep_mac`.
+    /// Includes root and rootless peers. The controller decides per-peer
+    /// routing from the projected `mode`.
     pub async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
         let my_node_name = my_node_name.to_string();
         self.db_call("db_query", move |conn| {

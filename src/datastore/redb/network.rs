@@ -16,7 +16,7 @@ use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
 use crate::datastore::types::*;
 use crate::networking::types::HostPortRange;
-use crate::networking::{ClusterCidr, NodeName, PodSubnet, VtepMac};
+use crate::networking::{ClusterCidr, NodeName, PodSubnet};
 
 pub struct RedbNetworkStore {
     pub accessor: Arc<RedbAccessor>,
@@ -284,11 +284,6 @@ impl RedbNetworkStore {
                 let vtep_ip: Ipv4Addr = vtep_ip_str
                     .parse()
                     .map_err(|e| anyhow!("bad vtep_ip: {e}"))?;
-                let vtep_mac = v
-                    .get("vtep_mac")
-                    .and_then(|s| s.as_str())
-                    .filter(|s| !s.is_empty())
-                    .and_then(|s| VtepMac::parse(s).ok());
                 let mode = parse_peer_mode(mode_str);
                 let hostport_range = hpr_str.and_then(|s| HostPortRange::parse(s).ok());
 
@@ -298,7 +293,6 @@ impl RedbNetworkStore {
                     subnet,
                     subnet_base_int: subnet_base,
                     vtep_ip,
-                    vtep_mac,
                     node_ip: node_ip_typed,
                     mode,
                     hostport_range,
@@ -338,7 +332,6 @@ impl RedbNetworkStore {
                     "subnet_base_int": base,
                     "vtep_ip": vtep_ip.to_string(),
                     "node_ip": node_ip,
-                    "vtep_mac": "",
                     "mode": "root",
                     "hostport_range": null,
                 });
@@ -352,7 +345,6 @@ impl RedbNetworkStore {
                     subnet: subnet_typed,
                     subnet_base_int: base,
                     vtep_ip,
-                    vtep_mac: None,
                     node_ip: node_ip_typed,
                     mode: NodePeerMode::Root,
                     hostport_range: None,
@@ -360,33 +352,6 @@ impl RedbNetworkStore {
             }
 
             Err(anyhow!("no free /24 subnets in cluster CIDR"))
-        })
-        .await
-    }
-
-    pub async fn update_vtep_mac(&self, node_name: &str, vtep_mac: &VtepMac) -> Result<()> {
-        let node_name_owned = node_name.to_string();
-        let vtep_mac_owned = *vtep_mac;
-        self.db_call("update_vtep_mac_impl", move |db| {
-            let node_name: &str = &node_name_owned;
-            let vtep_mac: &VtepMac = &vtep_mac_owned;
-            let w = db.begin_write()?;
-            {
-                let bytes: Vec<u8> = {
-                    let t = w.open_table(tables::NODE_SUBNETS)?;
-                    let g = t
-                        .get(node_name)?
-                        .ok_or_else(|| anyhow!("node subnet not found"))?;
-                    g.value().to_vec()
-                };
-                let mut v: Value = serde_json::from_slice(&bytes).unwrap_or_default();
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("vtep_mac".into(), Value::String(vtep_mac.to_string()));
-                }
-                let mut t = w.open_table(tables::NODE_SUBNETS)?;
-                t.insert(node_name, serde_json::to_vec(&v)?.as_slice())?;
-            }
-            Ok(w.commit()?)
         })
         .await
     }
@@ -624,11 +589,6 @@ fn parse_node_subnet_value(name: &str, body: &[u8]) -> Result<NodeSubnet> {
     let node_ip: Ipv4Addr = node_ip_str
         .parse()
         .map_err(|e| anyhow!("bad node_ip: {e}"))?;
-    let vtep_mac = v
-        .get("vtep_mac")
-        .and_then(|s| s.as_str())
-        .filter(|s| !s.is_empty())
-        .and_then(|s| VtepMac::parse(s).ok());
     let mode_str = v.get("mode").and_then(|s| s.as_str()).unwrap_or("root");
     let hpr_str = v.get("hostport_range").and_then(|s| s.as_str());
     Ok(NodeSubnet {
@@ -636,7 +596,6 @@ fn parse_node_subnet_value(name: &str, body: &[u8]) -> Result<NodeSubnet> {
         subnet,
         subnet_base_int,
         vtep_ip,
-        vtep_mac,
         node_ip,
         mode: parse_peer_mode(mode_str),
         hostport_range: hpr_str.and_then(|s| HostPortRange::parse(s).ok()),

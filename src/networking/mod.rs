@@ -31,7 +31,7 @@ pub use plane::NetworkPlane;
 pub use pod_endpoint_resolver::{PodEndpointResolver, SqlitePodEndpointResolver};
 pub use rootless_plane::RootlessNetworkPlane;
 pub use service_router::ServiceRouter;
-pub use types::{BridgeName, ClusterCidr, NodeEndpoint, NodeName, PodSubnet, VtepMac};
+pub use types::{BridgeName, ClusterCidr, NodeEndpoint, NodeName, PodSubnet};
 
 /// Default root-mode pod overlay device name retained for config compatibility
 /// while the legacy VXLAN-specific knobs are unwired.

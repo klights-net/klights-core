@@ -204,7 +204,6 @@ fn node_scoped_outbox_target(command: &StorageCommand) -> Option<&str> {
 
     match command {
         StorageCommand::AllocateNodeSubnet { node_name, .. }
-        | StorageCommand::UpdateNodeVtepMac { node_name, .. }
         | StorageCommand::UpdateNodePeerAttributes { node_name, .. }
         | StorageCommand::UpdateNodeDataplane { node_name, .. }
         | StorageCommand::DeleteNodeSubnet { node_name } => Some(node_name),

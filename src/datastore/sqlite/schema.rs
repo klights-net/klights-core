@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 
-use crate::networking::{NodeName, PodSubnet, VtepMac};
+use crate::networking::{NodeName, PodSubnet};
 use rusqlite::OptionalExtension;
 
 use super::NodeSubnet;
@@ -270,9 +270,9 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
 
     // node_subnets: one row per klights node in the cluster.
     // Populated by the node_subnet controller at startup.
-    // vtep_ip is the /32 address assigned on klights.vxlan (first addr of subnet).
-    // vtep_mac is the kernel-assigned MAC of klights.vxlan (NULL for rootless peers — F2-04).
-    // node_ip is the host's primary InternalIP (underlay address for VXLAN UDP).
+    // vtep_ip is the first address of the allocated subnet, retained for
+    // compatibility with existing row shape.
+    // node_ip is the host's primary InternalIP.
     // mode is the peer mode projected from klights.io/mode annotation (F2-04).
     // hostport_range is the rootless host-port graft range (NULL for root peers).
     conn.execute(
@@ -281,7 +281,6 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
             subnet          TEXT NOT NULL UNIQUE,
             subnet_base_int INTEGER NOT NULL,
             vtep_ip         TEXT NOT NULL,
-            vtep_mac        TEXT,
             node_ip         TEXT NOT NULL,
             mode            TEXT NOT NULL DEFAULT 'root',
             hostport_range  TEXT,
@@ -379,23 +378,17 @@ pub(super) fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<No
     let node_name_str: String = row.get(0)?;
     let subnet_str: String = row.get(1)?;
     let vtep_ip_str: String = row.get(3)?;
-    // F2-04: vtep_mac is nullable; tolerate an empty string from test fixtures.
-    let vtep_mac_opt: Option<String> = row.get(4)?;
-    let node_ip_str: String = row.get(5)?;
-    let mode_str: String = row.get(6).unwrap_or_else(|_| "root".to_string());
-    let hostport_range_opt: Option<String> = row.get(7).unwrap_or(None);
+    let node_ip_str: String = row.get(4)?;
+    let mode_str: String = row.get(5).unwrap_or_else(|_| "root".to_string());
+    let hostport_range_opt: Option<String> = row.get(6).unwrap_or(None);
 
     let node_name = NodeName::parse(&node_name_str).map_err(parse_err(0))?;
     let subnet = PodSubnet::parse(&subnet_str).map_err(parse_err(1))?;
     let vtep_ip: Ipv4Addr = vtep_ip_str.parse().map_err(|e: std::net::AddrParseError| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
     })?;
-    let vtep_mac = match vtep_mac_opt.as_deref() {
-        None | Some("") => None,
-        Some(s) => Some(VtepMac::parse(s).map_err(parse_err(4))?),
-    };
     let node_ip: Ipv4Addr = node_ip_str.parse().map_err(|e: std::net::AddrParseError| {
-        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let mode = parse_node_peer_mode(Some(mode_str.as_str())).unwrap_or(NodePeerMode::Root);
     let hostport_range = hostport_range_opt
@@ -408,7 +401,6 @@ pub(super) fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<No
         subnet,
         subnet_base_int: row.get::<_, i64>(2)? as u32,
         vtep_ip,
-        vtep_mac,
         node_ip,
         mode,
         hostport_range,

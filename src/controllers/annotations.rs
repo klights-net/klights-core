@@ -1,19 +1,16 @@
 //! Shared `klights.io/...` Node annotation keys, parsers, and the
 //! `NodePeerMode` enum (F2-05).
 //!
-//! `controllers/node_subnet.rs` previously owned `VTEP_MAC_ANNOTATION` as a
-//! file-local constant. F2-05 introduces two more annotations
-//! (`klights.io/mode`, `klights.io/hostport-range`) that need to be published
-//! by `kubelet/node.rs` *and* read back by `controllers/node_subnet.rs` for
-//! the peer-mode projection F2-04 introduces. Without one shared module the
-//! constants would drift across the publisher and the consumer.
+//! `klights.io/mode` and `klights.io/hostport-range` are published by
+//! `kubelet/node.rs` and read back by `controllers/node_subnet.rs` for peer
+//! mode projection. Keeping them in one module prevents publisher/consumer
+//! drift.
 
 use crate::bootstrap::NodeMode;
 use thiserror::Error;
 
 pub const NODE_MODE_ANNOTATION: &str = "klights.io/mode";
 pub const HOSTPORT_RANGE_ANNOTATION: &str = "klights.io/hostport-range";
-pub const VTEP_MAC_ANNOTATION: &str = "klights.io/vtep-mac";
 pub const DATAPLANE_ENDPOINT_ANNOTATION: &str = "klights.io/dataplane-endpoint";
 pub const DATAPLANE_PORT_ANNOTATION: &str = "klights.io/dataplane-port";
 pub const DATAPLANE_MODE_ANNOTATION: &str = "klights.io/dataplane-mode";
@@ -58,8 +55,7 @@ pub enum AnnotationError {
 
 /// Parse the `klights.io/mode` annotation into the typed peer mode. `None`
 /// returns `Ok(Root)` for backward compatibility with pre-F2-05 nodes that
-/// existed before mode was published; the caller can layer additional checks
-/// (e.g. require a `vtep_mac` for root mode) on top of this.
+/// existed before mode was published.
 pub fn parse_node_peer_mode(value: Option<&str>) -> Result<NodePeerMode, AnnotationError> {
     match value {
         None => Ok(NodePeerMode::Root),

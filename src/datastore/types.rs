@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use crate::networking::{NodeName, PodSubnet, VtepMac};
+use crate::networking::{NodeName, PodSubnet};
 use crate::watch::WatchEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -729,10 +729,6 @@ pub struct NodeSubnet {
     /// Legacy VXLAN VTEP IP (first address of the subnet) when an explicit
     /// VXLAN route mode owns `klights.vxlan`.
     pub vtep_ip: Ipv4Addr,
-    /// Kernel-assigned MAC of `klights.vxlan` when an explicit VXLAN route mode
-    /// creates it. `None` is expected for default WireGuard, direct-route, and
-    /// rootless peers.
-    pub vtep_mac: Option<VtepMac>,
     /// Host's primary underlay IP (used as the VXLAN UDP source/destination).
     pub node_ip: Ipv4Addr,
     /// Peer mode projected from the node's `klights.io/mode` annotation

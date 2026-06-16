@@ -16,7 +16,6 @@ use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::replicated::DatastoreApplier;
 
 use super::Datastore;
-use crate::networking::VtepMac;
 
 #[async_trait]
 impl DatastoreApplier for Datastore {
@@ -163,14 +162,6 @@ impl DatastoreApplier for Datastore {
             } => {
                 self.allocate_node_subnet(&node_name, &subnet, &node_ip)
                     .await?;
-            }
-            StorageCommand::UpdateNodeVtepMac {
-                node_name,
-                vtep_mac,
-            } => {
-                let mac = VtepMac::parse(&vtep_mac)
-                    .map_err(|e| anyhow!("invalid VTEP MAC '{}': {}", vtep_mac, e))?;
-                self.update_node_vtep_mac(&node_name, &mac).await?;
             }
             StorageCommand::UpdateNodePeerAttributes {
                 node_name,

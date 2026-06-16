@@ -358,13 +358,6 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 subnet,
                 node_ip,
             }),
-            StorageCommand::UpdateNodeVtepMac {
-                node_name,
-                vtep_mac,
-            } => proto_storage_command::Command::UpdateNodeVtepMac(ProtoUpdateNodeVtepMac {
-                node_name,
-                vtep_mac,
-            }),
             StorageCommand::UpdateNodePeerAttributes {
                 node_name,
                 mode,
@@ -586,12 +579,6 @@ impl TryFrom<ProtoStorageCommand> for StorageCommand {
                     node_name: p.node_name,
                     subnet: p.subnet,
                     node_ip: p.node_ip,
-                }
-            }
-            proto_storage_command::Command::UpdateNodeVtepMac(p) => {
-                StorageCommand::UpdateNodeVtepMac {
-                    node_name: p.node_name,
-                    vtep_mac: p.vtep_mac,
                 }
             }
             proto_storage_command::Command::UpdateNodePeerAttributes(p) => {
@@ -1038,13 +1025,6 @@ mod tests {
                 "AllocateNodeSubnet",
             ),
             (
-                StorageCommand::UpdateNodeVtepMac {
-                    node_name: "node-1".into(),
-                    vtep_mac: "aa:bb:cc:dd:ee:ff".into(),
-                },
-                "UpdateNodeVtepMac",
-            ),
-            (
                 StorageCommand::UpdateNodePeerAttributes {
                     node_name: "node-1".into(),
                     mode: "root".into(),
@@ -1214,7 +1194,6 @@ mod tests {
             "DeleteNamespace",
             "DeleteNamespaceContents",
             "AllocateNodeSubnet",
-            "UpdateNodeVtepMac",
             "UpdateNodePeerAttributes",
             "UpdateNodeDataplane",
             "DeleteNodeSubnet",
@@ -1797,7 +1776,6 @@ mod tests {
         for (cmd, name) in all_command_samples() {
             match cmd {
                 StorageCommand::AllocateNodeSubnet { .. }
-                | StorageCommand::UpdateNodeVtepMac { .. }
                 | StorageCommand::UpdateNodePeerAttributes { .. }
                 | StorageCommand::DeleteNodeSubnet { .. } => {
                     let json = encode_command_json(&cmd)

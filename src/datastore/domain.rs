@@ -513,13 +513,6 @@ static METHOD_DOMAINS: LazyLock<BTreeMap<&'static str, MethodMeta>> = LazyLock::
         },
     );
     m.insert(
-        "update_node_vtep_mac",
-        MethodMeta {
-            domain: D::ClusterReplicated,
-            cross_domain: false,
-        },
-    );
-    m.insert(
         "update_node_peer_attributes",
         MethodMeta {
             domain: D::ClusterReplicated,
@@ -933,7 +926,6 @@ mod tests {
             "list_watch_events_since",
             // Node subnet operations
             "allocate_node_subnet",
-            "update_node_vtep_mac",
             "update_node_peer_attributes",
             "update_node_dataplane",
             "get_node_dataplane",

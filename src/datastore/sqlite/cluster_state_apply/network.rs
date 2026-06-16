@@ -27,7 +27,6 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
                 row.subnet,
                 i64::from(row.subnet_base_int),
                 row.vtep_ip,
-                row.vtep_mac,
                 row.node_ip,
                 row.mode,
                 row.hostport_range
@@ -121,10 +120,9 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
                         subnet: row.get(1)?,
                         subnet_base_int: row.get::<_, i64>(2)? as u32,
                         vtep_ip: row.get(3)?,
-                        vtep_mac: row.get(4)?,
-                        node_ip: row.get(5)?,
-                        mode: row.get(6)?,
-                        hostport_range: row.get(7)?,
+                        node_ip: row.get(4)?,
+                        mode: row.get(5)?,
+                        hostport_range: row.get(6)?,
                     })
                 },
             )
@@ -160,7 +158,6 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
                 subnet: subnet_typed.to_string(),
                 subnet_base_int: base,
                 vtep_ip: vtep_ip.to_string(),
-                vtep_mac: None,
                 node_ip: node_ip_typed.to_string(),
                 mode: "root".to_string(),
                 hostport_range: None,

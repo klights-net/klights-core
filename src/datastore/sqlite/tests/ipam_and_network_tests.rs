@@ -16,7 +16,6 @@ type NodeSubnetReplayRow = (
     String,
     i64,
     String,
-    Option<String>,
     String,
     String,
     Option<String>,
@@ -36,7 +35,7 @@ type NodeDataplaneReplayRow = (
 async fn select_node_subnet_rows(db: &Datastore) -> Vec<NodeSubnetReplayRow> {
     db.db_call("test_select_node_subnet_rows", |conn| {
         let mut stmt = conn.prepare(
-            "SELECT node_name, subnet, subnet_base_int, vtep_ip, vtep_mac, node_ip, mode, \
+            "SELECT node_name, subnet, subnet_base_int, vtep_ip, node_ip, mode, \
              hostport_range, created_at FROM node_subnets ORDER BY node_name",
         )?;
         let rows = stmt
@@ -46,11 +45,10 @@ async fn select_node_subnet_rows(db: &Datastore) -> Vec<NodeSubnetReplayRow> {
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -347,7 +345,6 @@ async fn raft_node_subnet_replay_is_deterministic() {
         subnet: "10.60.0.0/24".to_string(),
         subnet_base_int: u32::from(Ipv4Addr::new(10, 60, 0, 0)),
         vtep_ip: "10.60.0.1".to_string(),
-        vtep_mac: Some("AA:BB:CC:DD:EE:01".to_string()),
         node_ip: "192.0.2.10".to_string(),
         mode: "root".to_string(),
         hostport_range: Some("30000-30100".to_string()),

@@ -460,7 +460,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
         let rows = db
             .db_call("family-fingerprint-node-subnets", |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT node_name, subnet, subnet_base_int, vtep_ip, vtep_mac, node_ip, mode, \
+                    "SELECT node_name, subnet, subnet_base_int, vtep_ip, node_ip, mode, \
                      hostport_range, created_at FROM node_subnets ORDER BY node_name",
                 )?;
                 let rows = stmt
@@ -470,11 +470,10 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
                             row.get::<_, String>(1)?,
                             row.get::<_, i64>(2)?,
                             row.get::<_, String>(3)?,
-                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(4)?,
                             row.get::<_, String>(5)?,
-                            row.get::<_, String>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                            row.get::<_, i64>(8)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, i64>(7)?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -490,11 +489,10 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
             hash_str(hasher, &row.1);
             hash_i64(hasher, row.2);
             hash_str(hasher, &row.3);
-            hash_optional_str(hasher, row.4.as_deref());
+            hash_str(hasher, &row.4);
             hash_str(hasher, &row.5);
-            hash_str(hasher, &row.6);
-            hash_optional_str(hasher, row.7.as_deref());
-            hash_i64(hasher, row.8);
+            hash_optional_str(hasher, row.6.as_deref());
+            hash_i64(hasher, row.7);
         }
         Ok(())
     }
@@ -779,7 +777,6 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
                 subnet: "10.42.0.0/24".to_string(),
                 subnet_base_int: 1_762_000_000,
                 vtep_ip: "10.42.0.1".to_string(),
-                vtep_mac: Some("02:11:22:33:44:55".to_string()),
                 node_ip: "192.0.2.10".to_string(),
                 mode: "root".to_string(),
                 hostport_range: Some("30000-30010".to_string()),

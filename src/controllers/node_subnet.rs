@@ -13,15 +13,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::AppState;
 use crate::controllers::annotations::{
-    HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION, NodePeerMode, VTEP_MAC_ANNOTATION,
-    parse_node_peer_mode,
+    HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION, NodePeerMode, parse_node_peer_mode,
 };
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{DatastoreBackend, DatastoreHandle, NodeSubnet, WatchTarget};
 use crate::kubelet::outbox::Outbox;
+use crate::networking::NodeEndpoint;
 use crate::networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
 use crate::networking::types::HostPortRange;
-use crate::networking::{NodeEndpoint, VtepMac};
 use crate::watch::{
     EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
     WindowPolicy,
@@ -382,27 +381,6 @@ async fn reconcile_peer_node_event_cluster_state(
                                 e
                             );
                         }
-                        if let Some(vtep_mac) = node_vtep_mac(&live_node.data) {
-                            match VtepMac::parse(&vtep_mac) {
-                                Ok(mac) => {
-                                    if let Err(e) = db.update_node_vtep_mac(peer_name, &mac).await {
-                                        tracing::warn!(
-                                            "node_subnet: failed to update peer {} vtep_mac from Node annotation: {}",
-                                            peer_name,
-                                            e
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "node_subnet: peer {} has invalid vtep_mac annotation '{}': {}",
-                                        peer_name,
-                                        vtep_mac,
-                                        e
-                                    );
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -461,7 +439,6 @@ pub async fn sync_peer_routes(
                 let s = &old.subnet;
                 s.subnet != peer.subnet
                     || s.vtep_ip != peer.vtep_ip
-                    || s.vtep_mac != peer.vtep_mac
                     || s.node_ip != peer.node_ip
                     || s.mode != peer.mode
                     || s.hostport_range != peer.hostport_range
@@ -643,18 +620,9 @@ fn project_node_peer_attributes(node: &serde_json::Value) -> (NodePeerMode, Opti
     (mode, hostport_range)
 }
 
-fn node_vtep_mac(node: &serde_json::Value) -> Option<String> {
-    node.pointer("/metadata/annotations")
-        .and_then(|v| v.get(VTEP_MAC_ANNOTATION))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .filter(|s| !s.trim().is_empty())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::node_vtep_mac;
-
+    use crate::controllers::annotations::NodePeerMode;
     use crate::networking::test_support::{MockNetworkProvider, NetworkCall};
     use serde_json::json;
     use std::collections::HashMap;
@@ -861,13 +829,10 @@ mod tests {
         assert_eq!(super::node_dataplane_ip(&node).as_deref(), Some("10.0.0.7"));
     }
 
-    /// F2-04: list_peer_subnets must NOT exclude self, but must include rows
-    /// without a vtep_mac (rootless peers). The legacy filter
-    /// `vtep_mac IS NOT NULL` silently dropped rootless peers; the controller
-    /// now decides per-peer whether to install a route via endpoint_for_peer.
+    /// F2-04: list_peer_subnets excludes self and includes all peer rows; the
+    /// controller decides per-peer whether to install a route via endpoint_for_peer.
     #[tokio::test]
-    async fn test_list_peer_subnets_excludes_self_and_includes_rows_without_vtep_mac() {
-        use crate::networking::VtepMac;
+    async fn test_list_peer_subnets_excludes_self_and_includes_peer_rows() {
         let db = crate::datastore::test_support::in_memory().await;
         db.allocate_node_subnet("node-a", "10.42.0.0/16", "10.0.0.1")
             .await
@@ -875,23 +840,9 @@ mod tests {
         db.allocate_node_subnet("node-b", "10.42.0.0/16", "10.0.0.2")
             .await
             .unwrap();
-        // node-a (self) is excluded; node-b is included even without a vtep_mac
-        // (F2-04 inclusion contract).
         let peers = db.list_peer_subnets("node-a").await.unwrap();
-        assert_eq!(
-            peers.len(),
-            1,
-            "self excluded, peers included regardless of vtep_mac"
-        );
+        assert_eq!(peers.len(), 1, "self excluded, peer row included");
         assert_eq!(peers[0].node_name.as_str(), "node-b");
-        assert!(peers[0].vtep_mac.is_none());
-
-        // Setting vtep_mac doesn't change inclusion, only the projected value.
-        let mac = VtepMac::parse("aa:bb:cc:dd:ee:ff").unwrap();
-        db.update_node_vtep_mac("node-b", &mac).await.unwrap();
-        let peers = db.list_peer_subnets("node-a").await.unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].vtep_mac, Some(mac));
     }
 
     #[tokio::test]
@@ -1011,27 +962,6 @@ mod tests {
         db.delete_node_subnet("node-a").await.unwrap();
         let record = db.get_node_subnet("node-a").await.unwrap();
         assert!(record.is_none());
-    }
-
-    #[test]
-    fn test_node_vtep_mac_reads_annotation() {
-        let node = json!({
-            "metadata": {
-                "annotations": {
-                    "klights.io/vtep-mac": "aa:bb:cc:dd:ee:ff"
-                }
-            }
-        });
-        assert_eq!(node_vtep_mac(&node).as_deref(), Some("aa:bb:cc:dd:ee:ff"));
-    }
-
-    #[test]
-    fn test_node_vtep_mac_absent_or_empty_returns_none() {
-        let no_annotation = json!({"metadata": {"annotations": {}}});
-        assert!(node_vtep_mac(&no_annotation).is_none());
-
-        let empty = json!({"metadata": {"annotations": {"klights.io/vtep-mac": "  "}}});
-        assert!(node_vtep_mac(&empty).is_none());
     }
 
     /// F2-02: rootless boot must allocate the local subnet without ever
@@ -1351,10 +1281,6 @@ mod tests {
             .expect("rootless-c row must exist");
         assert_eq!(row.mode, NodePeerMode::Rootless);
         assert_eq!(row.hostport_range, range);
-        assert!(
-            row.vtep_mac.is_none(),
-            "rootless peer must remain without a vtep_mac"
-        );
     }
 
     /// Bug 2: a Ready peer that has no dataplane metadata is counted as an
@@ -1519,11 +1445,10 @@ mod tests {
         );
     }
 
-    /// F2-04 rootless gate: a peer without a VTEP MAC must still be listed.
+    /// F2-04 rootless gate: rootless peers are still listed for route projection.
     #[tokio::test]
-    async fn list_peer_subnets_includes_rootless_peers_without_vtep_mac() {
+    async fn list_peer_subnets_includes_rootless_peers() {
         let db = crate::datastore::test_support::in_memory().await;
-        // Local + a rootless peer (no vtep_mac).
         super::ensure_local_node_subnet(&db, "node-a", "10.42.0.0/16", "10.0.0.1")
             .await
             .unwrap();
@@ -1534,8 +1459,8 @@ mod tests {
         let rootless_peer = peers
             .iter()
             .find(|p| p.node_name.as_str() == "rootless-d")
-            .expect("rootless peer must appear in list_peer_subnets even without a vtep_mac");
-        assert!(rootless_peer.vtep_mac.is_none());
+            .expect("rootless peer must appear in list_peer_subnets");
+        assert_eq!(rootless_peer.mode, NodePeerMode::Root);
     }
 
     /// Bug 4 Option B/C: reconcile_local_readiness must NOT memo the readiness

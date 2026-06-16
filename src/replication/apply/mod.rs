@@ -500,24 +500,6 @@ pub async fn apply_forwarded_command(
                 already_applied: false,
             })
         }
-        StorageCommand::UpdateNodeVtepMac {
-            node_name,
-            vtep_mac,
-        } => {
-            let before_rv = db.get_current_resource_version().await.unwrap_or(0);
-            let mac = crate::networking::VtepMac::parse(&vtep_mac)
-                .map_err(|err| anyhow!("invalid VTEP MAC '{}': {}", vtep_mac, err))?;
-            db.update_node_vtep_mac(&node_name, &mac).await?;
-            let rv = resource_version_after_mutation(db, before_rv).await?;
-            Ok(ack_apply(
-                StorageCommand::UpdateNodeVtepMac {
-                    node_name,
-                    vtep_mac,
-                },
-                rv,
-                authoring_node,
-            ))
-        }
         StorageCommand::UpdateNodePeerAttributes {
             node_name,
             mode,

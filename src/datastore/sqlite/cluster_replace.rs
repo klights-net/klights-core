@@ -578,7 +578,6 @@ mod tests {
                 subnet: format!("{subnet}/24"),
                 subnet_base_int: u32::from(subnet),
                 vtep_ip: subnet.to_string(),
-                vtep_mac: None,
                 node_ip: "192.0.2.1".to_string(),
                 mode: "root".to_string(),
                 hostport_range: None,

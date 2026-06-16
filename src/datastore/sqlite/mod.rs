@@ -39,7 +39,7 @@ use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
 
 use crate::datastore::WatchReplayRead;
-use crate::networking::{NodeName, PodSubnet, VtepMac};
+use crate::networking::{NodeName, PodSubnet};
 use crate::task_supervisor::TaskSupervisor;
 use crate::watch::{WatchBus, WatchSignal, WatchTopic};
 
@@ -1468,15 +1468,6 @@ impl Datastore {
                 )
             }
 
-            StorageCommand::UpdateNodeVtepMac {
-                node_name: _,
-                vtep_mac: _,
-            } => {
-                // VTEP MAC is a node routing attribute. Store as NodeSubnet-like row
-                // so the routing layer picks it up.
-                LogApplyCommit::new(rv, Vec::new())
-            }
-
             StorageCommand::UpdateNodePeerAttributes { .. } => {
                 // Projected from Node annotations — applied via PutResource on Node.
                 LogApplyCommit::new(rv, Vec::new())
@@ -2798,10 +2789,6 @@ impl DatastoreBackend for Datastore {
         node_ip: &str,
     ) -> Result<NodeSubnet> {
         Datastore::allocate_node_subnet(self, node_name, cluster_cidr, node_ip).await
-    }
-
-    async fn update_node_vtep_mac(&self, node_name: &str, vtep_mac: &VtepMac) -> Result<()> {
-        Datastore::update_node_vtep_mac(self, node_name, vtep_mac).await
     }
 
     async fn update_node_peer_attributes(

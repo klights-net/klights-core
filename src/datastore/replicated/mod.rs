@@ -27,8 +27,6 @@ use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::command::{CommandMeta, StorageCommand};
 #[cfg(test)]
 use crate::datastore::types::{ReplicatedCreateOptions, ResourcePatchRequest};
-#[cfg(test)]
-use crate::networking::VtepMac;
 
 mod backend_impl;
 
@@ -428,14 +426,6 @@ where
             backend
                 .allocate_node_subnet(&node_name, &subnet, &node_ip)
                 .await?;
-        }
-        StorageCommand::UpdateNodeVtepMac {
-            node_name,
-            vtep_mac,
-        } => {
-            let mac = VtepMac::parse(&vtep_mac)
-                .map_err(|err| anyhow!("invalid VTEP MAC '{}': {}", vtep_mac, err))?;
-            backend.update_node_vtep_mac(&node_name, &mac).await?;
         }
         StorageCommand::UpdateNodePeerAttributes {
             node_name,

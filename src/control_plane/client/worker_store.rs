@@ -22,7 +22,6 @@ use crate::datastore::{
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
-use crate::networking::VtepMac;
 use crate::watch::{EventType, WatchBus, WatchEvent, WatchSignal, WatchTopic};
 
 const WORKER_WATCH_EVENT_HISTORY_CAPACITY: usize = 32_768;
@@ -1106,10 +1105,6 @@ impl DatastoreBackend for WorkerStoreAdapter {
         self.cluster_api
             .allocate_node_subnet(node_name, cluster_cidr, node_ip)
             .await
-    }
-
-    async fn update_node_vtep_mac(&self, _node_name: &str, _vtep_mac: &VtepMac) -> Result<()> {
-        Ok(())
     }
 
     async fn update_node_peer_attributes(

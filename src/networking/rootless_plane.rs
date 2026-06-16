@@ -47,8 +47,8 @@ pub struct RootlessNetworkPlane {
 
 impl RootlessNetworkPlane {
     /// Boot the rootless network plane. Allocates the node-local pod subnet
-    /// through the shared IPAM and returns; intentionally skips VXLAN setup,
-    /// boot-time bridge mutation, and `vtep_mac` writes. The bridge is created
+    /// through the shared IPAM and returns; intentionally skips VXLAN setup
+    /// and boot-time bridge mutation. The bridge is created
     /// lazily on the first non-hostNetwork CNI ADD so unit tests and idle
     /// rootless starts do not require netlink mutations until pods need them.
     pub async fn boot(
@@ -542,13 +542,7 @@ mod tests {
             .expect("rootless boot must record a node_subnets row");
         assert_eq!(plane.local_subnet().subnet, row.subnet);
 
-        // vtep_mac must NOT be written in rootless mode (rootless never owns
-        // a VXLAN device, so a fake MAC would mislead peer routing).
-        assert!(
-            row.vtep_mac.is_none(),
-            "rootless boot must not write a vtep_mac, got {:?}",
-            row.vtep_mac
-        );
+        assert_eq!(row.node_name.as_str(), cfg.node_name);
     }
 
     #[tokio::test]

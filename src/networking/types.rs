@@ -220,76 +220,6 @@ impl fmt::Display for ClusterCidr {
     }
 }
 
-/// A VXLAN VTEP MAC address (e.g., "aa:bb:cc:dd:ee:ff").
-///
-/// Parsed case-insensitively, displayed in lowercase canonical form.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct VtepMac([u8; 6]);
-
-impl VtepMac {
-    pub fn parse(mac: &str) -> Result<Self, String> {
-        let mut result = [0u8; 6];
-        let parts: Vec<&str> = mac.split(':').collect();
-        if parts.len() != 6 {
-            return Err(format!(
-                "MAC address must have 6 octets separated by ':', got {} parts in {}",
-                parts.len(),
-                mac
-            ));
-        }
-        for (i, part) in parts.iter().enumerate() {
-            if part.len() != 2 {
-                return Err(format!(
-                    "Each MAC octet must be 2 hex digits, got '{}' at position {} in {}",
-                    part,
-                    i + 1,
-                    mac
-                ));
-            }
-            result[i] = u8::from_str_radix(part, 16).map_err(|_| {
-                format!(
-                    "Invalid hex byte '{}' at position {} in {}",
-                    part,
-                    i + 1,
-                    mac
-                )
-            })?;
-        }
-        Ok(VtepMac(result))
-    }
-
-    pub fn from_bytes(bytes: [u8; 6]) -> Self {
-        Self(bytes)
-    }
-
-    pub fn bytes(&self) -> [u8; 6] {
-        self.0
-    }
-}
-
-impl fmt::Display for VtepMac {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
-        )
-    }
-}
-
-impl ToSql for VtepMac {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::from(self.to_string()))
-    }
-}
-
-impl FromSql for VtepMac {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        let s = value.as_str()?;
-        VtepMac::parse(s).map_err(|e| FromSqlError::Other(Box::new(ParseError(e))))
-    }
-}
-
 /// A bridge interface name (e.g., "klights").
 ///
 /// Validated to be non-empty, ≤15 ASCII characters (Linux IFNAMSIZ),
@@ -562,43 +492,6 @@ mod tests {
     fn cluster_cidr_rejects_invalid() {
         assert!(ClusterCidr::parse("not").is_err());
         assert!(ClusterCidr::parse("10.0.0.0/33").is_err());
-    }
-
-    // VtepMac -----------------------------------------------------------
-    #[test]
-    fn vtep_mac_parses_lower_upper_mixed() {
-        let want = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
-        for m in &[
-            "aa:bb:cc:dd:ee:ff",
-            "AA:BB:CC:DD:EE:FF",
-            "Aa:Bb:Cc:Dd:Ee:Ff",
-        ] {
-            assert_eq!(VtepMac::parse(m).unwrap().bytes(), want);
-        }
-    }
-
-    #[test]
-    fn vtep_mac_display_is_lowercase() {
-        let m = VtepMac::parse("AA:BB:CC:DD:EE:FF").unwrap();
-        assert_eq!(m.to_string(), "aa:bb:cc:dd:ee:ff");
-    }
-
-    #[test]
-    fn vtep_mac_rejects_bad_input() {
-        assert!(VtepMac::parse("aa:bb:cc").is_err());
-        assert!(VtepMac::parse("aa:bb:cc:dd:ee:gg").is_err());
-        assert!(VtepMac::parse("aabbccddeeff").is_err());
-    }
-
-    #[test]
-    fn vtep_mac_to_sql_round_trip() {
-        let m = VtepMac::parse("aa:bb:cc:dd:ee:ff").unwrap();
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE t (m TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (?)", rusqlite::params![m])
-            .unwrap();
-        let got: VtepMac = conn.query_row("SELECT m FROM t", [], |r| r.get(0)).unwrap();
-        assert_eq!(m, got);
     }
 
     // BridgeName --------------------------------------------------------

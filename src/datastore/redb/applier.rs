@@ -5,14 +5,13 @@
 //!
 //! Delegates each `StorageCommand` variant to the appropriate domain store.
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::controllers::annotations::NodePeerMode;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::replicated::DatastoreApplier;
-use crate::networking::VtepMac;
 use crate::networking::types::HostPortRange;
 
 use super::RedbDatastore;
@@ -164,14 +163,6 @@ impl DatastoreApplier for RedbDatastore {
                 self.network
                     .allocate_node_subnet(&node_name, &subnet, &node_ip)
                     .await?;
-            }
-            StorageCommand::UpdateNodeVtepMac {
-                node_name,
-                vtep_mac,
-            } => {
-                let mac =
-                    VtepMac::parse(&vtep_mac).map_err(|e| anyhow!("invalid vtep_mac: {e}"))?;
-                self.network.update_vtep_mac(&node_name, &mac).await?;
             }
             StorageCommand::UpdateNodePeerAttributes {
                 node_name,

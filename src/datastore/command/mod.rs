@@ -221,9 +221,6 @@ pub enum StorageCommand {
         node_ip: String,
     },
 
-    /// Update the VXLAN VTEP MAC for a node.
-    UpdateNodeVtepMac { node_name: String, vtep_mac: String },
-
     /// Persist peer-mode + hostport-range projected from Node annotations.
     UpdateNodePeerAttributes {
         node_name: String,
@@ -344,7 +341,6 @@ impl StorageCommand {
             StorageCommand::DeleteNamespace { .. } => "DeleteNamespace",
             StorageCommand::DeleteNamespaceContents { .. } => "DeleteNamespaceContents",
             StorageCommand::AllocateNodeSubnet { .. } => "AllocateNodeSubnet",
-            StorageCommand::UpdateNodeVtepMac { .. } => "UpdateNodeVtepMac",
             StorageCommand::UpdateNodePeerAttributes { .. } => "UpdateNodePeerAttributes",
             StorageCommand::UpdateNodeDataplane { .. } => "UpdateNodeDataplane",
             StorageCommand::DeleteNodeSubnet { .. } => "DeleteNodeSubnet",

@@ -1791,7 +1791,6 @@ fn node_subnet_to_proto(subnet: crate::datastore::NodeSubnet) -> generated::Node
         subnet: forwarded.subnet,
         subnet_base_int: forwarded.subnet_base_int,
         vtep_ip: forwarded.vtep_ip,
-        vtep_mac: forwarded.vtep_mac,
         node_ip: forwarded.node_ip,
         mode: forwarded.mode,
         hostport_range: forwarded.hostport_range,

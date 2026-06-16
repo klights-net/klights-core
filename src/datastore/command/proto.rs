@@ -120,7 +120,7 @@ pub struct ProtoErrorResp {
 pub struct ProtoStorageCommand {
     #[prost(
         oneof = "proto_storage_command::Command",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
     )]
     pub command: Option<proto_storage_command::Command>,
 }
@@ -148,8 +148,6 @@ pub mod proto_storage_command {
         DeleteNamespaceContents(super::ProtoDeleteNamespaceContents),
         #[prost(message, tag = "10")]
         AllocateNodeSubnet(super::ProtoAllocateNodeSubnet),
-        #[prost(message, tag = "11")]
-        UpdateNodeVtepMac(super::ProtoUpdateNodeVtepMac),
         #[prost(message, tag = "12")]
         UpdateNodePeerAttributes(super::ProtoUpdateNodePeerAttributes),
         #[prost(message, tag = "13")]
@@ -380,14 +378,6 @@ pub struct ProtoAllocateNodeSubnet {
     pub subnet: String,
     #[prost(string, tag = "3")]
     pub node_ip: String,
-}
-
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct ProtoUpdateNodeVtepMac {
-    #[prost(string, tag = "1")]
-    pub node_name: String,
-    #[prost(string, tag = "2")]
-    pub vtep_mac: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

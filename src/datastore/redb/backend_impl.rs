@@ -18,7 +18,6 @@ use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
 use crate::datastore::types::*;
-use crate::networking::VtepMac;
 use crate::networking::types::HostPortRange;
 use crate::watch::{WatchSignal, WatchTopic};
 
@@ -496,9 +495,6 @@ impl DatastoreBackend for RedbDatastore {
     }
     async fn allocate_node_subnet(&self, n: &str, c: &str, i: &str) -> Result<NodeSubnet> {
         self.network.allocate_node_subnet(n, c, i).await
-    }
-    async fn update_node_vtep_mac(&self, n: &str, v: &VtepMac) -> Result<()> {
-        self.network.update_vtep_mac(n, v).await
     }
     async fn update_node_peer_attributes(
         &self,

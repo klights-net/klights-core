@@ -13,7 +13,7 @@ use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::types::{
     NodeSubnet, PodSlotAdmissionResult, PodSlotAdmissionState, Resource,
 };
-use crate::networking::{NodeName, PodSubnet, VtepMac};
+use crate::networking::{NodeName, PodSubnet};
 
 /// A replication envelope wrapping a command with its metadata.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -288,7 +288,6 @@ pub struct ForwardedNodeSubnet {
     pub subnet: String,
     pub subnet_base_int: u32,
     pub vtep_ip: String,
-    pub vtep_mac: Option<String>,
     pub node_ip: String,
     pub mode: String,
     pub hostport_range: Option<String>,
@@ -301,7 +300,6 @@ impl From<NodeSubnet> for ForwardedNodeSubnet {
             subnet: subnet.subnet.to_string(),
             subnet_base_int: subnet.subnet_base_int,
             vtep_ip: subnet.vtep_ip.to_string(),
-            vtep_mac: subnet.vtep_mac.map(|mac| mac.to_string()),
             node_ip: subnet.node_ip.to_string(),
             mode: match subnet.mode {
                 crate::controllers::annotations::NodePeerMode::Root => "root",
@@ -323,12 +321,6 @@ impl ForwardedNodeSubnet {
             .vtep_ip
             .parse()
             .with_context(|| format!("invalid forwarded VTEP IP '{}'", self.vtep_ip))?;
-        let vtep_mac = self
-            .vtep_mac
-            .as_deref()
-            .map(VtepMac::parse)
-            .transpose()
-            .map_err(|err| anyhow!("invalid forwarded VTEP MAC: {err}"))?;
         let node_ip: Ipv4Addr = self
             .node_ip
             .parse()
@@ -347,7 +339,6 @@ impl ForwardedNodeSubnet {
             subnet,
             subnet_base_int: self.subnet_base_int,
             vtep_ip,
-            vtep_mac,
             node_ip,
             mode,
             hostport_range,

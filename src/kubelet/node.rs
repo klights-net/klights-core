@@ -3329,18 +3329,14 @@ mod tests {
         );
     }
 
-    /// F2-05 DRY gate: the Node publisher and the projector
-    /// (`controllers/node_subnet.rs`) consume the same `VTEP_MAC_ANNOTATION`
-    /// constant from the shared annotations module. If a future refactor
-    /// introduces a duplicate string, this test fails the symbol equality.
+    /// F2-05 DRY gate: the Node publisher and the projector consume shared
+    /// annotation constants. If a future refactor introduces a duplicate
+    /// string, this test fails the symbol equality.
     #[test]
     fn annotation_key_constants_are_shared() {
-        use crate::controllers::annotations::{
-            HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION, VTEP_MAC_ANNOTATION,
-        };
+        use crate::controllers::annotations::{HOSTPORT_RANGE_ANNOTATION, NODE_MODE_ANNOTATION};
         assert_eq!(NODE_MODE_ANNOTATION, "klights.io/mode");
         assert_eq!(HOSTPORT_RANGE_ANNOTATION, "klights.io/hostport-range");
-        assert_eq!(VTEP_MAC_ANNOTATION, "klights.io/vtep-mac");
     }
 
     /// `register_node` publishes the short git commit hash so the wide-only

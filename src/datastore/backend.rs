@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::networking::VtepMac;
 #[cfg(test)]
 use crate::watch::{WatchEvent, WatchReceiver};
 use crate::watch::{WatchSignal, WatchTopic};
@@ -617,9 +616,6 @@ pub trait DatastoreBackend: Send + Sync {
         node_ip: &str,
     ) -> Result<NodeSubnet>;
 
-    /// Update `vtep_mac` for a node after creating the VXLAN interface.
-    async fn update_node_vtep_mac(&self, node_name: &str, vtep_mac: &VtepMac) -> Result<()>;
-
     /// F2-04: persist peer-mode + hostport-range projected from
     /// `klights.io/mode` / `klights.io/hostport-range` Node annotations.
     async fn update_node_peer_attributes(
@@ -654,7 +650,7 @@ pub trait DatastoreBackend: Send + Sync {
     /// Get node subnet record.
     async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>>;
 
-    /// List peer node subnets. F2-04: includes rootless peers (no `vtep_mac`).
+    /// List peer node subnets. Includes root and rootless peers.
     async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>>;
 
     /// Delete a node subnet row.
@@ -1410,7 +1406,6 @@ pub trait NetworkMetadataStore: Send + Sync {
         cluster_cidr: &str,
         node_ip: &str,
     ) -> Result<NodeSubnet>;
-    async fn update_node_vtep_mac(&self, node_name: &str, vtep_mac: &VtepMac) -> Result<()>;
     async fn update_node_peer_attributes(
         &self,
         node_name: &str,
@@ -1492,10 +1487,6 @@ impl<T: DatastoreBackend + ?Sized> NetworkMetadataStore for T {
         node_ip: &str,
     ) -> Result<NodeSubnet> {
         DatastoreBackend::allocate_node_subnet(self, node_name, cluster_cidr, node_ip).await
-    }
-
-    async fn update_node_vtep_mac(&self, node_name: &str, vtep_mac: &VtepMac) -> Result<()> {
-        DatastoreBackend::update_node_vtep_mac(self, node_name, vtep_mac).await
     }
 
     async fn update_node_peer_attributes(

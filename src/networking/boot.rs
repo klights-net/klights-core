@@ -211,9 +211,6 @@ mod tests {
             .await
             .expect("get_node_subnet must succeed")
             .expect("rootless boot must allocate the local subnet via shared IPAM");
-        assert!(
-            row.vtep_mac.is_none(),
-            "rootless dispatch must not write vtep_mac"
-        );
+        assert_eq!(row.node_name.as_str(), cfg.node_name);
     }
 }

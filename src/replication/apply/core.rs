@@ -312,7 +312,6 @@ mod tests {
             subnet: "10.244.0.0/24".into(),
             subnet_base_int: 0,
             vtep_ip: "10.244.0.1".into(),
-            vtep_mac: None,
             node_ip: "192.168.1.1".into(),
             mode: "Root".into(),
             hostport_range: None,
