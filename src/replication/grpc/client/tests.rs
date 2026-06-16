@@ -794,6 +794,135 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn apply_outbox_retry_after_lost_response_is_deduped() {
+        // Pillar A end-to-end lost-response dedupe: the leader commits an
+        // outbox mutation and records the idempotency ledger entry, but the
+        // response is dropped on the wire (lossy worker->leader link). The
+        // dispatcher retries the SAME idempotency key. The leader must replay
+        // the recorded result as AlreadyApplied — same applied RV, mutation
+        // applied exactly once — never a second mutation.
+        //
+        // Server-side exactly-once is unit-tested at the datastore layer
+        // (`raft_apply_same_idempotency_key_returns_same_rv_without_reapply`);
+        // this locks the client->server gRPC path that carries the key.
+        use crate::datastore::ResourcePreconditions;
+        use crate::kubelet::outbox::OutboxApplyResult;
+        use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+
+        let (client, _service, db, handle) = client_and_service().await;
+
+        // A Pod must exist for the PodStatus update to apply.
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "web",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"namespace": "default", "name": "web", "uid": "pod-uid-1"},
+                "spec": {
+                    "nodeName": "worker-1",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .expect("create pod");
+
+        let payload = {
+            let command = StorageCommand::UpdateStatus {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+                status: serde_json::json!({"phase": "Running", "message": "applied-once"}),
+                expected_rv: None,
+                preconditions: ResourcePreconditions {
+                    uid: Some("pod-uid-1".to_string()),
+                    resource_version: None,
+                },
+                observed_status_stamp: None,
+            };
+            bytes::Bytes::from(
+                OutboxPayload::from_command(command)
+                    .encode_protobuf()
+                    .expect("encode pod status payload"),
+            )
+        };
+
+        let key = "p3-lost-response-key";
+
+        // First send: the leader commits and records the idempotency ledger.
+        let first = client
+            .apply_outbox_rpc(key, OutboxOperation::PodStatus, payload.clone())
+            .await
+            .expect("first apply must commit");
+        let applied_rv = match first {
+            OutboxApplyResult::Applied { applied_rv } => applied_rv,
+            other => panic!("first apply must be Applied, got {other:?}"),
+        };
+        let rv_after_first = db.get_current_resource_version().await.unwrap();
+        assert_eq!(applied_rv, rv_after_first);
+
+        let pod_message = |db: DatastoreHandle| async move {
+            db.get_resource("v1", "Pod", Some("default"), "web")
+                .await
+                .expect("read pod")
+                .expect("pod exists")
+                .data
+                .pointer("/status/message")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            pod_message(db.clone()).await.as_deref(),
+            Some("applied-once"),
+            "first apply must land the status mutation"
+        );
+
+        // The first response was "lost" on the wire; the dispatcher retries the
+        // SAME key. The leader must replay the ledger as AlreadyApplied.
+        let second = client
+            .apply_outbox_rpc(key, OutboxOperation::PodStatus, payload)
+            .await
+            .expect("lost-response retry must succeed");
+        match second {
+            OutboxApplyResult::AlreadyApplied {
+                applied_rv: replayed,
+            } => {
+                assert_eq!(
+                    replayed,
+                    Some(applied_rv),
+                    "retry must replay the original applied RV"
+                );
+            }
+            other => panic!("lost-response retry must be AlreadyApplied, got {other:?}"),
+        }
+
+        // Mutation applied exactly once: no new RV, single ledger row for the key.
+        assert_eq!(
+            db.get_current_resource_version().await.unwrap(),
+            rv_after_first,
+            "duplicate apply must not allocate another RV"
+        );
+        let matching = db
+            .list_applied_outbox()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.idempotency_key == key)
+            .count();
+        assert_eq!(
+            matching, 1,
+            "exactly one idempotency ledger row must exist for the retried key"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn apply_outbox_aborts_on_per_call_deadline() {
         // bug-grpc: under partial packet loss the HTTP/2 keepalive PING still
         // gets through (connection deemed alive) while the RPC's response is
