@@ -158,11 +158,32 @@ cargo build
 cargo build --release
 ```
 
-The release binary is written to:
+Plain Cargo release builds are dynamically linked and are written to:
 
 ```text
 target/release/klights
 ```
+
+To build a statically linked GNU/Linux release binary with Cargo, use an
+explicit target and static native dependency discovery:
+
+```bash
+PKG_CONFIG_ALL_STATIC=1 \
+OPENSSL_STATIC=1 \
+LIBSQLITE3_SYS_STATIC=1 \
+LIBZ_SYS_STATIC=1 \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
+cargo build --release --target x86_64-unknown-linux-gnu
+```
+
+The static binary is written to:
+
+```text
+target/x86_64-unknown-linux-gnu/release/klights
+```
+
+Static builds require static archives for the native dependencies used by
+`libnftnl`, `libmnl`, zlib, OpenSSL, and SQLite.
 
 Useful local checks:
 
