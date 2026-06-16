@@ -3356,8 +3356,37 @@ async fn test_openapi_v2_returns_swagger() {
     // Should include at least /api/ path
     assert!(response["paths"]["/api/"].is_object());
 
-    // Definitions should be empty without CRDs
+    // Definitions include generated built-in schemas even without CRDs.
     assert!(response["definitions"].is_object());
+}
+
+#[tokio::test]
+async fn test_openapi_v2_includes_builtin_pod_schema_properties() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let response = openapi_v2(&db).await;
+
+    let pod = response
+        .pointer("/definitions/io.k8s.api.core.v1.Pod")
+        .expect("v2 OpenAPI must include the built-in Pod schema");
+    assert_eq!(pod["type"], "object");
+    assert_eq!(
+        pod.pointer("/x-kubernetes-group-version-kind/0"),
+        Some(&json!({"group": "", "version": "v1", "kind": "Pod"}))
+    );
+    let spec_ref = pod
+        .pointer("/properties/spec/$ref")
+        .or_else(|| pod.pointer("/properties/spec/allOf/0/$ref"))
+        .and_then(|v| v.as_str())
+        .and_then(|reference| reference.strip_prefix("#/definitions/"))
+        .expect("Pod.spec must reference the generated PodSpec schema");
+    assert_eq!(
+        response.pointer(&format!(
+            "/definitions/{}/properties/containers/type",
+            spec_ref
+        )),
+        Some(&json!("array")),
+        "kubectl explain pod.spec.containers needs built-in schema properties"
+    );
 }
 
 #[tokio::test]

@@ -719,4 +719,46 @@ async fn test_openapi_v3_apps_v1_includes_deployment_create_schema() {
             .is_some(),
         "apps/v1 OpenAPI must include a Deployment schema"
     );
+    let spec_ref = spec
+        .pointer("/components/schemas/io.k8s.api.apps.v1.Deployment/properties/spec/$ref")
+        .or_else(|| {
+            spec.pointer(
+                "/components/schemas/io.k8s.api.apps.v1.Deployment/properties/spec/allOf/0/$ref",
+            )
+        })
+        .and_then(|v| v.as_str())
+        .and_then(|reference| reference.strip_prefix("#/components/schemas/"))
+        .expect("Deployment.spec must reference the generated DeploymentSpec schema");
+    let template_ref = spec
+        .pointer(&format!(
+            "/components/schemas/{}/properties/template/$ref",
+            spec_ref
+        ))
+        .or_else(|| {
+            spec.pointer(&format!(
+                "/components/schemas/{}/properties/template/allOf/0/$ref",
+                spec_ref
+            ))
+        })
+        .and_then(|v| v.as_str())
+        .and_then(|reference| reference.strip_prefix("#/components/schemas/"))
+        .expect("DeploymentSpec.template must reference the generated PodTemplateSpec schema");
+    assert!(
+        spec.pointer(&format!(
+            "/components/schemas/{}/properties/spec",
+            template_ref
+        ))
+        .is_some(),
+        "kubectl explain deployment.spec.template.spec needs generated PodTemplateSpec properties"
+    );
+}
+
+#[tokio::test]
+async fn test_openapi_v3_apis_has_group_version_paths() {
+    let axum::Json(spec) = get_openapi_v3_apis().await;
+    let paths = spec["paths"].as_object().expect("paths must be object");
+    assert!(
+        paths.contains_key("/apis/apps/v1"),
+        "/openapi/v3/apis must advertise built-in API group/version paths"
+    );
 }

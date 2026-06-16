@@ -192,6 +192,404 @@ fn ensure_crd_top_level_object_fields(schema: &mut Value) {
         });
 }
 
+fn ensure_builtin_top_level_object_fields(
+    schema: &mut Value,
+    group: &str,
+    version: &str,
+    kind: &str,
+) {
+    ensure_crd_top_level_object_fields(schema);
+    if let Some(obj) = schema.as_object_mut() {
+        obj.insert(
+            "x-kubernetes-group-version-kind".to_string(),
+            serde_json::json!([{
+                "group": group,
+                "version": version,
+                "kind": kind
+            }]),
+        );
+    }
+}
+
+fn insert_generated_builtin_schema<T>(
+    definitions: &mut serde_json::Map<String, Value>,
+    group: &str,
+    version: &str,
+    kind: &str,
+) where
+    T: k8s_openapi::schemars::JsonSchema,
+{
+    let key = builtin_openapi_schema_key(group, version, kind);
+    let root = k8s_openapi::schemars::r#gen::SchemaGenerator::default().into_root_schema_for::<T>();
+    let mut root_value = serde_json::to_value(root).unwrap_or_else(|_| {
+        serde_json::json!({
+            "type": "object"
+        })
+    });
+
+    let nested_definitions = root_value
+        .as_object_mut()
+        .and_then(|obj| obj.remove("definitions"))
+        .and_then(|defs| defs.as_object().cloned())
+        .unwrap_or_default();
+    ensure_builtin_top_level_object_fields(&mut root_value, group, version, kind);
+    strip_x_kubernetes_fields(&mut root_value);
+
+    for (nested_key, mut nested_schema) in nested_definitions {
+        strip_x_kubernetes_fields(&mut nested_schema);
+        definitions.entry(nested_key).or_insert(nested_schema);
+    }
+    definitions.insert(key, root_value);
+}
+
+fn builtin_openapi_definitions() -> serde_json::Map<String, Value> {
+    let mut definitions = serde_json::Map::new();
+
+    insert_generated_builtin_schema::<
+        k8s_openapi::api::admissionregistration::v1::MutatingWebhookConfiguration,
+    >(
+        &mut definitions,
+        "admissionregistration.k8s.io",
+        "v1",
+        "MutatingWebhookConfiguration",
+    );
+    insert_generated_builtin_schema::<
+        k8s_openapi::api::admissionregistration::v1::ValidatingAdmissionPolicy,
+    >(
+        &mut definitions,
+        "admissionregistration.k8s.io",
+        "v1",
+        "ValidatingAdmissionPolicy",
+    );
+    insert_generated_builtin_schema::<
+        k8s_openapi::api::admissionregistration::v1::ValidatingAdmissionPolicyBinding,
+    >(
+        &mut definitions,
+        "admissionregistration.k8s.io",
+        "v1",
+        "ValidatingAdmissionPolicyBinding",
+    );
+    insert_generated_builtin_schema::<
+        k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration,
+    >(
+        &mut definitions,
+        "admissionregistration.k8s.io",
+        "v1",
+        "ValidatingWebhookConfiguration",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition>(
+        &mut definitions,
+        "apiextensions.k8s.io",
+        "v1",
+        "CustomResourceDefinition",
+    );
+    insert_generated_builtin_schema::<
+        k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService,
+    >(
+        &mut definitions,
+        "apiregistration.k8s.io",
+        "v1",
+        "APIService",
+    );
+
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::ConfigMap>(
+        &mut definitions,
+        "",
+        "v1",
+        "ConfigMap",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::Secret>(
+        &mut definitions,
+        "",
+        "v1",
+        "Secret",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::Pod>(
+        &mut definitions,
+        "",
+        "v1",
+        "Pod",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::Service>(
+        &mut definitions,
+        "",
+        "v1",
+        "Service",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::Namespace>(
+        &mut definitions,
+        "",
+        "v1",
+        "Namespace",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::ServiceAccount>(
+        &mut definitions,
+        "",
+        "v1",
+        "ServiceAccount",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::Endpoints>(
+        &mut definitions,
+        "",
+        "v1",
+        "Endpoints",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::PersistentVolumeClaim>(
+        &mut definitions,
+        "",
+        "v1",
+        "PersistentVolumeClaim",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::PersistentVolume>(
+        &mut definitions,
+        "",
+        "v1",
+        "PersistentVolume",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::Node>(
+        &mut definitions,
+        "",
+        "v1",
+        "Node",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::Event>(
+        &mut definitions,
+        "",
+        "v1",
+        "Event",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::ResourceQuota>(
+        &mut definitions,
+        "",
+        "v1",
+        "ResourceQuota",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::LimitRange>(
+        &mut definitions,
+        "",
+        "v1",
+        "LimitRange",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::PodTemplate>(
+        &mut definitions,
+        "",
+        "v1",
+        "PodTemplate",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::core::v1::ReplicationController>(
+        &mut definitions,
+        "",
+        "v1",
+        "ReplicationController",
+    );
+
+    insert_generated_builtin_schema::<k8s_openapi::api::apps::v1::ControllerRevision>(
+        &mut definitions,
+        "apps",
+        "v1",
+        "ControllerRevision",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::apps::v1::DaemonSet>(
+        &mut definitions,
+        "apps",
+        "v1",
+        "DaemonSet",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::apps::v1::Deployment>(
+        &mut definitions,
+        "apps",
+        "v1",
+        "Deployment",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::apps::v1::ReplicaSet>(
+        &mut definitions,
+        "apps",
+        "v1",
+        "ReplicaSet",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::apps::v1::StatefulSet>(
+        &mut definitions,
+        "apps",
+        "v1",
+        "StatefulSet",
+    );
+
+    insert_generated_builtin_schema::<k8s_openapi::api::autoscaling::v1::HorizontalPodAutoscaler>(
+        &mut definitions,
+        "autoscaling",
+        "v1",
+        "HorizontalPodAutoscaler",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler>(
+        &mut definitions,
+        "autoscaling",
+        "v2",
+        "HorizontalPodAutoscaler",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::batch::v1::CronJob>(
+        &mut definitions,
+        "batch",
+        "v1",
+        "CronJob",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::batch::v1::Job>(
+        &mut definitions,
+        "batch",
+        "v1",
+        "Job",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::coordination::v1::Lease>(
+        &mut definitions,
+        "coordination.k8s.io",
+        "v1",
+        "Lease",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::discovery::v1::EndpointSlice>(
+        &mut definitions,
+        "discovery.k8s.io",
+        "v1",
+        "EndpointSlice",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::flowcontrol::v1::FlowSchema>(
+        &mut definitions,
+        "flowcontrol.apiserver.k8s.io",
+        "v1",
+        "FlowSchema",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::flowcontrol::v1::PriorityLevelConfiguration>(
+        &mut definitions,
+        "flowcontrol.apiserver.k8s.io",
+        "v1",
+        "PriorityLevelConfiguration",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::networking::v1::IngressClass>(
+        &mut definitions,
+        "networking.k8s.io",
+        "v1",
+        "IngressClass",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::networking::v1::Ingress>(
+        &mut definitions,
+        "networking.k8s.io",
+        "v1",
+        "Ingress",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::networking::v1::NetworkPolicy>(
+        &mut definitions,
+        "networking.k8s.io",
+        "v1",
+        "NetworkPolicy",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::node::v1::RuntimeClass>(
+        &mut definitions,
+        "node.k8s.io",
+        "v1",
+        "RuntimeClass",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::policy::v1::PodDisruptionBudget>(
+        &mut definitions,
+        "policy",
+        "v1",
+        "PodDisruptionBudget",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::rbac::v1::ClusterRoleBinding>(
+        &mut definitions,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "ClusterRoleBinding",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::rbac::v1::ClusterRole>(
+        &mut definitions,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "ClusterRole",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::rbac::v1::RoleBinding>(
+        &mut definitions,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "RoleBinding",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::rbac::v1::Role>(
+        &mut definitions,
+        "rbac.authorization.k8s.io",
+        "v1",
+        "Role",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::scheduling::v1::PriorityClass>(
+        &mut definitions,
+        "scheduling.k8s.io",
+        "v1",
+        "PriorityClass",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::storage::v1::CSIDriver>(
+        &mut definitions,
+        "storage.k8s.io",
+        "v1",
+        "CSIDriver",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::storage::v1::CSINode>(
+        &mut definitions,
+        "storage.k8s.io",
+        "v1",
+        "CSINode",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::storage::v1::CSIStorageCapacity>(
+        &mut definitions,
+        "storage.k8s.io",
+        "v1",
+        "CSIStorageCapacity",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::storage::v1::StorageClass>(
+        &mut definitions,
+        "storage.k8s.io",
+        "v1",
+        "StorageClass",
+    );
+    insert_generated_builtin_schema::<k8s_openapi::api::storage::v1::VolumeAttachment>(
+        &mut definitions,
+        "storage.k8s.io",
+        "v1",
+        "VolumeAttachment",
+    );
+
+    definitions
+}
+
+fn rewrite_refs_to_openapi_v3_components(value: &mut Value) {
+    match value {
+        Value::Object(obj) => {
+            if let Some(Value::String(reference)) = obj.get_mut("$ref")
+                && let Some(suffix) = reference.strip_prefix("#/definitions/")
+            {
+                *reference = format!("#/components/schemas/{suffix}");
+            }
+            for child in obj.values_mut() {
+                rewrite_refs_to_openapi_v3_components(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rewrite_refs_to_openapi_v3_components(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn openapi_v3_schemas_from_definitions(
+    definitions: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    definitions
+        .iter()
+        .map(|(key, schema)| {
+            let mut schema = schema.clone();
+            rewrite_refs_to_openapi_v3_components(&mut schema);
+            (key.clone(), schema)
+        })
+        .collect()
+}
+
 /// OpenAPI v2 endpoint - returns Swagger 2.0 spec with CRD schemas
 pub async fn openapi_v2(db: &dyn DatastoreBackend) -> Value {
     // Fetch all CRDs from the database
@@ -210,8 +608,8 @@ pub async fn openapi_v2(db: &dyn DatastoreBackend) -> Value {
             remaining_item_count: None,
         });
 
-    // Build definitions from CRD schemas
-    let mut definitions = serde_json::Map::new();
+    // Build definitions from generated built-in schemas plus CRD schemas.
+    let mut definitions = builtin_openapi_definitions();
 
     for crd_resource in crds.items {
         // Extract CRD metadata
@@ -442,6 +840,7 @@ fn builtin_openapi_resources(
 
 fn builtin_openapi_schema_key(group: &str, version: &str, kind: &str) -> String {
     let package = match group {
+        "" => "core".to_string(),
         "apps" => "apps".to_string(),
         "autoscaling" => "autoscaling".to_string(),
         "batch" => "batch".to_string(),
@@ -460,13 +859,14 @@ pub async fn build_openapi_v3_group_version(
     let v2 = openapi_v2(db).await;
     let all_definitions = v2.get("definitions").and_then(|d| d.as_object());
 
-    let mut schemas = serde_json::Map::new();
+    let mut schemas = all_definitions
+        .map(openapi_v3_schemas_from_definitions)
+        .unwrap_or_default();
     let mut paths = serde_json::Map::new();
     if let Some(resources) = builtin_openapi_resources(group, version) {
         for (plural, kind, namespaced) in resources {
             let schema_key = builtin_openapi_schema_key(group, version, kind);
-            schemas.insert(
-                schema_key.clone(),
+            schemas.entry(schema_key.clone()).or_insert_with(|| {
                 serde_json::json!({
                     "type": "object",
                     "x-kubernetes-group-version-kind": [{
@@ -474,8 +874,8 @@ pub async fn build_openapi_v3_group_version(
                         "version": version,
                         "kind": kind
                     }]
-                }),
-            );
+                })
+            });
             let path = if *namespaced {
                 format!(
                     "/apis/{}/{}/namespaces/{{namespace}}/{}",
@@ -500,7 +900,9 @@ pub async fn build_openapi_v3_group_version(
                     let def_group = gvk.get("group").and_then(|g| g.as_str()).unwrap_or("");
                     let def_version = gvk.get("version").and_then(|v| v.as_str()).unwrap_or("");
                     if def_group == group && def_version == version {
-                        schemas.insert(key.clone(), schema.clone());
+                        let mut schema = schema.clone();
+                        rewrite_refs_to_openapi_v3_components(&mut schema);
+                        schemas.insert(key.clone(), schema);
                         // Extract plural name from the key for path generation
                         // Key format: "reversed.domain.version.Kind" — we need the plural
                         let kind = gvk.get("kind").and_then(|k| k.as_str()).unwrap_or("");
@@ -545,7 +947,7 @@ pub async fn build_openapi_v3_api_v1(db: &dyn DatastoreBackend) -> Value {
         .unwrap_or(serde_json::json!({}));
 
     let mut schemas = if let Some(defs) = definitions.as_object() {
-        defs.clone()
+        openapi_v3_schemas_from_definitions(defs)
     } else {
         serde_json::Map::new()
     };
@@ -625,10 +1027,33 @@ pub async fn get_openapi_v3_api_v1(State(state): State<Arc<AppState>>) -> Json<V
 /// Handler for GET /openapi/v3/apis
 /// Return a minimal spec for API groups
 pub async fn get_openapi_v3_apis() -> Json<Value> {
+    let mut paths = serde_json::Map::new();
+    paths.insert(
+        "/apis".to_string(),
+        serde_json::json!({
+            "get": {
+                "description": "get available API groups",
+                "operationId": "getAPIVersions",
+                "responses": {"200": {"description": "OK"}}
+            }
+        }),
+    );
+    for (group, version) in builtin_openapi_group_versions() {
+        paths.insert(
+            format!("/apis/{group}/{version}"),
+            serde_json::json!({
+                "get": {
+                    "description": format!("get resources for {group}/{version}"),
+                    "operationId": format!("get{}{}APIResources", group.replace(['.', '-'], "_"), version),
+                    "responses": {"200": {"description": "OK"}}
+                }
+            }),
+        );
+    }
     Json(serde_json::json!({
         "openapi": "3.0.0",
         "info": {"title": "Kubernetes", "version": "1.34"},
-        "paths": {}
+        "paths": paths
     }))
 }
 
