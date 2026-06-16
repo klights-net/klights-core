@@ -23,7 +23,7 @@ async fn test_pod_endpoints_create_round_trip() {
     let row = sample_row(
         "uid-rt",
         Ipv4Addr::new(10, 42, 1, 5),
-        PodEndpointMode::Vxlan,
+        PodEndpointMode::EncryptedDirect,
     );
     db.pod_endpoint_upsert(row.clone()).await.unwrap();
 
@@ -40,8 +40,16 @@ async fn test_pod_endpoints_unique_pod_uid_violation() {
     // Two distinct pods inserted, then a raw INSERT (no REPLACE) of a third
     // row reusing the first pod's uid must violate the PRIMARY KEY constraint.
     let db = Datastore::new_in_memory().await.unwrap();
-    let a = sample_row("uid-a", Ipv4Addr::new(10, 42, 0, 1), PodEndpointMode::Vxlan);
-    let b = sample_row("uid-b", Ipv4Addr::new(10, 42, 0, 2), PodEndpointMode::Vxlan);
+    let a = sample_row(
+        "uid-a",
+        Ipv4Addr::new(10, 42, 0, 1),
+        PodEndpointMode::EncryptedDirect,
+    );
+    let b = sample_row(
+        "uid-b",
+        Ipv4Addr::new(10, 42, 0, 2),
+        PodEndpointMode::EncryptedDirect,
+    );
     db.pod_endpoint_upsert(a.clone()).await.unwrap();
     db.pod_endpoint_upsert(b.clone()).await.unwrap();
 
@@ -50,7 +58,7 @@ async fn test_pod_endpoints_unique_pod_uid_violation() {
             conn.execute(
                 "INSERT INTO pod_endpoints \
                  (pod_uid, namespace, pod_name, node_name, mode, pod_ip, generation, updated_at) \
-                 VALUES (?1, 'default', 'pod-dup', 'node-a', 'vxlan', '10.42.0.99', 1, 1700000000)",
+                 VALUES (?1, 'default', 'pod-dup', 'node-a', 'encrypted_direct', '10.42.0.99', 1, 1700000000)",
                 rusqlite::params!["uid-a"],
             )
             .map_err(tokio_rusqlite::Error::from)
@@ -72,12 +80,12 @@ async fn test_pod_endpoints_list_by_node() {
     let mut a = sample_row(
         "uid-1",
         Ipv4Addr::new(10, 42, 1, 10),
-        PodEndpointMode::Vxlan,
+        PodEndpointMode::EncryptedDirect,
     );
     let mut b = sample_row(
         "uid-2",
         Ipv4Addr::new(10, 42, 1, 11),
-        PodEndpointMode::Vxlan,
+        PodEndpointMode::EncryptedDirect,
     );
     let mut c = sample_row(
         "uid-3",
@@ -109,7 +117,11 @@ async fn test_pod_endpoints_list_by_node() {
 #[tokio::test]
 async fn test_pod_endpoints_list_all_orders_by_uid() {
     let db = Datastore::new_in_memory().await.unwrap();
-    let b = sample_row("uid-b", Ipv4Addr::new(10, 42, 0, 2), PodEndpointMode::Vxlan);
+    let b = sample_row(
+        "uid-b",
+        Ipv4Addr::new(10, 42, 0, 2),
+        PodEndpointMode::EncryptedDirect,
+    );
     let a = sample_row(
         "uid-a",
         Ipv4Addr::new(10, 42, 0, 1),
@@ -129,7 +141,11 @@ async fn test_pod_endpoints_watch_emits_create_update_delete() {
     let mut rx = db.subscribe_pod_endpoints();
 
     // CREATE
-    let mut row = sample_row("uid-w", Ipv4Addr::new(10, 42, 9, 1), PodEndpointMode::Vxlan);
+    let mut row = sample_row(
+        "uid-w",
+        Ipv4Addr::new(10, 42, 9, 1),
+        PodEndpointMode::EncryptedDirect,
+    );
     db.pod_endpoint_upsert(row.clone()).await.unwrap();
     let evt = rx.recv().await.expect("create event");
     match evt {

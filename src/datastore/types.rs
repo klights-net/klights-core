@@ -726,10 +726,10 @@ pub struct NodeSubnet {
     pub subnet: PodSubnet,
     /// Base address of `subnet` as a `u32` (host byte order). Stored for DB allocation logic.
     pub subnet_base_int: u32,
-    /// Legacy VXLAN VTEP IP (first address of the subnet) when an explicit
-    /// VXLAN route mode owns `klights.vxlan`.
+    /// First address of the subnet, retained for row-shape compatibility with
+    /// older node-subnet allocation code.
     pub vtep_ip: Ipv4Addr,
-    /// Host's primary underlay IP (used as the VXLAN UDP source/destination).
+    /// Host's primary underlay IP used for direct/WireGuard peer routing.
     pub node_ip: Ipv4Addr,
     /// Peer mode projected from the node's `klights.io/mode` annotation
     /// (F2-04). Defaults to `Root` for legacy rows or pre-F2-05 nodes.
@@ -806,26 +806,27 @@ pub struct PodWorkqueueEntry {
 
 /// Reachability mode recorded in the `pod_endpoints` table.
 ///
-/// `Vxlan` — pod is reachable directly at its pod IP via the cluster overlay.
+/// `EncryptedDirect` — pod is reachable directly at its pod IP through the
+/// encrypted pod-CIDR dataplane.
 /// `Hostport` — pod is reachable via (host_ip, host_port) on its node, used
 /// in rootless / hybrid clusters where direct overlay reach is unavailable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PodEndpointMode {
-    Vxlan,
+    EncryptedDirect,
     Hostport,
 }
 
 impl PodEndpointMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            PodEndpointMode::Vxlan => "vxlan",
+            PodEndpointMode::EncryptedDirect => "encrypted_direct",
             PodEndpointMode::Hostport => "hostport",
         }
     }
 
     pub fn parse(s: &str) -> Result<Self> {
         match s {
-            "vxlan" => Ok(PodEndpointMode::Vxlan),
+            "encrypted_direct" | "vxlan" => Ok(PodEndpointMode::EncryptedDirect),
             "hostport" => Ok(PodEndpointMode::Hostport),
             other => Err(anyhow!("unknown pod_endpoint mode: {}", other)),
         }
@@ -880,4 +881,29 @@ pub enum PodEndpointEvent {
 #[derive(Clone, Debug)]
 pub struct PendingWatchEvent {
     pub event: WatchEvent,
+}
+
+#[cfg(test)]
+mod pod_endpoint_mode_tests {
+    use super::PodEndpointMode;
+
+    #[test]
+    fn encrypted_direct_is_live_pod_endpoint_label_with_legacy_alias() {
+        assert_eq!(
+            PodEndpointMode::EncryptedDirect.as_str(),
+            "encrypted_direct"
+        );
+        assert_eq!(
+            PodEndpointMode::parse("encrypted_direct").unwrap(),
+            PodEndpointMode::EncryptedDirect
+        );
+        assert_eq!(
+            PodEndpointMode::parse("vxlan").unwrap(),
+            PodEndpointMode::EncryptedDirect
+        );
+        assert_eq!(
+            PodEndpointMode::parse("hostport").unwrap(),
+            PodEndpointMode::Hostport
+        );
+    }
 }

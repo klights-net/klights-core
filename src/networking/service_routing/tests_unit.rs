@@ -472,7 +472,7 @@ fn test_remote_pod_endpoint_specs_keep_only_remote_hostport_rows() {
         pod_endpoint_row(
             "direct",
             "node-b",
-            crate::datastore::PodEndpointMode::Vxlan,
+            crate::datastore::PodEndpointMode::EncryptedDirect,
             Ipv4Addr::new(10, 42, 1, 10),
             Ipv4Addr::new(192, 0, 2, 11),
             None,

@@ -95,7 +95,7 @@ impl PodEndpointResolver for SqlitePodEndpointResolver {
             return Ok(None);
         };
         Ok(Some(match row.mode {
-            PodEndpointMode::Vxlan => {
+            PodEndpointMode::EncryptedDirect => {
                 let encryption = self
                     .cluster_api
                     .get_node_dataplane(&row.node_name)
@@ -191,10 +191,12 @@ impl PodEndpointResolver for SqlitePodEndpointResolver {
 fn translate_endpoint_event(event: &PodEndpointEvent) -> Option<EndpointEvent> {
     match event {
         PodEndpointEvent::Upsert(row) => match row.mode {
-            PodEndpointMode::Vxlan => Some(EndpointEvent::Upsert(Endpoint::EncryptedDirect {
-                pod_ip: row.pod_ip,
-                node_name: row.node_name.clone(),
-            })),
+            PodEndpointMode::EncryptedDirect => {
+                Some(EndpointEvent::Upsert(Endpoint::EncryptedDirect {
+                    pod_ip: row.pod_ip,
+                    node_name: row.node_name.clone(),
+                }))
+            }
             PodEndpointMode::Hostport => {
                 let host_port = row.host_port_tcp.or(row.host_port_udp).unwrap_or(0);
                 let protocol = if row.host_port_tcp.is_some() {
@@ -271,15 +273,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolver_returns_encrypted_direct_for_vxlan_mode_row_by_default() {
+    async fn test_resolver_returns_encrypted_direct_for_encrypted_direct_row_by_default() {
         let (node_local, _cluster_db, resolver) = build_resolver().await;
-        let row = sample_row("uid-d", Ipv4Addr::new(10, 42, 1, 5), PodEndpointMode::Vxlan);
+        let row = sample_row(
+            "uid-d",
+            Ipv4Addr::new(10, 42, 1, 5),
+            PodEndpointMode::EncryptedDirect,
+        );
         node_local.upsert_endpoint(row).await.unwrap();
         let resolved = resolver
             .resolve(Ipv4Addr::new(10, 42, 1, 5))
             .await
             .unwrap()
-            .expect("Vxlan row must resolve");
+            .expect("encrypted-direct row must resolve");
         match resolved {
             Endpoint::EncryptedDirect { pod_ip, node_name } => {
                 assert_eq!(pod_ip, Ipv4Addr::new(10, 42, 1, 5));
@@ -292,7 +298,11 @@ mod tests {
     #[tokio::test]
     async fn test_resolver_returns_unencrypted_direct_only_for_explicit_disabled_dataplane() {
         let (node_local, cluster_db, resolver) = build_resolver().await;
-        let row = sample_row("uid-u", Ipv4Addr::new(10, 42, 1, 6), PodEndpointMode::Vxlan);
+        let row = sample_row(
+            "uid-u",
+            Ipv4Addr::new(10, 42, 1, 6),
+            PodEndpointMode::EncryptedDirect,
+        );
         node_local.upsert_endpoint(row).await.unwrap();
         cluster_db
             .update_node_dataplane(
@@ -313,7 +323,7 @@ mod tests {
             .resolve(Ipv4Addr::new(10, 42, 1, 6))
             .await
             .unwrap()
-            .expect("Vxlan row must resolve");
+            .expect("encrypted-direct row must resolve");
         match resolved {
             Endpoint::UnencryptedDirect { pod_ip, node_name } => {
                 assert_eq!(pod_ip, Ipv4Addr::new(10, 42, 1, 6));
@@ -362,7 +372,11 @@ mod tests {
         let (node_local, _cluster_db, resolver) = build_resolver().await;
         let mut stream = resolver.watch();
 
-        let row = sample_row("uid-w", Ipv4Addr::new(10, 42, 7, 9), PodEndpointMode::Vxlan);
+        let row = sample_row(
+            "uid-w",
+            Ipv4Addr::new(10, 42, 7, 9),
+            PodEndpointMode::EncryptedDirect,
+        );
         node_local.upsert_endpoint(row).await.unwrap();
         let evt = tokio::time::timeout(Duration::from_secs(2), stream.next())
             .await
@@ -468,7 +482,7 @@ mod tests {
                 namespace: "default".to_string(),
                 pod_name: format!("pod-{i}"),
                 node_name: "node-a".to_string(),
-                mode: PodEndpointMode::Vxlan,
+                mode: PodEndpointMode::EncryptedDirect,
                 pod_ip: ip,
                 node_ip: Ipv4Addr::new(10, 0, 0, 1),
                 host_port_tcp: None,

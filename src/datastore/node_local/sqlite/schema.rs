@@ -109,7 +109,7 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
             namespace     TEXT NOT NULL,
             pod_name      TEXT NOT NULL,
             node_name     TEXT NOT NULL,
-            mode          TEXT NOT NULL CHECK(mode IN ('vxlan','hostport')),
+            mode          TEXT NOT NULL CHECK(mode IN ('encrypted_direct','hostport')),
             pod_ip        TEXT NOT NULL,
             node_ip       TEXT,
             host_port_tcp INTEGER,
@@ -197,7 +197,87 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
             value BLOB NOT NULL
         );
         ",
-    )
+    )?;
+
+    migrate_pod_endpoint_encrypted_direct_mode(conn)
+}
+
+fn migrate_pod_endpoint_encrypted_direct_mode(
+    conn: &mut rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pod_endpoints'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+    if !table_sql.contains("'vxlan'") || table_sql.contains("'encrypted_direct'") {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "
+        ALTER TABLE pod_endpoints RENAME TO pod_endpoints_old;
+        DROP INDEX IF EXISTS pod_endpoints_node;
+        DROP INDEX IF EXISTS pod_endpoints_ns_pod;
+        DROP INDEX IF EXISTS pod_endpoints_pod_ip;
+        CREATE TABLE pod_endpoints (
+            pod_uid       TEXT NOT NULL PRIMARY KEY,
+            namespace     TEXT NOT NULL,
+            pod_name      TEXT NOT NULL,
+            node_name     TEXT NOT NULL,
+            mode          TEXT NOT NULL CHECK(mode IN ('encrypted_direct','hostport')),
+            pod_ip        TEXT NOT NULL,
+            node_ip       TEXT,
+            host_port_tcp INTEGER,
+            host_port_udp INTEGER,
+            generation    INTEGER NOT NULL,
+            updated_ms    INTEGER NOT NULL
+        );
+        INSERT INTO pod_endpoints (
+            pod_uid,
+            namespace,
+            pod_name,
+            node_name,
+            mode,
+            pod_ip,
+            node_ip,
+            host_port_tcp,
+            host_port_udp,
+            generation,
+            updated_ms
+        )
+        SELECT
+            pod_uid,
+            namespace,
+            pod_name,
+            node_name,
+            CASE mode WHEN 'vxlan' THEN 'encrypted_direct' ELSE mode END,
+            pod_ip,
+            node_ip,
+            host_port_tcp,
+            host_port_udp,
+            generation,
+            updated_ms
+        FROM pod_endpoints_old;
+        DROP TABLE pod_endpoints_old;
+        CREATE INDEX pod_endpoints_node ON pod_endpoints(node_name);
+        CREATE INDEX pod_endpoints_ns_pod ON pod_endpoints(namespace, pod_name);
+        CREATE INDEX pod_endpoints_pod_ip ON pod_endpoints(pod_ip);
+        ",
+    )?;
+
+    let fingerprint = compute_fingerprint(&tx)?;
+    tx.execute(
+        "INSERT OR REPLACE INTO _node_meta (key, value) VALUES ('schema_fingerprint', ?1)",
+        [&fingerprint],
+    )?;
+    tx.commit()
 }
 
 pub fn check_or_init_fingerprint(
@@ -263,4 +343,95 @@ fn compute_fingerprint(conn: &rusqlite::Connection) -> rusqlite::Result<String> 
     }
     let bytes = hasher.finalize();
     Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn init_schema_migrates_old_pod_endpoint_mode_label() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE pod_endpoints (
+                pod_uid       TEXT NOT NULL PRIMARY KEY,
+                namespace     TEXT NOT NULL,
+                pod_name      TEXT NOT NULL,
+                node_name     TEXT NOT NULL,
+                mode          TEXT NOT NULL CHECK(mode IN ('vxlan', 'hostport')),
+                pod_ip        TEXT NOT NULL,
+                node_ip       TEXT,
+                host_port_tcp INTEGER,
+                host_port_udp INTEGER,
+                generation    INTEGER NOT NULL,
+                updated_ms    INTEGER NOT NULL
+            );
+            CREATE INDEX pod_endpoints_node ON pod_endpoints(node_name);
+            CREATE INDEX pod_endpoints_ns_pod ON pod_endpoints(namespace, pod_name);
+            CREATE INDEX pod_endpoints_pod_ip ON pod_endpoints(pod_ip);
+            CREATE TABLE _node_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO _node_meta (key, value) VALUES ('schema_fingerprint', 'old');
+            INSERT INTO pod_endpoints (
+                pod_uid,
+                namespace,
+                pod_name,
+                node_name,
+                mode,
+                pod_ip,
+                node_ip,
+                generation,
+                updated_ms
+            ) VALUES (
+                'uid-old',
+                'default',
+                'pod-old',
+                'node-a',
+                'vxlan',
+                '10.42.0.10',
+                '192.0.2.10',
+                7,
+                1700000000
+            );
+            ",
+        )
+        .unwrap();
+
+        init_schema_in_conn(&mut conn).unwrap();
+        check_or_init_fingerprint(&conn, Path::new("node.db")).unwrap();
+
+        let mode: String = conn
+            .query_row(
+                "SELECT mode FROM pod_endpoints WHERE pod_uid = 'uid-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mode, "encrypted_direct");
+
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='pod_endpoints'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table_sql.contains("'encrypted_direct'"));
+        assert!(!table_sql.contains("'vxlan', 'hostport'"));
+
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND tbl_name='pod_endpoints' \
+                 AND name IN ('pod_endpoints_node','pod_endpoints_ns_pod','pod_endpoints_pod_ip')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 3);
+    }
 }

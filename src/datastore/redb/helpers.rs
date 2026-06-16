@@ -357,7 +357,10 @@ pub fn resource_in_ns(_key_bytes: &[u8], rv: u64, body: &[u8]) -> Option<Resourc
 
 /// Parse a PodEndpointRow from a JSON value.
 pub fn parse_pod_endpoint(v: &Value) -> Result<PodEndpointRow> {
-    let mode_str = v.get("mode").and_then(|s| s.as_str()).unwrap_or("vxlan");
+    let mode_str = v
+        .get("mode")
+        .and_then(|s| s.as_str())
+        .unwrap_or("encrypted_direct");
     let pod_ip_str = v
         .get("pod_ip")
         .and_then(|s| s.as_str())
@@ -383,7 +386,7 @@ pub fn parse_pod_endpoint(v: &Value) -> Result<PodEndpointRow> {
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string(),
-        mode: PodEndpointMode::parse(mode_str).unwrap_or(PodEndpointMode::Vxlan),
+        mode: PodEndpointMode::parse(mode_str).unwrap_or(PodEndpointMode::EncryptedDirect),
         pod_ip: pod_ip_str
             .parse()
             .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED),
