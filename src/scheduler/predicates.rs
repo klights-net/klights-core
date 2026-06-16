@@ -342,16 +342,17 @@ fn pods_share_topology(
 }
 
 /// Check taints vs tolerations.
-/// Only `NoSchedule` taints cause hard rejection.
+/// `NoSchedule` and `NoExecute` taints cause hard rejection.
 /// `PreferNoSchedule` taints are handled in scoring (soft penalty).
-/// `NoExecute` taints are not checked during scheduling.
 pub(crate) fn check_taints(
     node: &SchedulableNode,
     pod: &PodSchedulingConstraints,
 ) -> Option<String> {
     for taint in &node.taints {
-        // Only NoSchedule causes hard rejection during predicate filtering.
-        if !matches!(taint.effect, TaintEffect::NoSchedule) {
+        if !matches!(
+            taint.effect,
+            TaintEffect::NoSchedule | TaintEffect::NoExecute
+        ) {
             continue;
         }
 
@@ -794,6 +795,19 @@ mod tests {
         let pod = make_pod();
         // Predicate should pass
         assert!(node_fit(&node, &pod, &[]).is_empty());
+    }
+
+    #[test]
+    fn taint_no_execute_not_tolerated_is_hard_reject() {
+        let mut node = make_node("node-a");
+        node.taints.push(Taint {
+            key: "maintenance".into(),
+            value: Some("true".into()),
+            effect: TaintEffect::NoExecute,
+        });
+        let pod = make_pod();
+        let reasons = node_fit(&node, &pod, &[]);
+        assert!(reasons.iter().any(|r| r.contains("not tolerated")));
     }
 
     #[test]
