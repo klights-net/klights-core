@@ -1545,6 +1545,14 @@ async fn schedule_pod_on_available_nodes(
             crate::datastore::ResourceListQuery::all(),
         )
         .await?;
+    let namespaces = db
+        .list_resources(
+            "v1",
+            "Namespace",
+            None,
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await?;
 
     // Collect existing pods on each node
     let all_pods = store
@@ -1556,6 +1564,11 @@ async fn schedule_pod_on_available_nodes(
     node_names.sort();
 
     let node_values: Vec<&Value> = nodes.items.iter().map(|n| n.data.as_ref()).collect();
+    let namespace_values: Vec<&Value> = namespaces
+        .items
+        .iter()
+        .map(|namespace| namespace.data.as_ref())
+        .collect();
     let existing_per_node: Vec<(&str, Vec<&Value>)> = node_names
         .iter()
         .map(|name| {
@@ -1569,13 +1582,14 @@ async fn schedule_pod_on_available_nodes(
         })
         .collect();
 
-    let decision = crate::scheduler::engine::schedule_from_json(
+    let decision = crate::scheduler::engine::schedule_from_json_with_namespaces(
         &node_values,
         pod,
         &existing_per_node
             .iter()
             .map(|(name, pods)| (*name, pods.as_slice()))
             .collect::<Vec<_>>(),
+        &namespace_values,
     );
 
     let mut api_decision = scheduling_decision_to_api(decision);

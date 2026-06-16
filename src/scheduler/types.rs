@@ -93,8 +93,11 @@ pub enum TolerationOperator {
 /// A pod's scheduling constraints.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodSchedulingConstraints {
+    pub namespace: String,
     pub node_selector: HashMap<String, String>,
     pub required_node_affinity: Vec<NodeSelectorTerm>,
+    pub required_pod_affinity: Vec<PodAffinityTerm>,
+    pub required_pod_anti_affinity: Vec<PodAffinityTerm>,
     pub tolerations: Vec<Toleration>,
     pub resources: PodResources,
     pub host_port_requests: Vec<u16>,
@@ -104,6 +107,87 @@ pub struct PodSchedulingConstraints {
     pub priority_class_name: Option<String>,
     /// Preemption policy.
     pub preemption_policy: Option<PreemptionPolicy>,
+}
+
+/// A required pod affinity or anti-affinity term.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PodAffinityTerm {
+    pub label_selector: Option<LabelSelectorTerm>,
+    pub namespaces: Option<Vec<String>>,
+    pub namespace_selector: Option<LabelSelectorTerm>,
+    pub topology_key: String,
+}
+
+/// A Kubernetes label selector in structured form.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelSelectorTerm {
+    pub match_labels: HashMap<String, String>,
+    pub match_expressions: Vec<LabelSelectorRequirement>,
+}
+
+impl LabelSelectorTerm {
+    pub fn is_empty(&self) -> bool {
+        self.match_labels.is_empty() && self.match_expressions.is_empty()
+    }
+
+    pub fn matches(&self, labels: &HashMap<String, String>) -> bool {
+        self.match_labels
+            .iter()
+            .all(|(key, value)| labels.get(key) == Some(value))
+            && self
+                .match_expressions
+                .iter()
+                .all(|requirement| requirement.matches(labels))
+    }
+}
+
+/// A label selector matchExpression requirement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelSelectorRequirement {
+    pub key: String,
+    pub operator: LabelSelectorOperator,
+    pub values: Vec<String>,
+}
+
+impl LabelSelectorRequirement {
+    fn matches(&self, labels: &HashMap<String, String>) -> bool {
+        let label_value = labels.get(&self.key);
+        match self.operator {
+            LabelSelectorOperator::In => label_value
+                .is_some_and(|value| self.values.iter().any(|candidate| candidate == value)),
+            LabelSelectorOperator::NotIn => label_value
+                .map(|value| self.values.iter().all(|candidate| candidate != value))
+                .unwrap_or(true),
+            LabelSelectorOperator::Exists => label_value.is_some(),
+            LabelSelectorOperator::DoesNotExist => label_value.is_none(),
+        }
+    }
+}
+
+/// Label selector matchExpression operators.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LabelSelectorOperator {
+    In,
+    NotIn,
+    Exists,
+    DoesNotExist,
+}
+
+/// Existing cluster state needed by inter-pod affinity predicates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InterPodAffinityContext {
+    pub existing_pods: Vec<ScheduledPod>,
+    pub node_labels_by_name: HashMap<String, HashMap<String, String>>,
+    pub namespace_labels_by_name: HashMap<String, HashMap<String, String>>,
+}
+
+/// A pod already assigned to a node.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScheduledPod {
+    pub namespace: String,
+    pub name: String,
+    pub node_name: String,
+    pub labels: HashMap<String, String>,
 }
 
 /// A node selector term for required node affinity.
@@ -332,6 +416,7 @@ mod tests {
     #[test]
     fn types_round_trip_json() {
         let constraints = PodSchedulingConstraints {
+            namespace: "default".into(),
             node_selector: HashMap::from([("zone".into(), "us-west".into())]),
             required_node_affinity: vec![NodeSelectorTerm {
                 match_expressions: vec![NodeSelectorRequirement {
@@ -345,6 +430,8 @@ mod tests {
                     values: vec!["node-a".into()],
                 }],
             }],
+            required_pod_affinity: Vec::new(),
+            required_pod_anti_affinity: Vec::new(),
             tolerations: vec![Toleration {
                 key: Some("dedicated".into()),
                 value: Some("gpu".into()),

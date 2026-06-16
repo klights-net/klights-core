@@ -61,6 +61,12 @@ pub fn extract_schedulable_node(node_value: &serde_json::Value) -> SchedulableNo
 
 /// Extract `PodSchedulingConstraints` from a JSON Pod object.
 pub fn extract_pod_constraints(pod_value: &serde_json::Value) -> PodSchedulingConstraints {
+    let namespace = pod_value
+        .pointer("/metadata/namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+
     let node_selector = pod_value
         .pointer("/spec/nodeSelector")
         .and_then(|v| v.as_object())
@@ -75,6 +81,18 @@ pub fn extract_pod_constraints(pod_value: &serde_json::Value) -> PodSchedulingCo
         .pointer("/spec/affinity/nodeAffinity/requiredDuringSchedulingIgnoredDuringExecution/nodeSelectorTerms")
         .and_then(|v| v.as_array())
         .map(|terms| terms.iter().filter_map(extract_node_selector_term).collect())
+        .unwrap_or_default();
+
+    let required_pod_affinity = pod_value
+        .pointer("/spec/affinity/podAffinity/requiredDuringSchedulingIgnoredDuringExecution")
+        .and_then(|v| v.as_array())
+        .map(|terms| terms.iter().filter_map(extract_pod_affinity_term).collect())
+        .unwrap_or_default();
+
+    let required_pod_anti_affinity = pod_value
+        .pointer("/spec/affinity/podAntiAffinity/requiredDuringSchedulingIgnoredDuringExecution")
+        .and_then(|v| v.as_array())
+        .map(|terms| terms.iter().filter_map(extract_pod_affinity_term).collect())
         .unwrap_or_default();
 
     let tolerations = pod_value
@@ -106,8 +124,11 @@ pub fn extract_pod_constraints(pod_value: &serde_json::Value) -> PodSchedulingCo
         });
 
     PodSchedulingConstraints {
+        namespace,
         node_selector,
         required_node_affinity,
+        required_pod_affinity,
+        required_pod_anti_affinity,
         tolerations,
         resources,
         host_port_requests: Vec::new(), // Not needed for scheduling predicates
@@ -141,16 +162,30 @@ pub fn extract_existing_pod(
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
     let resources = extract_pod_resources(pod_value);
+    let labels = extract_labels(pod_value, "/metadata/labels");
 
     crate::scheduler::preemption::ExistingPod {
         namespace,
         name,
         priority,
         resources,
+        labels,
     }
 }
 
 // ---- Internal helpers ----
+
+fn extract_labels(pod_value: &serde_json::Value, pointer: &str) -> HashMap<String, String> {
+    pod_value
+        .pointer(pointer)
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 fn extract_taint(v: &serde_json::Value) -> Option<Taint> {
     let key = v.get("key")?.as_str()?.to_string();
@@ -247,6 +282,83 @@ fn extract_node_selector_requirement(v: &serde_json::Value) -> Option<NodeSelect
         })
         .unwrap_or_default();
     Some(NodeSelectorRequirement {
+        key,
+        operator,
+        values,
+    })
+}
+
+fn extract_pod_affinity_term(v: &serde_json::Value) -> Option<PodAffinityTerm> {
+    let topology_key = v.get("topologyKey")?.as_str()?.to_string();
+    let label_selector = v.get("labelSelector").and_then(extract_label_selector_term);
+    let namespaces = v.get("namespaces").and_then(|value| {
+        value.as_array().map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+    });
+    let namespace_selector = v
+        .get("namespaceSelector")
+        .and_then(extract_label_selector_term);
+    Some(PodAffinityTerm {
+        label_selector,
+        namespaces,
+        namespace_selector,
+        topology_key,
+    })
+}
+
+fn extract_label_selector_term(v: &serde_json::Value) -> Option<LabelSelectorTerm> {
+    let mut match_labels = HashMap::new();
+    if let Some(labels) = v.get("matchLabels").and_then(|v| v.as_object()) {
+        for (key, value) in labels {
+            if let Some(value) = value.as_str() {
+                match_labels.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+
+    let match_expressions = v
+        .get("matchExpressions")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(extract_label_selector_requirement)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(LabelSelectorTerm {
+        match_labels,
+        match_expressions,
+    })
+}
+
+fn extract_label_selector_requirement(v: &serde_json::Value) -> Option<LabelSelectorRequirement> {
+    let key = v.get("key")?.as_str()?.to_string();
+    let operator = v
+        .get("operator")?
+        .as_str()
+        .and_then(|operator| match operator {
+            "In" => Some(LabelSelectorOperator::In),
+            "NotIn" => Some(LabelSelectorOperator::NotIn),
+            "Exists" => Some(LabelSelectorOperator::Exists),
+            "DoesNotExist" => Some(LabelSelectorOperator::DoesNotExist),
+            _ => None,
+        })?;
+    let values = v
+        .get("values")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(LabelSelectorRequirement {
         key,
         operator,
         values,

@@ -7,7 +7,7 @@ use super::predicates;
 use super::preemption::{self, ExistingPod};
 use super::scoring;
 use super::types::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Run the full scheduling pipeline: filter → score → preempt.
 ///
@@ -22,11 +22,22 @@ pub fn schedule_multi_node(
     pod: &PodSchedulingConstraints,
     existing_resources: &[NodeExistingPods],
 ) -> SchedulingDecision {
+    schedule_multi_node_with_namespace_labels(nodes, pod, existing_resources, HashMap::new())
+}
+
+fn schedule_multi_node_with_namespace_labels(
+    nodes: &[SchedulableNode],
+    pod: &PodSchedulingConstraints,
+    existing_resources: &[NodeExistingPods],
+    namespace_labels_by_name: HashMap<String, HashMap<String, String>>,
+) -> SchedulingDecision {
     // Build a map from node name to existing pods
     let existing_map: std::collections::HashMap<&str, &[ExistingPod]> = existing_resources
         .iter()
         .map(|nep| (nep.node_name.as_str(), nep.pods.as_slice()))
         .collect();
+    let inter_pod_context =
+        build_inter_pod_affinity_context(nodes, existing_resources, namespace_labels_by_name);
 
     // Step 1: Filter — run predicates on each node
     let mut fit_nodes = Vec::new();
@@ -37,7 +48,8 @@ pub fn schedule_multi_node(
         let existing = existing_map.get(node.name.as_str()).copied().unwrap_or(&[]);
         let existing_resources: Vec<PodResources> =
             existing.iter().map(|p| p.resources.clone()).collect();
-        let reasons = predicates::node_fit(node, pod, &existing_resources);
+        let reasons =
+            predicates::node_fit_with_context(node, pod, &existing_resources, &inter_pod_context);
         if reasons.is_empty() {
             fit_nodes.push(node.clone());
         } else {
@@ -72,6 +84,34 @@ pub fn schedule_multi_node(
     match selected {
         Some(name) => SchedulingDecision::success(name),
         None => SchedulingDecision::failed(vec!["no node selected after scoring".into()]),
+    }
+}
+
+fn build_inter_pod_affinity_context(
+    nodes: &[SchedulableNode],
+    existing_resources: &[NodeExistingPods],
+    namespace_labels_by_name: HashMap<String, HashMap<String, String>>,
+) -> InterPodAffinityContext {
+    let node_labels_by_name = nodes
+        .iter()
+        .map(|node| (node.name.clone(), node.labels.clone()))
+        .collect::<HashMap<_, _>>();
+    let existing_pods = existing_resources
+        .iter()
+        .flat_map(|node_existing| {
+            node_existing.pods.iter().map(|pod| ScheduledPod {
+                namespace: pod.namespace.clone(),
+                name: pod.name.clone(),
+                node_name: node_existing.node_name.clone(),
+                labels: pod.labels.clone(),
+            })
+        })
+        .collect();
+
+    InterPodAffinityContext {
+        existing_pods,
+        node_labels_by_name,
+        namespace_labels_by_name,
     }
 }
 
@@ -209,11 +249,30 @@ pub fn schedule_from_json(
     pod: &serde_json::Value,
     existing_pods_per_node: &[(&str, &[&serde_json::Value])],
 ) -> SchedulingDecision {
+    schedule_from_json_with_namespaces(nodes, pod, existing_pods_per_node, &[])
+}
+
+/// High-level scheduling entry point with Namespace labels for namespaceSelector.
+pub fn schedule_from_json_with_namespaces(
+    nodes: &[&serde_json::Value],
+    pod: &serde_json::Value,
+    existing_pods_per_node: &[(&str, &[&serde_json::Value])],
+    namespaces: &[&serde_json::Value],
+) -> SchedulingDecision {
     let typed_nodes: Vec<SchedulableNode> = nodes
         .iter()
         .map(|n| adapter::extract_schedulable_node(n))
         .collect();
     let pod_constraints = adapter::extract_pod_constraints(pod);
+    let namespace_labels_by_name = namespaces
+        .iter()
+        .filter_map(|namespace| {
+            let name = namespace
+                .pointer("/metadata/name")
+                .and_then(|value| value.as_str())?;
+            Some((name.to_string(), extract_metadata_labels(namespace)))
+        })
+        .collect::<HashMap<_, _>>();
     let existing: Vec<NodeExistingPods> = existing_pods_per_node
         .iter()
         .map(|(node_name, pods)| NodeExistingPods {
@@ -225,7 +284,25 @@ pub fn schedule_from_json(
         })
         .collect();
 
-    schedule_multi_node(&typed_nodes, &pod_constraints, &existing)
+    schedule_multi_node_with_namespace_labels(
+        &typed_nodes,
+        &pod_constraints,
+        &existing,
+        namespace_labels_by_name,
+    )
+}
+
+fn extract_metadata_labels(value: &serde_json::Value) -> HashMap<String, String> {
+    value
+        .pointer("/metadata/labels")
+        .and_then(|labels| labels.as_object())
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.into())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -301,6 +378,7 @@ mod tests {
                 memory_ki: mem,
                 ..Default::default()
             },
+            labels: HashMap::new(),
         }
     }
 
@@ -356,6 +434,195 @@ mod tests {
                 .any(|reason| reason.contains("Too many pods")),
             "node without allocatable.pods must not accept even a zero-request pod: {decision:?}"
         );
+    }
+
+    #[test]
+    fn schedule_from_json_enforces_required_pod_affinity_topology_key() {
+        let node_a = json!({
+            "metadata": {
+                "name": "node-a",
+                "labels": {"topology.kubernetes.io/zone": "zone-a"}
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let node_b = json!({
+            "metadata": {
+                "name": "node-b",
+                "labels": {"topology.kubernetes.io/zone": "zone-b"}
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let existing_peer = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "peer",
+                "labels": {"app": "database"}
+            },
+            "spec": {
+                "nodeName": "node-b",
+                "containers": [{"name": "main", "image": "pause"}]
+            }
+        });
+        let pod = json!({
+            "metadata": {"namespace": "default", "name": "client"},
+            "spec": {
+                "containers": [{"name": "main", "image": "pause"}],
+                "affinity": {
+                    "podAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": [{
+                            "labelSelector": {"matchLabels": {"app": "database"}},
+                            "topologyKey": "topology.kubernetes.io/zone"
+                        }]
+                    }
+                }
+            }
+        });
+
+        let decision = schedule_from_json(
+            &[&node_a, &node_b],
+            &pod,
+            &[("node-b", &[&existing_peer][..])],
+        );
+
+        assert!(decision.is_success(), "{decision:?}");
+        assert_eq!(decision.selected_node, Some("node-b".into()));
+    }
+
+    #[test]
+    fn schedule_from_json_enforces_required_pod_anti_affinity_topology_key() {
+        let node_a = json!({
+            "metadata": {
+                "name": "node-a",
+                "labels": {"kubernetes.io/hostname": "node-a"}
+            },
+            "status": {
+                "allocatable": {"cpu": "64", "memory": "256Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let node_b = json!({
+            "metadata": {
+                "name": "node-b",
+                "labels": {"kubernetes.io/hostname": "node-b"}
+            },
+            "spec": {
+                "taints": [{
+                    "key": "dedicated",
+                    "value": "fallback",
+                    "effect": "PreferNoSchedule"
+                }]
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let existing_peer = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "peer",
+                "labels": {"app": "database"}
+            },
+            "spec": {
+                "nodeName": "node-a",
+                "containers": [{"name": "main", "image": "pause"}]
+            }
+        });
+        let pod = json!({
+            "metadata": {"namespace": "default", "name": "client"},
+            "spec": {
+                "containers": [{"name": "main", "image": "pause"}],
+                "affinity": {
+                    "podAntiAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": [{
+                            "labelSelector": {"matchLabels": {"app": "database"}},
+                            "topologyKey": "kubernetes.io/hostname"
+                        }]
+                    }
+                }
+            }
+        });
+
+        let decision = schedule_from_json(
+            &[&node_a, &node_b],
+            &pod,
+            &[("node-a", &[&existing_peer][..])],
+        );
+
+        assert!(decision.is_success(), "{decision:?}");
+        assert_eq!(decision.selected_node, Some("node-b".into()));
+    }
+
+    #[test]
+    fn schedule_from_json_matches_pod_affinity_namespace_selector() {
+        let node_a = json!({
+            "metadata": {
+                "name": "node-a",
+                "labels": {"topology.kubernetes.io/zone": "zone-a"}
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let node_b = json!({
+            "metadata": {
+                "name": "node-b",
+                "labels": {"topology.kubernetes.io/zone": "zone-b"}
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let peer_namespace = json!({
+            "metadata": {
+                "name": "peer-ns",
+                "labels": {"team": "storage"}
+            }
+        });
+        let existing_peer = json!({
+            "metadata": {
+                "namespace": "peer-ns",
+                "name": "peer",
+                "labels": {"app": "database"}
+            },
+            "spec": {
+                "nodeName": "node-b",
+                "containers": [{"name": "main", "image": "pause"}]
+            }
+        });
+        let pod = json!({
+            "metadata": {"namespace": "default", "name": "client"},
+            "spec": {
+                "containers": [{"name": "main", "image": "pause"}],
+                "affinity": {
+                    "podAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": [{
+                            "labelSelector": {"matchLabels": {"app": "database"}},
+                            "namespaceSelector": {"matchLabels": {"team": "storage"}},
+                            "topologyKey": "topology.kubernetes.io/zone"
+                        }]
+                    }
+                }
+            }
+        });
+
+        let decision = schedule_from_json_with_namespaces(
+            &[&node_a, &node_b],
+            &pod,
+            &[("node-b", &[&existing_peer][..])],
+            &[&peer_namespace],
+        );
+
+        assert!(decision.is_success(), "{decision:?}");
+        assert_eq!(decision.selected_node, Some("node-b".into()));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! no side effects, no I/O.
 
 use super::types::*;
+use std::collections::HashMap;
 
 /// An existing pod on a node, used for preemption calculations.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub struct ExistingPod {
     pub name: String,
     pub priority: i64,
     pub resources: PodResources,
+    pub labels: HashMap<String, String>,
 }
 
 /// Select preemption victims on a node for an incoming pod.
@@ -223,6 +225,7 @@ mod tests {
                 memory_ki: mem,
                 ..Default::default()
             },
+            labels: HashMap::new(),
         }
     }
 
@@ -340,6 +343,7 @@ mod tests {
                 extended: HashMap::from([("nvidia.com/gpu".into(), 3)]),
                 ..Default::default()
             },
+            labels: HashMap::new(),
         }];
         // 3 existing + 2 requested = 5 > 4 allocatable → need to preempt
         let result = select_preemption_victims(&node, &pod, &existing);

@@ -13,6 +13,21 @@ pub fn node_fit(
     pod: &PodSchedulingConstraints,
     existing_pod_resources: &[PodResources],
 ) -> Vec<String> {
+    node_fit_with_context(
+        node,
+        pod,
+        existing_pod_resources,
+        &InterPodAffinityContext::default(),
+    )
+}
+
+/// Check if a node passes all predicates, including inter-pod affinity.
+pub fn node_fit_with_context(
+    node: &SchedulableNode,
+    pod: &PodSchedulingConstraints,
+    existing_pod_resources: &[PodResources],
+    inter_pod_context: &InterPodAffinityContext,
+) -> Vec<String> {
     let mut reasons = Vec::new();
 
     // 1. Node is schedulable
@@ -35,12 +50,131 @@ pub fn node_fit(
         reasons.push("node(s) didn't match Pod's node affinity/selector".into());
     }
 
+    if !required_pod_affinity_matches(node, pod, inter_pod_context) {
+        reasons.push("node(s) didn't match Pod's pod affinity rules".into());
+    }
+
+    if !required_pod_anti_affinity_matches(node, pod, inter_pod_context) {
+        reasons.push("node(s) didn't match Pod's pod anti-affinity rules".into());
+    }
+
     // 6. Resource fit check
     if let Some(reason) = check_resource_fit(node, pod, existing_pod_resources) {
         reasons.push(reason);
     }
 
     reasons
+}
+
+fn required_pod_affinity_matches(
+    node: &SchedulableNode,
+    pod: &PodSchedulingConstraints,
+    context: &InterPodAffinityContext,
+) -> bool {
+    pod.required_pod_affinity.iter().all(|term| {
+        matching_pods_in_topology(node, pod, term, context)
+            .next()
+            .is_some()
+    })
+}
+
+fn required_pod_anti_affinity_matches(
+    node: &SchedulableNode,
+    pod: &PodSchedulingConstraints,
+    context: &InterPodAffinityContext,
+) -> bool {
+    pod.required_pod_anti_affinity.iter().all(|term| {
+        matching_pods_in_topology(node, pod, term, context)
+            .next()
+            .is_none()
+    })
+}
+
+fn matching_pods_in_topology<'a>(
+    candidate_node: &'a SchedulableNode,
+    pod: &'a PodSchedulingConstraints,
+    term: &'a PodAffinityTerm,
+    context: &'a InterPodAffinityContext,
+) -> impl Iterator<Item = &'a ScheduledPod> + 'a {
+    context.existing_pods.iter().filter(move |existing| {
+        pod_matches_affinity_term(existing, pod, term, context)
+            && pods_share_topology(candidate_node, existing, term, context)
+    })
+}
+
+fn pod_matches_affinity_term(
+    existing: &ScheduledPod,
+    pod: &PodSchedulingConstraints,
+    term: &PodAffinityTerm,
+    context: &InterPodAffinityContext,
+) -> bool {
+    label_selector_matches(term, &existing.labels)
+        && namespace_matches_term(&existing.namespace, &pod.namespace, term, context)
+}
+
+fn label_selector_matches(term: &PodAffinityTerm, labels: &HashMap<String, String>) -> bool {
+    term.label_selector
+        .as_ref()
+        .map(|selector| selector.matches(labels))
+        .unwrap_or(false)
+}
+
+fn namespace_matches_term(
+    existing_namespace: &str,
+    pod_namespace: &str,
+    term: &PodAffinityTerm,
+    context: &InterPodAffinityContext,
+) -> bool {
+    let explicit_namespace_match = term.namespaces.as_ref().map(|namespaces| {
+        namespaces
+            .iter()
+            .any(|namespace| namespace == existing_namespace)
+    });
+    let namespace_selector_match = term
+        .namespace_selector
+        .as_ref()
+        .map(|selector| namespace_selector_matches(existing_namespace, selector, context));
+
+    match (explicit_namespace_match, namespace_selector_match) {
+        (Some(explicit), Some(selector)) => explicit && selector,
+        (Some(explicit), None) => explicit,
+        (None, Some(selector)) => selector,
+        (None, None) => existing_namespace == pod_namespace,
+    }
+}
+
+fn namespace_selector_matches(
+    namespace: &str,
+    selector: &LabelSelectorTerm,
+    context: &InterPodAffinityContext,
+) -> bool {
+    if selector.is_empty() {
+        return true;
+    }
+    context
+        .namespace_labels_by_name
+        .get(namespace)
+        .is_some_and(|labels| selector.matches(labels))
+}
+
+fn pods_share_topology(
+    candidate_node: &SchedulableNode,
+    existing: &ScheduledPod,
+    term: &PodAffinityTerm,
+    context: &InterPodAffinityContext,
+) -> bool {
+    if term.topology_key.is_empty() {
+        return false;
+    }
+
+    let Some(candidate_value) = candidate_node.labels.get(&term.topology_key) else {
+        return false;
+    };
+    context
+        .node_labels_by_name
+        .get(&existing.node_name)
+        .and_then(|labels| labels.get(&term.topology_key))
+        == Some(candidate_value)
 }
 
 /// Check taints vs tolerations.
