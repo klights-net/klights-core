@@ -457,6 +457,7 @@ impl VolumeHandler for ProjectedHandler {
             namespace: ctx.namespace,
             pod_dir_id: ctx.pod_dir_id,
             pod_db_name: ctx.pod_name,
+            pod: ctx.pod,
             volume_name,
             default_mode,
             sources: &sources_for_write,
@@ -896,6 +897,83 @@ mod tests {
             "default"
         );
         assert_eq!(sources.token_requests().len(), 1);
+
+        let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
+    }
+
+    #[tokio::test]
+    async fn test_projected_downward_api_uses_current_pod_snapshot() {
+        let registry = VolumeRegistry::with_defaults();
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let runtime_ns = format!("volreg-projected-pod-snapshot-{}", suffix);
+
+        let pod_name = "downwardapi-volume-test";
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": pod_name,
+                "namespace": "default",
+                "uid": "pod-uid-a"
+            },
+            "spec": {
+                "containers": [{"name": "app", "image": "busybox"}],
+                "volumes": [{
+                    "name": "podinfo",
+                    "projected": {
+                        "sources": [
+                            {"downwardAPI": {"items": [
+                                {"path": "podname", "fieldRef": {"fieldPath": "metadata.name"}}
+                            ]}}
+                        ]
+                    }
+                }]
+            }
+        });
+        let stale_pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "",
+                "namespace": "default",
+                "uid": "stale-pod-uid"
+            },
+            "spec": {"containers": [{"name": "app", "image": "busybox"}]}
+        });
+        let sources = RecordingVolumeSourceReader::new(
+            vec![test_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                pod_name,
+                stale_pod,
+            )],
+            "unused-token",
+        );
+
+        let volume = pod["spec"]["volumes"][0].clone();
+        let ctx = VolumeContext {
+            sources: &sources,
+            namespace: "default",
+            pod_name,
+            pod_dir_id: "default_downwardapi-volume-test",
+            pod: &pod,
+            containerd_namespace: &runtime_ns,
+        };
+
+        let resolved = registry
+            .resolve_path(&volume, "podinfo", &ctx)
+            .await
+            .expect("projected downwardAPI should render from the current pod snapshot")
+            .expect("projected volume path should be created");
+
+        assert_eq!(
+            crate::utils::read_utf8_file(format!("{}/podname", resolved)).unwrap(),
+            pod_name
+        );
 
         let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
     }

@@ -20,6 +20,7 @@ struct ProjectedRenderPlanRequest<'a> {
     source_reader: &'a dyn VolumeSourceReader,
     namespace: &'a str,
     pod_lookup_name: &'a str,
+    pod_snapshot: Option<&'a serde_json::Value>,
     default_mode: Option<u32>,
     sources: &'a serde_json::Value,
     token: Option<&'a str>,
@@ -31,6 +32,7 @@ struct ProjectedVolumePathRequest<'a> {
     namespace: &'a str,
     pod_dir_id: &'a str,
     pod_lookup_name: &'a str,
+    pod_snapshot: Option<&'a serde_json::Value>,
     volume_name: &'a str,
     default_mode: Option<u32>,
     sources: &'a serde_json::Value,
@@ -42,6 +44,7 @@ pub struct ProjectedVolumeNsRequest<'a> {
     pub namespace: &'a str,
     pub pod_dir_id: &'a str,
     pub pod_db_name: &'a str,
+    pub pod: &'a serde_json::Value,
     pub volume_name: &'a str,
     pub default_mode: Option<u32>,
     pub sources: &'a serde_json::Value,
@@ -95,6 +98,7 @@ async fn build_projected_render_plan(
         source_reader,
         namespace,
         pod_lookup_name,
+        pod_snapshot,
         default_mode,
         sources,
         token,
@@ -305,12 +309,18 @@ async fn build_projected_render_plan(
             let items = downward_api
                 .get("items")
                 .ok_or_else(|| anyhow::anyhow!("downwardAPI source missing items"))?;
-            let pod_resource = source_reader
-                .pod(namespace, pod_lookup_name)
-                .await?
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Pod {}/{} not found", namespace, pod_lookup_name)
-                })?;
+            let owned_pod_resource;
+            let pod_data = if let Some(pod_snapshot) = pod_snapshot {
+                pod_snapshot
+            } else {
+                owned_pod_resource = source_reader
+                    .pod(namespace, pod_lookup_name)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Pod {}/{} not found", namespace, pod_lookup_name)
+                    })?;
+                &owned_pod_resource.data
+            };
             let items_array = items
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("downwardAPI items must be an array"))?;
@@ -325,14 +335,14 @@ async fn build_projected_render_plan(
                         .get("fieldPath")
                         .and_then(|f| f.as_str())
                         .ok_or_else(|| anyhow::anyhow!("fieldRef missing fieldPath"))?;
-                    extract_field_ref(&pod_resource.data, field_path)?
+                    extract_field_ref(pod_data, field_path)?
                 } else if let Some(resource_ref) = item.get("resourceFieldRef") {
                     let resource = resource_ref
                         .get("resource")
                         .and_then(|r| r.as_str())
                         .ok_or_else(|| anyhow::anyhow!("resourceFieldRef missing resource"))?;
                     let container_name = resource_ref.get("containerName").and_then(|c| c.as_str());
-                    extract_resource_field_ref(&pod_resource.data, container_name, resource)?
+                    extract_resource_field_ref(pod_data, container_name, resource)?
                 } else {
                     anyhow::bail!("downwardAPI item must have fieldRef or resourceFieldRef");
                 };
@@ -360,6 +370,7 @@ async fn create_projected_volume_at_impl(
         namespace,
         pod_dir_id,
         pod_lookup_name,
+        pod_snapshot,
         volume_name,
         default_mode,
         sources,
@@ -373,6 +384,7 @@ async fn create_projected_volume_at_impl(
         source_reader,
         namespace,
         pod_lookup_name,
+        pod_snapshot,
         default_mode,
         sources,
         token,
@@ -398,6 +410,7 @@ pub async fn create_projected_volume_ns(request: ProjectedVolumeNsRequest<'_>) -
         namespace: request.namespace,
         pod_dir_id: request.pod_dir_id,
         pod_lookup_name: request.pod_db_name,
+        pod_snapshot: Some(request.pod),
         volume_name: request.volume_name,
         default_mode: request.default_mode,
         sources: request.sources,
@@ -414,6 +427,7 @@ pub async fn create_projected_volume_at(request: ProjectedVolumeAtRequest<'_>) -
         namespace: request.namespace,
         pod_dir_id: request.pod_name,
         pod_lookup_name: request.pod_name,
+        pod_snapshot: None,
         volume_name: request.volume_name,
         default_mode: request.default_mode,
         sources: request.sources,
