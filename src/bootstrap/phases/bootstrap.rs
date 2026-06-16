@@ -19,7 +19,6 @@ pub struct BootstrapPhase {
     pub _watcher_state: Arc<crate::api::AppState>,
     pub _node_lifecycle_start_resource_version: i64,
     pub pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
-    pub local_vtep_annotation_handle: SupervisedJoinHandle<()>,
     pub crd_registry_watch_handle: SupervisedJoinHandle<()>,
     pub leader_peer_endpoint_observer_handle: Option<SupervisedJoinHandle<()>>,
     pub pod_watcher_handle: Option<SupervisedJoinHandle<()>>,
@@ -433,23 +432,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .controller_dispatcher
         .set_pod_repository(api_pod_repository.clone())
         .await;
-
-    // VTEP reconciler
-    let local_vtep_annotation_handle = {
-        let state = watcher_state.clone();
-        let cancel = shutdown_token.clone();
-        supervisor
-            .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
-                "runtime_local_vtep_annotation_reconciler",
-                async move {
-                    controllers::node_subnet::run_local_node_vtep_reconciler(state, cancel).await;
-                },
-            )
-            .await
-            .context("failed to spawn local VTEP reconciler")?
-    };
-    tracing::info!("Local VTEP annotation reconciler task started");
 
     let node_lifecycle_start_resource_version = if has_leader_election {
         db.get_current_resource_version().await.unwrap_or(0)
@@ -899,7 +881,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     Ok(BootstrapPhase {
         _watcher_state: watcher_state,
         pod_repository: api_pod_repository,
-        local_vtep_annotation_handle,
         crd_registry_watch_handle,
         leader_peer_endpoint_observer_handle,
         _node_lifecycle_start_resource_version: node_lifecycle_start_resource_version,

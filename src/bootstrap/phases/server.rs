@@ -19,7 +19,6 @@ pub struct ServeArgs<'a> {
     pub heartbeat_handle: SupervisedJoinHandle<()>,
     pub node_subnet_watch_handle: SupervisedJoinHandle<()>,
     pub node_lifecycle_handle: Option<SupervisedJoinHandle<()>>,
-    pub local_vtep_annotation_handle: SupervisedJoinHandle<()>,
     pub crd_registry_watch_handle: SupervisedJoinHandle<()>,
     pub leader_peer_endpoint_observer_handle: Option<SupervisedJoinHandle<()>>,
     pub scheduler_controller_handle: Option<SupervisedJoinHandle<()>>,
@@ -42,7 +41,6 @@ pub async fn serve(args: ServeArgs<'_>) -> Result<()> {
         heartbeat_handle,
         node_subnet_watch_handle,
         node_lifecycle_handle,
-        local_vtep_annotation_handle,
         crd_registry_watch_handle,
         leader_peer_endpoint_observer_handle,
         scheduler_controller_handle,
@@ -142,18 +140,6 @@ pub async fn serve(args: ServeArgs<'_>) -> Result<()> {
             }
             Err(e) => tracing::warn!("Node lifecycle controller join cancelled: {e}"),
         }
-    }
-    match supervisor
-        .timeout(
-            "local_vtep_shutdown_join",
-            timeout,
-            local_vtep_annotation_handle.join(),
-        )
-        .await
-    {
-        Ok(Ok(_)) => tracing::info!("Local VTEP reconciler stopped"),
-        Ok(Err(_)) => tracing::warn!("Local VTEP reconciler did not complete within timeout"),
-        Err(e) => tracing::warn!("Local VTEP reconciler join cancelled: {e}"),
     }
     match supervisor
         .timeout(

@@ -967,7 +967,6 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     })
     .await?;
     let pod_repository = bp.pod_repository;
-    let local_vtep_annotation_handle = bp.local_vtep_annotation_handle;
     let crd_registry_watch_handle = bp.crd_registry_watch_handle;
     let leader_peer_endpoint_observer_handle = bp.leader_peer_endpoint_observer_handle;
     let pod_watcher_handle = bp.pod_watcher_handle;
@@ -1005,7 +1004,6 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         heartbeat_handle,
         node_subnet_watch_handle,
         node_lifecycle_handle,
-        local_vtep_annotation_handle,
         crd_registry_watch_handle,
         leader_peer_endpoint_observer_handle,
         scheduler_controller_handle,

@@ -17,9 +17,7 @@ use crate::controllers::annotations::{
     parse_node_peer_mode,
 };
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{
-    DatastoreBackend, DatastoreHandle, NodeSubnet, PatchKind, ResourcePreconditions, WatchTarget,
-};
+use crate::datastore::{DatastoreBackend, DatastoreHandle, NodeSubnet, WatchTarget};
 use crate::kubelet::outbox::Outbox;
 use crate::networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
 use crate::networking::types::HostPortRange;
@@ -102,15 +100,13 @@ pub struct AppliedPeer {
     pub endpoint: NodeEndpoint,
 }
 
-/// Allocate (or retrieve) the local node's /24 subnet and publish legacy VTEP
-/// MAC annotation only if an explicit VXLAN path populated it.
+/// Allocate (or retrieve) the local node's /24 subnet.
 ///
 /// F2-02 split: this owns node-local IPAM and metadata only. Peer route install
 /// lives in [`sync_peer_routes`] so callers (rootless / hybrid) that have no
 /// valid `PeerRouter` for the current mode can still allocate locally.
 ///
-/// Idempotent: re-running finds the existing allocation in SQLite and is a
-/// no-op for the annotation publish path.
+/// Idempotent: re-running finds the existing allocation in SQLite.
 pub async fn ensure_local_node_subnet(
     db: &dyn DatastoreBackend,
     node_name: &str,
@@ -128,15 +124,6 @@ pub async fn ensure_local_node_subnet(
         subnet.subnet,
         subnet.vtep_ip,
     );
-
-    if let Err(e) = publish_local_vtep_mac_annotation_if_ready(db, node_name).await {
-        tracing::warn!(
-            "node_subnet: failed to publish Node annotation {} for {}: {}",
-            VTEP_MAC_ANNOTATION,
-            node_name,
-            e
-        );
-    }
 
     Ok(subnet)
 }
@@ -426,75 +413,6 @@ async fn reconcile_peer_node_event_cluster_state(
     Ok(())
 }
 
-pub async fn run_local_node_vtep_reconciler(
-    state: std::sync::Arc<AppState>,
-    cancel: CancellationToken,
-) {
-    let my_node_name = state.config.node_name.clone();
-    let db = state.db.clone();
-    let topic = WatchTopic::new("v1", "Node");
-    let mut cursor = SignalWatchCursor::new(
-        db.subscribe_watch_signals(topic.clone()),
-        DatastoreWatchReplaySource::new(db.clone(), vec![WatchTarget::cluster("v1", "Node")]),
-        topic,
-        WatchDeliveryScope::Cluster,
-        db.get_current_resource_version().await.unwrap_or(0),
-        WindowPolicy::default_watch_delivery(),
-    );
-    if let Err(e) = cursor.prime_replay_or_expired().await {
-        tracing::warn!(
-            ?e,
-            "node_subnet: local-vtep reconcile initial replay failed"
-        );
-    }
-
-    // safe-to-ignore: advisory VTEP MAC annotation; reconciled again on next node event
-    let _ = publish_local_vtep_mac_annotation_if_ready(db.as_ref(), &my_node_name).await;
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                tracing::info!("node_subnet: local VTEP reconciler cancelled");
-                break;
-            }
-            result = cursor.next_event() => match result {
-            Ok(event) => {
-                if !is_node_event(&event) {
-                    continue;
-                }
-                if let Some(peer_name) = event
-                    .object
-                    .pointer("/metadata/name")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    && peer_name == my_node_name
-                    && let Err(e) =
-                        publish_local_vtep_mac_annotation_if_ready(db.as_ref(), &my_node_name).await
-                {
-                    tracing::warn!(
-                        "node_subnet: local Node {} VTEP annotation reconcile failed: {}",
-                        my_node_name,
-                        e
-                    );
-                }
-            }
-            Err(WatchCursorError::Closed) => {
-                tracing::warn!("node_subnet: local VTEP watch signal channel closed");
-                break;
-            }
-            Err(WatchCursorError::Expired) => {
-                tracing::warn!(
-                    "node_subnet: local VTEP replay window expired; waiting for next signal"
-                );
-            }
-            Err(WatchCursorError::Replay(err)) => {
-                tracing::warn!("node_subnet: local VTEP replay failed: {err:#}");
-            }
-            }
-        }
-    }
-}
-
 pub async fn sync_peer_routes(
     db: &dyn DatastoreBackend,
     my_node_name: &str,
@@ -733,59 +651,10 @@ fn node_vtep_mac(node: &serde_json::Value) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-async fn publish_local_vtep_mac_annotation_if_ready(
-    db: &dyn DatastoreBackend,
-    node_name: &str,
-) -> Result<()> {
-    let Some(local_subnet) = db.get_node_subnet(node_name).await? else {
-        tracing::warn!(
-            "node_subnet: local node {} subnet not found; skip {} annotation publish",
-            node_name,
-            VTEP_MAC_ANNOTATION
-        );
-        return Ok(());
-    };
-    let Some(vtep_mac) = local_subnet.vtep_mac else {
-        tracing::debug!(
-            "node_subnet: local node {} has empty vtep_mac; skip {} annotation publish",
-            node_name,
-            VTEP_MAC_ANNOTATION
-        );
-        return Ok(());
-    };
-
-    let patch = serde_json::json!({
-        "metadata": {
-            "annotations": {
-                VTEP_MAC_ANNOTATION: vtep_mac.to_string(),
-            }
-        }
-    });
-
-    let Some(node) = db.get_resource("v1", "Node", None, node_name).await? else {
-        return Ok(());
-    };
-    db.patch_resource_latest_with_preconditions(
-        "v1",
-        "Node",
-        None,
-        node_name,
-        crate::datastore::ResourcePatchRequest::new(
-            PatchKind::Merge,
-            patch,
-            ResourcePreconditions::uid(node.uid),
-        ),
-    )
-    .await?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::node_vtep_mac;
 
-    use crate::networking::VtepMac;
     use crate::networking::test_support::{MockNetworkProvider, NetworkCall};
     use serde_json::json;
     use std::collections::HashMap;
@@ -1163,56 +1032,6 @@ mod tests {
 
         let empty = json!({"metadata": {"annotations": {"klights.io/vtep-mac": "  "}}});
         assert!(node_vtep_mac(&empty).is_none());
-    }
-
-    #[tokio::test]
-    async fn test_publish_local_vtep_mac_annotation_if_ready_noop_without_subnet() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let result = super::publish_local_vtep_mac_annotation_if_ready(&db, "node-missing").await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_publish_local_vtep_mac_annotation_if_ready_patches_node() {
-        let db = crate::datastore::test_support::in_memory().await;
-
-        let _node = db
-            .create_resource(
-                "v1",
-                "Node",
-                None,
-                "node-a",
-                serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "Node",
-                    "metadata": {
-                        "name": "node-a",
-                        "annotations": {}
-                    }
-                }),
-            )
-            .await
-            .unwrap();
-
-        db.allocate_node_subnet("node-a", "10.42.0.0/16", "192.168.1.1")
-            .await
-            .unwrap();
-        let mac = VtepMac::parse("aa:bb:cc:dd:ee:ff").unwrap();
-        db.update_node_vtep_mac("node-a", &mac).await.unwrap();
-
-        super::publish_local_vtep_mac_annotation_if_ready(&db, "node-a")
-            .await
-            .unwrap();
-
-        let node = db
-            .get_resource("v1", "Node", None, "node-a")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            node_vtep_mac(&node.data).as_deref(),
-            Some("aa:bb:cc:dd:ee:ff")
-        );
     }
 
     /// F2-02: rootless boot must allocate the local subnet without ever
