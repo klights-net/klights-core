@@ -86,6 +86,18 @@ pub fn topology_spread_schedule_anyway_score(
         .sum()
 }
 
+/// Score preferred node affinity terms. Higher is better.
+pub fn preferred_node_affinity_score(
+    node: &SchedulableNode,
+    pod: &PodSchedulingConstraints,
+) -> i64 {
+    pod.preferred_node_affinity
+        .iter()
+        .filter(|term| term_matches(node, &term.preference))
+        .map(|term| term.weight.clamp(1, 100))
+        .sum()
+}
+
 fn topology_spread_constraints_match(
     node: &SchedulableNode,
     pod: &PodSchedulingConstraints,

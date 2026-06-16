@@ -91,7 +91,11 @@ pub fn score_node(
         100
     };
 
-    cpu_pct + mem_pct + pods_pct + prefer_no_schedule_penalty(node, pod)
+    cpu_pct
+        + mem_pct
+        + pods_pct
+        + prefer_no_schedule_penalty(node, pod)
+        + super::predicates::preferred_node_affinity_score(node, pod)
 }
 
 /// Select the best node from a list of candidates.

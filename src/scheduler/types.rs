@@ -97,6 +97,7 @@ pub struct PodSchedulingConstraints {
     pub labels: HashMap<String, String>,
     pub node_selector: HashMap<String, String>,
     pub required_node_affinity: Vec<NodeSelectorTerm>,
+    pub preferred_node_affinity: Vec<PreferredNodeSelectorTerm>,
     pub required_pod_affinity: Vec<PodAffinityTerm>,
     pub required_pod_anti_affinity: Vec<PodAffinityTerm>,
     pub topology_spread_constraints: Vec<TopologySpreadConstraint>,
@@ -109,6 +110,13 @@ pub struct PodSchedulingConstraints {
     pub priority_class_name: Option<String>,
     /// Preemption policy.
     pub preemption_policy: Option<PreemptionPolicy>,
+}
+
+/// A weighted preferred node affinity term.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreferredNodeSelectorTerm {
+    pub weight: i64,
+    pub preference: NodeSelectorTerm,
 }
 
 /// A Pod topology spread constraint.
@@ -472,6 +480,7 @@ mod tests {
                     values: vec!["node-a".into()],
                 }],
             }],
+            preferred_node_affinity: Vec::new(),
             required_pod_affinity: Vec::new(),
             required_pod_anti_affinity: Vec::new(),
             topology_spread_constraints: Vec::new(),

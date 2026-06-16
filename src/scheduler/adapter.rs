@@ -84,6 +84,17 @@ pub fn extract_pod_constraints(pod_value: &serde_json::Value) -> PodSchedulingCo
         .map(|terms| terms.iter().filter_map(extract_node_selector_term).collect())
         .unwrap_or_default();
 
+    let preferred_node_affinity = pod_value
+        .pointer("/spec/affinity/nodeAffinity/preferredDuringSchedulingIgnoredDuringExecution")
+        .and_then(|v| v.as_array())
+        .map(|terms| {
+            terms
+                .iter()
+                .filter_map(extract_preferred_node_selector_term)
+                .collect()
+        })
+        .unwrap_or_default();
+
     let required_pod_affinity = pod_value
         .pointer("/spec/affinity/podAffinity/requiredDuringSchedulingIgnoredDuringExecution")
         .and_then(|v| v.as_array())
@@ -140,6 +151,7 @@ pub fn extract_pod_constraints(pod_value: &serde_json::Value) -> PodSchedulingCo
         labels,
         node_selector,
         required_node_affinity,
+        preferred_node_affinity,
         required_pod_affinity,
         required_pod_anti_affinity,
         topology_spread_constraints,
@@ -273,6 +285,14 @@ fn extract_node_selector_term(v: &serde_json::Value) -> Option<NodeSelectorTerm>
         match_expressions,
         match_fields,
     })
+}
+
+fn extract_preferred_node_selector_term(
+    v: &serde_json::Value,
+) -> Option<PreferredNodeSelectorTerm> {
+    let weight = v.get("weight")?.as_i64()?;
+    let preference = extract_node_selector_term(v.get("preference")?)?;
+    Some(PreferredNodeSelectorTerm { weight, preference })
 }
 
 fn extract_node_selector_requirement(v: &serde_json::Value) -> Option<NodeSelectorRequirement> {

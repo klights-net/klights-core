@@ -1013,6 +1013,49 @@ mod tests {
     }
 
     #[test]
+    fn schedule_from_json_scores_preferred_node_affinity() {
+        let node_a = json!({
+            "metadata": {"name": "node-a", "labels": {"disk": "hdd"}},
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let node_b = json!({
+            "metadata": {"name": "node-b", "labels": {"disk": "ssd"}},
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let pod = json!({
+            "metadata": {"namespace": "default", "name": "preferred-affinity"},
+            "spec": {
+                "containers": [{"name": "main", "image": "pause"}],
+                "affinity": {
+                    "nodeAffinity": {
+                        "preferredDuringSchedulingIgnoredDuringExecution": [{
+                            "weight": 100,
+                            "preference": {
+                                "matchExpressions": [{
+                                    "key": "disk",
+                                    "operator": "In",
+                                    "values": ["ssd"]
+                                }]
+                            }
+                        }]
+                    }
+                }
+            }
+        });
+
+        let decision = schedule_from_json(&[&node_a, &node_b], &pod, &[]);
+
+        assert!(decision.is_success(), "{decision:?}");
+        assert_eq!(decision.selected_node, Some("node-b".into()));
+    }
+
+    #[test]
     fn all_nodes_fail_predicates() {
         let node_a = make_node("node-a", 1000, 1000);
         let pod = make_constraints(5000, 5000, 0);
