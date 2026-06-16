@@ -2,7 +2,7 @@
 //!
 //! This handle is intentionally cheaper than a fully booted `Datapath`: it is
 //! built from process-start configuration before `NetworkPlane::boot()` touches
-//! the bridge/VXLAN path. If boot fails half way through, bootstrap can still
+//! the bridge path. If boot fails half way through, bootstrap can still
 //! ask this networking-owned handle to remove root-mode bridge/veth leftovers.
 //! Rootless cleanup only runs when the process is inside rootlesskit, so link
 //! and nft commands target the user network namespace rather than the host.
@@ -19,7 +19,6 @@ use crate::bootstrap::NodeMode;
 enum NetworkCleanupMode {
     Root {
         bridge_name: String,
-        vxlan_device: String,
         wireguard_device: String,
         nft_table_name: String,
     },
@@ -57,7 +56,6 @@ impl NetworkCleanup {
         match mode {
             NodeMode::Root => Self::root_with_runtime(
                 cfg.bridge_name.clone(),
-                crate::networking::DEFAULT_POD_OVERLAY_DEVICE.to_string(),
                 cfg.wireguard_device.clone(),
                 cfg.containerd_namespace.clone(),
             ),
@@ -78,7 +76,6 @@ impl NetworkCleanup {
         let bridge_name = bridge_name.into();
         Self::root_with_runtime(
             bridge_name.clone(),
-            crate::networking::DEFAULT_POD_OVERLAY_DEVICE.to_string(),
             crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
             bridge_name,
         )
@@ -86,7 +83,6 @@ impl NetworkCleanup {
 
     fn root_with_runtime(
         bridge_name: impl Into<String>,
-        vxlan_device: impl Into<String>,
         wireguard_device: impl Into<String>,
         nft_table_name: impl Into<String>,
     ) -> Self {
@@ -94,7 +90,6 @@ impl NetworkCleanup {
         Self {
             mode: NetworkCleanupMode::Root {
                 bridge_name: bridge_name.clone(),
-                vxlan_device: vxlan_device.into(),
                 wireguard_device: wireguard_device.into(),
                 nft_table_name: nft_table_name.into(),
             },
@@ -128,9 +123,9 @@ impl NetworkCleanup {
     }
 
     /// Best-effort startup recovery cleanup for stale subordinate runtime
-    /// resources. The configured bridge and VXLAN device are preserved so
-    /// boot-time validation can reject wrong-kind links and immutable VXLAN
-    /// mismatches instead of silently deleting operator-owned conflicts.
+    /// resources. The configured bridge is preserved so boot-time validation
+    /// can reject wrong-kind links instead of silently deleting operator-owned
+    /// conflicts.
     pub async fn cleanup_startup_network_best_effort(&self) {
         self.cleanup_network_best_effort(false).await;
     }
@@ -146,15 +141,8 @@ impl NetworkCleanup {
             if let Err(e) = self.cleanup_bridge().await {
                 tracing::warn!("Failed to cleanup bridge: {}", e);
             }
-
-            tracing::info!("Removing VXLAN interface");
-            if let Err(e) = self.cleanup_vxlan_device().await {
-                tracing::warn!("Failed to cleanup VXLAN interface: {}", e);
-            }
         } else {
-            tracing::debug!(
-                "Preserving configured bridge and VXLAN interfaces during startup recovery"
-            );
+            tracing::debug!("Preserving configured bridge during startup recovery");
         }
 
         tracing::info!("Removing WireGuard interface");
@@ -165,11 +153,6 @@ impl NetworkCleanup {
         tracing::info!("Removing nftables service-routing table");
         if let Err(e) = self.cleanup_nft_table().await {
             tracing::warn!("Failed to cleanup nftables table: {}", e);
-        }
-
-        tracing::info!("Removing NetworkManager VXLAN profile");
-        if let Err(e) = self.cleanup_network_manager_profile().await {
-            tracing::warn!("Failed to cleanup NetworkManager profile: {}", e);
         }
 
         tracing::info!("Removing CNI cache artifacts");
@@ -380,38 +363,6 @@ impl NetworkCleanup {
         Ok(())
     }
 
-    pub async fn cleanup_vxlan_device(&self) -> Result<()> {
-        let NetworkCleanupMode::Root { vxlan_device, .. } = &self.mode else {
-            tracing::debug!("rootless network cleanup: skipping host VXLAN delete");
-            return Ok(());
-        };
-
-        let check = Command::new("ip")
-            .args(vxlan_show_args(vxlan_device))
-            .output()
-            .await?;
-
-        if check.status.success() {
-            let delete = Command::new("ip")
-                .args(vxlan_delete_args(vxlan_device))
-                .output()
-                .await
-                .context("Failed to delete VXLAN interface")?;
-            if delete.status.success() {
-                tracing::info!("Deleted VXLAN interface: {}", vxlan_device);
-            } else {
-                let stderr = String::from_utf8_lossy(&delete.stderr);
-                tracing::warn!(
-                    vxlan = vxlan_device,
-                    stderr = %stderr.trim(),
-                    "Failed to delete VXLAN interface"
-                );
-            }
-        }
-
-        Ok(())
-    }
-
     pub async fn cleanup_wireguard_device(&self) -> Result<()> {
         let Some(wireguard_device) = self.current_namespace_wireguard_device() else {
             tracing::debug!("network cleanup: skipping WireGuard delete outside owned namespace");
@@ -474,29 +425,6 @@ impl NetworkCleanup {
         }
 
         Ok(())
-    }
-
-    pub async fn cleanup_network_manager_profile(&self) -> Result<()> {
-        let NetworkCleanupMode::Root { vxlan_device, .. } = &self.mode else {
-            tracing::debug!("rootless network cleanup: skipping NetworkManager profile delete");
-            return Ok(());
-        };
-        let path = network_manager_connection_path(vxlan_device);
-        let key = path.to_string_lossy().into_owned();
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "cleanup_network_manager_vxlan_profile",
-            key,
-            move || {
-                if path.exists() {
-                    std::fs::remove_file(&path).with_context(|| {
-                        format!("failed to remove NetworkManager profile {}", path.display())
-                    })?;
-                    tracing::info!("Removed NetworkManager profile: {}", path.display());
-                }
-                Ok(())
-            },
-        )
-        .await
     }
 
     pub async fn cleanup_cni_artifacts(&self) -> Result<()> {
@@ -562,14 +490,6 @@ impl NetworkCleanup {
                 inside_rootlesskit: true,
                 ..
             } => Some(bridge_name.as_str()),
-            NetworkCleanupMode::Rootless { .. } => None,
-        }
-    }
-
-    #[cfg(test)]
-    fn vxlan_device_for_test(&self) -> Option<&str> {
-        match &self.mode {
-            NetworkCleanupMode::Root { vxlan_device, .. } => Some(vxlan_device.as_str()),
             NetworkCleanupMode::Rootless { .. } => None,
         }
     }
@@ -688,14 +608,6 @@ fn link_delete_args(iface: &str) -> Vec<&str> {
     vec!["link", "delete", iface]
 }
 
-fn vxlan_show_args(vxlan_device: &str) -> Vec<&str> {
-    vec!["link", "show", vxlan_device]
-}
-
-fn vxlan_delete_args(vxlan_device: &str) -> Vec<&str> {
-    link_delete_args(vxlan_device)
-}
-
 fn wireguard_show_args(wireguard_device: &str) -> Vec<&str> {
     vec!["link", "show", wireguard_device]
 }
@@ -714,11 +626,6 @@ fn nft_delete_table_args(table_name: &str) -> Vec<&str> {
 
 fn netns_delete_args(netns_name: &str) -> Vec<&str> {
     vec!["netns", "del", netns_name]
-}
-
-fn network_manager_connection_path(vxlan_device: &str) -> PathBuf {
-    PathBuf::from("/run/NetworkManager/system-connections")
-        .join(format!("{vxlan_device}.nmconnection"))
 }
 
 fn netns_runtime_path(netns_name: &str) -> PathBuf {
@@ -960,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn root_cleanup_plans_vxlan_nft_and_network_manager_artifacts() {
+    fn root_cleanup_plans_bridge_wireguard_nft_and_cni_artifacts() {
         let mut cfg = crate::KlightsConfig::test_default();
         cfg.bridge_name = "klights".to_string();
         cfg.containerd_namespace = "klights".to_string();
@@ -969,11 +876,6 @@ mod tests {
         let cleanup = NetworkCleanup::from_config(&NodeMode::Root, &cfg);
 
         assert_eq!(cleanup.bridge_name_for_test(), Some("klights"));
-        assert_eq!(
-            cleanup.vxlan_device_for_test(),
-            Some("klights.vxlan"),
-            "root cleanup keeps deleting the legacy VXLAN device until the cleanup path is removed"
-        );
         assert_eq!(
             cleanup.nft_table_name_for_test(),
             Some("klights"),
@@ -985,22 +887,12 @@ mod tests {
             "root cleanup must delete the configured WireGuard device"
         );
         assert_eq!(
-            vxlan_delete_args("klights.vxlan"),
-            vec!["link", "delete", "klights.vxlan"]
-        );
-        assert_eq!(
             wireguard_delete_args("klights.wg"),
             vec!["link", "delete", "klights.wg"]
         );
         assert_eq!(
             nft_delete_table_args("klights"),
             vec!["delete", "table", "inet", "klights"]
-        );
-        assert_eq!(
-            network_manager_connection_path("klights.vxlan"),
-            std::path::PathBuf::from(
-                "/run/NetworkManager/system-connections/klights.vxlan.nmconnection"
-            )
         );
     }
 
@@ -1146,7 +1038,6 @@ mod tests {
             Some("klights"),
             "rootless cleanup must delete current user-netns bridge leftovers"
         );
-        assert_eq!(cleanup.vxlan_device_for_test(), None);
         assert_eq!(
             cleanup.wireguard_device_for_test(),
             Some("klights.wg"),

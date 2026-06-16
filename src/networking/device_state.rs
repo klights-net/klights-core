@@ -1,7 +1,5 @@
-use std::net::Ipv4Addr;
-
 use netlink_packet_route::link::{
-    InfoData, InfoKind, LinkAttribute, LinkFlag, LinkInfo, LinkMessage, State as LinkOperState,
+    InfoKind, LinkAttribute, LinkFlag, LinkInfo, LinkMessage, State as LinkOperState,
 };
 
 /// Parsed link-kind taxonomy for parsed rtnetlink `LinkMessage` records.
@@ -9,8 +7,6 @@ use netlink_packet_route::link::{
 pub enum LinkKind {
     /// A Linux bridge (`bridge` link kind).
     Bridge,
-    /// A VXLAN tunnel interface.
-    Vxlan,
     /// A WireGuard tunnel interface.
     Wireguard,
     /// A dummy link.
@@ -33,15 +29,6 @@ pub struct LinkState {
     pub up: bool,
     pub operstate: Option<LinkOperState>,
     pub master: Option<u32>,
-}
-
-/// Parsed VXLAN-specific configuration extracted from rtnetlink link info attributes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VxlanState {
-    pub vni: Option<u32>,
-    pub port: Option<u16>,
-    pub local: Option<Ipv4Addr>,
-    pub learning: Option<bool>,
 }
 
 /// Parse a `LinkMessage` into the validation-focused [`LinkState`].
@@ -78,51 +65,9 @@ pub fn parse_link_state(msg: &LinkMessage) -> LinkState {
     state
 }
 
-/// Parse VXLAN fields (`vni`, `port`, `local`, `learning`) from a `LinkMessage`.
-pub fn parse_vxlan_state(msg: &LinkMessage) -> VxlanState {
-    let mut out = VxlanState {
-        vni: None,
-        port: None,
-        local: None,
-        learning: None,
-    };
-
-    for attr in &msg.attributes {
-        let LinkAttribute::LinkInfo(infos) = attr else {
-            continue;
-        };
-
-        for info in infos {
-            let LinkInfo::Data(InfoData::Vxlan(vxlan_attrs)) = info else {
-                continue;
-            };
-
-            for vxlan_attr in vxlan_attrs {
-                match vxlan_attr {
-                    netlink_packet_route::link::InfoVxlan::Id(vni) => out.vni = Some(*vni),
-                    netlink_packet_route::link::InfoVxlan::Port(port) => out.port = Some(*port),
-                    netlink_packet_route::link::InfoVxlan::Local(raw) => {
-                        let raw = raw.as_slice();
-                        if let [a, b, c, d] = raw {
-                            out.local = Some(Ipv4Addr::new(*a, *b, *c, *d));
-                        }
-                    }
-                    netlink_packet_route::link::InfoVxlan::Learning(learning) => {
-                        out.learning = Some(*learning)
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    out
-}
-
 fn parse_link_kind(kind: &InfoKind) -> LinkKind {
     match kind {
         InfoKind::Bridge => LinkKind::Bridge,
-        InfoKind::Vxlan => LinkKind::Vxlan,
         InfoKind::Wireguard => LinkKind::Wireguard,
         InfoKind::Dummy => LinkKind::Dummy,
         InfoKind::Veth => LinkKind::Veth,
@@ -134,9 +79,7 @@ fn parse_link_kind(kind: &InfoKind) -> LinkKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use netlink_packet_route::link::{
-        InfoData, InfoKind, InfoVxlan, LinkAttribute, LinkFlag, LinkInfo,
-    };
+    use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkFlag, LinkInfo};
 
     #[test]
     fn parses_bridge_link_state() {
@@ -145,10 +88,7 @@ mod tests {
             LinkAttribute::IfName("klights0".to_string()),
             LinkAttribute::Mtu(1450),
             LinkAttribute::Controller(11),
-            LinkAttribute::LinkInfo(vec![
-                LinkInfo::Kind(InfoKind::Bridge),
-                LinkInfo::Data(InfoData::Vxlan(vec![InfoVxlan::Id(1228)])),
-            ]),
+            LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Bridge)]),
         ];
 
         let state = parse_link_state(&msg);
@@ -162,31 +102,6 @@ mod tests {
                 up: false,
                 operstate: None,
                 master: Some(11),
-            }
-        );
-    }
-
-    #[test]
-    fn parses_vxlan_state() {
-        let mut msg = LinkMessage::default();
-        msg.attributes = vec![LinkAttribute::LinkInfo(vec![
-            LinkInfo::Kind(InfoKind::Vxlan),
-            LinkInfo::Data(InfoData::Vxlan(vec![
-                InfoVxlan::Id(1228),
-                InfoVxlan::Port(8472),
-                InfoVxlan::Learning(false),
-                InfoVxlan::Local(vec![10, 43, 0, 1]),
-            ])),
-        ])];
-
-        let state = parse_vxlan_state(&msg);
-        assert_eq!(
-            state,
-            VxlanState {
-                vni: Some(1228),
-                port: Some(8472),
-                local: Some(Ipv4Addr::new(10, 43, 0, 1)),
-                learning: Some(false),
             }
         );
     }
