@@ -1553,6 +1553,14 @@ async fn schedule_pod_on_available_nodes(
             crate::datastore::ResourceListQuery::all(),
         )
         .await?;
+    let pdbs = db
+        .list_resources(
+            "policy/v1",
+            "PodDisruptionBudget",
+            None,
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await?;
 
     // Collect existing pods on each node
     let all_pods = store
@@ -1569,6 +1577,7 @@ async fn schedule_pod_on_available_nodes(
         .iter()
         .map(|namespace| namespace.data.as_ref())
         .collect();
+    let pdb_values: Vec<&Value> = pdbs.items.iter().map(|pdb| pdb.data.as_ref()).collect();
     let existing_per_node: Vec<(&str, Vec<&Value>)> = node_names
         .iter()
         .map(|name| {
@@ -1582,7 +1591,7 @@ async fn schedule_pod_on_available_nodes(
         })
         .collect();
 
-    let decision = crate::scheduler::engine::schedule_from_json_with_namespaces(
+    let decision = crate::scheduler::engine::schedule_from_json_with_policy(
         &node_values,
         pod,
         &existing_per_node
@@ -1590,6 +1599,7 @@ async fn schedule_pod_on_available_nodes(
             .map(|(name, pods)| (*name, pods.as_slice()))
             .collect::<Vec<_>>(),
         &namespace_values,
+        &pdb_values,
     );
 
     let mut api_decision = scheduling_decision_to_api(decision);

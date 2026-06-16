@@ -22,14 +22,15 @@ pub fn schedule_multi_node(
     pod: &PodSchedulingConstraints,
     existing_resources: &[NodeExistingPods],
 ) -> SchedulingDecision {
-    schedule_multi_node_with_namespace_labels(nodes, pod, existing_resources, HashMap::new())
+    schedule_multi_node_with_context(nodes, pod, existing_resources, HashMap::new(), &[])
 }
 
-fn schedule_multi_node_with_namespace_labels(
+fn schedule_multi_node_with_context(
     nodes: &[SchedulableNode],
     pod: &PodSchedulingConstraints,
     existing_resources: &[NodeExistingPods],
     namespace_labels_by_name: HashMap<String, HashMap<String, String>>,
+    pdbs: &[PodDisruptionBudgetConstraint],
 ) -> SchedulingDecision {
     // Build a map from node name to existing pods
     let existing_map: std::collections::HashMap<&str, &[ExistingPod]> = existing_resources
@@ -67,7 +68,7 @@ fn schedule_multi_node_with_namespace_labels(
 
     if fit_nodes.is_empty() {
         // Step 4: Try preemption
-        return try_preemption(&failed_nodes, pod, &existing_map, &all_reasons);
+        return try_preemption(&failed_nodes, pod, &existing_map, &all_reasons, pdbs);
     }
 
     // Step 2-3: Score and select
@@ -184,6 +185,7 @@ fn try_preemption(
     pod: &PodSchedulingConstraints,
     existing_map: &std::collections::HashMap<&str, &[ExistingPod]>,
     all_reasons: &[String],
+    pdbs: &[PodDisruptionBudgetConstraint],
 ) -> SchedulingDecision {
     let mut best: Option<PreemptionCandidate> = None;
 
@@ -198,7 +200,9 @@ fn try_preemption(
 
         let node = &failed.node;
         let existing = existing_map.get(node.name.as_str()).copied().unwrap_or(&[]);
-        if let Some(victims) = preemption::select_preemption_victims(node, pod, existing) {
+        if let Some(victims) =
+            preemption::select_preemption_victims_with_pdbs(node, pod, existing, pdbs)
+        {
             let remaining_resources = resources_after_preemption(existing, &victims);
             if !predicates::node_fit(node, pod, &remaining_resources).is_empty() {
                 continue;
@@ -299,7 +303,7 @@ pub fn schedule_from_json(
     pod: &serde_json::Value,
     existing_pods_per_node: &[(&str, &[&serde_json::Value])],
 ) -> SchedulingDecision {
-    schedule_from_json_with_namespaces(nodes, pod, existing_pods_per_node, &[])
+    schedule_from_json_with_policy(nodes, pod, existing_pods_per_node, &[], &[])
 }
 
 /// High-level scheduling entry point with Namespace labels for namespaceSelector.
@@ -308,6 +312,17 @@ pub fn schedule_from_json_with_namespaces(
     pod: &serde_json::Value,
     existing_pods_per_node: &[(&str, &[&serde_json::Value])],
     namespaces: &[&serde_json::Value],
+) -> SchedulingDecision {
+    schedule_from_json_with_policy(nodes, pod, existing_pods_per_node, namespaces, &[])
+}
+
+/// High-level scheduling entry point with Namespace labels and PDB constraints.
+pub fn schedule_from_json_with_policy(
+    nodes: &[&serde_json::Value],
+    pod: &serde_json::Value,
+    existing_pods_per_node: &[(&str, &[&serde_json::Value])],
+    namespaces: &[&serde_json::Value],
+    pdbs: &[&serde_json::Value],
 ) -> SchedulingDecision {
     let typed_nodes: Vec<SchedulableNode> = nodes
         .iter()
@@ -323,6 +338,10 @@ pub fn schedule_from_json_with_namespaces(
             Some((name.to_string(), extract_metadata_labels(namespace)))
         })
         .collect::<HashMap<_, _>>();
+    let pdb_constraints = pdbs
+        .iter()
+        .filter_map(|pdb| extract_pdb_constraint(pdb))
+        .collect::<Vec<_>>();
     let existing: Vec<NodeExistingPods> = existing_pods_per_node
         .iter()
         .map(|(node_name, pods)| NodeExistingPods {
@@ -334,12 +353,36 @@ pub fn schedule_from_json_with_namespaces(
         })
         .collect();
 
-    schedule_multi_node_with_namespace_labels(
+    schedule_multi_node_with_context(
         &typed_nodes,
         &pod_constraints,
         &existing,
         namespace_labels_by_name,
+        &pdb_constraints,
     )
+}
+
+fn extract_pdb_constraint(value: &serde_json::Value) -> Option<PodDisruptionBudgetConstraint> {
+    let namespace = value
+        .pointer("/metadata/namespace")
+        .and_then(|value| value.as_str())
+        .unwrap_or("default")
+        .to_string();
+    let name = value.pointer("/metadata/name")?.as_str()?.to_string();
+    let selector_value = value
+        .pointer("/spec/selector")
+        .unwrap_or(&serde_json::Value::Null);
+    let selector = adapter::extract_label_selector_term(selector_value)?;
+    let disruptions_allowed = value
+        .pointer("/status/disruptionsAllowed")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    Some(PodDisruptionBudgetConstraint {
+        namespace,
+        name,
+        selector,
+        disruptions_allowed,
+    })
 }
 
 fn extract_metadata_labels(value: &serde_json::Value) -> HashMap<String, String> {
@@ -1124,6 +1167,75 @@ mod tests {
         assert!(decision.is_success());
         assert_eq!(decision.selected_node, Some("mn-worker".into()));
         assert_eq!(decision.preemption_victims, vec!["default/worker-low"]);
+    }
+
+    #[test]
+    fn schedule_from_json_preemption_prefers_non_pdb_violating_victim() {
+        let node = json!({
+            "metadata": {"name": "node-a"},
+            "status": {
+                "allocatable": {"cpu": "1000m", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let protected = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "protected-low",
+                "labels": {"app": "protected"}
+            },
+            "spec": {
+                "nodeName": "node-a",
+                "priority": 1,
+                "containers": [{
+                    "name": "main",
+                    "image": "pause",
+                    "resources": {"requests": {"cpu": "300m"}}
+                }]
+            }
+        });
+        let unprotected = json!({
+            "metadata": {"namespace": "default", "name": "unprotected-medium"},
+            "spec": {
+                "nodeName": "node-a",
+                "priority": 50,
+                "containers": [{
+                    "name": "main",
+                    "image": "pause",
+                    "resources": {"requests": {"cpu": "300m"}}
+                }]
+            }
+        });
+        let pdb = json!({
+            "metadata": {"namespace": "default", "name": "protected-pdb"},
+            "spec": {"selector": {"matchLabels": {"app": "protected"}}},
+            "status": {"disruptionsAllowed": 0}
+        });
+        let pod = json!({
+            "metadata": {"namespace": "default", "name": "preemptor"},
+            "spec": {
+                "priority": 100,
+                "containers": [{
+                    "name": "main",
+                    "image": "pause",
+                    "resources": {"requests": {"cpu": "500m"}}
+                }]
+            }
+        });
+
+        let decision = schedule_from_json_with_policy(
+            &[&node],
+            &pod,
+            &[("node-a", &[&protected, &unprotected][..])],
+            &[],
+            &[&pdb],
+        );
+
+        assert!(decision.is_success(), "{decision:?}");
+        assert_eq!(
+            decision.preemption_victims,
+            vec!["default/unprotected-medium"]
+        );
     }
 
     #[test]

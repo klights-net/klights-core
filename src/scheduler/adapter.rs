@@ -324,7 +324,7 @@ fn extract_pod_affinity_term(v: &serde_json::Value) -> Option<PodAffinityTerm> {
     })
 }
 
-fn extract_label_selector_term(v: &serde_json::Value) -> Option<LabelSelectorTerm> {
+pub(crate) fn extract_label_selector_term(v: &serde_json::Value) -> Option<LabelSelectorTerm> {
     let mut match_labels = HashMap::new();
     if let Some(labels) = v.get("matchLabels").and_then(|v| v.as_object()) {
         for (key, value) in labels {

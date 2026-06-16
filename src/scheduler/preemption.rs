@@ -35,6 +35,16 @@ pub fn select_preemption_victims(
     pod: &PodSchedulingConstraints,
     existing_pods: &[ExistingPod],
 ) -> Option<Vec<PreemptionVictim>> {
+    select_preemption_victims_with_pdbs(node, pod, existing_pods, &[])
+}
+
+/// Select preemption victims while preferring victims that do not violate PDBs.
+pub fn select_preemption_victims_with_pdbs(
+    node: &SchedulableNode,
+    pod: &PodSchedulingConstraints,
+    existing_pods: &[ExistingPod],
+    pdbs: &[PodDisruptionBudgetConstraint],
+) -> Option<Vec<PreemptionVictim>> {
     // Step 1: Check preemption policy
     if matches!(pod.preemption_policy, Some(PreemptionPolicy::Never)) {
         return None;
@@ -76,21 +86,32 @@ pub fn select_preemption_victims(
 
     // Step 4: Greedily accumulate victims
     let mut victims = Vec::new();
-    for candidate in candidates {
+    let mut remaining_disruptions = pdb_disruptions_by_key(pdbs);
+    while !candidates.is_empty() {
+        candidates.sort_by(|a, b| {
+            candidate_violates_pdb(a, pdbs, &remaining_disruptions)
+                .cmp(&candidate_violates_pdb(b, pdbs, &remaining_disruptions))
+                .then_with(|| a.priority.cmp(&b.priority))
+                .then_with(|| a.namespace.cmp(&b.namespace))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+
+        let Some(index) = candidates.iter().position(|candidate| {
+            request_relieves_fit_failure(
+                node,
+                &allocated,
+                &pod.resources,
+                candidate.resources.effective_cpu_milli(),
+                candidate.resources.effective_memory_ki(),
+                &candidate.resources.extended,
+            )
+        }) else {
+            break;
+        };
+
+        let candidate = candidates.remove(index);
         let candidate_effective_cpu = candidate.resources.effective_cpu_milli();
         let candidate_effective_mem = candidate.resources.effective_memory_ki();
-
-        // Check if this candidate relieves at least one current fit failure
-        if !request_relieves_fit_failure(
-            node,
-            &allocated,
-            &pod.resources,
-            candidate_effective_cpu,
-            candidate_effective_mem,
-            &candidate.resources.extended,
-        ) {
-            continue;
-        }
 
         // Remove this candidate's resources from allocated
         allocated.cpu_milli = allocated.cpu_milli.saturating_sub(candidate_effective_cpu);
@@ -104,6 +125,7 @@ pub fn select_preemption_victims(
             namespace: candidate.namespace.clone(),
             name: candidate.name.clone(),
         });
+        record_pdb_disruption(candidate, pdbs, &mut remaining_disruptions);
 
         // Step 5: Check if we've resolved all failures
         if resource_fit_failures(node, &allocated, &pod.resources).is_empty() {
@@ -113,6 +135,52 @@ pub fn select_preemption_victims(
 
     // Step 6: Exhausted candidates without resolving all failures
     None
+}
+
+fn pdb_disruptions_by_key(
+    pdbs: &[PodDisruptionBudgetConstraint],
+) -> HashMap<(String, String), i64> {
+    pdbs.iter()
+        .map(|pdb| {
+            (
+                (pdb.namespace.clone(), pdb.name.clone()),
+                pdb.disruptions_allowed.max(0),
+            )
+        })
+        .collect()
+}
+
+fn candidate_violates_pdb(
+    candidate: &ExistingPod,
+    pdbs: &[PodDisruptionBudgetConstraint],
+    remaining_disruptions: &HashMap<(String, String), i64>,
+) -> bool {
+    matching_pdb_keys(candidate, pdbs)
+        .any(|key| remaining_disruptions.get(&key).copied().unwrap_or(0) <= 0)
+}
+
+fn record_pdb_disruption(
+    candidate: &ExistingPod,
+    pdbs: &[PodDisruptionBudgetConstraint],
+    remaining_disruptions: &mut HashMap<(String, String), i64>,
+) {
+    for key in matching_pdb_keys(candidate, pdbs) {
+        let remaining = remaining_disruptions.entry(key).or_insert(0);
+        *remaining = remaining.saturating_sub(1);
+    }
+}
+
+fn matching_pdb_keys<'a>(
+    pod: &'a ExistingPod,
+    pdbs: &'a [PodDisruptionBudgetConstraint],
+) -> impl Iterator<Item = (String, String)> + 'a {
+    pdbs.iter().filter_map(|pdb| {
+        if pdb.namespace == pod.namespace && pdb.selector.matches(&pod.labels) {
+            Some((pdb.namespace.clone(), pdb.name.clone()))
+        } else {
+            None
+        }
+    })
 }
 
 /// Check if current resource allocation + new pod request exceeds allocatable.
@@ -351,6 +419,34 @@ mod tests {
         let victims = result.unwrap();
         assert_eq!(victims.len(), 1);
         assert_eq!(victims[0].name, "gpu-hog");
+    }
+
+    #[test]
+    fn preemption_prefers_victim_that_does_not_violate_pdb() {
+        let node = make_node("node-a", 1000, 10000);
+        let pod = make_constraints(500, 0, 100);
+        let existing = vec![
+            ExistingPod {
+                labels: HashMap::from([("app".into(), "protected".into())]),
+                ..make_existing("protected-low", 1, 300, 0)
+            },
+            make_existing("unprotected-medium", 50, 300, 0),
+        ];
+        let pdbs = vec![PodDisruptionBudgetConstraint {
+            namespace: "default".into(),
+            name: "protected-pdb".into(),
+            selector: LabelSelectorTerm {
+                match_labels: HashMap::from([("app".into(), "protected".into())]),
+                match_expressions: Vec::new(),
+            },
+            disruptions_allowed: 0,
+        }];
+
+        let victims = select_preemption_victims_with_pdbs(&node, &pod, &existing, &pdbs)
+            .expect("preemption should use the unprotected pod");
+
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].name, "unprotected-medium");
     }
 
     #[test]

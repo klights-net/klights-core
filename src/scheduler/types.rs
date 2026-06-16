@@ -222,6 +222,15 @@ pub struct ScheduledPod {
     pub labels: HashMap<String, String>,
 }
 
+/// Scheduling-time view of a PodDisruptionBudget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PodDisruptionBudgetConstraint {
+    pub namespace: String,
+    pub name: String,
+    pub selector: LabelSelectorTerm,
+    pub disruptions_allowed: i64,
+}
+
 /// A node selector term for required node affinity.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSelectorTerm {
