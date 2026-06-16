@@ -1943,32 +1943,16 @@ fn watch_target_for_request(req: &generated::WatchResourcesRequest) -> WatchTarg
             namespace.clone(),
         );
     }
-    if grpc_watch_kind_is_cluster_scoped(&req.kind) {
-        WatchTarget::cluster(req.api_version.clone(), req.kind.clone())
-    } else {
+    // Share the canonical scope list with the datastore/API scope logic instead
+    // of maintaining a second list here, which drifted out of sync and
+    // misclassified cluster-scoped kinds such as CSIDriver, CSINode,
+    // VolumeAttachment, IngressClass, IPAddress, ServiceCIDR, and the
+    // validating admission policy types as namespaced on the watch replay path.
+    if crate::datastore::sqlite::scope::is_namespaced(&req.kind) {
         WatchTarget::namespaced(req.api_version.clone(), req.kind.clone())
+    } else {
+        WatchTarget::cluster(req.api_version.clone(), req.kind.clone())
     }
-}
-
-fn grpc_watch_kind_is_cluster_scoped(kind: &str) -> bool {
-    matches!(
-        kind,
-        "Node"
-            | "Namespace"
-            | "PersistentVolume"
-            | "StorageClass"
-            | "RuntimeClass"
-            | "PriorityClass"
-            | "ClusterRole"
-            | "ClusterRoleBinding"
-            | "CertificateSigningRequest"
-            | "CustomResourceDefinition"
-            | "MutatingWebhookConfiguration"
-            | "ValidatingWebhookConfiguration"
-            | "FlowSchema"
-            | "PriorityLevelConfiguration"
-            | "APIService"
-    )
 }
 
 async fn refresh_node_external_ip_from_dataplane(
@@ -2239,6 +2223,67 @@ mod tests {
             dataplane_mode: "root".to_string(),
             dataplane_encryption: "enabled".to_string(),
         }
+    }
+
+    fn watch_request_for_kind(
+        kind: &str,
+        namespace: Option<&str>,
+    ) -> generated::WatchResourcesRequest {
+        generated::WatchResourcesRequest {
+            api_version: "v1".to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            field_selector: None,
+            start_resource_version: 0,
+            label_selector: None,
+        }
+    }
+
+    #[test]
+    fn watch_target_classifies_cluster_scoped_kinds() {
+        use crate::datastore::types::WatchTargetScope;
+
+        // Kinds that the old hand-maintained gRPC list omitted and therefore
+        // misclassified as namespaced on the watch replay path.
+        for kind in [
+            "CSIDriver",
+            "CSINode",
+            "VolumeAttachment",
+            "IngressClass",
+            "IPAddress",
+            "ServiceCIDR",
+            "ValidatingAdmissionPolicy",
+            "ValidatingAdmissionPolicyBinding",
+            // Kinds the old list already covered must keep classifying correctly.
+            "Node",
+            "Namespace",
+            "ClusterRole",
+            "PriorityLevelConfiguration",
+        ] {
+            let target = super::watch_target_for_request(&watch_request_for_kind(kind, None));
+            assert_eq!(
+                target.scope,
+                WatchTargetScope::Cluster,
+                "{kind} must be classified as cluster-scoped"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_target_classifies_namespaced_kinds() {
+        use crate::datastore::types::WatchTargetScope;
+
+        let target = super::watch_target_for_request(&watch_request_for_kind("ConfigMap", None));
+        assert_eq!(target.scope, WatchTargetScope::Namespaced(None));
+
+        let scoped = super::watch_target_for_request(&watch_request_for_kind(
+            "ConfigMap",
+            Some("kube-system"),
+        ));
+        assert_eq!(
+            scoped.scope,
+            WatchTargetScope::Namespaced(Some("kube-system".to_string()))
+        );
     }
 
     async fn create_scoped_token_for_test(

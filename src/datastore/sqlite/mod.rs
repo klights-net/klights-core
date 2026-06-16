@@ -19,7 +19,7 @@ mod replay;
 mod resource_shape;
 mod rv_helpers;
 mod schema;
-mod scope;
+pub(crate) mod scope;
 mod selector_index;
 #[cfg(test)]
 pub mod test_support;

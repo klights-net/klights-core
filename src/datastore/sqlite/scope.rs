@@ -1,6 +1,10 @@
 /// Determine if a resource kind is namespace-scoped or cluster-scoped.
 /// Returns true for namespaced resources, false for cluster-scoped.
-pub(super) fn is_namespaced(kind: &str) -> bool {
+///
+/// This is the canonical scope list for built-in kinds. Other layers (e.g. the
+/// gRPC watch replay path) must share it rather than maintaining a second list
+/// that drifts out of sync.
+pub(crate) fn is_namespaced(kind: &str) -> bool {
     !matches!(
         kind,
         "APIService"
