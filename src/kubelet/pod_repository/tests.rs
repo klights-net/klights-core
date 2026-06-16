@@ -8310,6 +8310,52 @@ async fn api_create_pod_resolves_priority_class_name_before_storage() {
 }
 
 #[tokio::test]
+async fn api_create_pod_applies_global_default_priority_class() {
+    use super::PodApiWriter;
+
+    let repo = build_repo().await;
+    repo.store
+        .db()
+        .create_resource(
+            "scheduling.k8s.io/v1",
+            "PriorityClass",
+            None,
+            "default-high",
+            json!({
+                "apiVersion": "scheduling.k8s.io/v1",
+                "kind": "PriorityClass",
+                "metadata": {"name": "default-high"},
+                "value": 500,
+                "globalDefault": true,
+                "preemptionPolicy": "Never"
+            }),
+        )
+        .await
+        .unwrap();
+
+    let result = repo
+        .api_create_pod(api_create_request(
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "default-classed"},
+                "spec": {
+                    "containers": [{"name": "c", "image": "registry.k8s.io/pause:3.10"}]
+                }
+            }),
+            false,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(result.body.pointer("/spec/priority"), Some(&json!(500)));
+    assert_eq!(
+        result.body.pointer("/spec/preemptionPolicy"),
+        Some(&json!("Never"))
+    );
+}
+
+#[tokio::test]
 async fn api_create_pod_priority_class_overrides_wire_zero_priority() {
     use super::PodApiWriter;
 

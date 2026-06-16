@@ -2057,33 +2057,12 @@ async fn apply_priority_class_to_pod(
     db: &dyn crate::datastore::DatastoreBackend,
     pod: &mut Value,
 ) -> Result<(), AppError> {
-    let Some(class_name) = pod
+    let class_name = pod
         .pointer("/spec/priorityClassName")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-    else {
-        return Ok(());
-    };
-    let (priority, policy) = match class_name.as_str() {
-        "system-node-critical" => (Some(2_000_001_000_i64), None),
-        "system-cluster-critical" => (Some(2_000_000_000_i64), None),
-        _ => {
-            let pc = db
-                .get_resource("scheduling.k8s.io/v1", "PriorityClass", None, &class_name)
-                .await?;
-            let priority = pc
-                .as_ref()
-                .and_then(|pc| pc.data.get("value"))
-                .and_then(|v| v.as_i64());
-            let policy = pc
-                .as_ref()
-                .and_then(|pc| pc.data.get("preemptionPolicy"))
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string);
-            (priority, policy)
-        }
-    };
+        .map(ToString::to_string);
+    let (priority, policy) = resolve_priority_class(db, class_name.as_deref()).await?;
     let Some(priority) = priority else {
         return Ok(());
     };
@@ -2099,6 +2078,52 @@ async fn apply_priority_class_to_pod(
         }
     }
     Ok(())
+}
+
+async fn resolve_priority_class(
+    db: &dyn crate::datastore::DatastoreBackend,
+    class_name: Option<&str>,
+) -> Result<(Option<i64>, Option<String>), AppError> {
+    match class_name {
+        Some("system-node-critical") => Ok((Some(2_000_001_000_i64), None)),
+        Some("system-cluster-critical") => Ok((Some(2_000_000_000_i64), None)),
+        Some(class_name) => {
+            let pc = db
+                .get_resource("scheduling.k8s.io/v1", "PriorityClass", None, class_name)
+                .await?;
+            Ok(priority_class_value_and_policy(
+                pc.as_ref().map(|pc| pc.data.as_ref()),
+            ))
+        }
+        None => {
+            let classes = db
+                .list_resources(
+                    "scheduling.k8s.io/v1",
+                    "PriorityClass",
+                    None,
+                    crate::datastore::ResourceListQuery::all(),
+                )
+                .await?;
+            let default_class = classes.items.iter().find(|pc| {
+                pc.data
+                    .get("globalDefault")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            });
+            Ok(priority_class_value_and_policy(
+                default_class.map(|pc| pc.data.as_ref()),
+            ))
+        }
+    }
+}
+
+fn priority_class_value_and_policy(pc: Option<&Value>) -> (Option<i64>, Option<String>) {
+    let priority = pc.and_then(|pc| pc.get("value")).and_then(|v| v.as_i64());
+    let policy = pc
+        .and_then(|pc| pc.get("preemptionPolicy"))
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    (priority, policy)
 }
 
 fn pod_priority(pod: &Value) -> i64 {
