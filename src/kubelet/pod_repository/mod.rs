@@ -639,6 +639,7 @@ impl PodRepository {
         let network_svc = PodNetworkService::new(db, supervisor.clone(), network_events);
         let watch = PodWatchService::new(store.clone());
         let gc_pod_delete_sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink> = api.clone();
+        workqueue.set_remote_pod_delete_resignal_sink(Arc::downgrade(&gc_pod_delete_sink));
 
         let deletion_finalizer = Arc::new(
             crate::kubelet::pod_runtime::deletion_finalizer::RealPodDeletionFinalizer::new(

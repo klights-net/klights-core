@@ -713,6 +713,56 @@ async fn actor_finalize_delete_for_replacement_uid_is_not_blocked_by_old_uid_sta
     );
 }
 
+#[tokio::test]
+async fn actor_owned_delete_terminal_error_is_not_silently_dropped() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+    let client = Arc::new(StackApplyClient::default());
+    let dispatcher = OutboxDispatcher::batch_mode_for_tests(node_db.clone(), client.clone(), 16);
+
+    let now = 7_000i64;
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "delete-uid-mismatch",
+            OutboxOperation::RuntimeReconcile,
+            OutboxSubject::new(
+                "v1/Pod/default/web/uid-old",
+                Some("default".to_string()),
+                "web",
+                Some("uid-old".to_string()),
+            ),
+            "uid-old",
+            pod_delete_command("default", "web", "uid-old"),
+            now,
+        ))
+        .await
+        .expect("enqueue");
+
+    client
+        .push_response(Err(OutboxApplyError::UidMismatch {
+            expected: "uid-old".to_string(),
+            actual: "uid-new".to_string(),
+        }))
+        .await;
+
+    assert_eq!(
+        dispatcher.dispatch_due_once(now).await.expect("dispatch"),
+        DispatchOutcome::Dispatched
+    );
+
+    let dead = node_db.list_dead_letter().await.expect("list dead letter");
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].idempotency_key, "delete-uid-mismatch");
+    assert!(
+        node_db
+            .claim_next_due_outbox(now + 100, 1_000, "check-empty")
+            .await
+            .expect("claim")
+            .is_none(),
+        "terminal actor-owned delete should leave visibility in dead-letter, not pending retry"
+    );
+}
+
 /// Client that simulates a crash after cluster apply but before
 /// node-db complete. First call succeeds (simulates cluster apply),
 /// second call for the same key returns AlreadyApplied (ledger replay).

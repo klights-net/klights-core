@@ -103,12 +103,29 @@ pub async fn reject_pod_uid_mismatch(
         .await
         .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
     let Some(live) = live else {
+        if matches!(command, StorageCommand::DeleteResource { .. }) {
+            tracing::warn!(
+                namespace = %namespace,
+                pod = %name,
+                expected_uid = %expected,
+                "leader apply_outbox rejected actor-owned Pod delete because the Pod is already absent"
+            );
+        }
         return Err(OutboxApplyError::NotFound(format!(
             "Pod {namespace}/{name} not found"
         )));
     };
     if live.uid == expected {
         return Ok(());
+    }
+    if matches!(command, StorageCommand::DeleteResource { .. }) {
+        tracing::warn!(
+            namespace = %namespace,
+            pod = %name,
+            expected_uid = %expected,
+            actual_uid = %live.uid,
+            "leader apply_outbox rejected actor-owned Pod delete due to UID mismatch"
+        );
     }
     Err(OutboxApplyError::UidMismatch {
         expected: expected.to_string(),

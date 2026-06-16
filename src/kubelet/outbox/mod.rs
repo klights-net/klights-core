@@ -1058,6 +1058,34 @@ impl OutboxDispatcher {
                 {
                     tracing::warn!(pod_uid = %row.pod_uid, error = %err, "delete checkpoint failed");
                 }
+                if actor_owned_pod_delete_needs_dead_letter(&row, &err) {
+                    tracing::warn!(
+                        idempotency_key = %row.idempotency_key,
+                        error = %err,
+                        "actor-owned Pod delete hit terminal outbox error; moving to dead letter"
+                    );
+                    match self
+                        .node_db
+                        .move_outbox_to_dead_letter_if_max_attempts(&row.idempotency_key, 0)
+                        .await
+                    {
+                        Ok(true) => return,
+                        Ok(false) => {
+                            tracing::warn!(
+                                idempotency_key = %row.idempotency_key,
+                                "actor-owned Pod delete terminal row was not moved to dead letter"
+                            );
+                        }
+                        Err(move_err) => {
+                            tracing::warn!(
+                                idempotency_key = %row.idempotency_key,
+                                error = %move_err,
+                                "actor-owned Pod delete dead-letter move failed"
+                            );
+                            return;
+                        }
+                    }
+                }
                 tracing::debug!(
                     idempotency_key = %row.idempotency_key,
                     error = %err,
@@ -1179,6 +1207,37 @@ fn deterministic_jitter_ms(idempotency_key: &str, attempt: i64, window_ms: i64) 
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     (hash % (window_ms.max(0) as u64 + 1)) as i64
+}
+
+fn actor_owned_pod_delete_needs_dead_letter(row: &OutboxRow, err: &OutboxApplyError) -> bool {
+    if matches!(err, OutboxApplyError::NotFound(_)) {
+        return false;
+    }
+    if !matches!(
+        err,
+        OutboxApplyError::UidMismatch { .. } | OutboxApplyError::ConflictTerminal(_)
+    ) {
+        return false;
+    }
+    let Ok(payload) = OutboxPayload::decode_protobuf(&row.payload_proto) else {
+        return false;
+    };
+    match payload.command {
+        StorageCommand::DeleteResource {
+            api_version,
+            kind,
+            preconditions,
+            ..
+        } => {
+            api_version == "v1"
+                && kind == "Pod"
+                && preconditions
+                    .uid
+                    .as_deref()
+                    .is_some_and(|uid| !uid.trim().is_empty())
+        }
+        _ => false,
+    }
 }
 
 fn outbox_operation_records_pod_status_checkpoint(operation: OutboxOperation) -> bool {

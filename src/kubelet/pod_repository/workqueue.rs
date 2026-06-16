@@ -19,6 +19,8 @@ use super::store::{PodStore, UnscheduledPodDeleteOutcome};
 const MAX_ATTEMPTS: i64 = 720;
 const MIN_DELAY_MS: i64 = 5_000;
 const POD_DELETE_TARGET_NODE_PAYLOAD_KEY: &str = "target_node";
+const POD_DELETE_LAST_RESIGNAL_MS_PAYLOAD_KEY: &str = "last_resignal_ms";
+const REMOTE_POD_DELETE_RESIGNAL_MIN_INTERVAL_MS: i64 = 30_000;
 
 pub struct PodWorkqueue {
     store: Arc<PodStore>,
@@ -28,6 +30,8 @@ pub struct PodWorkqueue {
     wake: Arc<Notify>,
     lifecycle_router: std::sync::Mutex<Option<Arc<PodLifecycleRouter>>>,
     local_node_name: std::sync::Mutex<Option<String>>,
+    remote_pod_delete_resignal_sink:
+        std::sync::Mutex<Option<std::sync::Weak<dyn crate::controllers::gc::GcPodDeleteSink>>>,
     reconciler_started: AtomicBool,
     /// Set to true when `start()` is called. Enables Task 4.1 tests to
     /// verify that `build_parts` defers startup to `PodRepositoryBackground`.
@@ -49,6 +53,7 @@ impl PodWorkqueue {
             wake: Arc::new(Notify::new()),
             lifecycle_router: std::sync::Mutex::new(None),
             local_node_name: std::sync::Mutex::new(None),
+            remote_pod_delete_resignal_sink: std::sync::Mutex::new(None),
             reconciler_started: AtomicBool::new(false),
             start_called: AtomicBool::new(false),
         })
@@ -71,6 +76,21 @@ impl PodWorkqueue {
     ) {
         *self.lifecycle_router.lock().unwrap() = Some(router);
         *self.local_node_name.lock().unwrap() = Some(local_node_name);
+    }
+
+    pub(super) fn set_remote_pod_delete_resignal_sink(
+        &self,
+        sink: std::sync::Weak<dyn crate::controllers::gc::GcPodDeleteSink>,
+    ) {
+        *self.remote_pod_delete_resignal_sink.lock().unwrap() = Some(sink);
+    }
+
+    #[cfg(test)]
+    fn set_remote_pod_delete_resignal_sink_for_tests(
+        &self,
+        sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink>,
+    ) {
+        self.set_remote_pod_delete_resignal_sink(Arc::downgrade(&sink));
     }
 
     #[cfg(test)]
@@ -239,19 +259,22 @@ impl PodWorkqueue {
         }
     }
 
-    async fn run_retry(self: Arc<Self>, row: PodWorkqueueEntry) {
+    async fn run_retry(self: Arc<Self>, mut row: PodWorkqueueEntry) {
         let target_node = row
             .payload
             .get(POD_DELETE_TARGET_NODE_PAYLOAD_KEY)
             .and_then(|value| value.as_str())
             .map(ToString::to_string);
+        let retry_now_ms = now_ms();
         let result = match row.kind {
             PodWorkqueueKind::Pod => {
-                self.run_pod_delete_full_with_target_node(
+                self.run_pod_delete_full_with_target_node_and_payload(
                     row.namespace.clone(),
                     row.name.clone(),
                     row.uid.clone(),
                     target_node,
+                    &mut row.payload,
+                    retry_now_ms,
                 )
                 .await
             }
@@ -295,12 +318,34 @@ impl PodWorkqueue {
         self.wake.notify_one();
     }
 
+    #[cfg(test)]
     async fn run_pod_delete_full_with_target_node(
         &self,
         ns: String,
         name: String,
         uid: String,
         target_node: Option<String>,
+    ) -> Result<()> {
+        let mut payload = pod_delete_target_payload(target_node.as_deref());
+        self.run_pod_delete_full_with_target_node_and_payload(
+            ns,
+            name,
+            uid,
+            target_node,
+            &mut payload,
+            now_ms(),
+        )
+        .await
+    }
+
+    async fn run_pod_delete_full_with_target_node_and_payload(
+        &self,
+        ns: String,
+        name: String,
+        uid: String,
+        target_node: Option<String>,
+        payload: &mut Value,
+        retry_now_ms: i64,
     ) -> Result<()> {
         let pod_before_delete = self.store.get(&ns, &name).await?;
         match pod_before_delete {
@@ -353,6 +398,16 @@ impl PodWorkqueue {
                     &uid,
                     target_node.as_deref(),
                 ) {
+                    if remote_pod_delete_resignal_due(payload, retry_now_ms) {
+                        self.resignal_remote_pod_delete(&ns, &name, &uid).await?;
+                    } else {
+                        tracing::debug!(
+                            namespace = %ns,
+                            pod = %name,
+                            uid = %uid,
+                            "remote pod delete re-signal throttled"
+                        );
+                    }
                     anyhow::bail!(
                         "pod deferred delete for remote pod {}/{} uid {} awaiting actor-owned finalization on target node",
                         ns,
@@ -396,6 +451,25 @@ impl PodWorkqueue {
         }
 
         Ok(())
+    }
+
+    async fn resignal_remote_pod_delete(&self, ns: &str, name: &str, uid: &str) -> Result<()> {
+        let sink = self
+            .remote_pod_delete_resignal_sink
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        let Some(sink) = sink else {
+            tracing::debug!(
+                namespace = %ns,
+                pod = %name,
+                uid = %uid,
+                "remote pod delete retry has no GC re-signal sink"
+            );
+            return Ok(());
+        };
+        sink.request_gc_pod_delete(ns, name, uid).await
     }
 
     fn live_pod_belongs_to_local_node(&self, pod: &serde_json::Value) -> bool {
@@ -642,6 +716,25 @@ fn pod_delete_target_payload(target_node: Option<&str>) -> Value {
     Value::Object(payload)
 }
 
+fn remote_pod_delete_resignal_due(payload: &mut Value, now_ms: i64) -> bool {
+    let Some(payload) = payload.as_object_mut() else {
+        return true;
+    };
+    let last_resignal_ms = payload
+        .get(POD_DELETE_LAST_RESIGNAL_MS_PAYLOAD_KEY)
+        .and_then(|value| value.as_i64());
+    if let Some(last_resignal_ms) = last_resignal_ms
+        && now_ms.saturating_sub(last_resignal_ms) < REMOTE_POD_DELETE_RESIGNAL_MIN_INTERVAL_MS
+    {
+        return false;
+    }
+    payload.insert(
+        POD_DELETE_LAST_RESIGNAL_MS_PAYLOAD_KEY.to_string(),
+        Value::Number(now_ms.into()),
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +742,34 @@ mod tests {
     use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleWorkKind};
     use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
     use crate::kubelet::pod_lifecycle_router::executor::{ExecutorError, PodWorkExecutor};
+
+    #[derive(Default)]
+    struct RecordingGcPodDeleteSink {
+        calls: tokio::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl RecordingGcPodDeleteSink {
+        async fn calls(&self) -> Vec<(String, String, String)> {
+            self.calls.lock().await.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::controllers::gc::GcPodDeleteSink for RecordingGcPodDeleteSink {
+        async fn request_gc_pod_delete(
+            &self,
+            namespace: &str,
+            name: &str,
+            uid: &str,
+        ) -> Result<()> {
+            self.calls.lock().await.push((
+                namespace.to_string(),
+                name.to_string(),
+                uid.to_string(),
+            ));
+            Ok(())
+        }
+    }
 
     struct WakeRecordingExecutor {
         stop_seen: tokio::sync::Notify,
@@ -1015,6 +1136,201 @@ mod tests {
             .await
             .is_err(),
             "remote-targeted delete should not wake local actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_pod_workqueue_resignals_gc_delete_on_retry() {
+        let (workqueue, db) = test_workqueue().await;
+
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "remote-pod",
+            pod_with_uid_on_node("remote-pod", "uid-old", true, "node-b"),
+        )
+        .await
+        .unwrap();
+
+        let sink = Arc::new(RecordingGcPodDeleteSink::default());
+        workqueue.set_remote_pod_delete_resignal_sink_for_tests(sink.clone());
+
+        let err = workqueue
+            .run_pod_delete_full_with_target_node(
+                "default".to_string(),
+                "remote-pod".to_string(),
+                "uid-old".to_string(),
+                Some("node-b".to_string()),
+            )
+            .await
+            .expect_err("remote Pod should keep retrying until actor removes row");
+
+        assert!(
+            err.to_string()
+                .contains("awaiting actor-owned finalization"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            sink.calls().await,
+            vec![(
+                "default".to_string(),
+                "remote-pod".to_string(),
+                "uid-old".to_string()
+            )],
+            "remote retry must re-signal the UID-bound GC delete path"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_pod_resignal_throttled_to_every_30_seconds() {
+        let (workqueue, db) = test_workqueue().await;
+
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "remote-pod",
+            pod_with_uid_on_node("remote-pod", "uid-old", true, "node-b"),
+        )
+        .await
+        .unwrap();
+
+        let sink = Arc::new(RecordingGcPodDeleteSink::default());
+        workqueue.set_remote_pod_delete_resignal_sink_for_tests(sink.clone());
+        let mut payload = pod_delete_target_payload(Some("node-b"));
+
+        workqueue
+            .run_pod_delete_full_with_target_node_and_payload(
+                "default".to_string(),
+                "remote-pod".to_string(),
+                "uid-old".to_string(),
+                Some("node-b".to_string()),
+                &mut payload,
+                100_000,
+            )
+            .await
+            .expect_err("remote Pod should retry after re-signal");
+        assert_eq!(sink.calls().await.len(), 1);
+
+        workqueue
+            .run_pod_delete_full_with_target_node_and_payload(
+                "default".to_string(),
+                "remote-pod".to_string(),
+                "uid-old".to_string(),
+                Some("node-b".to_string()),
+                &mut payload,
+                110_000,
+            )
+            .await
+            .expect_err("remote Pod should retry while re-signal is throttled");
+        assert_eq!(
+            sink.calls().await.len(),
+            1,
+            "second retry inside throttle window must not re-signal"
+        );
+
+        workqueue
+            .run_pod_delete_full_with_target_node_and_payload(
+                "default".to_string(),
+                "remote-pod".to_string(),
+                "uid-old".to_string(),
+                Some("node-b".to_string()),
+                &mut payload,
+                130_000,
+            )
+            .await
+            .expect_err("remote Pod should retry after throttle window re-signal");
+        assert_eq!(
+            sink.calls().await.len(),
+            2,
+            "retry at the 30s boundary should re-signal again"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_pod_without_deletion_timestamp_is_marked_on_first_retry() {
+        let (workqueue, db) = test_workqueue().await;
+
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "remote-pod",
+            pod_with_uid_on_node("remote-pod", "uid-old", false, "node-b"),
+        )
+        .await
+        .unwrap();
+
+        let sink = Arc::new(RecordingGcPodDeleteSink::default());
+        workqueue.set_remote_pod_delete_resignal_sink_for_tests(sink.clone());
+
+        workqueue
+            .run_pod_delete_full_with_target_node(
+                "default".to_string(),
+                "remote-pod".to_string(),
+                "uid-old".to_string(),
+                Some("node-b".to_string()),
+            )
+            .await
+            .expect_err("remote Pod should retry until target actor finalizes it");
+
+        assert_eq!(
+            sink.calls().await,
+            vec![(
+                "default".to_string(),
+                "remote-pod".to_string(),
+                "uid-old".to_string()
+            )],
+            "first remote retry must request the UID-bound delete mark even before deletionTimestamp is present"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_pod_resignal_is_uid_bound_and_self_extinguishes_when_row_removed() {
+        let (workqueue, db) = test_workqueue().await;
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "remote-pod",
+            pod_with_uid_on_node("remote-pod", "uid-new", true, "node-b"),
+        )
+        .await
+        .unwrap();
+
+        let sink = Arc::new(RecordingGcPodDeleteSink::default());
+        workqueue.set_remote_pod_delete_resignal_sink_for_tests(sink.clone());
+
+        workqueue
+            .run_pod_delete_full_with_target_node(
+                "default".to_string(),
+                "remote-pod".to_string(),
+                "uid-old".to_string(),
+                Some("node-b".to_string()),
+            )
+            .await
+            .expect("stale UID reminder must complete without touching replacement");
+        assert!(
+            sink.calls().await.is_empty(),
+            "stale UID must not re-signal deletion for a replacement Pod"
+        );
+
+        db.delete_resource("v1", "Pod", Some("default"), "remote-pod")
+            .await
+            .unwrap();
+        workqueue
+            .run_pod_delete_full_with_target_node(
+                "default".to_string(),
+                "remote-pod".to_string(),
+                "uid-old".to_string(),
+                Some("node-b".to_string()),
+            )
+            .await
+            .expect("missing row means actor-owned finalization completed");
+        assert!(
+            sink.calls().await.is_empty(),
+            "removed row should self-extinguish without re-signaling"
         );
     }
 
