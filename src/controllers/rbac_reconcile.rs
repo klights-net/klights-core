@@ -4,16 +4,18 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 
 use crate::auth::default_rbac::{
-    AUTOUPDATE_ANNOTATION, DefaultRbacObject, RBAC_API_VERSION, default_rbac_fixtures,
+    AUTOUPDATE_ANNOTATION, DefaultRbacObject, RBAC_API_VERSION, default_cluster_role_rules,
+    default_rbac_fixtures,
 };
 use crate::datastore::DatastoreBackend;
+use crate::label_selector::LabelSelector;
 
 pub async fn reconcile_default_rbac_objects(db: &dyn DatastoreBackend) -> Result<()> {
     for fixture in default_rbac_fixtures() {
         reconcile_default_rbac_object(db, &fixture).await?;
     }
 
-    reconcile_user_facing_role_aggregation(db).await?;
+    reconcile_cluster_role_aggregation(db).await?;
 
     Ok(())
 }
@@ -41,7 +43,8 @@ async fn reconcile_default_rbac_object(
                 .cloned()
                 .unwrap_or_default();
             let changed = reconcile_metadata(&mut patched, &expected)
-                | reconcile_role_rules(&mut patched, &expected);
+                | reconcile_role_rules(&mut patched, &expected)
+                | reconcile_aggregation_rule(&mut patched, &expected);
 
             if changed {
                 db.update_resource(
@@ -165,7 +168,27 @@ fn reconcile_role_rules(existing: &mut Map<String, Value>, desired: &Value) -> b
     changed
 }
 
-async fn reconcile_user_facing_role_aggregation(db: &dyn DatastoreBackend) -> Result<()> {
+/// Copy a fixture's `aggregationRule` onto an existing default object so that
+/// upgraded clusters gain the field (and corrected selectors) on the
+/// admin/edit/view ClusterRoles. No-op for fixtures that define no
+/// `aggregationRule`, so it never strips a user-managed aggregationRule.
+fn reconcile_aggregation_rule(existing: &mut Map<String, Value>, desired: &Value) -> bool {
+    let Some(desired_rule) = desired.get("aggregationRule") else {
+        return false;
+    };
+    if existing.get("aggregationRule") == Some(desired_rule) {
+        return false;
+    }
+    existing.insert("aggregationRule".to_string(), desired_rule.clone());
+    true
+}
+
+/// Recompute every aggregated ClusterRole (any role carrying an
+/// `aggregationRule.clusterRoleSelectors`) from the current set of source
+/// roles. Unlike a one-way add-only merge, this fully recomputes the managed
+/// rule set on each pass, so privilege contributed by a source role is revoked
+/// when that source loses the aggregation label or is deleted.
+async fn reconcile_cluster_role_aggregation(db: &dyn DatastoreBackend) -> Result<()> {
     let cluster_roles = db
         .list_resources_page(
             RBAC_API_VERSION,
@@ -177,84 +200,136 @@ async fn reconcile_user_facing_role_aggregation(db: &dyn DatastoreBackend) -> Re
         )
         .await?;
 
-    let roles: Vec<Value> = cluster_roles
+    // Snapshot every ClusterRole body once for selector matching.
+    let role_values: Vec<Value> = cluster_roles
         .items
         .iter()
         .map(|resource| resource.data.as_ref().clone())
         .collect();
 
-    for (target_name, label) in [
-        ("admin", "rbac.authorization.k8s.io/aggregate-to-admin"),
-        ("edit", "rbac.authorization.k8s.io/aggregate-to-edit"),
-        ("view", "rbac.authorization.k8s.io/aggregate-to-view"),
-    ] {
-        reconcile_aggregated_role(db, &roles, target_name, label).await?;
+    for resource in &cluster_roles.items {
+        let Some(selectors) = aggregation_selectors(resource.data.as_ref()) else {
+            continue;
+        };
+        reconcile_aggregated_role(db, resource, &role_values, &selectors).await?;
     }
 
     Ok(())
 }
 
+/// Parse `aggregationRule.clusterRoleSelectors` into label selectors. Returns
+/// `None` for ClusterRoles without an `aggregationRule` (their `rules` are not
+/// controller-managed). A present-but-empty selector list yields `Some(vec![])`,
+/// collapsing the role's aggregated rules down to its floor.
+fn aggregation_selectors(role: &Value) -> Option<Vec<LabelSelector>> {
+    let selectors = role
+        .pointer("/aggregationRule/clusterRoleSelectors")
+        .and_then(Value::as_array)?;
+    Some(
+        selectors
+            .iter()
+            .filter_map(|selector| LabelSelector::from_k8s_selector(selector).ok())
+            .collect(),
+    )
+}
+
 async fn reconcile_aggregated_role(
     db: &dyn DatastoreBackend,
+    target: &crate::datastore::Resource,
     cluster_roles: &[Value],
-    target_name: &str,
-    aggregate_label: &str,
+    selectors: &[LabelSelector],
 ) -> Result<()> {
-    let Some(existing) = db
-        .get_resource(RBAC_API_VERSION, "ClusterRole", None, target_name)
-        .await?
-    else {
-        return Ok(());
-    };
-
-    if !autoupdate_enabled(existing.data.as_ref()) {
+    if !autoupdate_enabled(target.data.as_ref()) {
         return Ok(());
     }
 
-    let mut patched = existing
+    let target_name = target.name.as_str();
+
+    // Floor: the role's own default rules (empty for user-defined aggregated
+    // roles). The floor is never revoked; everything above it is recomputed
+    // from the currently-qualifying source roles so stale grants drop out.
+    let mut desired_rules: Vec<Value> = Vec::new();
+    let mut seen: Vec<RuleShape> = Vec::new();
+    for rule in default_cluster_role_rules(target_name) {
+        push_unique_rule(&mut desired_rules, &mut seen, rule);
+    }
+
+    // Source roles matching any selector, ordered by name for determinism.
+    let mut sources: Vec<&Value> = cluster_roles
+        .iter()
+        .filter(|source| role_name(source) != Some(target_name))
+        .filter(|source| {
+            selectors
+                .iter()
+                .any(|selector| selector.matches_labels(role_labels(source)))
+        })
+        .collect();
+    sources.sort_by(|a, b| role_name(a).cmp(&role_name(b)));
+
+    for source in sources {
+        if let Some(rules) = source.get("rules").and_then(Value::as_array) {
+            for rule in rules {
+                push_unique_rule(&mut desired_rules, &mut seen, rule.clone());
+            }
+        }
+    }
+
+    let existing_rules = target
+        .data
+        .as_ref()
+        .get("rules")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if same_rule_set(&existing_rules, &desired_rules) {
+        return Ok(());
+    }
+
+    let mut patched = target
         .data
         .as_ref()
         .as_object()
         .cloned()
         .unwrap_or_default();
-    let mut changed = false;
-
-    for source in cluster_roles {
-        if source.pointer("/metadata/name").and_then(Value::as_str) == Some(target_name) {
-            continue;
-        }
-        let has_label = source
-            .get("metadata")
-            .and_then(|metadata| metadata.get("labels"))
-            .and_then(|labels| labels.get(aggregate_label))
-            .and_then(Value::as_str)
-            == Some("true");
-        if !has_label {
-            continue;
-        }
-        let desired = serde_json::json!({
-            "kind": "ClusterRole",
-            "rules": source.get("rules").cloned().unwrap_or_else(|| Value::Array(vec![]))
-        });
-        changed |= reconcile_role_rules(&mut patched, &desired);
-    }
-
-    if changed {
-        db.update_resource(
-            RBAC_API_VERSION,
-            "ClusterRole",
-            None,
-            target_name,
-            Value::Object(patched),
-            existing.resource_version,
-        )
-        .await?;
-    }
+    patched.insert("rules".to_string(), Value::Array(desired_rules));
+    db.update_resource(
+        RBAC_API_VERSION,
+        "ClusterRole",
+        None,
+        target_name,
+        Value::Object(patched),
+        target.resource_version,
+    )
+    .await?;
 
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn role_name(role: &Value) -> Option<&str> {
+    role.pointer("/metadata/name").and_then(Value::as_str)
+}
+
+fn role_labels(role: &Value) -> Option<&Map<String, Value>> {
+    role.pointer("/metadata/labels").and_then(Value::as_object)
+}
+
+fn push_unique_rule(rules: &mut Vec<Value>, seen: &mut Vec<RuleShape>, rule: Value) {
+    let shape = RuleShape::from_rule(&rule);
+    if seen.contains(&shape) {
+        return;
+    }
+    seen.push(shape);
+    rules.push(rule);
+}
+
+fn same_rule_set(a: &[Value], b: &[Value]) -> bool {
+    let a_shapes: BTreeSet<RuleShape> = a.iter().map(RuleShape::from_rule).collect();
+    let b_shapes: BTreeSet<RuleShape> = b.iter().map(RuleShape::from_rule).collect();
+    a_shapes == b_shapes
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RuleShape {
     verbs: BTreeSet<String>,
     api_groups: BTreeSet<String>,
@@ -626,6 +701,233 @@ mod tests {
         assert!(
             !has_rule(admin_rules, &source_rule),
             "aggregate-to-view must not leak into admin without the admin label"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_admin_edit_view_carry_aggregation_rule() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let handle = as_handle(&db);
+        reconcile_default_rbac_objects(handle.as_ref())
+            .await
+            .unwrap();
+
+        for (name, label) in [
+            ("admin", "rbac.authorization.k8s.io/aggregate-to-admin"),
+            ("edit", "rbac.authorization.k8s.io/aggregate-to-edit"),
+            ("view", "rbac.authorization.k8s.io/aggregate-to-view"),
+        ] {
+            let role = handle
+                .get_resource(RBAC_API_VERSION, "ClusterRole", None, name)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} ClusterRole should exist"));
+            let selectors = role
+                .data
+                .pointer("/aggregationRule/clusterRoleSelectors")
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| {
+                    panic!("{name} must expose aggregationRule.clusterRoleSelectors")
+                });
+            assert!(
+                selectors.iter().any(|selector| {
+                    selector
+                        .pointer("/matchLabels")
+                        .and_then(Value::as_object)
+                        .and_then(|labels| labels.get(label))
+                        .and_then(Value::as_str)
+                        == Some("true")
+                }),
+                "{name} aggregationRule must select {label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_revokes_aggregated_rules_when_source_label_removed() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let handle = as_handle(&db);
+        reconcile_default_rbac_objects(handle.as_ref())
+            .await
+            .unwrap();
+
+        let source_rule = serde_json::json!({
+            "verbs": ["get"],
+            "apiGroups": ["example.com"],
+            "resources": ["widgets"],
+            "resourceNames": [],
+            "nonResourceURLs": []
+        });
+        handle
+            .create_resource(
+                RBAC_API_VERSION,
+                "ClusterRole",
+                None,
+                "example-widget-viewer",
+                serde_json::json!({
+                    "apiVersion": RBAC_API_VERSION,
+                    "kind": "ClusterRole",
+                    "metadata": {
+                        "name": "example-widget-viewer",
+                        "labels": {"rbac.authorization.k8s.io/aggregate-to-view": "true"}
+                    },
+                    "rules": [source_rule.clone()]
+                }),
+            )
+            .await
+            .unwrap();
+
+        reconcile_default_rbac_objects(handle.as_ref())
+            .await
+            .unwrap();
+
+        let view = handle
+            .get_resource(RBAC_API_VERSION, "ClusterRole", None, "view")
+            .await
+            .unwrap()
+            .expect("view ClusterRole should exist");
+        let view_rules = view
+            .data
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("view should have rules");
+        assert!(
+            has_rule(view_rules, &source_rule),
+            "view should aggregate the labeled source rule"
+        );
+        let view_floor_len = super::default_cluster_role_rules("view").len();
+        assert!(view_rules.len() > view_floor_len);
+
+        // Drop the aggregate-to-view label from the source role.
+        let source = handle
+            .get_resource(
+                RBAC_API_VERSION,
+                "ClusterRole",
+                None,
+                "example-widget-viewer",
+            )
+            .await
+            .unwrap()
+            .expect("source role exists");
+        let mut patched = source
+            .data
+            .as_ref()
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(Value::Object(metadata)) = patched.get_mut("metadata") {
+            metadata.insert("labels".to_string(), serde_json::json!({}));
+        }
+        handle
+            .update_resource(
+                RBAC_API_VERSION,
+                "ClusterRole",
+                None,
+                "example-widget-viewer",
+                Value::Object(patched),
+                source.resource_version,
+            )
+            .await
+            .unwrap();
+
+        reconcile_default_rbac_objects(handle.as_ref())
+            .await
+            .unwrap();
+
+        let view = handle
+            .get_resource(RBAC_API_VERSION, "ClusterRole", None, "view")
+            .await
+            .unwrap()
+            .expect("view ClusterRole should exist");
+        let view_rules = view
+            .data
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("view should have rules");
+        assert!(
+            !has_rule(view_rules, &source_rule),
+            "revoked source rule must be removed from view after the label is dropped"
+        );
+        assert_eq!(
+            view_rules.len(),
+            view_floor_len,
+            "view must retain its default floor rules after revocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_honors_user_defined_aggregation_rule_selectors() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let handle = as_handle(&db);
+        reconcile_default_rbac_objects(handle.as_ref())
+            .await
+            .unwrap();
+
+        // A user-defined aggregated ClusterRole with its own selector.
+        handle
+            .create_resource(
+                RBAC_API_VERSION,
+                "ClusterRole",
+                None,
+                "monitoring",
+                serde_json::json!({
+                    "apiVersion": RBAC_API_VERSION,
+                    "kind": "ClusterRole",
+                    "metadata": {"name": "monitoring"},
+                    "aggregationRule": {
+                        "clusterRoleSelectors": [
+                            {"matchLabels": {"example.com/aggregate-to-monitoring": "true"}}
+                        ]
+                    },
+                    "rules": []
+                }),
+            )
+            .await
+            .unwrap();
+
+        let monitoring_rule = serde_json::json!({
+            "verbs": ["get", "list", "watch"],
+            "apiGroups": ["monitoring.example.com"],
+            "resources": ["dashboards"],
+            "resourceNames": [],
+            "nonResourceURLs": []
+        });
+        handle
+            .create_resource(
+                RBAC_API_VERSION,
+                "ClusterRole",
+                None,
+                "dashboard-reader",
+                serde_json::json!({
+                    "apiVersion": RBAC_API_VERSION,
+                    "kind": "ClusterRole",
+                    "metadata": {
+                        "name": "dashboard-reader",
+                        "labels": {"example.com/aggregate-to-monitoring": "true"}
+                    },
+                    "rules": [monitoring_rule.clone()]
+                }),
+            )
+            .await
+            .unwrap();
+
+        reconcile_default_rbac_objects(handle.as_ref())
+            .await
+            .unwrap();
+
+        let monitoring = handle
+            .get_resource(RBAC_API_VERSION, "ClusterRole", None, "monitoring")
+            .await
+            .unwrap()
+            .expect("monitoring ClusterRole should exist");
+        let monitoring_rules = monitoring
+            .data
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("monitoring should have rules");
+        assert!(
+            has_rule(monitoring_rules, &monitoring_rule),
+            "user-defined aggregationRule selectors must aggregate matching source rules"
         );
     }
 }

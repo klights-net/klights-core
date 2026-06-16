@@ -43,9 +43,21 @@ pub struct DefaultRbacObject {
     pub rules: Option<Vec<DefaultRbacRule>>,
     pub role_ref: Option<DefaultRbacRoleRef>,
     pub subjects: Option<Vec<DefaultRbacSubject>>,
+    /// `aggregationRule.clusterRoleSelectors` for aggregated ClusterRoles
+    /// (admin/edit/view). Each inner vec is one selector's `matchLabels`. The
+    /// reconciler recomputes `rules` as the union of the role's own default
+    /// rules and the rules of every ClusterRole matching any of these
+    /// selectors, so granted privilege is revoked when a source role loses the
+    /// label or is deleted.
+    pub aggregation_rule: Option<Vec<Vec<(&'static str, &'static str)>>>,
 }
 
 impl DefaultRbacObject {
+    fn aggregated_to(mut self, aggregate_label: &'static str) -> Self {
+        self.aggregation_rule = Some(vec![vec![(aggregate_label, "true")]]);
+        self
+    }
+
     fn metadata_labels(&self) -> Vec<(&'static str, &'static str)> {
         let mut labels = vec![BOOTSTRAP_LABEL; 1];
         labels.extend(self.labels.iter().cloned());
@@ -110,6 +122,23 @@ impl DefaultRbacObject {
                     })
                     .unwrap_or_default();
                 object.insert("rules".to_string(), json!(rules));
+
+                if let Some(selectors) = self.aggregation_rule.as_ref() {
+                    let cluster_role_selectors: Vec<serde_json::Value> = selectors
+                        .iter()
+                        .map(|match_labels| {
+                            let mut labels = serde_json::Map::new();
+                            for (key, value) in match_labels {
+                                labels.insert(key.to_string(), json!(value));
+                            }
+                            json!({"matchLabels": serde_json::Value::Object(labels)})
+                        })
+                        .collect();
+                    object.insert(
+                        "aggregationRule".to_string(),
+                        json!({"clusterRoleSelectors": cluster_role_selectors}),
+                    );
+                }
             }
             "ClusterRoleBinding" => {
                 let role_ref = self.role_ref.as_ref().expect("clusterrolebinding roleRef");
@@ -164,6 +193,7 @@ fn cluster_role(
         rules: Some(rules),
         role_ref: None,
         subjects: None,
+        aggregation_rule: None,
     }
 }
 
@@ -183,6 +213,7 @@ fn role(
         rules: Some(rules),
         role_ref: None,
         subjects: None,
+        aggregation_rule: None,
     }
 }
 
@@ -202,6 +233,7 @@ fn cluster_role_binding(
         rules: None,
         role_ref: Some(role_ref),
         subjects: Some(subjects),
+        aggregation_rule: None,
     }
 }
 
@@ -642,7 +674,8 @@ fn bootstrap_defaults() -> Vec<DefaultRbacObject> {
                     non_resource_urls: vec![],
                 },
             ],
-        ),
+        )
+        .aggregated_to("rbac.authorization.k8s.io/aggregate-to-admin"),
         cluster_role(
             "edit",
             vec![("rbac.authorization.k8s.io/aggregate-to-edit", "true")],
@@ -714,7 +747,8 @@ fn bootstrap_defaults() -> Vec<DefaultRbacObject> {
                     non_resource_urls: vec![],
                 },
             ],
-        ),
+        )
+        .aggregated_to("rbac.authorization.k8s.io/aggregate-to-edit"),
         cluster_role(
             "view",
             vec![("rbac.authorization.k8s.io/aggregate-to-view", "true")],
@@ -787,12 +821,31 @@ fn bootstrap_defaults() -> Vec<DefaultRbacObject> {
                     non_resource_urls: vec![],
                 },
             ],
-        ),
+        )
+        .aggregated_to("rbac.authorization.k8s.io/aggregate-to-view"),
     ]
 }
 
 pub fn default_rbac_fixtures() -> Vec<DefaultRbacObject> {
     bootstrap_defaults()
+}
+
+/// Default `rules` for a built-in ClusterRole fixture, as JSON rule objects.
+/// Returns an empty vec for names that have no fixture (e.g. user-defined
+/// aggregated ClusterRoles). The aggregation reconciler uses this as the
+/// non-revocable floor of an aggregated role's rule set.
+pub fn default_cluster_role_rules(name: &str) -> Vec<serde_json::Value> {
+    default_rbac_fixtures()
+        .into_iter()
+        .find(|object| object.kind == "ClusterRole" && object.name == name)
+        .and_then(|object| {
+            object
+                .to_json_value()
+                .get("rules")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
