@@ -387,6 +387,16 @@ impl DatastoreBackend for WorkerStoreAdapter {
         } else {
             field_selector.map(str::to_string)
         };
+        // Fetch the full scope from the leader and paginate locally. The worker
+        // cache (and the leader datastore) own the authoritative collection, but
+        // pagination must be applied exactly once: passing limit/continue_token
+        // to the leader *and* re-applying ListPageRequest here would let the
+        // local pass clear the leader-provided continue_token (the leader has
+        // already truncated to the limit), silently dropping the rest of the
+        // collection from a worker LIST. The node/worker cache also returns
+        // items in arbitrary (hash-map) order, so sort by name before applying
+        // the page so name-based continuation is deterministic and matches the
+        // leader's ordering.
         let mut list = self
             .cluster_api
             .list_resources(ListRequest {
@@ -395,12 +405,13 @@ impl DatastoreBackend for WorkerStoreAdapter {
                 namespace: namespace.map(str::to_string),
                 label_selector: label_selector.map(str::to_string),
                 field_selector,
-                limit: page.limit(),
-                continue_token: page.continue_token().map(str::to_string),
+                limit: None,
+                continue_token: None,
             })
             .await?;
         self.observe_rv(list.resource_version);
         if page.limit().is_some() || page.continue_token().is_some() {
+            list.items.sort_by(|a, b| a.name.cmp(&b.name));
             list = page.apply_to_sorted_resource_list(list);
         }
         Ok(list)
@@ -1412,6 +1423,100 @@ mod tests {
             .expect("list local pods");
 
         assert_eq!(list.resource_version, 41);
+    }
+
+    #[tokio::test]
+    async fn worker_list_page_preserves_continuation_metadata() {
+        // Regression: list_resources_page used to pass limit/continue_token to
+        // the leader *and* re-apply ListPageRequest locally. The leader-side
+        // pagination already truncated the page, so the local re-apply saw a
+        // list no longer than the limit and cleared the leader-provided
+        // continue_token / remaining_item_count — workers' LIST silently dropped
+        // the rest of the collection. Pagination must be applied exactly once.
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        for name in ["cm-a", "cm-b", "cm-c"] {
+            cluster_db
+                .create_resource(
+                    "v1",
+                    "ConfigMap",
+                    Some("default"),
+                    name,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {"namespace": "default", "name": name}
+                    }),
+                )
+                .await
+                .expect("create configmap");
+        }
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db.clone()),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-pagination-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+
+        let first = adapter
+            .list_resources_page(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                None,
+                None,
+                ListPageRequest::try_new(Some(2), None).expect("page request"),
+            )
+            .await
+            .expect("list first page");
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cm-a", "cm-b"]
+        );
+        assert_eq!(
+            first.continue_token.as_deref(),
+            Some("cm-b"),
+            "first page must expose a continue token for the remaining item"
+        );
+        assert_eq!(first.remaining_item_count, Some(1));
+
+        let second = adapter
+            .list_resources_page(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                None,
+                None,
+                ListPageRequest::try_new(Some(2), first.continue_token.clone())
+                    .expect("page request"),
+            )
+            .await
+            .expect("list second page");
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cm-c"]
+        );
+        assert!(
+            second.continue_token.is_none(),
+            "final page must not advertise a continue token"
+        );
     }
 
     #[tokio::test]
