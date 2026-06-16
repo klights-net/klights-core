@@ -1392,6 +1392,7 @@ mod tests {
                 stdin: false,
                 stdout: true,
                 stderr: false,
+                attach: false,
             })
             .await
             .unwrap();
@@ -1593,6 +1594,7 @@ mod tests {
                 stdin: false,
                 stdout: true,
                 stderr: false,
+                attach: false,
             })
             .await
             .unwrap();

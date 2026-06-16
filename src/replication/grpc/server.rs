@@ -2102,6 +2102,7 @@ fn node_exec_request_to_proto(request: NodeExecRequest) -> generated::NodeExecRe
         stdin: request.stdin,
         stdout: request.stdout,
         stderr: request.stderr,
+        attach: request.attach,
     }
 }
 

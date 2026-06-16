@@ -133,6 +133,7 @@ mod tests {
                 stdin: true,
                 stdout: true,
                 stderr: true,
+                attach: false,
             })),
         };
         let exec_frame = NodeExecStreamFrame {

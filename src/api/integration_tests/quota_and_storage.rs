@@ -1953,7 +1953,7 @@ async fn test_pod_log_websocket_upgrade_returns_switching_protocols() {
 }
 
 #[tokio::test]
-async fn test_pod_attach_route_exists_and_returns_not_implemented() {
+async fn test_pod_attach_route_exists_and_requires_streaming_upgrade() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -1971,7 +1971,13 @@ async fn test_pod_attach_route_exists_and_returns_not_implemented() {
                 "kind": "Pod",
                 "metadata": {"name": "attach-target", "namespace": "default"},
                 "spec": {"containers": [{"name": "c", "image": "busybox"}]},
-                "status": {"podIP": "10.0.0.10"}
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{
+                        "name": "c",
+                        "containerID": "containerd://attach-container"
+                    }]
+                }
             }),
         )
         .await
@@ -1987,13 +1993,13 @@ async fn test_pod_attach_route_exists_and_returns_not_implemented() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::NOT_IMPLEMENTED,
-        "pods/attach route must exist and return a typed API error until full streaming support is wired"
+        StatusCode::BAD_REQUEST,
+        "pods/attach route must reject non-upgrade requests after streaming support is wired"
     );
 }
 
 #[tokio::test]
-async fn test_pod_attach_validating_webhook_denies_before_not_implemented() {
+async fn test_pod_attach_validating_webhook_denies_before_stream_upgrade() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use serde_json::json;
@@ -2141,7 +2147,7 @@ async fn test_pod_attach_validating_webhook_denies_before_not_implemented() {
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "validating webhook deny must be returned for pods/attach before NotImplemented fallback"
+        "validating webhook deny must be returned for pods/attach before stream upgrade handling"
     );
     let message = value["message"].as_str().unwrap_or_default();
     assert!(

@@ -2,12 +2,12 @@ use crate::kubelet::cri_events::{CriContainerEventCodec, CriContainerEventRespon
 use crate::replication::grpc::transport_policy::{ChannelKind, GrpcTransportPolicy};
 use anyhow::{Context, Result};
 use k8s_cri::v1::{
-    ContainerConfig, ContainerFilter, ContainerStatusRequest, ContainerStatusResponse,
-    CreateContainerRequest, ExecRequest, ExecResponse, ExecSyncRequest, ExecSyncResponse,
-    GetEventsRequest, ImageSpec, ImageStatusRequest, ListContainersRequest, ListContainersResponse,
-    ListPodSandboxRequest, PodSandboxConfig, PullImageRequest, RemoveContainerRequest,
-    RemovePodSandboxRequest, RunPodSandboxRequest, StartContainerRequest, StopContainerRequest,
-    StopPodSandboxRequest, image_service_client::ImageServiceClient,
+    AttachRequest, AttachResponse, ContainerConfig, ContainerFilter, ContainerStatusRequest,
+    ContainerStatusResponse, CreateContainerRequest, ExecRequest, ExecResponse, ExecSyncRequest,
+    ExecSyncResponse, GetEventsRequest, ImageSpec, ImageStatusRequest, ListContainersRequest,
+    ListContainersResponse, ListPodSandboxRequest, PodSandboxConfig, PullImageRequest,
+    RemoveContainerRequest, RemovePodSandboxRequest, RunPodSandboxRequest, StartContainerRequest,
+    StopContainerRequest, StopPodSandboxRequest, image_service_client::ImageServiceClient,
     runtime_service_client::RuntimeServiceClient,
 };
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -353,6 +353,26 @@ impl CriClient {
         });
 
         let response = self.runtime.exec(request).await?;
+        Ok(response.into_inner())
+    }
+
+    pub async fn attach(
+        &mut self,
+        container_id: &str,
+        tty: bool,
+        stdin: bool,
+        stdout: bool,
+        stderr: bool,
+    ) -> Result<AttachResponse> {
+        let request = tonic::Request::new(AttachRequest {
+            container_id: container_id.to_string(),
+            tty,
+            stdin,
+            stdout,
+            stderr,
+        });
+
+        let response = self.runtime.attach(request).await?;
         Ok(response.into_inner())
     }
 }

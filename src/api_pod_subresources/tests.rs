@@ -420,6 +420,72 @@ async fn test_remote_websocket_exec_accepts_upgrade_instead_of_bad_request() {
 }
 
 #[tokio::test]
+async fn test_remote_websocket_attach_accepts_upgrade_instead_of_not_implemented() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let mut state = crate::api::test_support::build_test_app_state().await;
+    let remote_node = format!("{}-worker", state.config.node_name);
+    state.replication = Some(Arc::new(crate::replication::ReplicationService::new(
+        state.db.clone(),
+        state.task_supervisor.clone(),
+    )));
+    state
+        .db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "remote-attach-ws",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "remote-attach-ws",
+                    "namespace": "default",
+                    "uid": "remote-attach-ws-uid"
+                },
+                "spec": {
+                    "nodeName": remote_node,
+                    "containers": [{"name": "shell", "image": "busybox"}]
+                },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{
+                        "name": "shell",
+                        "containerID": "containerd://remote-container"
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let app = crate::api::build_router(state);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/namespaces/default/pods/remote-attach-ws/attach?stdin=1&stdout=1&stderr=1&tty=1")
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .header(header::SEC_WEBSOCKET_PROTOCOL, "v5.channel.k8s.io")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(
+        resp.headers()
+            .get(header::SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|v| v.to_str().ok()),
+        Some("v5.channel.k8s.io")
+    );
+}
+
+#[tokio::test]
 async fn test_remote_pod_log_websocket_accepts_upgrade_before_proxying() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -1610,6 +1676,7 @@ async fn test_spdy_exec_streams_stdout_and_error_to_client_stream_ids() {
                 stdout: true,
                 stderr: false,
                 tty: false,
+                attach: false,
             },
             &supervisor,
         )
@@ -1725,6 +1792,7 @@ async fn test_spdy_exec_accepts_stdout_only_client_when_only_stdout_requested() 
                 stdout: true,
                 stderr: false,
                 tty: false,
+                attach: false,
             },
             &supervisor,
         )
@@ -1760,6 +1828,7 @@ fn test_containerd_spdy_bridge_waits_for_container_close_when_stdout_was_request
         stdout: true,
         stderr: false,
         tty: false,
+        attach: false,
     });
     let status = exec_exit_status(0).to_string();
 
@@ -1788,6 +1857,7 @@ fn test_containerd_spdy_bridge_completes_terminal_status_when_no_output_requeste
         stdout: false,
         stderr: false,
         tty: false,
+        attach: false,
     });
     let status = exec_exit_status(0).to_string();
 

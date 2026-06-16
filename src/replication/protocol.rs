@@ -179,6 +179,7 @@ pub struct NodeExecRequest {
     pub stdin: bool,
     pub stdout: bool,
     pub stderr: bool,
+    pub attach: bool,
 }
 
 /// One data/control frame for a node-local streaming Exec session.

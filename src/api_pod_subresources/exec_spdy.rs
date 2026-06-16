@@ -20,6 +20,7 @@ pub struct SpdyExecStreamRequest {
     pub stdout: bool,
     pub stderr: bool,
     pub tty: bool,
+    pub attach: bool,
 }
 
 pub struct LocalExecSpdyRequest {
@@ -314,22 +315,40 @@ where
 {
     let streaming_url = {
         let mut cri_client = target.cri.lock().await;
-        exec_with_created_state_retry(
-            &mut cri_client,
-            target.task_supervisor.as_ref(),
-            ExecRequest {
-                container_id: target.container_id,
-                command: target.command,
-                stream_options: ExecStreamOptions {
-                    tty: target.request.tty,
-                    stdin: target.request.stdin,
-                    stdout: target.request.stdout,
-                    stderr: target.request.stderr && !target.request.tty,
+        if target.request.attach {
+            attach_with_created_state_retry(
+                &mut cri_client,
+                target.task_supervisor.as_ref(),
+                AttachRequest {
+                    container_id: target.container_id,
+                    stream_options: ExecStreamOptions {
+                        tty: target.request.tty,
+                        stdin: target.request.stdin,
+                        stdout: target.request.stdout,
+                        stderr: target.request.stderr && !target.request.tty,
+                    },
                 },
-            },
-        )
-        .await?
-        .url
+            )
+            .await?
+            .url
+        } else {
+            exec_with_created_state_retry(
+                &mut cri_client,
+                target.task_supervisor.as_ref(),
+                ExecRequest {
+                    container_id: target.container_id,
+                    command: target.command,
+                    stream_options: ExecStreamOptions {
+                        tty: target.request.tty,
+                        stdin: target.request.stdin,
+                        stdout: target.request.stdout,
+                        stderr: target.request.stderr && !target.request.tty,
+                    },
+                },
+            )
+            .await?
+            .url
+        }
     };
 
     let mut containerd_stream = SpdyExec::connect_to_streaming_url(&streaming_url).await?;
@@ -549,6 +568,7 @@ where
             stdin: request.stdin,
             stdout: request.stdout,
             stderr: request.stderr,
+            attach: request.attach,
         })
         .await;
 

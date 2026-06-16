@@ -191,6 +191,7 @@ message NodeExecRequest {
   bool stdin = 8;
   bool stdout = 9;
   bool stderr = 10;
+  bool attach = 11;
 }
 
 message NodeExecStreamFrame {

@@ -1737,6 +1737,7 @@ mod cases {
                 stdin: true,
                 stdout: true,
                 stderr: true,
+                attach: false,
             })
             .await
             .unwrap();

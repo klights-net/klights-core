@@ -48,11 +48,17 @@ pub struct ExecRequest<'a> {
     pub stream_options: ExecStreamOptions,
 }
 
+pub struct AttachRequest<'a> {
+    pub container_id: &'a str,
+    pub stream_options: ExecStreamOptions,
+}
+
 struct LocalPodExecSpdyStreamRequest {
     req: Request,
     cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
     target: ExecTarget,
     stream_options: ExecStreamOptions,
+    attach: bool,
 }
 
 struct RemotePodExecStreamRequest {
@@ -60,6 +66,7 @@ struct RemotePodExecStreamRequest {
     node_name: String,
     target: ExecTarget,
     stream_options: ExecStreamOptions,
+    attach: bool,
 }
 
 struct RemotePodExecSyncRequest {
@@ -135,6 +142,7 @@ pub async fn pod_exec(
                         command,
                     },
                     stream_options,
+                    attach: false,
                 },
             )
             .await;
@@ -173,6 +181,7 @@ pub async fn pod_exec(
                     command,
                 },
                 stream_options,
+                attach: false,
             },
         )
         .await;
@@ -196,6 +205,7 @@ pub async fn pod_exec(
                     command,
                 },
                 stream_options,
+                attach: false,
             },
         )
         .await
@@ -259,6 +269,7 @@ pub async fn pod_exec(
                                     target,
                                     subprotocol: selected_subprotocol,
                                     stream_options,
+                                    attach: false,
                                 },
                             )
                             .await;
@@ -307,13 +318,14 @@ async fn pod_exec_local_spdy_stream(
         cri,
         target,
         stream_options,
+        attach,
     } = request;
 
     if stream_options.stdin || stream_options.tty {
-        return Err(AppError::BadRequest(
-            "SPDY exec currently supports non-interactive commands; use WebSocket for stdin/tty"
-                .to_string(),
-        ));
+        return Err(AppError::BadRequest(format!(
+            "SPDY {} currently supports non-interactive streams; use WebSocket for stdin/tty",
+            if attach { "attach" } else { "exec" }
+        )));
     }
 
     let selected_subprotocol =
@@ -326,6 +338,7 @@ async fn pod_exec_local_spdy_stream(
         stdout: stream_options.stdout,
         stderr: stream_options.stderr,
         tty: stream_options.tty,
+        attach,
     };
 
     if let Err(err) = task_supervisor
@@ -370,9 +383,13 @@ async fn pod_exec_remote_websocket_stream(
         node_name,
         target,
         stream_options,
+        attach,
     } = request;
     let replication = state.replication.as_ref().cloned().ok_or_else(|| {
-        AppError::Internal("replication service not available for remote pod exec".to_string())
+        AppError::Internal(format!(
+            "replication service not available for remote pod {}",
+            if attach { "attach" } else { "exec" }
+        ))
     })?;
 
     let ws_key = req
@@ -393,7 +410,10 @@ async fn pod_exec_remote_websocket_stream(
         .task_supervisor
         .spawn_async(
             crate::task_supervisor::TaskCategory::Others,
-            "pod_exec_remote_websocket_stream_upgrade",
+            format!(
+                "pod_{}_remote_websocket_stream_upgrade",
+                if attach { "attach" } else { "exec" }
+            ),
             async move {
                 match on_upgrade.await {
                     Ok(upgraded) => {
@@ -420,6 +440,7 @@ async fn pod_exec_remote_websocket_stream(
                                 stdin: stream_options.stdin,
                                 stdout: stream_options.stdout,
                                 stderr: stream_options.stderr,
+                                attach,
                             })
                             .await
                         {
@@ -432,6 +453,7 @@ async fn pod_exec_remote_websocket_stream(
                                         target: handler_target,
                                         subprotocol: selected_subprotocol,
                                         stream_options,
+                                        attach,
                                     },
                                 )
                                 .await;
@@ -477,17 +499,22 @@ async fn pod_exec_remote_spdy_stream(
         node_name,
         target,
         stream_options,
+        attach,
     } = request;
 
     if stream_options.stdin || stream_options.tty {
         return Err(AppError::BadRequest(format!(
-            "SPDY exec for pod on remote node '{}' currently supports non-interactive commands; use WebSocket for stdin/tty",
+            "SPDY {} for pod on remote node '{}' currently supports non-interactive streams; use WebSocket for stdin/tty",
+            if attach { "attach" } else { "exec" },
             node_name
         )));
     }
 
     let replication = state.replication.as_ref().cloned().ok_or_else(|| {
-        AppError::Internal("replication service not available for remote pod exec".to_string())
+        AppError::Internal(format!(
+            "replication service not available for remote pod {}",
+            if attach { "attach" } else { "exec" }
+        ))
     })?;
     let selected_subprotocol =
         crate::api_pod_subresources::exec_spdy::negotiate_spdy_subprotocol(req.headers());
@@ -498,6 +525,7 @@ async fn pod_exec_remote_spdy_stream(
         stdout: stream_options.stdout,
         stderr: stream_options.stderr,
         tty: stream_options.tty,
+        attach,
     };
 
     let on_upgrade = hyper::upgrade::on(req);
@@ -622,12 +650,12 @@ pub async fn pod_attach(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
     RawQuery(query): RawQuery,
-    _req: Request,
+    req: Request,
 ) -> Result<Response, AppError> {
     let query_str = query.unwrap_or_default();
     let (container, stdin, stdout, stderr, tty) = parse_attach_query(&query_str);
 
-    let _pod = crate::kubelet::pod_repository::PodReader::get_pod(
+    let pod = crate::kubelet::pod_repository::PodReader::get_pod(
         state.pod_repository.as_ref(),
         &namespace,
         &name,
@@ -655,8 +683,8 @@ pub async fn pod_attach(
             api_version: "v1",
             kind: "Pod",
             operation: "CONNECT",
-            namespace: Some(namespace),
-            name: Some(name),
+            namespace: Some(namespace.clone()),
+            name: Some(name.clone()),
             object: attach_options,
             old_object: None,
             dry_run: false,
@@ -666,14 +694,152 @@ pub async fn pod_attach(
     )
     .await?;
 
-    let container_msg = container
-        .as_deref()
-        .map(|c| format!(" for container '{}'", c))
-        .unwrap_or_default();
-    Err(AppError::NotImplemented(format!(
-        "Pod attach{} is not implemented yet",
-        container_msg
-    )))
+    let container_id = extract_container_id(&pod.data, container.as_deref())?;
+    let stream_options = ExecStreamOptions {
+        stdin,
+        stdout,
+        stderr,
+        tty,
+    };
+    let remote_node = remote_pod_node_name(&pod.data, &state.config.node_name);
+    let target = ExecTarget {
+        namespace,
+        pod_name: name,
+        container_id,
+        command: Vec::new(),
+    };
+
+    let upgrade_header = req
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if let Some(node_name) = remote_node {
+        if crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers()) {
+            return pod_exec_remote_spdy_stream(
+                state,
+                RemotePodExecStreamRequest {
+                    req,
+                    node_name,
+                    target,
+                    stream_options,
+                    attach: true,
+                },
+            )
+            .await;
+        }
+        if !upgrade_header.eq_ignore_ascii_case("websocket") {
+            return Err(AppError::BadRequest(format!(
+                "Pod attach for pod on remote node '{}' requires WebSocket upgrade",
+                node_name
+            )));
+        }
+        return pod_exec_remote_websocket_stream(
+            state,
+            RemotePodExecStreamRequest {
+                req,
+                node_name,
+                target,
+                stream_options,
+                attach: true,
+            },
+        )
+        .await;
+    }
+
+    if crate::api_pod_subresources::exec_spdy::is_spdy_upgrade(req.headers()) {
+        let cri_arc = state.cri.as_ref().cloned().ok_or_else(|| {
+            AppError::Internal("CRI client not available (containerd not running)".to_string())
+        })?;
+        pod_exec_local_spdy_stream(
+            state,
+            LocalPodExecSpdyStreamRequest {
+                req,
+                cri: cri_arc,
+                target,
+                stream_options,
+                attach: true,
+            },
+        )
+        .await
+    } else if upgrade_header.eq_ignore_ascii_case("websocket") {
+        let cri_arc = state.cri.as_ref().cloned().ok_or_else(|| {
+            AppError::Internal("CRI client not available (containerd not running)".to_string())
+        })?;
+        let ws_key = req
+            .headers()
+            .get(header::SEC_WEBSOCKET_KEY)
+            .ok_or_else(|| AppError::BadRequest("Missing Sec-WebSocket-Key header".to_string()))?
+            .clone();
+
+        let subprotocol = negotiate_websocket_subprotocol(req.headers()).ok_or_else(|| {
+            AppError::BadRequest("Missing or unsupported Sec-WebSocket-Protocol".to_string())
+        })?;
+        let selected_subprotocol = subprotocol.clone();
+        let task_supervisor = state.task_supervisor.clone();
+        let on_upgrade = hyper::upgrade::on(req);
+
+        if let Err(err) = state
+            .task_supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::Others,
+                "pod_attach_ws_upgrade",
+                async move {
+                    match on_upgrade.await {
+                        Ok(upgraded) => {
+                            use hyper_util::rt::TokioIo;
+                            use tokio_tungstenite::WebSocketStream;
+
+                            let io = TokioIo::new(upgraded);
+                            let ws_stream = WebSocketStream::from_raw_socket(
+                                io,
+                                tokio_tungstenite::tungstenite::protocol::Role::Server,
+                                None,
+                            )
+                            .await;
+
+                            handle_exec_websocket_tungstenite(
+                                ws_stream,
+                                ExecWebSocketRequest {
+                                    cri: cri_arc,
+                                    task_supervisor,
+                                    target,
+                                    subprotocol: selected_subprotocol,
+                                    stream_options,
+                                    attach: true,
+                                },
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            tracing::error!("WebSocket attach upgrade failed: {}", e);
+                        }
+                    }
+                },
+            )
+            .await
+        {
+            tracing::warn!("Failed to spawn pod attach WebSocket upgrade task: {}", err);
+        }
+
+        Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header(header::UPGRADE, "websocket")
+            .header(header::CONNECTION, "Upgrade")
+            .header(
+                header::SEC_WEBSOCKET_ACCEPT,
+                derive_websocket_accept_key(&ws_key),
+            )
+            .header(header::SEC_WEBSOCKET_PROTOCOL, subprotocol)
+            .body(axum::body::Body::empty())
+            .map_err(|e| AppError::Internal(format!("Failed to build WebSocket response: {}", e)))
+    } else {
+        Err(AppError::BadRequest(format!(
+            "Invalid Upgrade header: {}. WebSocket upgrade required",
+            upgrade_header
+        )))
+    }
 }
 
 // Derive Sec-WebSocket-Accept key from Sec-WebSocket-Key (RFC 6455)
@@ -976,6 +1142,76 @@ pub async fn exec_with_created_state_retry(
         .exec(
             container_id,
             command,
+            stream_options.tty,
+            stream_options.stdin,
+            stream_options.stdout,
+            stream_options.stderr,
+        )
+        .await
+}
+
+pub async fn attach_with_created_state_retry(
+    cri_client: &mut crate::kubelet::cri::CriClient,
+    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    request: AttachRequest<'_>,
+) -> anyhow::Result<k8s_cri::v1::AttachResponse> {
+    use std::time::Duration;
+
+    let AttachRequest {
+        container_id,
+        stream_options,
+    } = request;
+    let first = cri_client
+        .attach(
+            container_id,
+            stream_options.tty,
+            stream_options.stdin,
+            stream_options.stdout,
+            stream_options.stderr,
+        )
+        .await;
+    if first
+        .as_ref()
+        .err()
+        .map(|e| e.to_string().contains("CONTAINER_CREATED state"))
+        != Some(true)
+    {
+        return first;
+    }
+
+    let _ = task_supervisor
+        .sleep(
+            "attach_retry_created_state_250ms",
+            Duration::from_millis(250),
+        )
+        .await;
+    let second = cri_client
+        .attach(
+            container_id,
+            stream_options.tty,
+            stream_options.stdin,
+            stream_options.stdout,
+            stream_options.stderr,
+        )
+        .await;
+    if second
+        .as_ref()
+        .err()
+        .map(|e| e.to_string().contains("CONTAINER_CREATED state"))
+        != Some(true)
+    {
+        return second;
+    }
+
+    let _ = task_supervisor
+        .sleep(
+            "attach_retry_created_state_500ms",
+            Duration::from_millis(500),
+        )
+        .await;
+    cri_client
+        .attach(
+            container_id,
             stream_options.tty,
             stream_options.stdin,
             stream_options.stdout,

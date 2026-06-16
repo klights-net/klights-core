@@ -460,22 +460,40 @@ async fn run_cri_node_exec_stream(
 
     let streaming_url = {
         let mut cri_client = cri.lock().await;
-        crate::api_pod_subresources::exec_with_created_state_retry(
-            &mut cri_client,
-            task_supervisor.as_ref(),
-            crate::api_pod_subresources::ExecRequest {
-                container_id: &request.container_id,
-                command: &request.command,
-                stream_options: crate::api_pod_subresources::ExecStreamOptions {
-                    tty: request.tty,
-                    stdin: request.stdin,
-                    stdout: request.stdout,
-                    stderr: request.stderr && !request.tty,
+        if request.attach {
+            crate::api_pod_subresources::attach_with_created_state_retry(
+                &mut cri_client,
+                task_supervisor.as_ref(),
+                crate::api_pod_subresources::AttachRequest {
+                    container_id: &request.container_id,
+                    stream_options: crate::api_pod_subresources::ExecStreamOptions {
+                        tty: request.tty,
+                        stdin: request.stdin,
+                        stdout: request.stdout,
+                        stderr: request.stderr && !request.tty,
+                    },
                 },
-            },
-        )
-        .await?
-        .url
+            )
+            .await?
+            .url
+        } else {
+            crate::api_pod_subresources::exec_with_created_state_retry(
+                &mut cri_client,
+                task_supervisor.as_ref(),
+                crate::api_pod_subresources::ExecRequest {
+                    container_id: &request.container_id,
+                    command: &request.command,
+                    stream_options: crate::api_pod_subresources::ExecStreamOptions {
+                        tty: request.tty,
+                        stdin: request.stdin,
+                        stdout: request.stdout,
+                        stderr: request.stderr && !request.tty,
+                    },
+                },
+            )
+            .await?
+            .url
+        }
     };
 
     let mut containerd_stream = SpdyExec::connect_to_streaming_url(&streaming_url).await?;
@@ -3028,6 +3046,7 @@ fn node_exec_request_from_proto(request: generated::NodeExecRequest) -> NodeExec
         stdin: request.stdin,
         stdout: request.stdout,
         stderr: request.stderr,
+        attach: request.attach,
     }
 }
 

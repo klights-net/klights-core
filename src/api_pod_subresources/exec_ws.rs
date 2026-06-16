@@ -65,6 +65,7 @@ pub struct ExecWebSocketRequest {
     pub target: ExecTarget,
     pub subprotocol: String,
     pub stream_options: ExecStreamOptions,
+    pub attach: bool,
 }
 
 pub struct RemoteExecWebSocketRequest {
@@ -73,6 +74,7 @@ pub struct RemoteExecWebSocketRequest {
     pub target: ExecTarget,
     pub subprotocol: String,
     pub stream_options: ExecStreamOptions,
+    pub attach: bool,
 }
 
 pub struct RemoteExecWebSocketSyncRequest {
@@ -99,6 +101,7 @@ pub async fn handle_exec_websocket_tungstenite<S>(
         target,
         subprotocol,
         stream_options,
+        attach,
     } = request;
     let ExecTarget {
         namespace,
@@ -107,10 +110,13 @@ pub async fn handle_exec_websocket_tungstenite<S>(
         command,
     } = target;
     let stdin = stream_options.stdin;
+    let stdout = stream_options.stdout;
+    let stderr = stream_options.stderr;
     let tty = stream_options.tty;
 
     tracing::info!(
-        "kubectl exec (POST WebSocket): pod={}/{}, container={}, command={:?}, stdin={}, tty={}",
+        "kubectl {} (POST WebSocket): pod={}/{}, container={}, command={:?}, stdin={}, tty={}",
+        if attach { "attach" } else { "exec" },
         namespace,
         pod_name,
         container_id,
@@ -122,8 +128,9 @@ pub async fn handle_exec_websocket_tungstenite<S>(
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut peer_closed = false;
 
-    // Interactive mode: stdin=true or tty=true
-    if stdin || tty {
+    // Attach is always a streaming operation. Exec only needs the streaming
+    // path for stdin/TTY; non-interactive exec can use ExecSync below.
+    if attach || stdin || tty {
         // Use CRI Exec API instead of nsenter
         // 1. Call CRI Exec to get streaming URL
         // 2. Connect to containerd streaming server with SPDY upgrade
@@ -131,7 +138,8 @@ pub async fn handle_exec_websocket_tungstenite<S>(
         // 4. Bridge kubectl WebSocket <-> containerd SPDY
 
         tracing::info!(
-            "kubectl exec (CRI): pod={}/{}, container={}, command={:?}, stdin={}, tty={}",
+            "kubectl {} (CRI): pod={}/{}, container={}, command={:?}, stdin={}, tty={}",
+            if attach { "attach" } else { "exec" },
             namespace,
             pod_name,
             container_id,
@@ -143,29 +151,56 @@ pub async fn handle_exec_websocket_tungstenite<S>(
         // Step 1: Call CRI Exec to get streaming URL
         let streaming_url = {
             let mut cri_client = cri.lock().await;
-            match exec_with_created_state_retry(
-                &mut cri_client,
-                task_supervisor.as_ref(),
-                ExecRequest {
-                    container_id: &container_id,
-                    command: &command,
-                    stream_options: ExecStreamOptions {
-                        tty,
-                        stdin,
-                        stdout: true,
-                        stderr: !tty,
+            let stream_result = if attach {
+                attach_with_created_state_retry(
+                    &mut cri_client,
+                    task_supervisor.as_ref(),
+                    AttachRequest {
+                        container_id: &container_id,
+                        stream_options: ExecStreamOptions {
+                            tty,
+                            stdin,
+                            stdout,
+                            stderr: stderr && !tty,
+                        },
                     },
-                },
-            )
-            .await
-            {
-                Ok(resp) => resp.url,
+                )
+                .await
+                .map(|resp| resp.url)
+            } else {
+                exec_with_created_state_retry(
+                    &mut cri_client,
+                    task_supervisor.as_ref(),
+                    ExecRequest {
+                        container_id: &container_id,
+                        command: &command,
+                        stream_options: ExecStreamOptions {
+                            tty,
+                            stdin,
+                            stdout,
+                            stderr: stderr && !tty,
+                        },
+                    },
+                )
+                .await
+                .map(|resp| resp.url)
+            };
+            match stream_result {
+                Ok(url) => url,
                 Err(e) => {
-                    tracing::error!("CRI Exec failed: {}", e);
+                    tracing::error!(
+                        "CRI {} failed: {}",
+                        if attach { "Attach" } else { "Exec" },
+                        e
+                    );
                     let mut frame = vec![3u8];
                     frame.extend_from_slice(&format_websocket_error_payload(
                         &subprotocol,
-                        format!("CRI Exec failed: {}", e),
+                        format!(
+                            "CRI {} failed: {}",
+                            if attach { "Attach" } else { "Exec" },
+                            e
+                        ),
                     ));
                     let _ = ws_sender
                         .send(TungsteniteMessage::Binary(frame.into()))
@@ -182,7 +217,11 @@ pub async fn handle_exec_websocket_tungstenite<S>(
             }
         };
 
-        tracing::debug!("CRI Exec streaming URL: {}", streaming_url);
+        tracing::debug!(
+            "CRI {} streaming URL: {}",
+            if attach { "Attach" } else { "Exec" },
+            streaming_url
+        );
 
         // Step 2: Connect to containerd streaming server with SPDY upgrade
         let mut containerd_stream =
@@ -229,10 +268,11 @@ pub async fn handle_exec_websocket_tungstenite<S>(
             return;
         }
 
-        // Create stdout stream (stream ID 3)
-        if let Err(e) = spdy
-            .write_syn_stream(&mut containerd_stream, 3, crate::spdy::StreamType::Stdout)
-            .await
+        // Create stdout stream (stream ID 3) if requested
+        if stdout
+            && let Err(e) = spdy
+                .write_syn_stream(&mut containerd_stream, 3, crate::spdy::StreamType::Stdout)
+                .await
         {
             tracing::error!("Failed to create stdout SPDY stream: {}", e);
             close_websocket_gracefully(
@@ -245,8 +285,9 @@ pub async fn handle_exec_websocket_tungstenite<S>(
             return;
         }
 
-        // Create stderr stream (stream ID 5) if not tty mode
-        if !tty
+        // Create stderr stream (stream ID 5) if requested and not tty mode
+        if stderr
+            && !tty
             && let Err(e) = spdy
                 .write_syn_stream(&mut containerd_stream, 5, crate::spdy::StreamType::Stderr)
                 .await
@@ -603,6 +644,7 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
         target,
         subprotocol,
         stream_options,
+        attach,
     } = request;
     let ExecTarget {
         namespace,
@@ -614,7 +656,8 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
     let tty = stream_options.tty;
 
     tracing::info!(
-        "kubectl remote exec (POST WebSocket): pod={}/{}, container={}, command={:?}, stdin={}, tty={}",
+        "kubectl remote {} (POST WebSocket): pod={}/{}, container={}, command={:?}, stdin={}, tty={}",
+        if attach { "attach" } else { "exec" },
         namespace,
         pod_name,
         container_id,
@@ -796,7 +839,8 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
     )
     .await;
     tracing::info!(
-        "kubectl remote exec (WebSocket) completed: pod={}/{}",
+        "kubectl remote {} (WebSocket) completed: pod={}/{}",
+        if attach { "attach" } else { "exec" },
         namespace,
         pod_name
     );
