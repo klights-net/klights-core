@@ -36,8 +36,6 @@ pub use types::{BridgeName, ClusterCidr, NodeEndpoint, NodeName, PodSubnet, Vtep
 /// Default root-mode pod overlay device name retained for config compatibility
 /// while the legacy VXLAN-specific knobs are unwired.
 pub const DEFAULT_POD_OVERLAY_DEVICE: &str = "klights.vxlan";
-pub const DEFAULT_POD_OVERLAY_VNI: u32 = 1228;
-pub const DEFAULT_POD_OVERLAY_PORT: u16 = 8472;
 /// Historical pod-link MTU used when encryption is disabled.
 pub const POD_OVERLAY_MTU: u32 = 1450;
 

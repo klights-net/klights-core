@@ -57,7 +57,7 @@ impl NetworkCleanup {
         match mode {
             NodeMode::Root => Self::root_with_runtime(
                 cfg.bridge_name.clone(),
-                cfg.vxlan_device.clone(),
+                crate::networking::DEFAULT_POD_OVERLAY_DEVICE.to_string(),
                 cfg.wireguard_device.clone(),
                 cfg.containerd_namespace.clone(),
             ),
@@ -964,7 +964,6 @@ mod tests {
         let mut cfg = crate::KlightsConfig::test_default();
         cfg.bridge_name = "klights".to_string();
         cfg.containerd_namespace = "klights".to_string();
-        cfg.vxlan_device = "klights.vxlan".to_string();
         cfg.wireguard_device = "klights.wg".to_string();
 
         let cleanup = NetworkCleanup::from_config(&NodeMode::Root, &cfg);
@@ -973,7 +972,7 @@ mod tests {
         assert_eq!(
             cleanup.vxlan_device_for_test(),
             Some("klights.vxlan"),
-            "root cleanup must delete the configured VXLAN device"
+            "root cleanup keeps deleting the legacy VXLAN device until the cleanup path is removed"
         );
         assert_eq!(
             cleanup.nft_table_name_for_test(),

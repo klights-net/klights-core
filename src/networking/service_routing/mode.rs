@@ -4,8 +4,8 @@
 //! to the project default device. That breaks two ways:
 //!   1. Rootless mode never owns a VXLAN device, so the rule matches an
 //!      interface that does not exist in the user namespace.
-//!   2. Test instances and operators that override `KLIGHTS_VXLAN_DEVICE`
-//!      end up with a forward rule pinned to the wrong interface name.
+//!   2. Test instances with custom bridge/table names must not accidentally
+//!      pin the rule to an unrelated interface name.
 //!
 //! Both decisions belong in one config value handed down from the network
 //! boot layer, not buried inside `nft_table.rs`.
@@ -83,7 +83,7 @@ mod tests {
         assert_eq!(
             mode.vxlan_device(),
             "tester1.vxlan",
-            "configured KLIGHTS_VXLAN_DEVICE name must be honored, not the hardcoded default"
+            "configured routing mode device name must be honored"
         );
     }
 }

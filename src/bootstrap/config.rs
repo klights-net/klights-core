@@ -18,14 +18,6 @@ pub struct KlightsConfig {
     /// Node-local IP override for the Kubernetes Node InternalIP and local
     /// endpoint fallback. When unset, startup discovers the host IP.
     pub node_ip: Option<String>,
-    pub vxlan_vni: u32,
-    pub vxlan_port: u16,
-    /// VXLAN overlay device name (Linux IFNAMSIZ ≤ 15 chars).  Defaults to
-    /// `klights.vxlan` so production and single-instance hosts keep their
-    /// existing device.  Test instances override per slot so multiple
-    /// klights processes can coexist in the host network namespace
-    /// without colliding on link name.
-    pub vxlan_device: String,
 
     /// Dataplane encryption mode. Missing/empty env defaults to enabled.
     pub dataplane_encryption: crate::networking::wireguard::DataplaneEncryption,
@@ -123,7 +115,7 @@ impl KlightsConfig {
         namespace_override: Option<&str>,
     ) -> anyhow::Result<Self> {
         use crate::networking::{BridgeName, ClusterCidr, NodeName, PodSubnet};
-        use anyhow::{Context, anyhow};
+        use anyhow::anyhow;
 
         let containerd_namespace = namespace_override.map(str::to_string).unwrap_or_else(|| {
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string())
@@ -204,16 +196,6 @@ impl KlightsConfig {
             containerd_socket: std::env::var("KLIGHTS_CONTAINERD_SOCKET").ok(),
             node_name,
             node_ip: parse_optional_ipv4_env("KLIGHTS_NODE_IP")?,
-            vxlan_vni: parse_u32_env(
-                "KLIGHTS_VXLAN_VNI",
-                crate::networking::DEFAULT_POD_OVERLAY_VNI,
-            )
-            .context("KLIGHTS_VXLAN_VNI must be a valid u32")?,
-            vxlan_port: parse_u16_env(
-                "KLIGHTS_VXLAN_PORT",
-                crate::networking::DEFAULT_POD_OVERLAY_PORT,
-            )?,
-            vxlan_device: parse_vxlan_device_env(crate::networking::DEFAULT_POD_OVERLAY_DEVICE)?,
             dataplane_encryption: parse_dataplane_encryption_env()?,
             external_endpoint: parse_optional_trimmed_env("KLIGHTS_EXTERNAL_ENDPOINT"),
             worker_dataplane_no_ingress: parse_bool_env(
@@ -304,9 +286,6 @@ impl KlightsConfig {
             containerd_socket: None,
             node_name: "test-node".into(),
             node_ip: None,
-            vxlan_vni: 1,
-            vxlan_port: 8472,
-            vxlan_device: "klights.vxlan".into(),
             dataplane_encryption: crate::networking::wireguard::DataplaneEncryption::Enabled,
             external_endpoint: None,
             worker_dataplane_no_ingress: false,
@@ -410,39 +389,6 @@ fn parse_optional_ipv4_env(var: &str) -> anyhow::Result<Option<String>> {
     Ok(Some(value))
 }
 
-fn parse_u32_env(var: &str, default: u32) -> anyhow::Result<u32> {
-    match std::env::var(var) {
-        Ok(v) => v
-            .parse::<u32>()
-            .map_err(|e| anyhow::anyhow!("{} must be a u32: {}", var, e)),
-        Err(_) => Ok(default),
-    }
-}
-
-/// Resolve the VXLAN device name from `KLIGHTS_VXLAN_DEVICE` with the supplied
-/// fallback.  Validates that the name fits the Linux IFNAMSIZ limit (15
-/// chars) and contains no path separators or whitespace, since it lands
-/// directly in netlink RTM_NEWLINK requests.
-fn parse_vxlan_device_env(default: &str) -> anyhow::Result<String> {
-    let raw = std::env::var("KLIGHTS_VXLAN_DEVICE").unwrap_or_else(|_| default.to_string());
-    if raw.is_empty() {
-        return Err(anyhow::anyhow!("KLIGHTS_VXLAN_DEVICE must not be empty"));
-    }
-    if raw.len() > 15 {
-        return Err(anyhow::anyhow!(
-            "KLIGHTS_VXLAN_DEVICE '{}' exceeds Linux IFNAMSIZ (15 chars)",
-            raw
-        ));
-    }
-    if raw.contains('/') || raw.chars().any(char::is_whitespace) {
-        return Err(anyhow::anyhow!(
-            "KLIGHTS_VXLAN_DEVICE '{}' must not contain '/' or whitespace",
-            raw
-        ));
-    }
-    Ok(raw)
-}
-
 fn parse_wireguard_device_env(default: &str) -> anyhow::Result<String> {
     let raw = std::env::var("KLIGHTS_WIREGUARD_DEVICE").unwrap_or_else(|_| default.to_string());
     crate::networking::wireguard::parse_wireguard_device_name(&raw)
@@ -493,12 +439,6 @@ mod tests {
         unsafe { std::env::remove_var("KLIGHTS_NODE_NAME") };
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("KLIGHTS_NODE_IP") };
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("KLIGHTS_VXLAN_VNI") };
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("KLIGHTS_VXLAN_PORT") };
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("KLIGHTS_VXLAN_DEVICE") };
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("KLIGHTS_DATAPLANE_ENCRYPTION") };
         // TODO: Audit that the environment access only happens in single-threaded code.
@@ -875,83 +815,6 @@ mod tests {
         assert!(
             format!("{:#}", err).contains("KLIGHTS_POD_SUBNET"),
             "error should name the bad var, got: {:#}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_from_env_rejects_invalid_vxlan_vni() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_VXLAN_VNI", "not-a-number") };
-        let err = KlightsConfig::from_env().expect_err("must reject non-numeric VNI");
-        assert!(
-            format!("{:#}", err).contains("KLIGHTS_VXLAN_VNI"),
-            "error should name the bad var, got: {:#}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_from_env_uses_default_vxlan_device_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
-        let cfg = KlightsConfig::from_env().expect("default config must build");
-        assert_eq!(
-            cfg.vxlan_device,
-            crate::networking::DEFAULT_POD_OVERLAY_DEVICE
-        );
-    }
-
-    #[test]
-    fn test_from_env_accepts_custom_vxlan_device_within_ifnamsiz() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_VXLAN_DEVICE", "tester1.vxlan") };
-        let cfg = KlightsConfig::from_env().expect("custom device must build");
-        assert_eq!(cfg.vxlan_device, "tester1.vxlan");
-    }
-
-    #[test]
-    fn test_from_env_rejects_vxlan_device_over_ifnamsiz() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_VXLAN_DEVICE", "this-name-is-too-long") };
-        let err = KlightsConfig::from_env().expect_err("must reject 21-char device name");
-        assert!(
-            format!("{:#}", err).contains("IFNAMSIZ"),
-            "error should mention IFNAMSIZ, got: {:#}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_from_env_rejects_empty_vxlan_device() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_VXLAN_DEVICE", "") };
-        let err = KlightsConfig::from_env().expect_err("must reject empty device name");
-        assert!(
-            format!("{:#}", err).contains("must not be empty"),
-            "error should mention emptiness, got: {:#}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_from_env_rejects_vxlan_device_with_whitespace() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        clear_klights_env();
-        // TODO: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("KLIGHTS_VXLAN_DEVICE", "bad name") };
-        let err = KlightsConfig::from_env().expect_err("must reject whitespace");
-        assert!(
-            format!("{:#}", err).contains("whitespace"),
-            "error should mention whitespace, got: {:#}",
             err
         );
     }

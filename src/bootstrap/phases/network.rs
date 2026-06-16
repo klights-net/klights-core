@@ -98,7 +98,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
 
     let srm = networking::service_routing::ServiceRoutingMode::new(
         node_mode.clone(),
-        config.vxlan_device.clone(),
+        networking::DEFAULT_POD_OVERLAY_DEVICE,
     );
     let services: Arc<dyn networking::ServiceRouter> =
         networking::service_routing::NftServiceRouter::boot_with_defaults(

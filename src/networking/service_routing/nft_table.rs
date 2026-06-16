@@ -1280,14 +1280,13 @@ impl KlightsTable {
 
     /// `iifname "<vxlan_device>" accept` — allow VXLAN-decapsulated packets
     /// arriving on the configured overlay device to pass through the forward
-    /// chain. The interface name flows in from `ServiceRoutingMode` so test
-    /// instances and operators that override `KLIGHTS_VXLAN_DEVICE` get a
-    /// rule that matches their actual device, not the hardcoded default.
+    /// chain. The interface name flows in from `ServiceRoutingMode` so tests
+    /// and cleanup paths can keep one routing-mode contract.
     fn rule_vxlan_iifname_accept<'a>(&self, chain: &'a Chain<'a>) -> Rule<'a> {
         let mut rule = Rule::new(chain);
         rule.add_expr(&Meta::IifName);
         let vxlan_iface = CString::new(self.mode.vxlan_device())
-            .expect("VXLAN device name was validated by KlightsConfig parser");
+            .expect("overlay device name must not contain NUL bytes");
         rule.add_expr(&Cmp::new(CmpOp::Eq, InterfaceName::Exact(vxlan_iface)));
         rule.add_expr(&nft_expr!(verdict accept));
         rule
