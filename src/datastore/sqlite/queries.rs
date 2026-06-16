@@ -121,14 +121,30 @@ pub(super) const WATCH_REPLAY_FLOOR_FOR_NAMESPACED_ALL: &str =
 
 pub(super) const WATCH_EVENTS_GC_CANDIDATES: &str =
     "SELECT id, api_version, kind, COALESCE(namespace, '#cluster'), resource_version
-     FROM watch_events
+     FROM (
+         SELECT id, api_version, kind, namespace, resource_version,
+                ROW_NUMBER() OVER (
+                    PARTITION BY api_version, kind, COALESCE(namespace, '#cluster')
+                    ORDER BY id DESC
+                ) AS scope_rank
+         FROM watch_events
+     )
      WHERE id <= COALESCE((SELECT MAX(id) FROM watch_events), 0) - ?1
+       AND scope_rank > ?3
      ORDER BY id ASC
      LIMIT ?2";
 
 pub(super) const WATCH_EVENTS_GC_PRUNABLE_COUNT: &str = "SELECT COUNT(*) FROM (
-         SELECT id FROM watch_events
+         SELECT id FROM (
+             SELECT id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY api_version, kind, COALESCE(namespace, '#cluster')
+                        ORDER BY id DESC
+                    ) AS scope_rank
+             FROM watch_events
+         )
          WHERE id <= COALESCE((SELECT MAX(id) FROM watch_events), 0) - ?1
+           AND scope_rank > ?3
          ORDER BY id ASC
          LIMIT ?2
      )";

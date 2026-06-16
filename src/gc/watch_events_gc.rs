@@ -2,9 +2,8 @@
 //!
 //! Each tick deletes rows below `MAX(id) - MAX_WATCH_EVENTS`, capped at
 //! `BATCH_CAP_PER_TICK` rows per tick to keep the SQLite write small.
-//! Bound is by `id`, not `COUNT(*)` — no full-table scan, so the tick
-//! is O(log n) on the index and pays ~10 ms once every 5 min instead
-//! of ~100 µs per write under the per-INSERT-cap alternative.
+//! The SQLite GC also preserves a small per resource-scope floor so unrelated
+//! write bursts cannot erase rare-kind history needed by lagged watches.
 //!
 //! The 100k-row cap is configurable via `KLIGHTS_MAX_WATCH_EVENTS`.
 
@@ -129,6 +128,69 @@ mod tests {
             removed <= 30usize,
             "GC must not exceed batch cap; removed {}",
             removed
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_retains_rare_kind_history_despite_unrelated_churn() {
+        let db = crate::datastore::test_support::in_memory().await;
+
+        db.create_resource(
+            "v1",
+            "LimitRange",
+            Some("default"),
+            "limit-range",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "LimitRange",
+                "metadata": {"name": "limit-range", "namespace": "default"},
+                "spec": {
+                    "limits": [{
+                        "type": "Container",
+                        "default": {"cpu": "500m"},
+                        "defaultRequest": {"cpu": "100m"}
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        for i in 0..30 {
+            db.create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                &format!("churn-{i}"),
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": format!("churn-{i}"), "namespace": "default"},
+                    "data": {"k": "v"}
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let removed = db.gc_watch_events(5, 1000).await.unwrap();
+        assert!(removed > 0, "GC must exercise the pruning path");
+
+        let events = db
+            .list_watch_events_since(
+                &[crate::datastore::WatchTarget::namespaced_in_namespace(
+                    "v1",
+                    "LimitRange",
+                    "default",
+                )],
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "rare-kind watch history must survive unrelated resource churn"
         );
     }
 

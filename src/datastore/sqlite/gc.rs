@@ -5,6 +5,11 @@ use anyhow::Result;
 use std::collections::HashMap;
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
+const DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE: i64 = 1_024;
+
+pub(super) fn watch_events_min_scope_rows(max_rows: i64) -> i64 {
+    max_rows.clamp(1, DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE)
+}
 
 impl Datastore {
     pub async fn list_cluster_resources_modified_since(
@@ -90,7 +95,9 @@ impl Datastore {
 
     /// Garbage-collect old `watch_events` rows so the table holds a bounded
     /// sliding window of the most recent events. Returns the number of rows
-    /// deleted. The id-based bound is O(1) — no `COUNT(*)` scan.
+    /// deleted. The global id bound keeps high-churn scopes compact, while the
+    /// per-resource-scope floor prevents unrelated churn from deleting rare
+    /// resource history needed by lagged watches.
     ///
     /// Workers that fall behind this window get `RecvError::Lagged` → replay
     /// via `DatastoreWatchReplaySource`; workers further behind than the
@@ -100,11 +107,12 @@ impl Datastore {
         max_rows: i64,
         batch_cap: i64,
     ) -> Result<usize> {
+        let min_scope_rows = watch_events_min_scope_rows(max_rows);
         let count = self
             .db_call("watch_events_gc_prunable_count", move |conn| {
                 Ok(conn.query_row::<i64, _, _>(
                     queries::WATCH_EVENTS_GC_PRUNABLE_COUNT,
-                    rusqlite::params![max_rows, batch_cap],
+                    rusqlite::params![max_rows, batch_cap, min_scope_rows],
                     |row| row.get(0),
                 )? as usize)
             })
@@ -346,16 +354,20 @@ pub(super) fn gc_watch_events_in_tx(
     batch_cap: i64,
 ) -> rusqlite::Result<usize> {
     let (ids, floors) = {
+        let min_scope_rows = watch_events_min_scope_rows(max_rows);
         let mut stmt = tx.prepare(queries::WATCH_EVENTS_GC_CANDIDATES)?;
-        let rows = stmt.query_map(rusqlite::params![max_rows, batch_cap], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![max_rows, batch_cap, min_scope_rows],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
 
         let mut ids = Vec::new();
         let mut floors: HashMap<(String, String, String), i64> = HashMap::new();

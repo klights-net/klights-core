@@ -6639,26 +6639,29 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
 
     let (app, db) = build_test_router_with_db().await;
 
+    let mut template_rvs = std::collections::HashMap::new();
     for i in 0..45 {
         let name = format!("template-{i:04}");
-        db.create_resource(
-            "v1",
-            "PodTemplate",
-            Some("default"),
-            &name,
-            serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "PodTemplate",
-                "metadata": {"name": name, "namespace": "default"},
-                "template": {
-                    "spec": {
-                        "containers": [{"name": "main", "image": "registry.k8s.io/pause:3.10"}]
+        let created = db
+            .create_resource(
+                "v1",
+                "PodTemplate",
+                Some("default"),
+                &name,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PodTemplate",
+                    "metadata": {"name": name, "namespace": "default"},
+                    "template": {
+                        "spec": {
+                            "containers": [{"name": "main", "image": "registry.k8s.io/pause:3.10"}]
+                        }
                     }
-                }
-            }),
-        )
-        .await
-        .unwrap();
+                }),
+            )
+            .await
+            .unwrap();
+        template_rvs.insert(name, created.resource_version);
     }
 
     let first_resp = app
@@ -6685,26 +6688,33 @@ async fn test_paginated_continue_falls_back_to_inconsistent_after_snapshot_compa
     let first_token_data = decode_continue_token(&first_token);
     assert!(first_token_data.ts.is_some());
 
-    // Unrelated API churn can compact the global watch_events table during
-    // parallel e2e. The fresh PodTemplate continue token must still make
-    // progress rather than returning an early 410.
-    for i in 0..8 {
-        let name = format!("unrelated-{i:04}");
-        db.create_resource(
-            "v1",
-            "ConfigMap",
-            Some("default"),
-            &name,
-            serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {"name": name, "namespace": "default"},
-                "data": {"k": "v"}
-            }),
-        )
-        .await
-        .unwrap();
-    }
+    // Same-scope PodTemplate churn can compact the historical snapshot while
+    // a client still holds a fresh continue token. The token must still make
+    // progress by downgrading to an inconsistent continuation rather than
+    // returning an early 410.
+    let changed_name = "template-0020";
+    db.update_resource(
+        "v1",
+        "PodTemplate",
+        Some("default"),
+        changed_name,
+        serde_json::json!({
+            "apiVersion": "v1",
+        "kind": "PodTemplate",
+        "metadata": {"name": changed_name, "namespace": "default"},
+        "template": {
+            "metadata": {"labels": {"changed": "true"}},
+            "spec": {
+                "containers": [{"name": "main", "image": "registry.k8s.io/pause:3.10"}]
+            }
+        }
+        }),
+        *template_rvs
+            .get(changed_name)
+            .expect("changed template rv must be recorded"),
+    )
+    .await
+    .unwrap();
     db.gc_watch_events(1, 1000).await.unwrap();
 
     let compacted_resp = app
