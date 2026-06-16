@@ -20,6 +20,8 @@ pub struct PodResources {
     pub memory_ki: i64,
     /// Extended resource requests.
     pub extended: HashMap<String, i64>,
+    /// Host ports reserved by this pod.
+    pub host_port_requests: Vec<HostPortRequest>,
     /// Pod overhead (from spec.overhead) — added to effective request.
     pub overhead_cpu_milli: i64,
     /// Pod overhead memory (from spec.overhead) — added to effective request.
@@ -103,13 +105,37 @@ pub struct PodSchedulingConstraints {
     pub topology_spread_constraints: Vec<TopologySpreadConstraint>,
     pub tolerations: Vec<Toleration>,
     pub resources: PodResources,
-    pub host_port_requests: Vec<u16>,
+    pub host_port_requests: Vec<HostPortRequest>,
     /// Pod priority (from spec.priority or PriorityClass).
     pub priority: i64,
     /// Priority class name (from spec.priorityClassName).
     pub priority_class_name: Option<String>,
     /// Preemption policy.
     pub preemption_policy: Option<PreemptionPolicy>,
+}
+
+/// A host port reserved by a pod container.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostPortRequest {
+    pub port: u16,
+    pub protocol: String,
+    pub host_ip: Option<String>,
+}
+
+impl HostPortRequest {
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        self.port == other.port
+            && self.protocol.eq_ignore_ascii_case(&other.protocol)
+            && host_ips_conflict(self.host_ip.as_deref(), other.host_ip.as_deref())
+    }
+}
+
+fn host_ips_conflict(left: Option<&str>, right: Option<&str>) -> bool {
+    is_wildcard_host_ip(left) || is_wildcard_host_ip(right) || left == right
+}
+
+fn is_wildcard_host_ip(value: Option<&str>) -> bool {
+    value.is_none_or(|value| matches!(value, "" | "0.0.0.0" | "::"))
 }
 
 /// A weighted preferred node affinity term.
@@ -497,7 +523,11 @@ mod tests {
                 overhead_memory_ki: 256,
                 ..Default::default()
             },
-            host_port_requests: vec![8080],
+            host_port_requests: vec![HostPortRequest {
+                port: 8080,
+                protocol: "TCP".to_string(),
+                host_ip: None,
+            }],
             priority: 100,
             priority_class_name: Some("high-priority".into()),
             preemption_policy: Some(PreemptionPolicy::PreemptLowerPriority),

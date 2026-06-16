@@ -74,6 +74,8 @@ pub fn select_preemption_victims_with_pdbs(
                 for (k, v) in &p.resources.extended {
                     *acc.extended.entry(k.clone()).or_insert(0) += v;
                 }
+                acc.host_port_requests
+                    .extend(p.resources.host_port_requests.iter().cloned());
                 acc
             });
 
@@ -104,6 +106,7 @@ pub fn select_preemption_victims_with_pdbs(
                 candidate.resources.effective_cpu_milli(),
                 candidate.resources.effective_memory_ki(),
                 &candidate.resources.extended,
+                &candidate.resources.host_port_requests,
             )
         }) else {
             break;
@@ -119,6 +122,9 @@ pub fn select_preemption_victims_with_pdbs(
         for (k, v) in &candidate.resources.extended {
             let current = allocated.extended.entry(k.clone()).or_insert(0);
             *current = current.saturating_sub(*v);
+        }
+        for host_port in &candidate.resources.host_port_requests {
+            remove_host_port_request(&mut allocated.host_port_requests, host_port);
         }
 
         victims.push(PreemptionVictim {
@@ -207,6 +213,14 @@ fn resource_fit_failures(
             failures.push(format!("Insufficient {key}"));
         }
     }
+    if requested.host_port_requests.iter().any(|request| {
+        allocated
+            .host_port_requests
+            .iter()
+            .any(|allocated| request.conflicts_with(allocated))
+    }) {
+        failures.push("node(s) didn't have free host ports".to_string());
+    }
     failures
 }
 
@@ -218,6 +232,7 @@ fn request_relieves_fit_failure(
     candidate_cpu: i64,
     candidate_mem: i64,
     candidate_extended: &std::collections::HashMap<String, i64>,
+    candidate_host_ports: &[HostPortRequest],
 ) -> bool {
     let effective_requested_cpu = requested.effective_cpu_milli();
     let effective_requested_mem = requested.effective_memory_ki();
@@ -241,7 +256,21 @@ fn request_relieves_fit_failure(
             return true;
         }
     }
-    false
+    requested.host_port_requests.iter().any(|request| {
+        allocated
+            .host_port_requests
+            .iter()
+            .any(|allocated| request.conflicts_with(allocated))
+            && candidate_host_ports
+                .iter()
+                .any(|candidate| request.conflicts_with(candidate))
+    })
+}
+
+fn remove_host_port_request(allocated: &mut Vec<HostPortRequest>, request: &HostPortRequest) {
+    if let Some(index) = allocated.iter().position(|item| item == request) {
+        allocated.swap_remove(index);
+    }
 }
 
 #[cfg(test)]

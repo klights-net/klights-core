@@ -233,7 +233,9 @@ fn try_preemption(
 }
 
 fn preemption_recoverable_reason(reason: &str) -> bool {
-    reason == "Too many pods" || reason.starts_with("Insufficient ")
+    reason == "Too many pods"
+        || reason.starts_with("Insufficient ")
+        || reason == "node(s) didn't have free host ports"
 }
 
 fn resources_after_preemption(
@@ -1053,6 +1055,89 @@ mod tests {
 
         assert!(decision.is_success(), "{decision:?}");
         assert_eq!(decision.selected_node, Some("node-b".into()));
+    }
+
+    #[test]
+    fn schedule_from_json_rejects_host_port_conflict_when_only_node_matches() {
+        let node_a = json!({
+            "metadata": {"name": "node-a"},
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let existing = json!({
+            "metadata": {"namespace": "default", "name": "existing"},
+            "spec": {
+                "nodeName": "node-a",
+                "containers": [{
+                    "name": "main",
+                    "image": "pause",
+                    "ports": [{"containerPort": 8080, "hostPort": 32080, "protocol": "TCP"}]
+                }]
+            }
+        });
+        let incoming = json!({
+            "metadata": {"namespace": "default", "name": "incoming"},
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "image": "pause",
+                    "ports": [{"containerPort": 8080, "hostPort": 32080, "protocol": "TCP"}]
+                }]
+            }
+        });
+
+        let decision = schedule_from_json(&[&node_a], &incoming, &[("node-a", &[&existing])]);
+
+        assert!(!decision.is_success(), "{decision:?}");
+        assert!(
+            decision
+                .failed_reasons
+                .iter()
+                .any(|reason| reason.contains("host port")),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn schedule_from_json_preempts_lower_priority_host_port_holder() {
+        let node_a = json!({
+            "metadata": {"name": "node-a"},
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let existing = json!({
+            "metadata": {"namespace": "default", "name": "existing"},
+            "spec": {
+                "nodeName": "node-a",
+                "priority": 10,
+                "containers": [{
+                    "name": "main",
+                    "image": "pause",
+                    "ports": [{"containerPort": 8080, "hostPort": 32080, "protocol": "TCP"}]
+                }]
+            }
+        });
+        let incoming = json!({
+            "metadata": {"namespace": "default", "name": "incoming"},
+            "spec": {
+                "priority": 100,
+                "containers": [{
+                    "name": "main",
+                    "image": "pause",
+                    "ports": [{"containerPort": 8080, "hostPort": 32080, "protocol": "TCP"}]
+                }]
+            }
+        });
+
+        let decision = schedule_from_json(&[&node_a], &incoming, &[("node-a", &[&existing])]);
+
+        assert!(decision.is_success(), "{decision:?}");
+        assert_eq!(decision.selected_node, Some("node-a".into()));
+        assert_eq!(decision.preemption_victims, vec!["default/existing"]);
     }
 
     #[test]

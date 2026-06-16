@@ -563,8 +563,26 @@ fn check_resource_fit(
         }
     }
 
+    if host_port_conflict(&pod.host_port_requests, existing_pod_resources) {
+        failures.push("node(s) didn't have free host ports".to_string());
+    }
+
     // Return the first failure (or None)
     failures.into_iter().next()
+}
+
+fn host_port_conflict(
+    requested: &[HostPortRequest],
+    existing_pod_resources: &[PodResources],
+) -> bool {
+    requested.iter().any(|request| {
+        existing_pod_resources.iter().any(|existing| {
+            existing
+                .host_port_requests
+                .iter()
+                .any(|allocated| request.conflicts_with(allocated))
+        })
+    })
 }
 
 #[cfg(test)]
@@ -868,14 +886,26 @@ mod tests {
 
     #[test]
     fn host_port_conflict_same_node() {
-        // HostPort conflicts are checked at a higher level (the scoring phase),
-        // not at the predicate level. The predicate just checks resources.
-        // This test documents that HostPort checking is NOT a predicate.
         let node = make_node("node-a");
         let mut pod = make_pod();
-        pod.host_port_requests.push(8080);
-        // Should still pass predicates
-        assert!(node_fit(&node, &pod, &[]).is_empty());
+        pod.host_port_requests.push(HostPortRequest {
+            port: 8080,
+            protocol: "TCP".to_string(),
+            host_ip: None,
+        });
+        let existing = vec![PodResources {
+            host_port_requests: vec![HostPortRequest {
+                port: 8080,
+                protocol: "TCP".to_string(),
+                host_ip: None,
+            }],
+            ..Default::default()
+        }];
+        let reasons = node_fit(&node, &pod, &existing);
+        assert!(
+            reasons.iter().any(|reason| reason.contains("host ports")),
+            "{reasons:?}"
+        );
     }
 
     // ---- matchFields (node affinity) ----

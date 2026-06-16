@@ -125,6 +125,7 @@ pub fn extract_pod_constraints(pod_value: &serde_json::Value) -> PodSchedulingCo
         .unwrap_or_default();
 
     let resources = extract_pod_resources(pod_value);
+    let host_port_requests = resources.host_port_requests.clone();
 
     let priority = pod_value
         .pointer("/spec/priority")
@@ -157,7 +158,7 @@ pub fn extract_pod_constraints(pod_value: &serde_json::Value) -> PodSchedulingCo
         topology_spread_constraints,
         tolerations,
         resources,
-        host_port_requests: Vec::new(), // Not needed for scheduling predicates
+        host_port_requests,
         priority,
         priority_class_name,
         preemption_policy,
@@ -526,9 +527,49 @@ fn extract_pod_resources(pod_value: &serde_json::Value) -> PodResources {
         cpu_milli,
         memory_ki,
         extended,
+        host_port_requests: extract_host_port_requests(pod_value),
         overhead_cpu_milli,
         overhead_memory_ki,
     }
+}
+
+fn extract_host_port_requests(pod_value: &serde_json::Value) -> Vec<HostPortRequest> {
+    let mut requests = Vec::new();
+    for container_path in &["/spec/initContainers", "/spec/containers"] {
+        let Some(containers) = pod_value.pointer(container_path).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for container in containers {
+            let Some(ports) = container.get("ports").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for port in ports {
+                let Some(host_port) = port.get("hostPort").and_then(|v| v.as_i64()) else {
+                    continue;
+                };
+                if !(1..=u16::MAX as i64).contains(&host_port) {
+                    continue;
+                }
+                let protocol = port
+                    .get("protocol")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("TCP")
+                    .to_string();
+                let host_ip = port
+                    .get("hostIP")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string);
+                requests.push(HostPortRequest {
+                    port: host_port as u16,
+                    protocol,
+                    host_ip,
+                });
+            }
+        }
+    }
+    requests
 }
 
 fn extract_pod_extended_resources(pod_value: &serde_json::Value) -> HashMap<String, i64> {
