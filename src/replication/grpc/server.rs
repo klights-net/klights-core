@@ -8,7 +8,7 @@ use tonic::{Request, Response, Status, metadata::MetadataMap};
 use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{ResourcePreconditions, WatchTarget};
+use crate::datastore::{Resource, ResourcePreconditions, WatchTarget};
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use crate::replication::grpc::{
     JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, log_apply_commit_to_proto,
@@ -18,6 +18,7 @@ use crate::replication::protocol::{
     NodeExecStreamFrame, NodeExecSyncRequest, NodeExecSyncResponse, PodLogRequest, PodLogResponse,
 };
 use crate::replication::service::ReplicationService;
+use crate::watch::WatchEventSelection;
 
 use super::ca_files::ControlplaneCaFiles;
 use super::snapshot_cache::SnapshotCache;
@@ -1826,36 +1827,7 @@ fn pod_cleanup_intent_to_proto(
 }
 
 fn resource_from_event(event: &crate::watch::WatchEvent) -> crate::datastore::Resource {
-    let namespace = event
-        .object
-        .pointer("/metadata/namespace")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    crate::datastore::Resource {
-        id: 0,
-        api_version: event
-            .object
-            .get("apiVersion")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        kind: event
-            .object
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        namespace,
-        name: event
-            .object
-            .pointer("/metadata/name")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        uid: crate::datastore::Resource::uid_from_data(&event.object),
-        resource_version: crate::utils::extract_resource_version_from_object(&event.object),
-        data: event.object.clone(),
-    }
+    Resource::from_watch_event_ref(event)
 }
 
 fn watch_event_type(event: &crate::watch::WatchEvent) -> &'static str {
@@ -1885,26 +1857,11 @@ fn watch_event_matches(
     event: &crate::watch::WatchEvent,
     req: &generated::WatchResourcesRequest,
 ) -> bool {
-    if event.object.get("apiVersion").and_then(|v| v.as_str()) != Some(req.api_version.as_str()) {
-        return false;
-    }
-    if event.object.get("kind").and_then(|v| v.as_str()) != Some(req.kind.as_str()) {
-        return false;
-    }
-    if let Some(ref ns) = req.namespace
-        && event
-            .object
-            .pointer("/metadata/namespace")
-            .and_then(|v| v.as_str())
-            != Some(ns.as_str())
-    {
-        return false;
-    }
-    event.matches_filter(
-        &req.kind,
-        req.namespace.as_deref(),
-        req.label_selector.as_deref(),
-    ) && event.matches_field_selector(req.field_selector.as_deref())
+    WatchEventSelection::new(&req.api_version, &req.kind)
+        .namespace(req.namespace.as_deref())
+        .label_selector(req.label_selector.as_deref())
+        .field_selector(req.field_selector.as_deref())
+        .matches(event)
 }
 
 fn watch_cursor_error_to_status(err: crate::watch::WatchCursorError, accepted_rv: i64) -> Status {

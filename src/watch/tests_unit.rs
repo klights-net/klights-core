@@ -112,6 +112,33 @@ fn test_matches_filter_namespaced_event_without_namespace_returns_false() {
     assert!(!event.matches_filter("Pod", Some("default"), None));
 }
 
+#[test]
+fn watch_event_selection_matches_api_kind_namespace_label_and_field() {
+    let event = WatchEvent::added(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "frontend",
+            "namespace": "default",
+            "labels": {"app": "web"}
+        },
+        "spec": {"nodeName": "node-a"}
+    }));
+    let selection = WatchEventSelection::new("v1", "Pod")
+        .namespace(Some("default"))
+        .label_selector(Some("app=web"))
+        .field_selector(Some("spec.nodeName=node-a"));
+
+    assert!(selection.matches(&event));
+    assert!(
+        !selection
+            .clone()
+            .field_selector(Some("spec.nodeName=node-b"))
+            .matches(&event)
+    );
+    assert!(!WatchEventSelection::new("apps/v1", "Pod").matches(&event));
+}
+
 #[tokio::test]
 async fn test_broadcast_lag_recovers_remaining_messages() {
     use tokio::sync::broadcast;

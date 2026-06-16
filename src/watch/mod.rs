@@ -6,6 +6,7 @@ pub mod events;
 mod filter;
 mod replay;
 mod scope;
+mod selection;
 mod signal_cursor;
 mod window;
 
@@ -23,6 +24,7 @@ pub use events::{
 pub use filter::WatchEventFilter;
 pub use replay::{WatchCursorError, WatchReplaySource};
 pub use scope::WatchDeliveryScope;
+pub use selection::WatchEventSelection;
 pub use signal_cursor::SignalWatchCursor;
 pub use window::WindowPolicy;
 

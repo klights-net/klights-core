@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use tokio::sync::{Notify, RwLock};
 
 use crate::control_plane::client::{CacheScope, ListRequest, ResourceEvent, ResourceKey};
@@ -77,7 +77,7 @@ impl InformerCache {
         if event.event.event_type == EventType::Bookmark {
             return Ok(None);
         }
-        let resource = resource_from_watch_event(event)?;
+        let resource = Resource::try_from_watch_event(&event.event)?;
         let key = resource_cache_key(
             &resource.api_version,
             &resource.kind,
@@ -170,37 +170,4 @@ fn label_selector_matches(resource: &Resource, selector: Option<&str>) -> bool {
     crate::label_selector::LabelSelector::parse(selector)
         .map(|parsed| parsed.matches_resource(&resource.data))
         .unwrap_or(false)
-}
-
-fn resource_from_watch_event(event: &ResourceEvent) -> Result<Resource> {
-    let object = event.event.object.clone();
-    let api_version = object
-        .get("apiVersion")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow!("watch event missing apiVersion"))?
-        .to_string();
-    let kind = object
-        .get("kind")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow!("watch event missing kind"))?
-        .to_string();
-    let name = object
-        .pointer("/metadata/name")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| anyhow!("watch event missing metadata.name"))?
-        .to_string();
-    let namespace = object
-        .pointer("/metadata/namespace")
-        .and_then(|value| value.as_str())
-        .map(str::to_string);
-    Ok(Resource {
-        id: 0,
-        api_version,
-        kind,
-        namespace,
-        name,
-        uid: crate::datastore::Resource::uid_from_data(&object),
-        resource_version: crate::utils::extract_resource_version_from_object(&object),
-        data: object,
-    })
 }

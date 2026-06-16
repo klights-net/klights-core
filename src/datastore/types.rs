@@ -110,6 +110,74 @@ pub struct ReplicatedSnapshotMetadata {
 }
 
 impl Resource {
+    pub fn from_watch_event(event: WatchEvent) -> Self {
+        Self::from_watch_event_data(event.object)
+    }
+
+    pub fn from_watch_event_ref(event: &WatchEvent) -> Self {
+        Self::from_watch_event_data(event.object.clone())
+    }
+
+    pub fn try_from_watch_event(event: &WatchEvent) -> Result<Self> {
+        let data = event.object.clone();
+        let api_version = data
+            .get("apiVersion")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("watch event missing apiVersion"))?
+            .to_string();
+        let kind = data
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("watch event missing kind"))?
+            .to_string();
+        let name = data
+            .pointer("/metadata/name")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("watch event missing metadata.name"))?
+            .to_string();
+        Ok(Self {
+            id: 0,
+            api_version,
+            kind,
+            namespace: data
+                .pointer("/metadata/namespace")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            name,
+            uid: Self::uid_from_data(&data),
+            resource_version: crate::utils::extract_resource_version_from_object(&data),
+            data,
+        })
+    }
+
+    fn from_watch_event_data(data: Arc<Value>) -> Self {
+        Self {
+            id: 0,
+            api_version: data
+                .get("apiVersion")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            kind: data
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            namespace: data
+                .pointer("/metadata/namespace")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            name: data
+                .pointer("/metadata/name")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            uid: Self::uid_from_data(&data),
+            resource_version: crate::utils::extract_resource_version_from_object(&data),
+            data,
+        }
+    }
+
     pub fn uid_from_data(data: &Value) -> String {
         data.pointer("/metadata/uid")
             .and_then(|value| value.as_str())
@@ -404,6 +472,13 @@ pub enum WatchReplayRead<T = CatchUpResource> {
 }
 
 impl CatchUpResource {
+    pub fn added(resource: Resource) -> Self {
+        Self {
+            resource,
+            event_type: std::borrow::Cow::Borrowed("ADDED"),
+        }
+    }
+
     pub fn into_watch_event(self) -> WatchEvent {
         let CatchUpResource {
             resource,
@@ -461,6 +536,32 @@ mod resource_arc_tests {
             resource_version: 1,
             data: Arc::new(json!({"spec": {"x": 1}, "status": {"y": 2}})),
         }
+    }
+
+    #[test]
+    fn resource_helpers_convert_watch_event_and_added_catchup() {
+        let event = WatchEvent::added(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "frontend",
+                "namespace": "default",
+                "uid": "uid-frontend",
+                "resourceVersion": "42"
+            }
+        }));
+
+        let resource = Resource::try_from_watch_event(&event).unwrap();
+        assert_eq!(resource.api_version, "v1");
+        assert_eq!(resource.kind, "Pod");
+        assert_eq!(resource.namespace.as_deref(), Some("default"));
+        assert_eq!(resource.name, "frontend");
+        assert_eq!(resource.uid, "uid-frontend");
+        assert_eq!(resource.resource_version, 42);
+
+        let catchup = CatchUpResource::added(resource);
+        assert_eq!(catchup.event_type.as_ref(), "ADDED");
+        assert!(matches!(catchup.event_type, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]

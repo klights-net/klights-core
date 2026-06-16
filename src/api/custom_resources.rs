@@ -825,11 +825,7 @@ async fn list_cr_inner(
                         let mut last_rv = 0i64;
                         for resource in list.items {
                             last_rv = last_rv.max(resource.resource_version);
-                            let event = CatchUpResource {
-                                resource,
-                                event_type: std::borrow::Cow::Borrowed("ADDED"),
-                            }
-                            .into_watch_event();
+                            let event = CatchUpResource::added(resource).into_watch_event();
                             let matches_selector = event.matches_filter_parsed(
                                 &kind,
                                 watch_ns.as_deref(),
@@ -899,11 +895,7 @@ async fn list_cr_inner(
                 if let Ok(baseline) = baseline {
                     for catchup in baseline {
                         let rv = catchup.resource.resource_version;
-                        let event = CatchUpResource {
-                            resource: catchup.resource,
-                            event_type: std::borrow::Cow::Borrowed("ADDED"),
-                        }
-                        .into_watch_event();
+                        let event = CatchUpResource::added(catchup.resource).into_watch_event();
                         let event = match convert_custom_resource_watch_event_to_requested_version(
                             db.as_ref(),
                             conversion_for_watch.as_ref(),

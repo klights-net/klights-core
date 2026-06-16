@@ -708,11 +708,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         baseline_delivered_rvs.push(resource.resource_version);
                         last_delivered_scoped_rv =
                             last_delivered_scoped_rv.max(resource.resource_version);
-                        let event = CatchUpResource {
-                            resource,
-                            event_type: std::borrow::Cow::Borrowed("ADDED"),
-                        }
-                        .into_watch_event();
+                        let event = CatchUpResource::added(resource).into_watch_event();
                         yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
                             event,
                             &kind,
@@ -746,11 +742,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                     if has_selector {
                         seen_resources.insert(resource_to_seen_key(&resource));
                     }
-                    let event = CatchUpResource {
-                        resource,
-                        event_type: std::borrow::Cow::Borrowed("ADDED"),
-                    }
-                    .into_watch_event();
+                    let event = CatchUpResource::added(resource).into_watch_event();
                     if let Some(rv) = event.resource_version() {
                         last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
                     }
@@ -1034,10 +1026,7 @@ mod tests {
             resource_version: 1,
             data: std::sync::Arc::new(serde_json::json!({"metadata": {"name": "p1"}})),
         };
-        let event = CatchUpResource {
-            resource,
-            event_type: std::borrow::Cow::Borrowed("ADDED"),
-        };
+        let event = CatchUpResource::added(resource);
         match &event.event_type {
             std::borrow::Cow::Borrowed(s) => assert_eq!(*s, "ADDED"),
             std::borrow::Cow::Owned(_) => panic!("static literal must stay borrowed"),

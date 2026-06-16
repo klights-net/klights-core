@@ -19,7 +19,7 @@ use crate::datastore::{DatastoreHandle, NodeSubnet, PodCleanupIntent, Resource, 
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{OutboxApplyClient, OutboxApplyError, OutboxApplyResult};
 use crate::networking::wireguard::DataplanePeerMetadata;
-use crate::watch::WatchEvent;
+use crate::watch::{WatchEvent, WatchEventSelection};
 
 /// T6 step 1: builds a `watch::Receiver<bool>` that is permanently true.
 ///
@@ -310,7 +310,7 @@ impl LeaderApiClient for LocalApiClient {
                             .and_then(|value| value.as_str())
                             == Some(node_name.as_str()) =>
                     {
-                        Some(Ok(resource_from_watch_event(event.event)))
+                        Some(Ok(Resource::from_watch_event(event.event)))
                     }
                     Ok(_) => None,
                     Err(err) => Some(Err(err)),
@@ -389,7 +389,7 @@ impl LeaderApiClient for LocalApiClient {
                             .and_then(|value| value.as_str())
                             == Some(name.as_str()) =>
                     {
-                        Some(Ok(resource_from_watch_event(event.event)))
+                        Some(Ok(Resource::from_watch_event(event.event)))
                     }
                     Ok(_) => None,
                     Err(err) => Some(Err(err)),
@@ -499,25 +499,11 @@ impl OutboxApplyClient for LocalApiClient {
 }
 
 fn watch_event_matches(event: &WatchEvent, req: &WatchRequest) -> bool {
-    event
-        .object
-        .get("apiVersion")
-        .and_then(|value| value.as_str())
-        == Some(req.api_version.as_str())
-        && event.object.get("kind").and_then(|value| value.as_str()) == Some(req.kind.as_str())
-        && req.namespace.as_deref().is_none_or(|namespace| {
-            event
-                .object
-                .pointer("/metadata/namespace")
-                .and_then(|value| value.as_str())
-                == Some(namespace)
-        })
-        && event.matches_filter(
-            &req.kind,
-            req.namespace.as_deref(),
-            req.label_selector.as_deref(),
-        )
-        && event.matches_field_selector(req.field_selector.as_deref())
+    WatchEventSelection::new(&req.api_version, &req.kind)
+        .namespace(req.namespace.as_deref())
+        .label_selector(req.label_selector.as_deref())
+        .field_selector(req.field_selector.as_deref())
+        .matches(event)
 }
 
 fn watch_target_for_request(req: &WatchRequest) -> WatchTarget {
@@ -556,39 +542,6 @@ fn local_watch_cursor_error(
         }
         crate::watch::WatchCursorError::Replay(err) => anyhow!("local watch replay failed: {err}"),
         crate::watch::WatchCursorError::Closed => anyhow!("local watch signal channel closed"),
-    }
-}
-
-fn resource_from_watch_event(event: WatchEvent) -> Resource {
-    let namespace = event
-        .object
-        .pointer("/metadata/namespace")
-        .and_then(|value| value.as_str())
-        .map(str::to_string);
-    Resource {
-        id: 0,
-        api_version: event
-            .object
-            .get("apiVersion")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        kind: event
-            .object
-            .get("kind")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        namespace,
-        name: event
-            .object
-            .pointer("/metadata/name")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .to_string(),
-        uid: Resource::uid_from_data(&event.object),
-        resource_version: crate::utils::extract_resource_version_from_object(&event.object),
-        data: event.object,
     }
 }
 
