@@ -58,12 +58,164 @@ pub fn node_fit_with_context(
         reasons.push("node(s) didn't match Pod's pod anti-affinity rules".into());
     }
 
+    if !topology_spread_constraints_match(node, pod, inter_pod_context) {
+        reasons.push("node(s) didn't satisfy Pod's topology spread constraints".into());
+    }
+
     // 6. Resource fit check
     if let Some(reason) = check_resource_fit(node, pod, existing_pod_resources) {
         reasons.push(reason);
     }
 
     reasons
+}
+
+/// Score ScheduleAnyway topology spread constraints. Higher is better.
+pub fn topology_spread_schedule_anyway_score(
+    node: &SchedulableNode,
+    pod: &PodSchedulingConstraints,
+    context: &InterPodAffinityContext,
+) -> i64 {
+    pod.topology_spread_constraints
+        .iter()
+        .filter(|constraint| {
+            constraint.when_unsatisfiable == TopologySpreadUnsatisfiableAction::ScheduleAnyway
+        })
+        .filter_map(|constraint| evaluate_topology_spread(node, pod, constraint, context))
+        .map(|evaluation| (evaluation.max_count - evaluation.candidate_count) * 100)
+        .sum()
+}
+
+fn topology_spread_constraints_match(
+    node: &SchedulableNode,
+    pod: &PodSchedulingConstraints,
+    context: &InterPodAffinityContext,
+) -> bool {
+    pod.topology_spread_constraints
+        .iter()
+        .filter(|constraint| {
+            constraint.when_unsatisfiable == TopologySpreadUnsatisfiableAction::DoNotSchedule
+        })
+        .all(|constraint| {
+            evaluate_topology_spread(node, pod, constraint, context).is_some_and(|evaluation| {
+                evaluation.candidate_count + 1 - evaluation.global_min <= constraint.max_skew
+            })
+        })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TopologySpreadEvaluation {
+    candidate_count: i64,
+    global_min: i64,
+    max_count: i64,
+}
+
+fn evaluate_topology_spread(
+    node: &SchedulableNode,
+    pod: &PodSchedulingConstraints,
+    constraint: &TopologySpreadConstraint,
+    context: &InterPodAffinityContext,
+) -> Option<TopologySpreadEvaluation> {
+    if constraint.topology_key.is_empty() || constraint.max_skew <= 0 {
+        return None;
+    }
+
+    let candidate_domain = node.labels.get(&constraint.topology_key)?;
+    let mut domain_counts = eligible_domain_counts(pod, constraint, context);
+    if !domain_counts.contains_key(candidate_domain) {
+        return None;
+    }
+
+    for existing in &context.existing_pods {
+        if !pod_matches_topology_spread_selector(existing, pod, constraint) {
+            continue;
+        }
+        let Some(existing_node) = context.nodes_by_name.get(&existing.node_name) else {
+            continue;
+        };
+        if !node_included_for_topology_spread(existing_node, pod, constraint) {
+            continue;
+        }
+        if let Some(domain) = existing_node.labels.get(&constraint.topology_key)
+            && let Some(count) = domain_counts.get_mut(domain)
+        {
+            *count += 1;
+        }
+    }
+
+    let min_domains = constraint.min_domains.unwrap_or(1);
+    let global_min = if min_domains > 0 && (domain_counts.len() as i64) < min_domains {
+        0
+    } else {
+        domain_counts.values().copied().min().unwrap_or(0)
+    };
+    let max_count = domain_counts.values().copied().max().unwrap_or(0);
+    let candidate_count = domain_counts.get(candidate_domain).copied().unwrap_or(0);
+
+    Some(TopologySpreadEvaluation {
+        candidate_count,
+        global_min,
+        max_count,
+    })
+}
+
+fn eligible_domain_counts(
+    pod: &PodSchedulingConstraints,
+    constraint: &TopologySpreadConstraint,
+    context: &InterPodAffinityContext,
+) -> HashMap<String, i64> {
+    let mut domains = HashMap::new();
+    for node in context.nodes_by_name.values() {
+        if !node_included_for_topology_spread(node, pod, constraint) {
+            continue;
+        }
+        if let Some(domain) = node.labels.get(&constraint.topology_key) {
+            domains.entry(domain.clone()).or_insert(0);
+        }
+    }
+    domains
+}
+
+fn node_included_for_topology_spread(
+    node: &SchedulableNode,
+    pod: &PodSchedulingConstraints,
+    constraint: &TopologySpreadConstraint,
+) -> bool {
+    if constraint.node_affinity_policy == NodeInclusionPolicy::Honor
+        && !node_selector_and_affinity_match(node, pod)
+    {
+        return false;
+    }
+    if constraint.node_taints_policy == NodeInclusionPolicy::Honor
+        && check_taints(node, pod).is_some()
+    {
+        return false;
+    }
+    true
+}
+
+fn pod_matches_topology_spread_selector(
+    existing: &ScheduledPod,
+    pod: &PodSchedulingConstraints,
+    constraint: &TopologySpreadConstraint,
+) -> bool {
+    if existing.namespace != pod.namespace {
+        return false;
+    }
+    if constraint.label_selector.is_none() && constraint.match_label_keys.is_empty() {
+        return false;
+    }
+    if let Some(selector) = &constraint.label_selector
+        && !selector.matches(&existing.labels)
+    {
+        return false;
+    }
+    constraint.match_label_keys.iter().all(|key| {
+        pod.labels
+            .get(key)
+            .map(|value| existing.labels.get(key) == Some(value))
+            .unwrap_or(true)
+    })
 }
 
 fn required_pod_affinity_matches(
@@ -181,7 +333,10 @@ fn pods_share_topology(
 /// Only `NoSchedule` taints cause hard rejection.
 /// `PreferNoSchedule` taints are handled in scoring (soft penalty).
 /// `NoExecute` taints are not checked during scheduling.
-fn check_taints(node: &SchedulableNode, pod: &PodSchedulingConstraints) -> Option<String> {
+pub(crate) fn check_taints(
+    node: &SchedulableNode,
+    pod: &PodSchedulingConstraints,
+) -> Option<String> {
     for taint in &node.taints {
         // Only NoSchedule causes hard rejection during predicate filtering.
         if !matches!(taint.effect, TaintEffect::NoSchedule) {
@@ -233,7 +388,7 @@ fn check_taints(node: &SchedulableNode, pod: &PodSchedulingConstraints) -> Optio
 }
 
 /// Check nodeSelector and node affinity together.
-fn node_selector_and_affinity_match(
+pub(crate) fn node_selector_and_affinity_match(
     node: &SchedulableNode,
     pod: &PodSchedulingConstraints,
 ) -> bool {

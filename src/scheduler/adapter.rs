@@ -66,6 +66,7 @@ pub fn extract_pod_constraints(pod_value: &serde_json::Value) -> PodSchedulingCo
         .and_then(|v| v.as_str())
         .unwrap_or("default")
         .to_string();
+    let labels = extract_labels(pod_value, "/metadata/labels");
 
     let node_selector = pod_value
         .pointer("/spec/nodeSelector")
@@ -93,6 +94,17 @@ pub fn extract_pod_constraints(pod_value: &serde_json::Value) -> PodSchedulingCo
         .pointer("/spec/affinity/podAntiAffinity/requiredDuringSchedulingIgnoredDuringExecution")
         .and_then(|v| v.as_array())
         .map(|terms| terms.iter().filter_map(extract_pod_affinity_term).collect())
+        .unwrap_or_default();
+
+    let topology_spread_constraints = pod_value
+        .pointer("/spec/topologySpreadConstraints")
+        .and_then(|v| v.as_array())
+        .map(|constraints| {
+            constraints
+                .iter()
+                .filter_map(extract_topology_spread_constraint)
+                .collect()
+        })
         .unwrap_or_default();
 
     let tolerations = pod_value
@@ -125,10 +137,12 @@ pub fn extract_pod_constraints(pod_value: &serde_json::Value) -> PodSchedulingCo
 
     PodSchedulingConstraints {
         namespace,
+        labels,
         node_selector,
         required_node_affinity,
         required_pod_affinity,
         required_pod_anti_affinity,
+        topology_spread_constraints,
         tolerations,
         resources,
         host_port_requests: Vec::new(), // Not needed for scheduling predicates
@@ -363,6 +377,55 @@ fn extract_label_selector_requirement(v: &serde_json::Value) -> Option<LabelSele
         operator,
         values,
     })
+}
+
+fn extract_topology_spread_constraint(v: &serde_json::Value) -> Option<TopologySpreadConstraint> {
+    let max_skew = v.get("maxSkew")?.as_i64()?;
+    let topology_key = v.get("topologyKey")?.as_str()?.to_string();
+    let when_unsatisfiable = v
+        .get("whenUnsatisfiable")
+        .and_then(|value| value.as_str())
+        .and_then(|value| match value {
+            "DoNotSchedule" => Some(TopologySpreadUnsatisfiableAction::DoNotSchedule),
+            "ScheduleAnyway" => Some(TopologySpreadUnsatisfiableAction::ScheduleAnyway),
+            _ => None,
+        })?;
+    let min_domains = v.get("minDomains").and_then(|value| value.as_i64());
+    let label_selector = v.get("labelSelector").and_then(extract_label_selector_term);
+    let match_label_keys = v
+        .get("matchLabelKeys")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let node_affinity_policy = extract_node_inclusion_policy(v.get("nodeAffinityPolicy"))
+        .unwrap_or(NodeInclusionPolicy::Honor);
+    let node_taints_policy = extract_node_inclusion_policy(v.get("nodeTaintsPolicy"))
+        .unwrap_or(NodeInclusionPolicy::Ignore);
+
+    Some(TopologySpreadConstraint {
+        max_skew,
+        min_domains,
+        topology_key,
+        when_unsatisfiable,
+        label_selector,
+        match_label_keys,
+        node_affinity_policy,
+        node_taints_policy,
+    })
+}
+
+fn extract_node_inclusion_policy(v: Option<&serde_json::Value>) -> Option<NodeInclusionPolicy> {
+    v.and_then(|value| value.as_str())
+        .and_then(|value| match value {
+            "Honor" => Some(NodeInclusionPolicy::Honor),
+            "Ignore" => Some(NodeInclusionPolicy::Ignore),
+            _ => None,
+        })
 }
 
 fn extract_node_resources(node_value: &serde_json::Value, pointer: &str) -> NodeResources {

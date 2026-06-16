@@ -80,7 +80,12 @@ fn schedule_multi_node_with_namespace_labels(
         })
         .collect();
 
-    let selected = scoring::select_best_node(&fit_nodes, pod, &scoring_existing);
+    let selected = select_best_node_with_topology_spread(
+        &fit_nodes,
+        pod,
+        &scoring_existing,
+        &inter_pod_context,
+    );
     match selected {
         Some(name) => SchedulingDecision::success(name),
         None => SchedulingDecision::failed(vec!["no node selected after scoring".into()]),
@@ -92,6 +97,10 @@ fn build_inter_pod_affinity_context(
     existing_resources: &[NodeExistingPods],
     namespace_labels_by_name: HashMap<String, HashMap<String, String>>,
 ) -> InterPodAffinityContext {
+    let nodes_by_name = nodes
+        .iter()
+        .map(|node| (node.name.clone(), node.clone()))
+        .collect::<HashMap<_, _>>();
     let node_labels_by_name = nodes
         .iter()
         .map(|node| (node.name.clone(), node.labels.clone()))
@@ -110,9 +119,50 @@ fn build_inter_pod_affinity_context(
 
     InterPodAffinityContext {
         existing_pods,
+        nodes_by_name,
         node_labels_by_name,
         namespace_labels_by_name,
     }
+}
+
+fn select_best_node_with_topology_spread(
+    nodes: &[SchedulableNode],
+    pod: &PodSchedulingConstraints,
+    existing_resources: &[(&str, Vec<PodResources>)],
+    inter_pod_context: &InterPodAffinityContext,
+) -> Option<String> {
+    if pod.topology_spread_constraints.iter().all(|constraint| {
+        constraint.when_unsatisfiable != TopologySpreadUnsatisfiableAction::ScheduleAnyway
+    }) {
+        return scoring::select_best_node(nodes, pod, existing_resources);
+    }
+
+    let resource_map: HashMap<&str, &[PodResources]> = existing_resources
+        .iter()
+        .map(|(name, resources)| (*name, resources.as_slice()))
+        .collect();
+    let mut best_nodes = Vec::new();
+    let mut best_score = i64::MIN;
+
+    for node in nodes {
+        let existing = resource_map.get(node.name.as_str()).copied().unwrap_or(&[]);
+        let score = scoring::score_node(node, pod, existing)
+            + predicates::topology_spread_schedule_anyway_score(node, pod, inter_pod_context);
+        match score.cmp(&best_score) {
+            std::cmp::Ordering::Greater => {
+                best_score = score;
+                best_nodes.clear();
+                best_nodes.push(node);
+            }
+            std::cmp::Ordering::Equal => best_nodes.push(node),
+            std::cmp::Ordering::Less => {}
+        }
+    }
+
+    best_nodes
+        .into_iter()
+        .min_by(|a, b| a.name.cmp(&b.name))
+        .map(|node| node.name.clone())
 }
 
 /// Convenience struct for passing existing pods per node.
@@ -619,6 +669,300 @@ mod tests {
             &pod,
             &[("node-b", &[&existing_peer][..])],
             &[&peer_namespace],
+        );
+
+        assert!(decision.is_success(), "{decision:?}");
+        assert_eq!(decision.selected_node, Some("node-b".into()));
+    }
+
+    #[test]
+    fn schedule_from_json_enforces_topology_spread_do_not_schedule() {
+        let node_a = json!({
+            "metadata": {
+                "name": "node-a",
+                "labels": {"topology.kubernetes.io/zone": "zone-a"}
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let node_b = json!({
+            "metadata": {
+                "name": "node-b",
+                "labels": {"topology.kubernetes.io/zone": "zone-b"}
+            },
+            "spec": {
+                "taints": [{
+                    "key": "dedicated",
+                    "value": "fallback",
+                    "effect": "PreferNoSchedule"
+                }]
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let existing_one = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "peer-1",
+                "labels": {"app": "web"}
+            },
+            "spec": {"nodeName": "node-a", "containers": [{"name": "main", "image": "pause"}]}
+        });
+        let existing_two = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "peer-2",
+                "labels": {"app": "web"}
+            },
+            "spec": {"nodeName": "node-a", "containers": [{"name": "main", "image": "pause"}]}
+        });
+        let pod = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "client",
+                "labels": {"app": "web"}
+            },
+            "spec": {
+                "containers": [{"name": "main", "image": "pause"}],
+                "topologySpreadConstraints": [{
+                    "maxSkew": 1,
+                    "topologyKey": "topology.kubernetes.io/zone",
+                    "whenUnsatisfiable": "DoNotSchedule",
+                    "labelSelector": {"matchLabels": {"app": "web"}}
+                }]
+            }
+        });
+
+        let decision = schedule_from_json(
+            &[&node_a, &node_b],
+            &pod,
+            &[("node-a", &[&existing_one, &existing_two][..])],
+        );
+
+        assert!(decision.is_success(), "{decision:?}");
+        assert_eq!(decision.selected_node, Some("node-b".into()));
+    }
+
+    #[test]
+    fn schedule_from_json_prefers_topology_spread_schedule_anyway_domain() {
+        let node_a = json!({
+            "metadata": {
+                "name": "node-a",
+                "labels": {"topology.kubernetes.io/zone": "zone-a"}
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let node_b = json!({
+            "metadata": {
+                "name": "node-b",
+                "labels": {"topology.kubernetes.io/zone": "zone-b"}
+            },
+            "spec": {
+                "taints": [{
+                    "key": "dedicated",
+                    "value": "fallback",
+                    "effect": "PreferNoSchedule"
+                }]
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let existing_one = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "peer-1",
+                "labels": {"app": "web"}
+            },
+            "spec": {"nodeName": "node-a", "containers": [{"name": "main", "image": "pause"}]}
+        });
+        let existing_two = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "peer-2",
+                "labels": {"app": "web"}
+            },
+            "spec": {"nodeName": "node-a", "containers": [{"name": "main", "image": "pause"}]}
+        });
+        let pod = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "client",
+                "labels": {"app": "web"}
+            },
+            "spec": {
+                "containers": [{"name": "main", "image": "pause"}],
+                "topologySpreadConstraints": [{
+                    "maxSkew": 1,
+                    "topologyKey": "topology.kubernetes.io/zone",
+                    "whenUnsatisfiable": "ScheduleAnyway",
+                    "labelSelector": {"matchLabels": {"app": "web"}}
+                }]
+            }
+        });
+
+        let decision = schedule_from_json(
+            &[&node_a, &node_b],
+            &pod,
+            &[("node-a", &[&existing_one, &existing_two][..])],
+        );
+
+        assert!(decision.is_success(), "{decision:?}");
+        assert_eq!(decision.selected_node, Some("node-b".into()));
+    }
+
+    #[test]
+    fn schedule_from_json_topology_spread_min_domains_uses_zero_global_minimum() {
+        let node_a = json!({
+            "metadata": {
+                "name": "node-a",
+                "labels": {"topology.kubernetes.io/zone": "zone-a"}
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let node_b = json!({
+            "metadata": {
+                "name": "node-b",
+                "labels": {"topology.kubernetes.io/zone": "zone-b"}
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let existing_a = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "peer-a",
+                "labels": {"app": "web"}
+            },
+            "spec": {"nodeName": "node-a", "containers": [{"name": "main", "image": "pause"}]}
+        });
+        let existing_b = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "peer-b",
+                "labels": {"app": "web"}
+            },
+            "spec": {"nodeName": "node-b", "containers": [{"name": "main", "image": "pause"}]}
+        });
+        let pod = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "client",
+                "labels": {"app": "web"}
+            },
+            "spec": {
+                "containers": [{"name": "main", "image": "pause"}],
+                "topologySpreadConstraints": [{
+                    "maxSkew": 1,
+                    "minDomains": 3,
+                    "topologyKey": "topology.kubernetes.io/zone",
+                    "whenUnsatisfiable": "DoNotSchedule",
+                    "labelSelector": {"matchLabels": {"app": "web"}}
+                }]
+            }
+        });
+
+        let decision = schedule_from_json(
+            &[&node_a, &node_b],
+            &pod,
+            &[
+                ("node-a", &[&existing_a][..]),
+                ("node-b", &[&existing_b][..]),
+            ],
+        );
+
+        assert!(!decision.is_success(), "{decision:?}");
+        assert!(
+            decision
+                .failed_reasons
+                .iter()
+                .any(|reason| reason.contains("topology spread")),
+            "{decision:?}"
+        );
+    }
+
+    #[test]
+    fn schedule_from_json_topology_spread_match_label_keys_selects_peer_pods() {
+        let node_a = json!({
+            "metadata": {
+                "name": "node-a",
+                "labels": {"topology.kubernetes.io/zone": "zone-a"}
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let node_b = json!({
+            "metadata": {
+                "name": "node-b",
+                "labels": {"topology.kubernetes.io/zone": "zone-b"}
+            },
+            "spec": {
+                "taints": [{
+                    "key": "dedicated",
+                    "value": "fallback",
+                    "effect": "PreferNoSchedule"
+                }]
+            },
+            "status": {
+                "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+        let matching_peer = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "peer-1",
+                "labels": {"pod-template-hash": "abc123"}
+            },
+            "spec": {"nodeName": "node-a", "containers": [{"name": "main", "image": "pause"}]}
+        });
+        let other_peer = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "peer-2",
+                "labels": {"pod-template-hash": "other"}
+            },
+            "spec": {"nodeName": "node-b", "containers": [{"name": "main", "image": "pause"}]}
+        });
+        let pod = json!({
+            "metadata": {
+                "namespace": "default",
+                "name": "client",
+                "labels": {"pod-template-hash": "abc123"}
+            },
+            "spec": {
+                "containers": [{"name": "main", "image": "pause"}],
+                "topologySpreadConstraints": [{
+                    "maxSkew": 1,
+                    "topologyKey": "topology.kubernetes.io/zone",
+                    "whenUnsatisfiable": "DoNotSchedule",
+                    "matchLabelKeys": ["pod-template-hash"]
+                }]
+            }
+        });
+
+        let decision = schedule_from_json(
+            &[&node_a, &node_b],
+            &pod,
+            &[
+                ("node-a", &[&matching_peer][..]),
+                ("node-b", &[&other_peer][..]),
+            ],
         );
 
         assert!(decision.is_success(), "{decision:?}");

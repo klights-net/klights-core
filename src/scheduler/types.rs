@@ -94,10 +94,12 @@ pub enum TolerationOperator {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodSchedulingConstraints {
     pub namespace: String,
+    pub labels: HashMap<String, String>,
     pub node_selector: HashMap<String, String>,
     pub required_node_affinity: Vec<NodeSelectorTerm>,
     pub required_pod_affinity: Vec<PodAffinityTerm>,
     pub required_pod_anti_affinity: Vec<PodAffinityTerm>,
+    pub topology_spread_constraints: Vec<TopologySpreadConstraint>,
     pub tolerations: Vec<Toleration>,
     pub resources: PodResources,
     pub host_port_requests: Vec<u16>,
@@ -107,6 +109,35 @@ pub struct PodSchedulingConstraints {
     pub priority_class_name: Option<String>,
     /// Preemption policy.
     pub preemption_policy: Option<PreemptionPolicy>,
+}
+
+/// A Pod topology spread constraint.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopologySpreadConstraint {
+    pub max_skew: i64,
+    pub min_domains: Option<i64>,
+    pub topology_key: String,
+    pub when_unsatisfiable: TopologySpreadUnsatisfiableAction,
+    pub label_selector: Option<LabelSelectorTerm>,
+    pub match_label_keys: Vec<String>,
+    pub node_affinity_policy: NodeInclusionPolicy,
+    pub node_taints_policy: NodeInclusionPolicy,
+}
+
+/// Action when a topology spread constraint cannot be satisfied.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TopologySpreadUnsatisfiableAction {
+    #[default]
+    DoNotSchedule,
+    ScheduleAnyway,
+}
+
+/// Node inclusion policy for topology spread skew calculations.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeInclusionPolicy {
+    #[default]
+    Honor,
+    Ignore,
 }
 
 /// A required pod affinity or anti-affinity term.
@@ -177,6 +208,7 @@ pub enum LabelSelectorOperator {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InterPodAffinityContext {
     pub existing_pods: Vec<ScheduledPod>,
+    pub nodes_by_name: HashMap<String, SchedulableNode>,
     pub node_labels_by_name: HashMap<String, HashMap<String, String>>,
     pub namespace_labels_by_name: HashMap<String, HashMap<String, String>>,
 }
@@ -417,6 +449,7 @@ mod tests {
     fn types_round_trip_json() {
         let constraints = PodSchedulingConstraints {
             namespace: "default".into(),
+            labels: HashMap::from([("app".into(), "web".into())]),
             node_selector: HashMap::from([("zone".into(), "us-west".into())]),
             required_node_affinity: vec![NodeSelectorTerm {
                 match_expressions: vec![NodeSelectorRequirement {
@@ -432,6 +465,7 @@ mod tests {
             }],
             required_pod_affinity: Vec::new(),
             required_pod_anti_affinity: Vec::new(),
+            topology_spread_constraints: Vec::new(),
             tolerations: vec![Toleration {
                 key: Some("dedicated".into()),
                 value: Some("gpu".into()),
