@@ -638,6 +638,8 @@ pub async fn create_inner(
         enforce_limitrange_constraints_for_pvc(state.db.as_ref(), namespace, &body).await?;
     }
 
+    validate_builtin_resource_spec(kind, &body)?;
+
     if is_dry_run {
         return Ok((StatusCode::CREATED, Json(body)));
     }
@@ -872,6 +874,7 @@ pub async fn update_inner(
         validate_priorityclass_update_immutable(&current.data, &body)?;
     }
 
+    validate_builtin_resource_spec(kind, &body)?;
     normalize_resource_for_storage(api_version, kind, &mut body);
 
     if is_dry_run {
@@ -1580,6 +1583,8 @@ pub async fn patch_inner(
         if kind == "PriorityClass" {
             validate_priorityclass_update_immutable(&current.data, &patched)?;
         }
+
+        validate_builtin_resource_spec(kind, &patched)?;
 
         if kind == "Secret" {
             if let Err(err_msg) = validate_secret_data(&patched) {

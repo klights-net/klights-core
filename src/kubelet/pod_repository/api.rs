@@ -24,7 +24,8 @@ use crate::api::{
     check_resource_quota_for_creation, check_resource_quota_for_pod_update, compute_qos_class,
     enforce_limitrange_constraints_for_pod, enforce_pod_security_admission,
     normalize_resource_for_storage, resolve_resource_name, run_admission_for_request,
-    validate_dns_subdomain, validate_pod_resource_requirements_immutable, validate_pod_sysctls,
+    validate_builtin_resource_spec, validate_dns_subdomain,
+    validate_pod_resource_requirements_immutable, validate_pod_sysctls,
 };
 use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::{DatastoreHandle, Resource, ResourcePreconditions};
@@ -305,6 +306,7 @@ impl PodApiService {
         apply_pod_runtimeclass_admission(self.db.as_ref(), &mut body).await?;
         apply_limitrange_defaults_to_pod(self.db.as_ref(), &namespace, &mut body).await?;
         enforce_limitrange_constraints_for_pod(self.db.as_ref(), &namespace, &body).await?;
+        validate_builtin_resource_spec("Pod", &body)?;
 
         if dry_run {
             return Ok(PodApiCreateResult {
@@ -876,6 +878,7 @@ impl PodApiService {
 
         validate_pod_resource_requirements_immutable(&current.data, &body)?;
         check_resource_quota_for_pod_update(self.db.as_ref(), ns, &current.data, &body).await?;
+        validate_builtin_resource_spec("Pod", &body)?;
 
         normalize_resource_for_storage("v1", "Pod", &mut body);
         preserve_status_from_current(&current.data, &mut body);
@@ -993,6 +996,7 @@ impl PodApiService {
             validate_pod_resource_requirements_immutable(&current.data, &patched)?;
             check_resource_quota_for_pod_update(self.db.as_ref(), ns, &current.data, &patched)
                 .await?;
+            validate_builtin_resource_spec("Pod", &patched)?;
 
             normalize_resource_for_storage("v1", "Pod", &mut patched);
             preserve_status_from_current(&current.data, &mut patched);

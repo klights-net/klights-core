@@ -282,6 +282,60 @@ pub fn validate_pod_resource_requirements_immutable(
     Ok(())
 }
 
+pub fn validate_builtin_resource_spec(kind: &str, body: &Value) -> Result<(), AppError> {
+    match kind {
+        "Pod" => validate_pod_spec(body),
+        "Service" => validate_service_spec(body),
+        _ => Ok(()),
+    }
+}
+
+fn validate_pod_spec(body: &Value) -> Result<(), AppError> {
+    let containers = body.pointer("/spec/containers").and_then(|v| v.as_array());
+    if containers.is_none_or(|containers| containers.is_empty()) {
+        let name = body
+            .pointer("/metadata/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return Err(AppError::UnprocessableEntity(format!(
+            "Pod \"{name}\" is invalid: spec.containers: Required value"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_service_spec(body: &Value) -> Result<(), AppError> {
+    let Some(service_type) = body.pointer("/spec/type") else {
+        return Ok(());
+    };
+    if service_type.is_null() {
+        return Ok(());
+    }
+    let Some(service_type) = service_type.as_str() else {
+        let name = body
+            .pointer("/metadata/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return Err(AppError::UnprocessableEntity(format!(
+            "Service \"{name}\" is invalid: spec.type: Invalid value: must be a string"
+        )));
+    };
+    if service_type.is_empty() {
+        return Ok(());
+    }
+    const VALID_SERVICE_TYPES: &[&str] = &["ClusterIP", "ExternalName", "LoadBalancer", "NodePort"];
+    if !VALID_SERVICE_TYPES.contains(&service_type) {
+        let name = body
+            .pointer("/metadata/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return Err(AppError::UnprocessableEntity(format!(
+            "Service \"{name}\" is invalid: spec.type: Unsupported value: \"{service_type}\": supported values: \"ClusterIP\", \"ExternalName\", \"LoadBalancer\", \"NodePort\""
+        )));
+    }
+    Ok(())
+}
+
 pub fn validate_priorityclass_update_immutable(
     current: &Value,
     updated: &Value,

@@ -1124,7 +1124,8 @@ async fn test_namespace_delete_pod_finalizer_blocks_non_pod_deletion_until_clear
                     "name":"pod-blocker",
                     "namespace":"ns-order-pod-finalizer",
                     "finalizers":["example.com/hold"]
-                }
+                },
+                "spec":{"containers":[{"name":"hold","image":"busybox"}]}
             }),
         )
         .await

@@ -522,6 +522,91 @@ async fn test_merge_patch_strict_rejects_unknown_nested_field_pod() {
 }
 
 #[tokio::test]
+async fn test_create_pod_rejects_missing_containers() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let ns_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}"#,
+        ))
+        .unwrap();
+    let _ = app.clone().oneshot(ns_req).await.unwrap();
+
+    let pod_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/default/pods")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"no-containers"},"spec":{}}"#,
+        ))
+        .unwrap();
+    let resp = app.oneshot(pod_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("spec.containers"),
+        "expected spec.containers validation message: {value}"
+    );
+}
+
+#[tokio::test]
+async fn test_create_service_rejects_invalid_type() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let ns_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}"#,
+        ))
+        .unwrap();
+    let _ = app.clone().oneshot(ns_req).await.unwrap();
+
+    let service_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/default/services")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+                "apiVersion":"v1",
+                "kind":"Service",
+                "metadata":{"name":"bad-type"},
+                "spec":{"type":"ClusterIPv6","ports":[{"port":80}]}
+            }"#,
+        ))
+        .unwrap();
+    let resp = app.oneshot(service_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("spec.type"),
+        "expected spec.type validation message: {value}"
+    );
+}
+
+#[tokio::test]
 async fn test_patch_custom_resource_apply_strict_missing_resource_returns_schema_error_not_notfound()
  {
     use axum::body::Body;
