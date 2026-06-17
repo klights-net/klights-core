@@ -458,6 +458,25 @@ pub fn validate_dns_subdomain(name: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
 }
 
+/// Validate DNS label (RFC 1123).
+/// Rules: lowercase alphanumeric, hyphens (no dots)
+/// Max 63 characters
+/// Cannot start/end with hyphen
+pub fn validate_dns_label(name: &str) -> bool {
+    if name.is_empty() || name.len() > 63 {
+        return false;
+    }
+
+    let first = name.chars().next().unwrap();
+    let last = name.chars().last().unwrap();
+    if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
+        return false;
+    }
+
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// RBAC metadata names use Kubernetes path-segment validation, which permits
 /// colons but rejects path separators and the two relative-path names.
 pub fn validate_path_segment_name(name: &str) -> bool {
@@ -476,32 +495,13 @@ pub fn validate_metadata_name_for_kind(api_version: &str, kind: &str, name: &str
     if kind == "IPAddress" {
         return validate_path_segment_name(name);
     }
+    if api_version == "v1" && kind == "Namespace" {
+        return validate_dns_label(name);
+    }
     if metadata_name_uses_path_segment_validation(api_version, kind) {
         return validate_path_segment_name(name);
     }
     validate_dns_subdomain(name)
-}
-
-/// Validate DNS label (RFC 1123).
-/// Rules: lowercase alphanumeric, hyphens (no dots)
-/// Max 63 characters
-/// Cannot start/end with hyphen
-#[cfg(test)]
-fn validate_dns_label(name: &str) -> bool {
-    if name.is_empty() || name.len() > 63 {
-        return false;
-    }
-
-    // Must start and end with alphanumeric
-    let first = name.chars().next().unwrap();
-    let last = name.chars().last().unwrap();
-    if !first.is_ascii_alphanumeric() || !last.is_ascii_alphanumeric() {
-        return false;
-    }
-
-    // All characters must be lowercase alphanumeric or hyphen (no dots)
-    name.chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 // Error handling

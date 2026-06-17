@@ -193,6 +193,40 @@ async fn test_create_cluster_scoped_resource_injects_name() {
 }
 
 #[tokio::test]
+async fn test_create_namespace_rejects_dns_subdomain_name_with_dot() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"team.alpha"}}"#,
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status["kind"], "Status");
+    assert!(
+        status["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("valid DNS label"),
+        "unexpected validation message: {status}"
+    );
+}
+
+#[tokio::test]
 async fn test_version_endpoint_returns_k8s_version_info() {
     use axum::{
         body::Body,

@@ -2310,6 +2310,23 @@ fn test_metadata_name_validation_allows_colons_only_for_rbac_resources() {
 }
 
 #[test]
+fn test_namespace_metadata_name_uses_dns_label_validation() {
+    assert!(validate_metadata_name_for_kind(
+        "v1",
+        "Namespace",
+        "team-alpha"
+    ));
+    assert!(
+        !validate_metadata_name_for_kind("v1", "Namespace", "team.alpha"),
+        "Namespace metadata.name must reject DNS subdomain dots"
+    );
+    assert!(
+        !validate_metadata_name_for_kind("v1", "Namespace", &"a".repeat(64)),
+        "Namespace metadata.name must enforce the DNS label length limit"
+    );
+}
+
+#[test]
 fn test_rbac_metadata_name_uses_path_segment_validation() {
     for invalid in [".", "..", "has/slash", "has%percent"] {
         assert!(

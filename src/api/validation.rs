@@ -1915,6 +1915,41 @@ pub fn validate_dns_subdomain(name: &str, context: &str) -> Result<(), AppError>
     Ok(())
 }
 
+pub fn validate_dns_label(name: &str, context: &str) -> Result<(), AppError> {
+    if name.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "Invalid {context}: must be non-empty"
+        )));
+    }
+    if name.len() > 63 {
+        return Err(AppError::BadRequest(format!(
+            "Invalid {context} '{name}': must be no more than 63 characters"
+        )));
+    }
+
+    for (i, ch) in name.char_indices() {
+        let valid = ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-';
+        if !valid {
+            return Err(AppError::BadRequest(format!(
+                "Invalid {context} '{name}': must be a valid DNS label (lowercase alphanumeric, hyphens; max 63 chars; cannot start/end with hyphen) at position {i}: '{ch}'"
+            )));
+        }
+    }
+
+    if name.starts_with('-') {
+        return Err(AppError::BadRequest(format!(
+            "Invalid {context} '{name}': must not start with hyphen"
+        )));
+    }
+    if name.ends_with('-') {
+        return Err(AppError::BadRequest(format!(
+            "Invalid {context} '{name}': must not end with hyphen"
+        )));
+    }
+
+    Ok(())
+}
+
 pub fn validate_path_segment_name(name: &str, context: &str) -> Result<(), AppError> {
     if name.is_empty() {
         return Err(AppError::BadRequest(format!(
@@ -1944,6 +1979,9 @@ pub fn validate_metadata_name_for_kind(
         || crate::api::metadata_name_uses_path_segment_validation(api_version, kind)
     {
         return validate_path_segment_name(name, context);
+    }
+    if api_version == "v1" && kind == "Namespace" {
+        return validate_dns_label(name, context);
     }
     validate_dns_subdomain(name, context)
 }

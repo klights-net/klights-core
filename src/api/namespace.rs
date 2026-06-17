@@ -207,10 +207,6 @@ pub async fn create_namespace(
     )
     .await?;
 
-    if is_dry_run {
-        return Ok((StatusCode::CREATED, Json(body)));
-    }
-
     // Extract name
     let name = body
         .get("metadata")
@@ -218,6 +214,17 @@ pub async fn create_namespace(
         .and_then(|n| n.as_str())
         .ok_or_else(|| AppError::BadRequest("Missing metadata.name".to_string()))?
         .to_string();
+
+    if !validate_metadata_name_for_kind("v1", "Namespace", &name) {
+        return Err(AppError::UnprocessableEntity(format!(
+            "Invalid metadata.name '{}': must be a valid DNS label (lowercase alphanumeric, hyphens; max 63 chars; cannot start/end with hyphen)",
+            name
+        )));
+    }
+
+    if is_dry_run {
+        return Ok((StatusCode::CREATED, Json(body)));
+    }
 
     // Inject metadata fields
     if let Some(obj) = body.as_object_mut() {
