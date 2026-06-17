@@ -111,6 +111,7 @@ pub fn global_oo_registry() -> &'static OoCodecRegistry {
             Box::new(super::RbacV1Codec),
             Box::new(super::CertificatesV1Codec),
             Box::new(super::AuthorizationV1Codec),
+            Box::new(super::FlowcontrolV1Codec),
             Box::new(super::BuiltinResourceCodec),
         ])
     })
@@ -327,6 +328,27 @@ mod tests {
             assert!(
                 registry.handles(api_version, kind),
                 "global OO registry must handle {api_version}/{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn flowcontrol_resources_are_not_owned_by_builtin_bucket() {
+        let registry = global_oo_registry();
+        for kind in [
+            "FlowSchema",
+            "PriorityLevelConfiguration",
+            "FlowSchemaList",
+            "PriorityLevelConfigurationList",
+        ] {
+            assert!(
+                registry.handles("flowcontrol.apiserver.k8s.io/v1", kind),
+                "global OO registry must keep handling flowcontrol {kind}"
+            );
+            assert!(
+                !super::super::BuiltinResourceCodec
+                    .handles("flowcontrol.apiserver.k8s.io/v1", kind),
+                "flowcontrol {kind} must be served by a dedicated ResourceProtoCodec"
             );
         }
     }

@@ -344,26 +344,6 @@ decode_pb_fn!(
     pb_endpointslice_to_json
 );
 decode_pb_fn!(
-    decode_flowschema,
-    k8s_pb::api::flowcontrol::v1::FlowSchema,
-    pb_flowschema_to_json
-);
-decode_pb_fn!(
-    decode_prioritylevelconfiguration,
-    k8s_pb::api::flowcontrol::v1::PriorityLevelConfiguration,
-    pb_prioritylevelconfiguration_to_json
-);
-decode_pb_fn!(
-    decode_flowschemalist,
-    k8s_pb::api::flowcontrol::v1::FlowSchemaList,
-    pb_flowschemalist_to_json
-);
-decode_pb_fn!(
-    decode_prioritylevelconfigurationlist,
-    k8s_pb::api::flowcontrol::v1::PriorityLevelConfigurationList,
-    pb_prioritylevelconfigurationlist_to_json
-);
-decode_pb_fn!(
     decode_nodelist,
     k8s_pb::api::core::v1::NodeList,
     pb_nodelist_to_json
@@ -858,17 +838,6 @@ encode_value_result_fn!(
     encode_validatingwebhookconfigurationlist,
     json_validatingwebhookconfigurationlist_to_pb
 );
-encode_value_plain_fn!(encode_flowschema, json_flowschema_to_pb);
-encode_value_result_fn!(encode_flowschemalist, json_flowschemalist_to_pb);
-encode_value_plain_fn!(
-    encode_prioritylevelconfiguration,
-    json_prioritylevelconfiguration_to_pb
-);
-encode_value_result_fn!(
-    encode_prioritylevelconfigurationlist,
-    json_prioritylevelconfigurationlist_to_pb
-);
-
 fn encode_event(api_version: &str, value: &Value) -> anyhow::Result<Vec<u8>> {
     if api_version_matches("events.k8s.io", api_version) {
         let mut normalized = value.clone();
@@ -1200,30 +1169,6 @@ static BUILTIN_ENTRIES: &[BuiltinCodecEntry] = &[
         kind: "EndpointSlice",
         decode: decode_endpointslice,
         encode: encode_endpointslice,
-    },
-    BuiltinCodecEntry {
-        api_version_prefix: "flowcontrol.apiserver.k8s.io",
-        kind: "FlowSchema",
-        decode: decode_flowschema,
-        encode: encode_flowschema,
-    },
-    BuiltinCodecEntry {
-        api_version_prefix: "flowcontrol.apiserver.k8s.io",
-        kind: "PriorityLevelConfiguration",
-        decode: decode_prioritylevelconfiguration,
-        encode: encode_prioritylevelconfiguration,
-    },
-    BuiltinCodecEntry {
-        api_version_prefix: "flowcontrol.apiserver.k8s.io",
-        kind: "FlowSchemaList",
-        decode: decode_flowschemalist,
-        encode: encode_flowschemalist,
-    },
-    BuiltinCodecEntry {
-        api_version_prefix: "flowcontrol.apiserver.k8s.io",
-        kind: "PriorityLevelConfigurationList",
-        decode: decode_prioritylevelconfigurationlist,
-        encode: encode_prioritylevelconfigurationlist,
     },
     BuiltinCodecEntry {
         api_version_prefix: "",
