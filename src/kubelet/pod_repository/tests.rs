@@ -2356,6 +2356,26 @@ async fn build_repo() -> super::PodRepository {
     super::PodRepository::new(db, supervisor, side_effects, metrics)
 }
 
+async fn build_repo_with_bound_side_effects() -> Arc<super::PodRepository> {
+    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let supervisor = fixture_supervisor();
+    let metrics = crate::side_effects::SideEffectMetrics::new();
+    let side_effects = Arc::new(crate::side_effects::default_registry(
+        metrics.clone(),
+        None,
+        Some(supervisor.clone()),
+        Some(db.clone()),
+    ));
+    let repo = Arc::new(super::PodRepository::new(
+        db,
+        supervisor,
+        side_effects.clone(),
+        metrics,
+    ));
+    side_effects.set_pod_repository(repo.clone());
+    repo
+}
+
 struct StatusRacingRaftProposer {
     inner: crate::datastore::DatastoreHandle,
     namespace: String,
@@ -3122,7 +3142,7 @@ async fn set_pod_status_reconciles_namespace_termination_for_late_pod() {
 #[tokio::test]
 async fn set_pod_status_reconciles_matching_pdb_after_readiness_transition() {
     use super::PodStatusWriter;
-    let repo = build_repo().await;
+    let repo = build_repo_with_bound_side_effects().await;
     let db = repo.store.db().clone();
 
     let pdb = json!({
@@ -3150,7 +3170,7 @@ async fn set_pod_status_reconciles_matching_pdb_after_readiness_transition() {
         .await
         .unwrap();
 
-    crate::controllers::pdb::reconcile_pdb(&*db, &repo, &pdb)
+    crate::controllers::pdb::reconcile_pdb(&*db, repo.as_ref(), &pdb)
         .await
         .unwrap();
     let before = db
@@ -3222,6 +3242,103 @@ async fn set_pod_status_reconciles_matching_pdb_after_readiness_transition() {
             .pointer("/status/disruptionsAllowed")
             .and_then(|v| v.as_i64()),
         Some(1)
+    );
+}
+
+#[tokio::test]
+async fn record_sandbox_id_does_not_reconcile_pdb_without_endpoint_change() {
+    use super::PodMetadataWriter;
+
+    let repo = build_repo().await;
+    let db = repo.store.db().clone();
+
+    let pdb = json!({
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": {"name": "pdb-sandbox", "namespace": "default"},
+        "spec": {
+            "minAvailable": 0,
+            "selector": {"matchLabels": {"app": "x"}}
+        }
+    });
+    db.create_resource(
+        "policy/v1",
+        "PodDisruptionBudget",
+        Some("default"),
+        "pdb-sandbox",
+        pdb.clone(),
+    )
+    .await
+    .unwrap();
+
+    let created = repo
+        .store
+        .create("default", "pdb-sandbox-pod", pending_pod("pdb-sandbox-pod"))
+        .await
+        .unwrap();
+
+    crate::controllers::pdb::reconcile_pdb(&*db, &repo, &pdb)
+        .await
+        .unwrap();
+    let before = db
+        .get_resource(
+            "policy/v1",
+            "PodDisruptionBudget",
+            Some("default"),
+            "pdb-sandbox",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before
+            .data
+            .pointer("/status/currentHealthy")
+            .and_then(|v| v.as_i64()),
+        Some(0)
+    );
+
+    repo.store
+        .update_status(
+            "default",
+            "pdb-sandbox-pod",
+            json!({
+                "phase": "Running",
+                "podIP": "10.42.0.9",
+                "podIPs": [{"ip": "10.42.0.9"}],
+                "conditions": [
+                    {"type": "Ready", "status": "True"},
+                    {"type": "ContainersReady", "status": "True"}
+                ]
+            }),
+            Some(created.resource_version),
+        )
+        .await
+        .unwrap();
+
+    repo.record_sandbox_id("default", "pdb-sandbox-pod", "sandbox-pdb")
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let after = db
+        .get_resource(
+            "policy/v1",
+            "PodDisruptionBudget",
+            Some("default"),
+            "pdb-sandbox",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after
+            .data
+            .pointer("/status/currentHealthy")
+            .and_then(|v| v.as_i64()),
+        Some(0),
+        "sandbox metadata writes must not trigger the old namespace-wide PDB sweep"
     );
 }
 

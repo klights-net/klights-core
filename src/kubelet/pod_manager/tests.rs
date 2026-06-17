@@ -14,13 +14,20 @@ pub(super) fn fixture_pod_repository(
     let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
         crate::task_supervisor::TaskCategoryConfig::default(),
     ));
-    let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
-    std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
+    let side_effects = std::sync::Arc::new(crate::side_effects::default_registry(
+        metrics.clone(),
+        None,
+        Some(supervisor.clone()),
+        Some(db_handle.clone()),
+    ));
+    let repo = std::sync::Arc::new(crate::kubelet::pod_repository::PodRepository::new(
         db_handle,
         supervisor,
-        side_effects,
+        side_effects.clone(),
         metrics,
-    ))
+    ));
+    side_effects.set_pod_repository(repo.clone());
+    repo
 }

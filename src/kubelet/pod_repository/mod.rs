@@ -727,8 +727,8 @@ impl PodRepository {
             .await
     }
 
-    /// Spawn async PDB + namespace-termination reconciliation after a
-    /// pod status or metadata write.
+    /// Spawn async namespace-termination reconciliation after a pod status or
+    /// metadata write.
     ///
     /// Both operations are derived-state maintenance that must not block
     /// the caller (kubelet status writer, controller pod writer). The
@@ -737,7 +737,6 @@ impl PodRepository {
     /// graceful shutdown.
     async fn spawn_post_write_maintenance(&self, namespace: &str) {
         let db = self.store.db().clone();
-        let pod_reader: Arc<dyn crate::kubelet::pod_repository::PodReader> = self.store.clone();
         let metrics = self.metrics.clone();
         let ns = namespace.to_string();
         let _ = self
@@ -746,12 +745,6 @@ impl PodRepository {
                 crate::task_supervisor::TaskCategory::Background,
                 format!("post_write_maintenance/{ns}"),
                 async move {
-                    crate::controllers::pdb::reconcile_pdbs_for_namespace(
-                        db.as_ref(),
-                        pod_reader.as_ref(),
-                        &ns,
-                    )
-                    .await;
                     if let Err(err) = crate::api::reconcile_namespace_termination(
                         db.as_ref(),
                         &ns,
@@ -768,6 +761,30 @@ impl PodRepository {
                 },
             )
             .await;
+    }
+
+    async fn finish_status_write(
+        &self,
+        namespace: &str,
+        result: status::PodStatusWriteResult,
+        context: &'static str,
+    ) -> Resource {
+        let resource = result.resource;
+        if result.changed {
+            if result.endpoint_state_changed {
+                crate::side_effects::run_named_hook_logged(
+                    &self.side_effects,
+                    &resource.data,
+                    self.store.db().as_ref(),
+                    &self.metrics,
+                    "pdb_reconcile",
+                    context,
+                )
+                .await;
+            }
+            self.spawn_post_write_maintenance(namespace).await;
+        }
+        resource
     }
 
     pub async fn schedule_pending_pod(
@@ -983,10 +1000,7 @@ impl PodStatusWriter for PodRepository {
             .status
             .set_pod_status(ns, name, &update, expected_rv)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self.finish_status_write(ns, result, "pod_status_set").await)
     }
 
     async fn set_pod_status_for_uid(
@@ -1001,10 +1015,9 @@ impl PodStatusWriter for PodRepository {
             .status
             .set_pod_status_for_uid(ns, name, pod_uid, update, expected_rv)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self
+            .finish_status_write(ns, result, "pod_status_set_uid")
+            .await)
     }
 
     async fn apply_runtime_reconcile_status(
@@ -1018,10 +1031,9 @@ impl PodStatusWriter for PodRepository {
             .status
             .apply_runtime_reconcile_status(ns, name, update, expected_rv)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self
+            .finish_status_write(ns, result, "pod_runtime_reconcile_status")
+            .await)
     }
 
     async fn apply_runtime_reconcile_status_for_uid(
@@ -1036,10 +1048,9 @@ impl PodStatusWriter for PodRepository {
             .status
             .apply_runtime_reconcile_status_for_uid(ns, name, pod_uid, update, expected_rv)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self
+            .finish_status_write(ns, result, "pod_runtime_reconcile_status_uid")
+            .await)
     }
 
     async fn mark_start_pending_for_retry_for_uid(
@@ -1053,10 +1064,9 @@ impl PodStatusWriter for PodRepository {
             .status
             .mark_start_pending_for_retry_for_uid(ns, name, pod_uid, error_message)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self
+            .finish_status_write(ns, result, "pod_start_pending_retry")
+            .await)
     }
 
     async fn set_probe_readiness(
@@ -1071,10 +1081,9 @@ impl PodStatusWriter for PodRepository {
             .status
             .set_probe_readiness(ns, name, container_name, ready, expected_rv)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self
+            .finish_status_write(ns, result, "pod_probe_readiness")
+            .await)
     }
 
     async fn set_probe_readiness_for_uid(
@@ -1090,10 +1099,9 @@ impl PodStatusWriter for PodRepository {
             .status
             .set_probe_readiness_for_uid(ns, name, pod_uid, container_name, ready, expected_rv)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self
+            .finish_status_write(ns, result, "pod_probe_readiness_uid")
+            .await)
     }
     async fn set_deadline_exceeded(
         &self,
@@ -1106,10 +1114,9 @@ impl PodStatusWriter for PodRepository {
             .status
             .set_deadline_exceeded(ns, name, message, expected_rv)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self
+            .finish_status_write(ns, result, "pod_deadline_exceeded")
+            .await)
     }
 
     async fn set_deadline_exceeded_for_uid(
@@ -1124,10 +1131,9 @@ impl PodStatusWriter for PodRepository {
             .status
             .set_deadline_exceeded_for_uid(ns, name, pod_uid, message, expected_rv)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self
+            .finish_status_write(ns, result, "pod_deadline_exceeded_uid")
+            .await)
     }
     async fn apply_ephemeral_container_statuses(
         &self,
@@ -1140,10 +1146,9 @@ impl PodStatusWriter for PodRepository {
             .status
             .apply_ephemeral_container_statuses(ns, name, statuses, expected_rv)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self
+            .finish_status_write(ns, result, "pod_ephemeral_container_statuses")
+            .await)
     }
 
     async fn apply_ephemeral_container_statuses_for_uid(
@@ -1158,10 +1163,9 @@ impl PodStatusWriter for PodRepository {
             .status
             .apply_ephemeral_container_statuses_for_uid(ns, name, pod_uid, statuses, expected_rv)
             .await?;
-        if result.changed {
-            self.spawn_post_write_maintenance(ns).await;
-        }
-        Ok(result.resource)
+        Ok(self
+            .finish_status_write(ns, result, "pod_ephemeral_container_statuses_uid")
+            .await)
     }
     async fn note_container_restart(
         &self,

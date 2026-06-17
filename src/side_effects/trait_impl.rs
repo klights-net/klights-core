@@ -163,6 +163,29 @@ impl SideEffectRegistry {
         resource: &Value,
         db: &dyn DatastoreBackend,
     ) -> (Vec<SideEffectFailure>, bool) {
+        self.run_hooks_collect_failures_matching(resource, db, |_| true)
+            .await
+    }
+
+    /// Run one named hook for a resource type and collect failures.
+    pub async fn run_named_hook_collect_failures(
+        &self,
+        resource: &Value,
+        db: &dyn DatastoreBackend,
+        hook_name: &'static str,
+    ) -> (Vec<SideEffectFailure>, bool) {
+        self.run_hooks_collect_failures_matching(resource, db, |hook| {
+            hook.side_effect.name() == hook_name
+        })
+        .await
+    }
+
+    async fn run_hooks_collect_failures_matching(
+        &self,
+        resource: &Value,
+        db: &dyn DatastoreBackend,
+        should_run: impl Fn(&Hook) -> bool,
+    ) -> (Vec<SideEffectFailure>, bool) {
         let api_version = resource
             .get("apiVersion")
             .and_then(|v| v.as_str())
@@ -174,6 +197,9 @@ impl SideEffectRegistry {
 
         if let Some(hooks) = self.hooks.get(&key) {
             for hook in hooks {
+                if !should_run(hook) {
+                    continue;
+                }
                 match hook.side_effect.apply(resource, db).await {
                     Err(e) => {
                         failures.push(SideEffectFailure {

@@ -35,6 +35,7 @@ pub(super) struct PodStatusService {
 pub(super) struct PodStatusWriteResult {
     pub(super) resource: Resource,
     pub(super) changed: bool,
+    pub(super) endpoint_state_changed: bool,
 }
 
 impl PodStatusWriteResult {
@@ -42,6 +43,7 @@ impl PodStatusWriteResult {
         Self {
             resource,
             changed: false,
+            endpoint_state_changed: false,
         }
     }
 }
@@ -410,6 +412,7 @@ impl PodStatusService {
                 return Ok(PodStatusWriteResult {
                     resource,
                     changed: false,
+                    endpoint_state_changed: false,
                 });
             }
 
@@ -431,9 +434,15 @@ impl PodStatusService {
                         self.refresh_owner_status_after_pod_status_change(&pod, &updated.data)
                             .await;
                     }
+                    let endpoint_state_changed = changed
+                        && crate::side_effects::service_pod::pod_endpoint_state_changed(
+                            &pod,
+                            &updated.data,
+                        );
                     return Ok(PodStatusWriteResult {
                         resource: updated,
                         changed,
+                        endpoint_state_changed,
                     });
                 }
                 Err(e)
@@ -733,6 +742,7 @@ impl PodStatusService {
                 return Ok(PodStatusWriteResult {
                     resource,
                     changed: false,
+                    endpoint_state_changed: false,
                 });
             }
 
@@ -757,9 +767,15 @@ impl PodStatusService {
                         )
                         .await;
                     }
+                    let endpoint_state_changed = changed
+                        && crate::side_effects::service_pod::pod_endpoint_state_changed(
+                            &pod_resource.data,
+                            &updated.data,
+                        );
                     return Ok(PodStatusWriteResult {
                         resource: updated,
                         changed,
+                        endpoint_state_changed,
                     });
                 }
                 Err(e)
@@ -971,6 +987,7 @@ impl PodStatusService {
             return Ok(PodStatusWriteResult {
                 resource,
                 changed: false,
+                endpoint_state_changed: false,
             });
         }
 
@@ -986,9 +1003,15 @@ impl PodStatusService {
             &pod_resource.data,
             &updated,
         );
+        let endpoint_state_changed = changed
+            && crate::side_effects::service_pod::pod_endpoint_state_changed(
+                &pod_resource.data,
+                &updated.data,
+            );
         Ok(PodStatusWriteResult {
             resource: updated,
             changed,
+            endpoint_state_changed,
         })
     }
 
@@ -1169,6 +1192,7 @@ impl PodStatusService {
                 return Ok(PodStatusWriteResult {
                     resource,
                     changed: false,
+                    endpoint_state_changed: false,
                 });
             }
 
@@ -1193,9 +1217,15 @@ impl PodStatusService {
                         )
                         .await;
                     }
+                    let endpoint_state_changed = changed
+                        && crate::side_effects::service_pod::pod_endpoint_state_changed(
+                            &pod_resource.data,
+                            &updated.data,
+                        );
                     return Ok(PodStatusWriteResult {
                         resource: updated,
                         changed,
+                        endpoint_state_changed,
                     });
                 }
                 Err(e)
@@ -1412,6 +1442,7 @@ impl PodStatusService {
             return Ok(PodStatusWriteResult {
                 resource,
                 changed: false,
+                endpoint_state_changed: false,
             });
         }
 
@@ -1431,9 +1462,15 @@ impl PodStatusService {
             self.refresh_owner_status_after_pod_status_change(&pod_resource.data, &updated.data)
                 .await;
         }
+        let endpoint_state_changed = changed
+            && crate::side_effects::service_pod::pod_endpoint_state_changed(
+                &pod_resource.data,
+                &updated.data,
+            );
         Ok(PodStatusWriteResult {
             resource: updated,
             changed,
+            endpoint_state_changed,
         })
     }
 }
