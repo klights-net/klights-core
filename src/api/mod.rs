@@ -136,9 +136,9 @@ pub use validation::{
     check_deployment_strict_decode_from_raw_json, check_field_validation_strict,
     check_field_validation_strict_typed, check_immutable_fields, inject_resource_version,
     parse_apply_yaml, parse_delete_options_body, prepare_admissionregistration_resource,
-    run_admission_for_request, validate_builtin_resource_spec, validate_crd_field_selector,
-    validate_pod_resource_requirements_immutable, validate_pod_sysctls,
-    validate_priorityclass_update_immutable,
+    run_admission_for_request, validate_builtin_field_selector, validate_builtin_resource_spec,
+    validate_crd_field_selector, validate_pod_resource_requirements_immutable,
+    validate_pod_sysctls, validate_priorityclass_update_immutable,
 };
 #[cfg(test)]
 pub use validation::{

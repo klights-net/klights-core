@@ -28,6 +28,13 @@ pub async fn list_namespaces(
         LabelSelector::parse(selector)
             .map_err(|err| AppError::BadRequest(format!("Invalid label selector: {err}")))?;
     }
+    validate_builtin_field_selector(
+        "v1",
+        "Namespace",
+        query.label_selector.as_deref(),
+        query.field_selector.as_deref(),
+        false,
+    )?;
 
     // Watch streaming for Namespaces
     if query.watch == Some("true".to_string()) {

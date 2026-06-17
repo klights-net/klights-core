@@ -14,6 +14,13 @@ pub async fn list_pods(
     Query(query): Query<ListQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    validate_builtin_field_selector(
+        "v1",
+        "Pod",
+        query.label_selector.as_deref(),
+        query.field_selector.as_deref(),
+        true,
+    )?;
     if query.watch == Some("true".to_string()) {
         // Watch streaming
         let kind = "Pod".to_string();
@@ -482,6 +489,13 @@ pub async fn list_all_pods(
     Query(query): Query<ListQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    validate_builtin_field_selector(
+        "v1",
+        "Pod",
+        query.label_selector.as_deref(),
+        query.field_selector.as_deref(),
+        true,
+    )?;
     // Watch streaming for cluster-wide list (all namespaces)
     if query.watch == Some("true".to_string()) {
         let kind = "Pod".to_string();

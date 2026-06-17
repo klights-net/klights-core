@@ -51,6 +51,96 @@ pub fn validate_crd_field_selector(
     Ok(())
 }
 
+pub fn validate_builtin_field_selector(
+    api_version: &str,
+    kind: &str,
+    label_selector: Option<&str>,
+    field_selector: Option<&str>,
+    namespaced: bool,
+) -> Result<(), AppError> {
+    validate_field_selector(
+        api_version,
+        kind,
+        label_selector,
+        field_selector,
+        namespaced,
+        builtin_selectable_fields(api_version, kind),
+    )
+}
+
+fn validate_field_selector(
+    api_version: &str,
+    resource: &str,
+    label_selector: Option<&str>,
+    field_selector: Option<&str>,
+    namespaced: bool,
+    selectable_fields: &[&str],
+) -> Result<(), AppError> {
+    let Some(selector) = field_selector else {
+        return Ok(());
+    };
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Ok(());
+    }
+
+    let mut supported_fields = std::collections::HashSet::new();
+    supported_fields.insert("metadata.name");
+    if namespaced {
+        supported_fields.insert("metadata.namespace");
+    }
+    for field in selectable_fields {
+        supported_fields.insert(*field);
+    }
+
+    for part in selector.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let key = if let Some((key, _)) = part.split_once("!=") {
+            key.trim()
+        } else if let Some((key, _)) = part.split_once('=') {
+            key.trim()
+        } else {
+            continue;
+        };
+
+        if !supported_fields.contains(key) {
+            return Err(AppError::BadRequest(format!(
+                "Unable to find \"{}, Resource={}\" that match label selector \"{}\", field selector \"{}\": field label not supported: {}",
+                api_version,
+                resource,
+                label_selector.unwrap_or_default(),
+                selector,
+                key
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn builtin_selectable_fields(api_version: &str, kind: &str) -> &'static [&'static str] {
+    match (api_version, kind) {
+        ("v1", "Pod") => &[
+            "spec.nodeName",
+            "status.phase",
+            "spec.restartPolicy",
+            "spec.schedulerName",
+        ],
+        ("v1", "Node") => &["spec.unschedulable"],
+        ("v1", "PersistentVolume") => &["status.phase"],
+        ("v1", "PersistentVolumeClaim") => &["status.phase"],
+        ("v1", "Event") | ("events.k8s.io/v1", "Event") => &[
+            "reason",
+            "type",
+            "source",
+            "involvedObject.kind",
+            "involvedObject.uid",
+            "involvedObject.name",
+            "involvedObject.namespace",
+        ],
+        _ => &[],
+    }
+}
+
 /// Standard K8s top-level fields accepted by all resource types.
 static KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "apiVersion",

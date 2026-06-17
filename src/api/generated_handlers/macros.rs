@@ -1031,6 +1031,13 @@ macro_rules! cluster_wide_list_handler {
             Query(query): Query<ListQuery>,
             headers: HeaderMap,
         ) -> Result<Response, AppError> {
+            validate_builtin_field_selector(
+                $api_version,
+                $kind,
+                query.label_selector.as_deref(),
+                query.field_selector.as_deref(),
+                true,
+            )?;
             // Watch streaming for cluster-wide list (all namespaces)
             if query.watch == Some("true".to_string()) {
                 let kind = $kind.to_string();

@@ -2122,6 +2122,97 @@ async fn test_pod_watch_catchup_honors_metadata_name_field_selector() {
     );
 }
 
+#[tokio::test]
+async fn test_builtin_list_rejects_unsupported_field_selector() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/namespaces/default/configmaps?fieldSelector=data.foo%3Dbar")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("field label not supported: data.foo"),
+        "unexpected unsupported field-selector response: {text}"
+    );
+
+    let namespace_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/namespaces?fieldSelector=metadata.namespace%3Ddefault")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(namespace_resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_builtin_watch_rejects_unsupported_field_selector_before_streaming() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/configmaps?watch=true&fieldSelector=data.foo%3Dbar")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_builtin_field_selector_accepts_supported_fields() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    for uri in [
+        "/api/v1/pods?fieldSelector=spec.nodeName%3Dnode-a",
+        "/api/v1/nodes?fieldSelector=spec.unschedulable%3Dfalse",
+        "/api/v1/namespaces?fieldSelector=metadata.name%3Ddefault",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "unexpected status for {uri}");
+    }
+}
+
 /// Reproduces sonobuoy "should observe an object deletion if it stops
 /// meeting the requirements of the selector" against the real watch
 /// pipeline. The conformance test opens a label-selector watch, creates a

@@ -250,6 +250,13 @@ pub async fn list_inner(
         headers,
     } = request;
     let ns = namespace.as_deref();
+    validate_builtin_field_selector(
+        api_version,
+        kind,
+        query.label_selector.as_deref(),
+        query.field_selector.as_deref(),
+        ns.is_some(),
+    )?;
     if query.watch == Some("true".to_string()) {
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
         let explicit_resource_version_zero = query
