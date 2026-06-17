@@ -13,6 +13,7 @@ pub(super) mod core_v1;
 pub(super) mod discovery_v1;
 pub(super) mod events_k8s_io_v1;
 pub(super) mod flowcontrol_v1;
+pub(super) mod metrics_v1beta1;
 pub(super) mod networking_v1;
 pub(super) mod node_k8s_io_v1;
 pub(super) mod policy_v1;

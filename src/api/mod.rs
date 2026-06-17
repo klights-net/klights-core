@@ -179,9 +179,9 @@ use crate::api_discovery::{
     certificates_v1_resources, coordination_v1_resources, custom_resource_discovery,
     discovery_v1_resources, events_k8s_io_v1_resources, flowcontrol_v1_resources, get_openapi_v2,
     get_openapi_v3_api_v1, get_openapi_v3_apis, get_openapi_v3_discovery,
-    get_openapi_v3_group_version, networking_v1_resources, node_k8s_io_group,
-    node_k8s_io_v1_resources, policy_v1_resources, rbac_v1_resources, scheduling_group,
-    scheduling_v1_resources, storage_v1_resources,
+    get_openapi_v3_group_version, metrics_v1beta1_resources, networking_v1_resources,
+    node_k8s_io_group, node_k8s_io_v1_resources, policy_v1_resources, rbac_v1_resources,
+    scheduling_group, scheduling_v1_resources, storage_v1_resources,
 };
 use crate::api_pod_subresources::{
     get_pod_ephemeral_containers, get_pod_log, get_pod_status, node_proxy, node_proxy_with_path,

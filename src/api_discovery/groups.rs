@@ -117,6 +117,17 @@ pub async fn api_groups(State(state): State<Arc<AppState>>, headers: HeaderMap) 
             },
         },
         APIGroup {
+            name: "metrics.k8s.io".to_string(),
+            versions: vec![GroupVersionForDiscovery {
+                group_version: "metrics.k8s.io/v1beta1".to_string(),
+                version: "v1beta1".to_string(),
+            }],
+            preferred_version: GroupVersionForDiscovery {
+                group_version: "metrics.k8s.io/v1beta1".to_string(),
+                version: "v1beta1".to_string(),
+            },
+        },
+        APIGroup {
             name: "networking.k8s.io".to_string(),
             versions: vec![GroupVersionForDiscovery {
                 group_version: "networking.k8s.io/v1".to_string(),
@@ -422,6 +433,7 @@ pub async fn api_group_by_name(
         ("coordination.k8s.io", "v1"),
         ("discovery.k8s.io", "v1"),
         ("events.k8s.io", "v1"),
+        ("metrics.k8s.io", "v1beta1"),
         ("networking.k8s.io", "v1"),
         ("storage.k8s.io", "v1"),
         ("node.k8s.io", "v1"),
@@ -666,6 +678,30 @@ pub fn aggregated_resources_for_group_version(
             subresources: Vec::new(),
             ..Default::default()
         }],
+        "metrics.k8s.io" => vec![
+            APIResourceDiscovery {
+                resource: "nodes".to_string(),
+                response_kind: APIResourceResponseKind {
+                    kind: "NodeMetrics".to_string(),
+                },
+                scope: "Cluster".to_string(),
+                singular_resource: "node".to_string(),
+                verbs: vec!["get".to_string(), "list".to_string()],
+                subresources: Vec::new(),
+                ..Default::default()
+            },
+            APIResourceDiscovery {
+                resource: "pods".to_string(),
+                response_kind: APIResourceResponseKind {
+                    kind: "PodMetrics".to_string(),
+                },
+                scope: "Namespaced".to_string(),
+                singular_resource: "pod".to_string(),
+                verbs: vec!["get".to_string(), "list".to_string()],
+                subresources: Vec::new(),
+                ..Default::default()
+            },
+        ],
         "networking.k8s.io" => vec![
             APIResourceDiscovery {
                 resource: "ingresses".to_string(),

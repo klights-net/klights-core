@@ -172,6 +172,268 @@ async fn test_apis_scheduling_group_discovery_endpoint() {
 }
 
 #[tokio::test]
+async fn test_metrics_k8s_io_discovery_advertises_node_and_pod_metrics() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let group_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/metrics.k8s.io")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(group_resp.status(), StatusCode::OK);
+    let group_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(group_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(group_body["name"], "metrics.k8s.io");
+    assert_eq!(
+        group_body["preferredVersion"]["groupVersion"],
+        "metrics.k8s.io/v1beta1"
+    );
+
+    let resources_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/metrics.k8s.io/v1beta1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resources_resp.status(), StatusCode::OK);
+    let resources_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resources_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(resources_body["groupVersion"], "metrics.k8s.io/v1beta1");
+    let resources = resources_body["resources"].as_array().unwrap();
+    assert!(resources.iter().any(|r| {
+        r["name"] == "nodes"
+            && r["kind"] == "NodeMetrics"
+            && r["namespaced"] == false
+            && r["verbs"] == json!(["get", "list"])
+    }));
+    assert!(resources.iter().any(|r| {
+        r["name"] == "pods"
+            && r["kind"] == "PodMetrics"
+            && r["namespaced"] == true
+            && r["verbs"] == json!(["get", "list"])
+    }));
+
+    let aggregated_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis")
+                .header(
+                    "accept",
+                    "application/json;v=v2;g=apidiscovery.k8s.io;as=APIGroupDiscoveryList",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(aggregated_resp.status(), StatusCode::OK);
+    let aggregated_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(aggregated_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let metrics_group = aggregated_body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["metadata"]["name"] == "metrics.k8s.io")
+        .expect("metrics.k8s.io missing from aggregated discovery");
+    let resources = metrics_group["versions"][0]["resources"]
+        .as_array()
+        .unwrap();
+    assert!(resources.iter().any(|r| {
+        r["resource"] == "nodes"
+            && r["responseKind"]["kind"] == "NodeMetrics"
+            && r["scope"] == "Cluster"
+    }));
+    assert!(resources.iter().any(|r| {
+        r["resource"] == "pods"
+            && r["responseKind"]["kind"] == "PodMetrics"
+            && r["scope"] == "Namespaced"
+    }));
+}
+
+#[tokio::test]
+async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    db.create_resource(
+        "v1",
+        "Node",
+        None,
+        "node-a",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "node-a"}
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "metrics-ns",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "metrics-ns"}
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("metrics-ns"),
+        "pod-a",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "pod-a", "namespace": "metrics-ns"},
+            "spec": {
+                "nodeName": "node-a",
+                "containers": [
+                    {"name": "app", "image": "busybox"},
+                    {"name": "sidecar", "image": "busybox"}
+                ]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let node_list_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/metrics.k8s.io/v1beta1/nodes")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(node_list_resp.status(), StatusCode::OK);
+    let node_list: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(node_list_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(node_list["apiVersion"], "metrics.k8s.io/v1beta1");
+    assert_eq!(node_list["kind"], "NodeMetricsList");
+    assert_eq!(node_list["items"][0]["kind"], "NodeMetrics");
+    assert_eq!(node_list["items"][0]["metadata"]["name"], "node-a");
+    assert!(node_list["items"][0]["timestamp"].as_str().is_some());
+    assert_eq!(node_list["items"][0]["window"], "30s");
+    assert_eq!(node_list["items"][0]["usage"]["cpu"], "0");
+    assert_eq!(node_list["items"][0]["usage"]["memory"], "0");
+
+    let node_get_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/metrics.k8s.io/v1beta1/nodes/node-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(node_get_resp.status(), StatusCode::OK);
+    let node_get: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(node_get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(node_get["kind"], "NodeMetrics");
+    assert_eq!(node_get["metadata"]["name"], "node-a");
+
+    let pod_list_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/metrics.k8s.io/v1beta1/namespaces/metrics-ns/pods")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pod_list_resp.status(), StatusCode::OK);
+    let pod_list: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(pod_list_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pod_list["apiVersion"], "metrics.k8s.io/v1beta1");
+    assert_eq!(pod_list["kind"], "PodMetricsList");
+    assert_eq!(pod_list["items"][0]["kind"], "PodMetrics");
+    assert_eq!(pod_list["items"][0]["metadata"]["namespace"], "metrics-ns");
+    assert_eq!(pod_list["items"][0]["metadata"]["name"], "pod-a");
+    assert_eq!(pod_list["items"][0]["containers"][0]["name"], "app");
+    assert_eq!(pod_list["items"][0]["containers"][1]["name"], "sidecar");
+    assert_eq!(pod_list["items"][0]["containers"][0]["usage"]["cpu"], "0");
+    assert_eq!(
+        pod_list["items"][0]["containers"][0]["usage"]["memory"],
+        "0"
+    );
+
+    let pod_get_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/metrics.k8s.io/v1beta1/namespaces/metrics-ns/pods/pod-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pod_get_resp.status(), StatusCode::OK);
+    let pod_get: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(pod_get_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pod_get["kind"], "PodMetrics");
+    assert_eq!(pod_get["metadata"]["name"], "pod-a");
+    assert_eq!(pod_get["containers"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn test_priorityclass_value_immutable_on_patch_and_update() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

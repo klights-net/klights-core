@@ -253,7 +253,19 @@ pub fn build_router(state: AppState) -> Router {
             "/apis/authentication.k8s.io/v1/tokenreviews/",
             post(create_token_review),
         )
+        .route(
+            "/apis/metrics.k8s.io/v1beta1",
+            get(metrics_v1beta1_resources),
+        )
+        .route(
+            "/apis/metrics.k8s.io/v1beta1/",
+            get(metrics_v1beta1_resources),
+        )
         .nest("/api/v1", handlers::core_v1::api_v1_routes())
+        .nest(
+            "/apis/metrics.k8s.io/v1beta1",
+            handlers::metrics_v1beta1::metrics_v1beta1_routes(),
+        )
         .nest(
             "/apis/autoscaling/v1",
             handlers::autoscaling_v1::autoscaling_v1_routes(),
