@@ -8461,7 +8461,7 @@ async fn api_create_pod_rejects_restricted_pod_security_violation() {
 
 #[tokio::test]
 async fn api_create_pod_defaults_container_fields() {
-    use super::PodApiWriter;
+    use super::{PodApiWriter, PodReader};
     let repo = build_repo().await;
     let result = repo
         .api_create_pod(api_create_request(
@@ -8470,9 +8470,13 @@ async fn api_create_pod_defaults_container_fields() {
                 "kind": "Pod",
                 "metadata": { "name": "container-defaults" },
                 "spec": {
+                    "initContainers": [{
+                        "name": "init",
+                        "image": "busybox"
+                    }],
                     "containers": [{
                         "name": "c",
-                        "image": "busybox",
+                        "image": "nginx:1.25",
                         "terminationMessagePath": "",
                         "terminationMessagePolicy": "",
                         "livenessProbe": { "httpGet": { "port": 8080, "path": "", "scheme": "" } }
@@ -8511,6 +8515,42 @@ async fn api_create_pod_defaults_container_fields() {
     assert_eq!(
         result.body.pointer("/spec/restartPolicy"),
         Some(&json!("Always"))
+    );
+    assert_eq!(
+        result.body.pointer("/spec/dnsPolicy"),
+        Some(&json!("ClusterFirst"))
+    );
+    assert_eq!(
+        result.body.pointer("/spec/schedulerName"),
+        Some(&json!("default-scheduler"))
+    );
+    assert_eq!(
+        result
+            .body
+            .pointer("/spec/initContainers/0/imagePullPolicy"),
+        Some(&json!("Always"))
+    );
+    assert_eq!(
+        result.body.pointer("/spec/containers/0/imagePullPolicy"),
+        Some(&json!("IfNotPresent"))
+    );
+
+    let stored = repo
+        .get_pod("default", "container-defaults")
+        .await
+        .unwrap()
+        .expect("created pod stored");
+    assert_eq!(
+        stored.data.pointer("/spec/dnsPolicy"),
+        Some(&json!("ClusterFirst"))
+    );
+    assert_eq!(
+        stored.data.pointer("/spec/schedulerName"),
+        Some(&json!("default-scheduler"))
+    );
+    assert_eq!(
+        stored.data.pointer("/spec/containers/0/imagePullPolicy"),
+        Some(&json!("IfNotPresent"))
     );
 }
 

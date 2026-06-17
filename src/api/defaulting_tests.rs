@@ -155,6 +155,34 @@ fn apply_pod_create_defaults_sets_empty_serviceaccountname_to_default() {
     assert_eq!(pod["spec"]["serviceAccountName"], "default");
 }
 
+#[test]
+fn apply_pod_create_defaults_sets_dns_scheduler_and_image_pull_policy() {
+    let mut pod = json!({
+        "spec": {
+            "initContainers": [{"name": "init", "image": "busybox"}],
+            "containers": [
+                {"name": "tagged", "image": "nginx:1.25"},
+                {"name": "latest", "image": "redis:latest"}
+            ]
+        }
+    });
+    apply_pod_create_defaults(&mut pod);
+    assert_eq!(pod["spec"]["dnsPolicy"], "ClusterFirst");
+    assert_eq!(pod["spec"]["schedulerName"], "default-scheduler");
+    assert_eq!(
+        pod.pointer("/spec/initContainers/0/imagePullPolicy"),
+        Some(&json!("Always"))
+    );
+    assert_eq!(
+        pod.pointer("/spec/containers/0/imagePullPolicy"),
+        Some(&json!("IfNotPresent"))
+    );
+    assert_eq!(
+        pod.pointer("/spec/containers/1/imagePullPolicy"),
+        Some(&json!("Always"))
+    );
+}
+
 // ============================================================================
 // apply_pvc_create_defaults
 // ============================================================================

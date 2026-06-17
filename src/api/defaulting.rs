@@ -15,7 +15,7 @@
 
 use crate::api::helpers::SPEC_BEARING_KINDS;
 use crate::api::{apply_pod_container_defaults, compute_qos_class};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Inject namespace, name, UID, creationTimestamp, and generation defaults
 /// into `body.metadata`. Mirrors the K8s API server's per-create metadata
@@ -89,23 +89,7 @@ pub fn apply_pod_create_defaults(body: &mut Value) {
     };
     let spec = obj.entry("spec").or_insert_with(|| serde_json::json!({}));
     if let Some(spec_obj) = spec.as_object_mut() {
-        if !spec_obj.contains_key("terminationGracePeriodSeconds") {
-            spec_obj.insert(
-                "terminationGracePeriodSeconds".to_string(),
-                serde_json::json!(30),
-            );
-        }
-        let service_account_name_missing_or_empty = spec_obj
-            .get("serviceAccountName")
-            .and_then(|v| v.as_str())
-            .is_none_or(str::is_empty);
-        if service_account_name_missing_or_empty {
-            spec_obj.insert(
-                "serviceAccountName".to_string(),
-                serde_json::json!("default"),
-            );
-        }
-        apply_pod_container_defaults(spec_obj);
+        apply_pod_spec_create_defaults(spec_obj);
     }
     obj.insert(
         "status".to_string(),
@@ -137,6 +121,44 @@ pub fn apply_pod_create_defaults(body: &mut Value) {
             "qosClass": qos_class,
         }),
     );
+}
+
+/// Apply create-time defaults that live under `Pod.spec`.
+pub fn apply_pod_spec_create_defaults(spec_obj: &mut Map<String, Value>) {
+    if !spec_obj.contains_key("terminationGracePeriodSeconds") {
+        spec_obj.insert(
+            "terminationGracePeriodSeconds".to_string(),
+            serde_json::json!(30),
+        );
+    }
+    let service_account_name_missing_or_empty = spec_obj
+        .get("serviceAccountName")
+        .and_then(|v| v.as_str())
+        .is_none_or(str::is_empty);
+    if service_account_name_missing_or_empty {
+        spec_obj.insert(
+            "serviceAccountName".to_string(),
+            serde_json::json!("default"),
+        );
+    }
+    let dns_policy_missing_or_empty = spec_obj
+        .get("dnsPolicy")
+        .and_then(|v| v.as_str())
+        .is_none_or(str::is_empty);
+    if dns_policy_missing_or_empty {
+        spec_obj.insert("dnsPolicy".to_string(), serde_json::json!("ClusterFirst"));
+    }
+    let scheduler_name_missing_or_empty = spec_obj
+        .get("schedulerName")
+        .and_then(|v| v.as_str())
+        .is_none_or(str::is_empty);
+    if scheduler_name_missing_or_empty {
+        spec_obj.insert(
+            "schedulerName".to_string(),
+            serde_json::json!("default-scheduler"),
+        );
+    }
+    apply_pod_container_defaults(spec_obj);
 }
 
 /// Set `status.phase = "Pending"` on a freshly-created PVC when missing.

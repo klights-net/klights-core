@@ -63,10 +63,11 @@ use custom_resources::{
 };
 pub use debug::pod_lifecycle_debug_dump;
 pub use defaulting::{
-    apply_pod_create_defaults, apply_pv_create_defaults, apply_pvc_create_defaults,
-    apply_replicationcontroller_selector_default, apply_resourcequota_create_status,
-    apply_workload_replicas_default, increment_generation_for_spec_change,
-    increment_generation_if_spec_changed, inject_create_metadata, set_deletion_timestamp,
+    apply_pod_create_defaults, apply_pod_spec_create_defaults, apply_pv_create_defaults,
+    apply_pvc_create_defaults, apply_replicationcontroller_selector_default,
+    apply_resourcequota_create_status, apply_workload_replicas_default,
+    increment_generation_for_spec_change, increment_generation_if_spec_changed,
+    inject_create_metadata, set_deletion_timestamp,
 };
 pub use errors::AppError;
 use errors::{map_mutating_admission_error, map_validating_admission_error};
@@ -260,6 +261,15 @@ pub fn apply_pod_container_defaults(spec_obj: &mut serde_json::Map<String, Value
             );
         }
 
+        let image_pull_policy_missing_or_empty = container_obj
+            .get("imagePullPolicy")
+            .is_none_or(|v| v.is_null() || v.as_str().is_some_and(str::is_empty));
+        if image_pull_policy_missing_or_empty {
+            let policy =
+                default_image_pull_policy(container_obj.get("image").and_then(|v| v.as_str()));
+            container_obj.insert("imagePullPolicy".to_string(), serde_json::json!(policy));
+        }
+
         for probe_key in ["livenessProbe", "readinessProbe", "startupProbe"] {
             let Some(http_get) = container_obj
                 .get_mut(probe_key)
@@ -282,6 +292,20 @@ pub fn apply_pod_container_defaults(spec_obj: &mut serde_json::Map<String, Value
             if needs_scheme_default {
                 http_get.insert("scheme".to_string(), serde_json::json!("HTTP"));
             }
+        }
+    }
+
+    fn default_image_pull_policy(image: Option<&str>) -> &'static str {
+        let image = image.unwrap_or_default();
+        let image_without_digest = image.split_once('@').map(|(name, _)| name).unwrap_or(image);
+        let last_component = image_without_digest
+            .rsplit('/')
+            .next()
+            .unwrap_or(image_without_digest);
+        match last_component.rsplit_once(':') {
+            Some((_, "latest")) | None => "Always",
+            Some((_, "")) => "Always",
+            Some(_) => "IfNotPresent",
         }
     }
 

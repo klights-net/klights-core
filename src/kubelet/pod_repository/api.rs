@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::api::{
     AdmissionContextRequest, AppError, apply_limitrange_defaults_to_pod, apply_patch,
-    apply_pod_container_defaults, apply_pod_runtimeclass_admission, build_admission_context,
+    apply_pod_runtimeclass_admission, apply_pod_spec_create_defaults, build_admission_context,
     check_resource_quota_for_creation, check_resource_quota_for_pod_update, compute_qos_class,
     enforce_limitrange_constraints_for_pod, enforce_pod_security_admission,
     normalize_resource_for_storage, resolve_resource_name, run_admission_for_request,
@@ -368,17 +368,7 @@ impl PodApiService {
         if let Some(obj) = body.as_object_mut() {
             let spec = obj.entry("spec".to_string()).or_insert_with(|| json!({}));
             if let Some(spec_obj) = spec.as_object_mut() {
-                if !spec_obj.contains_key("terminationGracePeriodSeconds") {
-                    spec_obj.insert("terminationGracePeriodSeconds".to_string(), json!(30));
-                }
-                let service_account_name_missing_or_empty = spec_obj
-                    .get("serviceAccountName")
-                    .and_then(|v| v.as_str())
-                    .is_none_or(str::is_empty);
-                if service_account_name_missing_or_empty {
-                    spec_obj.insert("serviceAccountName".to_string(), json!("default"));
-                }
-                apply_pod_container_defaults(spec_obj);
+                apply_pod_spec_create_defaults(spec_obj);
                 let needs_node_name = spec_obj
                     .get("nodeName")
                     .map(|v| v.as_str().map(|s| s.is_empty()).unwrap_or(v.is_null()))
