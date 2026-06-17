@@ -401,6 +401,198 @@ async fn watch_cursor_ordered_replay_keeps_live_jump_when_replay_omits_it() {
     assert_eq!(second.object["status"]["phase"], "Running");
 }
 
+/// Durable window that is momentarily unreadable under transport stress
+/// (packet loss / raft-apply read contention on the watch_events table): the
+/// retained-edge read fails and the gap replay returns nothing. Models the
+/// lossy-netns path where `replay_gap_detected` hits its `Err(_) => false`
+/// fail-open arm, so a real gap is treated as recoverable when it is not.
+struct TransportFlakyReplaySource;
+
+#[async_trait::async_trait]
+impl WatchReplaySource for TransportFlakyReplaySource {
+    async fn replay_since(&self, _since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn earliest_retained_rv(&self) -> anyhow::Result<Option<i64>> {
+        Err(anyhow::Error::msg("window read failed (transport stress)"))
+    }
+}
+
+#[tokio::test]
+async fn watch_cursor_ordered_replay_expires_when_gap_unfillable_under_transport_stress() {
+    // Scoped Pod watch resumed at floor_rv=10. Under packet loss a live
+    // readiness transition jumps to RV=12 while the intervening in-scope event
+    // at RV=11 must be replayed. The durable window read fails transiently
+    // (`earliest_retained_rv -> Err`, the fail-open arm of
+    // `replay_gap_detected`) and `replay_since` returns nothing. The cursor must
+    // NOT silently advance `floor_rv` past the unfilled gap -- that would drop
+    // the late RV=11 readiness MODIFIED via `should_skip` and hang the
+    // reflector cache until the readiness wait times out. It must surface
+    // `Expired` so the HTTP watch returns 410 Gone and the client relists with
+    // fresh data.
+    let (tx, rx) = broadcast::channel(8);
+    let replay_source = TransportFlakyReplaySource;
+    let mut cursor = WatchCursor::new(rx, replay_source, 10).with_ordered_replay();
+
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "frontend",
+            "namespace": "default",
+            "resourceVersion": "12"
+        },
+        "status": {"phase": "Running"}
+    })))
+    .unwrap();
+
+    let supervisor = test_task_supervisor();
+    let result = tokio::time::timeout(Duration::from_secs(2), cursor.next_event(&supervisor))
+        .await
+        .expect("cursor must not block on an unfillable gap");
+    match result {
+        Err(WatchCursorError::Expired) => {}
+        other => panic!(
+            "expected Expired (410) for an unfillable ordered gap under transport stress, got {other:?}"
+        ),
+    }
+}
+
+#[tokio::test]
+async fn watch_cursor_allowlist_allows_scoped_transition_from_floor_with_no_regression() {
+    let (tx, rx) = broadcast::channel(8);
+    let replay_source = FixedReplaySource::new(Vec::new());
+    let mut cursor = WatchCursor::new(rx, replay_source, 20);
+    cursor.allow_low_rv_for_key(Some("default".into()), "resume-pod".into(), 15);
+
+    tx.send(WatchEvent::added(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "resume-pod",
+            "namespace": "default",
+            "resourceVersion": "12"
+        }
+    })))
+    .unwrap();
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "resume-pod",
+            "namespace": "default",
+            "resourceVersion": "16"
+        }
+    })))
+    .unwrap();
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "other-pod",
+            "namespace": "default",
+            "resourceVersion": "16"
+        }
+    })))
+    .unwrap();
+
+    let supervisor = test_task_supervisor();
+    let first = tokio::time::timeout(Duration::from_secs(1), cursor.next_event(&supervisor))
+        .await
+        .expect("scoped cursor should emit first floor-eligible event")
+        .unwrap();
+    assert_eq!(first.resource_version(), Some(16));
+    assert_eq!(
+        first.object.get("metadata").unwrap().get("name"),
+        Some(&serde_json::Value::String("resume-pod".into()))
+    );
+
+    let timed =
+        tokio::time::timeout(Duration::from_millis(200), cursor.next_event(&supervisor)).await;
+    assert!(
+        timed.is_err(),
+        "events below scoped floor or transition threshold must be suppressed"
+    );
+}
+
+#[tokio::test]
+async fn watch_cursor_allowlist_skips_non_matching_floor_events() {
+    let (tx, rx) = broadcast::channel(8);
+    let replay_source = FixedReplaySource::new(Vec::new());
+    let mut cursor = WatchCursor::new(rx, replay_source, 20);
+    cursor.allow_low_rv_for_key(Some("default".into()), "resume-pod".into(), 15);
+
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "resume-pod",
+            "namespace": "default",
+            "resourceVersion": "12"
+        }
+    })))
+    .unwrap();
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "resume-pod",
+            "namespace": "default",
+            "resourceVersion": "16"
+        }
+    })))
+    .unwrap();
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "out-of-scope",
+            "namespace": "default",
+            "resourceVersion": "18"
+        }
+    })))
+    .unwrap();
+    tx.send(WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "resume-pod",
+            "namespace": "default",
+            "resourceVersion": "21"
+        }
+    })))
+    .unwrap();
+
+    let supervisor = test_task_supervisor();
+    let first = tokio::time::timeout(Duration::from_secs(1), cursor.next_event(&supervisor))
+        .await
+        .expect("cursor must emit allowed floor-crossing transition event")
+        .unwrap();
+    assert_eq!(first.resource_version(), Some(16));
+    assert_eq!(
+        first.object.get("metadata").unwrap().get("name"),
+        Some(&serde_json::Value::String("resume-pod".into()))
+    );
+
+    let second = tokio::time::timeout(Duration::from_secs(1), cursor.next_event(&supervisor))
+        .await
+        .expect("cursor should skip floor-only events and emit the next resumed event")
+        .unwrap();
+    assert_eq!(second.resource_version(), Some(21));
+    assert_eq!(
+        second.object.get("metadata").unwrap().get("name"),
+        Some(&serde_json::Value::String("resume-pod".into()))
+    );
+
+    let timed =
+        tokio::time::timeout(Duration::from_millis(200), cursor.next_event(&supervisor)).await;
+    assert!(
+        timed.is_err(),
+        "cursor must not emit events that remain below scoped floor/allowlist threshold"
+    );
+}
+
 #[tokio::test]
 async fn watch_cursor_ordered_replay_does_not_expire_rv_less_watch() {
     let (tx, rx) = broadcast::channel(8);

@@ -330,14 +330,23 @@ impl<S: WatchReplaySource> WatchCursor<S> {
     /// True when `since_rv` precedes the durable replay window, i.e. the
     /// oldest retained watch event has a higher RV than the next one the
     /// cursor would replay. In that case the intervening events were trimmed
-    /// and cannot be recovered. A read error or empty window reports no gap
-    /// (fall through to normal replay) so transient datastore hiccups do not
-    /// spuriously expire healthy watches.
+    /// and cannot be recovered.
+    ///
+    /// A read **error** is treated as a detected gap (fail closed → `Expired`
+    /// → HTTP 410 → reflector relists): when the server cannot confirm the
+    /// retained window still covers the cursor, it must never silently advance
+    /// its delivery floor past possibly-undelivered in-scope events (which
+    /// `should_skip` would then drop). Returning 410 on a transient datastore
+    /// hiccup is the Kubernetes-correct outcome — clients relist routinely —
+    /// whereas the previous fail-open (`Err => false`) is what let the lossy
+    /// Guestbook readiness transition be dropped silently. An genuinely empty
+    /// window (`Ok(None)`) still reports no gap so fresh/quiet watches and the
+    /// `WatchReplaySource` default stay non-expiring.
     async fn replay_gap_detected(&self, since_rv: i64) -> bool {
         match self.replay_source.earliest_retained_rv().await {
             Ok(Some(earliest)) => since_rv + 1 < earliest,
             Ok(None) => false,
-            Err(_) => false,
+            Err(_) => true,
         }
     }
 
@@ -586,6 +595,16 @@ impl<S: WatchReplaySource> WatchCursor<S> {
     }
 }
 
+/// Whether `replay` densely reconstructs the ordered gap `(floor_rv, live_rv]`.
+///
+/// The persisted `watch_events` log carries exactly one row per committed
+/// resourceVersion, so the gap is reconstructible iff the replay supplies every
+/// integer RV in `floor_rv+1 .. live_rv`. A missing integer means the window
+/// was pruned below the gap or the read returned a partial result (e.g. a
+/// transient datastore error under transport stress): the gap is unfillable and
+/// the caller must expire (410) rather than advance its delivery floor past
+/// events it never emitted. `live_rv == None` (a bookmark/RV-less event) carries
+/// no gap contract.
 fn event_key(event: &WatchEvent) -> Option<(Option<String>, String)> {
     let name = event
         .object
