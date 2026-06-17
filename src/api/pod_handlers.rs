@@ -29,6 +29,10 @@ pub async fn list_pods(
             .as_ref()
             .and_then(|rv| rv.parse::<i64>().ok())
             .unwrap_or(0);
+        let explicit_resource_version_zero = query
+            .resource_version
+            .as_deref()
+            .is_some_and(|rv| rv.trim() == "0");
 
         // K8s watch semantics: default watch does NOT replay initial objects.
         // Initial list+watch replay is only enabled when sendInitialEvents=true.
@@ -47,6 +51,7 @@ pub async fn list_pods(
         if requested_rv <= 0
             && !send_initial_events
             && !has_selector
+            && !explicit_resource_version_zero
             && let Ok(floor) = state.db.get_current_resource_version().await
             && floor > 0
         {
@@ -72,6 +77,7 @@ pub async fn list_pods(
             table_format,
             catch_up_mode: WatchCatchUpMode::NamespacedScoped,
             timeout_seconds: query.timeout_seconds,
+            emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
         });
         return Ok(Response::builder()
             .header("Content-Type", "application/json")
@@ -481,6 +487,10 @@ pub async fn list_all_pods(
             .as_ref()
             .and_then(|rv| rv.parse::<i64>().ok())
             .unwrap_or(0);
+        let explicit_resource_version_zero = query
+            .resource_version
+            .as_deref()
+            .is_some_and(|rv| rv.trim() == "0");
 
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
         let has_selector = label_selector
@@ -495,6 +505,7 @@ pub async fn list_all_pods(
         if requested_rv <= 0
             && !send_initial_events
             && !has_selector
+            && !explicit_resource_version_zero
             && let Ok(floor) = state.db.get_current_resource_version().await
             && floor > 0
         {
@@ -520,6 +531,7 @@ pub async fn list_all_pods(
             table_format,
             catch_up_mode: WatchCatchUpMode::NamespacedScoped,
             timeout_seconds: query.timeout_seconds,
+            emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
         });
         return Ok(Response::builder()
             .header("Content-Type", "application/json")

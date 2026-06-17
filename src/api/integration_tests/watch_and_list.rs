@@ -4978,6 +4978,97 @@ async fn watch_delivers_event_committed_immediately_after_establishment() {
     );
 }
 
+#[tokio::test]
+async fn selectorless_watch_resource_version_zero_replays_current_state() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let ns = "rv-zero-current-state";
+
+    let ns_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":ns}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/namespaces/{ns}/configmaps"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {"name": "cm-existing", "namespace": ns},
+                        "data": {"k": "v"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let watch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/{ns}/configmaps?watch=true&resourceVersion=0"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+
+    let mut stream = watch_resp.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("resourceVersion=0 watch must replay current state")
+        .expect("stream must remain open")
+        .expect("watch chunk must be readable");
+
+    let mut saw_existing = false;
+    for line in chunk.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+        let event: serde_json::Value = serde_json::from_slice(line).unwrap();
+        if event["type"] == "ADDED"
+            && event
+                .pointer("/object/metadata/name")
+                .and_then(|v| v.as_str())
+                == Some("cm-existing")
+        {
+            saw_existing = true;
+        }
+    }
+    assert!(
+        saw_existing,
+        "selector-less resourceVersion=0 watch must emit existing objects as ADDED"
+    );
+}
+
 /// Regression: a watch BOOKMARK must report the rv this scoped watch has
 /// actually caught up to — NOT the global collection resourceVersion. Under
 /// parallel load the global rv races ahead of a namespaced/selector watch's

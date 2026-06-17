@@ -252,6 +252,10 @@ pub async fn list_inner(
     let ns = namespace.as_deref();
     if query.watch == Some("true".to_string()) {
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
+        let explicit_resource_version_zero = query
+            .resource_version
+            .as_deref()
+            .is_some_and(|rv| rv.trim() == "0");
         let mut requested_rv: i64 = query
             .resource_version
             .as_ref()
@@ -287,6 +291,7 @@ pub async fn list_inner(
         if requested_rv <= 0
             && !send_initial_events
             && !has_selector
+            && !explicit_resource_version_zero
             && let Ok(floor) = state.db.get_current_resource_version().await
             && floor > 0
         {
@@ -323,6 +328,7 @@ pub async fn list_inner(
             table_format,
             catch_up_mode: mode,
             timeout_seconds: query.timeout_seconds,
+            emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
         });
         return Ok(Response::builder()
             .header("Content-Type", "application/json")

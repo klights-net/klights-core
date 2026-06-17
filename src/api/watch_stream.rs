@@ -536,6 +536,7 @@ pub struct LabelSelectorWatchStreamRequest<'a> {
     pub table_format: bool,
     pub catch_up_mode: WatchCatchUpMode,
     pub timeout_seconds: Option<u64>,
+    pub emit_initial_state_for_resource_version_zero: bool,
 }
 
 pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamRequest<'_>) -> Body {
@@ -554,6 +555,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         table_format,
         catch_up_mode,
         timeout_seconds,
+        emit_initial_state_for_resource_version_zero,
     } = request;
 
     let api_version = api_version.to_string();
@@ -694,9 +696,10 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         // Label-selector watches need a current membership baseline. For
         // resourceVersion-less selector watches, Kubernetes-compatible clients
         // such as the ServiceAccount lifecycle conformance test expect existing
-        // matching objects to be delivered as ADDED. Selector-free watches keep
-        // the default no-replay behavior.
-        if has_selector && !send_initial_events
+        // matching objects to be delivered as ADDED. Explicit
+        // resourceVersion=0 has the same current-state replay semantics even
+        // without selectors; omitted resourceVersion still starts from now.
+        if (has_selector || emit_initial_state_for_resource_version_zero) && !send_initial_events
             && let Ok(baseline) = db
                 .list_resources(&api_version, &kind, watch_namespace.clone().as_deref(), crate::datastore::ResourceListQuery::new(label_selector.clone().as_deref(), field_selector.as_deref(), None, None))
                 .await
