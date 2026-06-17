@@ -4015,6 +4015,165 @@ async fn test_tokenreview_includes_pod_extra_for_pod_bound_token() {
 }
 
 #[tokio::test]
+async fn test_tokenreview_uses_webhook_authenticator_for_opaque_tokens() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    struct StaticReviewer;
+
+    #[async_trait::async_trait]
+    impl crate::auth::webhook_auth::WebhookTokenReviewer for StaticReviewer {
+        async fn review_token(
+            &self,
+            token: &str,
+            _audiences: &[String],
+        ) -> Result<Option<crate::auth::webhook_auth::TokenReviewStatus>, String> {
+            assert_eq!(token, "opaque-tokenreview-token");
+            Ok(Some(crate::auth::webhook_auth::TokenReviewStatus {
+                authenticated: true,
+                user: Some(crate::auth::webhook_auth::TokenReviewUser {
+                    username: "webhook-tokenreview-user".to_string(),
+                    uid: Some("webhook-tokenreview-uid".to_string()),
+                    groups: vec!["webhook-group".to_string()],
+                    extra: vec![(
+                        "example.com/authenticator".to_string(),
+                        "webhook".to_string(),
+                    )],
+                }),
+                error: None,
+                audiences: vec!["https://kubernetes.default.svc.cluster.local".to_string()],
+            }))
+        }
+    }
+
+    let mut state = build_test_app_state().await;
+    state.webhook_authenticator = Some(Arc::new(crate::auth::webhook_auth::WebhookAuth::new(
+        Arc::new(StaticReviewer),
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+        vec!["https://kubernetes.default.svc.cluster.local".to_string()],
+    )));
+    let app = crate::api::build_router(state);
+
+    let req_body = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "spec": {
+            "token": "opaque-tokenreview-token",
+            "audiences": ["https://kubernetes.default.svc.cluster.local"]
+        }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"]["authenticated"], true);
+    assert_eq!(
+        json["status"]["user"]["username"],
+        "webhook-tokenreview-user"
+    );
+    assert_eq!(json["status"]["user"]["uid"], "webhook-tokenreview-uid");
+    assert!(
+        json["status"]["user"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group == "webhook-group"),
+        "webhook groups must be preserved: {json}"
+    );
+    assert_eq!(
+        json["status"]["user"]["extra"]["example.com/authenticator"][0],
+        "webhook"
+    );
+}
+
+#[tokio::test]
+async fn test_tokenreview_uses_oidc_authenticator_for_jwt_tokens() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use std::sync::Arc;
+    use time::OffsetDateTime;
+    use tower::ServiceExt;
+
+    struct StaticOidcValidator;
+
+    #[async_trait::async_trait]
+    impl crate::auth::oidc::OidcValidator for StaticOidcValidator {
+        async fn validate_token(
+            &self,
+            token: &str,
+            _now: OffsetDateTime,
+        ) -> Result<crate::auth::oidc::OidcClaims, String> {
+            assert_eq!(token, "header.payload.signature");
+            Ok(crate::auth::oidc::OidcClaims {
+                username: "oidc-tokenreview-user".to_string(),
+                groups: vec!["oidc-group".to_string()],
+                uid: Some("oidc-tokenreview-uid".to_string()),
+            })
+        }
+    }
+
+    let mut state = build_test_app_state().await;
+    state.oidc_authenticator = Some(Arc::new(StaticOidcValidator));
+    let app = crate::api::build_router(state);
+
+    let req_body = json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "spec": {
+            "token": "header.payload.signature",
+            "audiences": ["https://kubernetes.default.svc.cluster.local"]
+        }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/authentication.k8s.io/v1/tokenreviews")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"]["authenticated"], true);
+    assert_eq!(json["status"]["user"]["username"], "oidc-tokenreview-user");
+    assert_eq!(json["status"]["user"]["uid"], "oidc-tokenreview-uid");
+    assert!(
+        json["status"]["user"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|group| group == "oidc-group"),
+        "OIDC groups must be preserved: {json}"
+    );
+}
+
+#[tokio::test]
 async fn test_tokenreview_includes_node_name_extra_for_node_bound_token() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

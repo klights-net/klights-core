@@ -105,6 +105,90 @@ pub fn tokenreview_user_from_claims(claims: &crate::auth::SaTokenClaims) -> Valu
     user
 }
 
+pub fn tokenreview_user_from_identity(
+    identity: &crate::auth::identity::AuthenticatedIdentity,
+) -> Value {
+    let mut user = serde_json::json!({
+        "username": identity.username,
+        "groups": identity.groups,
+    });
+    if let Some(uid) = identity.uid.as_deref() {
+        user["uid"] = serde_json::json!(uid);
+    }
+    if !identity.extra.is_empty() {
+        let mut extra = serde_json::Map::new();
+        for (key, value) in &identity.extra {
+            extra
+                .entry(key.clone())
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .expect("inserted extra value must be an array")
+                .push(serde_json::json!(value));
+        }
+        user["extra"] = Value::Object(extra);
+    }
+    user
+}
+
+fn unauthenticated_token_review() -> Json<Value> {
+    Json(serde_json::json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "status": {
+            "authenticated": false
+        }
+    }))
+}
+
+fn authenticated_token_review(user: Value, audiences: Vec<String>) -> Json<Value> {
+    let mut status = serde_json::json!({
+        "authenticated": true,
+        "user": user,
+    });
+    if !audiences.is_empty() {
+        status["audiences"] = serde_json::json!(audiences);
+    }
+    Json(serde_json::json!({
+        "apiVersion": "authentication.k8s.io/v1",
+        "kind": "TokenReview",
+        "status": status
+    }))
+}
+
+async fn authenticate_non_serviceaccount_token_review(
+    state: &AppState,
+    token: &str,
+) -> Option<Result<crate::auth::identity::AuthenticatedIdentity, AppError>> {
+    match token.split('.').count() {
+        2 => {
+            match crate::bootstrap::bootstrap_token::validate_bootstrap_token(
+                state.db.as_ref(),
+                token,
+            )
+            .await
+            {
+                Ok(identity) => Some(Ok(crate::auth::identity::AuthenticatedIdentity::bootstrap(
+                    &identity.token_id,
+                    &identity.extra_groups,
+                ))),
+                Err(_) => {
+                    crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token)
+                        .await
+                }
+            }
+        }
+        3 => {
+            if let Some(result) =
+                crate::auth::oidc::try_oidc_auth(&state.oidc_authenticator, token).await
+            {
+                return Some(result);
+            }
+            crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token).await
+        }
+        _ => crate::auth::webhook_auth::try_webhook_auth(&state.webhook_authenticator, token).await,
+    }
+}
+
 /// TokenReview — create-only resource, no Table support.
 pub async fn create_token_review(
     State(state): State<Arc<AppState>>,
@@ -124,68 +208,50 @@ pub async fn create_token_review(
     let token = req.spec.token.unwrap_or_default();
 
     if token.is_empty() {
-        return Ok(Json(serde_json::json!({
-            "apiVersion": "authentication.k8s.io/v1",
-            "kind": "TokenReview",
-            "status": {
-                "authenticated": false
-            }
-        })));
+        return Ok(unauthenticated_token_review());
     }
 
-    let signing_key_pem =
-        crate::auth::read_service_account_signing_key_async(&state.config.containerd_namespace)
-            .await
-            .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {e}")))?;
-    let claims = match crate::auth::decode_serviceaccount_token(
-        &token,
-        &signing_key_pem,
-        Some(&requested_audiences),
-    ) {
-        Ok(claims) => claims,
-        Err(_) => {
-            return Ok(Json(serde_json::json!({
-                "apiVersion": "authentication.k8s.io/v1",
-                "kind": "TokenReview",
-                "status": {
-                    "authenticated": false
-                }
-            })));
-        }
-    };
-
-    // Honor SA-UID revocation and bound pod/node invalidation, exactly like the
-    // request auth path — otherwise TokenReview would report a token from a
-    // deleted SA (or bound to a deleted pod) as authenticated.
-    if crate::auth::validate_sa_token_bindings(&state, &claims)
+    if token.split('.').count() == 3
+        && let Ok(signing_key_pem) = crate::auth::read_service_account_signing_key_supervised(
+            &state.config.containerd_namespace,
+            state.task_supervisor.as_ref(),
+        )
         .await
-        .is_err()
+        && let Ok(claims) = crate::auth::decode_serviceaccount_token(
+            &token,
+            &signing_key_pem,
+            Some(&requested_audiences),
+        )
     {
-        return Ok(Json(serde_json::json!({
-            "apiVersion": "authentication.k8s.io/v1",
-            "kind": "TokenReview",
-            "status": {
-                "authenticated": false
-            }
-        })));
+        // Honor SA-UID revocation and bound pod/node invalidation, exactly like
+        // the request auth path — otherwise TokenReview would report a token
+        // from a deleted SA (or bound to a deleted pod) as authenticated.
+        if crate::auth::validate_sa_token_bindings(&state, &claims)
+            .await
+            .is_err()
+        {
+            return Ok(unauthenticated_token_review());
+        }
+
+        let audiences = if requested_audiences.is_empty() {
+            claims.aud.clone()
+        } else {
+            requested_audiences
+                .into_iter()
+                .filter(|aud| claims.aud.iter().any(|claim_aud| claim_aud == aud))
+                .collect()
+        };
+        return Ok(authenticated_token_review(
+            tokenreview_user_from_claims(&claims),
+            audiences,
+        ));
     }
 
-    let audiences = if requested_audiences.is_empty() {
-        claims.aud.clone()
-    } else {
-        requested_audiences
-            .into_iter()
-            .filter(|aud| claims.aud.iter().any(|claim_aud| claim_aud == aud))
-            .collect()
-    };
-
-    Ok(Json(serde_json::json!({
-        "apiVersion": "authentication.k8s.io/v1",
-        "kind": "TokenReview",
-        "status": {
-            "authenticated": true,
-            "user": tokenreview_user_from_claims(&claims),
-            "audiences": audiences
-        }
-    })))
+    match authenticate_non_serviceaccount_token_review(&state, &token).await {
+        Some(Ok(identity)) => Ok(authenticated_token_review(
+            tokenreview_user_from_identity(&identity),
+            requested_audiences,
+        )),
+        Some(Err(_)) | None => Ok(unauthenticated_token_review()),
+    }
 }
