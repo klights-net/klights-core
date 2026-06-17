@@ -188,7 +188,7 @@ fn reconcile_aggregation_rule(existing: &mut Map<String, Value>, desired: &Value
 /// roles. Unlike a one-way add-only merge, this fully recomputes the managed
 /// rule set on each pass, so privilege contributed by a source role is revoked
 /// when that source loses the aggregation label or is deleted.
-async fn reconcile_cluster_role_aggregation(db: &dyn DatastoreBackend) -> Result<()> {
+pub(crate) async fn reconcile_cluster_role_aggregation(db: &dyn DatastoreBackend) -> Result<()> {
     let cluster_roles = db
         .list_resources_page(
             RBAC_API_VERSION,

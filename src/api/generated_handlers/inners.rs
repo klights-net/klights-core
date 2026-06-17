@@ -79,6 +79,26 @@ async fn enqueue_generated_controller_after_mutation(
     }
 }
 
+async fn maybe_reconcile_cluster_role_aggregation(
+    state: &Arc<AppState>,
+    api_version: &'static str,
+    kind: &'static str,
+) {
+    if (api_version, kind) != ("rbac.authorization.k8s.io/v1", "ClusterRole") {
+        return;
+    }
+
+    if let Err(err) =
+        crate::controllers::rbac_reconcile::reconcile_cluster_role_aggregation(state.db.as_ref())
+            .await
+    {
+        tracing::warn!(
+            error = %err,
+            "failed to reconcile ClusterRole aggregation after mutation"
+        );
+    }
+}
+
 pub async fn mark_foreground_deletion_with_retry(
     db: &dyn DatastoreBackend,
     api_version: &str,
@@ -747,6 +767,7 @@ pub async fn create_inner(
 
     let data = inject_resource_version(resource.data, resource.resource_version);
     enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
+    maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
     Ok((StatusCode::CREATED, Json(data)))
 }
 
@@ -947,6 +968,7 @@ pub async fn update_inner(
     if !(api_version == "v1" && kind == "Service") {
         enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
     }
+    maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
     Ok(Json(data))
 }
 
@@ -1165,6 +1187,7 @@ pub async fn delete_inner(
             kind,
         )
         .await;
+        maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
         let data = inject_resource_version(updated.data, updated.resource_version);
         return Ok(Json(data));
     }
@@ -1309,6 +1332,7 @@ pub async fn delete_inner(
     }
 
     let data = inject_resource_version(resource.data, resource.resource_version);
+    maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
     Ok(Json(data))
 }
 
@@ -1440,6 +1464,7 @@ pub async fn patch_inner(
                 .run_hooks(&resource.data, state.db.as_ref())
                 .await;
             let data = inject_resource_version(resource.data, resource.resource_version);
+            maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
             return Ok(Json(data));
         }
     }
@@ -1616,6 +1641,7 @@ pub async fn patch_inner(
                     enqueue_generated_controller_after_mutation(&state, api_version, kind, &data)
                         .await;
                 }
+                maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
                 return Ok(Json(data));
             }
             Err(e)
@@ -1740,6 +1766,8 @@ pub async fn delete_collection_shared_inner(
         let _ = state.side_effects.run_hooks(&stub, state.db.as_ref()).await;
     }
 
+    maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
+
     Ok(Json(serde_json::json!({
         "apiVersion": "v1",
         "kind": "Status",
@@ -1754,6 +1782,73 @@ mod tests {
     use base64::Engine;
     use serde_json::json;
     use std::sync::Arc;
+
+    fn default_create_update_query() -> CreateUpdateQuery {
+        CreateUpdateQuery {
+            dry_run: None,
+            field_manager: None,
+            field_validation: None,
+            force: None,
+            orphan_dependents: None,
+            propagation_policy: None,
+        }
+    }
+
+    fn aggregate_widgets_rule() -> Value {
+        json!({
+            "verbs": ["get", "list"],
+            "apiGroups": ["example.klights.io"],
+            "resources": ["widgets"]
+        })
+    }
+
+    async fn seeded_rbac_state() -> Arc<AppState> {
+        let state = Arc::new(crate::api::test_support::build_test_app_state().await);
+        crate::controllers::rbac_reconcile::reconcile_default_rbac_objects(state.db.as_ref())
+            .await
+            .expect("seed default RBAC");
+        state
+    }
+
+    async fn create_labeled_aggregate_source(state: &Arc<AppState>, name: &str, rule: Value) {
+        state
+            .db
+            .create_resource(
+                "rbac.authorization.k8s.io/v1",
+                "ClusterRole",
+                None,
+                name,
+                json!({
+                    "apiVersion": "rbac.authorization.k8s.io/v1",
+                    "kind": "ClusterRole",
+                    "metadata": {
+                        "name": name,
+                        "labels": {"rbac.authorization.k8s.io/aggregate-to-view": "true"}
+                    },
+                    "rules": [rule]
+                }),
+            )
+            .await
+            .expect("create aggregate source");
+        crate::controllers::rbac_reconcile::reconcile_cluster_role_aggregation(state.db.as_ref())
+            .await
+            .expect("seed aggregate rules");
+    }
+
+    async fn view_has_rule(state: &Arc<AppState>, expected: &Value) -> bool {
+        let view = state
+            .db
+            .get_resource("rbac.authorization.k8s.io/v1", "ClusterRole", None, "view")
+            .await
+            .expect("read view")
+            .expect("view ClusterRole exists");
+        view.data
+            .get("rules")
+            .and_then(Value::as_array)
+            .expect("view should have rules")
+            .iter()
+            .any(|rule| rule == expected)
+    }
 
     fn kubelet_client_csr_b64(node_name: &str) -> String {
         use rcgen::{CertificateParams, DnType, KeyPair};
@@ -1942,6 +2037,110 @@ mod tests {
         assert!(
             !groups.iter().any(|g| g.as_str() == Some("system:nodes")),
             "forged system:nodes group must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_role_create_reconciles_aggregation_immediately() {
+        let state = seeded_rbac_state().await;
+        let aggregate_rule = aggregate_widgets_rule();
+        let body = json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {
+                "name": "aggregate-widgets-view",
+                "labels": {"rbac.authorization.k8s.io/aggregate-to-view": "true"}
+            },
+            "rules": [aggregate_rule.clone()]
+        });
+        let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+
+        let (status, _) = create_inner(
+            state.clone(),
+            &identity,
+            "rbac.authorization.k8s.io/v1",
+            "ClusterRole",
+            None,
+            default_create_update_query(),
+            body,
+        )
+        .await
+        .expect("create aggregating ClusterRole");
+
+        assert_eq!(status, StatusCode::CREATED);
+
+        assert!(
+            view_has_rule(&state, &aggregate_rule).await,
+            "live ClusterRole create should reconcile aggregate-to-view rules"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_role_update_reconciles_aggregation_label_removal_immediately() {
+        let state = seeded_rbac_state().await;
+        let aggregate_rule = aggregate_widgets_rule();
+        create_labeled_aggregate_source(&state, "aggregate-widgets-view", aggregate_rule.clone())
+            .await;
+        assert!(view_has_rule(&state, &aggregate_rule).await);
+
+        let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+        let _ = update_inner(
+            state.clone(),
+            &identity,
+            GeneratedUpdateInnerRequest {
+                target: GeneratedNamedResource {
+                    api_version: "rbac.authorization.k8s.io/v1",
+                    kind: "ClusterRole",
+                    namespace: None,
+                    name: "aggregate-widgets-view",
+                },
+                query: default_create_update_query(),
+                body: json!({
+                    "apiVersion": "rbac.authorization.k8s.io/v1",
+                    "kind": "ClusterRole",
+                    "metadata": {"name": "aggregate-widgets-view"},
+                    "rules": [aggregate_rule.clone()]
+                }),
+            },
+        )
+        .await
+        .expect("remove aggregate label");
+
+        assert!(
+            !view_has_rule(&state, &aggregate_rule).await,
+            "live ClusterRole update should revoke rules when aggregate label is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_role_delete_reconciles_aggregation_immediately() {
+        let state = seeded_rbac_state().await;
+        let aggregate_rule = aggregate_widgets_rule();
+        create_labeled_aggregate_source(&state, "aggregate-widgets-view", aggregate_rule.clone())
+            .await;
+        assert!(view_has_rule(&state, &aggregate_rule).await);
+
+        let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+        let _ = delete_inner(
+            state.clone(),
+            &identity,
+            GeneratedDeleteInnerRequest {
+                target: GeneratedNamedResource {
+                    api_version: "rbac.authorization.k8s.io/v1",
+                    kind: "ClusterRole",
+                    namespace: None,
+                    name: "aggregate-widgets-view",
+                },
+                query: default_create_update_query(),
+                body: Bytes::new(),
+            },
+        )
+        .await
+        .expect("delete aggregate source");
+
+        assert!(
+            !view_has_rule(&state, &aggregate_rule).await,
+            "live ClusterRole delete should revoke aggregated source rules"
         );
     }
 }
