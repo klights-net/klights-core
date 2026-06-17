@@ -147,6 +147,11 @@ pub async fn authorize_request(
         .unwrap_or_else(AuthenticatedIdentity::anonymous);
 
     let decision = state.authorizer.authorize(&identity, &authz).await;
+    state
+        .audit_sink
+        .record(crate::audit::AuditEvent::authorization(
+            &identity, &authz, &decision,
+        ));
     if decision.allowed {
         return next.run(request).await;
     }
@@ -937,5 +942,93 @@ mod tests {
         assert_eq!(identity.username, "opaque-user");
         assert_eq!(identity.uid, Some("opaque-uid".to_string()));
         assert!(identity.groups.contains(&"opaque-group".to_string()));
+    }
+
+    #[tokio::test]
+    async fn authorization_denial_writes_structured_audit_event() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let audit_sink = Arc::new(crate::audit::MemoryAuditSink::default());
+        let authorizer: Arc<dyn crate::auth::authorizer::Authorizer> = Arc::new(
+            crate::auth::authorizer::RecordingAuthorizer::deny("policy denied secret read"),
+        );
+        let mut state =
+            crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
+        state.audit_sink = audit_sink.clone();
+        let app = crate::api::build_router(state);
+
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/api/v1/namespaces/default/secrets/db-password")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(AuthenticatedIdentity::client_cert(
+                "alice".to_string(),
+                vec![],
+            ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let events = audit_sink.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.stage, crate::audit::AuditStage::Authorization);
+        assert_eq!(event.user.username, "alice");
+        assert_eq!(event.verb, "get");
+        assert_eq!(event.api_group.as_deref(), None);
+        assert_eq!(event.api_version.as_deref(), Some("v1"));
+        assert_eq!(event.resource.as_deref(), Some("secrets"));
+        assert_eq!(event.subresource.as_deref(), None);
+        assert_eq!(event.namespace.as_deref(), Some("default"));
+        assert_eq!(event.name.as_deref(), Some("db-password"));
+        assert_eq!(event.non_resource_url.as_deref(), None);
+        assert!(!event.allowed);
+        assert_eq!(event.reason, "policy denied secret read");
+    }
+
+    #[tokio::test]
+    async fn pod_exec_authorization_writes_high_value_audit_event() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let audit_sink = Arc::new(crate::audit::MemoryAuditSink::default());
+        let authorizer: Arc<dyn crate::auth::authorizer::Authorizer> =
+            Arc::new(crate::auth::authorizer::RecordingAuthorizer::allow());
+        let mut state =
+            crate::api::test_support::build_test_app_state_with_authorizer(authorizer).await;
+        state.audit_sink = audit_sink.clone();
+        let app = crate::api::build_router(state);
+
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/namespaces/default/pods/web/exec?container=app&command=id")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(AuthenticatedIdentity::client_cert(
+                "operator".to_string(),
+                vec![],
+            ));
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let events = audit_sink.events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.stage, crate::audit::AuditStage::Authorization);
+        assert_eq!(event.user.username, "operator");
+        assert_eq!(event.verb, "create");
+        assert_eq!(event.resource.as_deref(), Some("pods"));
+        assert_eq!(event.subresource.as_deref(), Some("exec"));
+        assert_eq!(event.namespace.as_deref(), Some("default"));
+        assert_eq!(event.name.as_deref(), Some("web"));
+        assert!(event.allowed);
+        assert!(event.high_value);
     }
 }

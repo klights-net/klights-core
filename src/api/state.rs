@@ -13,6 +13,9 @@ pub struct AppState {
     /// after authentication. Tests can inject a mock; production wires
     /// system:masters bypass → bootstrap CSR → node → RBAC → deny.
     pub authorizer: std::sync::Arc<dyn crate::auth::authorizer::Authorizer>,
+    /// Structured Kubernetes audit event stream for authentication and
+    /// authorization decisions.
+    pub audit_sink: std::sync::Arc<dyn crate::audit::AuditSink>,
     pub rbac_policy_store: std::sync::Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
     /// Kubelet-facing cluster-state API. Leader mode uses the in-process
     /// LocalApiClient; remote worker implementations arrive with T4.

@@ -151,6 +151,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         pod_start_retry_state: None,
         is_raft_leader_rx: None,
         authorizer: std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::test_allow_all()),
+        audit_sink: crate::audit::default_audit_sink(),
         rbac_policy_store: std::sync::Arc::new(
             crate::auth::rbac_policy_store::InMemoryRbacPolicyStore::empty(),
         ),

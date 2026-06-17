@@ -421,6 +421,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 api_pod_repository.clone(),
             ),
         ),
+        audit_sink: crate::audit::default_audit_sink(),
         rbac_policy_store: std::sync::Arc::new(
             crate::auth::rbac_policy_store::DatastoreRbacPolicyStore::new(db_handle.clone()),
         ),
