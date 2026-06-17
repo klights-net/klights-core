@@ -14,6 +14,7 @@ pub mod node_taint_manager;
 pub mod pdb;
 pub mod policy;
 pub mod resource_quota;
+pub mod service_account_defaults;
 pub mod service_pod;
 pub mod trait_impl;
 pub mod workload_pod;
@@ -144,15 +145,12 @@ pub fn default_registry(
     ] {
         registry.register(api_version, kind, rq_effect.clone(), ErrorPolicy::Warn);
     }
-    // namespace_defaults side effect removed: bootstrap of `default`
-    // ServiceAccount and `kube-root-ca.crt` ConfigMap is one-shot at
-    // namespace creation time (src/api/namespace.rs::create_namespace
-    // calls create_default_service_account + create_kube_root_ca_configmap).
-    // If a user/admin deletes them later, that's their choice — we do not
-    // re-create them. The previous on-mutation maintenance loop fought
-    // namespace termination by re-creating these as fast as the
-    // termination controller deleted them, leaving the namespace stuck
-    // Terminating with the kubernetes finalizer intact.
+    registry.register(
+        "v1",
+        "ServiceAccount",
+        service_account_defaults::default_serviceaccount(),
+        ErrorPolicy::Warn,
+    );
     registry.register(
         "v1",
         "Pod",

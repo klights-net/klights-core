@@ -8555,6 +8555,71 @@ async fn api_create_pod_defaults_container_fields() {
 }
 
 #[tokio::test]
+async fn api_create_pod_applies_serviceaccount_image_pull_secrets_and_deprecated_alias() {
+    use super::{PodApiWriter, PodReader};
+    let repo = build_repo().await;
+    repo.store
+        .db()
+        .create_resource(
+            "v1",
+            "ServiceAccount",
+            Some("default"),
+            "default",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {"name": "default", "namespace": "default"},
+                "imagePullSecrets": [{"name": "registry-cred"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let result = repo
+        .api_create_pod(api_create_request(
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": { "name": "sa-image-pull" },
+                "spec": {
+                    "containers": [{"name": "c", "image": "private.example.com/app:1"}]
+                }
+            }),
+            false,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.body.pointer("/spec/serviceAccountName"),
+        Some(&json!("default"))
+    );
+    assert_eq!(
+        result.body.pointer("/spec/serviceAccount"),
+        Some(&json!("default")),
+        "deprecated serviceAccount field must mirror serviceAccountName"
+    );
+    assert_eq!(
+        result.body.pointer("/spec/imagePullSecrets"),
+        Some(&json!([{"name": "registry-cred"}]))
+    );
+
+    let stored = repo
+        .get_pod("default", "sa-image-pull")
+        .await
+        .unwrap()
+        .expect("created pod stored");
+    assert_eq!(
+        stored.data.pointer("/spec/imagePullSecrets"),
+        Some(&json!([{"name": "registry-cred"}]))
+    );
+    assert_eq!(
+        stored.data.pointer("/spec/serviceAccount"),
+        Some(&json!("default"))
+    );
+}
+
+#[tokio::test]
 async fn api_create_pod_sets_pending_status_and_qos() {
     use super::PodApiWriter;
     let repo = build_repo().await;

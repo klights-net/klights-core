@@ -131,16 +131,7 @@ pub fn apply_pod_spec_create_defaults(spec_obj: &mut Map<String, Value>) {
             serde_json::json!(30),
         );
     }
-    let service_account_name_missing_or_empty = spec_obj
-        .get("serviceAccountName")
-        .and_then(|v| v.as_str())
-        .is_none_or(str::is_empty);
-    if service_account_name_missing_or_empty {
-        spec_obj.insert(
-            "serviceAccountName".to_string(),
-            serde_json::json!("default"),
-        );
-    }
+    apply_pod_service_account_defaults(spec_obj);
     let dns_policy_missing_or_empty = spec_obj
         .get("dnsPolicy")
         .and_then(|v| v.as_str())
@@ -159,6 +150,32 @@ pub fn apply_pod_spec_create_defaults(spec_obj: &mut Map<String, Value>) {
         );
     }
     apply_pod_container_defaults(spec_obj);
+}
+
+/// Default and mirror Pod ServiceAccount fields.
+///
+/// Kubernetes still carries the deprecated `spec.serviceAccount` alias in its
+/// wire type. Keep it mirrored with `spec.serviceAccountName` so JSON and
+/// protobuf paths agree.
+pub fn apply_pod_service_account_defaults(spec_obj: &mut Map<String, Value>) {
+    let service_account_name = spec_obj
+        .get("serviceAccountName")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let deprecated_service_account = spec_obj
+        .get("serviceAccount")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let chosen = service_account_name
+        .or(deprecated_service_account)
+        .unwrap_or("default")
+        .to_string();
+
+    spec_obj.insert(
+        "serviceAccountName".to_string(),
+        serde_json::json!(chosen.clone()),
+    );
+    spec_obj.insert("serviceAccount".to_string(), serde_json::json!(chosen));
 }
 
 /// Set `status.phase = "Pending"` on a freshly-created PVC when missing.

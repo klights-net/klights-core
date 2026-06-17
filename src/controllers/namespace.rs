@@ -104,6 +104,28 @@ pub async fn create_default_service_account(
     Ok(())
 }
 
+/// Reconcile the default ServiceAccount in a namespace.
+///
+/// This is event-driven maintenance for active namespaces only. It deliberately
+/// skips missing or terminating namespaces so namespace finalization can delete
+/// ServiceAccounts without racing a recreate.
+pub async fn reconcile_default_service_account(
+    db: &dyn DatastoreBackend,
+    namespace: &str,
+) -> Result<()> {
+    if namespace_absent_or_terminating(db, namespace).await? {
+        return Ok(());
+    }
+    if db
+        .get_resource("v1", "ServiceAccount", Some(namespace), "default")
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    create_default_service_account(db, namespace).await
+}
+
 pub async fn create_kube_root_ca_configmap(
     db: &dyn DatastoreBackend,
     namespace: &str,
@@ -627,6 +649,35 @@ mod tests {
 
         drop(env_guard);
         std::fs::remove_dir_all(crate::paths::data_root_path(&unique_ns)).ok();
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_default_service_account_skips_when_namespace_terminating() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let ns = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {
+                "name": "terminating-sa-ns",
+                "deletionTimestamp": "2026-01-01T00:00:00Z"
+            },
+            "spec": { "finalizers": ["kubernetes"] },
+            "status": { "phase": "Terminating" }
+        });
+        db.create_namespace("terminating-sa-ns", ns).await.unwrap();
+
+        reconcile_default_service_account(&db, "terminating-sa-ns")
+            .await
+            .unwrap();
+
+        let sa = db
+            .get_resource("v1", "ServiceAccount", Some("terminating-sa-ns"), "default")
+            .await
+            .unwrap();
+        assert!(
+            sa.is_none(),
+            "default ServiceAccount must not be recreated during namespace termination"
+        );
     }
 
     #[tokio::test]

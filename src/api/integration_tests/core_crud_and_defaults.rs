@@ -338,6 +338,53 @@ async fn test_create_kube_root_ca_configmap_contains_ca_cert() {
 }
 
 #[tokio::test]
+async fn test_deleted_default_service_account_is_recreated_in_active_namespace() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let namespace_name = format!("sa-recreate-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"apiVersion":"v1","kind":"Namespace","metadata":{{"name":"{namespace_name}"}}}}"#
+        )))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!(
+            "/api/v1/namespaces/{namespace_name}/serviceaccounts/default"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/api/v1/namespaces/{namespace_name}/serviceaccounts/default"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "default ServiceAccount should be recreated after deletion in an active namespace"
+    );
+}
+
+#[tokio::test]
 async fn test_dynamic_namespace_creates_kube_root_ca_configmap() {
     let db = crate::datastore::test_support::in_memory().await;
     let namespace_name = "dynamic-ns";
