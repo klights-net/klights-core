@@ -4,6 +4,7 @@
 //! API mutation handlers: Endpoint mirroring, service rule sync,
 //! ResourceQuota recount, PDB status updates, namespace termination.
 
+pub mod apiservice;
 pub mod daemonset_node;
 pub mod endpoint_mirror;
 pub mod endpoint_slice_sync;
@@ -192,6 +193,20 @@ pub fn default_registry(
         daemonset_node::daemonset_node_reconcile(controller_slot),
         ErrorPolicy::Warn,
     );
+    let apiservice_effect = apiservice::apiservice_reconcile(registry.controller_dispatcher_slot());
+    registry.register(
+        "apiregistration.k8s.io/v1",
+        "APIService",
+        apiservice_effect.clone(),
+        ErrorPolicy::Warn,
+    );
+    registry.register(
+        "v1",
+        "Service",
+        apiservice_effect.clone(),
+        ErrorPolicy::Warn,
+    );
+    registry.register("v1", "Endpoints", apiservice_effect, ErrorPolicy::Warn);
     registry.register(
         "v1",
         "Node",

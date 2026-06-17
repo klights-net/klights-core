@@ -15,6 +15,7 @@
 
 use crate::controller::{Context, Controller};
 use crate::controllers::{
+    apiservice_controller::APIServiceController,
     daemonset_controller::DaemonSetController,
     deployment_controller::DeploymentController,
     hpa_controller::HpaController,
@@ -160,6 +161,10 @@ impl ControllerDispatcher {
         controllers.insert(
             ("autoscaling/v2", "HorizontalPodAutoscaler"),
             Arc::new(HpaController) as Arc<dyn Controller>,
+        );
+        controllers.insert(
+            ("apiregistration.k8s.io/v1", "APIService"),
+            Arc::new(APIServiceController) as Arc<dyn Controller>,
         );
 
         // CSR signer controller — only registered when a signer is available

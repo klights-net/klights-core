@@ -5,31 +5,7 @@ use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
 };
-use serde_json::Value;
 use std::sync::Arc;
-
-fn ensure_apiservice_status_condition(body: &mut Value) {
-    let available = serde_json::json!({
-        "type": "Available",
-        "status": "True",
-        "reason": "Passed",
-        "message": "all checks passed",
-        "lastTransitionTime": crate::utils::k8s_timestamp()
-    });
-
-    let status = ensure_object(body, "status");
-    if status
-        .get("conditions")
-        .and_then(|v| v.as_array())
-        .is_none_or(|conds| {
-            !conds
-                .iter()
-                .any(|cond| cond.get("type").and_then(|v| v.as_str()) == Some("Available"))
-        })
-    {
-        status.insert("conditions".to_string(), serde_json::json!([available]));
-    }
-}
 
 pub async fn get_apiservice_status(
     State(state): State<Arc<AppState>>,
@@ -42,8 +18,7 @@ pub async fn get_apiservice_status(
         .await?
         .ok_or_else(|| AppError::NotFound("APIService not found".to_string()))?;
 
-    let mut data = inject_resource_version(resource.data, resource.resource_version);
-    ensure_apiservice_status_condition(&mut data);
+    let data = inject_resource_version(resource.data, resource.resource_version);
     Ok(K8sResponse::new(data, &headers))
 }
 

@@ -153,6 +153,9 @@ pub fn controller_kind_static(
         ("autoscaling/v2", "HorizontalPodAutoscaler") => {
             Some(("autoscaling/v2", "HorizontalPodAutoscaler"))
         }
+        ("apiregistration.k8s.io/v1", "APIService") => {
+            Some(("apiregistration.k8s.io/v1", "APIService"))
+        }
         ("certificates.k8s.io/v1", "CertificateSigningRequest") => {
             Some(("certificates.k8s.io/v1", "CertificateSigningRequest"))
         }
@@ -445,6 +448,15 @@ mod tests {
             controller_kind_static("certificates.k8s.io/v1", "CertificateSigningRequest"),
             Some(("certificates.k8s.io/v1", "CertificateSigningRequest")),
             "CSR create events must reach CsrSignerController for worker TLS bootstrap"
+        );
+    }
+
+    #[test]
+    fn controller_kind_static_routes_apiservices() {
+        assert_eq!(
+            controller_kind_static("apiregistration.k8s.io/v1", "APIService"),
+            Some(("apiregistration.k8s.io/v1", "APIService")),
+            "APIService mutations must reach the availability controller"
         );
     }
 

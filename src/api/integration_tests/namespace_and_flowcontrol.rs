@@ -4413,6 +4413,46 @@ async fn test_apiservice_status_subresource_returns_available_condition() {
     let state = build_test_app_state().await;
     let app = crate::api::build_router(state);
 
+    let service = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "wardle-service", "namespace": "default"},
+        "spec": {"ports": [{"port": 443}]}
+    });
+    let create_service = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/services")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&service).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_service.status(), StatusCode::CREATED);
+
+    let endpoints = json!({
+        "apiVersion": "v1",
+        "kind": "Endpoints",
+        "metadata": {"name": "wardle-service", "namespace": "default"},
+        "subsets": [{"addresses": [{"ip": "127.0.0.1"}], "ports": [{"port": 443}]}]
+    });
+    let create_endpoints = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/endpoints")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&endpoints).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_endpoints.status(), StatusCode::CREATED);
+
     let body = json!({
         "apiVersion": "apiregistration.k8s.io/v1",
         "kind": "APIService",

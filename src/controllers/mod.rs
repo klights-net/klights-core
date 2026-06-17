@@ -1,4 +1,6 @@
 pub mod annotations;
+pub mod apiservice;
+pub mod apiservice_controller;
 pub mod common;
 pub mod coredns;
 pub mod crd;

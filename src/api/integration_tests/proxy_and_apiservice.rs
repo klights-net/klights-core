@@ -352,6 +352,209 @@ async fn test_apiservice_proxy_cache_invalidates_on_apiservice_update() {
 }
 
 #[tokio::test]
+async fn test_apiservice_status_reports_missing_backend_service_unavailable() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let app = crate::api::build_router(state);
+
+    let apiservice = json!({
+        "apiVersion": "apiregistration.k8s.io/v1",
+        "kind": "APIService",
+        "metadata": {"name": "v1alpha1.missing.example.com"},
+        "spec": {
+            "group": "missing.example.com",
+            "version": "v1alpha1",
+            "groupPriorityMinimum": 1000,
+            "versionPriority": 10,
+            "insecureSkipTLSVerify": true,
+            "service": {"name": "missing-service", "namespace": "default", "port": 443}
+        }
+    });
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/apiregistration.k8s.io/v1/apiservices")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&apiservice).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let status = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.missing.example.com/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let available = body["status"]["conditions"]
+        .as_array()
+        .and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|condition| condition["type"].as_str() == Some("Available"))
+        })
+        .expect("APIService status must contain Available condition");
+    assert_eq!(available["status"], "False");
+    assert_eq!(available["reason"], "ServiceNotFound");
+    assert!(
+        available["message"]
+            .as_str()
+            .unwrap()
+            .contains("default/missing-service")
+    );
+}
+
+#[tokio::test]
+async fn test_apiservice_status_reconciles_after_backend_service_and_endpoints_create() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tokio::time::{Duration, timeout};
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let dispatcher = state.controller_dispatcher.clone();
+    let db = state.db.clone();
+    let node_name = state.config.node_name.clone();
+    let cancel = CancellationToken::new();
+    let worker = tokio::spawn(dispatcher.run_worker(db, node_name, cancel.clone()));
+    let app = crate::api::build_router(state);
+
+    let apiservice = json!({
+        "apiVersion": "apiregistration.k8s.io/v1",
+        "kind": "APIService",
+        "metadata": {"name": "v1alpha1.ready.example.com"},
+        "spec": {
+            "group": "ready.example.com",
+            "version": "v1alpha1",
+            "groupPriorityMinimum": 1000,
+            "versionPriority": 10,
+            "insecureSkipTLSVerify": true,
+            "service": {"name": "ready-service", "namespace": "default", "port": 9443}
+        }
+    });
+
+    let create_apiservice = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/apiregistration.k8s.io/v1/apiservices")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&apiservice).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_apiservice.status(), StatusCode::CREATED);
+
+    let service = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "ready-service", "namespace": "default"},
+        "spec": {"ports": [{"port": 9443}]}
+    });
+    let create_service = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/services")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&service).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_service.status(), StatusCode::CREATED);
+
+    let endpoints = json!({
+        "apiVersion": "v1",
+        "kind": "Endpoints",
+        "metadata": {"name": "ready-service", "namespace": "default"},
+        "subsets": [{"addresses": [{"ip": "127.0.0.1"}], "ports": [{"port": 9443}]}]
+    });
+    let create_endpoints = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/endpoints")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&endpoints).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_endpoints.status(), StatusCode::CREATED);
+
+    let body = timeout(Duration::from_secs(2), async {
+        loop {
+            let status = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(
+                            "/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.ready.example.com/status",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(status.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            let available = body["status"]["conditions"]
+                .as_array()
+                .and_then(|conditions| {
+                    conditions
+                        .iter()
+                        .find(|condition| condition["type"].as_str() == Some("Available"))
+                })
+                .expect("APIService status must contain Available condition");
+            if available["status"].as_str() == Some("True") {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("APIService status should become Available=True after backend readiness");
+    let available = body["status"]["conditions"]
+        .as_array()
+        .and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|condition| condition["type"].as_str() == Some("Available"))
+        })
+        .expect("APIService status must contain Available condition");
+    assert_eq!(available["reason"], "Passed");
+
+    cancel.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
 async fn test_apiservice_proxy_cache_invalidates_on_apiservice_delete() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
