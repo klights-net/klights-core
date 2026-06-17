@@ -4722,8 +4722,23 @@ async fn test_bookmark_reports_caught_up_rv_not_global_collection_rv() {
     );
 }
 
+/// Characterization coverage for scoped-watch resume, NOT a regression for the
+/// `initial_list_rv` catch-up advancement. It locks in the end-to-end behavior a
+/// client-go reflector relies on: after a label-scoped watch resumes from a
+/// BOOKMARK produced under unrelated (out-of-scope) write churn, subsequent
+/// in-scope create + modify events are still delivered in order.
+///
+/// This is deliberately not a regression for the `delivered_scoped_catchup_rv`
+/// change in `build_label_selector_watch_stream`: that change tightens the
+/// catch-up floor to the last *emitted* scoped RV instead of the last
+/// *encountered* (incl. out-of-scope) RV, but `list_resources_modified_since`
+/// returns events `ORDER BY resource_version ASC`, so under RV monotonicity no
+/// in-scope event can ever land in `(emitted_scoped_max, encountered_max]`. The
+/// inflated floor therefore never drops an extra event -- the change is a
+/// defensive invariant cleanup with no observable delivery difference, which is
+/// why this test passes with or without it.
 #[tokio::test]
-async fn test_scoped_watch_reconnect_from_bookmark_preserves_in_scope_pod_events() {
+async fn test_scoped_watch_reconnect_from_bookmark_delivers_subsequent_in_scope_events() {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use futures::StreamExt;
