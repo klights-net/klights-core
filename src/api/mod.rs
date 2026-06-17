@@ -24,6 +24,7 @@ mod patch;
 #[cfg(test)]
 mod patch_tests;
 mod pod_handlers;
+mod pod_security;
 mod query;
 mod quotas;
 pub mod raft_proxy;
@@ -106,6 +107,7 @@ pub use pod_handlers::{
     create_pod, delete_collection_pods, delete_pod, get_pod, list_all_pods, list_pods, patch_pod,
     update_pod,
 };
+pub use pod_security::enforce_pod_security_admission;
 #[cfg(test)]
 pub use query::{
     CONTINUE_TOKEN_TTL_SECS, ContinueTokenData, encode_continue_token,

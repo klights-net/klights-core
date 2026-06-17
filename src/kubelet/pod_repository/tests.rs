@@ -8403,6 +8403,63 @@ async fn api_create_pod_priority_class_overrides_wire_zero_priority() {
 }
 
 #[tokio::test]
+async fn api_create_pod_rejects_restricted_pod_security_violation() {
+    use super::PodApiWriter;
+
+    let repo = build_repo().await;
+    repo.store
+        .db()
+        .create_resource(
+            "v1",
+            "Namespace",
+            None,
+            "restricted",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "restricted",
+                    "labels": {"pod-security.kubernetes.io/enforce": "restricted"}
+                },
+                "status": {"phase": "Active"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let err = repo
+        .api_create_pod(super::PodApiCreateRequest {
+            namespace: "restricted".to_string(),
+            name: String::new(),
+            body: json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "privileged"},
+                "spec": {
+                    "containers": [{
+                        "name": "c",
+                        "image": "registry.k8s.io/pause:3.10",
+                        "securityContext": {"privileged": true}
+                    }]
+                }
+            }),
+            dry_run: false,
+            run_admission: false,
+        })
+        .await
+        .expect_err("restricted namespace must reject privileged pod");
+
+    let msg = match err {
+        crate::api::AppError::Forbidden(msg) | crate::api::AppError::BadRequest(msg) => msg,
+        other => panic!("unexpected error: {other:?}"),
+    };
+    assert!(
+        msg.contains("PodSecurity") && msg.contains("restricted") && msg.contains("privileged"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn api_create_pod_defaults_container_fields() {
     use super::PodApiWriter;
     let repo = build_repo().await;

@@ -22,9 +22,9 @@ use crate::api::{
     AdmissionContextRequest, AppError, apply_limitrange_defaults_to_pod, apply_patch,
     apply_pod_container_defaults, apply_pod_runtimeclass_admission, build_admission_context,
     check_resource_quota_for_creation, check_resource_quota_for_pod_update, compute_qos_class,
-    enforce_limitrange_constraints_for_pod, normalize_resource_for_storage, resolve_resource_name,
-    run_admission_for_request, validate_dns_subdomain,
-    validate_pod_resource_requirements_immutable, validate_pod_sysctls,
+    enforce_limitrange_constraints_for_pod, enforce_pod_security_admission,
+    normalize_resource_for_storage, resolve_resource_name, run_admission_for_request,
+    validate_dns_subdomain, validate_pod_resource_requirements_immutable, validate_pod_sysctls,
 };
 use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::{DatastoreHandle, Resource, ResourcePreconditions};
@@ -447,6 +447,7 @@ impl PodApiService {
         }
 
         normalize_resource_for_storage("v1", "Pod", &mut body);
+        enforce_pod_security_admission(self.db.as_ref(), &namespace, &body).await?;
         let resource = self
             .store
             .create(&namespace, &resource_name, body)
@@ -888,6 +889,7 @@ impl PodApiService {
 
         normalize_resource_for_storage("v1", "Pod", &mut body);
         preserve_status_from_current(&current.data, &mut body);
+        enforce_pod_security_admission(self.db.as_ref(), ns, &body).await?;
 
         if dry_run {
             return Ok(PodApiUpdateOutcome::DryRun(body));
@@ -1004,6 +1006,7 @@ impl PodApiService {
 
             normalize_resource_for_storage("v1", "Pod", &mut patched);
             preserve_status_from_current(&current.data, &mut patched);
+            enforce_pod_security_admission(self.db.as_ref(), ns, &patched).await?;
 
             if dry_run {
                 return Ok(PodApiUpdateOutcome::DryRun(patched));
