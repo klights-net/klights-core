@@ -40,6 +40,48 @@ fn pod_quota_bucket_and_resource(quota_key: &str) -> Option<(&'static str, &str)
     }
 }
 
+fn pod_container_has_resource(container: &Value, bucket: &str, resource_key: &str) -> bool {
+    container
+        .get("resources")
+        .and_then(|resources| resources.get(bucket))
+        .and_then(|resources| resources.get(resource_key))
+        .and_then(Value::as_str)
+        .is_some_and(|quantity| !quantity.is_empty())
+}
+
+fn pod_missing_required_quota_resource(pod: &Value, bucket: &str, resource_key: &str) -> bool {
+    let mut saw_container = false;
+
+    for field in ["/spec/containers", "/spec/initContainers"] {
+        let Some(containers) = pod.pointer(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for container in containers {
+            saw_container = true;
+            if !pod_container_has_resource(container, bucket, resource_key) {
+                return true;
+            }
+        }
+    }
+
+    !saw_container
+}
+
+fn ensure_pod_specifies_quota_resource(
+    pod: &Value,
+    quota_key: &str,
+    bucket: &str,
+    resource_key: &str,
+) -> Result<(), AppError> {
+    if pod_missing_required_quota_resource(pod, bucket, resource_key) {
+        return Err(AppError::Forbidden(format!(
+            "must specify {} for every container when ResourceQuota tracks it",
+            quota_key
+        )));
+    }
+    Ok(())
+}
+
 pub async fn check_resource_quota_for_pod_update(
     db: &dyn crate::datastore::DatastoreBackend,
     namespace: &str,
@@ -96,6 +138,10 @@ pub async fn check_resource_quota_for_pod_update(
             ) else {
                 continue;
             };
+
+            if new_matches_scope {
+                ensure_pod_specifies_quota_resource(new_pod, quota_key, bucket, resource_key)?;
+            }
 
             let old_usage = if old_matches_scope {
                 crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
@@ -327,6 +373,7 @@ pub async fn check_resource_quota_for_creation(
                 ) else {
                     continue;
                 };
+                ensure_pod_specifies_quota_resource(body, quota_key, bucket, resource_key)?;
                 let requested =
                     crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
                         body,
@@ -527,6 +574,7 @@ pub async fn check_service_type_quota(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_kind_to_quota_info_returns_expected_tuples_for_known_kinds() {
@@ -589,5 +637,43 @@ mod tests {
             pod_quota_bucket_and_resource("requests."),
             Some(("requests", ""))
         );
+    }
+
+    #[test]
+    fn test_pod_missing_required_quota_resource_checks_requests_limits_and_init_containers() {
+        let pod = json!({
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "resources": {
+                        "requests": {"cpu": "100m"},
+                        "limits": {"memory": "128Mi"}
+                    }
+                }],
+                "initContainers": [{
+                    "name": "init",
+                    "resources": {
+                        "requests": {"cpu": "50m"},
+                        "limits": {"memory": "64Mi"}
+                    }
+                }]
+            }
+        });
+
+        for (quota_key, expected_missing) in [
+            ("requests.cpu", false),
+            ("limits.memory", false),
+            ("cpu", false),
+            ("limits.cpu", true),
+            ("requests.memory", true),
+        ] {
+            let (bucket, resource_key) =
+                pod_quota_bucket_and_resource(quota_key).expect("pod quota key");
+            assert_eq!(
+                pod_missing_required_quota_resource(&pod, bucket, resource_key),
+                expected_missing,
+                "unexpected missing-resource result for {quota_key}"
+            );
+        }
     }
 }

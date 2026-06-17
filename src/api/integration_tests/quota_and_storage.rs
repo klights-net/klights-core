@@ -294,6 +294,79 @@ async fn test_resourcequota_pod_create_denies_when_cpu_or_memory_would_exceed_ha
 }
 
 #[tokio::test]
+async fn test_resourcequota_pod_create_requires_configured_request_resource() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let ns_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"rq-require"}}"#,
+        ))
+        .unwrap();
+    let ns_resp = app.clone().oneshot(ns_req).await.unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+
+    let rq_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/rq-require/resourcequotas")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+                "apiVersion":"v1",
+                "kind":"ResourceQuota",
+                "metadata":{"name":"rq-cpu","namespace":"rq-require"},
+                "spec":{"hard":{"requests.cpu":"1"}}
+            }"#,
+        ))
+        .unwrap();
+    let rq_resp = app.clone().oneshot(rq_req).await.unwrap();
+    assert_eq!(rq_resp.status(), StatusCode::CREATED);
+
+    let pod_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/rq-require/pods")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+                "apiVersion":"v1",
+                "kind":"Pod",
+                "metadata":{"name":"missing-request","namespace":"rq-require"},
+                "spec":{
+                    "containers":[{
+                        "name":"c",
+                        "image":"busybox",
+                        "resources":{"requests":{"memory":"64Mi"}}
+                    }]
+                }
+            }"#,
+        ))
+        .unwrap();
+    let pod_resp = app.clone().oneshot(pod_req).await.unwrap();
+    assert_eq!(
+        pod_resp.status(),
+        StatusCode::FORBIDDEN,
+        "ResourceQuota hard.requests.cpu must require every pod container to specify requests.cpu"
+    );
+    let pod_body = axum::body::to_bytes(pod_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let pod_text = String::from_utf8_lossy(&pod_body);
+    assert!(
+        pod_text.contains("must specify requests.cpu"),
+        "quota rejection should name the missing request resource, got: {}",
+        pod_text
+    );
+}
+
+#[tokio::test]
 async fn test_resourcequota_pod_update_denies_when_requests_would_exceed_hard_limit() {
     use axum::{
         body::Body,
