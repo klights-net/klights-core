@@ -1076,7 +1076,11 @@ async fn test_orphan_children_removes_owner_references() {
                 "name": "child-rs",
                 "namespace": "default",
                 "uid": "child-uid",
-                "ownerReferences": [{"uid": owner_uid, "kind": "Deployment"}]
+                "ownerReferences": [{
+                    "uid": owner_uid,
+                    "kind": "Deployment",
+                    "blockOwnerDeletion": true
+                }]
             }
         }),
     )
@@ -1214,7 +1218,11 @@ async fn test_foreground_deletion_deletes_children_first() {
                 "name": "child-rs-fg",
                 "namespace": "default",
                 "uid": "child-uid-fg",
-                "ownerReferences": [{"uid": owner_uid, "kind": "Deployment"}]
+                "ownerReferences": [{
+                    "uid": owner_uid,
+                    "kind": "Deployment",
+                    "blockOwnerDeletion": true
+                }]
             }
         }),
     )
@@ -1318,7 +1326,8 @@ async fn foreground_delete_finalizes_owner_after_shared_dependents_are_unblocked
                         "apiVersion": "v1",
                         "kind": "ReplicationController",
                         "name": "rc-to-delete",
-                        "uid": "rc-delete-uid"
+                        "uid": "rc-delete-uid",
+                        "blockOwnerDeletion": true
                     },
                     {
                         "apiVersion": "v1",
@@ -1423,7 +1432,8 @@ async fn foreground_owner_ready_after_hard_deleted_child_and_shared_dependents_o
                     "apiVersion": "v1",
                     "kind": "ReplicationController",
                     "name": "owner-rc-to-delete",
-                    "uid": "rc-foreground-delete-uid"
+                    "uid": "rc-foreground-delete-uid",
+                    "blockOwnerDeletion": true
                 }]
             }
         }),
@@ -1445,7 +1455,8 @@ async fn foreground_owner_ready_after_hard_deleted_child_and_shared_dependents_o
                     "apiVersion": "v1",
                     "kind": "ReplicationController",
                     "name": "owner-rc-to-delete",
-                    "uid": "rc-foreground-delete-uid"
+                    "uid": "rc-foreground-delete-uid",
+                    "blockOwnerDeletion": true
                 }, {
                     "apiVersion": "v1",
                     "kind": "ReplicationController",
@@ -1554,7 +1565,8 @@ async fn gc_foreground_owner_with_mixed_pods_waits_for_pod_cleanup() {
                         "apiVersion":"v1",
                         "kind":"ReplicationController",
                         "name":"owner-rc-to-delete",
-                        "uid": owner_uid
+                        "uid": owner_uid,
+                        "blockOwnerDeletion": true
                     }]
                 }
             }),
@@ -1583,7 +1595,8 @@ async fn gc_foreground_owner_with_mixed_pods_waits_for_pod_cleanup() {
                             "apiVersion":"v1",
                             "kind":"ReplicationController",
                             "name":"owner-rc-to-delete",
-                            "uid": owner_uid
+                            "uid": owner_uid,
+                            "blockOwnerDeletion": true
                         },
                         {
                             "apiVersion":"v1",
@@ -1758,7 +1771,8 @@ async fn foreground_gc_requests_independent_pod_deletes_concurrently() {
                         "apiVersion":"v1",
                         "kind":"ReplicationController",
                         "name":"owner-rc-concurrent-delete",
-                        "uid": owner_uid
+                        "uid": owner_uid,
+                        "blockOwnerDeletion": true
                     }]
                 }
             }),
@@ -1839,7 +1853,8 @@ async fn foreground_gc_skips_duplicate_pod_delete_requests_across_retries() {
                         "apiVersion": "v1",
                         "kind": "ReplicationController",
                         "name": "owner-rc-no-dup-delete",
-                        "uid": owner_uid
+                        "uid": owner_uid,
+                        "blockOwnerDeletion": true
                     }]
                 }
             }),
@@ -2241,7 +2256,12 @@ async fn gc_foreground_pod_child_uses_actor_delete_sink() {
         json!({
             "metadata": {
                 "name": "fg-child-pod", "namespace": "default", "uid": "fg-child-pod-uid",
-                "ownerReferences": [{"uid": "fg-owner-uid", "kind": "Deployment", "apiVersion": "apps/v1"}]
+                "ownerReferences": [{
+                    "uid": "fg-owner-uid",
+                    "kind": "Deployment",
+                    "apiVersion": "apps/v1",
+                    "blockOwnerDeletion": true
+                }]
             }
         }),
     )
@@ -2318,7 +2338,8 @@ async fn gc_foreground_pod_child_already_terminating_is_not_redeleted() {
                 "ownerReferences": [{
                     "uid": "fg-owner-uid",
                     "kind": "Deployment",
-                    "apiVersion": "apps/v1"
+                    "apiVersion": "apps/v1",
+                    "blockOwnerDeletion": true
                 }]
             }
         }),
@@ -2386,7 +2407,8 @@ async fn gc_foreground_pod_child_already_terminating_allows_owner_finalization_a
                 "ownerReferences": [{
                     "uid": "fg-owner-uid",
                     "kind": "Deployment",
-                    "apiVersion": "apps/v1"
+                    "apiVersion": "apps/v1",
+                    "blockOwnerDeletion": true
                 }]
             }
         }),

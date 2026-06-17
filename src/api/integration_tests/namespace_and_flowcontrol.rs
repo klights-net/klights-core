@@ -3014,6 +3014,100 @@ async fn test_gc_foreground_rc_delete_retains_parent_until_pods_are_deleted() {
 }
 
 #[tokio::test]
+async fn test_gc_foreground_delete_ignores_non_blocking_owner_ref_child() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+
+    db.create_resource(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "gc-nonblocking-owner",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "gc-nonblocking-owner",
+                "namespace": "default",
+                "uid": "cm-nonblocking-owner-uid"
+            },
+            "data": {"role": "owner"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    db.create_resource(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "gc-nonblocking-child",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "gc-nonblocking-child",
+                "namespace": "default",
+                "uid": "cm-nonblocking-child-uid",
+                "finalizers": ["example.com/hold"],
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "name": "gc-nonblocking-owner",
+                    "uid": "cm-nonblocking-owner-uid",
+                    "blockOwnerDeletion": false
+                }]
+            },
+            "data": {"role": "child"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let del = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/namespaces/default/configmaps/gc-nonblocking-owner")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"propagationPolicy":"Foreground","preconditions":{"uid":"cm-nonblocking-owner-uid"}}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(del).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let parent = db
+        .get_resource("v1", "ConfigMap", Some("default"), "gc-nonblocking-owner")
+        .await
+        .unwrap();
+    assert!(
+        parent.is_none(),
+        "non-blocking ownerReferences must not retain a foreground-deleting owner: {:?}",
+        parent.map(|resource| resource.data)
+    );
+
+    let child = db
+        .get_resource("v1", "ConfigMap", Some("default"), "gc-nonblocking-child")
+        .await
+        .unwrap()
+        .expect("non-blocking dependent should remain after foreground owner finalization");
+    assert!(
+        child
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .and_then(|v| v.as_str())
+            .is_none(),
+        "non-blocking dependent must not be deleted by foreground GC: {:?}",
+        child.data
+    );
+}
+
+#[tokio::test]
 async fn test_foreground_delete_mark_retries_internal_rv_conflict_without_user_rv_precondition() {
     let state = build_test_app_state().await;
     let db = state.db.clone();

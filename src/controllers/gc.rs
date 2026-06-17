@@ -357,6 +357,33 @@ fn resource_has_matching_owner_ref(
         .unwrap_or(false)
 }
 
+fn resource_has_blocking_owner_ref(
+    resource: &serde_json::Value,
+    owner_uid: &str,
+    owner_api_version: &str,
+    owner_name: &str,
+    owner_kind: &str,
+) -> bool {
+    resource
+        .pointer("/metadata/ownerReferences")
+        .and_then(|refs| refs.as_array())
+        .map(|refs| {
+            refs.iter().any(|owner_ref| {
+                owner_ref_matches(
+                    owner_ref,
+                    owner_uid,
+                    owner_api_version,
+                    owner_name,
+                    owner_kind,
+                ) && owner_ref
+                    .get("blockOwnerDeletion")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn owner_ref_identity_matches(candidate: &serde_json::Value, target: &serde_json::Value) -> bool {
     let target_uid = target.get("uid").and_then(|u| u.as_str()).unwrap_or("");
     if !target_uid.is_empty() {
@@ -672,7 +699,7 @@ async fn has_current_matching_dependents(
             continue;
         };
 
-        if resource_has_matching_owner_ref(
+        if resource_has_blocking_owner_ref(
             &current.data,
             owner_uid,
             owner_api_version,
@@ -1335,7 +1362,7 @@ pub async fn check_foreground_deletion_ready(
             .pointer("/metadata/ownerReferences")
             .and_then(|v| v.as_array());
 
-        if !resource_has_matching_owner_ref(
+        if !resource_has_blocking_owner_ref(
             &current.data,
             owner_uid,
             owner_api_version,
