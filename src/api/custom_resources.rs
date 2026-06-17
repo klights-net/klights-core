@@ -1870,7 +1870,10 @@ async fn delete_cr_inner(
     }
 
     let requested_api_version = resource_type.api_version();
-    let delete_options = parse_delete_options_body(&body);
+    let mut delete_options = parse_delete_options_body(&body);
+    if delete_options._grace_period_seconds.is_none() {
+        delete_options._grace_period_seconds = query.grace_period_seconds;
+    }
     let is_dry_run = query.dry_run == Some("All".to_string());
     let mut options_value =
         serde_json::to_value(&delete_options).unwrap_or_else(|_| serde_json::json!({}));

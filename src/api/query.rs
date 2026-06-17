@@ -137,6 +137,8 @@ pub struct CreateUpdateQuery {
     pub orphan_dependents: Option<bool>,
     #[serde(rename = "propagationPolicy")]
     pub propagation_policy: Option<String>,
+    #[serde(rename = "gracePeriodSeconds")]
+    pub grace_period_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]

@@ -1314,7 +1314,7 @@ async fn test_pod_delete_returns_accepted_when_marked_terminating() {
 
     let req = Request::builder()
         .method("DELETE")
-        .uri("/api/v1/namespaces/pod-delete-accepted/pods/victim")
+        .uri("/api/v1/namespaces/pod-delete-accepted/pods/victim?gracePeriodSeconds=5")
         .body(Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -1324,6 +1324,11 @@ async fn test_pod_delete_returns_accepted_when_marked_terminating() {
     assert!(
         body.pointer("/metadata/deletionTimestamp").is_some(),
         "Pod DELETE must return the terminating Pod object: {body:?}"
+    );
+    assert_eq!(
+        body.pointer("/metadata/deletionGracePeriodSeconds"),
+        Some(&json!(5)),
+        "Pod DELETE must honor query gracePeriodSeconds"
     );
 }
 

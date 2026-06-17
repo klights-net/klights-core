@@ -1504,7 +1504,7 @@ async fn test_delete_configmap_with_finalizer_marks_terminating_without_hard_del
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri("/api/v1/namespaces/finalizer-ns/configmaps/held")
+                .uri("/api/v1/namespaces/finalizer-ns/configmaps/held?gracePeriodSeconds=7")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1518,6 +1518,11 @@ async fn test_delete_configmap_with_finalizer_marks_terminating_without_hard_del
             .and_then(|v| v.as_str())
             .is_some(),
         "delete response must mark ConfigMap terminating: {body:?}"
+    );
+    assert_eq!(
+        body.pointer("/metadata/deletionGracePeriodSeconds"),
+        Some(&json!(7)),
+        "ConfigMap DELETE must honor query gracePeriodSeconds"
     );
     assert_eq!(
         body.pointer("/metadata/finalizers/0")

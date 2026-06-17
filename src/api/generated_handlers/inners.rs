@@ -1073,7 +1073,10 @@ pub async fn delete_inner(
         namespace: ns,
         name,
     } = target;
-    let body_options = parse_delete_options_body(&body);
+    let mut body_options = parse_delete_options_body(&body);
+    if body_options._grace_period_seconds.is_none() {
+        body_options._grace_period_seconds = query.grace_period_seconds;
+    }
     let delete_preconditions = body_options
         .resource_preconditions()
         .map_err(AppError::BadRequest)?;
@@ -1808,6 +1811,7 @@ mod tests {
             force: None,
             orphan_dependents: None,
             propagation_policy: None,
+            grace_period_seconds: None,
         }
     }
 
@@ -1937,6 +1941,7 @@ mod tests {
                 force: None,
                 orphan_dependents: None,
                 propagation_policy: None,
+                grace_period_seconds: None,
             },
             body,
         )
@@ -2017,6 +2022,7 @@ mod tests {
                     force: None,
                     orphan_dependents: None,
                     propagation_policy: None,
+                    grace_period_seconds: None,
                 },
                 headers,
                 body: Bytes::from(serde_json::to_vec(&forged).unwrap()),

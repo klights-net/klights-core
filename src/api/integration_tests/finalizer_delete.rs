@@ -110,7 +110,7 @@ async fn test_custom_resource_delete_with_finalizer_marks_terminating_until_fina
     let delete = request_json(
         &app,
         "DELETE",
-        "/apis/example.com/v1/namespaces/default/widgets/held",
+        "/apis/example.com/v1/namespaces/default/widgets/held?gracePeriodSeconds=9",
         "application/json",
         json!({}),
     )
@@ -121,6 +121,11 @@ async fn test_custom_resource_delete_with_finalizer_marks_terminating_until_fina
     assert!(
         delete_body.pointer("/metadata/deletionTimestamp").is_some(),
         "custom resource DELETE with finalizers must return the terminating object: {delete_body:?}"
+    );
+    assert_eq!(
+        delete_body.pointer("/metadata/deletionGracePeriodSeconds"),
+        Some(&json!(9)),
+        "custom resource DELETE must honor query gracePeriodSeconds"
     );
 
     let held = db

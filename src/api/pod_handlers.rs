@@ -313,7 +313,10 @@ pub async fn delete_pod(
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     // Parse DeleteOptions from request body (JSON or protobuf)
-    let body_options = parse_delete_options_body(&body);
+    let mut body_options = parse_delete_options_body(&body);
+    if body_options._grace_period_seconds.is_none() {
+        body_options._grace_period_seconds = query.grace_period_seconds;
+    }
     // Note: propagation policy / orphanDependents are read at the macro-level
     // for non-Pod kinds. Pod delete defers cascade through PodWorkqueue, so
     // the option is captured into PodApiService once Pod delete gains an
