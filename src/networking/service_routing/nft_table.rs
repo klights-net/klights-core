@@ -1,5 +1,8 @@
 use super::hostport::HostPortSpec;
 use super::mode::ServiceRoutingMode;
+use super::network_policy::{
+    Ipv4CidrMatch, NetworkPolicyDirection, NetworkPolicyPeerMatch, NetworkPolicyPlan,
+};
 use super::prelude::*;
 use super::*;
 use crate::utils::lock_recover;
@@ -133,6 +136,7 @@ pub struct KlightsTable {
     /// `None` means the cache must be re-bootstrapped from the API
     /// (initial sync or after watch compaction / inventory corruption).
     service_route_inventory: std::sync::Mutex<Option<super::inventory::ServiceRouteInventory>>,
+    network_policy_snapshot: std::sync::Mutex<Option<NetworkPolicyPlan>>,
 }
 
 #[derive(Clone, Copy)]
@@ -517,6 +521,7 @@ impl KlightsTable {
             service_snapshot: std::sync::Mutex::new(None),
             applied_service_specs: std::sync::Mutex::new(Vec::new()),
             service_route_inventory: std::sync::Mutex::new(None),
+            network_policy_snapshot: std::sync::Mutex::new(None),
         })
     }
 
@@ -608,6 +613,20 @@ impl KlightsTable {
             .context("ensure service_ct_guard chain exists")?;
         self.replace_service_ct_guard(&[]).await?;
 
+        // ---- NetworkPolicy chain ----
+        // Regular chain jumped from filter-forward. Starts empty and returns
+        // by default, so clusters with no policies keep the existing allow
+        // behavior.
+        let network_policy = Chain::new(NETWORK_POLICY_CHAIN, &table);
+        let mut network_policy_create = Batch::new();
+        network_policy_create.add(&network_policy, MsgType::Add);
+        self.nf
+            .send(network_policy_create)
+            .await
+            .context("ensure network-policy chain exists")?;
+        self.replace_network_policies(&NetworkPolicyPlan::default())
+            .await?;
+
         // ---- Filter forward ----
         let mut forward = Chain::new(FILTER_FORWARD_CHAIN, &table);
         forward.set_type(ChainType::Filter);
@@ -623,6 +642,7 @@ impl KlightsTable {
             self.rule_jump_service_ct_guard_for_iif(&forward),
             self.rule_jump_service_ct_guard_for_oif(&forward),
             self.rule_ct_established_accept(&forward),
+            self.rule_jump_to_chain(&forward, NETWORK_POLICY_CHAIN),
             self.rule_ip_in_subnet(&forward, Ipv4HeaderField::Saddr, CmpOp::Eq, Verdict::Accept),
             self.rule_ip_in_subnet(&forward, Ipv4HeaderField::Daddr, CmpOp::Eq, Verdict::Accept),
         ];
@@ -804,6 +824,66 @@ impl KlightsTable {
         Ok(svc_count)
     }
 
+    pub async fn sync_network_policies_from_api(&self, api: &dyn LeaderApiClient) -> Result<usize> {
+        let policies = api
+            .list_resources_fresh(ListRequest {
+                api_version: "networking.k8s.io/v1".to_string(),
+                kind: "NetworkPolicy".to_string(),
+                namespace: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+            })
+            .await
+            .context("list NetworkPolicies through LeaderApiClient")?;
+        let pods = api
+            .list_resources_fresh(ListRequest {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+            })
+            .await
+            .context("list Pods through LeaderApiClient for NetworkPolicy")?;
+        let namespaces = api
+            .list_resources_fresh(ListRequest {
+                api_version: "v1".to_string(),
+                kind: "Namespace".to_string(),
+                namespace: None,
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+            })
+            .await
+            .context("list Namespaces through LeaderApiClient for NetworkPolicy")?;
+
+        let policy_values: Vec<serde_json::Value> = policies
+            .items
+            .iter()
+            .map(|resource| resource.data.as_ref().clone())
+            .collect();
+        let pod_values: Vec<serde_json::Value> = pods
+            .items
+            .iter()
+            .map(|resource| resource.data.as_ref().clone())
+            .collect();
+        let namespace_values: Vec<serde_json::Value> = namespaces
+            .items
+            .iter()
+            .map(|resource| resource.data.as_ref().clone())
+            .collect();
+        let plan =
+            NetworkPolicyPlan::from_resources(&policy_values, &pod_values, &namespace_values)?;
+        let isolated = plan.isolated_ingress.len().max(plan.isolated_egress.len());
+        self.replace_network_policies(&plan).await?;
+        Ok(isolated)
+    }
+
     pub async fn sync_services_from_api(&self, api: &dyn LeaderApiClient) -> Result<usize> {
         let inventory = bootstrap_inventory_from_api(api).await?;
         let specs = inventory.to_specs();
@@ -956,6 +1036,31 @@ impl KlightsTable {
             .replace_chain_rules(&chain, &rules)
             .await
             .context("replace service conntrack guard rules")?;
+        Ok(())
+    }
+
+    pub async fn replace_network_policies(&self, plan: &NetworkPolicyPlan) -> Result<()> {
+        if lock_recover(&self.network_policy_snapshot).as_ref() == Some(plan) {
+            tracing::debug!("nft network-policy chain unchanged; skipping replace");
+            return Ok(());
+        }
+
+        let table = self.table();
+        let chain = Chain::new(NETWORK_POLICY_CHAIN, &table);
+        let rules = self.network_policy_rules(&chain, plan);
+        let rule_count = rules.len();
+        self.nf
+            .replace_chain_rules(&chain, &rules)
+            .await
+            .context("replace network-policy chain rules")?;
+        tracing::debug!(
+            "nft network-policy chain replaced: {} isolated ingress pods, {} isolated egress pods, {} allowed flows, {} rules",
+            plan.isolated_ingress.len(),
+            plan.isolated_egress.len(),
+            plan.allowed_flows.len(),
+            rule_count
+        );
+        *lock_recover(&self.network_policy_snapshot) = Some(plan.clone());
         Ok(())
     }
 
@@ -1290,6 +1395,130 @@ impl KlightsTable {
         rule.add_expr(&Payload::Network(NetworkHeaderField::Ipv4(field)));
         rule.add_expr(&Bitwise::new(self.cluster_cidr_mask, 0u32));
         rule.add_expr(&Cmp::new(op, self.cluster_cidr_ip));
+    }
+
+    fn add_exact_ip_match(rule: &mut Rule, field: Ipv4HeaderField, ip: Ipv4Addr) {
+        rule.add_expr(&Payload::Network(NetworkHeaderField::Ipv4(field)));
+        rule.add_expr(&Cmp::new(CmpOp::Eq, ip));
+    }
+
+    fn add_policy_cidr_match(
+        rule: &mut Rule,
+        field: Ipv4HeaderField,
+        cidr: Ipv4CidrMatch,
+        op: CmpOp,
+    ) {
+        rule.add_expr(&Payload::Network(NetworkHeaderField::Ipv4(field)));
+        rule.add_expr(&Bitwise::new(cidr.mask, 0u32));
+        rule.add_expr(&Cmp::new(op, cidr.network));
+    }
+
+    fn network_policy_rules<'a>(
+        &self,
+        chain: &'a Chain<'a>,
+        plan: &NetworkPolicyPlan,
+    ) -> Vec<Rule<'a>> {
+        let mut rules = Vec::new();
+        for flow in &plan.allowed_flows {
+            rules.push(self.rule_network_policy_allow(chain, flow));
+        }
+        for pod_ip in &plan.isolated_ingress {
+            rules.push(self.rule_network_policy_drop(
+                chain,
+                NetworkPolicyDirection::Ingress,
+                *pod_ip,
+            ));
+        }
+        for pod_ip in &plan.isolated_egress {
+            rules.push(self.rule_network_policy_drop(
+                chain,
+                NetworkPolicyDirection::Egress,
+                *pod_ip,
+            ));
+        }
+        let mut return_rule = Rule::new(chain);
+        return_rule.add_expr(&nft_expr!(verdict return));
+        rules.push(return_rule);
+        rules
+    }
+
+    fn rule_network_policy_allow<'a>(
+        &self,
+        chain: &'a Chain<'a>,
+        flow: &super::network_policy::NetworkPolicyFlow,
+    ) -> Rule<'a> {
+        let mut rule = Rule::new(chain);
+        match flow.direction {
+            NetworkPolicyDirection::Ingress => {
+                Self::add_exact_ip_match(&mut rule, Ipv4HeaderField::Daddr, flow.pod_ip);
+                self.add_network_policy_peer_match(&mut rule, Ipv4HeaderField::Saddr, &flow.peer);
+            }
+            NetworkPolicyDirection::Egress => {
+                Self::add_exact_ip_match(&mut rule, Ipv4HeaderField::Saddr, flow.pod_ip);
+                self.add_network_policy_peer_match(&mut rule, Ipv4HeaderField::Daddr, &flow.peer);
+            }
+        }
+        if let Some(port) = flow.port {
+            rule.add_expr(&Payload::Network(NetworkHeaderField::Ipv4(
+                Ipv4HeaderField::Protocol,
+            )));
+            rule.add_expr(&Cmp::new(CmpOp::Eq, port.protocol.ip_proto()));
+            Self::add_transport_port_match(&mut rule, port.protocol, port.port, port.end_port);
+        }
+        rule.add_expr(&nft_expr!(verdict accept));
+        rule
+    }
+
+    fn add_transport_port_match(
+        rule: &mut Rule,
+        protocol: Protocol,
+        start_port: u16,
+        end_port: u16,
+    ) {
+        rule.add_expr(&Payload::Transport(protocol.dport_field()));
+        if start_port == end_port {
+            rule.add_expr(&Cmp::new(CmpOp::Eq, start_port.to_be()));
+            return;
+        }
+        rule.add_expr(&Cmp::new(CmpOp::Gte, start_port.to_be()));
+        rule.add_expr(&Payload::Transport(protocol.dport_field()));
+        rule.add_expr(&Cmp::new(CmpOp::Lte, end_port.to_be()));
+    }
+
+    fn add_network_policy_peer_match(
+        &self,
+        rule: &mut Rule,
+        field: Ipv4HeaderField,
+        peer: &NetworkPolicyPeerMatch,
+    ) {
+        match peer {
+            NetworkPolicyPeerMatch::Any => {}
+            NetworkPolicyPeerMatch::IpBlock { cidr, except } => {
+                Self::add_policy_cidr_match(rule, field, *cidr, CmpOp::Eq);
+                for excluded in except {
+                    Self::add_policy_cidr_match(rule, field, *excluded, CmpOp::Neq);
+                }
+            }
+        }
+    }
+
+    fn rule_network_policy_drop<'a>(
+        &self,
+        chain: &'a Chain<'a>,
+        direction: NetworkPolicyDirection,
+        pod_ip: Ipv4Addr,
+    ) -> Rule<'a> {
+        let mut rule = Rule::new(chain);
+        match direction {
+            NetworkPolicyDirection::Ingress => {
+                Self::add_exact_ip_match(&mut rule, Ipv4HeaderField::Daddr, pod_ip);
+            }
+            NetworkPolicyDirection::Egress => {
+                Self::add_exact_ip_match(&mut rule, Ipv4HeaderField::Saddr, pod_ip);
+            }
+        }
+        rule.add_expr(&nft_expr!(verdict drop));
+        rule
     }
 
     // ---- Service routing helpers --------------------------------------

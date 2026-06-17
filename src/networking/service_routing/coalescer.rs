@@ -356,7 +356,7 @@ impl NftServiceRouter {
                                 .sleep("service_routing_coalescer_min_sync_period", min_sync_period) => {}
                         }
                         let full_sync = worker_force_full_sync.swap(false, Ordering::AcqRel);
-                        let sync_result = if full_sync {
+                        let service_sync_result = if full_sync {
                             worker_table.sync_services_from_api(worker_cluster_api.as_ref()).await
                         } else {
                             match worker_table.sync_services_from_cached_inventory().await {
@@ -370,6 +370,14 @@ impl NftServiceRouter {
                                 }
                             }
                         };
+                        let sync_result = match service_sync_result {
+                            Ok(service_count) => worker_table
+                                .sync_network_policies_from_api(worker_cluster_api.as_ref())
+                                .await
+                                .context("rebuild network-policy chain")
+                                .map(|_| service_count),
+                            Err(err) => Err(err),
+                        };
                         match sync_result {
                             Ok(_n) => {
                                 backoff = INITIAL_RETRY_BACKOFF;
@@ -379,7 +387,7 @@ impl NftServiceRouter {
                                 let next_backoff =
                                     std::cmp::min(backoff.saturating_mul(2), MAX_RETRY_BACKOFF);
                                 tracing::warn!(
-                                    "coalesced services sync failed (retry in {:?}, next backoff {:?}): {e}",
+                                    "coalesced routing sync failed (retry in {:?}, next backoff {:?}): {e}",
                                     backoff,
                                     next_backoff,
                                 );
@@ -397,7 +405,7 @@ impl NftServiceRouter {
                             }
                         }
                     }
-                    tracing::info!("nft services-sync coalescer exited");
+                    tracing::info!("nft routing-sync coalescer exited");
                 },
             )
             .await
@@ -488,10 +496,9 @@ impl ServiceRouter for NftServiceRouter {
     }
 
     async fn sync_services_now(&self) -> Result<()> {
-        self.table
-            .sync_services_from_api(self.cluster_api.as_ref())
+        sync_routing_from_api(self.table.as_ref(), self.cluster_api.as_ref())
             .await
-            .context("sync_services_now: rebuild services chain")?;
+            .context("sync_services_now: rebuild routing chains")?;
         Ok(())
     }
 
@@ -582,7 +589,7 @@ impl ServiceRoutingWatchTarget {
     }
 }
 
-const SERVICE_ROUTING_WATCH_TARGETS: [ServiceRoutingWatchTarget; 3] = [
+const SERVICE_ROUTING_WATCH_TARGETS: [ServiceRoutingWatchTarget; 6] = [
     ServiceRoutingWatchTarget {
         api_version: "v1",
         kind: "Service",
@@ -594,6 +601,18 @@ const SERVICE_ROUTING_WATCH_TARGETS: [ServiceRoutingWatchTarget; 3] = [
     ServiceRoutingWatchTarget {
         api_version: "discovery.k8s.io/v1",
         kind: "EndpointSlice",
+    },
+    ServiceRoutingWatchTarget {
+        api_version: "networking.k8s.io/v1",
+        kind: "NetworkPolicy",
+    },
+    ServiceRoutingWatchTarget {
+        api_version: "v1",
+        kind: "Pod",
+    },
+    ServiceRoutingWatchTarget {
+        api_version: "v1",
+        kind: "Namespace",
     },
 ];
 
@@ -860,6 +879,21 @@ async fn run_service_routing_watch_worker(
     tracing::info!("nft service routing watch worker exited");
 }
 
+async fn sync_routing_from_api(
+    table: &KlightsTable,
+    cluster_api: &dyn LeaderApiClient,
+) -> Result<usize> {
+    let service_count = table
+        .sync_services_from_api(cluster_api)
+        .await
+        .context("rebuild services chain")?;
+    table
+        .sync_network_policies_from_api(cluster_api)
+        .await
+        .context("rebuild network-policy chain")?;
+    Ok(service_count)
+}
+
 async fn run_remote_pod_endpoint_worker(
     table: std::sync::Arc<KlightsTable>,
     node_local: NodeLocalHandle,
@@ -1016,7 +1050,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::sync::Notify;
@@ -1042,6 +1076,7 @@ mod tests {
     #[derive(Default)]
     struct WatchOnlyLeaderApiClient {
         watches_opened: AtomicUsize,
+        watched_targets: Mutex<Vec<(String, String)>>,
     }
 
     #[derive(Default)]
@@ -1062,6 +1097,13 @@ mod tests {
         }
     }
 
+    fn expected_service_routing_watch_targets() -> Vec<(String, String)> {
+        SERVICE_ROUTING_WATCH_TARGETS
+            .iter()
+            .map(|target| (target.api_version.to_string(), target.kind.to_string()))
+            .collect()
+    }
+
     #[async_trait]
     impl LeaderApiClient for WatchOnlyLeaderApiClient {
         async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
@@ -1072,8 +1114,12 @@ mod tests {
             Err(anyhow!("unexpected list_resources for {req:?}"))
         }
 
-        async fn watch_resources(&self, _req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
+        async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
             self.watches_opened.fetch_add(1, Ordering::SeqCst);
+            self.watched_targets
+                .lock()
+                .expect("watch target record lock not poisoned")
+                .push((req.api_version, req.kind));
             Ok(Box::pin(futures::stream::pending()))
         }
 
@@ -1297,8 +1343,15 @@ mod tests {
 
         assert_eq!(
             client.watches_opened.load(Ordering::SeqCst),
-            3,
-            "service routing must open Service, Endpoints, and EndpointSlice watches"
+            SERVICE_ROUTING_WATCH_TARGETS.len(),
+            "service routing must open every routing-affecting watch"
+        );
+        assert_eq!(
+            *client
+                .watched_targets
+                .lock()
+                .expect("watch target record lock not poisoned"),
+            expected_service_routing_watch_targets()
         );
     }
 
@@ -1329,9 +1382,12 @@ mod tests {
             .await
             .expect("spawn watch worker under task supervisor");
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), client.wait_for_opened(3))
-            .await
-            .expect("watch worker must open the initial watch set");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.wait_for_opened(SERVICE_ROUTING_WATCH_TARGETS.len()),
+        )
+        .await
+        .expect("watch worker must open the initial watch set");
         tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
             .await
             .expect("initial watch set must request a full service sync");
@@ -1340,9 +1396,12 @@ mod tests {
             "initial watch set must request a full service sync flag"
         );
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), client.wait_for_opened(6))
-            .await
-            .expect("watch worker must reopen all watches after one stream closes");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.wait_for_opened(SERVICE_ROUTING_WATCH_TARGETS.len() * 2),
+        )
+        .await
+        .expect("watch worker must reopen all watches after one stream closes");
 
         cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(1), worker.join())
