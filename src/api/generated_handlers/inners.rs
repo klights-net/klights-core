@@ -625,6 +625,11 @@ pub async fn create_inner(
         apply_limitrange_defaults_to_pod(state.db.as_ref(), namespace, &mut body).await?;
         enforce_limitrange_constraints_for_pod(state.db.as_ref(), namespace, &body).await?;
     }
+    if kind == "PersistentVolumeClaim"
+        && let Some(namespace) = ns
+    {
+        enforce_limitrange_constraints_for_pvc(state.db.as_ref(), namespace, &body).await?;
+    }
 
     if is_dry_run {
         return Ok((StatusCode::CREATED, Json(body)));

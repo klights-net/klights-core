@@ -92,12 +92,12 @@ pub use handlers::flowcontrol_v1::{
 pub use helpers::watch_event_from_type;
 pub use helpers::{
     NamespaceTerminationOutcome, apply_limitrange_defaults_to_pod, apply_patch,
-    apply_pod_runtimeclass_admission, enforce_limitrange_constraints_for_pod, ensure_array,
-    ensure_namespace_status_phase_active, ensure_object, normalize_resource_for_read,
-    normalize_resource_for_storage, preserve_status_subresource_on_main_update,
-    process_secret_stringdata, reconcile_namespace_termination,
-    reconcile_namespace_termination_for_uid_with_outcome, resource_has_finalizers,
-    set_namespace_terminating_status, validate_secret_data,
+    apply_pod_runtimeclass_admission, enforce_limitrange_constraints_for_pod,
+    enforce_limitrange_constraints_for_pvc, ensure_array, ensure_namespace_status_phase_active,
+    ensure_object, normalize_resource_for_read, normalize_resource_for_storage,
+    preserve_status_subresource_on_main_update, process_secret_stringdata,
+    reconcile_namespace_termination, reconcile_namespace_termination_for_uid_with_outcome,
+    resource_has_finalizers, set_namespace_terminating_status, validate_secret_data,
 };
 pub use namespace::{
     create_namespace, delete_namespace, finalize_namespace, get_namespace, is_protected_namespace,

@@ -987,6 +987,73 @@ pub fn container_quantity(container: &Value, bucket: &str, resource_key: &str) -
     crate::controllers::resource_quota::parse_resource_quantity(resource_key, raw)
 }
 
+fn pod_effective_quantity(pod: &Value, bucket: &str, resource_key: &str) -> Option<i64> {
+    let has_quantity = pod
+        .pointer("/spec/containers")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .chain(
+            pod.pointer("/spec/initContainers")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten(),
+        )
+        .any(|container| container_quantity(container, bucket, resource_key).is_some());
+    if !has_quantity {
+        return None;
+    }
+    Some(
+        crate::controllers::resource_quota::calculate_pod_effective_resource_for_key(
+            pod,
+            bucket,
+            resource_key,
+        ),
+    )
+}
+
+fn enforce_limitrange_pod_item(pod: &Value, item: &Value) -> Result<(), AppError> {
+    let min = item.get("min").and_then(|v| v.as_object());
+    let max = item.get("max").and_then(|v| v.as_object());
+
+    if let Some(min_obj) = min {
+        for (resource_key, min_raw) in min_obj {
+            let Some(min_value) = parse_limitrange_quantity(resource_key, min_raw) else {
+                continue;
+            };
+            for bucket in ["requests", "limits"] {
+                if let Some(value) = pod_effective_quantity(pod, bucket, resource_key)
+                    && value > 0
+                    && value < min_value
+                {
+                    return Err(AppError::Forbidden(format!(
+                        "minimum {bucket} for pod resource {resource_key} is {min_raw}"
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Some(max_obj) = max {
+        for (resource_key, max_raw) in max_obj {
+            let Some(max_value) = parse_limitrange_quantity(resource_key, max_raw) else {
+                continue;
+            };
+            for bucket in ["requests", "limits"] {
+                if let Some(value) = pod_effective_quantity(pod, bucket, resource_key)
+                    && value > max_value
+                {
+                    return Err(AppError::Forbidden(format!(
+                        "maximum {bucket} for pod resource {resource_key} is {max_raw}"
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn enforce_limitrange_constraints_for_pod(
     db: &dyn DatastoreBackend,
     namespace: &str,
@@ -1032,8 +1099,13 @@ pub async fn enforce_limitrange_constraints_for_pod(
         };
 
         for item in limit_items {
-            if item.get("type").and_then(|t| t.as_str()) != Some("Container") {
-                continue;
+            match item.get("type").and_then(|t| t.as_str()) {
+                Some("Pod") => {
+                    enforce_limitrange_pod_item(pod, item)?;
+                    continue;
+                }
+                Some("Container") => {}
+                _ => continue,
             }
 
             let min = item.get("min").and_then(|v| v.as_object());
@@ -1137,6 +1209,72 @@ pub async fn enforce_limitrange_constraints_for_pod(
                         }
                     }
                 }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn pvc_requested_storage(pvc: &Value) -> Option<i64> {
+    let raw = pvc.pointer("/spec/resources/requests/storage")?;
+    parse_limitrange_quantity("storage", raw)
+}
+
+pub async fn enforce_limitrange_constraints_for_pvc(
+    db: &dyn DatastoreBackend,
+    namespace: &str,
+    pvc: &Value,
+) -> Result<(), AppError> {
+    let Some(storage) = pvc_requested_storage(pvc) else {
+        return Ok(());
+    };
+    let ranges = db
+        .list_resources(
+            "v1",
+            "LimitRange",
+            Some(namespace),
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await?;
+
+    for range in ranges.items {
+        let Some(limit_items) = range
+            .data
+            .pointer("/spec/limits")
+            .and_then(|v| v.as_array())
+        else {
+            continue;
+        };
+        for item in limit_items {
+            if item.get("type").and_then(|t| t.as_str()) != Some("PersistentVolumeClaim") {
+                continue;
+            }
+            if let Some(min_value) = item
+                .pointer("/min/storage")
+                .and_then(|raw| parse_limitrange_quantity("storage", raw))
+                && storage < min_value
+            {
+                let min_raw = item
+                    .pointer("/min/storage")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                return Err(AppError::Forbidden(format!(
+                    "minimum storage request for PersistentVolumeClaim is {min_raw}"
+                )));
+            }
+            if let Some(max_value) = item
+                .pointer("/max/storage")
+                .and_then(|raw| parse_limitrange_quantity("storage", raw))
+                && storage > max_value
+            {
+                let max_raw = item
+                    .pointer("/max/storage")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                return Err(AppError::Forbidden(format!(
+                    "maximum storage request for PersistentVolumeClaim is {max_raw}"
+                )));
             }
         }
     }

@@ -3908,6 +3908,178 @@ async fn test_pod_create_limitrange_rejects_resources_below_minimum() {
 }
 
 #[tokio::test]
+async fn test_pod_create_limitrange_rejects_pod_aggregate_over_maximum() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let namespace = "limitrange-pod-max";
+
+    let ns = json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {"name": namespace}
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&ns).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let limit_range = json!({
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": {"name": "pod-aggregate"},
+        "spec": {
+            "limits": [{
+                "type": "Pod",
+                "max": {"cpu": "500m"}
+            }]
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/namespaces/{namespace}/limitranges"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&limit_range).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "too-large"},
+        "spec": {
+            "containers": [
+                {
+                    "name": "a",
+                    "image": "registry.k8s.io/pause:3.10.1",
+                    "resources": {"requests": {"cpu": "300m"}}
+                },
+                {
+                    "name": "b",
+                    "image": "registry.k8s.io/pause:3.10.1",
+                    "resources": {"requests": {"cpu": "300m"}}
+                }
+            ]
+        }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/namespaces/{namespace}/pods"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&pod).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "LimitRange type=Pod max.cpu must reject aggregate Pod requests over the maximum"
+    );
+}
+
+#[tokio::test]
+async fn test_pvc_create_limitrange_rejects_storage_over_maximum() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let namespace = "limitrange-pvc-max";
+
+    let ns = json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {"name": namespace}
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&ns).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let limit_range = json!({
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": {"name": "pvc-storage"},
+        "spec": {
+            "limits": [{
+                "type": "PersistentVolumeClaim",
+                "max": {"storage": "1Gi"}
+            }]
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/namespaces/{namespace}/limitranges"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&limit_range).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "too-large"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "2Gi"}}
+        }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/namespaces/{namespace}/persistentvolumeclaims"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&pvc).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "LimitRange type=PersistentVolumeClaim max.storage must reject oversized PVC requests"
+    );
+}
+
+#[tokio::test]
 async fn test_pod_create_limitrange_rejects_max_limit_request_ratio() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
