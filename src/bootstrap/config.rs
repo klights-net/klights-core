@@ -19,6 +19,9 @@ pub struct KlightsConfig {
     /// endpoint fallback. When unset, startup discovers the host IP.
     pub node_ip: Option<String>,
 
+    /// Whether unauthenticated requests are admitted as system:anonymous.
+    pub anonymous_auth: bool,
+
     /// Dataplane encryption mode. Missing/empty env defaults to enabled.
     pub dataplane_encryption: crate::networking::wireguard::DataplaneEncryption,
 
@@ -196,6 +199,7 @@ impl KlightsConfig {
             containerd_socket: std::env::var("KLIGHTS_CONTAINERD_SOCKET").ok(),
             node_name,
             node_ip: parse_optional_ipv4_env("KLIGHTS_NODE_IP")?,
+            anonymous_auth: parse_bool_env("KLIGHTS_ANONYMOUS_AUTH", true)?,
             dataplane_encryption: parse_dataplane_encryption_env()?,
             external_endpoint: parse_optional_trimmed_env("KLIGHTS_EXTERNAL_ENDPOINT"),
             worker_dataplane_no_ingress: parse_bool_env(
@@ -286,6 +290,7 @@ impl KlightsConfig {
             containerd_socket: None,
             node_name: "test-node".into(),
             node_ip: None,
+            anonymous_auth: true,
             dataplane_encryption: crate::networking::wireguard::DataplaneEncryption::Enabled,
             external_endpoint: None,
             worker_dataplane_no_ingress: false,
@@ -440,6 +445,8 @@ mod tests {
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("KLIGHTS_NODE_IP") };
         // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("KLIGHTS_ANONYMOUS_AUTH") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("KLIGHTS_DATAPLANE_ENCRYPTION") };
         // TODO: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var("KLIGHTS_EXTERNAL_ENDPOINT") };
@@ -498,6 +505,10 @@ mod tests {
         assert_eq!(config.tls_port, 7679);
         assert_eq!(config.containerd_namespace, "klights");
         assert_eq!(config.node_ip, None);
+        assert!(
+            config.anonymous_auth,
+            "anonymous-auth must default to kube-apiserver-compatible enabled"
+        );
         assert_eq!(config.datastore_backend, BackendKind::Sqlite);
         assert_eq!(config.node_local_backend, BackendKind::Sqlite);
         let log_path = config.log_file_path();
@@ -671,6 +682,18 @@ mod tests {
 
         // Default is None (spawn own containerd)
         assert_eq!(config.containerd_socket, None);
+    }
+
+    #[test]
+    fn anonymous_auth_env_can_disable_anonymous_requests() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_klights_env();
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("KLIGHTS_ANONYMOUS_AUTH", "false") };
+
+        let config = KlightsConfig::from_env().expect("env config valid in test");
+
+        assert!(!config.anonymous_auth);
     }
 
     #[test]

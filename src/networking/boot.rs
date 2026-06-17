@@ -116,6 +116,7 @@ mod tests {
             containerd_socket: None,
             node_name: node_name.to_string(),
             node_ip: None,
+            anonymous_auth: true,
             dataplane_encryption: crate::networking::wireguard::DataplaneEncryption::Disabled,
             external_endpoint: None,
             worker_dataplane_no_ingress: false,

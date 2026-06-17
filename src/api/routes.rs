@@ -754,6 +754,24 @@ mod status_tests {
     }
 
     #[tokio::test]
+    async fn anonymous_auth_false_rejects_unauthenticated_requests_before_authorization() {
+        let mut state = crate::api::test_support::build_test_app_state().await;
+        let mut config = crate::KlightsConfig::test_default();
+        config.anonymous_auth = false;
+        state.config = std::sync::Arc::new(config);
+        state.authorizer =
+            std::sync::Arc::new(crate::auth::authorizer::AuthorizerChain::test_allow_all());
+        let app = crate::api::build_router(state);
+
+        let response = app
+            .oneshot(Request::builder().uri("/api").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn unmatched_path_returns_status_404() {
         let state = crate::api::test_support::build_test_app_state().await;
         let app = crate::api::build_router(state);

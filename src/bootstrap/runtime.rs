@@ -1120,6 +1120,7 @@ mod tests {
             rootless: false,
             namespace: None,
             bind_address: None,
+            anonymous_auth: None,
             token_file: None,
             role: super::super::NodeRole::Leader {
                 bootstrap: super::super::node_role::LeaderBootstrap::Seed,
@@ -1147,6 +1148,7 @@ mod tests {
             rootless: false,
             namespace: None,
             bind_address: None,
+            anonymous_auth: None,
             token_file: None,
             role: super::super::NodeRole::Controlplane {
                 leader_endpoints: vec!["https://192.0.2.4:7679".into()],
@@ -1167,6 +1169,7 @@ mod tests {
             rootless: false,
             namespace: None,
             bind_address: None,
+            anonymous_auth: None,
             token_file: None,
             role: super::super::NodeRole::Worker {
                 leader_endpoints: vec!["https://192.0.2.4:7679".into()],
@@ -1188,6 +1191,7 @@ mod tests {
             rootless: false,
             namespace: None,
             bind_address: None,
+            anonymous_auth: None,
             token_file: Some(token_file.path().to_path_buf()),
             role: super::super::NodeRole::Worker {
                 leader_endpoints: vec!["https://192.0.2.4:7679".into()],

@@ -47,6 +47,17 @@ pub struct Cli {
     /// control-plane boots default to the configured dataplane endpoint.
     #[arg(long, global = true)]
     pub bind_address: Option<String>,
+
+    /// Enable anonymous requests as system:anonymous [default: true].
+    #[arg(
+        long = "anonymous-auth",
+        global = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::value_parser!(bool)
+    )]
+    pub anonymous_auth: Option<bool>,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -323,6 +334,20 @@ mod tests {
         let cli = cli.unwrap();
         assert!(cli.command.is_none(), "no subcommand should yield None");
         assert_eq!(cli.namespace, "klights");
+        assert_eq!(
+            cli.anonymous_auth, None,
+            "absent CLI flag must leave the config/env default in force"
+        );
+    }
+
+    #[test]
+    fn anonymous_auth_global_flag_accepts_false() {
+        let cli = Cli::try_parse_from(["klights", "--anonymous-auth=false", "start"]).unwrap();
+
+        assert!(
+            matches!(cli.anonymous_auth, Some(false)),
+            "--anonymous-auth=false must disable anonymous requests"
+        );
     }
 
     #[test]

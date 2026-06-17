@@ -247,6 +247,7 @@ mod tests {
             rootless: false,
             namespace: Some("test".to_string()),
             bind_address: bind_address.map(str::to_string),
+            anonymous_auth: None,
             token_file: None,
             role,
         }

@@ -26,10 +26,12 @@ pub struct ConfigPhase {
 }
 
 pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
-    let config = Arc::new(
-        KlightsConfig::from_env_with_namespace_override(cli.namespace.as_deref())
-            .context("invalid klights configuration")?,
-    );
+    let mut config = KlightsConfig::from_env_with_namespace_override(cli.namespace.as_deref())
+        .context("invalid klights configuration")?;
+    if let Some(anonymous_auth) = cli.anonymous_auth {
+        config.anonymous_auth = anonymous_auth;
+    }
+    let config = Arc::new(config);
     let node_mode =
         NodeMode::detect(cli.rootless).context("failed to detect klights operating mode")?;
     tracing::info!(?node_mode, "operating mode detected");

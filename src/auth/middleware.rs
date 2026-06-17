@@ -56,7 +56,16 @@ pub async fn authenticate_request(
             Ok(id) => id,
             Err(err) => return err.into_response(),
         };
-    let real_identity = identity.unwrap_or_else(AuthenticatedIdentity::anonymous);
+    let real_identity = match identity {
+        Some(identity) => identity,
+        None if state.config.anonymous_auth => AuthenticatedIdentity::anonymous(),
+        None => {
+            return crate::api::AppError::Unauthorized(
+                "anonymous authentication is disabled".to_string(),
+            )
+            .into_response();
+        }
+    };
     // A follower API proxy delegates the original caller's identity to the
     // leader. We only honor that delegation when the connection itself is
     // authenticated as a trusted internal API proxy (its own mTLS cert), and

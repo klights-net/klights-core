@@ -208,6 +208,7 @@ async fn test_replicationcontroller_scale_subresource() {
             containerd_socket: None,
             node_name: "test-node".to_string(),
             node_ip: None,
+            anonymous_auth: true,
             dataplane_encryption: crate::networking::wireguard::DataplaneEncryption::Enabled,
             external_endpoint: None,
             worker_dataplane_no_ingress: false,

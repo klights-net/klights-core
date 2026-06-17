@@ -82,6 +82,7 @@ fn cli_flags_for_runtime(cli: cli::Cli) -> Result<Option<bootstrap::CliFlags>, S
         rootless: cli.rootless,
         namespace: Some(cli.namespace),
         bind_address: cli.bind_address,
+        anonymous_auth: cli.anonymous_auth,
         token_file,
         role,
     }))
@@ -187,6 +188,7 @@ pub fn main_entry() {
                     rootless: cli_rootless,
                     namespace: Some(cli.namespace),
                     bind_address: cli.bind_address,
+                    anonymous_auth: cli.anonymous_auth,
                     token_file: None,
                     role: bootstrap::NodeRole::Leader {
                         bootstrap: bootstrap::node_role::LeaderBootstrap::Seed,
@@ -214,6 +216,7 @@ pub fn main_entry() {
                     rootless: cli_rootless,
                     namespace: Some(cli.namespace),
                     bind_address: cli.bind_address,
+                    anonymous_auth: cli.anonymous_auth,
                     token_file: None,
                     role: bootstrap::NodeRole::Leader {
                         bootstrap: bootstrap::node_role::LeaderBootstrap::Seed,
@@ -246,6 +249,7 @@ pub fn main_entry() {
                     rootless: cli_rootless,
                     namespace: Some(cli.namespace),
                     bind_address: cli.bind_address,
+                    anonymous_auth: cli.anonymous_auth,
                     token_file,
                     // Replicas-as-learners: `klights replica` is sugar
                     // for `klights controlplane --leader X --token-file T
@@ -285,6 +289,7 @@ pub fn main_entry() {
                     rootless: cli_rootless,
                     namespace: Some(cli.namespace),
                     bind_address: cli.bind_address,
+                    anonymous_auth: cli.anonymous_auth,
                     token_file,
                     role: bootstrap::NodeRole::Worker {
                         leader_endpoints: leader,
@@ -320,6 +325,7 @@ pub fn main_entry() {
                     rootless: cli_rootless,
                     namespace: Some(cli.namespace),
                     bind_address: cli.bind_address,
+                    anonymous_auth: cli.anonymous_auth,
                     token_file,
                     role: bootstrap::NodeRole::Controlplane {
                         leader_endpoints: leader,
@@ -377,6 +383,7 @@ pub fn main_entry() {
                     rootless: cli_rootless,
                     namespace: Some(ns),
                     bind_address: cli.bind_address,
+                    anonymous_auth: cli.anonymous_auth,
                     token_file: None,
                     role: bootstrap::NodeRole::Leader {
                         bootstrap: bootstrap::node_role::LeaderBootstrap::Seed,
