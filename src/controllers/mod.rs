@@ -12,6 +12,8 @@ pub mod deployment_controller;
 pub mod endpoints;
 pub mod endpoints_controller;
 pub mod gc;
+pub mod hpa;
+pub mod hpa_controller;
 pub mod job;
 pub mod job_controller;
 pub mod kube_service;

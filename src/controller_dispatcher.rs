@@ -17,6 +17,7 @@ use crate::controller::{Context, Controller};
 use crate::controllers::{
     daemonset_controller::DaemonSetController,
     deployment_controller::DeploymentController,
+    hpa_controller::HpaController,
     job_controller::JobController,
     pdb_controller::PDBController,
     pvc_controller::PVCController,
@@ -151,6 +152,14 @@ impl ControllerDispatcher {
         controllers.insert(
             ("policy/v1", "PodDisruptionBudget"),
             Arc::new(PDBController) as Arc<dyn Controller>,
+        );
+        controllers.insert(
+            ("autoscaling/v1", "HorizontalPodAutoscaler"),
+            Arc::new(HpaController) as Arc<dyn Controller>,
+        );
+        controllers.insert(
+            ("autoscaling/v2", "HorizontalPodAutoscaler"),
+            Arc::new(HpaController) as Arc<dyn Controller>,
         );
 
         // CSR signer controller — only registered when a signer is available

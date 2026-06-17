@@ -7,6 +7,7 @@
 pub mod daemonset_node;
 pub mod endpoint_mirror;
 pub mod endpoint_slice_sync;
+pub mod hpa;
 pub mod job;
 pub mod metrics;
 pub mod namespace_termination;
@@ -175,6 +176,16 @@ pub fn default_registry(
         namespace_termination::namespace_termination_check(metrics),
         ErrorPolicy::Warn,
     );
+    let hpa_effect = hpa::hpa_reconcile(controller_slot.clone());
+    for (api_version, kind) in [
+        ("v1", "Pod"),
+        ("v1", "ReplicationController"),
+        ("apps/v1", "Deployment"),
+        ("apps/v1", "ReplicaSet"),
+        ("apps/v1", "StatefulSet"),
+    ] {
+        registry.register(api_version, kind, hpa_effect.clone(), ErrorPolicy::Warn);
+    }
     registry.register(
         "v1",
         "Node",

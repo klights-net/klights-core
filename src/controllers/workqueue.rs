@@ -147,6 +147,12 @@ pub fn controller_kind_static(
         ("v1", "PersistentVolumeClaim") => Some(("v1", "PersistentVolumeClaim")),
         ("v1", "ReplicationController") => Some(("v1", "ReplicationController")),
         ("policy/v1", "PodDisruptionBudget") => Some(("policy/v1", "PodDisruptionBudget")),
+        ("autoscaling/v1", "HorizontalPodAutoscaler") => {
+            Some(("autoscaling/v1", "HorizontalPodAutoscaler"))
+        }
+        ("autoscaling/v2", "HorizontalPodAutoscaler") => {
+            Some(("autoscaling/v2", "HorizontalPodAutoscaler"))
+        }
         ("certificates.k8s.io/v1", "CertificateSigningRequest") => {
             Some(("certificates.k8s.io/v1", "CertificateSigningRequest"))
         }
