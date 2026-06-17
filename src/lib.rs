@@ -3,6 +3,7 @@ mod allocator;
 pub mod api;
 pub mod api_discovery;
 pub mod api_pod_subresources;
+pub mod api_priority_fairness;
 pub mod api_status;
 pub mod audit;
 pub mod auth;

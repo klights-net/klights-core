@@ -2910,6 +2910,95 @@ async fn test_prioritylevel_watch_default_does_not_replay_added_for_existing_obj
     );
 }
 
+#[tokio::test]
+async fn test_apf_rejects_matching_request_when_limited_priority_level_is_full() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    db.create_resource(
+        "flowcontrol.apiserver.k8s.io/v1",
+        "PriorityLevelConfiguration",
+        None,
+        "apf-limited-one-seat",
+        json!({
+            "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+            "kind": "PriorityLevelConfiguration",
+            "metadata": {"name": "apf-limited-one-seat"},
+            "spec": {
+                "type": "Limited",
+                "limited": {
+                    "nominalConcurrencyShares": 1,
+                    "limitResponse": {"type": "Reject"}
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "flowcontrol.apiserver.k8s.io/v1",
+        "FlowSchema",
+        None,
+        "apf-bob-list-namespaces",
+        json!({
+            "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+            "kind": "FlowSchema",
+            "metadata": {"name": "apf-bob-list-namespaces"},
+            "spec": {
+                "matchingPrecedence": 10,
+                "priorityLevelConfiguration": {"name": "apf-limited-one-seat"},
+                "rules": [{
+                    "subjects": [{"kind": "User", "user": {"name": "bob"}}],
+                    "resourceRules": [{
+                        "verbs": ["list"],
+                        "apiGroups": [""],
+                        "resources": ["namespaces"],
+                        "clusterScope": true
+                    }]
+                }]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let _held_seat = state
+        .api_priority_fairness
+        .occupy_limited_priority_level_for_test("apf-limited-one-seat", 1)
+        .expect("test should occupy APF seat");
+    let app = crate::api::build_router(state);
+
+    let mut req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/namespaces")
+        .body(Body::empty())
+        .unwrap();
+    req.extensions_mut()
+        .insert(crate::auth::AuthenticatedIdentity::client_cert(
+            "bob".to_string(),
+            vec![],
+        ));
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["reason"], "TooManyRequests");
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("apf-limited-one-seat")),
+        "429 status should name the saturated PriorityLevelConfiguration: {body}"
+    );
+}
+
 /// Regression for garbage_collector.go:436
 /// Orphan-deleting an RC must NOT delete the pods it created.
 /// After orphan delete: all pods must still exist in the API (any phase).

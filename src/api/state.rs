@@ -16,6 +16,10 @@ pub struct AppState {
     /// Structured Kubernetes audit event stream for authentication and
     /// authorization decisions.
     pub audit_sink: std::sync::Arc<dyn crate::audit::AuditSink>,
+    /// API Priority and Fairness admission state. Request-time classification
+    /// reads FlowSchema/PriorityLevelConfiguration resources and uses
+    /// semaphore-backed seats for limited priority levels.
+    pub api_priority_fairness: std::sync::Arc<crate::api_priority_fairness::ApiPriorityFairness>,
     pub rbac_policy_store: std::sync::Arc<dyn crate::auth::rbac_policy_store::RbacPolicyStore>,
     /// Kubelet-facing cluster-state API. Leader mode uses the in-process
     /// LocalApiClient; remote worker implementations arrive with T4.

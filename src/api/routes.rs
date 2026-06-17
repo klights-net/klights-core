@@ -437,6 +437,15 @@ pub fn build_router(state: AppState) -> Router {
                 async move { crate::auth::authorize_request(authz_state, request, next).await }
             })
         })
+        .layer({
+            let apf_state = state.clone();
+            middleware::from_fn(move |request: Request, next: Next| {
+                let apf_state = apf_state.clone();
+                async move {
+                    crate::api_priority_fairness::admit_request(apf_state, request, next).await
+                }
+            })
+        })
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::api::raft_proxy::leader_proxy_middleware,

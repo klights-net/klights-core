@@ -422,6 +422,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             ),
         ),
         audit_sink: crate::audit::default_audit_sink(),
+        api_priority_fairness: std::sync::Arc::new(
+            crate::api_priority_fairness::ApiPriorityFairness::new(),
+        ),
         rbac_policy_store: std::sync::Arc::new(
             crate::auth::rbac_policy_store::DatastoreRbacPolicyStore::new(db_handle.clone()),
         ),
