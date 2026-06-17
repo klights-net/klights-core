@@ -176,8 +176,164 @@ pub fn pod_matches_scopes(pod: &serde_json::Value, scopes: &[&str]) -> bool {
         "NotBestEffort" => !pod_is_best_effort(pod),
         "Terminating" => pod_is_terminating(pod),
         "NotTerminating" => !pod_is_terminating(pod),
+        "PriorityClass" => pod_priority_class_name(pod).is_some(),
+        "CrossNamespacePodAffinity" => pod_has_cross_namespace_pod_affinity(pod),
         _ => true,
     })
+}
+
+fn pod_priority_class_name(pod: &serde_json::Value) -> Option<&str> {
+    pod.pointer("/spec/priorityClassName")
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.is_empty())
+}
+
+fn pod_has_cross_namespace_pod_affinity(pod: &serde_json::Value) -> bool {
+    let affinity = pod.pointer("/spec/affinity");
+    for terms_pointer in [
+        "/podAffinity/requiredDuringSchedulingIgnoredDuringExecution",
+        "/podAntiAffinity/requiredDuringSchedulingIgnoredDuringExecution",
+    ] {
+        if affinity
+            .and_then(|affinity| affinity.pointer(terms_pointer))
+            .and_then(|terms| terms.as_array())
+            .is_some_and(|terms| terms.iter().any(pod_affinity_term_is_cross_namespace))
+        {
+            return true;
+        }
+    }
+
+    for terms_pointer in [
+        "/podAffinity/preferredDuringSchedulingIgnoredDuringExecution",
+        "/podAntiAffinity/preferredDuringSchedulingIgnoredDuringExecution",
+    ] {
+        if affinity
+            .and_then(|affinity| affinity.pointer(terms_pointer))
+            .and_then(|terms| terms.as_array())
+            .is_some_and(|terms| {
+                terms.iter().any(|weighted| {
+                    weighted
+                        .get("podAffinityTerm")
+                        .is_some_and(pod_affinity_term_is_cross_namespace)
+                })
+            })
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn pod_affinity_term_is_cross_namespace(term: &serde_json::Value) -> bool {
+    term.get("namespaces")
+        .and_then(|namespaces| namespaces.as_array())
+        .is_some_and(|namespaces| !namespaces.is_empty())
+        || term.get("namespaceSelector").is_some()
+}
+
+fn pod_quota_scope_value<'a>(pod: &'a serde_json::Value, scope_name: &str) -> Option<&'a str> {
+    match scope_name {
+        "BestEffort" if pod_is_best_effort(pod) => Some("BestEffort"),
+        "NotBestEffort" if !pod_is_best_effort(pod) => Some("NotBestEffort"),
+        "Terminating" if pod_is_terminating(pod) => Some("Terminating"),
+        "NotTerminating" if !pod_is_terminating(pod) => Some("NotTerminating"),
+        "PriorityClass" => pod_priority_class_name(pod),
+        "CrossNamespacePodAffinity" if pod_has_cross_namespace_pod_affinity(pod) => {
+            Some("CrossNamespacePodAffinity")
+        }
+        _ => None,
+    }
+}
+
+fn pod_matches_scope_selector_expression(
+    pod: &serde_json::Value,
+    expr: &serde_json::Value,
+) -> bool {
+    let Some(scope_name) = expr.get("scopeName").and_then(|v| v.as_str()) else {
+        return true;
+    };
+    let operator = expr
+        .get("operator")
+        .and_then(|v| v.as_str())
+        .unwrap_or("In");
+    let value = pod_quota_scope_value(pod, scope_name);
+    let values: Vec<&str> = expr
+        .get("values")
+        .and_then(|v| v.as_array())
+        .map(|values| values.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    match operator {
+        "Exists" => value.is_some(),
+        "DoesNotExist" => value.is_none(),
+        "In" => value.is_some_and(|value| values.contains(&value)),
+        "NotIn" => value.is_none_or(|value| !values.contains(&value)),
+        _ => true,
+    }
+}
+
+fn pod_matches_scope_selector(
+    pod: &serde_json::Value,
+    scope_selector: Option<&serde_json::Value>,
+) -> bool {
+    scope_selector
+        .and_then(|selector| selector.get("matchExpressions"))
+        .and_then(|expressions| expressions.as_array())
+        .map(|expressions| {
+            expressions
+                .iter()
+                .all(|expr| pod_matches_scope_selector_expression(pod, expr))
+        })
+        .unwrap_or(true)
+}
+
+pub fn pod_matches_resource_quota_scopes(
+    pod: &serde_json::Value,
+    resource_quota: &serde_json::Value,
+) -> bool {
+    let scopes: Vec<&str> = resource_quota
+        .pointer("/spec/scopes")
+        .and_then(|s| s.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    pod_matches_scopes(pod, &scopes)
+        && pod_matches_scope_selector(pod, resource_quota.pointer("/spec/scopeSelector"))
+}
+
+fn is_pod_scope_name(scope_name: &str) -> bool {
+    matches!(
+        scope_name,
+        "BestEffort"
+            | "NotBestEffort"
+            | "Terminating"
+            | "NotTerminating"
+            | "PriorityClass"
+            | "CrossNamespacePodAffinity"
+    )
+}
+
+pub fn resource_quota_has_pod_scope_constraints(resource_quota: &serde_json::Value) -> bool {
+    let has_scope = resource_quota
+        .pointer("/spec/scopes")
+        .and_then(|scopes| scopes.as_array())
+        .is_some_and(|scopes| {
+            scopes
+                .iter()
+                .filter_map(|scope| scope.as_str())
+                .any(is_pod_scope_name)
+        });
+    let has_scope_selector = resource_quota
+        .pointer("/spec/scopeSelector/matchExpressions")
+        .and_then(|expressions| expressions.as_array())
+        .is_some_and(|expressions| {
+            expressions
+                .iter()
+                .filter_map(|expr| expr.get("scopeName").and_then(|scope| scope.as_str()))
+                .any(is_pod_scope_name)
+        });
+    has_scope || has_scope_selector
 }
 
 fn parse_cpu_milli(q: &str) -> Option<i64> {
@@ -329,7 +485,7 @@ pub fn calculate_pod_effective_resource_for_key(
 async fn sum_pod_resource_quota_key(
     pod_reader: &dyn PodReader,
     namespace: &str,
-    scopes: &[&str],
+    resource_quota: &Value,
     quota_key: &str,
 ) -> Option<String> {
     let (bucket, resource_key) = if let Some(suffix) = quota_key.strip_prefix("requests.") {
@@ -359,7 +515,7 @@ async fn sum_pod_resource_quota_key(
         if pod_has_deletion_timestamp(&pod.data) {
             continue;
         }
-        if !pod_matches_scopes(&pod.data, scopes) {
+        if !pod_matches_resource_quota_scopes(&pod.data, resource_quota) {
             continue;
         }
         total += calculate_pod_effective_resource_for_key(&pod.data, bucket, resource_key);
@@ -372,7 +528,7 @@ async fn sum_pod_resource_quota_key(
 async fn count_pods_with_scope(
     pod_reader: &dyn PodReader,
     namespace: &str,
-    scopes: &[&str],
+    resource_quota: &Value,
 ) -> i64 {
     let pods = match pod_reader
         .list_pods(Some(namespace), None, None, None, None)
@@ -384,7 +540,7 @@ async fn count_pods_with_scope(
 
     pods.iter()
         .filter(|pod| !pod_has_deletion_timestamp(&pod.data))
-        .filter(|pod| pod_matches_scopes(&pod.data, scopes))
+        .filter(|pod| pod_matches_resource_quota_scopes(&pod.data, resource_quota))
         .count() as i64
 }
 
@@ -399,16 +555,10 @@ async fn calculate_resource_quota_status(
         .and_then(|h| h.as_object())?
         .clone();
 
-    let scopes: Vec<&str> = rq
-        .pointer("/spec/scopes")
-        .and_then(|s| s.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-        .unwrap_or_default();
-
     let mut used = serde_json::Map::new();
     for resource_name in hard.keys() {
         if let Some(pod_used) =
-            sum_pod_resource_quota_key(pod_reader, namespace, &scopes, resource_name).await
+            sum_pod_resource_quota_key(pod_reader, namespace, rq, resource_name).await
         {
             used.insert(resource_name.clone(), json!(pod_used));
             continue;
@@ -423,7 +573,7 @@ async fn calculate_resource_quota_status(
             count_services_by_type(db, namespace, "LoadBalancer").await
         } else if resource_name == "pods" {
             // Pod counting must exclude terminating pods
-            count_pods_with_scope(pod_reader, namespace, &scopes).await
+            count_pods_with_scope(pod_reader, namespace, rq).await
         } else if let Some((api_version, kind)) = quota_resource_to_kind(resource_name) {
             count_resources(db, api_version, kind, namespace).await
         } else if resource_name.starts_with("count/") {

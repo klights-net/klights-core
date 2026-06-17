@@ -367,6 +367,99 @@ async fn test_resourcequota_pod_create_requires_configured_request_resource() {
 }
 
 #[tokio::test]
+async fn test_resourcequota_scope_selector_priorityclass_filters_pod_quota() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let ns_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"rq-scope-selector"}}"#,
+        ))
+        .unwrap();
+    let ns_resp = app.clone().oneshot(ns_req).await.unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+
+    let rq_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/rq-scope-selector/resourcequotas")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+                "apiVersion":"v1",
+                "kind":"ResourceQuota",
+                "metadata":{"name":"rq-high-priority","namespace":"rq-scope-selector"},
+                "spec":{
+                    "hard":{"pods":"0"},
+                    "scopeSelector":{
+                        "matchExpressions":[{
+                            "scopeName":"PriorityClass",
+                            "operator":"In",
+                            "values":["high"]
+                        }]
+                    }
+                }
+            }"#,
+        ))
+        .unwrap();
+    let rq_resp = app.clone().oneshot(rq_req).await.unwrap();
+    assert_eq!(rq_resp.status(), StatusCode::CREATED);
+
+    let low_pod_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/rq-scope-selector/pods")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+                "apiVersion":"v1",
+                "kind":"Pod",
+                "metadata":{"name":"low","namespace":"rq-scope-selector"},
+                "spec":{
+                    "priorityClassName":"low",
+                    "containers":[{"name":"c","image":"busybox"}]
+                }
+            }"#,
+        ))
+        .unwrap();
+    let low_pod_resp = app.clone().oneshot(low_pod_req).await.unwrap();
+    assert_eq!(
+        low_pod_resp.status(),
+        StatusCode::CREATED,
+        "PriorityClass scopeSelector must not apply high-priority quota to low-priority Pods"
+    );
+
+    let high_pod_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/rq-scope-selector/pods")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+                "apiVersion":"v1",
+                "kind":"Pod",
+                "metadata":{"name":"high","namespace":"rq-scope-selector"},
+                "spec":{
+                    "priorityClassName":"high",
+                    "containers":[{"name":"c","image":"busybox"}]
+                }
+            }"#,
+        ))
+        .unwrap();
+    let high_pod_resp = app.clone().oneshot(high_pod_req).await.unwrap();
+    assert_eq!(
+        high_pod_resp.status(),
+        StatusCode::FORBIDDEN,
+        "PriorityClass scopeSelector must apply quota to matching high-priority Pods"
+    );
+}
+
+#[tokio::test]
 async fn test_resourcequota_pod_update_denies_when_requests_would_exceed_hard_limit() {
     use axum::{
         body::Body,

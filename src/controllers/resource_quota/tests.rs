@@ -227,6 +227,75 @@ fn test_parse_scalar_resource_accepts_decimal_si_suffix() {
     );
 }
 
+#[test]
+fn test_resource_quota_scope_selector_matches_priority_class_and_cross_namespace_affinity() {
+    let high_priority_quota = json!({
+        "spec": {
+            "scopeSelector": {
+                "matchExpressions": [{
+                    "scopeName": "PriorityClass",
+                    "operator": "In",
+                    "values": ["high"]
+                }]
+            }
+        }
+    });
+    let high_pod = json!({"spec": {"priorityClassName": "high", "containers": []}});
+    let low_pod = json!({"spec": {"priorityClassName": "low", "containers": []}});
+    assert!(pod_matches_resource_quota_scopes(
+        &high_pod,
+        &high_priority_quota
+    ));
+    assert!(!pod_matches_resource_quota_scopes(
+        &low_pod,
+        &high_priority_quota
+    ));
+
+    let cross_namespace_quota = json!({
+        "spec": {
+            "scopeSelector": {
+                "matchExpressions": [{
+                    "scopeName": "CrossNamespacePodAffinity",
+                    "operator": "Exists"
+                }]
+            }
+        }
+    });
+    let cross_namespace_pod = json!({
+        "spec": {
+            "affinity": {
+                "podAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": [{
+                        "labelSelector": {"matchLabels": {"app": "db"}},
+                        "namespaces": ["shared"]
+                    }]
+                }
+            },
+            "containers": []
+        }
+    });
+    let same_namespace_pod = json!({
+        "spec": {
+            "affinity": {
+                "podAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": [{
+                        "labelSelector": {"matchLabels": {"app": "db"}}
+                    }]
+                }
+            },
+            "containers": []
+        }
+    });
+    assert!(pod_matches_resource_quota_scopes(
+        &cross_namespace_pod,
+        &cross_namespace_quota
+    ));
+    assert!(!pod_matches_resource_quota_scopes(
+        &same_namespace_pod,
+        &cross_namespace_quota
+    ));
+}
+
 #[tokio::test]
 async fn test_reconcile_resource_quota_rejects_stale_status_overlap() {
     let db = crate::datastore::test_support::in_memory().await;

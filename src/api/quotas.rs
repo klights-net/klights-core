@@ -110,16 +110,16 @@ pub async fn check_resource_quota_for_pod_update(
             Some(h) => h.clone(),
             None => continue,
         };
-        let scopes: Vec<&str> = rq_resource
-            .data
-            .pointer("/spec/scopes")
-            .and_then(|s| s.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-        let old_matches_scope = scopes.is_empty()
-            || crate::controllers::resource_quota::pod_matches_scopes(old_pod, &scopes);
-        let new_matches_scope = scopes.is_empty()
-            || crate::controllers::resource_quota::pod_matches_scopes(new_pod, &scopes);
+        let old_matches_scope =
+            crate::controllers::resource_quota::pod_matches_resource_quota_scopes(
+                old_pod,
+                rq_resource.data.as_ref(),
+            );
+        let new_matches_scope =
+            crate::controllers::resource_quota::pod_matches_resource_quota_scopes(
+                new_pod,
+                rq_resource.data.as_ref(),
+            );
         let used_map = rq_resource
             .data
             .pointer("/status/used")
@@ -243,6 +243,36 @@ async fn count_services_of_type(
     .unwrap_or(0)
 }
 
+async fn count_pods_matching_resource_quota(
+    db: &dyn crate::datastore::DatastoreBackend,
+    namespace: &str,
+    pod_kind: &str,
+    resource_quota: &Value,
+) -> i64 {
+    db.list_resources(
+        "v1",
+        pod_kind,
+        Some(namespace),
+        crate::datastore::ResourceListQuery::all(),
+    )
+    .await
+    .map(|list| {
+        list.items
+            .iter()
+            .filter(|pod| {
+                !crate::controllers::resource_quota::pod_has_deletion_timestamp(&pod.data)
+            })
+            .filter(|pod| {
+                crate::controllers::resource_quota::pod_matches_resource_quota_scopes(
+                    &pod.data,
+                    resource_quota,
+                )
+            })
+            .count() as i64
+    })
+    .unwrap_or(0)
+}
+
 pub async fn check_resource_quota_for_creation(
     db: &dyn crate::datastore::DatastoreBackend,
     namespace: &str,
@@ -272,27 +302,17 @@ pub async fn check_resource_quota_for_creation(
             None => continue,
         };
 
-        let scopes: Vec<&str> = rq_resource
-            .data
-            .pointer("/spec/scopes")
-            .and_then(|s| s.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-
-        if kind == "Pod" && !scopes.is_empty() {
-            if !crate::controllers::resource_quota::pod_matches_scopes(body, &scopes) {
+        if kind == "Pod" {
+            if !crate::controllers::resource_quota::pod_matches_resource_quota_scopes(
+                body,
+                rq_resource.data.as_ref(),
+            ) {
                 continue;
             }
-        } else if kind != "Pod" && !scopes.is_empty() {
-            let has_pod_scopes = scopes.iter().any(|s| {
-                matches!(
-                    *s,
-                    "BestEffort" | "NotBestEffort" | "Terminating" | "NotTerminating"
-                )
-            });
-            if has_pod_scopes {
-                continue;
-            }
+        } else if crate::controllers::resource_quota::resource_quota_has_pod_scope_constraints(
+            rq_resource.data.as_ref(),
+        ) {
+            continue;
         }
 
         if let Some((direct_name, group, plural)) = kind_to_quota_info(kind) {
@@ -303,8 +323,16 @@ pub async fn check_resource_quota_for_creation(
                     .as_str()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(i64::MAX);
-                let current_count = db
-                    .list_resources(
+                let current_count = if kind == "Pod" {
+                    count_pods_matching_resource_quota(
+                        db,
+                        namespace,
+                        kind,
+                        rq_resource.data.as_ref(),
+                    )
+                    .await
+                } else {
+                    db.list_resources(
                         "v1",
                         kind,
                         Some(namespace),
@@ -312,7 +340,8 @@ pub async fn check_resource_quota_for_creation(
                     )
                     .await
                     .map(|list| list.items.len() as i64)
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                };
                 if current_count >= limit {
                     return Err(AppError::Forbidden(format!(
                         "exceeded quota: {}, requested: 1, used: {}, limited: {}",
@@ -336,8 +365,16 @@ pub async fn check_resource_quota_for_creation(
                 } else {
                     format!("{}/v1", group)
                 };
-                let current_count = db
-                    .list_resources(
+                let current_count = if kind == "Pod" {
+                    count_pods_matching_resource_quota(
+                        db,
+                        namespace,
+                        kind,
+                        rq_resource.data.as_ref(),
+                    )
+                    .await
+                } else {
+                    db.list_resources(
                         &api_version,
                         kind,
                         Some(namespace),
@@ -345,7 +382,8 @@ pub async fn check_resource_quota_for_creation(
                     )
                     .await
                     .map(|list| list.items.len() as i64)
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                };
                 if current_count >= limit {
                     return Err(AppError::Forbidden(format!(
                         "exceeded quota: {}, requested: 1, used: {}, limited: {}",
