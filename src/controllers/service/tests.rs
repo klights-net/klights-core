@@ -889,6 +889,44 @@ fn test_normalize_service_ports_keeps_explicit_values() {
     assert_eq!(ports[0]["targetPort"], "http");
 }
 
+#[tokio::test]
+async fn test_reconcile_service_defaults_single_stack_ip_family_fields() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let service_ipam = ServiceIpam::new("10.43.128.0/17");
+
+    let service = json!({
+        "metadata": {
+            "name": "family-defaults",
+            "namespace": "default",
+            "uid": "family-defaults-uid"
+        },
+        "spec": {
+            "selector": {"app": "family-defaults"},
+            "ports": [{"port": 80, "targetPort": 8080}]
+        }
+    });
+    let created = db
+        .create_resource("v1", "Service", Some("default"), "family-defaults", service)
+        .await
+        .unwrap();
+    let service = crate::api::inject_resource_version(created.data, created.resource_version);
+
+    let result = reconcile_service(
+        &db,
+        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        &service,
+        &service_ipam,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.pointer("/spec/ipFamilyPolicy"),
+        Some(&json!("SingleStack"))
+    );
+    assert_eq!(result.pointer("/spec/ipFamilies"), Some(&json!(["IPv4"])));
+}
+
 #[test]
 fn test_nodeport_allocator_skips_already_used_ports() {
     let alloc = NodePortAllocator::new();

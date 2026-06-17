@@ -388,6 +388,52 @@ fn normalize_service_ports(spec: &mut serde_json::Map<String, Value>) {
     }
 }
 
+fn normalize_service_ip_family_defaults(spec: &mut serde_json::Map<String, Value>) {
+    let service_type = spec
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("ClusterIP");
+    if service_type == "ExternalName" {
+        return;
+    }
+
+    let family = spec
+        .get("clusterIPs")
+        .and_then(|ips| ips.as_array())
+        .and_then(|ips| ips.iter().find_map(value_to_routable_ip))
+        .or_else(|| spec.get("clusterIP").and_then(value_to_routable_ip))
+        .map(ip_family_for)
+        .unwrap_or("IPv4");
+
+    let needs_ip_family_policy_default = spec
+        .get("ipFamilyPolicy")
+        .is_none_or(|v| v.is_null() || v.as_str().is_some_and(str::is_empty));
+    if needs_ip_family_policy_default {
+        spec.insert("ipFamilyPolicy".to_string(), json!("SingleStack"));
+    }
+
+    let needs_ip_families_default = spec.get("ipFamilies").is_none_or(|v| {
+        v.is_null()
+            || v.as_array().is_some_and(|families| families.is_empty())
+            || v.as_str().is_some_and(str::is_empty)
+    });
+    if needs_ip_families_default {
+        spec.insert("ipFamilies".to_string(), json!([family]));
+    }
+}
+
+fn value_to_routable_ip(value: &Value) -> Option<&str> {
+    let ip = value.as_str()?;
+    if ip.is_empty() || ip == "None" {
+        return None;
+    }
+    Some(ip)
+}
+
+fn ip_family_for(ip: &str) -> &'static str {
+    if ip.contains(':') { "IPv6" } else { "IPv4" }
+}
+
 /// K8s spec: ExternalName services return CNAME DNS records and must not
 /// carry any cluster-routing fields — `clusterIP`/`clusterIPs` are emptied
 /// and per-port `nodePort` values are removed so a Service transitioned
@@ -472,6 +518,7 @@ async fn allocate_service_fields_in_object(
         }
     }
     // If clusterIP is explicitly set to "None", it's a headless service - don't allocate
+    normalize_service_ip_family_defaults(spec_mut);
 
     // Allocate NodePort if type is NodePort or LoadBalancer
     if (service_type == "NodePort" || service_type == "LoadBalancer")
