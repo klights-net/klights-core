@@ -1268,6 +1268,96 @@ async fn test_patch_pvc_status_condition_survives_stale_controller_status_commit
 }
 
 #[tokio::test]
+async fn test_pvc_create_defaults_storage_class_from_default_storageclass() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let ns_body = r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"pvc-default-sc"}}"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(ns_body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let sc_body = r#"{
+        "apiVersion":"storage.k8s.io/v1",
+        "kind":"StorageClass",
+        "metadata":{
+            "name":"fast-default",
+            "annotations":{"storageclass.kubernetes.io/is-default-class":"true"}
+        },
+        "provisioner":"kubernetes.io/no-provisioner"
+    }"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/apis/storage.k8s.io/v1/storageclasses")
+        .header("content-type", "application/json")
+        .body(Body::from(sc_body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let pvc_body = r#"{
+        "apiVersion":"v1",
+        "kind":"PersistentVolumeClaim",
+        "metadata":{"name":"claim-defaulted","namespace":"pvc-default-sc"},
+        "spec":{
+            "accessModes":["ReadWriteOnce"],
+            "resources":{"requests":{"storage":"1Gi"}}
+        }
+    }"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/pvc-default-sc/persistentvolumeclaims")
+        .header("content-type", "application/json")
+        .body(Body::from(pvc_body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        body.pointer("/spec/storageClassName"),
+        Some(&serde_json::json!("fast-default")),
+        "PVC create must default absent spec.storageClassName from the default StorageClass"
+    );
+
+    let explicit_empty_pvc = r#"{
+        "apiVersion":"v1",
+        "kind":"PersistentVolumeClaim",
+        "metadata":{"name":"claim-no-class","namespace":"pvc-default-sc"},
+        "spec":{
+            "storageClassName":"",
+            "accessModes":["ReadWriteOnce"],
+            "resources":{"requests":{"storage":"1Gi"}}
+        }
+    }"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/pvc-default-sc/persistentvolumeclaims")
+        .header("content-type", "application/json")
+        .body(Body::from(explicit_empty_pvc))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        body.pointer("/spec/storageClassName"),
+        Some(&serde_json::json!("")),
+        "PVC create must preserve explicit empty storageClassName"
+    );
+}
+
+#[tokio::test]
 async fn test_pv_status_defaults_phase_available_on_create() {
     use axum::{
         body::Body,

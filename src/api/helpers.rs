@@ -1,6 +1,7 @@
 use crate::api::*;
 use serde::Deserialize;
 use serde_json::Value;
+use std::cmp::Ordering;
 
 pub fn ensure_namespace_status_phase_active(data: &mut Value) {
     let Some(obj) = data.as_object_mut() else {
@@ -1280,6 +1281,92 @@ pub async fn enforce_limitrange_constraints_for_pvc(
     }
 
     Ok(())
+}
+
+pub async fn apply_default_storage_class_admission(
+    db: &dyn DatastoreBackend,
+    pvc: &mut Value,
+) -> Result<(), AppError> {
+    match pvc.pointer("/spec/storageClassName") {
+        Some(Value::String(_)) => return Ok(()),
+        Some(value) if !value.is_null() => return Ok(()),
+        _ => {}
+    }
+
+    let storage_classes = db
+        .list_resources(
+            "storage.k8s.io/v1",
+            "StorageClass",
+            None,
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await?;
+    let Some(default_class) = storage_classes
+        .items
+        .iter()
+        .filter(|resource| storage_class_is_default(&resource.data))
+        .max_by(compare_storage_class_default_order)
+    else {
+        return Ok(());
+    };
+    let Some(default_name) = default_class
+        .data
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+
+    let Some(pvc_obj) = pvc.as_object_mut() else {
+        return Ok(());
+    };
+    let spec = pvc_obj
+        .entry("spec".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !spec.is_object() {
+        return Ok(());
+    }
+    let Some(spec_obj) = spec.as_object_mut() else {
+        return Ok(());
+    };
+    spec_obj.insert(
+        "storageClassName".to_string(),
+        Value::String(default_name.to_string()),
+    );
+    Ok(())
+}
+
+fn storage_class_is_default(storage_class: &Value) -> bool {
+    const DEFAULT_SC_ANNOTATIONS: [&str; 2] = [
+        "storageclass.kubernetes.io/is-default-class",
+        "storageclass.beta.kubernetes.io/is-default-class",
+    ];
+
+    DEFAULT_SC_ANNOTATIONS.iter().any(|key| {
+        storage_class
+            .pointer("/metadata/annotations")
+            .and_then(Value::as_object)
+            .and_then(|annotations| annotations.get(*key))
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    })
+}
+
+fn compare_storage_class_default_order(
+    left: &&crate::datastore::Resource,
+    right: &&crate::datastore::Resource,
+) -> Ordering {
+    storage_class_creation_timestamp(&left.data)
+        .cmp(storage_class_creation_timestamp(&right.data))
+        .then_with(|| left.resource_version.cmp(&right.resource_version))
+        .then_with(|| left.name.cmp(&right.name))
+}
+
+fn storage_class_creation_timestamp(storage_class: &Value) -> &str {
+    storage_class
+        .pointer("/metadata/creationTimestamp")
+        .and_then(Value::as_str)
+        .unwrap_or("")
 }
 
 // Macro to generate generic handlers for namespaced resources

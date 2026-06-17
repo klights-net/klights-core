@@ -628,6 +628,7 @@ pub async fn create_inner(
     if kind == "PersistentVolumeClaim"
         && let Some(namespace) = ns
     {
+        apply_default_storage_class_admission(state.db.as_ref(), &mut body).await?;
         enforce_limitrange_constraints_for_pvc(state.db.as_ref(), namespace, &body).await?;
     }
 
