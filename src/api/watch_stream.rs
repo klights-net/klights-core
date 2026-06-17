@@ -599,6 +599,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             };
 
             if let Ok(missed) = missed {
+                let mut delivered_scoped_catchup_rv = requested_rv;
                 for catchup in missed {
                     let resource = catchup.resource.clone();
                     if resource.resource_version <= initial_list_rv {
@@ -616,7 +617,6 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         }
                         continue;
                     }
-                    initial_list_rv = initial_list_rv.max(resource.resource_version);
                     let event = CatchUpResource {
                         resource: catchup.resource,
                         event_type: catchup.event_type,
@@ -631,6 +631,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                     }
                     if let Some(rv) = event.resource_version() {
                         last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
+                        delivered_scoped_catchup_rv = delivered_scoped_catchup_rv.max(rv);
                     }
                     yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
                         event,
@@ -638,6 +639,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         table_format,
                     ));
                 }
+                initial_list_rv = initial_list_rv.max(delivered_scoped_catchup_rv);
             }
         }
 

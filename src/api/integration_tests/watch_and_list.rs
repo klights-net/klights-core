@@ -4722,6 +4722,376 @@ async fn test_bookmark_reports_caught_up_rv_not_global_collection_rv() {
     );
 }
 
+#[tokio::test]
+async fn test_scoped_watch_reconnect_from_bookmark_preserves_in_scope_pod_events() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let namespace = "scoped-watch-bookmark-resume";
+    let selector = "app%3Dguestbook%2Ctier%3Dfrontend";
+    let deployment_name = "bookmark-frontend-deployment";
+    let first_pod = "bookmark-first-pod";
+    let second_pod = "bookmark-second-pod";
+
+    let ns_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"apiVersion":"v1","kind":"Namespace","metadata":{{"name":"{namespace}"}}}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+
+    let deployment_body = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": deployment_name,
+            "namespace": namespace,
+            "labels": {"app": "guestbook", "tier": "frontend"}
+        },
+        "spec": {
+            "replicas": 1,
+            "selector": {
+                "matchLabels": {"app": "guestbook", "tier": "frontend"}
+            },
+            "template": {
+                "metadata": {
+                    "labels": {"app": "guestbook", "tier": "frontend"}
+                },
+                "spec": {
+                    "containers": [{
+                        "name": "c",
+                        "image": "registry.k8s.io/pause:3.10.1"
+                    }]
+                }
+            }
+        }
+    });
+    let deployment_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/apis/apps/v1/namespaces/{namespace}/deployments"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&deployment_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deployment_resp.status(), StatusCode::CREATED);
+
+    let list_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/{namespace}/pods?labelSelector={selector}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+    let list_rv: i64 = serde_json::from_slice::<serde_json::Value>(&list_body)
+        .unwrap()
+        .pointer("/metadata/resourceVersion")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse().ok())
+        .expect("list must return a resourceVersion");
+
+    let watch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/{namespace}/pods?watch=true&resourceVersion={list_rv}&labelSelector={selector}&allowWatchBookmarks=true"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+
+    let watch_stream = watch_resp.into_body().into_data_stream();
+    let first_pod_body = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": first_pod,
+            "namespace": namespace,
+            "labels": {"app": "guestbook", "tier": "frontend"}
+        },
+        "spec": {
+            "containers": [{
+                "name": "c",
+                "image": "registry.k8s.io/pause:3.10.1"
+            }]
+        }
+    });
+    let create_first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/namespaces/{namespace}/pods"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&first_pod_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_first.status(), StatusCode::CREATED);
+
+    let patch_first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/namespaces/{namespace}/pods/{first_pod}"))
+                .header("content-type", "application/merge-patch+json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "metadata": {
+                            "annotations": {"watch-reconnect": "phase-one"}
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patch_first.status(), StatusCode::OK);
+
+    for i in 0..20 {
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": format!("bookmark-noise-{i}"),
+                "namespace": namespace,
+                "labels": {"app": "noise", "tier": "backend"}
+            },
+            "spec": {
+                "containers": [{"name": "c", "image": "registry.k8s.io/pause:3.10.1"}]
+            }
+        });
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/namespaces/{namespace}/pods"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&pod).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let mut first_events: Vec<String> = Vec::new();
+    let mut resume_rv: Option<i64> = None;
+    let mut first_events_max_rv: i64 = 0;
+    let mut watch_stream = watch_stream;
+    let namespace_match = namespace;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while first_events.len() < 2 || resume_rv.is_none() {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let chunk = tokio::time::timeout(Duration::from_millis(500), watch_stream.next())
+            .await
+            .expect("watch stream should continue during reconnect test")
+            .expect("watch stream should yield data")
+            .expect("watch stream chunk error")
+            .to_vec();
+        let text = String::from_utf8(chunk).unwrap();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let event = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(event) => event,
+                Err(_) => continue,
+            };
+            let event_type = event
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = event
+                .pointer("/object/metadata/name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let event_namespace = event
+                .pointer("/object/metadata/namespace")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+
+            match event_type.as_str() {
+                "ADDED" | "MODIFIED" => {
+                    if name == first_pod && event_namespace == namespace_match {
+                        first_events.push(event_type);
+                        let rv = event
+                            .pointer("/object/metadata/resourceVersion")
+                            .and_then(|value| value.as_str())
+                            .and_then(|value| value.parse::<i64>().ok())
+                            .unwrap_or(0);
+                        first_events_max_rv = first_events_max_rv.max(rv);
+                    }
+                }
+                "BOOKMARK" => {
+                    if let Some(rv) = event
+                        .pointer("/object/metadata/resourceVersion")
+                        .and_then(|value| value.as_str())
+                        .and_then(|value| value.parse::<i64>().ok())
+                    {
+                        resume_rv = Some(resume_rv.unwrap_or(0).max(rv));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    drop(watch_stream);
+
+    let resume_rv = resume_rv.expect("watch must emit a bookmark while reconnect test is active");
+    assert_eq!(
+        first_events,
+        ["ADDED", "MODIFIED"],
+        "first scoped watch must deliver create then modify for the in-scope pod"
+    );
+    assert!(
+        first_events_max_rv > 0,
+        "scoped watch must capture in-scope event resourceVersions"
+    );
+
+    let reconnect_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/{namespace}/pods?watch=true&resourceVersion={resume_rv}&labelSelector={selector}&allowWatchBookmarks=true"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reconnect_resp.status(), StatusCode::OK);
+
+    let mut reconnect_stream = reconnect_resp.into_body().into_data_stream();
+    let second_pod_body = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": second_pod,
+            "namespace": namespace,
+            "labels": {"app": "guestbook", "tier": "frontend"}
+        },
+        "spec": {
+            "containers": [{
+                "name": "c",
+                "image": "registry.k8s.io/pause:3.10.1"
+            }]
+        }
+    });
+    let create_second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/namespaces/{namespace}/pods"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&second_pod_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_second.status(), StatusCode::CREATED);
+
+    let patch_second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/namespaces/{namespace}/pods/{second_pod}"))
+                .header("content-type", "application/merge-patch+json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "metadata": {
+                            "annotations": {"watch-reconnect": "phase-two"}
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patch_second.status(), StatusCode::OK);
+
+    let mut second_events: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while second_events.len() < 2 {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let chunk = tokio::time::timeout(Duration::from_millis(500), reconnect_stream.next())
+            .await
+            .expect("reconnected watch should remain active")
+            .expect("reconnected watch should emit frames")
+            .expect("reconnected watch chunk error")
+            .to_vec();
+        let text = String::from_utf8(chunk).unwrap();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let event = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(event) => event,
+                Err(_) => continue,
+            };
+            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let name = event
+                .pointer("/object/metadata/name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let event_namespace = event
+                .pointer("/object/metadata/namespace")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if (event_type == "ADDED" || event_type == "MODIFIED")
+                && name == second_pod
+                && event_namespace == namespace_match
+            {
+                second_events.push(event_type.to_string());
+            }
+        }
+    }
+
+    assert_eq!(
+        second_events,
+        ["ADDED", "MODIFIED"],
+        "reconnected scoped watch must deliver in-order create and modify events"
+    );
+}
+
 /// Regression: a resourceVersion-less (`resourceVersion=""`) label-selector
 /// watch must deliver the ADDED of a matching object created AFTER the watch
 /// establishes, even while unrelated writes inflate the global resourceVersion.

@@ -969,10 +969,12 @@ async fn list_cr_inner(
                         .map_err(AppError::from)
                 };
                 if let Ok(missed) = missed {
+                    let mut delivered_scoped_catchup_rv = requested_rv;
                     for catchup in missed {
                         let resource = catchup.resource.clone();
-                        if resource.resource_version <= initial_list_rv { continue; }
-                        initial_list_rv = initial_list_rv.max(resource.resource_version);
+                        if resource.resource_version <= initial_list_rv {
+                            continue;
+                        }
                         let event = CatchUpResource {
                             resource: catchup.resource,
                             event_type: catchup.event_type,
@@ -1014,11 +1016,13 @@ async fn list_cr_inner(
                         };
                         if let Some(delivered_rv) = event.resource_version() {
                             last_delivered_scoped_rv = last_delivered_scoped_rv.max(delivered_rv);
+                            delivered_scoped_catchup_rv = delivered_scoped_catchup_rv.max(delivered_rv);
                         }
                         let mut json = serde_json::to_vec(&event).unwrap_or_default();
                         json.push(b'\n');
                         yield Ok::<_, std::convert::Infallible>(json);
                     }
+                    initial_list_rv = initial_list_rv.max(delivered_scoped_catchup_rv);
                 }
 
                 // Register the current selector members and grant each a per-key
