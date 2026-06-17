@@ -10,6 +10,7 @@ use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 use std::sync::Arc;
 
 const DELETE_MAX_CONFLICT_RETRIES: usize = 16;
+const ORPHAN_FINALIZER: &str = "orphan";
 
 #[derive(Debug)]
 pub enum DeleteCompletion {
@@ -62,20 +63,56 @@ fn has_deletion_timestamp(data: &Value) -> bool {
         .is_some_and(|s| !s.is_empty())
 }
 
+fn has_finalizer(data: &Value, finalizer: &str) -> bool {
+    data.pointer("/metadata/finalizers")
+        .and_then(|v| v.as_array())
+        .is_some_and(|finalizers| {
+            finalizers
+                .iter()
+                .any(|value| value.as_str() == Some(finalizer))
+        })
+}
+
+fn add_finalizer(data: &mut Value, finalizer: &'static str) {
+    let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
+        return;
+    };
+    let finalizers = meta
+        .entry("finalizers".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(finalizers) = finalizers.as_array_mut()
+        && !finalizers
+            .iter()
+            .any(|value| value.as_str() == Some(finalizer))
+    {
+        finalizers.push(serde_json::json!(finalizer));
+    }
+}
+
+fn remove_finalizer(data: &mut Value, finalizer: &str) {
+    let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
+        return;
+    };
+    let Some(finalizers) = meta
+        .get_mut("finalizers")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+    finalizers.retain(|value| value.as_str() != Some(finalizer));
+    if finalizers.is_empty() {
+        meta.remove("finalizers");
+    }
+}
+
+fn apply_orphan_deletion_mark(data: &mut Value, grace_seconds: i64) {
+    ensure_deletion_timestamp(data, grace_seconds);
+    add_finalizer(data, ORPHAN_FINALIZER);
+}
+
 fn apply_foreground_deletion_mark(data: &mut Value) {
     ensure_deletion_timestamp(data, 0);
-    if let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-        let finalizers = meta
-            .entry("finalizers".to_string())
-            .or_insert_with(|| serde_json::json!([]));
-        if let Some(finalizers) = finalizers.as_array_mut()
-            && !finalizers
-                .iter()
-                .any(|f| f.as_str() == Some("foregroundDeletion"))
-        {
-            finalizers.push(serde_json::json!("foregroundDeletion"));
-        }
-    }
+    add_finalizer(data, "foregroundDeletion");
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -260,9 +297,11 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
         }
 
         if orphan_children_before_completion {
-            if !has_deletion_timestamp(&resource.data) {
+            if !has_deletion_timestamp(&resource.data)
+                || !has_finalizer(&resource.data, ORPHAN_FINALIZER)
+            {
                 let mut del_data: Value = (*resource.data).clone();
-                ensure_deletion_timestamp(&mut del_data, grace_seconds);
+                apply_orphan_deletion_mark(&mut del_data, grace_seconds);
                 let update_preconditions = ResourcePreconditions::uid_and_resource_version(
                     expected_uid.clone(),
                     resource.resource_version,
@@ -302,6 +341,38 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
             )
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
+
+            if has_finalizer(&resource.data, ORPHAN_FINALIZER) {
+                let mut del_data: Value = (*resource.data).clone();
+                remove_finalizer(&mut del_data, ORPHAN_FINALIZER);
+                let update_preconditions = ResourcePreconditions::uid_and_resource_version(
+                    expected_uid.clone(),
+                    resource.resource_version,
+                );
+                match db
+                    .update_resource_with_preconditions(
+                        api_version,
+                        kind,
+                        namespace,
+                        name,
+                        del_data,
+                        update_preconditions,
+                    )
+                    .await
+                {
+                    Ok(updated) => {
+                        resource = updated;
+                    }
+                    Err(err)
+                        if explicit_rv.is_none()
+                            && is_conflict_error(&err)
+                            && attempt < DELETE_MAX_CONFLICT_RETRIES =>
+                    {
+                        continue;
+                    }
+                    Err(err) => return Err(AppError::from(err)),
+                }
+            }
         }
 
         let has_finalizers = resource
@@ -614,6 +685,15 @@ mod tests {
                     .pointer("/metadata/deletionTimestamp")
                     .and_then(|v| v.as_str())
                     .is_some_and(|value| !value.is_empty())
+                && event
+                    .object
+                    .pointer("/metadata/finalizers")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|finalizers| {
+                        finalizers
+                            .iter()
+                            .any(|finalizer| finalizer.as_str() == Some("orphan"))
+                    })
         });
         let owner_deleted = events.iter().position(|event| {
             event.event_type == EventType::Deleted

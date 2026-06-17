@@ -841,7 +841,7 @@ async fn delete_resource_for_gc(
             },
             initial_resource: resource.clone(),
             delete_preconditions: ResourcePreconditions::uid(resource.uid.clone()),
-            orphan_children_before_completion: false,
+            orphan_children_before_completion: has_finalizer(&resource.data, "orphan"),
             uid_mismatch_is_conflict: false,
             grace_seconds: 0,
         },
