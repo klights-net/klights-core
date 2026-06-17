@@ -608,6 +608,7 @@ async fn list_cr_inner(
     let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
 
     if query.watch == Some("true".to_string()) {
+        query.validate_send_initial_events_watch()?;
         let kind = info.kind.clone();
         let av = api_version.clone();
         let mut requested_rv: i64 = query

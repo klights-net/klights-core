@@ -38,6 +38,7 @@ pub async fn list_namespaces(
 
     // Watch streaming for Namespaces
     if query.watch == Some("true".to_string()) {
+        query.validate_send_initial_events_watch()?;
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let label_selector = query.label_selector.clone();
         let field_selector = query.field_selector.clone();

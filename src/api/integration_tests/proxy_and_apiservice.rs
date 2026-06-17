@@ -6568,7 +6568,7 @@ async fn crd_watch_non_storage_version_receives_requested_version_events() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/apis/example.com/v2/namespaces/default/watcheds?watch=true&sendInitialEvents=true")
+                .uri("/apis/example.com/v2/namespaces/default/watcheds?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6620,6 +6620,100 @@ async fn crd_watch_non_storage_version_receives_requested_version_events() {
     }
 
     assert!(saw_added, "watch must emit ADDED for created object");
+}
+
+#[tokio::test]
+async fn builtin_watchlist_send_initial_events_requires_not_older_than() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/namespaces?watch=true&sendInitialEvents=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn crd_watchlist_send_initial_events_requires_not_older_than() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let ns = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ns.status(), StatusCode::CREATED);
+
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "initialeventchecks.example.com"},
+        "spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {
+                "plural": "initialeventchecks",
+                "singular": "initialeventcheck",
+                "kind": "InitialEventCheck"
+            },
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}
+            }]
+        }
+    });
+    let crd_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/apiextensions.k8s.io/v1/customresourcedefinitions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&crd).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(crd_resp.status(), StatusCode::CREATED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/example.com/v1/namespaces/default/initialeventchecks?watch=true&sendInitialEvents=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -6842,7 +6936,7 @@ async fn test_cluster_custom_resource_watch_field_selector_preserves_cluster_sco
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/apis/example.com/v1/clusterwidgets?watch=true&sendInitialEvents=true&fieldSelector=metadata.name%3Dcw1")
+                .uri("/apis/example.com/v1/clusterwidgets?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&fieldSelector=metadata.name%3Dcw1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -7156,7 +7250,7 @@ async fn test_watch_and_list_label_selector_parity_for_exists_selector() {
             Request::builder()
                 .method("GET")
                 .uri(format!(
-                    "/api/v1/namespaces/{}/configmaps?watch=true&sendInitialEvents=true&labelSelector=has-gpu",
+                    "/api/v1/namespaces/{}/configmaps?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&labelSelector=has-gpu",
                     namespace
                 ))
                 .body(Body::empty())
@@ -7386,7 +7480,7 @@ async fn test_namespace_watch_list_label_selector_parity_and_invalid_selector_re
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/v1/namespaces?watch=true&sendInitialEvents=true&labelSelector=team")
+                .uri("/api/v1/namespaces?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&labelSelector=team")
                 .body(Body::empty())
                 .unwrap(),
         )

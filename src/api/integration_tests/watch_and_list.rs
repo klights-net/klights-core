@@ -221,7 +221,7 @@ async fn test_cluster_pod_watch_send_initial_events_emits_initial_events_end_boo
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/v1/pods?watch=true&sendInitialEvents=true&allowWatchBookmarks=true")
+                .uri("/api/v1/pods?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -270,6 +270,29 @@ async fn test_cluster_pod_watch_send_initial_events_emits_initial_events_end_boo
     );
 }
 
+#[tokio::test]
+async fn test_pod_watchlist_send_initial_events_requires_not_older_than() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let app = crate::api::build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/pods?watch=true&sendInitialEvents=true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 /// A `sendInitialEvents=true` (WatchList) watch over an EMPTY collection
 /// must still report the collection's snapshot resourceVersion in its
 /// `initial-events-end` bookmark — not `0`/`""`. An informer that opens
@@ -312,7 +335,7 @@ async fn test_send_initial_events_empty_collection_bookmark_reports_snapshot_rv(
             Request::builder()
                 .method("GET")
                 .uri(format!(
-                    "/api/v1/namespaces/{namespace}/configmaps?watch=true&sendInitialEvents=true&allowWatchBookmarks=true"
+                    "/api/v1/namespaces/{namespace}/configmaps?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -431,7 +454,7 @@ async fn test_namespace_watch_send_initial_events_emits_initial_events_end_bookm
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/v1/namespaces?watch=true&sendInitialEvents=true&allowWatchBookmarks=true&fieldSelector=metadata.name%3Dnamespace-watch-initial-bookmark")
+                .uri("/api/v1/namespaces?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true&fieldSelector=metadata.name%3Dnamespace-watch-initial-bookmark")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -532,7 +555,7 @@ async fn test_cluster_service_watch_send_initial_events_emits_initial_events_end
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/api/v1/services?watch=true&sendInitialEvents=true&allowWatchBookmarks=true&fieldSelector=metadata.name%3Dcluster-service-watch-initial")
+                .uri("/api/v1/services?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true&fieldSelector=metadata.name%3Dcluster-service-watch-initial")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4609,7 +4632,7 @@ async fn test_watch_pods_as_table_emits_columns_once_then_table_rows_per_event()
     // sendInitialEvents=true so kubectl gets columnDefinitions on the first
     // event and an initial-events-end BOOKMARK afterwards.
     let watch_uri = "/api/v1/namespaces/watch-table-test/pods\
-        ?watch=true&sendInitialEvents=true&allowWatchBookmarks=true&resourceVersion=0";
+        ?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true&resourceVersion=0";
     let watch_resp = app
         .clone()
         .oneshot(

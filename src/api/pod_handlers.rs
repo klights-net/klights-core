@@ -22,6 +22,7 @@ pub async fn list_pods(
         true,
     )?;
     if query.watch == Some("true".to_string()) {
+        query.validate_send_initial_events_watch()?;
         // Watch streaming
         let kind = "Pod".to_string();
         let ns = namespace.clone();
@@ -498,6 +499,7 @@ pub async fn list_all_pods(
     )?;
     // Watch streaming for cluster-wide list (all namespaces)
     if query.watch == Some("true".to_string()) {
+        query.validate_send_initial_events_watch()?;
         let kind = "Pod".to_string();
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let table_format = wants_table_format(&headers)?;

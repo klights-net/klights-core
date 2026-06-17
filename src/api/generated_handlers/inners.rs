@@ -258,6 +258,7 @@ pub async fn list_inner(
         ns.is_some(),
     )?;
     if query.watch == Some("true".to_string()) {
+        query.validate_send_initial_events_watch()?;
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
         let explicit_resource_version_zero = query
             .resource_version

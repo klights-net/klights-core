@@ -111,6 +111,27 @@ impl ListQuery {
         }
     }
 
+    pub fn validate_send_initial_events_watch(&self) -> Result<(), AppError> {
+        if self.send_initial_events.as_deref() != Some("true") {
+            return Ok(());
+        }
+
+        match self
+            .resource_version_match
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            Some("NotOlderThan") => Ok(()),
+            Some(other) => Err(AppError::BadRequest(format!(
+                "Invalid value: resourceVersionMatch \"{other}\": sendInitialEvents=true requires resourceVersionMatch=NotOlderThan"
+            ))),
+            None => Err(AppError::BadRequest(
+                "Invalid value: sendInitialEvents=true requires resourceVersionMatch=NotOlderThan"
+                    .to_string(),
+            )),
+        }
+    }
+
     pub fn normalized_limit(&self) -> Result<Option<i64>, AppError> {
         match self.limit {
             None | Some(0) => Ok(None),
@@ -388,6 +409,33 @@ mod list_rv_match_tests {
             q(Some("abc"), None).resolve_resource_version_match(false),
             Err(AppError::BadRequest(_))
         ));
+    }
+
+    #[test]
+    fn send_initial_events_requires_not_older_than_match() {
+        let mut query = q(None, None);
+        query.send_initial_events = Some("true".to_string());
+        assert!(matches!(
+            query.validate_send_initial_events_watch(),
+            Err(AppError::BadRequest(_))
+        ));
+
+        query.resource_version_match = Some("Exact".to_string());
+        assert!(matches!(
+            query.validate_send_initial_events_watch(),
+            Err(AppError::BadRequest(_))
+        ));
+
+        query.resource_version_match = Some("NotOlderThan".to_string());
+        query.validate_send_initial_events_watch().unwrap();
+    }
+
+    #[test]
+    fn send_initial_events_false_does_not_require_match() {
+        let mut query = q(None, None);
+        query.send_initial_events = Some("false".to_string());
+
+        query.validate_send_initial_events_watch().unwrap();
     }
 }
 
