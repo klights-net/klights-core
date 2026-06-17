@@ -2154,6 +2154,7 @@ async fn update_cr_inner(
     )
     .await?;
     apply_crd_pruning(state.db.as_ref(), group, version, &info.kind, &mut body).await;
+    increment_generation_for_spec_change(&current.data, &mut body);
     crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(&current.data, &mut body);
 
     let storage_body = normalize_custom_resource_storage_data(
@@ -2407,6 +2408,7 @@ async fn patch_cr_inner(
         &mut patched_resource,
     )
     .await;
+    increment_generation_for_spec_change(&current.data, &mut patched_resource);
     crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(
         &current.data,
         &mut patched_resource,

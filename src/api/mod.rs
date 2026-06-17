@@ -65,8 +65,8 @@ pub use debug::pod_lifecycle_debug_dump;
 pub use defaulting::{
     apply_pod_create_defaults, apply_pv_create_defaults, apply_pvc_create_defaults,
     apply_replicationcontroller_selector_default, apply_resourcequota_create_status,
-    apply_workload_replicas_default, increment_generation_if_spec_changed, inject_create_metadata,
-    set_deletion_timestamp,
+    apply_workload_replicas_default, increment_generation_for_spec_change,
+    increment_generation_if_spec_changed, inject_create_metadata, set_deletion_timestamp,
 };
 pub use errors::AppError;
 use errors::{map_mutating_admission_error, map_validating_admission_error};

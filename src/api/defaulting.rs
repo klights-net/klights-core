@@ -265,15 +265,9 @@ pub fn apply_resourcequota_create_status(body: &mut Value) {
 }
 
 /// Increment `metadata.generation` by 1 when `body.spec` differs from
-/// `current.spec` AND `kind` is one of `SPEC_BEARING_KINDS` (workload
-/// resources whose controllers compare `status.observedGeneration`
-/// against `metadata.generation`).
-///
-/// No-op for non-spec-bearing kinds and when spec is unchanged.
-pub fn increment_generation_if_spec_changed(kind: &str, current: &Value, body: &mut Value) {
-    if !SPEC_BEARING_KINDS.contains(&kind) {
-        return;
-    }
+/// `current.spec`. No-op when spec is unchanged or the body has no metadata
+/// object to carry the incremented generation.
+pub fn increment_generation_for_spec_change(current: &Value, body: &mut Value) {
     if body.pointer("/spec") == current.pointer("/spec") {
         return;
     }
@@ -288,6 +282,17 @@ pub fn increment_generation_if_spec_changed(kind: &str, current: &Value, body: &
         .and_then(|v| v.as_i64())
         .unwrap_or(1);
     meta_obj.insert("generation".to_string(), serde_json::json!(current_gen + 1));
+}
+
+/// Increment `metadata.generation` by 1 when `body.spec` differs from
+/// `current.spec` AND `kind` is one of `SPEC_BEARING_KINDS`.
+///
+/// No-op for non-spec-bearing kinds and when spec is unchanged.
+pub fn increment_generation_if_spec_changed(kind: &str, current: &Value, body: &mut Value) {
+    if !SPEC_BEARING_KINDS.contains(&kind) {
+        return;
+    }
+    increment_generation_for_spec_change(current, body);
 }
 
 /// Stamp `metadata.deletionTimestamp = now` and

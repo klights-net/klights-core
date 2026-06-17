@@ -7317,7 +7317,10 @@ async fn build_app_with_cluster_widget_crd() -> axum::Router {
                 "name": "v1",
                 "served": true,
                 "storage": true,
-                "schema": {"openAPIV3Schema": {"type": "object"}}
+                "schema": {"openAPIV3Schema": {
+                    "type": "object",
+                    "x-kubernetes-preserve-unknown-fields": true
+                }}
             }]
         }
     });
@@ -7481,6 +7484,55 @@ async fn get_cluster_widget(app: &axum::Router, name: &str) -> Option<serde_json
         .await
         .unwrap();
     Some(serde_json::from_slice(&bytes).unwrap())
+}
+
+#[tokio::test]
+async fn test_cluster_custom_resource_update_bumps_generation_on_spec_change() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = build_app_with_cluster_widget_crd().await;
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/example.com/v1/widgets")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"apiVersion":"example.com/v1","kind":"Widget","metadata":{"name":"generation-widget"},"spec":{"value":"old"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let update_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/apis/example.com/v1/widgets/generation-widget")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"apiVersion":"example.com/v1","kind":"Widget","metadata":{"name":"generation-widget"},"spec":{"value":"new"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(update_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let updated: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        updated.pointer("/metadata/generation"),
+        Some(&serde_json::json!(2)),
+        "custom resource spec updates must bump metadata.generation: {updated:?}"
+    );
 }
 
 #[tokio::test]

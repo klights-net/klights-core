@@ -391,6 +391,22 @@ fn increment_generation_if_spec_changed_each_workload_kind_recognised() {
     }
 }
 
+#[test]
+fn increment_generation_if_spec_changed_bumps_for_non_workload_spec_kinds() {
+    for kind in [
+        "Service",
+        "HorizontalPodAutoscaler",
+        "PodDisruptionBudget",
+        "NetworkPolicy",
+        "Ingress",
+    ] {
+        let current = json!({"spec": {"a": 1}, "metadata": {"generation": 1}});
+        let mut body = json!({"spec": {"a": 2}, "metadata": {"generation": 1}});
+        increment_generation_if_spec_changed(kind, &current, &mut body);
+        assert_eq!(body["metadata"]["generation"], 2, "kind={}", kind);
+    }
+}
+
 // ============================================================================
 // set_deletion_timestamp
 // ============================================================================

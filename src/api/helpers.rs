@@ -691,13 +691,34 @@ pub fn watch_event_from_type(event_type: &str, data: Value) -> WatchEvent {
 /// PUT/PATCH so controllers can use `status.observedGeneration` to detect
 /// whether they have reconciled the latest spec.
 pub const SPEC_BEARING_KINDS: &[&str] = &[
+    "APIService",
+    "CertificateSigningRequest",
+    "CSIDriver",
+    "CSINode",
     "DaemonSet",
     "Deployment",
-    "ReplicaSet",
-    "StatefulSet",
+    "FlowSchema",
+    "HorizontalPodAutoscaler",
+    "Ingress",
     "CronJob",
     "Job",
+    "LimitRange",
+    "MutatingWebhookConfiguration",
+    "NetworkPolicy",
+    "PersistentVolume",
+    "PersistentVolumeClaim",
+    "Pod",
+    "PodDisruptionBudget",
+    "PriorityLevelConfiguration",
+    "ReplicaSet",
     "ReplicationController",
+    "ResourceQuota",
+    "Service",
+    "StatefulSet",
+    "ValidatingAdmissionPolicy",
+    "ValidatingAdmissionPolicyBinding",
+    "ValidatingWebhookConfiguration",
+    "VolumeAttachment",
 ];
 
 pub use crate::resource_semantics::preserve_status_subresource_on_main_update;
