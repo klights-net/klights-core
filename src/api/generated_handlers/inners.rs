@@ -1710,6 +1710,7 @@ pub async fn delete_collection_shared_inner(
     namespace: Option<&str>,
     query: DeleteCollectionQuery,
 ) -> Result<Json<Value>, AppError> {
+    let is_dry_run = query.dry_run == Some("All".to_string());
     let list = state
         .db
         .list_resources(
@@ -1724,6 +1725,15 @@ pub async fn delete_collection_shared_inner(
             ),
         )
         .await?;
+
+    if is_dry_run {
+        return Ok(Json(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Success",
+            "code": 200,
+        })));
+    }
 
     for resource in list.items {
         let owner_uid = resource.uid.clone();

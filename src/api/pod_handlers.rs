@@ -447,23 +447,26 @@ pub async fn delete_collection_pods(
     Path(namespace): Path<String>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
+    let is_dry_run = query.dry_run == Some("All".to_string());
     crate::kubelet::pod_repository::PodApiWriter::api_delete_collection_pods(
         state.pod_repository.as_ref(),
         &namespace,
         query.label_selector.as_deref(),
-        None,  // field_selector matches today's macro behavior
-        false, // dry_run is not exposed at the collection-delete handler today
+        None, // field_selector matches today's macro behavior
+        is_dry_run,
     )
     .await?;
 
     // P3d-1: post-bulk-delete side effects (RQ recount mainly). The RQ hook
     // only needs metadata.namespace, so a synthesized stub is enough.
-    let stub = serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {"namespace": namespace.clone()},
-    });
-    let _ = state.side_effects.run_hooks(&stub, state.db.as_ref()).await;
+    if !is_dry_run {
+        let stub = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"namespace": namespace.clone()},
+        });
+        let _ = state.side_effects.run_hooks(&stub, state.db.as_ref()).await;
+    }
 
     // Return K8s Status object
     Ok(Json(serde_json::json!({

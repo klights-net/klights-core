@@ -147,6 +147,8 @@ pub struct DeleteCollectionQuery {
     pub label_selector: Option<String>,
     #[serde(rename = "fieldSelector")]
     pub field_selector: Option<String>,
+    #[serde(rename = "dryRun")]
+    pub dry_run: Option<String>,
 }
 
 pub const CONTINUE_TOKEN_TTL_SECS: i64 = 60;

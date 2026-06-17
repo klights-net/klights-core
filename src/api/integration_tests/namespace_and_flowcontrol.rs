@@ -1697,6 +1697,127 @@ async fn test_delete_collection_configmap_with_finalizer_does_not_cascade_child(
 }
 
 #[tokio::test]
+async fn test_delete_collection_dry_run_does_not_delete_configmaps_or_pods() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+
+    db.create_namespace(
+        "dryrun-collection-ns",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "dryrun-collection-ns"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    for name in ["cm-a", "cm-b"] {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("dryrun-collection-ns"),
+            name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": name,
+                    "namespace": "dryrun-collection-ns"
+                },
+                "data": {"key": name}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    for name in ["pod-a", "pod-b"] {
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("dryrun-collection-ns"),
+            name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": name,
+                    "namespace": "dryrun-collection-ns",
+                    "labels": {"delete": "dryrun"}
+                },
+                "spec": {
+                    "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+                },
+                "status": {"phase": "Running"}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/namespaces/dryrun-collection-ns/configmaps?dryRun=All")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/namespaces/dryrun-collection-ns/pods?labelSelector=delete%3Ddryrun&dryRun=All")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    for name in ["cm-a", "cm-b"] {
+        let config_map = db
+            .get_resource("v1", "ConfigMap", Some("dryrun-collection-ns"), name)
+            .await
+            .unwrap()
+            .expect("dry-run deletecollection must not remove ConfigMaps");
+        assert!(
+            config_map
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .is_none(),
+            "dry-run deletecollection must not mark ConfigMap {name} terminating: {:?}",
+            config_map.data
+        );
+    }
+
+    for name in ["pod-a", "pod-b"] {
+        let pod = db
+            .get_resource("v1", "Pod", Some("dryrun-collection-ns"), name)
+            .await
+            .unwrap()
+            .expect("dry-run deletecollection must not remove Pods");
+        assert!(
+            pod.data.pointer("/metadata/deletionTimestamp").is_none(),
+            "dry-run deletecollection must not mark Pod {name} terminating: {:?}",
+            pod.data
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_delete_collection_stale_same_name_replacement_does_not_delete_or_cascade() {
     let state = build_test_app_state().await;
     let db = state.db.clone();
