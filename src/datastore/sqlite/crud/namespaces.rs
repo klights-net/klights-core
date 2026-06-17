@@ -174,6 +174,16 @@ impl Datastore {
             if let Some(selector) = &parsed_label_selector {
                 items.retain(|item| selector.matches_resource(&item.data));
             }
+            if let Some(selector) = field_selector_owned
+                .as_deref()
+                .map(str::trim)
+                .filter(|selector| !selector.is_empty())
+            {
+                let conditions = parse_field_selector_conditions(selector);
+                if !conditions.is_empty() {
+                    items.retain(|item| matches_field_selector_conditions(&item.data, &conditions));
+                }
+            }
             Ok(ResourceList {
                 items,
                 resource_version: current_rv,

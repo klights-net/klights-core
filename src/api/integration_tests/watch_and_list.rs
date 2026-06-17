@@ -2213,6 +2213,122 @@ async fn test_builtin_field_selector_accepts_supported_fields() {
     }
 }
 
+#[tokio::test]
+async fn test_builtin_selectable_fields_cover_pod_namespace_and_secret_fields() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    for (name, phase) in [
+        ("selectable-fields", "Active"),
+        ("selectable-fields-terminating", "Terminating"),
+    ] {
+        db.create_resource(
+            "v1",
+            "Namespace",
+            None,
+            name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": name},
+                "status": {"phase": phase}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    for (name, service_account, pod_ip) in [
+        ("pod-builder", "builder", "10.42.0.7"),
+        ("pod-runner", "runner", "10.42.0.8"),
+    ] {
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("selectable-fields"),
+            name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": name, "namespace": "selectable-fields"},
+                "spec": {
+                    "serviceAccountName": service_account,
+                    "containers": [{"name": "app", "image": "busybox"}]
+                },
+                "status": {"podIP": pod_ip}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    for (name, secret_type) in [
+        ("opaque-secret", "Opaque"),
+        ("tls-secret", "kubernetes.io/tls"),
+    ] {
+        db.create_resource(
+            "v1",
+            "Secret",
+            Some("selectable-fields"),
+            name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {"name": name, "namespace": "selectable-fields"},
+                "type": secret_type
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    let cases = [
+        (
+            "/api/v1/namespaces/selectable-fields/pods?fieldSelector=spec.serviceAccountName%3Dbuilder",
+            vec!["pod-builder"],
+        ),
+        (
+            "/api/v1/namespaces/selectable-fields/pods?fieldSelector=status.podIP%3D10.42.0.8",
+            vec!["pod-runner"],
+        ),
+        (
+            "/api/v1/namespaces?fieldSelector=status.phase%3DTerminating",
+            vec!["selectable-fields-terminating"],
+        ),
+        (
+            "/api/v1/namespaces/selectable-fields/secrets?fieldSelector=type%3Dkubernetes.io%2Ftls",
+            vec!["tls-secret"],
+        ),
+    ];
+
+    for (uri, expected_names) in cases {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "unexpected status for {uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            list_item_names(&list),
+            expected_names,
+            "unexpected field-selector result for {uri}"
+        );
+    }
+}
+
 /// Reproduces sonobuoy "should observe an object deletion if it stops
 /// meeting the requirements of the selector" against the real watch
 /// pipeline. The conformance test opens a label-selector watch, creates a

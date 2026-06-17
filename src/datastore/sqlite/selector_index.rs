@@ -35,10 +35,13 @@ pub(super) fn indexed_field_paths(api_version: &str, kind: &str) -> &'static [&'
             "status.phase",
             "spec.restartPolicy",
             "spec.schedulerName",
+            "spec.serviceAccountName",
+            "status.podIP",
         ],
         ("v1", "Node") => &["spec.unschedulable"],
         ("v1", "PersistentVolume") => &["status.phase"],
         ("v1", "PersistentVolumeClaim") => &["status.phase"],
+        ("v1", "Secret") => &["type"],
         ("v1", "Event") | ("events.k8s.io/v1", "Event") => &[
             "reason",
             "type",
