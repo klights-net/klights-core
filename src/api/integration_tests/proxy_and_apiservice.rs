@@ -7557,8 +7557,8 @@ async fn test_cluster_cr_delete_foreground_sets_deletion_timestamp_and_finalizer
         .unwrap();
     assert_eq!(
         delete_resp.status(),
-        StatusCode::OK,
-        "DELETE with Foreground must return 200"
+        StatusCode::ACCEPTED,
+        "DELETE with Foreground must return 202 when the parent is retained"
     );
 
     let parent_after = get_cluster_widget(&app, "parent-fg").await;

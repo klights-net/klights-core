@@ -104,7 +104,7 @@ macro_rules! namespaced_resource_handlers {
             Query(query): Query<CreateUpdateQuery>,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
             body: Bytes,
-        ) -> Result<Json<Value>, AppError> {
+        ) -> Result<(StatusCode, Json<Value>), AppError> {
             delete_inner(
                 state,
                 &identity,
@@ -225,7 +225,7 @@ macro_rules! cluster_resource_handlers {
             Query(query): Query<CreateUpdateQuery>,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
             body: Bytes,
-        ) -> Result<Json<Value>, AppError> {
+        ) -> Result<(StatusCode, Json<Value>), AppError> {
             delete_inner(
                 state,
                 &identity,

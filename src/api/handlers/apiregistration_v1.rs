@@ -91,7 +91,7 @@ pub async fn delete_apiservice_with_cache_invalidation(
     Query(query): Query<CreateUpdateQuery>,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
     body: Bytes,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let response = crate::api::generated_handlers::inners::delete_inner(
         state.clone(),
         &identity,

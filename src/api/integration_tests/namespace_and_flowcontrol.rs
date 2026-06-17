@@ -1510,7 +1510,7 @@ async fn test_delete_configmap_with_finalizer_marks_terminating_without_hard_del
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert!(
@@ -1879,7 +1879,7 @@ async fn test_configmap_finalizer_drain_hard_deletes_non_pod_row() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert!(
         db.get_resource("v1", "ConfigMap", Some("finalizer-drain-ns"), "held")
             .await
@@ -2199,7 +2199,7 @@ async fn test_finalizer_held_orphan_delete_orphans_child_and_drain_does_not_casc
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
     let owner = db
         .get_resource("v1", "ConfigMap", Some("orphan-finalizer-ns"), "owner")
@@ -2959,7 +2959,7 @@ async fn test_gc_foreground_rc_delete_retains_parent_until_pods_are_deleted() {
         ))
         .unwrap();
     let resp = app.clone().oneshot(del).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
     let parent = db
         .get_resource(

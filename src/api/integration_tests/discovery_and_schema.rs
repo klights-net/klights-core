@@ -1281,6 +1281,53 @@ async fn test_pod_eviction_marks_pod_terminating_and_returns_201() {
 }
 
 #[tokio::test]
+async fn test_pod_delete_returns_accepted_when_marked_terminating() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"pod-delete-accepted"}}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/pod-delete-accepted/pods")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"victim","namespace":"pod-delete-accepted"},"spec":{"containers":[{"name":"c","image":"nginx"}]}}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/api/v1/namespaces/pod-delete-accepted/pods/victim")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        body.pointer("/metadata/deletionTimestamp").is_some(),
+        "Pod DELETE must return the terminating Pod object: {body:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_pod_eviction_respects_pdb_and_returns_disruptionbudget_cause() {
     use axum::{
         body::Body,

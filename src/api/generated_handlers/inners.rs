@@ -1061,7 +1061,7 @@ pub async fn delete_inner(
     state: Arc<AppState>,
     _identity: &crate::auth::AuthenticatedIdentity,
     request: GeneratedDeleteInnerRequest<'_>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let GeneratedDeleteInnerRequest {
         target,
         query,
@@ -1141,7 +1141,9 @@ pub async fn delete_inner(
         )
         .await?;
         return match outcome {
-            crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(v) => Ok(Json(v)),
+            crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(v) => {
+                Ok((StatusCode::OK, Json(v)))
+            }
             crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(r) => {
                 // Fire side effects (ResourceQuota recount, etc.) after
                 // pod deletionTimestamp is set. The pod still exists in the
@@ -1156,7 +1158,10 @@ pub async fn delete_inner(
                     .side_effects
                     .run_hooks(&r.data, state.db.as_ref())
                     .await;
-                Ok(Json(inject_resource_version(r.data, r.resource_version)))
+                Ok((
+                    StatusCode::ACCEPTED,
+                    Json(inject_resource_version(r.data, r.resource_version)),
+                ))
             }
         };
     }
@@ -1165,7 +1170,7 @@ pub async fn delete_inner(
         let mut del_data: Value = (*resource.data).clone();
         set_deletion_timestamp(&mut del_data);
         let result = inject_resource_version(del_data, resource.resource_version);
-        return Ok(Json(result));
+        return Ok((StatusCode::OK, Json(result)));
     }
 
     if !orphan && propagation_policy == "Foreground" {
@@ -1201,7 +1206,7 @@ pub async fn delete_inner(
         .await;
         maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
         let data = inject_resource_version(updated.data, updated.resource_version);
-        return Ok(Json(data));
+        return Ok((StatusCode::ACCEPTED, Json(data)));
     }
 
     let grace_seconds = body_options._grace_period_seconds.unwrap_or(0);
@@ -1231,7 +1236,7 @@ pub async fn delete_inner(
             )
             .await;
             let data = inject_resource_version(updated.data, updated.resource_version);
-            return Ok(Json(data));
+            return Ok((StatusCode::ACCEPTED, Json(data)));
         }
         crate::api::finalizer_delete::DeleteCompletion::GoneOrUidChanged => {
             return Err(AppError::NotFound(format!("{} not found", kind)));
@@ -1345,7 +1350,7 @@ pub async fn delete_inner(
 
     let data = inject_resource_version(resource.data, resource.resource_version);
     maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
-    Ok(Json(data))
+    Ok((StatusCode::OK, Json(data)))
 }
 
 pub async fn patch_inner(

@@ -115,7 +115,7 @@ async fn test_custom_resource_delete_with_finalizer_marks_terminating_until_fina
         json!({}),
     )
     .await;
-    assert_eq!(delete.status(), StatusCode::OK);
+    assert_eq!(delete.status(), StatusCode::ACCEPTED);
     let delete_body = response_json(delete).await;
     assert_eq!(delete_body["kind"], "Widget");
     assert!(
@@ -197,7 +197,7 @@ async fn test_custom_resource_foreground_delete_preserves_user_finalizer_until_d
         json!({"propagationPolicy": "Foreground"}),
     )
     .await;
-    assert_eq!(delete.status(), StatusCode::OK);
+    assert_eq!(delete.status(), StatusCode::ACCEPTED);
 
     let held = db
         .get_resource(

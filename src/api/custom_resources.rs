@@ -1981,7 +1981,7 @@ async fn delete_cr_inner(
                     inject_resource_version(latest.data, latest.resource_version),
                 )
                 .await?;
-                return Ok(Json(normalized).into_response());
+                return Ok((StatusCode::ACCEPTED, Json(normalized)).into_response());
             }
         }
         (_, _) => {
@@ -2018,7 +2018,7 @@ async fn delete_cr_inner(
                         inject_resource_version(updated.data, updated.resource_version),
                     )
                     .await?;
-                    return Ok(Json(normalized).into_response());
+                    return Ok((StatusCode::ACCEPTED, Json(normalized)).into_response());
                 }
                 crate::api::finalizer_delete::DeleteCompletion::GoneOrUidChanged => {}
                 crate::api::finalizer_delete::DeleteCompletion::HardDeleted(deleted) => {

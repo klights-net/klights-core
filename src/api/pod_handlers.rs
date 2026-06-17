@@ -311,7 +311,7 @@ pub async fn delete_pod(
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<CreateUpdateQuery>,
     body: Bytes,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     // Parse DeleteOptions from request body (JSON or protobuf)
     let body_options = parse_delete_options_body(&body);
     // Note: propagation policy / orphanDependents are read at the macro-level
@@ -332,7 +332,9 @@ pub async fn delete_pod(
     .await?;
 
     match outcome {
-        crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(v) => Ok(Json(v)),
+        crate::kubelet::pod_repository::PodApiDeleteOutcome::DryRun(v) => {
+            Ok((StatusCode::OK, Json(v)))
+        }
         crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(r) => {
             // Fire side effects (ResourceQuota recount, etc.) after
             // pod deletionTimestamp is set. The pod still exists in the
@@ -342,7 +344,7 @@ pub async fn delete_pod(
                 .run_hooks(&r.data, state.db.as_ref())
                 .await;
             let result = inject_resource_version(r.data, r.resource_version);
-            Ok(Json(result))
+            Ok((StatusCode::ACCEPTED, Json(result)))
         }
     }
 }
