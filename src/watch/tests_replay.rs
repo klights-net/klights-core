@@ -629,3 +629,199 @@ async fn test_next_event_recovering_holds_live_events_during_replay_failure() {
     assert_eq!(event.object["metadata"]["name"], "live-pod");
     assert_eq!(event.resource_version(), Some(200));
 }
+
+// ---------------------------------------------------------------------------
+// Multinode scoped-watch delivery mock (Guestbook readiness stall).
+// ---------------------------------------------------------------------------
+
+fn scoped_watch_event_at(rv: i64, name: &str) -> WatchEvent {
+    WatchEvent::modified(serde_json::json!({
+        "kind": "Pod",
+        "apiVersion": "v1",
+        "metadata": {
+            "name": name,
+            "namespace": "kubectl-gb",
+            "resourceVersion": rv.to_string(),
+            "labels": {"app": "guestbook", "tier": "frontend"}
+        }
+    }))
+}
+
+/// Mock replay source that models the multinode raft/outbox apply inconsistency
+/// behind the Guestbook scoped-watch stall: the durable `watch_events` window is
+/// NON-DENSE -- a committed, broadcast RV is absent (its row was lost or lagged
+/// under transport stress). The cursor's replay then advances its delivery
+/// floor past the missing RV, and the live broadcast copy is silently dropped
+/// (the `klights::watch_diag` "cursor dropped an undelivered event (floor
+/// advanced past it)" canary). `fills_on_retry` simulates the late-landing row:
+/// a later replay recovers the event.
+struct NonDenseReplaySource {
+    events: Vec<WatchEvent>,
+    earliest: i64,
+    fills_on_retry: bool,
+    calls: std::sync::Mutex<u32>,
+}
+
+impl NonDenseReplaySource {
+    fn new(events: Vec<WatchEvent>, earliest: i64, fills_on_retry: bool) -> Self {
+        Self {
+            events,
+            earliest,
+            fills_on_retry,
+            calls: std::sync::Mutex::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl WatchReplaySource for NonDenseReplaySource {
+    async fn replay_since(&self, since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+        let calls = {
+            let mut c = self.calls.lock().unwrap();
+            *c += 1;
+            *c
+        };
+        // First replay returns the non-dense window exactly as the failing run
+        // served it. If `fills_on_retry`, a subsequent replay (after the
+        // raft-apply lag clears) returns the full dense window.
+        let base: Vec<WatchEvent> = if calls > 1 && self.fills_on_retry {
+            self.events.clone()
+        } else {
+            self.events
+                .iter()
+                .filter(|e| e.resource_version().unwrap_or(0) > since_rv)
+                .cloned()
+                .collect()
+        };
+        if calls > 1 && self.fills_on_retry {
+            // Insert the previously-missing rv=12 row (now landed).
+            let mut v: Vec<WatchEvent> = base
+                .into_iter()
+                .filter(|e| e.resource_version().unwrap_or(0) != 12)
+                .collect();
+            v.push(scoped_watch_event_at(12, "frontend-ready"));
+            v.sort_by_key(|e| e.resource_version().unwrap_or(0));
+            Ok(v.into_iter()
+                .filter(|e| e.resource_version().unwrap_or(0) > since_rv)
+                .collect())
+        } else {
+            Ok(base)
+        }
+    }
+
+    async fn earliest_retained_rv(&self) -> anyhow::Result<Option<i64>> {
+        Ok(Some(self.earliest))
+    }
+}
+
+/// RED regression: a broadcast in-scope event whose durable row is absent from
+/// the (non-dense) replay must not be silently dropped. The cursor must either
+/// recover it (re-replay once the row lands) or surface Expired so the HTTP
+/// watch returns 410 and the client relists -- never the quiet bookmark-only
+/// stall that timed out `kubectl wait` in the failing run.
+#[tokio::test]
+async fn test_cursor_recovers_broadcast_event_missing_from_non_dense_replay() {
+    let (tx, rx) = broadcast::channel::<WatchEvent>(16);
+    // Durable window retains rv=11 and rv=13 but NOT rv=12 (the in-scope
+    // frontend Ready event whose row was lost/lagged). earliest=11.
+    let replay = NonDenseReplaySource::new(
+        vec![
+            scoped_watch_event_at(11, "pod-a"),
+            scoped_watch_event_at(13, "pod-c"),
+        ],
+        11,
+        true,
+    );
+    let mut cursor = WatchCursor::new(rx, replay, 10).with_ordered_replay();
+    cursor
+        .prime_replay_or_expired()
+        .await
+        .expect("prime replay must succeed (boundary gap check passes: 10+1 < 11 is false)");
+
+    // rv=12 (missing from the durable window) arrives via live broadcast, then
+    // rv=14 follows so the cursor has a forward event to return.
+    tx.send(scoped_watch_event_at(12, "frontend-ready"))
+        .unwrap();
+    tx.send(scoped_watch_event_at(14, "pod-d")).unwrap();
+
+    let mut delivered: Vec<i64> = Vec::new();
+    let mut expired = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while delivered.iter().all(|&rv| rv != 12) && !expired && tokio::time::Instant::now() < deadline
+    {
+        let next = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            cursor.next_event(&test_task_supervisor()),
+        )
+        .await;
+        match next {
+            Ok(Ok(event)) => {
+                if let Some(rv) = event.resource_version() {
+                    delivered.push(rv);
+                }
+            }
+            Ok(Err(WatchCursorError::Expired)) => expired = true,
+            Ok(Err(WatchCursorError::Closed)) => break,
+            Ok(Err(WatchCursorError::Replay(_))) => continue,
+            Err(_) => break, // timeout: no more events
+        }
+    }
+
+    assert!(
+        delivered.iter().any(|&rv| rv == 12) || expired,
+        "scoped watch cursor must recover the in-scope broadcast event rv=12 \
+         (whose durable row lagged) via re-replay, or surface Expired (410) -- \
+         silently dropping it is the Guestbook readiness stall. \
+         delivered={delivered:?} expired={expired}"
+    );
+}
+
+/// Companion to the recovery test: when the broadcast event's durable row is
+/// GENUINELY absent (never lands -- a permanent broadcast/watch_events
+/// inconsistency), the cursor must surface `Expired` so the HTTP watch returns
+/// 410 and the client relists, rather than silently dropping the event and
+/// stalling. This is the fail-safe branch of the fix.
+#[tokio::test]
+async fn test_cursor_expires_when_broadcast_event_never_persisted() {
+    let (tx, rx) = broadcast::channel::<WatchEvent>(16);
+    // Durable window retains rv=11 and rv=13 but rv=12 is permanently absent
+    // (fills_on_retry=false): the broadcast row was lost, not merely lagged.
+    let replay = NonDenseReplaySource::new(
+        vec![
+            scoped_watch_event_at(11, "pod-a"),
+            scoped_watch_event_at(13, "pod-c"),
+        ],
+        11,
+        false,
+    );
+    let mut cursor = WatchCursor::new(rx, replay, 10).with_ordered_replay();
+    cursor
+        .prime_replay_or_expired()
+        .await
+        .expect("prime replay");
+
+    tx.send(scoped_watch_event_at(12, "frontend-ready-never-persisted"))
+        .unwrap();
+
+    let mut saw_expired = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !saw_expired && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            cursor.next_event(&test_task_supervisor()),
+        )
+        .await
+        {
+            Ok(Err(WatchCursorError::Expired)) => saw_expired = true,
+            Ok(Ok(_))
+            | Ok(Err(WatchCursorError::Replay(_)))
+            | Ok(Err(WatchCursorError::Closed)) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_expired,
+        "a broadcast event whose durable row is permanently absent must surface Expired (410), \
+         not be silently dropped"
+    );
+}

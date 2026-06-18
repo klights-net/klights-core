@@ -5107,6 +5107,393 @@ async fn test_scoped_watch_reconnect_from_bookmark_delivers_subsequent_in_scope_
     );
 }
 
+/// Regression for the `[sig-cli] Kubectl client Guestbook application ... should
+/// create and stop a working application` readiness timeout under multinode
+/// netns latency + packet loss (canary run `/tmp/2r.log` run 25, build
+/// `e9bf241`). Reproduces the scoped-watch delivery stall: a positive-RV label
+/// selector watch over frontend pods must deliver a Running+Ready MODIFIED for
+/// EVERY in-scope pod even while heavy out-of-scope write churn advances the
+/// cursor high-water RV far past the scoped delivery frontier.
+///
+/// Closes the gap left by `test_label_selector_watch_catchup_filters_persisted_events`,
+/// `test_bookmark_reports_caught_up_rv_not_global_collection_rv`, and
+/// `test_scoped_watch_reconnect_from_bookmark_delivers_subsequent_in_scope_events`:
+/// none covers the failed Guestbook shape of positive-RV selector watch +
+/// multi-pod readiness status transitions + concurrent out-of-scope churn +
+/// bookmark/reconnect. Writes are driven concurrently to recreate the
+/// out-of-order broadcast delivery + floor advancement the lossy multinode
+/// harness induces (the `klights::watch_diag` "scoped bookmark held at delivered
+/// scoped rv" / "cursor dropped an undelivered event (floor advanced past it)"
+/// signature). If a BOOKMARK lands before all in-scope statuses are delivered,
+/// resuming from it must deliver the remainder or return 410 Expired -- never a
+/// quiet bookmark-only stall.
+#[tokio::test]
+async fn test_positive_rv_selector_pod_watch_delivers_all_ready_statuses_under_churn() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    fn mk(method: &str, uri: String, body: Option<Vec<u8>>) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap()
+    }
+
+    let (app, db) = build_test_router_with_db().await;
+    let namespace = "gb-scoped-watch-churn".to_string();
+    let noise_namespace = "gb-scoped-watch-noise".to_string();
+    let selector = "app%3Dguestbook%2Ctier%3Dfrontend";
+    let nodes = ["mn-controlplane1", "mn-replica", "mn-worker"];
+    // (pod name, node) -- distinct spec.nodeName like the failed run.
+    let frontend_pods: [(&str, &str); 3] = [
+        ("fe-controlplane1", "mn-controlplane1"),
+        ("fe-replica", "mn-replica"),
+        ("fe-worker", "mn-worker"),
+    ];
+
+    // Register the three nodes so spec.nodeName is honored on pod create.
+    for node in nodes {
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            node,
+            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":node},"spec":{},"status":{}}),
+        )
+        .await
+        .unwrap();
+    }
+    for ns in [&namespace, &noise_namespace] {
+        let resp = app
+            .clone()
+            .oneshot(mk(
+                "POST",
+                "/api/v1/namespaces".to_string(),
+                Some(
+                    format!(
+                        r#"{{"apiVersion":"v1","kind":"Namespace","metadata":{{"name":"{ns}"}}}}"#
+                    )
+                    .into_bytes(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+    // Three frontend pods (Pending) with distinct nodeNames, present before the list.
+    for (pod, node) in frontend_pods {
+        let body = json!({
+            "apiVersion":"v1","kind":"Pod",
+            "metadata":{"name":pod,"namespace":namespace,"labels":{"app":"guestbook","tier":"frontend"}},
+            "spec":{"nodeName":node,"containers":[{"name":"c","image":"registry.k8s.io/pause:3.10.1"}]}
+        });
+        let resp = app
+            .clone()
+            .oneshot(mk(
+                "POST",
+                format!("/api/v1/namespaces/{namespace}/pods"),
+                Some(serde_json::to_vec(&body).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Initial selector LIST with resourceVersion=0; capture the collection RV.
+    let list_resp = app
+        .clone()
+        .oneshot(mk(
+            "GET",
+            format!("/api/v1/namespaces/{namespace}/pods?labelSelector={selector}"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_rv: i64 = serde_json::from_slice::<serde_json::Value>(
+        &to_bytes(list_resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap()
+    .pointer("/metadata/resourceVersion")
+    .and_then(|v| v.as_str())
+    .and_then(|s| s.parse().ok())
+    .expect("list must return a resourceVersion");
+
+    let ready_patch = json!({"status":{"phase":"Running","podIP":"10.42.0.1","conditions":[
+        {"type":"Ready","status":"True","reason":"PodReady"},
+        {"type":"ContainersReady","status":"True","reason":"PodReady"}
+    ]}});
+
+    // CATCH-UP PATH: commit one frontend Ready status AFTER the list but BEFORE
+    // the watch opens, so it is served from the watch catch-up window (an
+    // in-scope event committed with rv > list_rv before the watch streams).
+    let resp = app
+        .clone()
+        .oneshot(mk(
+            "PATCH",
+            format!(
+                "/api/v1/namespaces/{namespace}/pods/{}/status",
+                frontend_pods[0].0
+            ),
+            Some(serde_json::to_vec(&ready_patch).unwrap()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Open the selector WATCH from list_rv with bookmarks enabled.
+    let watch_resp = app
+        .clone()
+        .oneshot(mk(
+            "GET",
+            format!(
+                "/api/v1/namespaces/{namespace}/pods?watch=true&resourceVersion={list_rv}&labelSelector={selector}&allowWatchBookmarks=true"
+            ),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+    let mut watch_stream = watch_resp.into_body().into_data_stream();
+
+    // LIVE PATH + churn: drive the other two frontend Ready statuses and 24+
+    // out-of-scope pod writes concurrently so broadcasts interleave out of RV
+    // order and the cursor high-water advances past the scoped frontier.
+    let mut write_handles = Vec::new();
+    for (pod, _) in frontend_pods.iter().skip(1) {
+        let app = app.clone();
+        let namespace = namespace.clone();
+        let patch = ready_patch.clone();
+        let pod = (*pod).to_string();
+        write_handles.push(tokio::spawn(async move {
+            let _ = app
+                .clone()
+                .oneshot(mk(
+                    "PATCH",
+                    format!("/api/v1/namespaces/{namespace}/pods/{pod}/status"),
+                    Some(serde_json::to_vec(&patch).unwrap()),
+                ))
+                .await;
+        }));
+    }
+    for i in 0..12 {
+        let app = app.clone();
+        let namespace = namespace.clone();
+        write_handles.push(tokio::spawn(async move {
+            let pod = json!({"apiVersion":"v1","kind":"Pod",
+                "metadata":{"name":format!("noise-same-{i}"),"namespace":namespace.clone(),"labels":{"app":"noise","tier":"backend"}},
+                "spec":{"containers":[{"name":"c","image":"registry.k8s.io/pause:3.10.1"}]}});
+            let _ = app
+                .clone()
+                .oneshot(mk(
+                    "POST",
+                    format!("/api/v1/namespaces/{namespace}/pods"),
+                    Some(serde_json::to_vec(&pod).unwrap()),
+                ))
+                .await;
+        }));
+    }
+    for i in 0..12 {
+        let app = app.clone();
+        let noise_namespace = noise_namespace.clone();
+        write_handles.push(tokio::spawn(async move {
+            let pod = json!({"apiVersion":"v1","kind":"Pod",
+                "metadata":{"name":format!("noise-other-{i}"),"namespace":noise_namespace.clone(),"labels":{"app":"noise","tier":"backend"}},
+                "spec":{"containers":[{"name":"c","image":"registry.k8s.io/pause:3.10.1"}]}});
+            let _ = app
+                .clone()
+                .oneshot(mk(
+                    "POST",
+                    format!("/api/v1/namespaces/{noise_namespace}/pods"),
+                    Some(serde_json::to_vec(&pod).unwrap()),
+                ))
+                .await;
+        }));
+    }
+
+    // Collect, per frontend pod, whether a Running+Ready MODIFIED was observed,
+    // and the highest bookmark RV seen (resume point if a reconnect is needed).
+    let mut ready_pods: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut bookmark_rv: Option<i64> = None;
+    let mut saw_expired = false;
+    let frontend_names: std::collections::HashSet<&str> =
+        frontend_pods.iter().map(|(n, _)| *n).collect();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while ready_pods.len() < 3 && tokio::time::Instant::now() < deadline {
+        let chunk = match tokio::time::timeout(Duration::from_secs(2), watch_stream.next()).await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => continue,
+        };
+        for line in String::from_utf8(chunk.to_vec())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+        {
+            let event = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "ERROR" => {
+                    if event
+                        .pointer("/object/code")
+                        .and_then(|c| c.as_i64())
+                        .is_some_and(|c| c == 410)
+                    {
+                        saw_expired = true;
+                    }
+                }
+                "BOOKMARK" => {
+                    if let Some(rv) = event
+                        .pointer("/object/metadata/resourceVersion")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<i64>().ok())
+                    {
+                        bookmark_rv = Some(bookmark_rv.unwrap_or(0).max(rv));
+                    }
+                }
+                "MODIFIED" => {
+                    let name = event
+                        .pointer("/object/metadata/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if frontend_names.contains(name)
+                        && event
+                            .pointer("/object/status/phase")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|p| p == "Running")
+                        && event
+                            .pointer("/object/status/conditions")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|conds| {
+                                conds.iter().any(|c| {
+                                    c.pointer("/type").and_then(|t| t.as_str()) == Some("Ready")
+                                        && c.pointer("/status").and_then(|s| s.as_str())
+                                            == Some("True")
+                                })
+                            })
+                    {
+                        ready_pods.insert(name.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    drop(watch_stream);
+
+    // If all three arrived on the first watch, the scoped delivery held.
+    if ready_pods.len() < 3 && !saw_expired {
+        // The stream stalled with undelivered in-scope status. A correct server
+        // must let a client resume from the last scoped BOOKMARK and either
+        // receive the missing events or a 410 Expired -- never a quiet stall.
+        let resume_rv = match bookmark_rv {
+            Some(rv) => rv,
+            None => {
+                for h in write_handles {
+                    let _ = h.await;
+                }
+                panic!(
+                    "scoped watch stalled with {}/3 frontend Ready statuses and no BOOKMARK to resume from",
+                    ready_pods.len()
+                );
+            }
+        };
+        let reconnect_resp = app
+            .clone()
+            .oneshot(mk(
+                "GET",
+                format!(
+                    "/api/v1/namespaces/{namespace}/pods?watch=true&resourceVersion={resume_rv}&labelSelector={selector}&allowWatchBookmarks=true"
+                ),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reconnect_resp.status(), StatusCode::OK);
+        let mut reconnect_stream = reconnect_resp.into_body().into_data_stream();
+        let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while ready_pods.len() < 3
+            && !saw_expired
+            && tokio::time::Instant::now() < reconnect_deadline
+        {
+            let chunk =
+                match tokio::time::timeout(Duration::from_secs(2), reconnect_stream.next()).await {
+                    Ok(Some(Ok(bytes))) => bytes,
+                    Ok(Some(Err(_))) | Ok(None) => break,
+                    Err(_) => continue,
+                };
+            for line in String::from_utf8(chunk.to_vec())
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+            {
+                let event = match serde_json::from_str::<serde_json::Value>(line) {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                match event.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                    "ERROR" => {
+                        if event
+                            .pointer("/object/code")
+                            .and_then(|c| c.as_i64())
+                            .is_some_and(|c| c == 410)
+                        {
+                            saw_expired = true;
+                        }
+                    }
+                    "BOOKMARK" => {}
+                    "MODIFIED" => {
+                        let name = event
+                            .pointer("/object/metadata/name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if frontend_names.contains(name)
+                            && event
+                                .pointer("/object/status/phase")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|p| p == "Running")
+                            && event
+                                .pointer("/object/status/conditions")
+                                .and_then(|v| v.as_array())
+                                .is_some_and(|conds| {
+                                    conds.iter().any(|c| {
+                                        c.pointer("/type").and_then(|t| t.as_str()) == Some("Ready")
+                                            && c.pointer("/status").and_then(|s| s.as_str())
+                                                == Some("True")
+                                    })
+                                })
+                        {
+                            ready_pods.insert(name.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    for h in write_handles {
+        let _ = h.await;
+    }
+
+    assert!(
+        ready_pods.len() == 3 || saw_expired,
+        "scoped selector watch must deliver Running+Ready MODIFIED for all 3 frontend pods \
+         (got {}/3: {:?}) or return 410 Expired on resume -- never a quiet bookmark-only stall",
+        ready_pods.len(),
+        ready_pods
+    );
+}
+
 /// Regression: a resourceVersion-less (`resourceVersion=""`) label-selector
 /// watch must deliver the ADDED of a matching object created AFTER the watch
 /// establishes, even while unrelated writes inflate the global resourceVersion.
