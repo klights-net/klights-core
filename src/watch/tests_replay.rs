@@ -634,17 +634,21 @@ async fn test_next_event_recovering_holds_live_events_during_replay_failure() {
 // Multinode scoped-watch delivery mock (Guestbook readiness stall).
 // ---------------------------------------------------------------------------
 
-fn scoped_watch_event_at(rv: i64, name: &str) -> WatchEvent {
+fn scoped_watch_event_in(rv: i64, name: &str, namespace: &str) -> WatchEvent {
     WatchEvent::modified(serde_json::json!({
         "kind": "Pod",
         "apiVersion": "v1",
         "metadata": {
             "name": name,
-            "namespace": "kubectl-gb",
+            "namespace": namespace,
             "resourceVersion": rv.to_string(),
             "labels": {"app": "guestbook", "tier": "frontend"}
         }
     }))
+}
+
+fn scoped_watch_event_at(rv: i64, name: &str) -> WatchEvent {
+    scoped_watch_event_in(rv, name, "kubectl-gb")
 }
 
 /// Mock replay source that models the multinode raft/outbox apply inconsistency
@@ -823,5 +827,79 @@ async fn test_cursor_expires_when_broadcast_event_never_persisted() {
         saw_expired,
         "a broadcast event whose durable row is permanently absent must surface Expired (410), \
          not be silently dropped"
+    );
+}
+
+/// Regression for the namespace-scope gate on floor-drop recovery. The live
+/// broadcast for built-in kinds is cluster-wide, but a namespaced watch's
+/// durable replay covers only its own namespace. An out-of-namespace Pod event
+/// that lands below the delivery floor is legitimately absent from that replay
+/// and must be IGNORED -- it must not be misread as an unrecoverable gap and
+/// expire (410) the watch. Before the `replay_namespace` gate, this would 410
+/// a namespaced watch under unrelated cross-namespace churn.
+#[tokio::test]
+async fn test_cursor_ignores_out_of_namespace_event_below_floor_without_expiring() {
+    let (tx, rx) = broadcast::channel::<WatchEvent>(16);
+    // Namespaced watch on "kubectl-gb"; replay is dense for that namespace.
+    let replay = NonDenseReplaySource::new(
+        vec![
+            scoped_watch_event_at(11, "pod-a"),
+            scoped_watch_event_at(13, "pod-c"),
+        ],
+        11,
+        false,
+    );
+    let mut cursor = WatchCursor::new(rx, replay, 10)
+        .with_ordered_replay()
+        .with_replay_namespace(Some("kubectl-gb".to_string()));
+    cursor
+        .prime_replay_or_expired()
+        .await
+        .expect("prime replay");
+    // Delivery floor is now 13 (max of the drained replay).
+
+    // Out-of-namespace event below the floor: legitimately absent from the
+    // namespaced replay -> must be ignored, not expired.
+    tx.send(scoped_watch_event_in(12, "other-ns-pod", "other-namespace"))
+        .unwrap();
+    // An in-scope event above the floor must still be delivered.
+    tx.send(scoped_watch_event_at(14, "pod-d")).unwrap();
+
+    let mut delivered: Vec<i64> = Vec::new();
+    let mut expired = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !expired && tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            cursor.next_event(&test_task_supervisor()),
+        )
+        .await
+        {
+            Ok(Ok(event)) => {
+                if let Some(rv) = event.resource_version() {
+                    delivered.push(rv);
+                    if rv == 14 {
+                        break;
+                    }
+                }
+            }
+            Ok(Err(WatchCursorError::Expired)) => expired = true,
+            Ok(Err(WatchCursorError::Closed)) => break,
+            Ok(Err(WatchCursorError::Replay(_))) => continue,
+            Err(_) => break, // timeout: no more events
+        }
+    }
+
+    assert!(
+        !expired,
+        "out-of-namespace event below the floor must NOT expire a namespaced watch"
+    );
+    assert!(
+        delivered.iter().any(|&rv| rv == 14),
+        "in-scope event above the floor must still be delivered: delivered={delivered:?}"
+    );
+    assert!(
+        !delivered.contains(&12),
+        "out-of-namespace event must be ignored, not delivered: delivered={delivered:?}"
     );
 }

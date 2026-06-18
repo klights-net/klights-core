@@ -1108,7 +1108,17 @@ async fn list_cr_inner(
                 replay_targets,
             );
             let mut cursor = WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv))
-                .with_ordered_replay();
+                .with_ordered_replay()
+                // Confine floor-drop recovery to the replay's namespace scope
+                // (the live broadcast is cluster-wide). Only a namespaced,
+                // namespace-scoped CR watch has a narrower replay than the
+                // broadcast; cluster-scoped and all-namespace watches replay
+                // everything they receive.
+                .with_replay_namespace(if is_cluster_scope {
+                    None
+                } else {
+                    watch_ns.clone()
+                });
             // Dedup baseline ADDEDs and grant per-key low-rv exceptions; shared
             // with the built-in watch builder via `seed_watch_cursor_baseline`.
             crate::api::watch_stream::seed_watch_cursor_baseline(

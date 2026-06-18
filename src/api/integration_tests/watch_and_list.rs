@@ -5247,6 +5247,45 @@ async fn test_positive_rv_selector_pod_watch_delivers_all_ready_statuses_under_c
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
+    // CATCH-UP WINDOW CHURN: commit out-of-scope pods AFTER the in-scope
+    // Ready status but BEFORE the watch opens, so they land in the watch's
+    // `list_resources_modified_since` catch-up. The catch-up advances
+    // `initial_list_rv` (the cursor floor) from these out-of-scope events
+    // before selector filtering; the in-scope Ready status (lower RV, ASC
+    // order) must still be delivered, not dropped by the inflated floor.
+    // Same-namespace noise drives the floor; other-namespace noise exercises
+    // the cluster-wide broadcast vs namespaced replay scope.
+    for i in 0..10 {
+        let pod = json!({"apiVersion":"v1","kind":"Pod",
+            "metadata":{"name":format!("noise-catchup-same-{i}"),"namespace":namespace.clone(),"labels":{"app":"noise","tier":"backend"}},
+            "spec":{"containers":[{"name":"c","image":"registry.k8s.io/pause:3.10.1"}]}});
+        let r = app
+            .clone()
+            .oneshot(mk(
+                "POST",
+                format!("/api/v1/namespaces/{namespace}/pods"),
+                Some(serde_json::to_vec(&pod).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+    }
+    for i in 0..6 {
+        let pod = json!({"apiVersion":"v1","kind":"Pod",
+            "metadata":{"name":format!("noise-catchup-other-{i}"),"namespace":noise_namespace.clone(),"labels":{"app":"noise","tier":"backend"}},
+            "spec":{"containers":[{"name":"c","image":"registry.k8s.io/pause:3.10.1"}]}});
+        let r = app
+            .clone()
+            .oneshot(mk(
+                "POST",
+                format!("/api/v1/namespaces/{noise_namespace}/pods"),
+                Some(serde_json::to_vec(&pod).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+    }
+
     // Open the selector WATCH from list_rv with bookmarks enabled.
     let watch_resp = app
         .clone()
