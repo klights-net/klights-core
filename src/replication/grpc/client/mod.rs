@@ -1167,7 +1167,13 @@ impl ReplicationGrpcClient {
         .into_inner()
         .map(|event| {
             event
-                .map_err(|err| anyhow!("gRPC WatchResources stream failed: {err}"))
+                // Preserve the tonic::Status as the error source (rather than
+                // flattening it into a display string) so the worker reflector
+                // can detect a replay-window expiration (Code::OutOfRange) and
+                // relist, matching the K8s "too old resource version" contract.
+                .map_err(|err| {
+                    anyhow::Error::from(err).context("gRPC WatchResources stream failed")
+                })
                 .and_then(resource_event_from_proto)
         });
         Ok(Box::pin(stream))

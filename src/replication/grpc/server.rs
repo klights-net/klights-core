@@ -1028,6 +1028,10 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::WatchResourcesRequest>,
     ) -> std::result::Result<Response<Self::WatchResourcesStream>, Status> {
         self.require_steady_state_auth(&request).await?;
+        // Issue #4: a worker watch must be served by the current raft leader.
+        // Reject establishment on a stale follower so the worker reconnects to
+        // the new leader instead of streaming from a deposed node.
+        self.require_raft_leader()?;
         let req = request.into_inner();
         let mut rx = self
             .db
@@ -1035,6 +1039,12 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let db = self.db.clone();
         let supervisor = self.service.task_supervisor();
         let heartbeat_interval = self.watch_heartbeat_interval;
+        // Clone the leadership signal into the stream so the loop can race it
+        // against the broadcast recv and terminate promptly on a leadership
+        // change. Without this a deposed leader's broadcast goes silent and the
+        // worker waits up to its ~60s idle watchdog before reconnecting, reading
+        // stale informer-cached state in the window.
+        let mut leader_rx = self.is_leader_rx.clone();
         let stream = async_stream::stream! {
             let mut last_rv = req.start_resource_version.max(0);
             if last_rv > 0 {
@@ -1069,11 +1079,23 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 }
                 let wait = heartbeat_interval - elapsed;
                 // broadcast::Receiver::recv is cancel-safe, so dropping it on
-                // timeout loses no event.
-                let recv = match supervisor
-                    .timeout("grpc_watch_heartbeat", wait, rx.recv())
-                    .await
-                {
+                // timeout loses no event. Race it against a leadership-loss
+                // signal (issue #4): if this node stops being the raft leader,
+                // end the stream so the worker reconnects to the new leader
+                // instead of idling on a deposed, silent broadcaster.
+                let recv = if let Some(leader_watch) = leader_rx.as_mut() {
+                    tokio::select! {
+                        biased;
+                        _ = watch_leadership_lost(leader_watch) => break,
+                        r = supervisor
+                            .timeout("grpc_watch_heartbeat", wait, rx.recv()) => r,
+                    }
+                } else {
+                    supervisor
+                        .timeout("grpc_watch_heartbeat", wait, rx.recv())
+                        .await
+                };
+                let recv = match recv {
                     Ok(Ok(recv)) => recv,
                     // Idle past this stream's heartbeat window: emit a liveness
                     // bookmark carrying the cursor so the client resumes
@@ -1906,11 +1928,99 @@ fn watch_event_matches(
     ) && event.matches_field_selector(req.field_selector.as_deref())
 }
 
-async fn replay_watch_events_after(
-    db: &dyn DatastoreBackend,
+/// Complete when the raft leadership signal reports this node is no longer the
+/// leader (or its sender is dropped). Used by the gRPC watch stream loop
+/// (`watch_resources`) to terminate promptly on a leadership change. Checks the
+/// current value first, then awaits the next change. `watch::Receiver::changed`
+/// is cancel-safe, so polling this inside a `select!` each loop iteration (and
+/// dropping the pending future when the broadcast recv wins) loses no
+/// transition: the next iteration re-checks the current value.
+async fn watch_leadership_lost(leader_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if !*leader_rx.borrow() {
+        return;
+    }
+    while leader_rx.changed().await.is_ok() {
+        if !*leader_rx.borrow() {
+            return;
+        }
+    }
+}
+
+/// Focused read-port for the gRPC watch replay path: just the two
+/// `watch_events`-window reads `replay_watch_events_after` needs. Defined as a
+/// separate trait so the gap-detection / frontier logic is unit-testable with a
+/// tiny mock instead of the 99-method `DatastoreBackend`. The blanket impl
+/// forwards every production `DatastoreBackend` (including `dyn
+/// DatastoreBackend`) to its real window reads, so the live path is unchanged.
+#[async_trait::async_trait]
+trait GrpcWatchReplay: Send + Sync {
+    async fn list_watch_events_since(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> Result<Vec<crate::datastore::types::CatchUpResource>>;
+    async fn earliest_watch_event_rv(&self) -> Result<Option<i64>>;
+}
+
+#[async_trait::async_trait]
+impl<T> GrpcWatchReplay for T
+where
+    T: DatastoreBackend + ?Sized,
+{
+    async fn list_watch_events_since(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> Result<Vec<crate::datastore::types::CatchUpResource>> {
+        DatastoreBackend::list_watch_events_since(self, targets, since_rv).await
+    }
+    async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
+        DatastoreBackend::earliest_watch_event_rv(self).await
+    }
+}
+
+/// Decide whether the durable `watch_events` window still covers the resume
+/// point `since_rv`. The persisted log carries one row per committed
+/// resourceVersion, so the gap `(since_rv, live]` is reconstructible iff the
+/// lowest retained RV is at most `since_rv + 1`; anything older was GC'd and
+/// the intervening in-scope events are gone for good.
+///
+/// A window **read error** is treated as a detected gap (fail closed): the
+/// server must never silently advance a worker's resume frontier past possibly
+/// undelivered in-scope events on an uncertain read. `Ok(None)` (empty window,
+/// e.g. a fresh/quiet cluster) reports no gap. Mirrors the HTTP `WatchCursor`
+/// fix (`2a4d8e5`) — Expired there is gRPC `OUT_OF_RANGE` here, both the
+/// Kubernetes "too old resource version" contract.
+fn watch_replay_window_expired(since_rv: i64, earliest_retained: Result<Option<i64>>) -> bool {
+    match earliest_retained {
+        Ok(Some(earliest)) => since_rv + 1 < earliest,
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
+async fn replay_watch_events_after<R>(
+    db: &R,
     req: &generated::WatchResourcesRequest,
     since_rv: i64,
-) -> std::result::Result<(Vec<generated::WatchEvent>, i64), Status> {
+) -> std::result::Result<(Vec<generated::WatchEvent>, i64), Status>
+where
+    R: GrpcWatchReplay + ?Sized,
+{
+    // Issue #1: gap detection. If the worker resumed from a bookmark RV the
+    // leader's watch_events window has since GC'd past, the retained tail alone
+    // cannot reconstruct the gap and the in-scope events (e.g. a Pod binding to
+    // this worker) are unrecoverable. Fail closed with OUT_OF_RANGE so the
+    // worker reflector relists from a fresh snapshot instead of silently
+    // advancing its frontier — never advance durable watch progress on an
+    // uncertain read. Only a real resume point (since_rv > 0) carries the gap
+    // contract; a fresh watch (since_rv == 0) has no prior expectation.
+    if since_rv > 0 && watch_replay_window_expired(since_rv, db.earliest_watch_event_rv().await) {
+        return Err(Status::out_of_range(format!(
+            "WatchResources replay window expired: resume rv {since_rv} predates the retained \
+             watch_events window; relist required"
+        )));
+    }
     let target = watch_target_for_request(req);
     let replay = db
         .list_watch_events_since(&[target], since_rv)
@@ -1920,11 +2030,19 @@ async fn replay_watch_events_after(
     let mut last_rv = since_rv;
     for catchup in replay {
         let event = catchup.into_watch_event();
-        if let Some(rv) = event.resource_version() {
-            last_rv = last_rv.max(rv);
-        }
         if !watch_event_matches(&event, req) {
             continue;
+        }
+        // Issue #2: advance the resume/bookmark frontier only on emitted
+        // in-scope events. Advancing on out-of-scope events (the kind+namespace
+        // firehose, e.g. Pods bound to other workers under heavy churn) would
+        // anchor the bookmark to the all-events frontier, so a reconnect from
+        // that bookmark could resume past delayed in-scope events and the live
+        // `rv <= last_rv` guard would drop them. `list_watch_events_since` is
+        // exclusive (`resource_version > since_rv`), so advancing only on
+        // matches never re-emits. Mirrors the HTTP scoped-watch fix (`7421077`).
+        if let Some(rv) = event.resource_version() {
+            last_rv = last_rv.max(rv);
         }
         let resource = resource_from_event(&event);
         events.push(generated::WatchEvent {
@@ -2187,6 +2305,7 @@ fn pod_log_response_from_proto(response: generated::PodLogResponse) -> PodLogRes
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use crate::datastore::WatchTarget;
     use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
@@ -2730,6 +2849,281 @@ mod tests {
         let resource = event.resource.expect("watch event should carry a resource");
         assert_eq!(resource.name, "scheduled-here");
         assert_eq!(resource.resource_version, 101);
+    }
+
+    // --- replay_watch_events_after unit tests (issues #1 and #2) -----------
+
+    /// A `spec.nodeName=<node>` Pod catch-up event at `rv`.
+    fn catchup_pod_on_node(
+        rv: i64,
+        name: &str,
+        node: &str,
+    ) -> crate::datastore::types::CatchUpResource {
+        crate::datastore::types::CatchUpResource {
+            resource: crate::datastore::Resource {
+                id: 0,
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: name.to_string(),
+                uid: format!("uid-{name}"),
+                resource_version: rv,
+                data: Arc::new(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": name,
+                        "uid": format!("uid-{name}"),
+                        "resourceVersion": rv.to_string()
+                    },
+                    "spec": {
+                        "nodeName": node,
+                        "containers": [{"name": "app", "image": "pause"}]
+                    },
+                    "status": {"phase": "Pending"}
+                })),
+            },
+            event_type: std::borrow::Cow::Borrowed("ADDED"),
+        }
+    }
+
+    fn watch_pods_on_node_request(node: &str, since_rv: i64) -> generated::WatchResourcesRequest {
+        generated::WatchResourcesRequest {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: None,
+            field_selector: Some(format!("spec.nodeName={node}")),
+            start_resource_version: since_rv,
+            label_selector: None,
+        }
+    }
+
+    /// Minimal `GrpcWatchReplay` mock: returns canned events from the window
+    /// and a controlled `earliest_retained` outcome, so the gap-detection and
+    /// frontier logic is exercised without a 99-method DatastoreBackend mock.
+    /// `earliest` holds a `String` error (anyhow::Error is not Clone) converted
+    /// to an `anyhow::Error` on read.
+    struct ReplayWindowMock {
+        events: Vec<crate::datastore::types::CatchUpResource>,
+        earliest: Result<Option<i64>, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::GrpcWatchReplay for ReplayWindowMock {
+        async fn list_watch_events_since(
+            &self,
+            _targets: &[WatchTarget],
+            _since_rv: i64,
+        ) -> anyhow::Result<Vec<crate::datastore::types::CatchUpResource>> {
+            Ok(self.events.clone())
+        }
+        async fn earliest_watch_event_rv(&self) -> anyhow::Result<Option<i64>> {
+            self.earliest.clone().map_err(anyhow::Error::msg)
+        }
+    }
+
+    #[test]
+    fn watch_replay_window_expired_detects_gap_and_read_error() {
+        use anyhow::anyhow;
+        // Gap: resume RV predates the retained window.
+        assert!(super::watch_replay_window_expired(5, Ok(Some(50))));
+        // Boundary: lowest retained is exactly resume+1 — window covers the gap.
+        assert!(!super::watch_replay_window_expired(49, Ok(Some(50))));
+        // Empty window (fresh/quiet cluster): no gap.
+        assert!(!super::watch_replay_window_expired(5, Ok(None)));
+        // Read error: fail closed — never advance on an uncertain read.
+        assert!(super::watch_replay_window_expired(
+            5,
+            Err(anyhow!("io error"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn replay_returns_out_of_range_when_window_gc_past_resume_rv() {
+        // Worker resumes from bookmark rv 5, but the watch_events window GC'd
+        // past it (earliest retained = 50). The retained tail cannot reconstruct
+        // the gap; the server must fail closed with OUT_OF_RANGE so the worker
+        // relists instead of silently leaping its frontier to the tail.
+        let mock = ReplayWindowMock {
+            events: vec![
+                catchup_pod_on_node(50, "a-1", "worker-a"),
+                catchup_pod_on_node(51, "a-2", "worker-a"),
+            ],
+            earliest: Ok(Some(50)),
+        };
+        let req = watch_pods_on_node_request("worker-a", 5);
+        let err = super::replay_watch_events_after(&mock, &req, 5)
+            .await
+            .expect_err("a GC'd window past the resume RV must yield OUT_OF_RANGE");
+        assert_eq!(err.code(), tonic::Code::OutOfRange);
+    }
+
+    #[tokio::test]
+    async fn replay_fail_closes_on_window_read_error() {
+        // An unreadable window (transient datastore error under transport
+        // stress) must be treated as a detected gap, not "no gap".
+        let mock = ReplayWindowMock {
+            events: vec![catchup_pod_on_node(50, "a-1", "worker-a")],
+            earliest: Err("window unreadable".to_string()),
+        };
+        let req = watch_pods_on_node_request("worker-a", 5);
+        let err = super::replay_watch_events_after(&mock, &req, 5)
+            .await
+            .expect_err("an unreadable window must fail closed as OUT_OF_RANGE");
+        assert_eq!(err.code(), tonic::Code::OutOfRange);
+    }
+
+    #[tokio::test]
+    async fn replay_serves_retained_window_when_resume_rv_is_covered() {
+        // Resume rv 49, earliest retained 50: the window fully covers the gap,
+        // so replay serves the retained in-scope events without expiring.
+        let mock = ReplayWindowMock {
+            events: vec![
+                catchup_pod_on_node(50, "a-1", "worker-a"),
+                catchup_pod_on_node(51, "a-2", "worker-a"),
+            ],
+            earliest: Ok(Some(50)),
+        };
+        let req = watch_pods_on_node_request("worker-a", 49);
+        let (events, last_rv) = super::replay_watch_events_after(&mock, &req, 49)
+            .await
+            .expect("a covered resume RV must replay normally");
+        assert_eq!(events.len(), 2);
+        assert_eq!(last_rv, 51);
+    }
+
+    #[tokio::test]
+    async fn replay_skips_gap_check_for_fresh_watch() {
+        // A fresh watch (since_rv == 0) carries no resume expectation: even if
+        // the window was GC'd, replay serves the retained tail without forcing
+        // a relist (a relist would yield the same current snapshot anyway).
+        let mock = ReplayWindowMock {
+            events: vec![catchup_pod_on_node(50, "a-1", "worker-a")],
+            earliest: Ok(Some(50)),
+        };
+        let req = watch_pods_on_node_request("worker-a", 0);
+        let (events, last_rv) = super::replay_watch_events_after(&mock, &req, 0)
+            .await
+            .expect("a fresh watch must not expire");
+        assert_eq!(events.len(), 1);
+        assert_eq!(last_rv, 50);
+    }
+
+    #[tokio::test]
+    async fn replay_advances_frontier_only_on_in_scope_events() {
+        // Issue #2: worker-a watches spec.nodeName=worker-a. Two Pods on
+        // worker-b (higher RVs) churn inside the same kind+namespace window.
+        // The replay must anchor the returned frontier to the last in-scope
+        // (worker-a) RV, not the all-Pods frontier, or a reconnect from that
+        // bookmark resumes past delayed in-scope events and the live
+        // `rv <= last_rv` guard drops them.
+        let mock = ReplayWindowMock {
+            events: vec![
+                catchup_pod_on_node(10, "a-1", "worker-a"), // in-scope, rv 10
+                catchup_pod_on_node(20, "b-1", "worker-b"), // out-of-scope, rv 20
+                catchup_pod_on_node(30, "b-2", "worker-b"), // out-of-scope, rv 30
+            ],
+            earliest: Ok(Some(1)),
+        };
+        let req = watch_pods_on_node_request("worker-a", 5);
+        let (events, last_rv) = super::replay_watch_events_after(&mock, &req, 5)
+            .await
+            .expect("replay within the retained window must not error");
+        // Only the in-scope event is emitted.
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .resource
+                .as_ref()
+                .expect("event has resource")
+                .name,
+            "a-1"
+        );
+        // Frontier is the in-scope RV (10), NOT the all-Pods frontier (30).
+        assert_eq!(last_rv, 10);
+    }
+
+    // --- watch_resources leadership-termination tests (issue #4) -----------
+
+    async fn grpc_leader_server(
+        is_leader: bool,
+    ) -> (
+        super::GrpcReplicationServer,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+            .await
+            .unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let (leader_tx, is_leader_rx) = tokio::sync::watch::channel(is_leader);
+        let grpc = super::GrpcReplicationServer::new(service, db).with_leader_gate(is_leader_rx);
+        (grpc, leader_tx)
+    }
+
+    fn watch_pods_request() -> generated::WatchResourcesRequest {
+        generated::WatchResourcesRequest {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: None,
+            field_selector: None,
+            start_resource_version: 0,
+            label_selector: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_resources_rejects_establishment_when_not_raft_leader() {
+        let (grpc, _leader_tx) = grpc_leader_server(false).await;
+        let status = match grpc
+            .watch_resources(request_with_node_client_cert(
+                watch_pods_request(),
+                "worker-1",
+            ))
+            .await
+        {
+            Ok(_) => panic!("a non-leader must reject watch establishment"),
+            Err(status) => status,
+        };
+        assert_eq!(
+            status.code(),
+            tonic::Code::FailedPrecondition,
+            "establishment on a non-leader must fail with FailedPrecondition"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_resources_terminates_promptly_on_leadership_loss() {
+        use futures::StreamExt;
+        let (grpc, leader_tx) = grpc_leader_server(true).await;
+        let mut stream = match grpc
+            .watch_resources(request_with_node_client_cert(
+                watch_pods_request(),
+                "worker-1",
+            ))
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) => panic!("the leader must accept watch establishment: {status:?}"),
+        };
+
+        // Depose this node mid-stream: leadership flips away.
+        leader_tx.send(false).expect("leader signal still live");
+
+        // The stream must terminate (None) promptly once leadership is lost,
+        // instead of idling up to the ~60s client idle watchdog on a deposed,
+        // silent broadcaster. Before the fix the loop had no leadership select
+        // and would wait on the broadcast recv indefinitely here.
+        match tokio::time::timeout(std::time::Duration::from_secs(2), stream.next()).await {
+            Ok(None) => { /* stream ended cleanly on leadership loss */ }
+            Ok(Some(Ok(_))) => {
+                panic!("stream should terminate on leadership loss, not yield an event")
+            }
+            Ok(Some(Err(_))) => panic!("stream should end cleanly, not error"),
+            Err(_) => panic!("stream did not terminate within 2s of leadership loss"),
+        }
     }
 
     struct AcceptingControlplaneJoinHandler;

@@ -151,6 +151,7 @@ impl WorkerStoreAdapter {
             match self.cluster_api.watch_resources(watch_req).await {
                 Ok(mut stream) => {
                     use futures::StreamExt;
+                    let mut relist_required = false;
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => return,
@@ -165,6 +166,28 @@ impl WorkerStoreAdapter {
                                         self.publish_watch(event.event);
                                     }
                                     Some(Err(err)) => {
+                                        if is_watch_window_expired(&err) {
+                                            // Replay-window expiration (gRPC
+                                            // OUT_OF_RANGE, the K8s "too old
+                                            // resource version" / HTTP 410
+                                            // contract): the leader GC'd past
+                                            // our resume bookmark and the
+                                            // in-scope events in the gap are
+                                            // gone. Relist from a fresh
+                                            // snapshot instead of reconnecting
+                                            // at the stale bookmark, which
+                                            // would loop on the same
+                                            // expiration and never recover the
+                                            // missing events.
+                                            tracing::info!(
+                                                error = %err,
+                                                "worker store watch mirror replay window expired; relisting"
+                                            );
+                                            next_resource_version = None;
+                                            reconnect_attempt = 0;
+                                            relist_required = true;
+                                            break;
+                                        }
                                         tracing::warn!(error = %err, "worker store watch mirror failed");
                                         break;
                                     }
@@ -172,6 +195,12 @@ impl WorkerStoreAdapter {
                                 }
                             }
                         }
+                    }
+                    // A relist is recovery, not a retry: skip the reconnect
+                    // backoff and immediately re-enter the outer loop, where
+                    // next_resource_version == None triggers a fresh LIST.
+                    if relist_required {
+                        continue;
                     }
                 }
                 Err(err) => {
@@ -308,6 +337,23 @@ async fn sleep_before_watch_mirror_reconnect(
             crate::utils::watch_reconnect_delay(attempt),
         ) => true,
     }
+}
+
+/// True when a worker watch-stream error is a replay-window expiration
+/// (gRPC `OUT_OF_RANGE`, the Kubernetes "too old resource version" / HTTP 410
+/// contract). The leader returns it from `replay_watch_events_after` when the
+/// durable `watch_events` window no longer covers the worker's resume bookmark;
+/// the reflector must relist from a fresh snapshot rather than retry the stale
+/// bookmark, which would loop on the same expiration.
+///
+/// The tonic::Status is carried as the error source by the gRPC client (see
+/// `watch_resources_rpc`), so walk the anyhow chain to find and inspect it.
+fn is_watch_window_expired(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|s| s.code() == tonic::Code::OutOfRange)
+    })
 }
 
 #[async_trait]
@@ -1113,6 +1159,34 @@ mod tests {
     };
     use crate::datastore::DatastoreBackend;
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+
+    #[test]
+    fn is_watch_window_expired_detects_out_of_range_in_error_chain() {
+        // OutOfRange (replay window expired) carried as the error source ->
+        // relist required. The gRPC client preserves the tonic::Status as the
+        // chain source, so it must be found even when wrapped in a context.
+        let err = anyhow::Error::from(tonic::Status::out_of_range("expired"))
+            .context("gRPC WatchResources stream failed");
+        assert!(
+            is_watch_window_expired(&err),
+            "OutOfRange status must trigger a relist"
+        );
+
+        // Any other gRPC code is a transport/processing error, not an
+        // expiration: keep the bookmark and reconnect (with backoff).
+        let err = anyhow::Error::from(tonic::Status::unavailable("transport gone"))
+            .context("gRPC WatchResources stream failed");
+        assert!(
+            !is_watch_window_expired(&err),
+            "non-OutOfRange gRPC errors must not trigger a relist"
+        );
+
+        // A plain non-tonic error is not an expiration.
+        assert!(
+            !is_watch_window_expired(&anyhow!("some other failure")),
+            "non-tonic errors must not trigger a relist"
+        );
+    }
 
     #[derive(Default)]
     struct HandoffLeaderApi;
