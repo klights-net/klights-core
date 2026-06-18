@@ -1,5 +1,6 @@
 use super::queries;
 use super::*;
+use crate::datastore::WatchReplayRead;
 use anyhow::Result;
 
 impl Datastore {
@@ -159,51 +160,94 @@ impl Datastore {
         let targets = targets.to_vec();
         let items = self
             .db_call("list_watch_events_since", move |conn| {
-                let mut query = queries::WATCH_EVENTS_LIST_TARGETS_HEAD.to_string();
-                let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since_rv)];
-
-                for (idx, target) in targets.iter().enumerate() {
-                    if idx > 0 {
-                        query.push_str(" OR ");
-                    }
-                    query.push('(');
-                    query.push_str(&format!(
-                        "api_version = ?{} AND kind = ?{}",
-                        params.len() + 1,
-                        params.len() + 2
-                    ));
-                    params.push(Box::new(target.api_version.clone()));
-                    params.push(Box::new(target.kind.clone()));
-
-                    match &target.scope {
-                        WatchTargetScope::Cluster => {
-                            query.push_str(" AND namespace IS NULL");
-                        }
-                        WatchTargetScope::Namespaced(Some(namespace)) => {
-                            query.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
-                            params.push(Box::new(namespace.clone()));
-                        }
-                        WatchTargetScope::Namespaced(None) => {
-                            query.push_str(" AND namespace IS NOT NULL");
-                        }
-                    }
-                    query.push(')');
-                }
-
-                query.push_str(") ORDER BY resource_version ASC");
-
-                let param_refs: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|param| param.as_ref()).collect();
-                let mut stmt = conn.prepare(&query)?;
-                let rows = stmt.query_map(&param_refs[..], Self::watch_row_to_catchup_resource)?;
-                let mut items = Vec::new();
-                for row in rows {
-                    items.push(row?);
-                }
-                Ok(items)
+                Ok(Self::list_watch_events_since_in_conn(
+                    conn, &targets, since_rv,
+                )?)
             })
             .await?;
 
+        Ok(items)
+    }
+
+    /// Atomically check the retained watch history floor and read a replay
+    /// suffix. Keeping both operations inside one SQLite connection call gives
+    /// this closure a single read snapshot, so watch_events GC cannot advance
+    /// the floor between "safe to replay" and the replay query.
+    pub async fn list_watch_events_since_checked(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> Result<WatchReplayRead> {
+        if targets.is_empty() {
+            return Ok(WatchReplayRead::Events(Vec::new()));
+        }
+
+        let targets = targets.to_vec();
+        self.db_call("list_watch_events_since_checked", move |conn| {
+            if since_rv > 0 {
+                let mut stmt = conn.prepare(queries::WATCH_EVENTS_MIN_RV)?;
+                let earliest = stmt.query_row([], |row| row.get::<_, i64>(0)).optional()?;
+                if let Some(earliest) = earliest
+                    && since_rv + 1 < earliest
+                {
+                    return Ok(WatchReplayRead::Expired);
+                }
+            }
+            Ok(
+                Self::list_watch_events_since_in_conn(conn, &targets, since_rv)
+                    .map(WatchReplayRead::Events)?,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to checked-list watch_events: {}", e))
+    }
+
+    fn list_watch_events_since_in_conn(
+        conn: &rusqlite::Connection,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> rusqlite::Result<Vec<CatchUpResource>> {
+        let mut query = queries::WATCH_EVENTS_LIST_TARGETS_HEAD.to_string();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since_rv)];
+
+        for (idx, target) in targets.iter().enumerate() {
+            if idx > 0 {
+                query.push_str(" OR ");
+            }
+            query.push('(');
+            query.push_str(&format!(
+                "api_version = ?{} AND kind = ?{}",
+                params.len() + 1,
+                params.len() + 2
+            ));
+            params.push(Box::new(target.api_version.clone()));
+            params.push(Box::new(target.kind.clone()));
+
+            match &target.scope {
+                WatchTargetScope::Cluster => {
+                    query.push_str(" AND namespace IS NULL");
+                }
+                WatchTargetScope::Namespaced(Some(namespace)) => {
+                    query.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
+                    params.push(Box::new(namespace.clone()));
+                }
+                WatchTargetScope::Namespaced(None) => {
+                    query.push_str(" AND namespace IS NOT NULL");
+                }
+            }
+            query.push(')');
+        }
+
+        query.push_str(") ORDER BY resource_version ASC");
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|param| param.as_ref()).collect();
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(&param_refs[..], Self::watch_row_to_catchup_resource)?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
         Ok(items)
     }
 

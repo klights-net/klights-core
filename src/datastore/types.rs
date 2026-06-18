@@ -358,6 +358,17 @@ pub struct CatchUpResource {
     pub event_type: std::borrow::Cow<'static, str>,
 }
 
+/// Result of a checked durable watch replay read.
+///
+/// `Expired` means the requested resume RV is outside the retained
+/// `watch_events` window and callers must relist instead of advancing from a
+/// partial suffix.
+#[derive(Debug, Clone)]
+pub enum WatchReplayRead {
+    Events(Vec<CatchUpResource>),
+    Expired,
+}
+
 impl CatchUpResource {
     pub fn into_watch_event(self) -> WatchEvent {
         let CatchUpResource {

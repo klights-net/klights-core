@@ -616,6 +616,16 @@ impl DatastoreBackend for ReplicatedDatastore {
         self.inner.list_watch_events_since(targets, since_rv).await
     }
 
+    async fn list_watch_events_since_checked(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> Result<WatchReplayRead> {
+        self.inner
+            .list_watch_events_since_checked(targets, since_rv)
+            .await
+    }
+
     async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
         self.inner.earliest_watch_event_rv().await
     }

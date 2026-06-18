@@ -36,6 +36,7 @@ use serde_json::Value;
 use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
 
+use crate::datastore::WatchReplayRead;
 use crate::networking::{NodeName, PodSubnet, VtepMac};
 use crate::task_supervisor::TaskSupervisor;
 use crate::watch::{WatchBus, WatchEvent, WatchReceiver, WatchTopic};
@@ -2360,6 +2361,14 @@ impl DatastoreBackend for Datastore {
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
         Datastore::list_watch_events_since(self, targets, since_rv).await
+    }
+
+    async fn list_watch_events_since_checked(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> Result<WatchReplayRead> {
+        Datastore::list_watch_events_since_checked(self, targets, since_rv).await
     }
 
     async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {

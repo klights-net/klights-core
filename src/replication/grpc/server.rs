@@ -7,7 +7,7 @@ use tonic::{Request, Response, Status, metadata::MetadataMap};
 
 use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
-use crate::datastore::{ResourcePreconditions, WatchTarget};
+use crate::datastore::{ResourcePreconditions, WatchReplayRead, WatchTarget};
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use crate::replication::grpc::{
     JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, log_apply_commit_to_proto,
@@ -1954,12 +1954,12 @@ async fn watch_leadership_lost(leader_rx: &mut tokio::sync::watch::Receiver<bool
 /// DatastoreBackend`) to its real window reads, so the live path is unchanged.
 #[async_trait::async_trait]
 trait GrpcWatchReplay: Send + Sync {
-    async fn list_watch_events_since(
+    async fn earliest_watch_event_rv(&self) -> Result<Option<i64>>;
+    async fn list_watch_events_since_checked(
         &self,
         targets: &[WatchTarget],
         since_rv: i64,
-    ) -> Result<Vec<crate::datastore::types::CatchUpResource>>;
-    async fn earliest_watch_event_rv(&self) -> Result<Option<i64>>;
+    ) -> Result<WatchReplayRead>;
 }
 
 #[async_trait::async_trait]
@@ -1967,15 +1967,15 @@ impl<T> GrpcWatchReplay for T
 where
     T: DatastoreBackend + ?Sized,
 {
-    async fn list_watch_events_since(
+    async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
+        DatastoreBackend::earliest_watch_event_rv(self).await
+    }
+    async fn list_watch_events_since_checked(
         &self,
         targets: &[WatchTarget],
         since_rv: i64,
-    ) -> Result<Vec<crate::datastore::types::CatchUpResource>> {
-        DatastoreBackend::list_watch_events_since(self, targets, since_rv).await
-    }
-    async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
-        DatastoreBackend::earliest_watch_event_rv(self).await
+    ) -> Result<WatchReplayRead> {
+        DatastoreBackend::list_watch_events_since_checked(self, targets, since_rv).await
     }
 }
 
@@ -2022,10 +2022,19 @@ where
         )));
     }
     let target = watch_target_for_request(req);
-    let replay = db
-        .list_watch_events_since(&[target], since_rv)
+    let replay = match db
+        .list_watch_events_since_checked(&[target], since_rv)
         .await
-        .map_err(|err| Status::internal(format!("replay WatchResources failed: {err}")))?;
+        .map_err(|err| Status::internal(format!("replay WatchResources failed: {err}")))?
+    {
+        WatchReplayRead::Events(events) => events,
+        WatchReplayRead::Expired => {
+            return Err(Status::out_of_range(format!(
+                "WatchResources replay window expired: resume rv {since_rv} predates the retained \
+                 watch_events window; relist required"
+            )));
+        }
+    };
     let mut events = Vec::new();
     let mut last_rv = since_rv;
     for catchup in replay {
@@ -2305,12 +2314,12 @@ fn pod_log_response_from_proto(response: generated::PodLogResponse) -> PodLogRes
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use crate::datastore::WatchTarget;
     use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
     use crate::datastore::types::ResourcePreconditions;
+    use crate::datastore::{WatchReplayRead, WatchTarget};
     use crate::replication::grpc::generated::replication_client::ReplicationClient;
     use crate::replication::grpc::generated::replication_server::Replication;
     use crate::replication::grpc::raft_rpc::{
@@ -2905,21 +2914,24 @@ mod tests {
     /// `earliest` holds a `String` error (anyhow::Error is not Clone) converted
     /// to an `anyhow::Error` on read.
     struct ReplayWindowMock {
-        events: Vec<crate::datastore::types::CatchUpResource>,
+        events: Result<Vec<crate::datastore::types::CatchUpResource>, String>,
         earliest: Result<Option<i64>, String>,
     }
 
     #[async_trait::async_trait]
     impl super::GrpcWatchReplay for ReplayWindowMock {
-        async fn list_watch_events_since(
+        async fn earliest_watch_event_rv(&self) -> anyhow::Result<Option<i64>> {
+            self.earliest.clone().map_err(anyhow::Error::msg)
+        }
+        async fn list_watch_events_since_checked(
             &self,
             _targets: &[WatchTarget],
             _since_rv: i64,
-        ) -> anyhow::Result<Vec<crate::datastore::types::CatchUpResource>> {
-            Ok(self.events.clone())
-        }
-        async fn earliest_watch_event_rv(&self) -> anyhow::Result<Option<i64>> {
-            self.earliest.clone().map_err(anyhow::Error::msg)
+        ) -> anyhow::Result<WatchReplayRead> {
+            match self.events.clone() {
+                Ok(events) => Ok(WatchReplayRead::Events(events)),
+                Err(_) => Ok(WatchReplayRead::Expired),
+            }
         }
     }
 
@@ -2946,10 +2958,10 @@ mod tests {
         // the gap; the server must fail closed with OUT_OF_RANGE so the worker
         // relists instead of silently leaping its frontier to the tail.
         let mock = ReplayWindowMock {
-            events: vec![
+            events: Ok(vec![
                 catchup_pod_on_node(50, "a-1", "worker-a"),
                 catchup_pod_on_node(51, "a-2", "worker-a"),
-            ],
+            ]),
             earliest: Ok(Some(50)),
         };
         let req = watch_pods_on_node_request("worker-a", 5);
@@ -2964,7 +2976,7 @@ mod tests {
         // An unreadable window (transient datastore error under transport
         // stress) must be treated as a detected gap, not "no gap".
         let mock = ReplayWindowMock {
-            events: vec![catchup_pod_on_node(50, "a-1", "worker-a")],
+            events: Ok(vec![catchup_pod_on_node(50, "a-1", "worker-a")]),
             earliest: Err("window unreadable".to_string()),
         };
         let req = watch_pods_on_node_request("worker-a", 5);
@@ -2975,14 +2987,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replay_returns_out_of_range_when_window_expires_during_replay_read() {
+        // The preflight floor read can race with watch_events GC. If the replay
+        // read itself detects that the window expired before it could return a
+        // complete suffix, gRPC must surface OUT_OF_RANGE so the worker relists
+        // rather than mapping it to INTERNAL or silently advancing.
+        let mock = ReplayWindowMock {
+            events: Err("watch replay window expired after floor check".to_string()),
+            earliest: Ok(Some(1)),
+        };
+        let req = watch_pods_on_node_request("worker-a", 5);
+        let err = super::replay_watch_events_after(&mock, &req, 5)
+            .await
+            .expect_err("a replay-read-side expiration must yield OUT_OF_RANGE");
+        assert_eq!(err.code(), tonic::Code::OutOfRange);
+    }
+
+    #[tokio::test]
     async fn replay_serves_retained_window_when_resume_rv_is_covered() {
         // Resume rv 49, earliest retained 50: the window fully covers the gap,
         // so replay serves the retained in-scope events without expiring.
         let mock = ReplayWindowMock {
-            events: vec![
+            events: Ok(vec![
                 catchup_pod_on_node(50, "a-1", "worker-a"),
                 catchup_pod_on_node(51, "a-2", "worker-a"),
-            ],
+            ]),
             earliest: Ok(Some(50)),
         };
         let req = watch_pods_on_node_request("worker-a", 49);
@@ -2999,7 +3028,7 @@ mod tests {
         // the window was GC'd, replay serves the retained tail without forcing
         // a relist (a relist would yield the same current snapshot anyway).
         let mock = ReplayWindowMock {
-            events: vec![catchup_pod_on_node(50, "a-1", "worker-a")],
+            events: Ok(vec![catchup_pod_on_node(50, "a-1", "worker-a")]),
             earliest: Ok(Some(50)),
         };
         let req = watch_pods_on_node_request("worker-a", 0);
@@ -3019,11 +3048,11 @@ mod tests {
         // bookmark resumes past delayed in-scope events and the live
         // `rv <= last_rv` guard drops them.
         let mock = ReplayWindowMock {
-            events: vec![
+            events: Ok(vec![
                 catchup_pod_on_node(10, "a-1", "worker-a"), // in-scope, rv 10
                 catchup_pod_on_node(20, "b-1", "worker-b"), // out-of-scope, rv 20
                 catchup_pod_on_node(30, "b-2", "worker-b"), // out-of-scope, rv 30
-            ],
+            ]),
             earliest: Ok(Some(1)),
         };
         let req = watch_pods_on_node_request("worker-a", 5);

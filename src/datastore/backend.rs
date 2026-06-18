@@ -17,7 +17,8 @@ use super::types::{
     PendingWatchEvent, PodCleanupIntent, PodEndpointEvent, PodEndpointRow, PodNetworkEndpoint,
     PodSlotAdmissionEvent, PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind,
     ReplicatedCreateOptions, ReplicatedSnapshotMetadata, Resource, ResourceList, ResourceListQuery,
-    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchTarget,
+    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayRead,
+    WatchTarget,
 };
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
@@ -493,6 +494,25 @@ pub trait DatastoreBackend: Send + Sync {
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>>;
+
+    /// Read a replay suffix only if the retained watch history still covers
+    /// `since_rv`. Backends with a durable watch-event table should override
+    /// this so the floor check and event read happen in the same read snapshot.
+    async fn list_watch_events_since_checked(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> Result<WatchReplayRead> {
+        if since_rv > 0
+            && let Some(earliest) = self.earliest_watch_event_rv().await?
+            && since_rv + 1 < earliest
+        {
+            return Ok(WatchReplayRead::Expired);
+        }
+        self.list_watch_events_since(targets, since_rv)
+            .await
+            .map(WatchReplayRead::Events)
+    }
 
     /// Lowest `resourceVersion` still retained in the durable `watch_events`
     /// window, or `None` when the window is empty. A watch whose requested /
