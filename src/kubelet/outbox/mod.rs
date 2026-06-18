@@ -629,6 +629,12 @@ impl OutboxDispatcher {
             });
         }
 
+        tracing::info!(
+            target: "klights::outbox_dispatch",
+            claimed = rows.len(),
+            "outbox dispatch: claimed due rows for dispatch"
+        );
+
         self.dispatch_rows_pipelined(rows, now_ms).await;
         let _ = self.persist_dispatch_counters().await;
         Ok(DispatchOutcome::Dispatched)
@@ -700,16 +706,37 @@ impl OutboxDispatcher {
 
         let records_checkpoint =
             outbox_operation_records_pod_status_checkpoint(operation) && !row.pod_uid.is_empty();
-
-        match self
+        if records_checkpoint {
+            tracing::info!(
+                target: "klights::outbox_dispatch",
+                idempotency_key = %row.idempotency_key,
+                pod_uid = %row.pod_uid,
+                attempt = row.attempt,
+                "outbox dispatch: claimed pod-status row"
+            );
+        }
+        let dispatch_start = std::time::Instant::now();
+        let applied = self
             .client
             .apply_outbox(
                 &row.idempotency_key,
                 operation,
                 Bytes::from(row.payload_proto.clone()),
             )
-            .await
-        {
+            .await;
+        let elapsed_ms = dispatch_start.elapsed().as_millis() as u64;
+        if records_checkpoint {
+            tracing::info!(
+                target: "klights::outbox_dispatch",
+                idempotency_key = %row.idempotency_key,
+                pod_uid = %row.pod_uid,
+                attempt = row.attempt,
+                elapsed_ms,
+                resolved = !matches!(applied, Err(OutboxApplyError::Retryable(_))),
+                "outbox dispatch: pod-status row apply_outbox resolved"
+            );
+        }
+        match applied {
             Ok(result) => {
                 self.dispatch_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
