@@ -763,7 +763,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv))
                 .with_ordered_replay()
                 // The live broadcast is cluster-wide for built-in kinds; confine
-                // floor-drop recovery to events a namespaced replay could hold
+                // floor-drop expiration to events a namespaced replay could hold
                 // so an out-of-namespace event below the floor is ignored, not
                 // expired. `watch_namespace` mirrors the replay target's scope.
                 .with_replay_namespace(watch_namespace.clone());

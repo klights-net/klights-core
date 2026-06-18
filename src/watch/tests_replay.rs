@@ -657,8 +657,8 @@ fn scoped_watch_event_at(rv: i64, name: &str) -> WatchEvent {
 /// under transport stress). The cursor's replay then advances its delivery
 /// floor past the missing RV, and the live broadcast copy is silently dropped
 /// (the `klights::watch_diag` "cursor dropped an undelivered event (floor
-/// advanced past it)" canary). `fills_on_retry` simulates the late-landing row:
-/// a later replay recovers the event.
+/// advanced past it)" canary). `fills_on_retry` simulates a late-landing row
+/// that the cursor must not depend on for client-facing watch correctness.
 struct NonDenseReplaySource {
     events: Vec<WatchEvent>,
     earliest: i64,
@@ -719,12 +719,11 @@ impl WatchReplaySource for NonDenseReplaySource {
 }
 
 /// RED regression: a broadcast in-scope event whose durable row is absent from
-/// the (non-dense) replay must not be silently dropped. The cursor must either
-/// recover it (re-replay once the row lands) or surface Expired so the HTTP
-/// watch returns 410 and the client relists -- never the quiet bookmark-only
-/// stall that timed out `kubectl wait` in the failing run.
+/// the replay window must not be silently dropped or recovered by making the
+/// cursor reason about higher-level watch relevance. The cursor should fail
+/// closed with Expired so the HTTP watch returns 410 and the client relists.
 #[tokio::test]
-async fn test_cursor_recovers_broadcast_event_missing_from_non_dense_replay() {
+async fn test_cursor_expires_ambiguous_in_scope_floor_drop_even_if_row_lands_later() {
     let (tx, rx) = broadcast::channel::<WatchEvent>(16);
     // Durable window retains rv=11 and rv=13 but NOT rv=12 (the in-scope
     // frontend Ready event whose row was lost/lagged). earliest=11.
@@ -748,22 +747,16 @@ async fn test_cursor_recovers_broadcast_event_missing_from_non_dense_replay() {
         .unwrap();
     tx.send(scoped_watch_event_at(14, "pod-d")).unwrap();
 
-    let mut delivered: Vec<i64> = Vec::new();
     let mut expired = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-    while delivered.iter().all(|&rv| rv != 12) && !expired && tokio::time::Instant::now() < deadline
-    {
+    while !expired && tokio::time::Instant::now() < deadline {
         let next = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             cursor.next_event(&test_task_supervisor()),
         )
         .await;
         match next {
-            Ok(Ok(event)) => {
-                if let Some(rv) = event.resource_version() {
-                    delivered.push(rv);
-                }
-            }
+            Ok(Ok(_)) => {}
             Ok(Err(WatchCursorError::Expired)) => expired = true,
             Ok(Err(WatchCursorError::Closed)) => break,
             Ok(Err(WatchCursorError::Replay(_))) => continue,
@@ -772,11 +765,8 @@ async fn test_cursor_recovers_broadcast_event_missing_from_non_dense_replay() {
     }
 
     assert!(
-        delivered.iter().any(|&rv| rv == 12) || expired,
-        "scoped watch cursor must recover the in-scope broadcast event rv=12 \
-         (whose durable row lagged) via re-replay, or surface Expired (410) -- \
-         silently dropping it is the Guestbook readiness stall. \
-         delivered={delivered:?} expired={expired}"
+        expired,
+        "an ambiguous in-scope floor drop must surface Expired (410) so the client relists"
     );
 }
 
@@ -830,7 +820,7 @@ async fn test_cursor_expires_when_broadcast_event_never_persisted() {
     );
 }
 
-/// Regression for the namespace-scope gate on floor-drop recovery. The live
+/// Regression for the namespace-scope gate on floor-drop expiration. The live
 /// broadcast for built-in kinds is cluster-wide, but a namespaced watch's
 /// durable replay covers only its own namespace. An out-of-namespace Pod event
 /// that lands below the delivery floor is legitimately absent from that replay

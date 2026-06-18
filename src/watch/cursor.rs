@@ -112,13 +112,12 @@ pub struct WatchCursor<S> {
     replay_required: bool,
     /// Current backoff duration for replay retry.
     replay_backoff: Duration,
-    /// Lowest RV this cursor may replay from to recover events the delivery
-    /// floor advanced past. Anchored to the watch's start floor (it never
-    /// advances), so a non-dense durable replay -- a broadcast event whose
-    /// `watch_events` row lagged or was lost under multinode apply stress --
-    /// can be re-fetched and the event recovered instead of silently dropped.
-    recovery_floor_rv: i64,
-    /// Namespace the durable replay covers, so floor-drop recovery is gated to
+    /// Initial watch floor from the resume/list boundary. Events at or below
+    /// this RV are outside this cursor's continuity contract; unseen events
+    /// above it that later fall below the advanced floor indicate an ambiguous
+    /// delivery gap and must fail closed with `Expired`.
+    start_floor_rv: i64,
+    /// Namespace the durable replay covers, so floor-drop expiration is gated to
     /// events that replay could actually contain. The live broadcast for
     /// built-in kinds is cluster-wide (e.g. all `v1/Pod`), but a namespaced
     /// watch replays only its own namespace; an out-of-namespace event with
@@ -148,7 +147,7 @@ impl<S: WatchReplaySource> WatchCursor<S> {
             ordered_replay: false,
             replay_required: false,
             replay_backoff: INITIAL_REPLAY_BACKOFF,
-            recovery_floor_rv: last_rv,
+            start_floor_rv: last_rv,
             replay_namespace: None,
         }
     }
@@ -158,7 +157,7 @@ impl<S: WatchReplaySource> WatchCursor<S> {
         self
     }
 
-    /// Confine floor-drop recovery to events the durable replay could contain.
+    /// Confine floor-drop expiration to events the durable replay could contain.
     /// Pass the watch's namespace (`Some(ns)` for a namespaced watch, `None` for
     /// a cluster-scoped or all-namespace watch). The live broadcast for built-in
     /// kinds is cluster-wide while a namespaced replay covers only its namespace,
@@ -278,43 +277,20 @@ impl<S: WatchReplaySource> WatchCursor<S> {
                         }
                     }
                     if self.should_skip(&event) {
-                        // The canary case: the floor advanced past an event this
-                        // cursor never delivered (rv <= floor AND not in seen).
-                        // That means the durable replay was non-dense -- a
-                        // broadcast event whose watch_events row lagged or was
-                        // lost under multinode apply stress. Recover it via
-                        // re-replay, or surface Expired (410) so the client
-                        // relists -- never silently drop the broadcast event a
-                        // reflector is waiting on (the Guestbook readiness
-                        // stall). Benign dedup (rv in seen) stays a silent skip,
-                        // and only events inside the replay's namespace scope are
-                        // candidates (the broadcast is cluster-wide; an
-                        // out-of-namespace event is legitimately absent from a
-                        // namespaced replay and must be ignored, not expired).
-                        if let Some(rv) = event.resource_version()
-                            && rv > self.recovery_floor_rv
-                            && !self.seen_rvs.contains(&rv)
-                            && self.event_in_replay_scope(&event)
-                        {
-                            match self.recover_floor_drop(rv).await {
-                                Ok(()) => continue,
-                                Err(WatchCursorError::Expired) => {
-                                    tracing::warn!(
-                                        target: "klights::watch_diag",
-                                        dropped_rv = rv,
-                                        floor_rv = self.floor_rv,
-                                        last_rv = self.last_rv,
-                                        kind = event
-                                            .object
-                                            .get("kind")
-                                            .and_then(|k| k.as_str())
-                                            .unwrap_or(""),
-                                        "watch cursor expired: live event absent from durable replay (unrecoverable gap)"
-                                    );
-                                    return Err(WatchCursorError::Expired);
-                                }
-                                Err(err) => return Err(err),
-                            }
+                        if let Some(rv) = self.skipped_live_event_requires_expired(&event) {
+                            tracing::warn!(
+                                target: "klights::watch_diag",
+                                dropped_rv = rv,
+                                floor_rv = self.floor_rv,
+                                last_rv = self.last_rv,
+                                kind = event
+                                    .object
+                                    .get("kind")
+                                    .and_then(|k| k.as_str())
+                                    .unwrap_or(""),
+                                "watch cursor expired: skipped unseen in-scope event after start floor"
+                            );
+                            return Err(WatchCursorError::Expired);
                         }
                         self.log_skipped_added("live", &event);
                         continue;
@@ -553,7 +529,7 @@ impl<S: WatchReplaySource> WatchCursor<S> {
     /// covers. The live broadcast for built-in kinds is cluster-wide, but a
     /// namespaced watch replays only its own namespace; an out-of-namespace
     /// event below the floor is legitimately absent from that replay and must
-    /// not be treated as a recoverable gap.
+    /// not expire the watch.
     fn event_in_replay_scope(&self, event: &WatchEvent) -> bool {
         let Some(namespace) = &self.replay_namespace else {
             return true;
@@ -565,48 +541,15 @@ impl<S: WatchReplaySource> WatchCursor<S> {
             == Some(namespace.as_str())
     }
 
-    /// Recover a live event the delivery floor advanced past because the durable
-    /// replay was non-dense -- a broadcast event whose `watch_events` row lagged
-    /// or was lost under multinode raft/outbox apply stress (the Guestbook
-    /// scoped-watch readiness stall: `watch_diag` "cursor dropped an
-    /// undelivered event (floor advanced past it)").
-    ///
-    /// Re-replay from the (never-advancing) recovery floor to catch rows that
-    /// landed after the original non-dense replay. If the dropped event's RV is
-    /// now retained, re-queue the dense replay -- drain delivers the recovered
-    /// event (already-delivered RVs are deduped via `seen_rvs`). If it is still
-    /// genuinely absent, the gap is unrecoverable: surface `Expired` so the HTTP
-    /// watch returns 410 and the client relists, rather than silently dropping
-    /// the broadcast event the reflector is waiting on.
-    ///
-    /// The caller MUST gate this on [`event_in_replay_scope`] so an
-    /// out-of-namespace event (absent from a namespaced replay by design) is
-    /// ignored instead of expiring the watch.
-    async fn recover_floor_drop(
-        &mut self,
-        dropped_rv: i64,
-    ) -> std::result::Result<(), WatchCursorError> {
-        let replay = self
-            .replay_source
-            .replay_since(self.recovery_floor_rv)
-            .await
-            .map_err(WatchCursorError::Replay)?;
-        if !replay
-            .iter()
-            .any(|event| event.resource_version() == Some(dropped_rv))
+    fn skipped_live_event_requires_expired(&self, event: &WatchEvent) -> Option<i64> {
+        let rv = event.resource_version()?;
+        if rv <= self.start_floor_rv
+            || self.seen_rvs.contains(&rv)
+            || !self.event_in_replay_scope(event)
         {
-            return Err(WatchCursorError::Expired);
+            return None;
         }
-        // Reached only when pending is empty (this runs from the live arm of
-        // next_event, which follows a draining pop_pending_event). Drop the
-        // floor back to the recovery floor so the re-queued events (rv >
-        // recovery_floor, including dropped_rv) are not should_skip'd;
-        // seen_rvs dedups the already-delivered ones and the floor is restored
-        // to the replay max when the re-queue drains.
-        self.floor_rv = self.recovery_floor_rv;
-        self.pending_replay_floor_rv = None;
-        self.queue_replay(replay);
-        Ok(())
+        Some(rv)
     }
 
     /// Diagnostic: an ADDED event being dropped by the cursor (rv <= floor or

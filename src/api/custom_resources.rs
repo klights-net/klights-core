@@ -1109,7 +1109,7 @@ async fn list_cr_inner(
             );
             let mut cursor = WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv))
                 .with_ordered_replay()
-                // Confine floor-drop recovery to the replay's namespace scope
+                // Confine floor-drop expiration to the replay's namespace scope
                 // (the live broadcast is cluster-wide). Only a namespaced,
                 // namespace-scoped CR watch has a narrower replay than the
                 // broadcast; cluster-scoped and all-namespace watches replay
