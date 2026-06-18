@@ -1126,6 +1126,88 @@ pub fn merge_existing_node_mutable_fields(
     if !desired_has_external_ip && let Some(existing_external_ip) = existing_external_ip {
         set_node_external_ip(desired, &existing_external_ip);
     }
+    // `status.conditions` is co-authored: the worker posts its
+    // dataplane-derived `Ready`/`NetworkUnavailable` via this forwarded update,
+    // while the leader's node_lifecycle controller writes `Ready=Unknown` on
+    // lease expiry via CAS (node_lifecycle.rs). This forwarded path drops the
+    // RV precondition (apply_against_latest), so an unconditionally
+    // overwriting merge lets a stale worker snapshot revert the leader's
+    // fresher Unknown (lost update — the worker's queued Ready=True, retried
+    // after the leader marked Unknown, would clobber it for a heartbeat
+    // window and let the scheduler place Pods on an unhealthy Node). Merge
+    // conditions per type by `lastTransitionTime` (newest wins, K8s
+    // condition contract): a stale worker snapshot has an older transition
+    // time and loses, while a genuine recovery transition (Unknown->True)
+    // stamps a newer time and wins.
+    merge_node_status_conditions(desired, existing);
+}
+
+/// Merge `status.conditions` from `existing` into `desired`, per condition
+/// `type`, keeping the freshest by `lastTransitionTime`. See
+/// [`merge_existing_node_mutable_fields`] for the lost-update rationale.
+fn merge_node_status_conditions(desired: &mut serde_json::Value, existing: &serde_json::Value) {
+    let Some(desired_conditions) = desired
+        .pointer_mut("/status/conditions")
+        .and_then(|value| value.as_array_mut())
+    else {
+        // Worker snapshot carries no conditions: nothing to merge.
+        return;
+    };
+    let Some(existing_conditions) = existing
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array())
+    else {
+        // No leader conditions to preserve.
+        return;
+    };
+    for existing_cond in existing_conditions {
+        let Some(cond_type) = existing_cond.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        match desired_conditions
+            .iter()
+            .position(|c| c.get("type").and_then(|v| v.as_str()) == Some(cond_type))
+        {
+            None => {
+                // Leader-owned condition type absent from the worker snapshot:
+                // preserve it instead of letting the forwarded update drop it.
+                desired_conditions.push(existing_cond.clone());
+            }
+            Some(idx) => {
+                // Both writers authored this condition type: keep the worker's
+                // (desired) only when it is strictly newer; on a tie or older,
+                // prefer the leader's (existing) so a retried worker snapshot
+                // cannot revert an authoritative write.
+                if !condition_is_strictly_newer(&desired_conditions[idx], existing_cond) {
+                    desired_conditions[idx] = existing_cond.clone();
+                }
+            }
+        }
+    }
+}
+
+/// True when condition `a` has a strictly newer `lastTransitionTime` than `b`.
+/// Falls back to lexicographic RFC3339 comparison when the timestamps do not
+/// parse, and to `false` (keep `b`) when either side lacks a timestamp —
+/// conservative against reverting an authoritative condition.
+fn condition_is_strictly_newer(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let a_time = a.get("lastTransitionTime").and_then(|v| v.as_str());
+    let b_time = b.get("lastTransitionTime").and_then(|v| v.as_str());
+    match (a_time, b_time) {
+        (Some(a_str), Some(b_str)) => match (parse_rfc3339_utc(a_str), parse_rfc3339_utc(b_str)) {
+            (Some(a_dt), Some(b_dt)) => a_dt > b_dt,
+            // Unparseable but present: lexicographic RFC3339-UTC is chronological.
+            _ => a_str > b_str,
+        },
+        // Missing a timestamp: do not claim newer; let the caller keep `b`.
+        _ => false,
+    }
+}
+
+fn parse_rfc3339_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 fn node_status_external_ip(node: &serde_json::Value) -> Option<&str> {
@@ -1564,6 +1646,86 @@ mod tests {
                     }
                 })
             })
+    }
+
+    fn node_with_ready_condition(
+        status: &str,
+        reason: &str,
+        last_transition: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-a", "resourceVersion": "10"},
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": status, "reason": reason, "message": "m", "lastTransitionTime": last_transition}
+                ]
+            }
+        })
+    }
+
+    // Issue #3: a forwarded worker Node update (apply_against_latest, no RV
+    // precondition) must not let a stale worker status.conditions revert the
+    // leader's fresher authoritative condition.
+    #[test]
+    fn merge_node_fields_keeps_leader_unknown_against_stale_worker_ready() {
+        // Leader marked Ready=Unknown at 11:00 (lease expiry). The worker's
+        // queued snapshot still carries Ready=True from 10:00 (before the blip;
+        // the status never transitioned so lastTransitionTime is stale).
+        let mut desired = node_with_ready_condition("True", "KubeletReady", "2026-06-18T10:00:00Z");
+        let existing =
+            node_with_ready_condition("Unknown", "NodeStatusUnknown", "2026-06-18T11:00:00Z");
+        merge_existing_node_mutable_fields(&mut desired, &existing);
+        assert_eq!(
+            node_condition_status(&desired, "Ready"),
+            Some("Unknown"),
+            "a stale worker Ready=True must not revert the leader's fresher Ready=Unknown"
+        );
+    }
+
+    #[test]
+    fn merge_node_fields_lets_worker_recovery_transition_win() {
+        // Worker genuinely recovered: Ready transitioned Unknown->True at 12:00,
+        // stamping a lastTransitionTime newer than the leader's 11:00 Unknown.
+        let mut desired = node_with_ready_condition("True", "KubeletReady", "2026-06-18T12:00:00Z");
+        let existing =
+            node_with_ready_condition("Unknown", "NodeStatusUnknown", "2026-06-18T11:00:00Z");
+        merge_existing_node_mutable_fields(&mut desired, &existing);
+        assert_eq!(
+            node_condition_status(&desired, "Ready"),
+            Some("True"),
+            "a genuine recovery transition (newer lastTransitionTime) must win"
+        );
+    }
+
+    #[test]
+    fn merge_node_fields_preserves_leader_condition_absent_from_worker() {
+        // Worker snapshot lacks a condition the leader authored; the merge must
+        // preserve it rather than let the forwarded update drop it.
+        let mut desired = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-a"},
+            "status": {"conditions": [
+                {"type": "Ready", "status": "True", "reason": "KubeletReady", "message": "m", "lastTransitionTime": "2026-06-18T10:00:00Z"}
+            ]}
+        });
+        let existing = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-a"},
+            "status": {"conditions": [
+                {"type": "Ready", "status": "True", "reason": "KubeletReady", "message": "m", "lastTransitionTime": "2026-06-18T10:00:00Z"},
+                {"type": "MemoryPressure", "status": "False", "reason": "KubeletHasSufficientMemory", "message": "m", "lastTransitionTime": "2026-06-18T09:00:00Z"}
+            ]}
+        });
+        merge_existing_node_mutable_fields(&mut desired, &existing);
+        assert_eq!(
+            node_condition_status(&desired, "MemoryPressure"),
+            Some("False"),
+            "a leader-owned condition absent from the worker snapshot must be preserved"
+        );
     }
 
     async fn create_ready_node(db: &dyn DatastoreBackend, name: &str) {
