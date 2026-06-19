@@ -730,11 +730,16 @@ impl crate::replication::grpc::raft_rpc::RaftRpcRouter for RaftNodeRpcRouter {
 pub struct RaftNodeJoinHandler {
     node: Arc<RaftNode>,
     db: crate::datastore::DatastoreHandle,
+    membership_metadata_mutex: tokio::sync::Mutex<()>,
 }
 
 impl RaftNodeJoinHandler {
     pub fn new(node: Arc<RaftNode>, db: crate::datastore::DatastoreHandle) -> Self {
-        Self { node, db }
+        Self {
+            node,
+            db,
+            membership_metadata_mutex: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// Register a joining voter's Node object in the cluster DB via
@@ -804,7 +809,8 @@ impl RaftNodeJoinHandler {
         admitted_node_name: &str,
         as_learner: bool,
     ) -> anyhow::Result<()> {
-        let mut membership = match crate::bootstrap::cluster_meta::read_cluster_membership(
+        let _guard = self.membership_metadata_mutex.lock().await;
+        let membership = match crate::bootstrap::cluster_meta::read_cluster_membership(
             self.db.as_ref(),
         )
         .await
@@ -818,13 +824,25 @@ impl RaftNodeJoinHandler {
                 return Ok(());
             }
         };
-
-        if !as_learner {
-            membership.voters.push(admitted_node_name.to_string());
-            membership.voters.sort();
-            membership.voters.dedup();
-        }
-        membership.leader_hint = Some(self.node.authoring_node.clone());
+        let latest = match crate::bootstrap::cluster_meta::read_cluster_membership(self.db.as_ref())
+            .await
+        {
+            Ok(latest) => Some(latest),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "JoinAsControlplane: latest cluster membership metadata unavailable; refreshing from initial snapshot"
+                );
+                None
+            }
+        };
+        let membership = merge_controlplane_join_membership_metadata(
+            membership,
+            latest.as_ref(),
+            admitted_node_name,
+            as_learner,
+            &self.node.authoring_node,
+        );
         crate::bootstrap::cluster_meta::write_cluster_membership(self.db.as_ref(), &membership)
             .await
             .with_context(|| {
@@ -833,6 +851,28 @@ impl RaftNodeJoinHandler {
                 )
             })
     }
+}
+
+fn merge_controlplane_join_membership_metadata(
+    mut membership: crate::control_plane::client::membership::ClusterMembership,
+    latest: Option<&crate::control_plane::client::membership::ClusterMembership>,
+    admitted_node_name: &str,
+    as_learner: bool,
+    leader_hint: &str,
+) -> crate::control_plane::client::membership::ClusterMembership {
+    if let Some(latest) = latest
+        && latest.cluster_id == membership.cluster_id
+    {
+        membership.voters.extend(latest.voters.iter().cloned());
+        membership.term = membership.term.max(latest.term);
+    }
+    if !as_learner {
+        membership.voters.push(admitted_node_name.to_string());
+    }
+    membership.voters.sort();
+    membership.voters.dedup();
+    membership.leader_hint = Some(leader_hint.to_string());
+    membership
 }
 
 #[async_trait]
@@ -1015,6 +1055,43 @@ mod tests {
             derive_operation_label(&command),
             crate::kubelet::outbox::payload::OutboxOperation::NodeStatus,
             "direct API Node updates must not use the kubelet NodeStatus outbox operation"
+        );
+    }
+
+    #[test]
+    fn join_membership_metadata_merge_preserves_concurrent_voters() {
+        let stale = crate::control_plane::client::membership::ClusterMembership {
+            cluster_id: "cluster-a".to_string(),
+            voters: vec![
+                "mn-controlplane1".to_string(),
+                "mn-controlplane2".to_string(),
+            ],
+            term: 0,
+            leader_hint: Some("mn-controlplane1".to_string()),
+        };
+        let latest = crate::control_plane::client::membership::ClusterMembership {
+            cluster_id: "cluster-a".to_string(),
+            voters: vec![
+                "mn-controlplane1".to_string(),
+                "mn-controlplane2".to_string(),
+                "mn-controlplane3".to_string(),
+            ],
+            term: 0,
+            leader_hint: Some("mn-controlplane1".to_string()),
+        };
+
+        let merged = merge_controlplane_join_membership_metadata(
+            stale,
+            Some(&latest),
+            "mn-controlplane2",
+            false,
+            "mn-controlplane1",
+        );
+
+        assert_eq!(
+            merged.voters,
+            vec!["mn-controlplane1", "mn-controlplane2", "mn-controlplane3"],
+            "a late duplicate JoinAsControlplane retry must not shrink voters metadata"
         );
     }
 
