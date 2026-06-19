@@ -9,13 +9,32 @@ use crate::datastore::DatastoreBackend;
 use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 use crate::label_selector::LabelSelector;
 use anyhow::{Context as _, Result};
+use futures::future::{poll_fn, select_all};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
+use std::task::Poll;
 
 type ReplicationControllerReconcileLocks = HashMap<String, Arc<tokio::sync::Mutex<()>>>;
+type PodCreateFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<crate::datastore::Resource>> + Send + 'a>>;
+
+enum ScaleUpPollResult {
+    Status(Result<()>),
+    Create(Result<crate::datastore::Resource>),
+}
+
+struct ScaleUpProgress<'state, 'future> {
+    in_flight_creates: &'state mut Vec<PodCreateFuture<'future>>,
+    owned_pods: &'state mut Vec<crate::datastore::Resource>,
+    created_in_reconcile: &'state mut usize,
+    creation_failure: &'state mut Option<String>,
+}
 
 const RC_SCALE_UP_PROGRESS_INTERVAL: usize = 10;
+const RC_SCALE_UP_MAX_IN_FLIGHT: usize = 4;
 
 static REPLICATIONCONTROLLER_RECONCILE_LOCKS: LazyLock<
     tokio::sync::Mutex<ReplicationControllerReconcileLocks>,
@@ -183,32 +202,57 @@ pub async fn reconcile_replicationcontroller(
     // Scale up or down.
     let mut creation_failure: Option<String> = None;
     if current_replicas < desired_replicas {
-        let to_create = desired_replicas - current_replicas;
         let mut created_in_reconcile = 0usize;
-        for _ in 0..to_create {
-            let Some(live_rc) = db
-                .get_resource("v1", "ReplicationController", Some(namespace), rc_name)
-                .await?
-            else {
-                return Ok(());
-            };
-            if live_rc
-                .data
-                .pointer("/metadata/deletionTimestamp")
-                .is_some()
-            {
-                return Ok(());
+        let mut stop_starting_creates = false;
+        let mut in_flight_creates: Vec<PodCreateFuture<'_>> = Vec::new();
+
+        loop {
+            if !stop_starting_creates && in_flight_creates.is_empty() {
+                let create_batch_limit =
+                    scale_up_create_concurrency_limit(db, namespace, template).await?;
+                while in_flight_creates.len() < create_batch_limit
+                    && current_replicas + created_in_reconcile + in_flight_creates.len()
+                        < desired_replicas
+                {
+                    let Some(live_rc) = db
+                        .get_resource("v1", "ReplicationController", Some(namespace), rc_name)
+                        .await?
+                    else {
+                        return Ok(());
+                    };
+                    if live_rc
+                        .data
+                        .pointer("/metadata/deletionTimestamp")
+                        .is_some()
+                    {
+                        return Ok(());
+                    }
+                    let live_replicas = live_rc
+                        .data
+                        .pointer("/spec/replicas")
+                        .and_then(|r| r.as_i64())
+                        .unwrap_or(1)
+                        .max(0) as usize;
+                    if current_replicas + created_in_reconcile + in_flight_creates.len()
+                        >= live_replicas
+                    {
+                        stop_starting_creates = true;
+                        break;
+                    }
+                    in_flight_creates.push(Box::pin(create_pod(
+                        pod_writer, rc_name, rc_uid, namespace, node_name, template,
+                    )));
+                }
             }
-            let live_replicas = live_rc
-                .data
-                .pointer("/spec/replicas")
-                .and_then(|r| r.as_i64())
-                .unwrap_or(1)
-                .max(0) as usize;
-            if current_replicas + created_in_reconcile >= live_replicas {
+
+            if in_flight_creates.is_empty() {
                 break;
             }
-            match create_pod(pod_writer, rc_name, rc_uid, namespace, node_name, template).await {
+            let (create_result, _completed_index, remaining_creates) =
+                select_all(in_flight_creates).await;
+            in_flight_creates = remaining_creates;
+
+            match create_result {
                 Ok(created) => {
                     owned_pods.push(created);
                     created_in_reconcile += 1;
@@ -217,19 +261,28 @@ pub async fn reconcile_replicationcontroller(
                         desired_replicas,
                         created_in_reconcile,
                     ) {
-                        update_replicationcontroller_status(
+                        let status_pods = owned_pods.clone();
+                        update_replicationcontroller_status_while_polling_creates(
                             db,
                             rc_name,
                             namespace,
-                            &owned_pods,
-                            None,
+                            status_pods,
+                            ScaleUpProgress {
+                                in_flight_creates: &mut in_flight_creates,
+                                owned_pods: &mut owned_pods,
+                                created_in_reconcile: &mut created_in_reconcile,
+                                creation_failure: &mut creation_failure,
+                            },
                         )
                         .await?;
+                        if creation_failure.is_some() {
+                            stop_starting_creates = true;
+                        }
                     }
                 }
                 Err(err) => {
                     creation_failure = Some(err.to_string());
-                    break;
+                    stop_starting_creates = true;
                 }
             }
         }
@@ -263,7 +316,7 @@ pub async fn reconcile_replicationcontroller(
     }
 
     // Re-query owned pods after scale operations to get fresh state.
-    let current_owned_pods = pod_reader
+    let mut current_owned_pods = pod_reader
         .list_pods(Some(namespace), None, None, None, None)
         .await?
         .items
@@ -272,6 +325,48 @@ pub async fn reconcile_replicationcontroller(
             common.is_owned_by(&pod.data, rc_uid) && pod_matches_selector(&pod.data, &selector)
         })
         .collect::<Vec<_>>();
+
+    let Some(live_rc) = db
+        .get_resource("v1", "ReplicationController", Some(namespace), rc_name)
+        .await?
+    else {
+        return Ok(());
+    };
+    if live_rc
+        .data
+        .pointer("/metadata/deletionTimestamp")
+        .is_some()
+    {
+        return Ok(());
+    }
+    let live_desired_replicas = live_rc
+        .data
+        .pointer("/spec/replicas")
+        .and_then(|r| r.as_i64())
+        .unwrap_or(1)
+        .max(0) as usize;
+    let active_after_scale = active_replicationcontroller_pods(&current_owned_pods);
+    if active_after_scale.len() > live_desired_replicas {
+        let surplus = active_after_scale.len() - live_desired_replicas;
+        let surplus_pod_names = active_after_scale
+            .iter()
+            .take(surplus)
+            .map(|pod| pod.name.clone())
+            .collect::<Vec<_>>();
+        drop(active_after_scale);
+        for pod_name in surplus_pod_names {
+            pod_writer.delete_pod(namespace, &pod_name).await?;
+        }
+        current_owned_pods = pod_reader
+            .list_pods(Some(namespace), None, None, None, None)
+            .await?
+            .items
+            .into_iter()
+            .filter(|pod| {
+                common.is_owned_by(&pod.data, rc_uid) && pod_matches_selector(&pod.data, &selector)
+            })
+            .collect::<Vec<_>>();
+    }
 
     // Update RC status, including the ReplicaFailure condition if any pod creation failed.
     update_replicationcontroller_status(
@@ -303,6 +398,83 @@ fn should_publish_scale_up_progress(
     created_in_reconcile == 1
         || observed_replicas == desired_replicas
         || observed_replicas.is_multiple_of(RC_SCALE_UP_PROGRESS_INTERVAL)
+}
+
+async fn scale_up_create_concurrency_limit(
+    db: &dyn DatastoreBackend,
+    namespace: &str,
+    template: &Value,
+) -> Result<usize> {
+    let quota_list = db
+        .list_resources(
+            "v1",
+            "ResourceQuota",
+            Some(namespace),
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await?;
+
+    if quota_list.items.is_empty() {
+        return Ok(RC_SCALE_UP_MAX_IN_FLIGHT);
+    }
+
+    let quota_probe_pod = quota_probe_pod_from_template(namespace, template);
+    let has_matching_pod_quota = quota_list
+        .items
+        .iter()
+        .any(|quota| resource_quota_constrains_pod_creates(&quota.data, &quota_probe_pod));
+    Ok(if has_matching_pod_quota {
+        1
+    } else {
+        RC_SCALE_UP_MAX_IN_FLIGHT
+    })
+}
+
+fn quota_probe_pod_from_template(namespace: &str, template: &Value) -> Value {
+    json!({
+        "metadata": {
+            "namespace": namespace,
+            "labels": template.pointer("/metadata/labels").cloned().unwrap_or_else(|| json!({}))
+        },
+        "spec": template.get("spec").cloned().unwrap_or_else(|| json!({}))
+    })
+}
+
+fn resource_quota_constrains_pod_creates(quota: &Value, pod: &Value) -> bool {
+    let Some(hard) = quota
+        .pointer("/spec/hard")
+        .and_then(|value| value.as_object())
+    else {
+        return false;
+    };
+    let scopes = quota
+        .pointer("/spec/scopes")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if !scopes.is_empty() && !crate::controllers::resource_quota::pod_matches_scopes(pod, &scopes) {
+        return false;
+    }
+
+    hard.keys().any(|key| pod_relevant_quota_key(key))
+}
+
+fn pod_relevant_quota_key(key: &str) -> bool {
+    matches!(
+        key,
+        "pods" | "count/pods" | "cpu" | "memory" | "ephemeral-storage"
+    ) || key
+        .strip_prefix("requests.")
+        .is_some_and(|resource| !resource.is_empty())
+        || key
+            .strip_prefix("limits.")
+            .is_some_and(|resource| !resource.is_empty())
 }
 
 /// Check if pod labels match RC selector. An empty selector matches nothing
@@ -373,6 +545,61 @@ async fn create_pod(
         .await?;
 
     Ok(created)
+}
+
+async fn update_replicationcontroller_status_while_polling_creates<'a>(
+    db: &dyn DatastoreBackend,
+    name: &str,
+    namespace: &str,
+    status_pods: Vec<crate::datastore::Resource>,
+    progress: ScaleUpProgress<'_, 'a>,
+) -> Result<()> {
+    let ScaleUpProgress {
+        in_flight_creates,
+        owned_pods,
+        created_in_reconcile,
+        creation_failure,
+    } = progress;
+    let mut status_update = Box::pin(update_replicationcontroller_status(
+        db,
+        name,
+        namespace,
+        &status_pods,
+        None,
+    ));
+
+    loop {
+        match poll_fn(|cx| {
+            let mut index = 0usize;
+            while index < in_flight_creates.len() {
+                match in_flight_creates[index].as_mut().poll(cx) {
+                    Poll::Ready(result) => {
+                        let _completed = in_flight_creates.swap_remove(index);
+                        return Poll::Ready(ScaleUpPollResult::Create(result));
+                    }
+                    Poll::Pending => index += 1,
+                }
+            }
+
+            match status_update.as_mut().poll(cx) {
+                Poll::Ready(result) => Poll::Ready(ScaleUpPollResult::Status(result)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
+        {
+            ScaleUpPollResult::Status(result) => return result,
+            ScaleUpPollResult::Create(Ok(created)) => {
+                owned_pods.push(created);
+                *created_in_reconcile += 1;
+            }
+            ScaleUpPollResult::Create(Err(err)) => {
+                if creation_failure.is_none() {
+                    *creation_failure = Some(err.to_string());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

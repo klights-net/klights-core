@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 
 struct SlowFirstCreateWriter {
     db: crate::datastore::sqlite::Datastore,
@@ -23,7 +23,15 @@ struct BlockingSecondCreateWriter {
     creates: AtomicUsize,
     first_create_persisted: Notify,
     second_create_started: Notify,
-    release_second_create: Notify,
+    release_second_create: Barrier,
+}
+
+struct BlockingFirstCreateWriter {
+    db: crate::datastore::sqlite::Datastore,
+    creates: AtomicUsize,
+    first_create_started: Notify,
+    second_create_started: Notify,
+    release_first_create: Barrier,
 }
 
 impl BlockingSecondCreateWriter {
@@ -33,7 +41,19 @@ impl BlockingSecondCreateWriter {
             creates: AtomicUsize::new(0),
             first_create_persisted: Notify::new(),
             second_create_started: Notify::new(),
-            release_second_create: Notify::new(),
+            release_second_create: Barrier::new(2),
+        }
+    }
+}
+
+impl BlockingFirstCreateWriter {
+    fn new(db: crate::datastore::sqlite::Datastore) -> Self {
+        Self {
+            db,
+            creates: AtomicUsize::new(0),
+            first_create_started: Notify::new(),
+            second_create_started: Notify::new(),
+            release_first_create: Barrier::new(2),
         }
     }
 }
@@ -205,7 +225,7 @@ impl PodObjectWriter for BlockingSecondCreateWriter {
         let create_index = self.creates.fetch_add(1, Ordering::SeqCst);
         if create_index == 1 {
             self.second_create_started.notify_one();
-            self.release_second_create.notified().await;
+            self.release_second_create.wait().await;
         }
 
         let created = self
@@ -216,6 +236,78 @@ impl PodObjectWriter for BlockingSecondCreateWriter {
             self.first_create_persisted.notify_one();
         }
         Ok(created)
+    }
+
+    async fn delete_pod(&self, ns: &str, name: &str) -> Result<()> {
+        self.db.delete_resource("v1", "Pod", Some(ns), name).await
+    }
+
+    async fn update_pod_owner_references(
+        &self,
+        ns: &str,
+        name: &str,
+        owner_refs: Vec<serde_json::Value>,
+    ) -> Result<Resource> {
+        let current = self
+            .db
+            .get_resource("v1", "Pod", Some(ns), name)
+            .await?
+            .expect("Pod should exist");
+        let mut pod: serde_json::Value = (*current.data).clone();
+        pod["metadata"]["ownerReferences"] = serde_json::Value::Array(owner_refs);
+        self.db
+            .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
+            .await
+    }
+
+    async fn merge_pod_labels(
+        &self,
+        ns: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> Result<Resource> {
+        let current = self
+            .db
+            .get_resource("v1", "Pod", Some(ns), name)
+            .await?
+            .expect("Pod should exist");
+        let mut pod: serde_json::Value = (*current.data).clone();
+        let label_map = pod["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .entry("labels".to_string())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .unwrap();
+        for (key, value) in labels {
+            label_map.insert(key, json!(value));
+        }
+        self.db
+            .update_resource("v1", "Pod", Some(ns), name, pod, current.resource_version)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl PodObjectWriter for BlockingFirstCreateWriter {
+    async fn create_controller_pod(
+        &self,
+        ns: &str,
+        name: &str,
+        _node_name: &str,
+        pod: serde_json::Value,
+    ) -> Result<Resource> {
+        let create_index = self.creates.fetch_add(1, Ordering::SeqCst);
+        if create_index == 0 {
+            self.first_create_started.notify_one();
+            self.release_first_create.wait().await;
+        } else if create_index == 1 {
+            self.second_create_started.notify_one();
+        }
+
+        self.db
+            .create_resource("v1", "Pod", Some(ns), name, pod)
+            .await
     }
 
     async fn delete_pod(&self, ns: &str, name: &str) -> Result<()> {
@@ -773,16 +865,26 @@ async fn test_rc_status_advances_while_large_scale_up_is_still_creating_pods() {
     .await
     .expect("reconcile must block on the second create");
 
-    let observed_replicas = db
-        .get_resource("v1", "ReplicationController", Some("default"), "slow-rc")
-        .await
-        .unwrap()
-        .expect("RC must exist")
-        .data
-        .pointer("/status/replicas")
-        .and_then(|value| value.as_u64());
+    let observed_replicas = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Some(replicas) = db
+                .get_resource("v1", "ReplicationController", Some("default"), "slow-rc")
+                .await
+                .unwrap()
+                .expect("RC must exist")
+                .data
+                .pointer("/status/replicas")
+                .and_then(|value| value.as_u64())
+            {
+                return replicas;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("RC status.replicas must advance before the full scale-up loop completes");
 
-    pod_writer.release_second_create.notify_one();
+    pod_writer.release_second_create.wait().await;
     tokio::time::timeout(std::time::Duration::from_secs(1), reconcile)
         .await
         .expect("reconcile should finish after releasing second create")
@@ -790,9 +892,89 @@ async fn test_rc_status_advances_while_large_scale_up_is_still_creating_pods() {
         .expect("reconcile should succeed");
 
     assert_eq!(
-        observed_replicas,
-        Some(1),
+        observed_replicas, 1,
         "RC status.replicas must reflect successfully created Pods before the full scale-up loop completes"
+    );
+}
+
+#[tokio::test]
+async fn test_rc_large_scale_up_starts_next_create_while_prior_create_is_in_flight() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let pod_reader = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let pod_writer = Arc::new(BlockingFirstCreateWriter::new(db.clone()));
+
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "default",
+        json!({"metadata": {"name": "default"}}),
+    )
+    .await
+    .unwrap();
+
+    let rc = json!({
+        "apiVersion": "v1",
+        "kind": "ReplicationController",
+        "metadata": {"name": "parallel-rc", "namespace": "default", "uid": "parallel-rc-uid"},
+        "spec": {
+            "replicas": 2,
+            "selector": {"app": "parallel"},
+            "template": {
+                "metadata": {"labels": {"app": "parallel"}},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+            }
+        }
+    });
+
+    db.create_resource(
+        "v1",
+        "ReplicationController",
+        Some("default"),
+        "parallel-rc",
+        rc.clone(),
+    )
+    .await
+    .unwrap();
+
+    let db_for_task = db.clone();
+    let reader_for_task = pod_reader.clone();
+    let writer_for_task = pod_writer.clone();
+    let rc_for_task = rc.clone();
+    let reconcile = tokio::spawn(async move {
+        reconcile_replicationcontroller(
+            &db_for_task,
+            reader_for_task.as_ref(),
+            writer_for_task.as_ref(),
+            reader_for_task.as_ref(),
+            &rc_for_task,
+            "test-node",
+        )
+        .await
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        pod_writer.first_create_started.notified(),
+    )
+    .await
+    .expect("first child Pod create must start");
+    let second_started_before_release = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        pod_writer.second_create_started.notified(),
+    )
+    .await;
+
+    pod_writer.release_first_create.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), reconcile)
+        .await
+        .expect("reconcile should finish after releasing first create")
+        .expect("reconcile task should not panic")
+        .expect("reconcile should succeed");
+
+    assert!(
+        second_started_before_release.is_ok(),
+        "ReplicationController scale-up must start more than one child create at a time so conformance-scale RCs complete under delayed control-plane writes"
     );
 }
 
