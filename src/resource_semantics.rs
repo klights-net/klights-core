@@ -67,3 +67,66 @@ pub fn preserve_status_subresource_on_main_update(
         obj.remove("status");
     }
 }
+
+pub fn preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
+    api_version: &str,
+    kind: &str,
+    current: &Value,
+    status: &mut Value,
+) {
+    if api_version != "v1" || kind != "Pod" {
+        return;
+    }
+
+    let Some(existing_conditions) = current
+        .pointer("/status/conditions")
+        .and_then(|conditions| conditions.as_array())
+    else {
+        return;
+    };
+    let preservable: Vec<Value> = existing_conditions
+        .iter()
+        .filter(|condition| {
+            condition
+                .get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|condition_type| !is_kubelet_rebuilt_pod_condition(condition_type))
+        })
+        .cloned()
+        .collect();
+    if preservable.is_empty() {
+        return;
+    }
+
+    let Some(status_obj) = status.as_object_mut() else {
+        return;
+    };
+    let conditions = status_obj
+        .entry("conditions".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !conditions.is_array() {
+        *conditions = Value::Array(Vec::new());
+    }
+    let Some(conditions) = conditions.as_array_mut() else {
+        return;
+    };
+
+    for condition in preservable {
+        let Some(condition_type) = condition.get("type").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if conditions.iter().any(|existing| {
+            existing.get("type").and_then(|value| value.as_str()) == Some(condition_type)
+        }) {
+            continue;
+        }
+        conditions.push(condition);
+    }
+}
+
+fn is_kubelet_rebuilt_pod_condition(condition_type: &str) -> bool {
+    matches!(
+        condition_type,
+        "PodScheduled" | "Initialized" | "ContainersReady" | "Ready"
+    )
+}

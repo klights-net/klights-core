@@ -7379,6 +7379,174 @@ async fn scheduler_preempts_controller_created_priority_class_pods() {
 }
 
 #[tokio::test]
+async fn scheduler_preemption_marks_api_created_priority_class_victim_disruption_target() {
+    use super::{PodApiWriter, PodReader};
+
+    let repo =
+        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
+            .await;
+    repo.store
+        .db()
+        .create_resource(
+            "v1",
+            "Node",
+            None,
+            "test-node",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "test-node"},
+                "spec": {"unschedulable": false},
+                "status": {
+                    "capacity": {
+                        "cpu": "8",
+                        "memory": "32Gi",
+                        "pods": "110",
+                        "scheduling.k8s.io/foo": "1"
+                    },
+                    "allocatable": {
+                        "cpu": "8",
+                        "memory": "32Gi",
+                        "pods": "110",
+                        "scheduling.k8s.io/foo": "1"
+                    },
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    for (name, value) in [("low", 1), ("high", 1000)] {
+        repo.store
+            .db()
+            .create_resource(
+                "scheduling.k8s.io/v1",
+                "PriorityClass",
+                None,
+                name,
+                json!({
+                    "apiVersion": "scheduling.k8s.io/v1",
+                    "kind": "PriorityClass",
+                    "metadata": {"name": name},
+                    "value": value
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    let node_affinity = json!({
+        "nodeAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": {
+                "nodeSelectorTerms": [{
+                    "matchFields": [{
+                        "key": "metadata.name",
+                        "operator": "In",
+                        "values": ["test-node"]
+                    }]
+                }]
+            }
+        }
+    });
+
+    repo.api_create_pod(api_create_request(
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "victim",
+                "namespace": "default",
+                "finalizers": ["example.com/test-finalizer"]
+            },
+            "spec": {
+                "priorityClassName": "low",
+                "affinity": node_affinity.clone(),
+                "containers": [{
+                    "name": "c",
+                    "image": "registry.k8s.io/pause:3.10",
+                    "resources": {
+                        "requests": {"scheduling.k8s.io/foo": "1"},
+                        "limits": {"scheduling.k8s.io/foo": "1"}
+                    }
+                }]
+            }
+        }),
+        false,
+    ))
+    .await
+    .unwrap();
+    repo.schedule_all_unbound_pods().await.unwrap();
+    let victim = repo.get_pod("default", "victim").await.unwrap().unwrap();
+    assert_eq!(
+        victim
+            .data
+            .pointer("/spec/nodeName")
+            .and_then(|v| v.as_str()),
+        Some("test-node")
+    );
+
+    repo.api_create_pod(api_create_request(
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "preemptor", "namespace": "default"},
+            "spec": {
+                "priorityClassName": "high",
+                "affinity": node_affinity,
+                "containers": [{
+                    "name": "c",
+                    "image": "registry.k8s.io/pause:3.10",
+                    "resources": {
+                        "requests": {"scheduling.k8s.io/foo": "1"},
+                        "limits": {"scheduling.k8s.io/foo": "1"}
+                    }
+                }]
+            }
+        }),
+        false,
+    ))
+    .await
+    .unwrap();
+    repo.schedule_all_unbound_pods().await.unwrap();
+
+    let preemptor = repo.get_pod("default", "preemptor").await.unwrap().unwrap();
+    assert_eq!(
+        preemptor
+            .data
+            .pointer("/spec/nodeName")
+            .and_then(|v| v.as_str()),
+        Some("test-node")
+    );
+    let victim = repo
+        .get_pod("default", "victim")
+        .await
+        .unwrap()
+        .expect("preempted victim remains until actor finalization");
+    assert!(
+        victim
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .and_then(|v| v.as_str())
+            .is_some(),
+        "preempted victim must be marked terminating: {:?}",
+        victim.data
+    );
+    assert!(
+        victim
+            .data
+            .pointer("/status/conditions")
+            .and_then(|v| v.as_array())
+            .is_some_and(|conditions| conditions.iter().any(|condition| {
+                condition.get("type").and_then(|v| v.as_str()) == Some("DisruptionTarget")
+                    && condition.get("status").and_then(|v| v.as_str()) == Some("True")
+                    && condition.get("reason").and_then(|v| v.as_str())
+                        == Some("PreemptionByScheduler")
+            })),
+        "preempted victim must include DisruptionTarget condition: {:?}",
+        victim.data
+    );
+}
+
+#[tokio::test]
 async fn scheduler_marks_finalized_preemption_victim_disruption_target() {
     use super::{PodApiWriter, PodReader};
 

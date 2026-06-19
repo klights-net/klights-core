@@ -159,6 +159,82 @@ async fn in_order_status_snapshots_apply_for_all_ops() {
 }
 
 #[tokio::test]
+async fn status_snapshot_preserves_live_non_kubelet_condition() {
+    let db = Datastore::new_in_memory().await.expect("db");
+    create_running_pod(&db, "uid-1").await;
+    db.update_status_only_with_preconditions(
+        "v1",
+        "Pod",
+        Some("default"),
+        "web",
+        json!({
+            "phase": "Running",
+            "conditions": [
+                {
+                    "type": "DisruptionTarget",
+                    "status": "True",
+                    "lastTransitionTime": "2026-06-19T17:07:55Z",
+                    "reason": "PreemptionByScheduler",
+                    "message": "Preempted by pod default/preemptor on node"
+                },
+                {"type": "PodScheduled", "status": "True"}
+            ]
+        }),
+        ResourcePreconditions::uid("uid-1"),
+    )
+    .await
+    .expect("seed live scheduler condition");
+
+    db.apply_outbox_transactionally(
+        "key-runtime",
+        OutboxOperation::PodStatus.as_str(),
+        &status_payload(
+            json!({
+                "phase": "Running",
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True"},
+                    {"type": "Initialized", "status": "True"},
+                    {"type": "ContainersReady", "status": "True"},
+                    {"type": "Ready", "status": "True"}
+                ],
+                "containerStatuses": [{
+                    "name": "app",
+                    "ready": true,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-06-19T17:07:51Z"}}
+                }]
+            }),
+            "uid-1",
+            Some(300),
+        ),
+        "worker-a",
+    )
+    .await
+    .expect("apply runtime status snapshot");
+
+    let pod = db
+        .get_resource("v1", "Pod", Some("default"), "web")
+        .await
+        .expect("read pod")
+        .expect("pod exists");
+    let conditions = pod
+        .data
+        .pointer("/status/conditions")
+        .and_then(|value| value.as_array())
+        .expect("status.conditions remains an array");
+    assert!(
+        conditions.iter().any(|condition| {
+            condition.get("type").and_then(|value| value.as_str()) == Some("DisruptionTarget")
+                && condition.get("status").and_then(|value| value.as_str()) == Some("True")
+                && condition.get("reason").and_then(|value| value.as_str())
+                    == Some("PreemptionByScheduler")
+        }),
+        "runtime status replay must preserve scheduler-owned DisruptionTarget: {:?}",
+        pod.data
+    );
+}
+
+#[tokio::test]
 async fn equal_stamp_snapshot_is_treated_as_already_applied() {
     let db = Datastore::new_in_memory().await.expect("db");
     create_running_pod(&db, "uid-1").await;

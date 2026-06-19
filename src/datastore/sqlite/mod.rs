@@ -990,7 +990,16 @@ impl Datastore {
                 }
                 let mut live: Value =
                     serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
-                live["status"] = status;
+                let mut next_status = status;
+                if apply_against_latest {
+                    crate::resource_semantics::preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
+                        &api_version,
+                        &kind,
+                        &live,
+                        &mut next_status,
+                    );
+                }
+                live["status"] = next_status;
                 ensure_resource_type_meta(&mut live, &api_version, &kind);
                 let uid = ensure_metadata_uid(&mut live);
                 let precondition_resource_version = if apply_against_latest {

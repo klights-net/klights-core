@@ -217,6 +217,21 @@ pub async fn apply_forwarded_command(
             preconditions,
             observed_status_stamp,
         } => {
+            let mut status = status;
+            if observed_status_stamp.is_some()
+                && api_version == "v1"
+                && kind == "Pod"
+                && let Some(current) = db
+                    .get_resource(&api_version, &kind, namespace.as_deref(), &name)
+                    .await?
+            {
+                crate::resource_semantics::preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
+                    &api_version,
+                    &kind,
+                    current.data.as_ref(),
+                    &mut status,
+                );
+            }
             let mut preconditions = preconditions;
             if preconditions.resource_version.is_none() {
                 preconditions.resource_version = expected_rv;

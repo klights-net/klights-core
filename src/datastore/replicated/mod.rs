@@ -405,11 +405,22 @@ where
             status,
             expected_rv,
             preconditions,
-            observed_status_stamp: _,
+            observed_status_stamp,
         } => {
             let current = backend
                 .get_resource(&api_version, &kind, namespace.as_deref(), &name)
                 .await?;
+            let mut status = status;
+            if observed_status_stamp.is_some()
+                && let Some(current) = current.as_ref()
+            {
+                crate::resource_semantics::preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
+                    &api_version,
+                    &kind,
+                    current.data.as_ref(),
+                    &mut status,
+                );
+            }
             let mut preconditions = preconditions;
             if preconditions.resource_version.is_some() {
                 preconditions.resource_version = current
