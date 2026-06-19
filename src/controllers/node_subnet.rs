@@ -211,9 +211,11 @@ async fn run_peer_watch_with_components_inner(
     }
 
     let mut applied: HashMap<String, AppliedPeer> = HashMap::new();
-    // Track the last published readiness so we only re-write the node's
-    // conditions when health actually changes (keeps the node idle-silent).
-    let mut last_readiness = dataplane_health.as_ref().map(|h| h.status());
+    // Track the last confirmed readiness so we only re-write the node's
+    // conditions when health actually changes. Start empty to force one
+    // persisted-state verification on watcher startup; unchanged conditions are
+    // memoed after that, while a missing Node is not.
+    let mut last_readiness: Option<DataplaneHealthStatus> = None;
 
     // Run an initial sync against an empty applied map so every peer known
     // in the datastore gets applied to the dataplane on watcher start.
@@ -609,7 +611,7 @@ async fn reconcile_local_readiness(
     match crate::kubelet::node::refresh_node_network_conditions(db, outbox, my_node_name, health)
         .await
     {
-        Ok(true) => {
+        Ok(crate::kubelet::node::NodeNetworkRefreshResult::Updated) => {
             tracing::info!(
                 node = %my_node_name,
                 ready = new_status.is_healthy(),
@@ -618,12 +620,19 @@ async fn reconcile_local_readiness(
             );
             *last_readiness = Some(new_status);
         }
-        Ok(false) => {
-            // Node not found or conditions unchanged — do NOT memo the readiness.
-            // A future re-sync (triggered by a Node watch event) must retry.
+        Ok(crate::kubelet::node::NodeNetworkRefreshResult::Unchanged) => {
+            *last_readiness = Some(new_status);
             tracing::debug!(
                 node = %my_node_name,
-                "node_subnet: readiness refresh skipped (node not found or conditions unchanged)"
+                "node_subnet: readiness refresh skipped (conditions unchanged)"
+            );
+        }
+        Ok(crate::kubelet::node::NodeNetworkRefreshResult::Missing) => {
+            // Node not found — do NOT memo the readiness. A future re-sync
+            // (triggered by a Node watch event) must retry.
+            tracing::debug!(
+                node = %my_node_name,
+                "node_subnet: readiness refresh skipped (node not found)"
             );
         }
         Err(e) => {
@@ -1912,6 +1921,56 @@ mod tests {
             last_readiness,
             Some(crate::networking::dataplane_health::DataplaneHealthStatus::Healthy),
             "last_readiness stays Healthy when conditions already match"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_local_readiness_memos_initial_noop_when_conditions_already_match() {
+        use crate::networking::dataplane_health::DataplaneHealth;
+
+        let db = crate::datastore::test_support::in_memory().await;
+        let health = DataplaneHealth::new_healthy();
+        let mut last_readiness = None;
+
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            "worker-node",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {
+                    "name": "worker-node",
+                    "annotations": {
+                        crate::controllers::annotations::GIT_COMMIT_ANNOTATION: crate::version::GIT_COMMIT_SHORT
+                    }
+                },
+                "status": {
+                    "conditions": [
+                        {"type": "Ready", "status": "True", "reason": "KubeletReady", "message": "klights is ready"},
+                        {"type": "NetworkUnavailable", "status": "False", "reason": "RouteCreated", "message": "RouteController created a route"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        super::reconcile_local_readiness(
+            &db,
+            None,
+            "worker-node",
+            Some(&health),
+            &super::PeerSyncOutcome::default(),
+            &mut last_readiness,
+        )
+        .await;
+
+        assert_eq!(
+            last_readiness,
+            Some(crate::networking::dataplane_health::DataplaneHealthStatus::Healthy),
+            "initial no-op reconcile must memo confirmed readiness so later Node events do not keep rechecking"
         );
     }
 }
