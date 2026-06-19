@@ -1803,6 +1803,7 @@ async fn start_pod_recovery_skips_already_realized_running_sandbox_with_parity()
     harness.simulate_running_containers(["container-live".to_string()]);
     harness.cri.clear_calls();
     harness.container_control.clear_calls();
+    harness.volumes.clear_calls();
 
     let result = harness
         .runtime
@@ -1852,6 +1853,79 @@ async fn start_pod_recovery_skips_already_realized_running_sandbox_with_parity()
             sandbox_id_filter: Some("sandbox-live".to_string())
         }],
         "runtime must verify the recorded sandbox has live containers before short-circuiting"
+    );
+    assert_eq!(
+        harness.volumes.recorded_calls(),
+        vec!["process_volumes:ns/restart-survivor/uid-restart".to_string()],
+        "restart recovery must reconcile volumes so projected serviceaccount tokens are refreshed"
+    );
+}
+
+#[tokio::test]
+async fn start_pod_recovery_returns_failed_when_volume_reconcile_fails() {
+    let harness = PodRuntimeHarness::new().await;
+    let key = PodRuntimeKey::new("ns", "restart-survivor", "uid-restart");
+    let mut pod = crate::kubelet::pod_runtime::test_support::pod_json(
+        &key.namespace,
+        &key.name,
+        &key.uid,
+        "nginx:1.25",
+    );
+    pod["status"] = serde_json::json!({
+        "phase": "Running",
+        "podIP": "10.0.0.21",
+        "hostIP": "192.168.1.1",
+        "containerStatuses": [{
+            "name": "app",
+            "containerID": "containerd://container-live",
+            "ready": true,
+            "started": true,
+            "restartCount": 0,
+            "state": {"running": {"startedAt": "2026-05-20T00:00:00Z"}}
+        }]
+    });
+    harness.create_runtime_pod(pod.clone()).await;
+    harness
+        .store
+        .record_sandbox(&key, "sandbox-live")
+        .await
+        .expect("record live sandbox");
+    harness.simulate_running_containers(["container-live".to_string()]);
+    harness
+        .volumes
+        .fail_process_volumes("projected token refresh failed");
+    harness.cri.clear_calls();
+
+    let result = harness
+        .runtime
+        .start_pod(key.clone(), Some(pod), CancellationToken::new())
+        .await
+        .expect("volume reconciliation failure should be reported as pod start result");
+
+    match result {
+        PodStartResult::Failed(message) => {
+            assert!(
+                message.contains("Failed to reconcile volumes for running pod"),
+                "failure should describe recovered volume reconciliation: {message}"
+            );
+            assert!(
+                message.contains("projected token refresh failed"),
+                "failure should retain the underlying volume error: {message}"
+            );
+        }
+        other => panic!("expected retryable failure, got {other:?}"),
+    }
+    let cri_ops: Vec<_> = harness
+        .cri
+        .recorded_calls()
+        .into_iter()
+        .map(|call| call.operation)
+        .collect();
+    assert!(
+        !cri_ops
+            .iter()
+            .any(|op| matches!(op, MockCriOperation::RunPodSandbox)),
+        "volume reconcile failure for a live sandbox must not recreate the sandbox: {cri_ops:?}"
     );
 }
 

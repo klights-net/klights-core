@@ -1728,6 +1728,17 @@ impl PodRuntimeService for RealPodRuntimeService {
                 sandbox_id = %sandbox_id,
                 "pod startup recovery found already realized running sandbox; skipping duplicate start"
             );
+            if let Err(e) = self.volumes.process_volumes(&key, &pod).await {
+                let message = format!("Failed to reconcile volumes for running pod: {e:#}");
+                tracing::warn!(
+                    namespace = key.namespace,
+                    name = key.name,
+                    uid = key.uid,
+                    sandbox_id = %sandbox_id,
+                    "{message}"
+                );
+                return Ok(PodStartResult::Failed(message));
+            }
             return Ok(PodStartResult::Started {
                 sandbox_id: Some(sandbox_id),
             });
