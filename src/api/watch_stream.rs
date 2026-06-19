@@ -342,6 +342,12 @@ pub(crate) fn bookmark_rv_for_watch_scope(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeriodicBookmarkDecision {
+    Bookmark(i64),
+    Expired,
+}
+
 /// Resolve the resourceVersion a periodic watch BOOKMARK must carry.
 ///
 /// Shared by every client-facing watch builder -- `build_label_selector_watch_stream`
@@ -398,7 +404,9 @@ pub(crate) struct PeriodicBookmarkContext<'a> {
 /// that is 0 (a quiet, freshly-established watch that has observed nothing)
 /// this falls back to a fresh collection snapshot read so the client still gets
 /// a valid, advancing resume point.
-pub(crate) async fn resolve_periodic_bookmark_rv(ctx: PeriodicBookmarkContext<'_>) -> i64 {
+pub(crate) async fn resolve_periodic_bookmark_decision(
+    ctx: PeriodicBookmarkContext<'_>,
+) -> PeriodicBookmarkDecision {
     let PeriodicBookmarkContext {
         db,
         api_version,
@@ -429,6 +437,33 @@ pub(crate) async fn resolve_periodic_bookmark_rv(ctx: PeriodicBookmarkContext<'_
             cursor_high_water_rv,
             "scoped watch bookmark held at delivered scoped rv"
         );
+        if label_selector.is_none()
+            && exact_metadata_name_field_selector(field_selector, watch_namespace).is_some()
+            && let Ok(list) = db
+                .list_resources(
+                    api_version,
+                    kind,
+                    watch_namespace,
+                    crate::datastore::ResourceListQuery::new(None, field_selector, Some(1), None),
+                )
+                .await
+            && list.items.is_empty()
+            && list.resource_version > rv
+        {
+            tracing::warn!(
+                target: "klights::watch_diag",
+                api_version = %api_version,
+                kind = %kind,
+                namespace = watch_namespace.unwrap_or(""),
+                field_selector = field_selector.unwrap_or(""),
+                requested_rv,
+                bookmark_rv = rv,
+                snapshot_rv = list.resource_version,
+                cursor_high_water_rv,
+                "scoped exact-name watch expired because selected object is absent and cursor advanced"
+            );
+            return PeriodicBookmarkDecision::Expired;
+        }
     }
     if rv <= 0 && !has_scope_filter {
         rv = db
@@ -442,7 +477,33 @@ pub(crate) async fn resolve_periodic_bookmark_rv(ctx: PeriodicBookmarkContext<'_
             .map(|list| list.resource_version)
             .unwrap_or(0);
     }
-    rv
+    PeriodicBookmarkDecision::Bookmark(rv)
+}
+
+fn exact_metadata_name_field_selector<'a>(
+    field_selector: Option<&'a str>,
+    watch_namespace: Option<&str>,
+) -> Option<&'a str> {
+    let selector = field_selector?;
+    let mut name = None;
+    for part in crate::label_selector::split_selector(selector) {
+        let (field, value) = part.split_once('=')?;
+        if part.contains("!=") {
+            return None;
+        }
+        let field = field.trim();
+        let value = value.trim();
+        if value.starts_with('=') {
+            return None;
+        }
+        match field {
+            "metadata.name" if !value.is_empty() => name = Some(value),
+            "metadata.namespace" if watch_namespace.is_some_and(|namespace| namespace == value) => {
+            }
+            _ => return None,
+        }
+    }
+    name
 }
 
 pub async fn maybe_spawn_watch_timeout_stream(
@@ -904,7 +965,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                     }
                 }
                 Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
-                    let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
+                    let decision = resolve_periodic_bookmark_decision(PeriodicBookmarkContext {
                         db: &db,
                         api_version: &api_version,
                         kind: &kind,
@@ -917,12 +978,24 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         last_delivered_scoped_rv,
                     })
                     .await;
-                    let event = WatchEvent::bookmark_typed(rv, &api_version, &kind);
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
-                        event,
-                        &kind,
-                        table_format,
-                    ));
+                    match decision {
+                        PeriodicBookmarkDecision::Bookmark(rv) => {
+                            let event = WatchEvent::bookmark_typed(rv, &api_version, &kind);
+                            yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
+                                event,
+                                &kind,
+                                table_format,
+                            ));
+                        }
+                        PeriodicBookmarkDecision::Expired => {
+                            yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                                410,
+                                "Expired",
+                                "too old resource version: exact-name watch scope is absent and the watch cursor advanced",
+                            ));
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -996,6 +1069,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exact_metadata_name_field_selector_requires_exact_identity_scope() {
+        assert_eq!(
+            exact_metadata_name_field_selector(Some("metadata.name=pod-a"), Some("default")),
+            Some("pod-a")
+        );
+        assert_eq!(
+            exact_metadata_name_field_selector(
+                Some("metadata.namespace=default,metadata.name=pod-a"),
+                Some("default")
+            ),
+            Some("pod-a")
+        );
+        assert_eq!(
+            exact_metadata_name_field_selector(Some("metadata.name!=pod-a"), Some("default")),
+            None
+        );
+        assert_eq!(
+            exact_metadata_name_field_selector(Some("metadata.name==pod-a"), Some("default")),
+            None
+        );
+        assert_eq!(
+            exact_metadata_name_field_selector(
+                Some("metadata.name=pod-a,status.phase=Running"),
+                Some("default")
+            ),
+            None
+        );
+        assert_eq!(
+            exact_metadata_name_field_selector(
+                Some("metadata.namespace=other,metadata.name=pod-a"),
+                Some("default")
+            ),
+            None
+        );
+    }
+
     /// Regression guard for the custom-resource watch builder, which used to mint
     /// every periodic BOOKMARK from `db.list_resources(...).resource_version` --
     /// the GLOBAL storage snapshot RV. Out-of-scope churn (other namespaces or
@@ -1006,7 +1116,7 @@ mod tests {
     /// A scoped watch must bookmark only the highest RV it has emitted for its
     /// scope, ignoring both the cursor high-water and a fresh collection read.
     #[tokio::test]
-    async fn resolve_periodic_bookmark_rv_scoped_anchors_to_delivered_frontier() {
+    async fn resolve_periodic_bookmark_decision_scoped_anchors_to_delivered_frontier() {
         let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
         // Seed unrelated objects so a naive "collection RV" read would return a
         // large global value; the scoped resolver must NOT touch it.
@@ -1031,7 +1141,7 @@ mod tests {
             "test fixture: global RV must be non-trivial, got {collection_rv}"
         );
 
-        let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
+        let decision = resolve_periodic_bookmark_decision(PeriodicBookmarkContext {
             db: &handle,
             api_version: "v1",
             kind: "ConfigMap",
@@ -1045,7 +1155,8 @@ mod tests {
         })
         .await;
         assert_eq!(
-            rv, 1,
+            decision,
+            PeriodicBookmarkDecision::Bookmark(1),
             "scoped watch bookmark must stay at the delivered scope frontier (1), \
              not the global cursor/collection RV ({collection_rv})"
         );
@@ -1053,9 +1164,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_periodic_bookmark_rv_selector_free_uses_cursor_high_water() {
+    async fn resolve_periodic_bookmark_decision_expires_absent_exact_name_scope() {
         let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
-        let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
+        ds.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "noise",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "noise", "namespace": "default"}
+            }),
+        )
+        .await
+        .unwrap();
+        let snapshot_rv = handle.get_current_resource_version().await.unwrap();
+
+        let decision = resolve_periodic_bookmark_decision(PeriodicBookmarkContext {
+            db: &handle,
+            api_version: "v1",
+            kind: "ConfigMap",
+            watch_namespace: Some("default"),
+            label_selector: None,
+            field_selector: Some("metadata.name=missing"),
+            requested_rv: snapshot_rv - 1,
+            has_scope_filter: true,
+            cursor_high_water_rv: snapshot_rv,
+            last_delivered_scoped_rv: snapshot_rv - 1,
+        })
+        .await;
+
+        assert_eq!(
+            decision,
+            PeriodicBookmarkDecision::Expired,
+            "an exact-name watch over an absent object must not emit endless same-rv bookmarks once the cursor advances"
+        );
+        let _ = ds;
+    }
+
+    #[tokio::test]
+    async fn resolve_periodic_bookmark_decision_selector_free_uses_cursor_high_water() {
+        let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
+        let decision = resolve_periodic_bookmark_decision(PeriodicBookmarkContext {
             db: &handle,
             api_version: "v1",
             kind: "ConfigMap",
@@ -1069,14 +1220,15 @@ mod tests {
         })
         .await;
         assert_eq!(
-            rv, 500,
+            decision,
+            PeriodicBookmarkDecision::Bookmark(500),
             "selector-free watch may bookmark the cursor's full high-water RV"
         );
         let _ = ds;
     }
 
     #[tokio::test]
-    async fn resolve_periodic_bookmark_rv_selector_free_falls_back_to_collection_when_zero() {
+    async fn resolve_periodic_bookmark_decision_selector_free_falls_back_to_collection_when_zero() {
         let (ds, handle) = crate::datastore::sqlite::test_support::in_memory_with_handle().await;
         ds.create_resource(
             "v1",
@@ -1095,7 +1247,7 @@ mod tests {
 
         // A selector-free watch that has observed nothing yet (quiet,
         // freshly established) must still emit a valid, advancing resume point.
-        let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
+        let decision = resolve_periodic_bookmark_decision(PeriodicBookmarkContext {
             db: &handle,
             api_version: "v1",
             kind: "ConfigMap",
@@ -1109,7 +1261,8 @@ mod tests {
         })
         .await;
         assert_eq!(
-            rv, collection_rv,
+            decision,
+            PeriodicBookmarkDecision::Bookmark(collection_rv),
             "selector-free watch with no observed RV falls back to a fresh collection snapshot RV"
         );
     }
