@@ -258,7 +258,9 @@ pub async fn refresh_node_network_conditions(
     };
     let conditions = NodeNetworkConditions::from_health(Some(dataplane_health));
     let mut node = existing.data.as_ref().clone();
-    if !apply_network_conditions(&mut node, &conditions) {
+    let mut changed = stamp_current_git_commit_annotation(&mut node);
+    changed |= apply_network_conditions(&mut node, &conditions);
+    if !changed {
         return Ok(false);
     }
 
@@ -1160,6 +1162,8 @@ fn merge_node_status_conditions(desired: &mut serde_json::Value, existing: &serd
         // No leader conditions to preserve.
         return;
     };
+    let desired_network_pair_is_newer =
+        network_condition_pair_has_newer_transition(desired_conditions, existing_conditions);
     for existing_cond in existing_conditions {
         let Some(cond_type) = existing_cond.get("type").and_then(|v| v.as_str()) else {
             continue;
@@ -1174,6 +1178,9 @@ fn merge_node_status_conditions(desired: &mut serde_json::Value, existing: &serd
                 desired_conditions.push(existing_cond.clone());
             }
             Some(idx) => {
+                if desired_network_pair_is_newer && is_network_condition_type(cond_type) {
+                    continue;
+                }
                 // Both writers authored this condition type: keep the worker's
                 // (desired) only when it is strictly newer; on a tie or older,
                 // prefer the leader's (existing) so a retried worker snapshot
@@ -1184,6 +1191,52 @@ fn merge_node_status_conditions(desired: &mut serde_json::Value, existing: &serd
             }
         }
     }
+}
+
+fn is_network_condition_type(cond_type: &str) -> bool {
+    matches!(cond_type, "Ready" | "NetworkUnavailable")
+}
+
+fn network_condition_pair_has_newer_transition(
+    desired_conditions: &[serde_json::Value],
+    existing_conditions: &[serde_json::Value],
+) -> bool {
+    let desired_ready = condition_by_type(desired_conditions, "Ready");
+    let desired_network = condition_by_type(desired_conditions, "NetworkUnavailable");
+    let existing_ready = condition_by_type(existing_conditions, "Ready");
+    let existing_network = condition_by_type(existing_conditions, "NetworkUnavailable");
+
+    desired_network_pair_is_coherent(desired_ready, desired_network)
+        && ((desired_ready.is_some_and(|desired| {
+            existing_ready.is_some_and(|existing| condition_is_strictly_newer(desired, existing))
+        })) || (desired_network.is_some_and(|desired| {
+            existing_network.is_some_and(|existing| condition_is_strictly_newer(desired, existing))
+        })))
+}
+
+fn desired_network_pair_is_coherent(
+    ready: Option<&serde_json::Value>,
+    network: Option<&serde_json::Value>,
+) -> bool {
+    let ready_status = ready
+        .and_then(|condition| condition.get("status"))
+        .and_then(|value| value.as_str());
+    let network_status = network
+        .and_then(|condition| condition.get("status"))
+        .and_then(|value| value.as_str());
+    matches!(
+        (ready_status, network_status),
+        (Some("True"), Some("False")) | (Some("False"), Some("True"))
+    )
+}
+
+fn condition_by_type<'a>(
+    conditions: &'a [serde_json::Value],
+    cond_type: &str,
+) -> Option<&'a serde_json::Value> {
+    conditions
+        .iter()
+        .find(|condition| condition.get("type").and_then(|value| value.as_str()) == Some(cond_type))
 }
 
 /// True when condition `a` has a strictly newer `lastTransitionTime` than `b`.
@@ -1208,6 +1261,43 @@ fn parse_rfc3339_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn stamp_current_git_commit_annotation(node: &mut serde_json::Value) -> bool {
+    use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
+
+    let Some(node_object) = node.as_object_mut() else {
+        return false;
+    };
+    let metadata = node_object
+        .entry("metadata")
+        .or_insert_with(|| serde_json::json!({}));
+    if !metadata.is_object() {
+        *metadata = serde_json::json!({});
+    }
+    let Some(metadata_object) = metadata.as_object_mut() else {
+        return false;
+    };
+    let annotations = metadata_object
+        .entry("annotations")
+        .or_insert_with(|| serde_json::json!({}));
+    if !annotations.is_object() {
+        *annotations = serde_json::json!({});
+    }
+    let Some(annotations_object) = annotations.as_object_mut() else {
+        return false;
+    };
+    let current = annotations_object
+        .get(GIT_COMMIT_ANNOTATION)
+        .and_then(|value| value.as_str());
+    if current == Some(crate::version::GIT_COMMIT_SHORT) {
+        return false;
+    }
+    annotations_object.insert(
+        GIT_COMMIT_ANNOTATION.to_string(),
+        serde_json::json!(crate::version::GIT_COMMIT_SHORT),
+    );
+    true
 }
 
 fn node_status_external_ip(node: &serde_json::Value) -> Option<&str> {
@@ -1700,6 +1790,44 @@ mod tests {
     }
 
     #[test]
+    fn merge_node_fields_accepts_coherent_network_recovery_when_ready_timestamp_ties() {
+        let mut desired = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-a", "resourceVersion": "10"},
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": "True", "reason": "KubeletReady", "message": "klights is ready", "lastTransitionTime": "2026-06-19T07:44:56Z"},
+                    {"type": "NetworkUnavailable", "status": "False", "reason": "RouteCreated", "message": "RouteController created a route", "lastTransitionTime": "2026-06-19T07:44:57Z"}
+                ]
+            }
+        });
+        let existing = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-a", "resourceVersion": "11"},
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": "False", "reason": "NetworkUnavailable", "message": "Waiting for peer dataplane connectivity", "lastTransitionTime": "2026-06-19T07:44:56Z"},
+                    {"type": "NetworkUnavailable", "status": "True", "reason": "DataplaneNotReady", "message": "Waiting for peer dataplane connectivity", "lastTransitionTime": "2026-06-19T07:44:56Z"}
+                ]
+            }
+        });
+
+        merge_existing_node_mutable_fields(&mut desired, &existing);
+
+        assert_eq!(
+            node_condition_status(&desired, "Ready"),
+            Some("True"),
+            "a coherent network recovery must not leave Ready=False when NetworkUnavailable=False is newer"
+        );
+        assert_eq!(
+            node_condition_status(&desired, "NetworkUnavailable"),
+            Some("False")
+        );
+    }
+
+    #[test]
     fn merge_node_fields_preserves_leader_condition_absent_from_worker() {
         // Worker snapshot lacks a condition the leader authored; the merge must
         // preserve it rather than let the forwarded update drop it.
@@ -1737,7 +1865,12 @@ mod tests {
             serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Node",
-                "metadata": {"name": name},
+                "metadata": {
+                    "name": name,
+                    "annotations": {
+                        crate::controllers::annotations::GIT_COMMIT_ANNOTATION: crate::version::GIT_COMMIT_SHORT
+                    }
+                },
                 "status": {
                     "conditions": [
                         {"type": "Ready", "status": "True", "reason": "KubeletReady", "message": "klights is ready", "lastTransitionTime": k8s_time_now()},
@@ -1802,6 +1935,56 @@ mod tests {
         assert_eq!(
             node_condition_status(&node.data, "NetworkUnavailable"),
             Some("False")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_network_conditions_stamps_current_git_commit() {
+        use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
+
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            "node-a",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {
+                    "name": "node-a",
+                    "annotations": {
+                        GIT_COMMIT_ANNOTATION: "oldcommit"
+                    }
+                },
+                "status": {
+                    "conditions": [
+                        {"type": "Ready", "status": "False", "reason": "NetworkUnavailable", "message": "waiting", "lastTransitionTime": "2026-06-19T07:44:56Z"},
+                        {"type": "NetworkUnavailable", "status": "True", "reason": "DataplaneNotReady", "message": "waiting", "lastTransitionTime": "2026-06-19T07:44:56Z"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let health = DataplaneHealth::new_healthy();
+        health.set_peers_connected();
+        refresh_node_network_conditions(&db, None, "node-a", &health)
+            .await
+            .unwrap();
+
+        let node = db
+            .get_resource("v1", "Node", None, "node-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            node.data
+                .pointer("/metadata/annotations/klights.io~1git-commit")
+                .and_then(|value| value.as_str()),
+            Some(crate::version::GIT_COMMIT_SHORT),
+            "network status refresh must not forward a stale build commit from the local Node cache"
         );
     }
 
