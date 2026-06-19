@@ -12,6 +12,10 @@ const NFT_CT_PROTOCOL: u32 = 10;
 const NFT_CT_PROTO_DST: u32 = 12;
 const NFT_CT_DST_IP: u32 = 20;
 const LINUX_IFNAMSIZ: usize = 16;
+const HOST_FORWARD_COMPAT_FAMILY: &str = "ip";
+const HOST_FORWARD_COMPAT_TABLE: &str = "filter";
+const HOST_FORWARD_COMPAT_CHAIN: &str = "FORWARD";
+const HOST_FORWARD_COMPAT_COMMENT: &str = "klights-forward-compat";
 
 #[derive(Clone, Copy)]
 enum CtOriginalKey {
@@ -104,6 +108,7 @@ pub struct KlightsTable {
     /// deltas. Lives on the table instance so the OnceLock global
     /// registry can be deleted (Task 5 of the network refactor).
     hostport_registry: std::sync::Mutex<std::collections::HashMap<Ipv4Addr, Vec<HostPortSpec>>>,
+    host_forward_compat_enabled: bool,
     /// Remote rootless pod endpoints keyed by pod IP. Root nodes use this
     /// registry to rebuild `remote_pod_v4` from `pod_endpoints` without
     /// reading kernel state back.
@@ -169,6 +174,40 @@ impl DnatEndpointRuleSpec {
             probability,
         }
     }
+}
+
+fn nft_args<const N: usize>(args: [&str; N]) -> Vec<String> {
+    args.into_iter().map(str::to_string).collect()
+}
+
+fn ipv4_prefix_len(mask: Ipv4Addr) -> u32 {
+    u32::from(mask).count_ones()
+}
+
+fn forward_compat_rule_handles(listing: &[u8], comment: &str) -> Result<Vec<u64>> {
+    let value: serde_json::Value =
+        serde_json::from_slice(listing).context("parse nft JSON listing")?;
+    let handles = value
+        .get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("rule"))
+        .filter(|rule| rule_has_comment(rule, comment))
+        .filter_map(|rule| rule.get("handle").and_then(serde_json::Value::as_u64))
+        .collect();
+    Ok(handles)
+}
+
+fn rule_has_comment(rule: &serde_json::Value, comment: &str) -> bool {
+    if rule.get("comment").and_then(serde_json::Value::as_str) == Some(comment) {
+        return true;
+    }
+    rule.get("expr")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|expr| expr.get("comment").and_then(serde_json::Value::as_str) == Some(comment))
 }
 
 pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<ServiceSpec>> {
@@ -313,6 +352,7 @@ impl KlightsTable {
             service_cidr_mask,
             mode,
             hostport_registry: std::sync::Mutex::new(std::collections::HashMap::new()),
+            host_forward_compat_enabled: !cfg!(test),
             remote_pod_registry: std::sync::Mutex::new(std::collections::HashMap::new()),
             hostport_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             remote_pod_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -437,6 +477,10 @@ impl KlightsTable {
             .replace_chain(&forward, &forward_rules)
             .await
             .context("replace filter-forward chain")?;
+
+        self.reconcile_host_forward_compat()
+            .await
+            .context("reconcile host FORWARD compatibility rules")?;
 
         // ---- NAT postrouting ----
         let mut postrouting = Chain::new(NAT_POSTROUTING_CHAIN, &table);
@@ -740,6 +784,143 @@ impl KlightsTable {
                 ),
             }
         }
+    }
+
+    async fn reconcile_host_forward_compat(&self) -> Result<()> {
+        if !self.host_forward_compat_enabled {
+            return Ok(());
+        }
+        self.reconcile_forward_compat_chain(
+            HOST_FORWARD_COMPAT_FAMILY,
+            HOST_FORWARD_COMPAT_TABLE,
+            HOST_FORWARD_COMPAT_CHAIN,
+            HOST_FORWARD_COMPAT_COMMENT,
+        )
+        .await
+    }
+
+    pub(crate) async fn reconcile_forward_compat_chain(
+        &self,
+        family: &str,
+        table: &str,
+        chain: &str,
+        comment: &str,
+    ) -> Result<()> {
+        let list = self
+            .run_nft(
+                "nft_forward_compat_list",
+                nft_args(["-j", "-a", "list", "chain", family, table, chain]),
+            )
+            .await?;
+        if !list.status.success() {
+            let stderr = String::from_utf8_lossy(&list.stderr);
+            tracing::debug!(
+                family,
+                table,
+                chain,
+                stderr = %stderr.trim(),
+                "host FORWARD compatibility chain absent; skipping"
+            );
+            return Ok(());
+        }
+
+        let handles = forward_compat_rule_handles(&list.stdout, comment)
+            .context("parse host FORWARD compatibility rules")?;
+        for handle in handles {
+            let handle_arg = handle.to_string();
+            let delete = self
+                .run_nft(
+                    "nft_forward_compat_delete",
+                    nft_args([
+                        "delete",
+                        "rule",
+                        family,
+                        table,
+                        chain,
+                        "handle",
+                        &handle_arg,
+                    ]),
+                )
+                .await?;
+            if !delete.status.success() {
+                let stderr = String::from_utf8_lossy(&delete.stderr);
+                tracing::debug!(
+                    family,
+                    table,
+                    chain,
+                    handle,
+                    stderr = %stderr.trim(),
+                    "stale host FORWARD compatibility rule already absent"
+                );
+            }
+        }
+
+        let bridge = self
+            .bridge_ifname
+            .to_str()
+            .context("bridge interface name is not valid UTF-8")?;
+        let pod_cidr = format!(
+            "{}/{}",
+            self.pod_subnet_ip,
+            ipv4_prefix_len(self.pod_subnet_mask)
+        );
+
+        self.add_forward_compat_rule(
+            family,
+            table,
+            chain,
+            ["iifname", bridge, "ip", "saddr", &pod_cidr],
+            comment,
+        )
+        .await?;
+        self.add_forward_compat_rule(
+            family,
+            table,
+            chain,
+            ["oifname", bridge, "ip", "daddr", &pod_cidr],
+            comment,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn add_forward_compat_rule<const N: usize>(
+        &self,
+        family: &str,
+        table: &str,
+        chain: &str,
+        matches: [&str; N],
+        comment: &str,
+    ) -> Result<()> {
+        let mut args = vec![
+            "add".to_string(),
+            "rule".to_string(),
+            family.to_string(),
+            table.to_string(),
+            chain.to_string(),
+        ];
+        args.extend(matches.into_iter().map(str::to_string));
+        args.extend([
+            "accept".to_string(),
+            "comment".to_string(),
+            comment.to_string(),
+        ]);
+
+        let output = self.run_nft("nft_forward_compat_add", args).await?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "add host FORWARD compatibility rule to {family} {table} {chain} failed: {}",
+            stderr.trim()
+        );
+    }
+
+    async fn run_nft(&self, name: &'static str, args: Vec<String>) -> Result<std::process::Output> {
+        self.nf.nft_output(name, args).await
     }
 
     fn table(&self) -> Table {

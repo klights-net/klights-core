@@ -21,6 +21,17 @@ mod integration_tests {
         }
     }
 
+    struct IpTableGuard {
+        name: String,
+    }
+    impl Drop for IpTableGuard {
+        fn drop(&mut self) {
+            let _ = Command::new("nft")
+                .args(["delete", "table", "ip", &self.name])
+                .status();
+        }
+    }
+
     fn unique_name(prefix: &str) -> String {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -83,6 +94,70 @@ mod integration_tests {
         assert!(
             accept_lines >= 3,
             "expected at least 3 accept rules in filter-forward, got {accept_lines}:\n{listing}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_reconcile_forward_compat_installs_idempotent_accepts_without_kube_mark() {
+        let name = unique_name("klights_sr_fwd_compat");
+        let ip_table = unique_name("klights_sr_ip_fwd");
+        let _guard = IpTableGuard {
+            name: ip_table.clone(),
+        };
+
+        let add_table = Command::new("nft")
+            .args(["add", "table", "ip", &ip_table])
+            .status()
+            .expect("nft add ip table");
+        assert!(add_table.success(), "create ip test table");
+        let add_chain = Command::new("nft")
+            .args(["add", "chain", "ip", &ip_table, "FORWARD"])
+            .status()
+            .expect("nft add ip chain");
+        assert!(add_chain.success(), "create ip test chain");
+
+        let table = build(&name);
+        table
+            .reconcile_forward_compat_chain(
+                "ip",
+                &ip_table,
+                "FORWARD",
+                "klights-forward-compat-test",
+            )
+            .await
+            .expect("first reconcile");
+        table
+            .reconcile_forward_compat_chain(
+                "ip",
+                &ip_table,
+                "FORWARD",
+                "klights-forward-compat-test",
+            )
+            .await
+            .expect("second reconcile must replace, not duplicate");
+
+        let chain = nft_ip_chain(&ip_table, "FORWARD");
+        let comment_count = chain.matches("klights-forward-compat-test").count();
+        assert_eq!(
+            comment_count, 2,
+            "reconcile must leave exactly one egress and one ingress accept rule:\n{chain}"
+        );
+        assert!(
+            chain.contains("iifname \"klights0\"")
+                && chain.contains("ip saddr 10.99.0.0/24")
+                && chain.contains("accept"),
+            "pod egress from the klights bridge must be explicitly accepted:\n{chain}"
+        );
+        assert!(
+            chain.contains("oifname \"klights0\"")
+                && chain.contains("ip daddr 10.99.0.0/24")
+                && chain.contains("accept"),
+            "pod ingress to the klights bridge must be explicitly accepted:\n{chain}"
+        );
+        assert!(
+            !chain.contains("meta mark"),
+            "compat accepts must not use KUBE-FORWARD's 0x4000 mark, which also triggers KUBE-POSTROUTING masquerade:\n{chain}"
         );
     }
 
@@ -327,6 +402,14 @@ mod integration_tests {
             .args(["list", "chain", "inet", table, chain])
             .output()
             .expect("nft list chain");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn nft_ip_chain(table: &str, chain: &str) -> String {
+        let out = Command::new("nft")
+            .args(["list", "chain", "ip", table, chain])
+            .output()
+            .expect("nft list ip chain");
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 

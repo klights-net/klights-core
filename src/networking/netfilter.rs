@@ -17,6 +17,7 @@ use anyhow::{Context, Result, anyhow};
 use mnl::Socket;
 use nftnl::{Batch as NftBatch, Chain, MsgType, NlMsg, ProtoFamily, Rule, Table};
 use std::ffi::CStr;
+use std::process::Output;
 use std::sync::{Arc, Mutex};
 
 /// Process-wide handle to the nf_tables netlink socket.
@@ -162,6 +163,19 @@ impl Netfilter {
             )
             .await
             .context("netlink send task failed")?
+    }
+
+    pub async fn nft_output(&self, name: impl Into<String>, args: Vec<String>) -> Result<Output> {
+        self.inner
+            .task_supervisor
+            .run_blocking(
+                crate::task_supervisor::TaskCategory::Network,
+                name,
+                move || std::process::Command::new("nft").args(args).output(),
+            )
+            .await
+            .context("nft command task failed")?
+            .context("run nft command")
     }
 }
 
