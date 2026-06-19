@@ -120,7 +120,12 @@ pub async fn enqueue_pod_status_side_effects(
             .enqueue_reconcile_key_with_priority(key.clone(), pod_status_workload_priority(&key))
             .await;
     }
-    for key in job_keys.into_iter().chain(service_keys).chain(pdb_keys) {
+    for key in service_keys {
+        controller_dispatcher
+            .enqueue_reconcile_key_with_priority(key, QueuePriority::High)
+            .await;
+    }
+    for key in job_keys.into_iter().chain(pdb_keys) {
         controller_dispatcher.enqueue_reconcile_key(key).await;
     }
 }
@@ -513,6 +518,100 @@ mod tests {
         assert_eq!(
             deployment_reconciles, 2,
             "worker-applied pod readiness must not collapse into the stale Deployment rollout key"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbox_ready_pod_status_preserves_followup_service_endpoint_reconcile() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Service",
+            Some("default"),
+            "web",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "web",
+                    "uid": "svc-web-uid"
+                },
+                "spec": {
+                    "selector": {"app": "web"},
+                    "ports": [{"name": "http", "port": 80, "targetPort": 9376, "protocol": "TCP"}]
+                }
+            }),
+        )
+        .await
+        .expect("create service");
+        let dispatcher = Arc::new(ControllerDispatcher::default());
+        let service_key = ReconcileKey::namespaced("v1", "Service", "default", "web");
+        dispatcher.enqueue_reconcile_key(service_key.clone()).await;
+
+        let command = StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web-pod".to_string(),
+            status: json!({"phase": "Running"}),
+            expected_rv: None,
+            preconditions: ResourcePreconditions {
+                uid: Some("pod-web-uid".to_string()),
+                resource_version: None,
+            },
+            observed_status_stamp: None,
+        };
+        let resource = ForwardedResource {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web-pod".to_string(),
+            resource_version: 2,
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "web-pod",
+                    "uid": "pod-web-uid",
+                    "labels": {"app": "web"}
+                },
+                "spec": {
+                    "containers": [{
+                        "name": "web",
+                        "image": "agnhost",
+                        "ports": [{"name": "http", "containerPort": 9376}]
+                    }]
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.50.1.2",
+                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "containerStatuses": [{"name": "web", "ready": true, "restartCount": 0}]
+                }
+            }),
+        };
+
+        enqueue_pod_status_side_effects(Some(&dispatcher), &command, Some(&resource), &db).await;
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            dispatcher.take_reconcile_key_for_test(),
+        )
+        .await
+        .expect("stale Service endpoint reconcile must already be queued");
+        assert_eq!(first, service_key);
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            dispatcher.take_reconcile_key_for_test(),
+        )
+        .await
+        .expect("ready Pod status must preserve a fresh Service endpoint reconcile");
+        assert_eq!(
+            second, service_key,
+            "worker-applied pod readiness must not collapse into a stale Service endpoint key"
         );
     }
 }
