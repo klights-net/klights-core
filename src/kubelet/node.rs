@@ -685,6 +685,9 @@ pub(crate) async fn register_node_impl_opts(
         .await
         .context("Failed to read existing Node resource")?
     {
+        if dataplane_health.is_none() {
+            preserve_existing_network_conditions(&mut node, &existing.data);
+        }
         merge_existing_node_mutable_fields(&mut node, &existing.data);
         if let Some(outbox) = outbox {
             let route = send_node_command(
@@ -1144,6 +1147,37 @@ pub fn merge_existing_node_mutable_fields(
     merge_node_status_conditions(desired, existing);
 }
 
+fn preserve_existing_network_conditions(
+    desired: &mut serde_json::Value,
+    existing: &serde_json::Value,
+) {
+    let Some(desired_conditions) = desired
+        .pointer_mut("/status/conditions")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+    let Some(existing_conditions) = existing
+        .pointer("/status/conditions")
+        .and_then(|value| value.as_array())
+    else {
+        return;
+    };
+
+    for cond_type in ["Ready", "NetworkUnavailable"] {
+        let Some(existing_condition) = condition_by_type(existing_conditions, cond_type).cloned()
+        else {
+            continue;
+        };
+        match desired_conditions.iter().position(|condition| {
+            condition.get("type").and_then(|value| value.as_str()) == Some(cond_type)
+        }) {
+            Some(index) => desired_conditions[index] = existing_condition,
+            None => desired_conditions.push(existing_condition),
+        }
+    }
+}
+
 /// Merge `status.conditions` from `existing` into `desired`, per condition
 /// `type`, keeping the freshest by `lastTransitionTime`. See
 /// [`merge_existing_node_mutable_fields`] for the lost-update rationale.
@@ -1162,8 +1196,8 @@ fn merge_node_status_conditions(desired: &mut serde_json::Value, existing: &serd
         // No leader conditions to preserve.
         return;
     };
-    let desired_network_pair_is_newer =
-        network_condition_pair_has_newer_transition(desired_conditions, existing_conditions);
+    let desired_network_pair_should_replace =
+        network_condition_pair_should_replace(desired_conditions, existing_conditions);
     for existing_cond in existing_conditions {
         let Some(cond_type) = existing_cond.get("type").and_then(|v| v.as_str()) else {
             continue;
@@ -1178,7 +1212,7 @@ fn merge_node_status_conditions(desired: &mut serde_json::Value, existing: &serd
                 desired_conditions.push(existing_cond.clone());
             }
             Some(idx) => {
-                if desired_network_pair_is_newer && is_network_condition_type(cond_type) {
+                if desired_network_pair_should_replace && is_network_condition_type(cond_type) {
                     continue;
                 }
                 // Both writers authored this condition type: keep the worker's
@@ -1214,20 +1248,69 @@ fn network_condition_pair_has_newer_transition(
         })))
 }
 
+fn network_condition_pair_should_replace(
+    desired_conditions: &[serde_json::Value],
+    existing_conditions: &[serde_json::Value],
+) -> bool {
+    if network_condition_pair_has_newer_transition(desired_conditions, existing_conditions) {
+        return true;
+    }
+
+    let desired_ready = condition_by_type(desired_conditions, "Ready");
+    let desired_network = condition_by_type(desired_conditions, "NetworkUnavailable");
+    let existing_ready = condition_by_type(existing_conditions, "Ready");
+    let existing_network = condition_by_type(existing_conditions, "NetworkUnavailable");
+
+    network_condition_pair_is_healthy(desired_ready, desired_network)
+        && network_condition_pair_is_unavailable(existing_ready, existing_network)
+        && network_condition_pair_timestamps_tie(
+            desired_ready,
+            desired_network,
+            existing_ready,
+            existing_network,
+        )
+}
+
 fn desired_network_pair_is_coherent(
     ready: Option<&serde_json::Value>,
     network: Option<&serde_json::Value>,
 ) -> bool {
-    let ready_status = ready
-        .and_then(|condition| condition.get("status"))
-        .and_then(|value| value.as_str());
-    let network_status = network
-        .and_then(|condition| condition.get("status"))
-        .and_then(|value| value.as_str());
     matches!(
-        (ready_status, network_status),
+        (condition_status(ready), condition_status(network)),
         (Some("True"), Some("False")) | (Some("False"), Some("True"))
     )
+}
+
+fn network_condition_pair_is_healthy(
+    ready: Option<&serde_json::Value>,
+    network: Option<&serde_json::Value>,
+) -> bool {
+    matches!(
+        (condition_status(ready), condition_status(network)),
+        (Some("True"), Some("False"))
+    )
+}
+
+fn network_condition_pair_is_unavailable(
+    ready: Option<&serde_json::Value>,
+    network: Option<&serde_json::Value>,
+) -> bool {
+    matches!(
+        (condition_status(ready), condition_status(network)),
+        (Some("False"), Some("True"))
+    )
+}
+
+fn network_condition_pair_timestamps_tie(
+    desired_ready: Option<&serde_json::Value>,
+    desired_network: Option<&serde_json::Value>,
+    existing_ready: Option<&serde_json::Value>,
+    existing_network: Option<&serde_json::Value>,
+) -> bool {
+    condition_transition_time(desired_ready).is_some()
+        && condition_transition_time(desired_ready) == condition_transition_time(existing_ready)
+        && condition_transition_time(desired_network).is_some()
+        && condition_transition_time(desired_network) == condition_transition_time(existing_network)
 }
 
 fn condition_by_type<'a>(
@@ -1237,6 +1320,18 @@ fn condition_by_type<'a>(
     conditions
         .iter()
         .find(|condition| condition.get("type").and_then(|value| value.as_str()) == Some(cond_type))
+}
+
+fn condition_status(condition: Option<&serde_json::Value>) -> Option<&str> {
+    condition
+        .and_then(|condition| condition.get("status"))
+        .and_then(|value| value.as_str())
+}
+
+fn condition_transition_time(condition: Option<&serde_json::Value>) -> Option<&str> {
+    condition
+        .and_then(|condition| condition.get("lastTransitionTime"))
+        .and_then(|value| value.as_str())
 }
 
 /// True when condition `a` has a strictly newer `lastTransitionTime` than `b`.
@@ -1828,6 +1923,44 @@ mod tests {
     }
 
     #[test]
+    fn merge_node_fields_accepts_network_recovery_when_pair_timestamps_tie() {
+        let mut desired = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-a", "resourceVersion": "10"},
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": "True", "reason": "KubeletReady", "message": "klights is ready", "lastTransitionTime": "2026-06-19T08:16:36Z"},
+                    {"type": "NetworkUnavailable", "status": "False", "reason": "RouteCreated", "message": "RouteController created a route", "lastTransitionTime": "2026-06-19T08:16:36Z"}
+                ]
+            }
+        });
+        let existing = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-a", "resourceVersion": "11"},
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": "False", "reason": "NetworkUnavailable", "message": "Waiting for peer dataplane connectivity", "lastTransitionTime": "2026-06-19T08:16:36Z"},
+                    {"type": "NetworkUnavailable", "status": "True", "reason": "DataplaneNotReady", "message": "Waiting for peer dataplane connectivity", "lastTransitionTime": "2026-06-19T08:16:36Z"}
+                ]
+            }
+        });
+
+        merge_existing_node_mutable_fields(&mut desired, &existing);
+
+        assert_eq!(
+            node_condition_status(&desired, "Ready"),
+            Some("True"),
+            "a same-second network recovery pair must not be discarded as a stale tie"
+        );
+        assert_eq!(
+            node_condition_status(&desired, "NetworkUnavailable"),
+            Some("False")
+        );
+    }
+
+    #[test]
     fn merge_node_fields_preserves_leader_condition_absent_from_worker() {
         // Worker snapshot lacks a condition the leader authored; the merge must
         // preserve it rather than let the forwarded update drop it.
@@ -1985,6 +2118,58 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some(crate::version::GIT_COMMIT_SHORT),
             "network status refresh must not forward a stale build commit from the local Node cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_node_without_dataplane_health_preserves_network_unavailable() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            "node-a",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "node-a"},
+                "status": {
+                    "conditions": [
+                        {"type": "Ready", "status": "False", "reason": "NetworkUnavailable", "message": "Waiting for peer dataplane connectivity", "lastTransitionTime": "2026-06-19T08:16:36Z"},
+                        {"type": "NetworkUnavailable", "status": "True", "reason": "DataplaneNotReady", "message": "Waiting for peer dataplane connectivity", "lastTransitionTime": "2026-06-19T08:16:36Z"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        register_node(
+            &db,
+            "node-a",
+            &crate::bootstrap::NodeMode::Root,
+            &crate::bootstrap::NodeRole::Leader {
+                bootstrap: crate::bootstrap::node_role::LeaderBootstrap::Seed,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let node = db
+            .get_resource("v1", "Node", None, "node-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            node_condition_status(&node.data, "Ready"),
+            Some("False"),
+            "a registration refresh without dataplane health must not declare peer connectivity ready"
+        );
+        assert_eq!(
+            node_condition_status(&node.data, "NetworkUnavailable"),
+            Some("True")
         );
     }
 
