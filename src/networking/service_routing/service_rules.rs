@@ -503,7 +503,7 @@ pub(super) fn probability_for_ladder_step(endpoints_remaining: usize) -> u32 {
         endpoints_remaining >= 2,
         "ladder is only used for >= 2 remaining"
     );
-    (u32::MAX / endpoints_remaining as u32).to_be()
+    u32::MAX / endpoints_remaining as u32
 }
 
 // ---- CIDR helpers -------------------------------------------------------

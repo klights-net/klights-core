@@ -343,18 +343,25 @@ fn test_hostportspec_from_pod_with_no_containers_returns_empty() {
 #[test]
 fn test_probability_for_ladder_step_two_endpoints_is_half() {
     // First step of a 2-endpoint ladder: probability 1/2.
-    // Threshold = UINT32_MAX / 2 (in be repr).
+    // Threshold = UINT32_MAX / 2.
     let t = probability_for_ladder_step(2);
-    let native = u32::from_be(t);
-    assert_eq!(native, u32::MAX / 2);
+    assert_eq!(t, u32::MAX / 2);
+}
+
+#[test]
+fn test_probability_for_ladder_step_returns_native_meta_random_threshold() {
+    assert_eq!(
+        probability_for_ladder_step(2),
+        u32::MAX / 2,
+        "nft meta random compares a native u32 register value; byte-swapping makes a 50% rule match almost every packet on little-endian hosts"
+    );
 }
 
 #[test]
 fn test_probability_for_ladder_step_three_endpoints_first_step_is_third() {
     // 3-endpoint ladder, first step (3 remaining): probability 1/3.
     let t = probability_for_ladder_step(3);
-    let native = u32::from_be(t);
-    assert_eq!(native, u32::MAX / 3);
+    assert_eq!(t, u32::MAX / 3);
 }
 
 #[test]
@@ -365,8 +372,8 @@ fn test_probability_for_ladder_step_thresholds_decrease_monotonically() {
     // raw probabilities follow 1/N > 1/(N-1) is FALSE — they get
     // larger. Wait: 1/3 < 1/2 < 1/1 — they get larger as remaining
     // shrinks. So thresholds increase. Lock that in.
-    let t3 = u32::from_be(probability_for_ladder_step(3));
-    let t2 = u32::from_be(probability_for_ladder_step(2));
+    let t3 = probability_for_ladder_step(3);
+    let t2 = probability_for_ladder_step(2);
     assert!(t3 < t2, "1/3 ({t3}) must be smaller than 1/2 ({t2})");
 }
 
