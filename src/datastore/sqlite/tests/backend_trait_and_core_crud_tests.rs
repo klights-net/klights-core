@@ -1017,6 +1017,78 @@ async fn raft_apply_same_idempotency_key_returns_same_rv_without_reapply() {
 }
 
 #[tokio::test]
+async fn raft_outbox_build_treats_fresh_placeholder_as_retryable_inflight() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "fresh-placeholder-pod",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "fresh-placeholder-pod",
+                "uid": "uid-fresh-raft-placeholder"
+            },
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "app", "image": "nginx"}]
+            },
+            "status": {"phase": "Running"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+        idempotency_key: "fresh-raft-placeholder-key".to_string(),
+        subject_key: String::new(),
+        operation: "PodMetadata".to_string(),
+        first_seen_ms: now_ms,
+        applied_rv: None,
+        result_proto: Vec::new(),
+        status_stamp: None,
+    })
+    .await
+    .unwrap();
+
+    let command = StorageCommand::DeleteResource {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "fresh-placeholder-pod".to_string(),
+        preconditions: ResourcePreconditions {
+            uid: Some("uid-fresh-raft-placeholder".to_string()),
+            resource_version: None,
+        },
+    };
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+
+    let result = db
+        .build_log_apply_commit_for_outbox(
+            "fresh-raft-placeholder-key",
+            "PodMetadata",
+            payload.as_ref(),
+            "worker-a",
+        )
+        .await;
+
+    match result {
+        Err(crate::kubelet::outbox::OutboxApplyError::Retryable(_)) => {}
+        Err(err) => panic!("fresh raft outbox placeholder must be retryable, got: {err:?}"),
+        Ok(_) => panic!("fresh placeholder is still in-flight and must retry"),
+    }
+}
+
+#[tokio::test]
 async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
     let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(

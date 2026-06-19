@@ -572,6 +572,61 @@ async fn outbox_apply_recovers_from_stale_placeholder() {
 }
 
 #[tokio::test]
+async fn outbox_apply_treats_fresh_placeholder_as_retryable_inflight() {
+    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "web",
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "web",
+                "uid": "uid-fresh-placeholder"
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+            "status": {"phase": "Pending"}
+        }),
+    )
+    .await
+    .expect("create pod");
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+        idempotency_key: "fresh-placeholder-key".to_string(),
+        subject_key: String::new(),
+        operation: "PodStatus".to_string(),
+        first_seen_ms: now_ms,
+        applied_rv: None,
+        result_proto: vec![],
+        status_stamp: None,
+    })
+    .await
+    .expect("insert fresh placeholder");
+
+    let err = db
+        .apply_outbox_transactionally(
+            "fresh-placeholder-key",
+            "PodStatus",
+            &pod_status_payload("uid-fresh-placeholder"),
+            "node-a",
+        )
+        .await
+        .expect_err("fresh placeholder is still in-flight and must retry");
+
+    assert!(
+        matches!(err, crate::kubelet::outbox::OutboxApplyError::Retryable(_)),
+        "fresh placeholder must be retryable, got: {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn duplicate_outbox_apply_mutates_resource_once() {
     let db = Arc::new(crate::datastore::test_support::in_memory().await);
     db.create_resource(

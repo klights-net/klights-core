@@ -112,6 +112,7 @@ enum OutboxTxnOutcome {
         applied_rv: i64,
         pending: Option<PendingWatchEvent>,
     },
+    InFlightPlaceholder,
     AlreadyApplied(Option<AppliedOutboxRecord>),
 }
 
@@ -139,6 +140,7 @@ enum BuildOutboxTxnOutcome {
         commit: crate::log_apply::LogApplyCommit,
         rv: i64,
     },
+    InFlightPlaceholder,
     AlreadyApplied(Option<AppliedOutboxRecord>),
 }
 
@@ -494,12 +496,14 @@ impl Datastore {
                     })
                     .optional()?;
                 if let Some(ref row) = existing {
-                    let stale_placeholder = row.applied_rv.is_none()
+                    let placeholder = row.applied_rv.is_none()
                         && row.subject_key.is_empty()
-                        && row.result_proto.is_empty()
-                        && row.first_seen_ms < stale_cutoff_ms;
-                    if stale_placeholder {
+                        && row.result_proto.is_empty();
+                    if placeholder && row.first_seen_ms < stale_cutoff_ms {
                         tx.execute(queries::APPLIED_OUTBOX_DELETE_BY_KEY, [&claim_key])?;
+                    } else if placeholder {
+                        tx.commit()?;
+                        return Ok(BuildOutboxTxnOutcome::InFlightPlaceholder);
                     } else {
                         tx.commit()?;
                         return Ok(BuildOutboxTxnOutcome::AlreadyApplied(existing));
@@ -568,6 +572,9 @@ impl Datastore {
                     applied_rv: record.and_then(|r| r.applied_rv),
                 })
             }
+            BuildOutboxTxnOutcome::InFlightPlaceholder => {
+                Err(Self::inflight_outbox_placeholder_error(idempotency_key))
+            }
         }
     }
 
@@ -621,12 +628,14 @@ impl Datastore {
                     .optional()?;
 
                 if let Some(ref row) = existing {
-                    let stale_placeholder = row.applied_rv.is_none()
+                    let placeholder = row.applied_rv.is_none()
                         && row.subject_key.is_empty()
-                        && row.result_proto.is_empty()
-                        && row.first_seen_ms < stale_cutoff_ms;
-                    if stale_placeholder {
+                        && row.result_proto.is_empty();
+                    if placeholder && row.first_seen_ms < stale_cutoff_ms {
                         tx.execute(queries::APPLIED_OUTBOX_DELETE_BY_KEY, [&claim_key])?;
+                    } else if placeholder {
+                        tx.commit()?;
+                        return Ok(OutboxTxnOutcome::InFlightPlaceholder);
                     } else {
                         tx.commit()?;
                         return Ok(OutboxTxnOutcome::AlreadyApplied(existing));
@@ -704,6 +713,9 @@ impl Datastore {
                 Ok(OutboxApplyResult::AlreadyApplied {
                     applied_rv: record.and_then(|record| record.applied_rv),
                 })
+            }
+            OutboxTxnOutcome::InFlightPlaceholder => {
+                Err(Self::inflight_outbox_placeholder_error(idempotency_key))
             }
         }
     }
@@ -1531,6 +1543,14 @@ impl Datastore {
                 format!("decode cached applied_outbox response: {err}"),
             )),
         }
+    }
+
+    fn inflight_outbox_placeholder_error(
+        idempotency_key: &str,
+    ) -> crate::kubelet::outbox::OutboxApplyError {
+        crate::kubelet::outbox::OutboxApplyError::Retryable(format!(
+            "outbox idempotency key {idempotency_key} is still in-flight"
+        ))
     }
 
     fn should_apply_outbox_update_against_latest(
