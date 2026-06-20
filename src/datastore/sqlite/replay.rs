@@ -2,9 +2,9 @@ use anyhow::Result;
 
 use async_trait::async_trait;
 
-use crate::watch::WatchReplaySource;
+use crate::watch::{WatchEvent, WatchReplaySource};
 
-use super::{CatchUpResource, DatastoreHandle, WatchEvent, WatchReplayRead, WatchTarget};
+use super::{CatchUpResource, DatastoreHandle, WatchReplayRead, WatchTarget};
 
 pub struct DatastoreWatchReplaySource {
     db: DatastoreHandle,

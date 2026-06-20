@@ -1,13 +1,13 @@
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::watch::{
-    WatchContentType, WatchReceiver, WatchSignal, WatchTopic, encode_watch_payload,
-};
+#[cfg(test)]
+use crate::watch::WatchReceiver;
+use crate::watch::{WatchContentType, WatchEvent, WatchSignal, WatchTopic, encode_watch_payload};
 
 use super::{
     CatchUpResource, Datastore, PendingWatchEvent, PodEndpointEvent, PodSlotAdmissionEvent,
-    Resource, WatchEvent, hydrate_watch_event_data,
+    Resource, hydrate_watch_event_data,
 };
 
 /// Free function to publish a pending watch event after DB commit.
@@ -45,7 +45,7 @@ fn catchup_event_type_from_db(event_type: String) -> std::borrow::Cow<'static, s
 /// Create a PendingWatchEvent from raw parameters.
 ///
 /// Used by crud operations to stage a watch event inside the transaction,
-/// then broadcast after commit via `Datastore::broadcast_watch_event`.
+/// then publish after commit via `Datastore::publish_watch_event`.
 pub fn create_pending_watch_event(
     api_version: &str,
     kind: &str,
@@ -88,10 +88,12 @@ impl Datastore {
         })
     }
 
+    #[cfg(test)]
     pub fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
         self.watch_bus.subscribe(topic)
     }
 
+    #[cfg(test)]
     pub fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
         self.watch_bus.subscribe_many(topics)
     }
@@ -104,8 +106,13 @@ impl Datastore {
     /// Delegates to the free function `publish_pending` so the broadcast
     /// path is identical whether called from CRUD methods or a future
     /// Raft FSM apply hook.
-    pub fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+    pub fn publish_watch_event(&self, pending: PendingWatchEvent) {
         publish_pending(pending, &self.watch_bus);
+    }
+
+    #[cfg(test)]
+    pub fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+        self.publish_watch_event(pending);
     }
 
     /// Subscribe to internal `pod_endpoints` table events. Used by Phase 2

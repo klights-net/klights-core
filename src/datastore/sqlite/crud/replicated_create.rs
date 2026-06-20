@@ -393,7 +393,7 @@ impl Datastore {
                     "ADDED",
                     data.clone(),
                 );
-                self.broadcast_watch_event(pending);
+                self.publish_watch_event(pending);
                 id
             }
             Ok(ApplyCreateResult::UpdatedSameUid(id)) => {
@@ -406,7 +406,7 @@ impl Datastore {
                     "MODIFIED",
                     data.clone(),
                 );
-                self.broadcast_watch_event(pending);
+                self.publish_watch_event(pending);
                 id
             }
             Ok(ApplyCreateResult::ReplacedDifferentUid {
@@ -436,7 +436,7 @@ impl Datastore {
                         "DELETED",
                         old_data,
                     );
-                    self.broadcast_watch_event(pending_delete);
+                    self.publish_watch_event(pending_delete);
                 }
                 let pending_add = create_pending_watch_event(
                     api_version,
@@ -447,7 +447,7 @@ impl Datastore {
                     "ADDED",
                     data.clone(),
                 );
-                self.broadcast_watch_event(pending_add);
+                self.publish_watch_event(pending_add);
                 id
             }
             Err(e) => return Err(anyhow!("Failed to apply replicated create resource: {}", e)),

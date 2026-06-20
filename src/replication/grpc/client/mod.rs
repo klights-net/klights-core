@@ -295,23 +295,35 @@ impl PodLogHandler for LocalPodLogHandler {
             insecure_skip_tls_verify_backend: false,
         };
         let byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-            if let Some(pod_event_db) = &self.pod_event_db {
+            if let Some(pod_event_db) = self.pod_event_db.clone() {
+                let task_supervisor = self.task_supervisor.clone();
+                let stream = async_stream::stream! {
+                    let pod_events =
+                        crate::api_pod_subresources::logs::build_pod_log_follow_event_cursor(
+                            pod_event_db,
+                        )
+                        .await;
                 let termination = crate::api_pod_subresources::logs::PodLogFollowTermination::new(
-                    pod_event_db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Pod")),
+                    pod_events,
                     namespace,
                     pod_name,
                     pod_uid,
                     container_name,
                     false,
                 );
-                Box::pin(
+                    let mut logs = Box::pin(
                     crate::api_pod_subresources::logs::follow_log_file_with_termination_watch(
                         log_path,
                         params,
-                        self.task_supervisor.clone(),
+                            task_supervisor,
                         termination,
                     ),
-                )
+                    );
+                    while let Some(item) = logs.next().await {
+                        yield item;
+                    }
+                };
+                Box::pin(stream)
             } else {
                 Box::pin(
                     crate::api_pod_subresources::logs::follow_log_file_with_initial_query(

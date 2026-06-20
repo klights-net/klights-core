@@ -17,11 +17,10 @@ use crate::controllers::annotations::NodePeerMode;
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
-use crate::datastore::sqlite::publish_pending;
 use crate::datastore::types::*;
 use crate::networking::VtepMac;
 use crate::networking::types::HostPortRange;
-use crate::watch::{WatchEvent, WatchReceiver, WatchSignal, WatchTopic};
+use crate::watch::{WatchSignal, WatchTopic};
 
 use super::RedbDatastore;
 
@@ -31,17 +30,27 @@ impl DatastoreBackend for RedbDatastore {
         self.accessor.close();
     }
 
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
-        self.watch_bus.subscribe(topic)
-    }
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
-        self.watch_bus.subscribe_many(topics)
-    }
     fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
         self.watch_bus.subscribe_signals(topic)
     }
-    fn broadcast_watch_event(&self, p: PendingWatchEvent) {
-        publish_pending(p, &self.watch_bus);
+
+    #[cfg(test)]
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
+        self.watch_bus.subscribe(topic)
+    }
+
+    #[cfg(test)]
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
+        self.watch_bus.subscribe_many(topics)
+    }
+
+    #[cfg(test)]
+    fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+        let event = pending.event;
+        if let Some(signal) = WatchSignal::from_event(&event) {
+            self.watch_bus.publish_signal(signal);
+        }
+        self.watch_bus.publish(event);
     }
 
     async fn apply_raft_log_apply_commit(

@@ -24,7 +24,10 @@ use crate::kubelet::outbox::Outbox;
 use crate::networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
 use crate::networking::types::HostPortRange;
 use crate::networking::{NodeEndpoint, VtepMac};
-use crate::watch::{EventType, WatchBootstrap, WatchCursorError, WatchEvent};
+use crate::watch::{
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
+    WindowPolicy,
+};
 
 /// Result of one [`sync_peer_routes`] pass, used to gate the local node's
 /// readiness. A node is only Ready when every *Ready* peer has a dataplane
@@ -191,23 +194,23 @@ async fn run_peer_watch_with_components_inner(
     my_node_name: String,
     cluster_cidr: String,
     peering: std::sync::Arc<dyn crate::networking::PeerRouter>,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    _task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
     raft_leader_proxy: Option<std::sync::Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
     dataplane_health: Option<DataplaneHealth>,
     outbox: Option<std::sync::Arc<Outbox>>,
     cancel: CancellationToken,
 ) {
-    let db_handle = db.clone();
-    let watch_bootstrap = WatchBootstrap::new(
-        crate::watch::WatchReceiver::from_receiver(
-            db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Node")),
-        ),
-        DatastoreWatchReplaySource::new(db_handle, vec![WatchTarget::cluster("v1", "Node")]),
+    let topic = WatchTopic::new("v1", "Node");
+    let mut cursor = SignalWatchCursor::new(
+        db.subscribe_watch_signals(topic.clone()),
+        DatastoreWatchReplaySource::new(db.clone(), vec![WatchTarget::cluster("v1", "Node")]),
+        topic,
+        WatchDeliveryScope::Cluster,
         db.get_current_resource_version().await.unwrap_or(0),
+        WindowPolicy::default_watch_delivery(),
     );
-    let mut cursor = watch_bootstrap.into_cursor();
-    if let Err(e) = cursor.prime_replay().await {
-        tracing::warn!("node_subnet: initial replay failed: {:#}", e);
+    if let Err(e) = cursor.prime_replay_or_expired().await {
+        tracing::warn!(?e, "node_subnet: initial replay failed");
     }
 
     let mut applied: HashMap<String, AppliedPeer> = HashMap::new();
@@ -238,11 +241,13 @@ async fn run_peer_watch_with_components_inner(
     }
 
     loop {
-        match cursor
-            .next_event_recovering(&cancel, task_supervisor.as_ref())
-            .await
-        {
-            Ok(Some(event)) => {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("node_subnet: peer watch cancelled");
+                break;
+            }
+            result = cursor.next_event() => match result {
+            Ok(event) => {
                 if !is_node_event(&event) {
                     continue;
                 }
@@ -293,17 +298,16 @@ async fn run_peer_watch_with_components_inner(
                     }
                 }
             }
-            Ok(None) => {
-                tracing::info!("node_subnet: peer watch cancelled");
-                break;
-            }
             Err(WatchCursorError::Closed) => {
-                tracing::warn!("node_subnet: watch channel closed");
+                tracing::warn!("node_subnet: watch signal channel closed");
                 break;
             }
-            Err(_) => {
-                tracing::warn!("node_subnet: unexpected error (should be unreachable)");
-                break;
+            Err(WatchCursorError::Expired) => {
+                tracing::warn!("node_subnet: watch replay window expired; peer routes will resync on the next signal");
+            }
+            Err(WatchCursorError::Replay(err)) => {
+                tracing::warn!("node_subnet: watch replay failed: {err:#}");
+            }
             }
         }
     }
@@ -428,20 +432,19 @@ pub async fn run_local_node_vtep_reconciler(
 ) {
     let my_node_name = state.config.node_name.clone();
     let db = state.db.clone();
-    let db_handle = state.db.clone();
-
-    let watch_bootstrap = WatchBootstrap::new(
-        crate::watch::WatchReceiver::from_receiver(
-            db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Node")),
-        ),
-        DatastoreWatchReplaySource::new(db_handle, vec![WatchTarget::cluster("v1", "Node")]),
+    let topic = WatchTopic::new("v1", "Node");
+    let mut cursor = SignalWatchCursor::new(
+        db.subscribe_watch_signals(topic.clone()),
+        DatastoreWatchReplaySource::new(db.clone(), vec![WatchTarget::cluster("v1", "Node")]),
+        topic,
+        WatchDeliveryScope::Cluster,
         db.get_current_resource_version().await.unwrap_or(0),
+        WindowPolicy::default_watch_delivery(),
     );
-    let mut cursor = watch_bootstrap.into_cursor();
-    if let Err(e) = cursor.prime_replay().await {
+    if let Err(e) = cursor.prime_replay_or_expired().await {
         tracing::warn!(
-            "node_subnet: local-vtep reconcile initial replay failed: {:#}",
-            e
+            ?e,
+            "node_subnet: local-vtep reconcile initial replay failed"
         );
     }
 
@@ -449,11 +452,13 @@ pub async fn run_local_node_vtep_reconciler(
     let _ = publish_local_vtep_mac_annotation_if_ready(db.as_ref(), &my_node_name).await;
 
     loop {
-        match cursor
-            .next_event_recovering(&cancel, state.task_supervisor.as_ref())
-            .await
-        {
-            Ok(Some(event)) => {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("node_subnet: local VTEP reconciler cancelled");
+                break;
+            }
+            result = cursor.next_event() => match result {
+            Ok(event) => {
                 if !is_node_event(&event) {
                     continue;
                 }
@@ -473,17 +478,18 @@ pub async fn run_local_node_vtep_reconciler(
                     );
                 }
             }
-            Ok(None) => {
-                tracing::info!("node_subnet: local VTEP reconciler cancelled");
-                break;
-            }
             Err(WatchCursorError::Closed) => {
-                tracing::warn!("node_subnet: local VTEP watch channel closed");
+                tracing::warn!("node_subnet: local VTEP watch signal channel closed");
                 break;
             }
-            Err(_) => {
-                tracing::warn!("node_subnet: local VTEP reconciler unexpected error (unreachable)");
-                break;
+            Err(WatchCursorError::Expired) => {
+                tracing::warn!(
+                    "node_subnet: local VTEP replay window expired; waiting for next signal"
+                );
+            }
+            Err(WatchCursorError::Replay(err)) => {
+                tracing::warn!("node_subnet: local VTEP replay failed: {err:#}");
+            }
             }
         }
     }

@@ -6,7 +6,10 @@ use crate::kubelet::outbox::{
     Outbox, OutboxCommand, OutboxSendPlanner, OutboxSendRoute, OutboxSubject,
 };
 use crate::utils::{k8s_microtime_now, k8s_time_now};
-use crate::watch::{EventType, WatchBootstrap, WatchCursorError, WatchEvent};
+use crate::watch::{
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
+    WindowPolicy,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -1771,15 +1774,16 @@ async fn run_heartbeat_with_interval(
     }
 
     // Event-driven heartbeat: renew the lease on node watch events.
-    let mut cursor = WatchBootstrap::new(
-        crate::watch::WatchReceiver::from_receiver(
-            db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Node")),
-        ),
+    let topic = WatchTopic::new("v1", "Node");
+    let mut cursor = SignalWatchCursor::new(
+        db.subscribe_watch_signals(topic.clone()),
         DatastoreWatchReplaySource::new(db.clone(), vec![WatchTarget::cluster("v1", "Node")]),
+        topic,
+        WatchDeliveryScope::Cluster,
         db.get_current_resource_version().await.unwrap_or(0),
-    )
-    .into_cursor();
-    match cursor.prime_replay().await {
+        WindowPolicy::default_watch_delivery(),
+    );
+    match cursor.prime_replay_or_expired().await {
         Ok(replayed) => {
             tracing::debug!(
                 "Node heartbeat primed {} replay events before entering live watch",
@@ -1787,7 +1791,7 @@ async fn run_heartbeat_with_interval(
             );
         }
         Err(err) => {
-            tracing::warn!("Node heartbeat initial replay failed: {:#}", err);
+            tracing::warn!(?err, "Node heartbeat initial replay failed");
         }
     }
 
@@ -1809,9 +1813,9 @@ async fn run_heartbeat_with_interval(
                 next_heartbeat = tokio::time::Instant::now() + heartbeat_interval;
                 tracing::debug!("Node heartbeat sent for {}", node_name);
             }
-            event = cursor.next_event_recovering(&cancel_token, task_supervisor.as_ref()) => {
+            event = cursor.next_event() => {
                 match event {
-                    Ok(Some(event)) if is_node_heartbeat_event(&event, &node_name) => {
+                    Ok(event) if is_node_heartbeat_event(&event, &node_name) => {
                         if let Err(err) =
                             renew_lease_with_client(lease_client.as_ref(), &node_name).await
                         {
@@ -1820,18 +1824,16 @@ async fn run_heartbeat_with_interval(
                         next_heartbeat = tokio::time::Instant::now() + heartbeat_interval;
                         tracing::debug!("Node heartbeat sent for {}", node_name);
                     }
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        tracing::info!("Node heartbeat cancelled, shutting down");
-                        break;
-                    }
+                    Ok(_) => {}
                     Err(WatchCursorError::Closed) => {
-                        tracing::warn!("Node heartbeat watcher channel closed");
+                        tracing::warn!("Node heartbeat watch signal channel closed");
                         break;
                     }
-                    Err(_) => {
-                        tracing::warn!("Node heartbeat unexpected error (should be unreachable)");
-                        break;
+                    Err(WatchCursorError::Expired) => {
+                        tracing::warn!("Node heartbeat replay window expired; waiting for next signal");
+                    }
+                    Err(WatchCursorError::Replay(err)) => {
+                        tracing::warn!("Node heartbeat replay failed: {err:#}");
                     }
                 }
             }

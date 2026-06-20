@@ -11,14 +11,14 @@ use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::node_local::NodeLocalHandle;
 use crate::datastore::{
     AppliedOutboxRecord, CatchUpResource, DatastoreBackend, ListPageRequest, NodeSubnet, PatchKind,
-    PendingWatchEvent, PodCleanupIntent, PodEndpointEvent, PodEndpointRow,
-    PodNetworkAllocationLink, PodNetworkAllocationPod, PodNetworkAllocationRequest,
-    PodNetworkAllocationSubnet, PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult,
-    PodWorkqueueEntry, PodWorkqueueKind, Resource, ResourceList, ResourcePatchRequest,
-    ResourcePreconditions, SandboxRef, WatchTarget, WatchTargetScope,
+    PodCleanupIntent, PodEndpointEvent, PodEndpointRow, PodNetworkAllocationLink,
+    PodNetworkAllocationPod, PodNetworkAllocationRequest, PodNetworkAllocationSubnet,
+    PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodWorkqueueEntry,
+    PodWorkqueueKind, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions,
+    SandboxRef, WatchTarget, WatchTargetScope,
 };
 use crate::networking::VtepMac;
-use crate::watch::{EventType, WatchBus, WatchEvent, WatchReceiver, WatchSignal, WatchTopic};
+use crate::watch::{EventType, WatchBus, WatchEvent, WatchSignal, WatchTopic};
 
 /// Worker-local compatibility store for legacy kubelet call sites.
 ///
@@ -365,19 +365,22 @@ impl DatastoreBackend for WorkerStoreAdapter {
         self.node_local.close();
     }
 
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
-        self.watch_bus.subscribe(topic)
-    }
-
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
-        self.watch_bus.subscribe_many(topics)
-    }
-
     fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
         self.watch_bus.subscribe_signals(topic)
     }
 
-    fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+    #[cfg(test)]
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
+        self.watch_bus.subscribe(topic)
+    }
+
+    #[cfg(test)]
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
+        self.watch_bus.subscribe_many(topics)
+    }
+
+    #[cfg(test)]
+    fn broadcast_watch_event(&self, pending: crate::datastore::PendingWatchEvent) {
         self.publish_watch(pending.event);
     }
 

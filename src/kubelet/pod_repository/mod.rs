@@ -17,6 +17,7 @@ use crate::kubelet::pod_repository::api::PodSchedulingMode;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+#[cfg(test)]
 use tokio::sync::broadcast;
 
 use crate::api::{AppError, DeleteOptions};
@@ -27,6 +28,7 @@ use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult;
 use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
 use crate::task_supervisor::TaskSupervisor;
+#[cfg(test)]
 use crate::watch::WatchEvent;
 
 pub mod api;
@@ -385,6 +387,7 @@ pub trait PodNetworkReader: Send + Sync {
     ) -> Result<PodNetworkAssignment>;
 }
 
+#[cfg(test)]
 pub trait PodWatchSource: Send + Sync {
     fn subscribe_pod_watch(&self) -> broadcast::Receiver<WatchEvent>;
 }
@@ -1412,6 +1415,7 @@ impl PodNetworkReader for PodRepository {
     }
 }
 
+#[cfg(test)]
 impl PodWatchSource for PodRepository {
     fn subscribe_pod_watch(&self) -> broadcast::Receiver<WatchEvent> {
         self.store.subscribe_watch()

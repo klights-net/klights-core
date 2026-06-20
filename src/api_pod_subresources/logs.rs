@@ -1,9 +1,13 @@
 use super::*;
 use crate::replication::protocol::PodLogRequest;
-use crate::watch::{EventType, WatchEvent};
+use crate::watch::{
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
+    WindowPolicy,
+};
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::{fs as blocking_fs, path::PathBuf};
+#[cfg(test)]
 use tokio::sync::broadcast;
 
 const LOG_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
@@ -281,9 +285,7 @@ async fn build_pod_log_follow_termination(
     pod_uid: &str,
     container_name: &str,
 ) -> Result<PodLogFollowTermination, AppError> {
-    let pod_events = state
-        .db
-        .subscribe_watch(crate::watch::WatchTopic::new("v1", "Pod"));
+    let pod_events = build_pod_log_follow_event_cursor(state.db.clone()).await;
     let current = crate::kubelet::pod_repository::PodReader::get_pod(
         state.pod_repository.as_ref(),
         namespace,
@@ -344,6 +346,25 @@ async fn build_pod_log_follow_termination(
         container_name.to_string(),
         terminate_after_initial,
     ))
+}
+
+pub async fn build_pod_log_follow_event_cursor(
+    db: crate::datastore::DatastoreHandle,
+) -> SignalWatchCursor<crate::datastore::sqlite::DatastoreWatchReplaySource> {
+    let topic = WatchTopic::new("v1", "Pod");
+    let signal_rx = db.subscribe_watch_signals(topic.clone());
+    let start_rv = db.get_current_resource_version().await.unwrap_or(0);
+    SignalWatchCursor::new(
+        signal_rx,
+        crate::datastore::sqlite::DatastoreWatchReplaySource::new(
+            db,
+            vec![crate::datastore::WatchTarget::namespaced("v1", "Pod")],
+        ),
+        topic,
+        WatchDeliveryScope::NamespacedAll,
+        start_rv,
+        WindowPolicy::default_watch_delivery(),
+    )
 }
 
 fn build_text_log_response(body: axum::body::Body) -> Result<Response, AppError> {
@@ -704,7 +725,7 @@ pub fn follow_log_file_with_initial_query(
 }
 
 pub struct PodLogFollowTermination {
-    pod_events: broadcast::Receiver<WatchEvent>,
+    pod_events: PodLogEventSource,
     namespace: String,
     name: String,
     uid: String,
@@ -714,6 +735,25 @@ pub struct PodLogFollowTermination {
 
 impl PodLogFollowTermination {
     pub fn new(
+        pod_events: SignalWatchCursor<crate::datastore::sqlite::DatastoreWatchReplaySource>,
+        namespace: String,
+        name: String,
+        uid: String,
+        container_name: String,
+        terminate_after_initial: bool,
+    ) -> Self {
+        Self {
+            pod_events: PodLogEventSource::Signal(pod_events),
+            namespace,
+            name,
+            uid,
+            container_name,
+            terminate_after_initial,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(
         pod_events: broadcast::Receiver<WatchEvent>,
         namespace: String,
         name: String,
@@ -722,12 +762,47 @@ impl PodLogFollowTermination {
         terminate_after_initial: bool,
     ) -> Self {
         Self {
-            pod_events,
+            pod_events: PodLogEventSource::Broadcast(pod_events),
             namespace,
             name,
             uid,
             container_name,
             terminate_after_initial,
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<WatchEvent, PodLogEventError> {
+        self.pod_events.next_event().await
+    }
+}
+
+enum PodLogEventSource {
+    Signal(SignalWatchCursor<crate::datastore::sqlite::DatastoreWatchReplaySource>),
+    #[cfg(test)]
+    Broadcast(broadcast::Receiver<WatchEvent>),
+}
+
+enum PodLogEventError {
+    #[cfg(test)]
+    Lagged(u64),
+    Closed,
+    Expired,
+    Replay(anyhow::Error),
+}
+
+impl PodLogEventSource {
+    async fn next_event(&mut self) -> Result<WatchEvent, PodLogEventError> {
+        match self {
+            Self::Signal(cursor) => cursor.next_event().await.map_err(|err| match err {
+                WatchCursorError::Closed => PodLogEventError::Closed,
+                WatchCursorError::Expired => PodLogEventError::Expired,
+                WatchCursorError::Replay(err) => PodLogEventError::Replay(err),
+            }),
+            #[cfg(test)]
+            Self::Broadcast(rx) => rx.recv().await.map_err(|err| match err {
+                broadcast::error::RecvError::Lagged(skipped) => PodLogEventError::Lagged(skipped),
+                broadcast::error::RecvError::Closed => PodLogEventError::Closed,
+            }),
         }
     }
 }
@@ -940,7 +1015,7 @@ fn follow_log_file_inner(
                             }
                         }
                     }
-                    event = termination.pod_events.recv() => {
+                    event = termination.next_event() => {
                         match event {
                             Ok(event) => {
                                 if pod_log_follow_event_is_terminal(termination, &event) {
@@ -955,7 +1030,8 @@ fn follow_log_file_inner(
                                     terminate_after_drain = true;
                                 }
                             }
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            #[cfg(test)]
+                            Err(PodLogEventError::Lagged(skipped)) => {
                                 tracing::warn!(
                                     skipped,
                                     namespace = %termination.namespace,
@@ -964,7 +1040,24 @@ fn follow_log_file_inner(
                                     "pod log follow missed pod watch events; continuing until a later terminal event"
                                 );
                             }
-                            Err(broadcast::error::RecvError::Closed) => {
+                            Err(PodLogEventError::Expired) => {
+                                tracing::warn!(
+                                    namespace = %termination.namespace,
+                                    pod = %termination.name,
+                                    uid = %termination.uid,
+                                    "pod log follow watch replay expired; continuing until a later terminal event"
+                                );
+                            }
+                            Err(PodLogEventError::Replay(err)) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    namespace = %termination.namespace,
+                                    pod = %termination.name,
+                                    uid = %termination.uid,
+                                    "pod log follow watch replay failed; continuing until a later terminal event"
+                                );
+                            }
+                            Err(PodLogEventError::Closed) => {
                                 tracing::warn!(
                                     namespace = %termination.namespace,
                                     pod = %termination.name,
@@ -1292,10 +1385,11 @@ async fn wait_for_log_path_activity_or_terminal(
                 let _ = drain_inotify_events(&mut guard);
                 Ok(false)
             }
-            event = termination.pod_events.recv() => {
+            event = termination.next_event() => {
                 match event {
                     Ok(event) => Ok(pod_log_follow_event_is_terminal(termination, &event)),
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    #[cfg(test)]
+                    Err(PodLogEventError::Lagged(skipped)) => {
                         tracing::warn!(
                             skipped,
                             namespace = %termination.namespace,
@@ -1305,7 +1399,26 @@ async fn wait_for_log_path_activity_or_terminal(
                         );
                         Ok(false)
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
+                    Err(PodLogEventError::Expired) => {
+                        tracing::warn!(
+                            namespace = %termination.namespace,
+                            pod = %termination.name,
+                            uid = %termination.uid,
+                            "pod log follow watch replay expired before log file creation"
+                        );
+                        Ok(false)
+                    }
+                    Err(PodLogEventError::Replay(err)) => {
+                        tracing::warn!(
+                            error = %err,
+                            namespace = %termination.namespace,
+                            pod = %termination.name,
+                            uid = %termination.uid,
+                            "pod log follow watch replay failed before log file creation"
+                        );
+                        Ok(false)
+                    }
+                    Err(PodLogEventError::Closed) => {
                         tracing::warn!(
                             namespace = %termination.namespace,
                             pod = %termination.name,

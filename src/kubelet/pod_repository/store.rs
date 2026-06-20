@@ -14,13 +14,16 @@ use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(test)]
 use tokio::sync::broadcast;
 
+#[cfg(test)]
+use crate::datastore::DatastoreBackend;
 use crate::datastore::errors::DatastoreError;
 use crate::datastore::{
-    DatastoreBackend, DatastoreHandle, PatchKind, Resource, ResourceList, ResourcePatchRequest,
-    ResourcePreconditions,
+    DatastoreHandle, PatchKind, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions,
 };
+#[cfg(test)]
 use crate::watch::WatchEvent;
 
 const POD_API_VERSION: &str = "v1";
@@ -384,6 +387,7 @@ impl PodStore {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn subscribe_watch(&self) -> broadcast::Receiver<WatchEvent> {
         DatastoreBackend::subscribe_watch(
             self.db.as_ref(),

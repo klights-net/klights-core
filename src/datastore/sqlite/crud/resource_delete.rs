@@ -187,7 +187,7 @@ impl Datastore {
                         "DELETED",
                         data,
                     );
-                    self.broadcast_watch_event(pending);
+                    self.publish_watch_event(pending);
                 }
                 Ok(rv)
             }

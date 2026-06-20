@@ -389,6 +389,12 @@ async fn signal_cursor_cluster_does_not_match_namespaced_signal() {
 }
 
 #[tokio::test]
+async fn signal_cursor_all_matches_cluster_and_namespaced_signals() {
+    assert!(WatchDeliveryScope::All.matches_namespace(None));
+    assert!(WatchDeliveryScope::All.matches_namespace(Some("default")));
+}
+
+#[tokio::test]
 async fn watch_replay_source_checked_replay_respects_limit() {
     let source = FixedReplaySource::new(vec![
         WatchEvent::added(serde_json::json!({

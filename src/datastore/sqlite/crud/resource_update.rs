@@ -308,7 +308,7 @@ impl Datastore {
                     "MODIFIED",
                     data.clone(),
                 );
-                self.broadcast_watch_event(pending);
+                self.publish_watch_event(pending);
 
                 Ok(Resource {
                     id,
@@ -557,7 +557,7 @@ impl Datastore {
                         "MODIFIED",
                         data.clone(),
                     );
-                    self.broadcast_watch_event(pending);
+                    self.publish_watch_event(pending);
                 };
 
                 Ok(Resource {

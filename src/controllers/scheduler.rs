@@ -1,9 +1,9 @@
 //! Event-driven scheduler controller.
 //!
-//! Watches unbound Pods and Node changes through the local datastore watch
-//! broadcaster, then schedules Pods by setting `spec.nodeName` and the
-//! PodScheduled condition. Runs an initial sweep after replay to catch pods
-//! that were created before the scheduler's watch floor RV.
+//! Watches unbound Pods and Node changes through datastore watch signals, then
+//! schedules Pods by setting `spec.nodeName` and the
+//! PodScheduled condition. Runs an initial sweep after subscribing so pods
+//! that already exist do not remain Pending forever.
 //!
 //! ## Invariants
 //! - Uses local datastore watch topics, not HTTP watch.
@@ -15,9 +15,6 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::AppState;
-use crate::datastore::WatchTarget;
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::watch::WatchBootstrap;
 
 /// Scheduler controller configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,26 +62,16 @@ pub fn should_wake_scheduler(event: &crate::watch::WatchEvent) -> bool {
 /// Disabled by default — call this only when config.enabled = true.
 pub async fn run_scheduler_watch(state: Arc<AppState>, cancel: CancellationToken) {
     let db = state.db.clone();
-    let db_handle = state.db.clone();
-
-    let watch_bootstrap = WatchBootstrap::new(
-        db.subscribe_watch_many(vec![
+    let mut signal_rx = crate::watch::WatchSignalReceiver::new(
+        [
             crate::watch::WatchTopic::new("v1", "Pod"),
             crate::watch::WatchTopic::new("v1", "Node"),
-        ]),
-        DatastoreWatchReplaySource::new(
-            db_handle,
-            vec![
-                WatchTarget::namespaced("v1", "Pod"),
-                WatchTarget::cluster("v1", "Node"),
-            ],
-        ),
-        db.get_current_resource_version().await.unwrap_or(0),
+        ]
+        .into_iter()
+        .map(|topic| db.subscribe_watch_signals(topic))
+        .collect(),
     );
-    let mut cursor = watch_bootstrap.into_cursor();
-    if let Err(e) = cursor.prime_replay().await {
-        tracing::warn!("scheduler: initial replay failed: {:#}", e);
-    }
+    let mut last_seen_rv = db.get_current_resource_version().await.unwrap_or(0);
 
     // Initial sweep: the watch replay only catches events with RV > floor_rv.
     // Pods created before the scheduler starts (e.g. during CoreDNS bootstrap)
@@ -95,38 +82,35 @@ pub async fn run_scheduler_watch(state: Arc<AppState>, cancel: CancellationToken
     }
 
     loop {
-        match cursor
-            .next_event_recovering(&cancel, state.task_supervisor.as_ref())
-            .await
-        {
-            Ok(Some(event)) => {
-                if !should_wake_scheduler(&event) {
-                    continue;
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            signal = signal_rx.recv() => match signal {
+                Ok(signal) => {
+                    let high_rv = signal
+                        .advances
+                        .iter()
+                        .map(|advance| advance.high_rv)
+                        .max()
+                        .unwrap_or(last_seen_rv);
+                    if high_rv <= last_seen_rv {
+                        continue;
+                    }
+                    last_seen_rv = high_rv;
+                    tracing::debug!("scheduler controller woke on watch signal");
+                    if let Err(e) = state.pod_repository.schedule_all_unbound_pods().await {
+                        tracing::warn!("scheduler reconcile failed: {e:#}");
+                    }
                 }
-
-                tracing::debug!(
-                    kind = %event.object.get("kind").and_then(|v| v.as_str()).unwrap_or(""),
-                    name = %event.object.pointer("/metadata/name").and_then(|v| v.as_str()).unwrap_or(""),
-                    "scheduler controller woke on relevant event"
-                );
-                if let Err(e) = state.pod_repository.schedule_all_unbound_pods().await {
-                    tracing::warn!("scheduler reconcile failed: {e:#}");
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        "scheduler watch signals lagged by {n}; running full unbound-pod sweep"
+                    );
+                    if let Err(e) = state.pod_repository.schedule_all_unbound_pods().await {
+                        tracing::warn!("scheduler reconcile after signal lag failed: {e:#}");
+                    }
+                    last_seen_rv = db.get_current_resource_version().await.unwrap_or(last_seen_rv);
                 }
-            }
-            Ok(None) => {
-                // Watch ended
-                break;
-            }
-            Err(e) => {
-                tracing::warn!("scheduler watch error: {:#?}", e);
-                // Backoff via TaskSupervisor timer helper
-                let _ = state
-                    .task_supervisor
-                    .sleep(
-                        "scheduler_watch_retry",
-                        std::time::Duration::from_millis(100),
-                    )
-                    .await;
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     }

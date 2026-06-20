@@ -19,7 +19,10 @@ use crate::node_lease_tracker::{
     DEFAULT_NODE_LEASE_GRACE_SECONDS, NodeLeaseObservation, NodeLeaseTracker,
 };
 use crate::utils::k8s_time_format;
-use crate::watch::{EventType, WatchBootstrap, WatchCursorError, WatchEvent};
+use crate::watch::{
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
+    WatchSignalReceiver, WatchTopic, WindowPolicy,
+};
 
 #[cfg(test)]
 const DEFAULT_NODE_LEASE_DURATION_SECONDS: i64 =
@@ -272,12 +275,19 @@ pub async fn run_node_lifecycle_controller(
     }
 
     let db = state.db.clone();
-    let watch_resource_version = db.get_current_resource_version().await.unwrap_or(0);
-    let watch_bootstrap = WatchBootstrap::new(
-        db.subscribe_watch_many(vec![
-            crate::watch::WatchTopic::new("v1", "Node"),
-            crate::watch::WatchTopic::new("coordination.k8s.io/v1", "Lease"),
-        ]),
+    let watch_topics = vec![
+        WatchTopic::new("v1", "Node"),
+        WatchTopic::new("coordination.k8s.io/v1", "Lease"),
+    ];
+    let signal_rx = WatchSignalReceiver::new(
+        watch_topics
+            .iter()
+            .cloned()
+            .map(|topic| db.subscribe_watch_signals(topic))
+            .collect(),
+    );
+    let mut cursor = SignalWatchCursor::new_many(
+        signal_rx,
         DatastoreWatchReplaySource::new(
             db.clone(),
             vec![
@@ -285,11 +295,13 @@ pub async fn run_node_lifecycle_controller(
                 WatchTarget::cluster("coordination.k8s.io/v1", "Lease"),
             ],
         ),
-        watch_resource_version,
+        watch_topics,
+        WatchDeliveryScope::Cluster,
+        db.get_current_resource_version().await.unwrap_or(0),
+        WindowPolicy::default_watch_delivery(),
     );
-    let mut cursor = watch_bootstrap.into_cursor();
-    if let Err(err) = cursor.prime_replay().await {
-        tracing::warn!("node_lifecycle: initial replay failed: {err:#}");
+    if let Err(err) = cursor.prime_replay_or_expired().await {
+        tracing::warn!(?err, "node_lifecycle: initial replay failed");
     }
 
     let mut retry_attempt = 0u32;
@@ -349,7 +361,7 @@ pub async fn run_node_lifecycle_controller(
                     None
                 }
                 _ = state.node_lease_tracker.wait_changed() => None,
-                event = cursor.next_event_recovering(&cancel, state.task_supervisor.as_ref()) => {
+                event = cursor.next_event() => {
                     Some(event)
                 },
             }
@@ -368,7 +380,7 @@ pub async fn run_node_lifecycle_controller(
                     None
                 }
                 _ = state.node_lease_tracker.wait_changed() => None,
-                event = cursor.next_event_recovering(&cancel, state.task_supervisor.as_ref()) => {
+                event = cursor.next_event() => {
                     Some(event)
                 },
             }
@@ -383,7 +395,7 @@ pub async fn run_node_lifecycle_controller(
             }
         };
         match watch_result {
-            Ok(Some(event)) => {
+            Ok(event) => {
                 if let Err(err) =
                     track_lease_from_event(&event, state.node_lease_tracker.as_ref()).await
                 {
@@ -395,7 +407,6 @@ pub async fn run_node_lifecycle_controller(
                     continue;
                 }
             }
-            Ok(None) => break,
             Err(WatchCursorError::Closed) => break,
             Err(err) => {
                 tracing::warn!("node_lifecycle watch error: {err:#?}");

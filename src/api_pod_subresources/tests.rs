@@ -856,7 +856,7 @@ async fn test_follow_log_file_closes_if_pod_deleted_before_log_file_exists() {
         std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
             crate::task_supervisor::TaskCategoryConfig::default(),
         )),
-        PodLogFollowTermination::new(
+        PodLogFollowTermination::new_for_test(
             rx,
             "default".to_string(),
             "late-delete".to_string(),
@@ -1033,7 +1033,7 @@ async fn test_follow_log_file_exits_after_matching_pod_deleted_event() {
             insecure_skip_tls_verify_backend: false,
         },
         task_supervisor,
-        PodLogFollowTermination::new(
+        PodLogFollowTermination::new_for_test(
             watch_bus.subscribe(crate::watch::WatchTopic::new("v1", "Pod")),
             "default".to_string(),
             "done".to_string(),

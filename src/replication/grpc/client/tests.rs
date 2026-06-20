@@ -1368,6 +1368,28 @@ mod cases {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let pod_event_db: crate::datastore::DatastoreHandle =
             Arc::new(crate::datastore::test_support::in_memory().await);
+        pod_event_db.seed_namespace_for_test("sonobuoy").await;
+        pod_event_db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("sonobuoy"),
+                "sonobuoy-e2e-job",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "sonobuoy",
+                        "name": "sonobuoy-e2e-job",
+                        "uid": "pod-uid"
+                    },
+                    "status": {
+                        "phase": "Running"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
         let handler = LocalPodLogHandler::new_with_pod_event_store(
             runtime_ns.clone(),
             supervisor.clone(),
@@ -1402,20 +1424,10 @@ mod cases {
             "follow stream should remain open until the pod delete event arrives"
         );
 
-        pod_event_db.broadcast_watch_event(crate::datastore::PendingWatchEvent {
-            event: crate::watch::WatchEvent::deleted(serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "namespace": "sonobuoy",
-                    "name": "sonobuoy-e2e-job",
-                    "uid": "pod-uid"
-                },
-                "status": {
-                    "phase": "Succeeded"
-                }
-            })),
-        });
+        pod_event_db
+            .delete_resource("v1", "Pod", Some("sonobuoy"), "sonobuoy-e2e-job")
+            .await
+            .unwrap();
 
         let done = supervisor
             .timeout(

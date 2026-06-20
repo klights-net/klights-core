@@ -1,5 +1,8 @@
 use crate::datastore::{DatastoreBackend, DatastoreHandle, WatchTarget};
-use crate::watch::{EventType, WatchBootstrap, WatchEvent};
+use crate::watch::{
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
+    WindowPolicy,
+};
 use anyhow::Result;
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use std::collections::BTreeMap;
@@ -184,7 +187,7 @@ pub async fn sync_registry_from_datastore(
 pub async fn run_crd_registry_watch_with_components(
     db: DatastoreHandle,
     registry: CrdRegistry,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    _task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     cancel: CancellationToken,
 ) {
     let start_rv = db.get_current_resource_version().await.unwrap_or(0);
@@ -192,10 +195,9 @@ pub async fn run_crd_registry_watch_with_components(
         tracing::warn!("crd_registry: initial sync failed: {err:#}");
     }
 
-    let watch_bootstrap = WatchBootstrap::new(
-        crate::watch::WatchReceiver::from_receiver(db.subscribe_watch(
-            crate::watch::WatchTopic::new("apiextensions.k8s.io/v1", "CustomResourceDefinition"),
-        )),
+    let topic = WatchTopic::new("apiextensions.k8s.io/v1", "CustomResourceDefinition");
+    let mut cursor = SignalWatchCursor::new(
+        db.subscribe_watch_signals(topic.clone()),
         crate::datastore::sqlite::DatastoreWatchReplaySource::new(
             db.clone(),
             vec![WatchTarget::cluster(
@@ -203,19 +205,21 @@ pub async fn run_crd_registry_watch_with_components(
                 "CustomResourceDefinition",
             )],
         ),
+        topic,
+        WatchDeliveryScope::Cluster,
         start_rv,
+        WindowPolicy::default_watch_delivery(),
     );
-    let mut cursor = watch_bootstrap.into_cursor();
-    if let Err(err) = cursor.prime_replay().await {
-        tracing::warn!("crd_registry: initial replay failed: {err:#}");
+    if let Err(err) = cursor.prime_replay_or_expired().await {
+        tracing::warn!(?err, "crd_registry: initial replay failed");
     }
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            result = cursor.next_event_recovering(&cancel, task_supervisor.as_ref()) => {
+            result = cursor.next_event() => {
                 match result {
-                    Ok(Some(event)) => {
+                    Ok(event) => {
                         if !is_crd_event(&event) {
                             continue;
                         }
@@ -223,10 +227,18 @@ pub async fn run_crd_registry_watch_with_components(
                             tracing::warn!("crd_registry: sync after watch event failed: {err:#}");
                         }
                     }
-                    Ok(None) => break,
-                    Err(err) => {
-                        tracing::warn!("crd_registry: watch stopped: {err:#?}");
+                    Err(WatchCursorError::Closed) => {
+                        tracing::warn!("crd_registry: watch signal channel closed");
                         break;
+                    }
+                    Err(WatchCursorError::Expired) => {
+                        tracing::warn!("crd_registry: replay window expired; running full resync");
+                        if let Err(err) = sync_registry_from_datastore(db.as_ref(), &registry).await {
+                            tracing::warn!("crd_registry: sync after expired replay failed: {err:#}");
+                        }
+                    }
+                    Err(WatchCursorError::Replay(err)) => {
+                        tracing::warn!("crd_registry: watch replay failed: {err:#}");
                     }
                 }
             }

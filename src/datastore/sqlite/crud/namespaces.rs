@@ -44,7 +44,7 @@ impl Datastore {
                     "ADDED",
                     data.clone(),
                 );
-                self.broadcast_watch_event(pending);
+                self.publish_watch_event(pending);
 
                 Ok(Resource {
                     id: 0, // Not used for namespaces (name is PRIMARY KEY)
@@ -246,7 +246,7 @@ impl Datastore {
                     "MODIFIED",
                     data.clone(),
                 );
-                self.broadcast_watch_event(pending);
+                self.publish_watch_event(pending);
 
                 Ok(Resource {
                     id: 0,
@@ -336,7 +336,7 @@ impl Datastore {
                 let data: Value = serde_json::from_slice(&namespace_data)?;
                 let pending =
                     create_pending_watch_event("v1", "Namespace", None, name, rv, "DELETED", data);
-                self.broadcast_watch_event(pending);
+                self.publish_watch_event(pending);
                 Ok(rv)
             }
             Ok(NamespaceDeleteResult::HasRemainingContent) => {

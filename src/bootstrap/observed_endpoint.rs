@@ -13,7 +13,6 @@ use crate::replication::grpc::client::{
 };
 use crate::replication::protocol::JoinRole;
 use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
-use crate::watch::{EventType, WatchEvent};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PeerEndpoint {
@@ -96,16 +95,16 @@ async fn run_leader_peer_endpoint_observer(
         );
     }
 
-    let mut watch_rx = db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Node"));
+    let mut signal_rx = db.subscribe_watch_signals(crate::watch::WatchTopic::new("v1", "Node"));
     loop {
         tokio::select! {
             _ = shutdown_token.cancelled() => return,
-            event = watch_rx.recv() => {
-                let event = match event {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            signal = signal_rx.recv() => {
+                match signal {
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-                };
+                }
                 if ensure_published_if_local_has_external_ip(
                     db.as_ref(),
                     &config,
@@ -116,17 +115,13 @@ async fn run_leader_peer_endpoint_observer(
                 {
                     return;
                 }
-                let Some(peer) = peer_endpoint_from_watch_event(&event, &config.node_name, config.tls_port) else {
-                    continue;
-                };
-                if let Err(err) = observe_from_peer(
+                if let Err(err) = observe_from_existing_nodes(
                     db.as_ref(),
                     &config,
                     &node_mode,
                     &client_identity,
                     supervisor.clone(),
                     grpc_transport_policy.clone(),
-                    peer,
                 )
                 .await
                 {
@@ -287,19 +282,6 @@ fn placeholder_dataplane(node_mode: &NodeMode) -> JoinDataplaneMetadata {
         port: None,
         mode,
         encryption: crate::networking::wireguard::DataplaneEncryption::Disabled,
-    }
-}
-
-fn peer_endpoint_from_watch_event(
-    event: &WatchEvent,
-    local_node_name: &str,
-    default_port: u16,
-) -> Option<PeerEndpoint> {
-    match event.event_type {
-        EventType::Added | EventType::Modified => {
-            peer_endpoint_from_node(&event.object, local_node_name, default_port)
-        }
-        EventType::Deleted | EventType::Bookmark | EventType::Error => None,
     }
 }
 

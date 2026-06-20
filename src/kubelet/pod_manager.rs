@@ -21,7 +21,8 @@ use crate::kubelet::pod_status_builders::{
 use crate::kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_restart};
 use crate::kubelet::pod_watch_handlers::{handle_pv_event, handle_pvc_event};
 use crate::watch::{
-    EventType, WatchBootstrap, WatchCursorError, WatchEvent, WatchEventFilter, WatchTopic,
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
+    WatchEventFilter, WatchSignalReceiver, WatchTopic, WindowPolicy,
 };
 use anyhow::Result;
 #[cfg(test)]
@@ -283,7 +284,14 @@ async fn run_pod_watcher_with_runtime(
         .await
         .take()
         .expect("pod lifecycle receiver must be set before run_pod_watcher");
-    let watch_rx = state.db.subscribe_watch_many(pod_watcher_watch_topics());
+    let watch_topics = pod_watcher_watch_topics();
+    let signal_rx = WatchSignalReceiver::new(
+        watch_topics
+            .iter()
+            .cloned()
+            .map(|topic| state.db.subscribe_watch_signals(topic))
+            .collect(),
+    );
 
     // Wait for CNI to be ready before creating any pods.
     // CRI gRPC is ready but the CNI plugin may not have loaded its config yet.
@@ -374,12 +382,15 @@ async fn run_pod_watcher_with_runtime(
         }
     }
 
-    let watch_bootstrap = WatchBootstrap::new(
-        watch_rx,
+    let event_filter = pod_watcher_node_event_filter(&config.node_name);
+    let mut cursor = SignalWatchCursor::new_many(
+        signal_rx,
         DatastoreWatchReplaySource::new(db_handle.clone(), pod_watcher_replay_targets()),
+        watch_topics,
+        WatchDeliveryScope::All,
         db.get_current_resource_version().await.unwrap_or(0),
-    )
-    .with_event_filter(pod_watcher_node_event_filter(&config.node_name));
+        WindowPolicy::default_watch_delivery(),
+    );
 
     {
         let mut pod_recovery = PodRecovery::new(
@@ -435,8 +446,7 @@ async fn run_pod_watcher_with_runtime(
     // transitions it to Failed/Succeeded cleanly. The CRI event stream is the
     // sole driver of phase reconciliation; the reconnect arm above keeps it
     // live across containerd hiccups.
-    let mut cursor = watch_bootstrap.into_cursor();
-    match cursor.prime_replay().await {
+    match cursor.prime_replay_or_expired().await {
         Ok(replayed) => {
             tracing::debug!(
                 "Pod watcher primed {} replay events before entering live watch",
@@ -444,7 +454,7 @@ async fn run_pod_watcher_with_runtime(
             );
         }
         Err(err) => {
-            tracing::warn!("Pod watcher initial replay failed: {:#}", err);
+            tracing::warn!(?err, "Pod watcher initial replay failed");
         }
     }
 
@@ -457,22 +467,25 @@ async fn run_pod_watcher_with_runtime(
             }
 
             // Handle watch events with replay retry
-            event_result = cursor.next_event_recovering(&cancel_token, state.task_supervisor.as_ref()) => {
+            event_result = cursor.next_event() => {
                 let event = match event_result {
-                    Ok(Some(event)) => event,
-                    Ok(None) => {
-                        tracing::info!("Pod watcher cancelled via replay, shutting down");
-                        break;
-                    }
+                    Ok(event) => event,
                     Err(WatchCursorError::Closed) => {
-                        tracing::warn!("Pod watcher broadcast channel closed");
+                        tracing::warn!("Pod watcher signal channel closed");
                         break;
                     }
-                    Err(_) => {
-                        tracing::warn!("Pod watcher unexpected error (should be unreachable)");
+                    Err(WatchCursorError::Expired) => {
+                        tracing::warn!("Pod watcher replay window expired");
+                        break;
+                    }
+                    Err(WatchCursorError::Replay(err)) => {
+                        tracing::warn!("Pod watcher replay failed: {err:#}");
                         break;
                     }
                 };
+                if !event_filter.matches(&event) {
+                    continue;
+                }
                 // Fire-and-forget lifecycle trace message: spawn through the
                 // supervisor so actor sends never block event processing.
                 // handle_watch_event must always run regardless of actor state.

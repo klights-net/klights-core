@@ -36,9 +36,13 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::controller_dispatcher::ControllerDispatcher;
-use crate::datastore::DatastoreHandle;
+use crate::datastore::sqlite::DatastoreWatchReplaySource;
+use crate::datastore::{DatastoreHandle, WatchTarget};
 use crate::task_supervisor::{SupervisedJoinHandle, TaskSupervisor};
-use crate::watch::{EventType, WatchEvent};
+use crate::watch::{
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
+    WindowPolicy,
+};
 
 /// Maximum delay we ever pass to `spawn_delay` for a single arm. Long
 /// delays still work (Tokio's timer wheel handles years); this cap is a
@@ -321,13 +325,25 @@ impl CronJobScheduler {
     /// `batch/v1`/`CronJob`, and arms / cancels timers in response.
     /// Runs until `cancel` fires.
     pub async fn run_watch_loop(self: Arc<Self>, cancel: CancellationToken) {
-        let mut rx = self
-            .db
-            .subscribe_watch(crate::watch::WatchTopic::new("batch/v1", "CronJob"));
+        let topic = WatchTopic::new("batch/v1", "CronJob");
+        let mut cursor = SignalWatchCursor::new(
+            self.db.subscribe_watch_signals(topic.clone()),
+            DatastoreWatchReplaySource::new(
+                self.db.clone(),
+                vec![WatchTarget::namespaced("batch/v1", "CronJob")],
+            ),
+            topic,
+            WatchDeliveryScope::NamespacedAll,
+            self.db.get_current_resource_version().await.unwrap_or(0),
+            WindowPolicy::default_watch_delivery(),
+        );
+        if let Err(e) = self.startup_walk().await {
+            tracing::warn!("cronjob_scheduler: startup walk after watch subscribe failed: {e:#}");
+        }
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                msg = rx.recv() => {
+                msg = cursor.next_event() => {
                     match msg {
                         Ok(event) => {
                             if !is_cronjob_event(&event) {
@@ -335,20 +351,22 @@ impl CronJobScheduler {
                             }
                             self.handle_watch_event(event).await;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        Err(WatchCursorError::Expired) => {
                             tracing::warn!(
-                                "cronjob_scheduler: watch lagged by {} events; \
-                                 reconciling all CronJobs to recover state",
-                                n
+                                "cronjob_scheduler: replay window expired; \
+                                 reconciling all CronJobs to recover state"
                             );
                             if let Err(e) = self.startup_walk().await {
                                 tracing::warn!(
-                                    "cronjob_scheduler: re-walk after lag failed: {:#}",
+                                    "cronjob_scheduler: re-walk after expired replay failed: {:#}",
                                     e
                                 );
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(WatchCursorError::Replay(err)) => {
+                            tracing::warn!("cronjob_scheduler: watch replay failed: {err:#}");
+                        }
+                        Err(WatchCursorError::Closed) => break,
                     }
                 }
             }

@@ -39,7 +39,7 @@ use tokio::sync::broadcast;
 use crate::datastore::WatchReplayRead;
 use crate::networking::{NodeName, PodSubnet, VtepMac};
 use crate::task_supervisor::TaskSupervisor;
-use crate::watch::{WatchBus, WatchEvent, WatchReceiver, WatchSignal, WatchTopic};
+use crate::watch::{WatchBus, WatchSignal, WatchTopic};
 
 impl std::fmt::Debug for Datastore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -324,7 +324,7 @@ impl Datastore {
             .await
             .map_err(|e| anyhow!("move pod to cleanup intent failed: {e}"))?;
         for event in pending {
-            self.broadcast_watch_event(event);
+            self.publish_watch_event(event);
         }
         Ok(())
     }
@@ -414,7 +414,7 @@ impl Datastore {
             .await
             .map_err(|e| anyhow!("apply cluster maintenance command failed: {e}"))?;
         for event in pending {
-            self.broadcast_watch_event(event);
+            self.publish_watch_event(event);
         }
         Ok(())
     }
@@ -702,7 +702,7 @@ impl Datastore {
                 pending,
             } => {
                 if let Some(pending) = pending {
-                    self.broadcast_watch_event(pending);
+                    self.publish_watch_event(pending);
                 }
                 Ok(OutboxApplyResult::Applied { applied_rv })
             }
@@ -1886,20 +1886,23 @@ impl DatastoreBackend for Datastore {
             .expect("seed namespace for test");
     }
 
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
-        Datastore::subscribe_watch(self, topic)
-    }
-
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
-        Datastore::subscribe_watch_many(self, topics)
-    }
-
     fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
         Datastore::subscribe_watch_signals(self, topic)
     }
 
+    #[cfg(test)]
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
+        Datastore::subscribe_watch(self, topic)
+    }
+
+    #[cfg(test)]
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
+        Datastore::subscribe_watch_many(self, topics)
+    }
+
+    #[cfg(test)]
     fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
-        Datastore::broadcast_watch_event(self, pending)
+        Datastore::broadcast_watch_event(self, pending);
     }
 
     async fn replace_replicated_resource_state(

@@ -14,7 +14,8 @@ use crate::control_plane::client::{
 };
 use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::replicated::WriteRejection;
-use crate::datastore::{DatastoreHandle, NodeSubnet, PodCleanupIntent, Resource};
+use crate::datastore::sqlite::DatastoreWatchReplaySource;
+use crate::datastore::{DatastoreHandle, NodeSubnet, PodCleanupIntent, Resource, WatchTarget};
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{OutboxApplyClient, OutboxApplyError, OutboxApplyResult};
 use crate::networking::wireguard::DataplanePeerMetadata;
@@ -198,26 +199,45 @@ impl LeaderApiClient for LocalApiClient {
     }
 
     async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-        let rx = self
-            .db
-            .subscribe_watch(crate::watch::WatchTopic::new(&req.api_version, &req.kind));
-        let stream = futures::stream::unfold(rx, move |mut rx| {
-            let req = req.clone();
-            async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(event) if watch_event_matches(&event, &req) => {
-                            return Some((Ok(ResourceEvent { event }), rx));
+        let topic = crate::watch::WatchTopic::new(&req.api_version, &req.kind);
+        let signal_rx = self.db.subscribe_watch_signals(topic.clone());
+        let replay_source =
+            DatastoreWatchReplaySource::new(self.db.clone(), vec![watch_target_for_request(&req)]);
+        let scope = watch_delivery_scope_for_request(&req);
+        let start_rv = req.start_resource_version.unwrap_or(0).max(0);
+        let stream = async_stream::stream! {
+            let mut cursor = crate::watch::SignalWatchCursor::new(
+                signal_rx,
+                replay_source,
+                topic,
+                scope,
+                start_rv,
+                crate::watch::WindowPolicy::default_watch_delivery(),
+            );
+            if start_rv > 0
+                && let Err(err) = cursor.prime_replay_or_expired().await
+            {
+                yield Err(local_watch_cursor_error(err, cursor.accepted_rv()));
+                return;
+            }
+            loop {
+                match cursor.next_event().await {
+                    Ok(event) => {
+                        if watch_event_matches(&event, &req) {
+                            yield Ok(ResourceEvent { event });
                         }
-                        Ok(_) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            return Some((Err(anyhow!("local watch channel closed")), rx));
-                        }
+                    }
+                    Err(crate::watch::WatchCursorError::Closed) => {
+                        yield Err(anyhow!("local watch signal channel closed"));
+                        return;
+                    }
+                    Err(err) => {
+                        yield Err(local_watch_cursor_error(err, cursor.accepted_rv()));
+                        return;
                     }
                 }
             }
-        });
+        };
         Ok(Box::pin(stream))
     }
 
@@ -498,6 +518,45 @@ fn watch_event_matches(event: &WatchEvent, req: &WatchRequest) -> bool {
             req.label_selector.as_deref(),
         )
         && event.matches_field_selector(req.field_selector.as_deref())
+}
+
+fn watch_target_for_request(req: &WatchRequest) -> WatchTarget {
+    if let Some(namespace) = req.namespace.as_ref() {
+        return WatchTarget::namespaced_in_namespace(
+            req.api_version.clone(),
+            req.kind.clone(),
+            namespace.clone(),
+        );
+    }
+    if crate::datastore::sqlite::scope::is_namespaced(&req.kind) {
+        WatchTarget::namespaced(req.api_version.clone(), req.kind.clone())
+    } else {
+        WatchTarget::cluster(req.api_version.clone(), req.kind.clone())
+    }
+}
+
+fn watch_delivery_scope_for_request(req: &WatchRequest) -> crate::watch::WatchDeliveryScope {
+    if let Some(namespace) = req.namespace.as_ref() {
+        return crate::watch::WatchDeliveryScope::Namespaced(namespace.clone());
+    }
+    if crate::datastore::sqlite::scope::is_namespaced(&req.kind) {
+        crate::watch::WatchDeliveryScope::NamespacedAll
+    } else {
+        crate::watch::WatchDeliveryScope::Cluster
+    }
+}
+
+fn local_watch_cursor_error(
+    err: crate::watch::WatchCursorError,
+    accepted_rv: i64,
+) -> anyhow::Error {
+    match err {
+        crate::watch::WatchCursorError::Expired => {
+            anyhow!("local watch replay window expired: resume rv {accepted_rv} requires relist")
+        }
+        crate::watch::WatchCursorError::Replay(err) => anyhow!("local watch replay failed: {err}"),
+        crate::watch::WatchCursorError::Closed => anyhow!("local watch signal channel closed"),
+    }
 }
 
 fn resource_from_watch_event(event: WatchEvent) -> Resource {

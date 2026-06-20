@@ -9,16 +9,19 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::networking::VtepMac;
-use crate::watch::{WatchEvent, WatchReceiver, WatchSignal, WatchTopic};
+#[cfg(test)]
+use crate::watch::{WatchEvent, WatchReceiver};
+use crate::watch::{WatchSignal, WatchTopic};
 
 use super::command::{CommandMeta, StorageCommand};
+#[cfg(test)]
+use super::types::PendingWatchEvent;
 use super::types::{
-    AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PatchKind,
-    PendingWatchEvent, PodCleanupIntent, PodEndpointEvent, PodEndpointRow, PodNetworkEndpoint,
-    PodSlotAdmissionEvent, PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind,
-    ReplicatedCreateOptions, ReplicatedSnapshotMetadata, Resource, ResourceList, ResourceListQuery,
-    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayRead,
-    WatchTarget,
+    AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PatchKind, PodCleanupIntent,
+    PodEndpointEvent, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
+    PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, ReplicatedCreateOptions,
+    ReplicatedSnapshotMetadata, Resource, ResourceList, ResourceListQuery, ResourcePatchRequest,
+    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayRead, WatchTarget,
 };
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
@@ -47,11 +50,15 @@ pub trait DatastoreBackend: Send + Sync {
     ) {
     }
 
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
     fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal>;
 
-    /// Broadcast a watch event after DB transaction commits.
+    #[cfg(test)]
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
+
+    #[cfg(test)]
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
+
+    #[cfg(test)]
     fn broadcast_watch_event(&self, pending: PendingWatchEvent);
 
     /// Apply a replicated command locally without going through role-based
@@ -1183,9 +1190,9 @@ impl<T: DatastoreBackend + ?Sized> OwnershipStore for T {
 /// Watch-event subscription, broadcast access, and replay queries.
 #[async_trait]
 pub trait WatchStore: Send + Sync {
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
     fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal>;
+    #[cfg(test)]
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
     async fn list_watch_events_since(
         &self,
         targets: &[WatchTarget],
@@ -1195,14 +1202,12 @@ pub trait WatchStore: Send + Sync {
 
 #[async_trait]
 impl<T: DatastoreBackend + ?Sized> WatchStore for T {
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
-        DatastoreBackend::subscribe_watch(self, topic)
-    }
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
-        DatastoreBackend::subscribe_watch_many(self, topics)
-    }
     fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
         DatastoreBackend::subscribe_watch_signals(self, topic)
+    }
+    #[cfg(test)]
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
+        DatastoreBackend::subscribe_watch(self, topic)
     }
     async fn list_watch_events_since(
         &self,

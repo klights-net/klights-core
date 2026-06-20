@@ -10,7 +10,7 @@ use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::types::*;
 use crate::networking::VtepMac;
-use crate::watch::{WatchEvent, WatchReceiver, WatchSignal, WatchTopic};
+use crate::watch::{WatchSignal, WatchTopic};
 
 use super::{ReplicatedDatastore, apply_command_to_backend};
 
@@ -20,21 +20,6 @@ impl DatastoreBackend for ReplicatedDatastore {
         self.set_raft_proposer(proposer);
     }
 
-    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
-        if true {
-            self.inner.subscribe_watch(topic)
-        } else {
-            let (_tx, rx) = broadcast::channel(1);
-            rx
-        }
-    }
-    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
-        if true {
-            self.inner.subscribe_watch_many(topics)
-        } else {
-            WatchReceiver::from_receiver(broadcast::channel(1).1)
-        }
-    }
     fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
         if true {
             self.inner.subscribe_watch_signals(topic)
@@ -42,10 +27,20 @@ impl DatastoreBackend for ReplicatedDatastore {
             broadcast::channel(1).1
         }
     }
+
+    #[cfg(test)]
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
+        self.inner.subscribe_watch(topic)
+    }
+
+    #[cfg(test)]
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
+        self.inner.subscribe_watch_many(topics)
+    }
+
+    #[cfg(test)]
     fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
-        if true {
-            self.inner.broadcast_watch_event(pending)
-        }
+        self.inner.broadcast_watch_event(pending);
     }
 
     async fn replace_replicated_resource_state(
