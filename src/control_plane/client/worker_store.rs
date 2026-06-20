@@ -1,4 +1,6 @@
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::{Result, anyhow};
@@ -20,6 +22,8 @@ use crate::datastore::{
 use crate::networking::VtepMac;
 use crate::watch::{EventType, WatchBus, WatchEvent, WatchSignal, WatchTopic};
 
+const WORKER_WATCH_EVENT_HISTORY_CAPACITY: usize = 32_768;
+
 /// Worker-local compatibility store for legacy kubelet call sites.
 ///
 /// This type deliberately does not open or own `cluster.db`. Cluster resource
@@ -31,6 +35,7 @@ pub struct WorkerStoreAdapter {
     watch_bus: Arc<WatchBus>,
     node_name: String,
     current_rv: AtomicI64,
+    event_history: Mutex<VecDeque<WatchEvent>>,
 }
 
 impl WorkerStoreAdapter {
@@ -45,6 +50,7 @@ impl WorkerStoreAdapter {
             watch_bus: Arc::new(WatchBus::new(1024)),
             node_name,
             current_rv: AtomicI64::new(0),
+            event_history: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -252,11 +258,47 @@ impl WorkerStoreAdapter {
         {
             self.observe_rv(rv);
         }
+        self.record_watch_event(event.clone());
         if let Some(signal) = WatchSignal::from_event(&event) {
             self.watch_bus.publish_signal(signal);
         }
         #[cfg(test)]
         self.watch_bus.publish(event);
+    }
+
+    fn record_watch_event(&self, event: WatchEvent) {
+        if event.resource_version().is_none() {
+            return;
+        }
+        let mut history = self
+            .event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        history.push_back(event);
+        while history.len() > WORKER_WATCH_EVENT_HISTORY_CAPACITY {
+            history.pop_front();
+        }
+    }
+
+    fn historical_watch_events_since(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> Vec<CatchUpResource> {
+        let history = self
+            .event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        history
+            .iter()
+            .filter_map(|event| {
+                let rv = event.resource_version()?;
+                if rv <= since_rv || !watch_event_matches_targets(event, targets) {
+                    return None;
+                }
+                catchup_resource_from_watch_event(event)
+            })
+            .collect()
     }
 
     fn is_pod_resource(api_version: &str, kind: &str) -> bool {
@@ -366,6 +408,65 @@ fn is_watch_window_expired(err: &anyhow::Error) -> bool {
         cause
             .downcast_ref::<tonic::Status>()
             .is_some_and(|s| s.code() == tonic::Code::OutOfRange)
+    })
+}
+
+fn watch_event_matches_targets(event: &WatchEvent, targets: &[WatchTarget]) -> bool {
+    let Some(api_version) = event
+        .object
+        .get("apiVersion")
+        .and_then(|value| value.as_str())
+    else {
+        return false;
+    };
+    let Some(kind) = event.object.get("kind").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    let namespace = event
+        .object
+        .pointer("/metadata/namespace")
+        .and_then(|value| value.as_str());
+
+    targets.iter().any(|target| {
+        if target.api_version != api_version || target.kind != kind {
+            return false;
+        }
+        match &target.scope {
+            WatchTargetScope::Cluster => namespace.is_none(),
+            WatchTargetScope::Namespaced(Some(target_ns)) => namespace == Some(target_ns.as_str()),
+            WatchTargetScope::Namespaced(None) => namespace.is_some(),
+        }
+    })
+}
+
+fn catchup_resource_from_watch_event(event: &WatchEvent) -> Option<CatchUpResource> {
+    let api_version = event.object.get("apiVersion")?.as_str()?.to_string();
+    let kind = event.object.get("kind")?.as_str()?.to_string();
+    let metadata = event.object.get("metadata")?;
+    let name = metadata.get("name")?.as_str()?.to_string();
+    let namespace = metadata
+        .get("namespace")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let uid = metadata
+        .get("uid")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let resource_version = event.resource_version()?;
+
+    Some(CatchUpResource {
+        resource: Resource {
+            id: 0,
+            api_version,
+            kind,
+            namespace,
+            name,
+            uid,
+            resource_version,
+            data: event.object.clone(),
+        },
+        event_type: std::borrow::Cow::Owned(event.event_type.to_string()),
     })
 }
 
@@ -875,7 +976,11 @@ impl DatastoreBackend for WorkerStoreAdapter {
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        let mut events = Vec::new();
+        let mut events = self.historical_watch_events_since(targets, since_rv);
+        let mut seen_rvs: HashSet<i64> = events
+            .iter()
+            .map(|event| event.resource.resource_version)
+            .collect();
         let event_type = Self::snapshot_replay_event_type(since_rv);
         for target in targets {
             let list = self.list_for_target(target).await?;
@@ -884,12 +989,14 @@ impl DatastoreBackend for WorkerStoreAdapter {
                 list.items
                     .into_iter()
                     .filter(|resource| resource.resource_version > since_rv)
+                    .filter(|resource| seen_rvs.insert(resource.resource_version))
                     .map(|resource| CatchUpResource {
                         resource,
                         event_type: std::borrow::Cow::Borrowed(event_type),
                     }),
             );
         }
+        events.sort_by_key(|event| event.resource.resource_version);
         Ok(events)
     }
 
@@ -1697,6 +1804,71 @@ mod tests {
         assert!(
             second_events.is_empty(),
             "resumed worker replay must not return resources at or below the resume RV"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_watch_replay_preserves_mirrored_delete_events() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db.clone()),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-watch-delete-replay-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+
+        crate::datastore::DatastoreBackend::broadcast_watch_event(
+            &adapter,
+            crate::datastore::create_pending_watch_event(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "deleted-config",
+                42,
+                "DELETED",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "deleted-config",
+                        "resourceVersion": "41"
+                    },
+                    "data": {"data-1": "value-1"}
+                }),
+            ),
+        );
+
+        let replay = adapter
+            .list_watch_events_since_checked_bounded(
+                &[WatchTarget::namespaced("v1", "ConfigMap")],
+                0,
+                std::num::NonZeroUsize::new(8).expect("non-zero limit"),
+            )
+            .await
+            .expect("watch replay should succeed");
+
+        let crate::datastore::WatchReplayRead::Events(events) = replay else {
+            panic!("worker adapter replay should not expire");
+        };
+        assert!(
+            events.iter().any(|event| {
+                event.event_type.as_ref() == "DELETED"
+                    && event.resource.kind == "ConfigMap"
+                    && event.resource.name == "deleted-config"
+                    && event.resource.resource_version == 42
+            }),
+            "worker watch replay must preserve mirrored DELETED events because deleted resources are absent from snapshot replay"
         );
     }
 
