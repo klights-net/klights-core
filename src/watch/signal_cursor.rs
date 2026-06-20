@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
@@ -10,6 +10,8 @@ use super::{
     WindowPolicy,
 };
 
+const RECENT_SIGNAL_SEEN_RV_CAPACITY: usize = 32_768;
+
 pub struct SignalWatchCursor<S> {
     signal_rx: broadcast::Receiver<WatchSignal>,
     replay_source: S,
@@ -19,6 +21,10 @@ pub struct SignalWatchCursor<S> {
     pending: VecDeque<WatchEvent>,
     window: WindowPolicy,
     replay_needed: bool,
+    replay_resume_rv: Option<i64>,
+    seen_rvs: HashSet<i64>,
+    seen_order: VecDeque<i64>,
+    low_rv_allowlist: HashMap<(Option<String>, String), i64>,
 }
 
 impl<S: WatchReplaySource> SignalWatchCursor<S> {
@@ -39,6 +45,10 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
             pending: VecDeque::new(),
             window,
             replay_needed: false,
+            replay_resume_rv: None,
+            seen_rvs: HashSet::new(),
+            seen_order: VecDeque::new(),
+            low_rv_allowlist: HashMap::new(),
         }
     }
 
@@ -47,13 +57,25 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
     }
 
     pub fn accept_event(&mut self, rv: i64) {
+        self.record_seen(rv);
         if rv > self.accepted_rv {
             self.accepted_rv = rv;
         }
     }
 
+    pub fn mark_delivered(&mut self, rv: i64) {
+        self.record_seen(rv);
+    }
+
+    pub fn allow_low_rv_for_key(&mut self, namespace: Option<String>, name: String, after_rv: i64) {
+        if after_rv <= 0 {
+            return;
+        }
+        self.low_rv_allowlist.insert((namespace, name), after_rv);
+    }
+
     pub async fn prime_replay_or_expired(&mut self) -> Result<usize, WatchCursorError> {
-        self.replay_once().await
+        self.replay_once_from(self.accepted_rv).await
     }
 
     pub async fn next_event(&mut self) -> Result<WatchEvent, WatchCursorError> {
@@ -64,16 +86,16 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
 
             if self.replay_needed {
                 self.replay_needed = false;
-                self.replay_once().await?;
+                let since_rv = self.replay_resume_rv.take().unwrap_or(self.accepted_rv);
+                self.replay_once_from(since_rv).await?;
                 continue;
             }
 
             match self.signal_rx.recv().await {
                 Ok(signal) => {
-                    if self.matching_signal_high_rv(&signal).is_none() {
-                        continue;
+                    if let Some(since_rv) = self.matching_signal_replay_since(&signal) {
+                        self.replay_once_from(since_rv).await?;
                     }
-                    self.replay_once().await?;
                 }
                 Err(RecvError::Lagged(_)) => {
                     self.replay_needed = true;
@@ -83,17 +105,19 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
         }
     }
 
-    async fn replay_once(&mut self) -> Result<usize, WatchCursorError> {
+    async fn replay_once_from(&mut self, since_rv: i64) -> Result<usize, WatchCursorError> {
         let limit = self.window.limit();
         let replay = self
             .replay_source
-            .replay_since_checked(self.accepted_rv, limit)
+            .replay_since_checked(since_rv, limit)
             .await
             .map_err(WatchCursorError::Replay)?;
         match replay {
             WatchReplayRead::Events(events) => {
                 let event_count = events.len();
+                let max_rv = events.iter().filter_map(WatchEvent::resource_version).max();
                 self.replay_needed = event_count == limit.get();
+                self.replay_resume_rv = self.replay_needed.then_some(max_rv.unwrap_or(since_rv));
                 self.pending.extend(events);
                 Ok(event_count)
             }
@@ -107,6 +131,15 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
                 continue;
             };
             if rv <= self.accepted_rv {
+                if self.seen_rvs.contains(&rv) {
+                    continue;
+                }
+                if !self.low_rv_allowed(&event, rv) {
+                    continue;
+                }
+            }
+            if self.seen_rvs.contains(&rv) {
+                self.accept_event(rv);
                 continue;
             }
             if !self.event_matches(&event) {
@@ -119,19 +152,25 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
         None
     }
 
-    fn matching_signal_high_rv(&self, signal: &WatchSignal) -> Option<i64> {
+    fn matching_signal_replay_since(&self, signal: &WatchSignal) -> Option<i64> {
         if signal.topic != self.topic {
             return None;
         }
-        signal
-            .advances
-            .iter()
-            .filter(|advance| {
-                advance.high_rv > self.accepted_rv
-                    && self.scope.matches_namespace(advance.namespace.as_deref())
-            })
-            .map(|advance| advance.high_rv)
-            .max()
+        let mut replay_since: Option<i64> = None;
+        for advance in &signal.advances {
+            if !self.scope.matches_namespace(advance.namespace.as_deref()) {
+                continue;
+            }
+            let since = if advance.high_rv > self.accepted_rv {
+                Some(self.accepted_rv)
+            } else {
+                self.low_rv_replay_floor(advance.high_rv)
+            };
+            if let Some(since) = since {
+                replay_since = Some(replay_since.map_or(since, |current| current.min(since)));
+            }
+        }
+        replay_since
     }
 
     fn event_matches(&self, event: &WatchEvent) -> bool {
@@ -145,6 +184,37 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
         }
         self.scope.matches_namespace(event_namespace(event))
     }
+
+    fn low_rv_replay_floor(&self, high_rv: i64) -> Option<i64> {
+        self.low_rv_allowlist
+            .values()
+            .filter(|after_rv| high_rv > **after_rv)
+            .copied()
+            .min()
+    }
+
+    fn low_rv_allowed(&self, event: &WatchEvent, rv: i64) -> bool {
+        let Some(key) = event_key(event) else {
+            return false;
+        };
+        self.low_rv_allowlist
+            .get(&key)
+            .is_some_and(|after_rv| rv > *after_rv)
+    }
+
+    fn record_seen(&mut self, rv: i64) {
+        if rv <= 0 {
+            return;
+        }
+        if self.seen_rvs.insert(rv) {
+            self.seen_order.push_back(rv);
+            while self.seen_order.len() > RECENT_SIGNAL_SEEN_RV_CAPACITY {
+                if let Some(oldest) = self.seen_order.pop_front() {
+                    self.seen_rvs.remove(&oldest);
+                }
+            }
+        }
+    }
 }
 
 fn event_namespace(event: &WatchEvent) -> Option<&str> {
@@ -153,4 +223,18 @@ fn event_namespace(event: &WatchEvent) -> Option<&str> {
         .get("metadata")
         .and_then(|metadata| metadata.get("namespace"))
         .and_then(|namespace| namespace.as_str())
+}
+
+fn event_key(event: &WatchEvent) -> Option<(Option<String>, String)> {
+    let name = event
+        .object
+        .pointer("/metadata/name")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)?;
+    let namespace = event
+        .object
+        .pointer("/metadata/namespace")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string);
+    Some((namespace, name))
 }

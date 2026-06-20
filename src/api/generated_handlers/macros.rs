@@ -1064,16 +1064,14 @@ macro_rules! cluster_wide_list_handler {
                     requested_rv = floor;
                 }
 
-                let rx = crate::watch::WatchReceiver::from_receiver(
-                    state
-                        .db
-                        .subscribe_watch(crate::watch::WatchTopic::new($api_version, &kind)),
-                );
+                let signal_rx = state
+                    .db
+                    .subscribe_watch_signals(crate::watch::WatchTopic::new($api_version, &kind));
                 let db = state.db.clone();
 
                 let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
                     db,
-                    rx,
+                    signal_rx,
                     task_supervisor: state.task_supervisor.clone(),
                     api_version: $api_version,
                     kind,

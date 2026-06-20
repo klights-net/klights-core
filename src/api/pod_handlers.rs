@@ -53,15 +53,13 @@ pub async fn list_pods(
             requested_rv = floor;
         }
 
-        let rx = crate::watch::WatchReceiver::from_receiver(
-            state
-                .db
-                .subscribe_watch(crate::watch::WatchTopic::new("v1", &kind)),
-        );
+        let signal_rx = state
+            .db
+            .subscribe_watch_signals(crate::watch::WatchTopic::new("v1", &kind));
         let db = state.db.clone();
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
             db,
-            rx,
+            signal_rx,
             task_supervisor: state.task_supervisor.clone(),
             api_version: "v1",
             kind,
@@ -503,15 +501,13 @@ pub async fn list_all_pods(
             requested_rv = floor;
         }
 
-        let rx = crate::watch::WatchReceiver::from_receiver(
-            state
-                .db
-                .subscribe_watch(crate::watch::WatchTopic::new("v1", &kind)),
-        );
+        let signal_rx = state
+            .db
+            .subscribe_watch_signals(crate::watch::WatchTopic::new("v1", &kind));
         let db = state.db.clone();
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
             db,
-            rx,
+            signal_rx,
             task_supervisor: state.task_supervisor.clone(),
             api_version: "v1",
             kind,

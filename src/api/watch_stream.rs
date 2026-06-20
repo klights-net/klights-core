@@ -4,8 +4,8 @@ use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{DatastoreHandle, WatchTarget};
 use crate::label_selector::LabelSelector;
 use crate::watch::{
-    EventType, WatchContentType, WatchCursor, WatchCursorError, WatchEvent, WatchReceiver,
-    WatchTopic,
+    EventType, SignalWatchCursor, WatchContentType, WatchCursor, WatchCursorError,
+    WatchDeliveryScope, WatchEvent, WatchSignal, WatchTopic, WindowPolicy,
 };
 use axum::body::Body;
 use serde_json::Value;
@@ -53,7 +53,7 @@ pub async fn wait_until_datastore_fresh(
     }
     // Subscribe BEFORE the first freshness check so an advance landing
     // between the check and the wait is still observed (no lost wakeup).
-    let mut fresh_rx = WatchReceiver::from_receiver(db.subscribe_watch(topic));
+    let mut fresh_rx = db.subscribe_watch_signals(topic);
     if db.get_current_resource_version().await.unwrap_or(0) >= target_rv {
         return;
     }
@@ -69,11 +69,15 @@ pub async fn wait_until_datastore_fresh(
                 return;
             }
             recv = fresh_rx.recv() => match recv {
-                Ok(event) => {
+                Ok(signal) => {
                     // Any applied write with rv >= target proves the
                     // monotonic resource-version counter has reached the
                     // target — no DB round-trip needed on the hot path.
-                    if event.resource_version().is_some_and(|rv| rv >= target_rv) {
+                    if signal
+                        .advances
+                        .iter()
+                        .any(|advance| advance.high_rv >= target_rv)
+                    {
                         return;
                     }
                 }
@@ -546,7 +550,7 @@ pub async fn recv_watch_timeout(rx: &mut Option<mpsc::Receiver<()>>) -> Option<(
 
 pub struct LabelSelectorWatchStreamRequest<'a> {
     pub db: DatastoreHandle,
-    pub rx: WatchReceiver,
+    pub signal_rx: broadcast::Receiver<WatchSignal>,
     pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     pub api_version: &'a str,
     pub kind: String,
@@ -564,7 +568,7 @@ pub struct LabelSelectorWatchStreamRequest<'a> {
 pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamRequest<'_>) -> Body {
     let LabelSelectorWatchStreamRequest {
         db,
-        rx,
+        signal_rx,
         task_supervisor,
         api_version,
         kind,
@@ -820,18 +824,27 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             (WatchCatchUpMode::ClusterOnly, _) => WatchTarget::cluster(api_version.clone(), kind.clone()),
         };
         let replay_source = DatastoreWatchReplaySource::new(db.clone(), vec![replay_target]);
-        let mut cursor =
-            WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv))
-                .with_ordered_replay()
-                // The live broadcast is cluster-wide for built-in kinds; confine
-                // floor-drop expiration to events a namespaced replay could hold
-                // so an out-of-namespace event below the floor is ignored, not
-                // expired. `watch_namespace` mirrors the replay target's scope.
-                .with_replay_namespace(watch_namespace.clone());
-        // Dedup baseline ADDEDs and grant per-key low-rv exceptions; shared with
-        // the custom-resource watch builder via `seed_watch_cursor_baseline`.
-        seed_watch_cursor_baseline(&mut cursor, baseline_delivered_rvs, baseline_low_rv_allowlist);
-        if requested_rv > 0 {
+        let topic = WatchTopic::new(&api_version, &kind);
+        let delivery_scope = match (catch_up_mode, watch_namespace.clone()) {
+            (WatchCatchUpMode::ClusterOnly, _) => WatchDeliveryScope::Cluster,
+            (WatchCatchUpMode::NamespacedScoped, Some(ns)) => WatchDeliveryScope::Namespaced(ns),
+            (WatchCatchUpMode::NamespacedScoped, None) => WatchDeliveryScope::NamespacedAll,
+        };
+        let mut cursor = SignalWatchCursor::new(
+            signal_rx,
+            replay_source,
+            topic,
+            delivery_scope,
+            initial_list_rv.max(requested_rv),
+            WindowPolicy::default_watch_delivery(),
+        );
+        for rv in baseline_delivered_rvs {
+            cursor.mark_delivered(rv);
+        }
+        for ((namespace, name), after_rv) in baseline_low_rv_allowlist {
+            cursor.allow_low_rv_for_key(namespace, name, after_rv);
+        }
+        if requested_rv > 0 || send_initial_events {
             match cursor.prime_replay_or_expired().await {
                 Ok(_) => {}
                 Err(WatchCursorError::Expired) => {
@@ -870,7 +883,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 Some(()) = recv_watch_timeout(&mut timeout_tick) => {
                     break;
                 }
-                result = cursor.next_event(&task_supervisor) => {
+                result = cursor.next_event() => {
                     let event = match result {
                         Ok(event) => event,
                         Err(WatchCursorError::Replay(err)) => {
@@ -946,22 +959,31 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                                     "selector watch rewrote a live MODIFIED (client awaiting MODIFIED may miss it)"
                                 );
                             }
-                            yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
+                            let rv = transitioned.resource_version();
+                            let line = serialize_watch_event_line(
                                 transitioned,
                                 &kind,
                                 table_format,
-                            ));
+                            );
+                            yield Ok::<_, std::convert::Infallible>(line);
+                            if let Some(rv) = rv {
+                                cursor.accept_event(rv);
+                                last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
+                            }
                         }
                     } else if event.matches_filter_parsed(&kind, watch_namespace.as_deref(), parsed_label_selector.as_ref())
                         && event.matches_field_selector(field_selector.as_deref()) {
-                        if let Some(rv) = event.resource_version() {
-                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
-                        }
-                        yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
+                        let rv = event.resource_version();
+                        let line = serialize_watch_event_line(
                             event,
                             &kind,
                             table_format,
-                        ));
+                        );
+                        yield Ok::<_, std::convert::Infallible>(line);
+                        if let Some(rv) = rv {
+                            cursor.accept_event(rv);
+                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
+                        }
                     }
                 }
                 Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
@@ -974,7 +996,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         field_selector: field_selector.as_deref(),
                         requested_rv,
                         has_scope_filter,
-                        cursor_high_water_rv: cursor.high_water_rv(),
+                        cursor_high_water_rv: cursor.accepted_rv(),
                         last_delivered_scoped_rv,
                     })
                     .await;
