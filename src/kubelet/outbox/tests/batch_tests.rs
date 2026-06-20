@@ -147,6 +147,75 @@ async fn leader_dispatcher_uses_consolidated_apply() {
 }
 
 #[tokio::test]
+async fn outbox_lost_response_remains_retryable_and_claimable_after_backoff() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+    let client = Arc::new(StackApplyClient::default());
+    let dispatcher = OutboxDispatcher::batch_mode_for_tests(node_db.clone(), client.clone(), 16);
+
+    let now = 10_000i64;
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "lost-response-key",
+            OutboxOperation::PodStatus,
+            OutboxSubject::new(
+                "v1/Pod/default/web/uid-web",
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_status_command("default", "web", "uid-web"),
+            now,
+        ))
+        .await
+        .expect("enqueue");
+
+    client
+        .push_response(Ok(OutboxApplyResult::Applied { applied_rv: 7 }))
+        .await;
+    client
+        .push_response(Err(OutboxApplyError::Retryable(
+            "simulated lost response".to_string(),
+        )))
+        .await;
+
+    assert_eq!(
+        dispatcher
+            .dispatch_due_once(now)
+            .await
+            .expect("first dispatch"),
+        DispatchOutcome::Dispatched
+    );
+
+    assert!(
+        node_db
+            .claim_next_due_outbox(now, 1_000, "too-soon")
+            .await
+            .expect("claim too soon")
+            .is_none(),
+        "retryable row must respect existing backoff"
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch_due_once(now + 60_000)
+            .await
+            .expect("second dispatch"),
+        DispatchOutcome::Dispatched
+    );
+
+    assert!(
+        node_db
+            .claim_next_due_outbox(now + 120_000, 1_000, "done")
+            .await
+            .expect("claim after success")
+            .is_none(),
+        "row should be completed after retry succeeds"
+    );
+}
+
+#[tokio::test]
 async fn leader_batch_respects_subject_fifo() {
     // When multiple rows exist for the same subject, the batch claim must
     // respect per-subject_key FIFO: only the oldest due row per subject
