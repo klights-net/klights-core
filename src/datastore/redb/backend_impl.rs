@@ -466,6 +466,16 @@ impl DatastoreBackend for RedbDatastore {
     ) -> Result<WatchReplayRead> {
         self.watch_store.watch_list_checked(t, s).await
     }
+    async fn list_watch_events_since_checked_bounded(
+        &self,
+        t: &[WatchTarget],
+        s: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead> {
+        self.watch_store
+            .watch_list_checked_bounded(t, s, limit)
+            .await
+    }
     async fn list_all_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {
         self.watch_store.watch_list_all_since(s).await
     }

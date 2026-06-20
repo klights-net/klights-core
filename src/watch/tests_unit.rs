@@ -7,6 +7,21 @@ fn test_task_supervisor() -> crate::task_supervisor::TaskSupervisor {
 }
 
 #[test]
+fn window_policy_default_watch_delivery_is_sliding_three() {
+    assert_eq!(
+        crate::watch::WindowPolicy::default_watch_delivery()
+            .limit()
+            .get(),
+        3
+    );
+}
+
+#[test]
+fn window_policy_stop_and_wait_reports_one() {
+    assert_eq!(crate::watch::WindowPolicy::StopAndWait.limit().get(), 1);
+}
+
+#[test]
 fn test_watch_event_added() {
     let obj = serde_json::json!({"kind": "Pod", "metadata": {"name": "test"}});
     let event = WatchEvent::added(obj.clone());
@@ -144,6 +159,38 @@ impl WatchReplaySource for FixedReplaySource {
             .filter(|event| event.resource_version().unwrap_or_default() > since_rv)
             .cloned()
             .collect())
+    }
+}
+
+#[tokio::test]
+async fn watch_replay_source_checked_replay_respects_limit() {
+    let source = FixedReplaySource::new(vec![
+        WatchEvent::added(serde_json::json!({
+            "kind": "Pod",
+            "metadata": {"name": "p1", "resourceVersion": "11"}
+        })),
+        WatchEvent::added(serde_json::json!({
+            "kind": "Pod",
+            "metadata": {"name": "p2", "resourceVersion": "12"}
+        })),
+        WatchEvent::added(serde_json::json!({
+            "kind": "Pod",
+            "metadata": {"name": "p3", "resourceVersion": "13"}
+        })),
+    ]);
+
+    let replay = source
+        .replay_since_checked(10, std::num::NonZeroUsize::new(2).unwrap())
+        .await
+        .unwrap();
+
+    match replay {
+        crate::datastore::WatchReplayRead::Events(events) => {
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].resource_version(), Some(11));
+            assert_eq!(events[1].resource_version(), Some(12));
+        }
+        crate::datastore::WatchReplayRead::Expired => panic!("fixed source should not expire"),
     }
 }
 

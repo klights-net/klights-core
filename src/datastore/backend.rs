@@ -514,6 +514,24 @@ pub trait DatastoreBackend: Send + Sync {
             .map(WatchReplayRead::Events)
     }
 
+    async fn list_watch_events_since_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead> {
+        match self
+            .list_watch_events_since_checked(targets, since_rv)
+            .await?
+        {
+            WatchReplayRead::Events(mut events) => {
+                events.truncate(limit.get());
+                Ok(WatchReplayRead::Events(events))
+            }
+            WatchReplayRead::Expired => Ok(WatchReplayRead::Expired),
+        }
+    }
+
     /// Lowest `resourceVersion` still retained in the durable `watch_events`
     /// window, or `None` when the window is empty. A watch whose requested /
     /// resume `resourceVersion` is older than this can no longer be replayed

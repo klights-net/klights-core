@@ -70,6 +70,21 @@ impl RedbWatchStore {
         .await
     }
 
+    pub async fn watch_list_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead> {
+        match self.watch_list_checked(targets, since_rv).await? {
+            WatchReplayRead::Events(mut events) => {
+                events.truncate(limit.get());
+                Ok(WatchReplayRead::Events(events))
+            }
+            WatchReplayRead::Expired => Ok(WatchReplayRead::Expired),
+        }
+    }
+
     fn watch_list_in_read(
         read_txn: &::redb::ReadTransaction,
         targets: &[WatchTarget],

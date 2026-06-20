@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::watch::WatchReplaySource;
 
-use super::{CatchUpResource, DatastoreHandle, WatchEvent, WatchTarget};
+use super::{CatchUpResource, DatastoreHandle, WatchEvent, WatchReplayRead, WatchTarget};
 
 pub struct DatastoreWatchReplaySource {
     db: DatastoreHandle,
@@ -28,6 +28,26 @@ impl WatchReplaySource for DatastoreWatchReplaySource {
             .into_iter()
             .map(CatchUpResource::into_watch_event)
             .collect())
+    }
+
+    async fn replay_since_checked(
+        &self,
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead<WatchEvent>> {
+        match self
+            .db
+            .list_watch_events_since_checked_bounded(&self.targets, since_rv, limit)
+            .await?
+        {
+            WatchReplayRead::Events(events) => Ok(WatchReplayRead::Events(
+                events
+                    .into_iter()
+                    .map(CatchUpResource::into_watch_event)
+                    .collect(),
+            )),
+            WatchReplayRead::Expired => Ok(WatchReplayRead::Expired),
+        }
     }
 
     async fn earliest_retained_rv(&self) -> Result<Option<i64>> {

@@ -185,14 +185,8 @@ impl Datastore {
 
         let targets = targets.to_vec();
         self.db_call("list_watch_events_since_checked", move |conn| {
-            if since_rv > 0 {
-                for target in &targets {
-                    if let Some(floor_rv) = target_floor(conn, target)?
-                        && since_rv < floor_rv
-                    {
-                        return Ok(WatchReplayRead::Expired);
-                    }
-                }
+            if watch_replay_expired_for_targets(conn, &targets, since_rv)? {
+                return Ok(WatchReplayRead::Expired);
             }
             Ok(
                 Self::list_watch_events_since_in_conn(conn, &targets, since_rv)
@@ -203,10 +197,46 @@ impl Datastore {
         .map_err(|e| anyhow::anyhow!("Failed to checked-list watch_events: {}", e))
     }
 
+    pub async fn list_watch_events_since_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead> {
+        if targets.is_empty() {
+            return Ok(WatchReplayRead::Events(Vec::new()));
+        }
+
+        let targets = targets.to_vec();
+        self.db_call("list_watch_events_since_checked_bounded", move |conn| {
+            if watch_replay_expired_for_targets(conn, &targets, since_rv)? {
+                return Ok(WatchReplayRead::Expired);
+            }
+            Ok(Self::list_watch_events_since_in_conn_with_limit(
+                conn,
+                &targets,
+                since_rv,
+                Some(limit),
+            )
+            .map(WatchReplayRead::Events)?)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to bounded checked-list watch_events: {}", e))
+    }
+
     fn list_watch_events_since_in_conn(
         conn: &rusqlite::Connection,
         targets: &[WatchTarget],
         since_rv: i64,
+    ) -> rusqlite::Result<Vec<CatchUpResource>> {
+        Self::list_watch_events_since_in_conn_with_limit(conn, targets, since_rv, None)
+    }
+
+    fn list_watch_events_since_in_conn_with_limit(
+        conn: &rusqlite::Connection,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: Option<std::num::NonZeroUsize>,
     ) -> rusqlite::Result<Vec<CatchUpResource>> {
         let mut query = queries::WATCH_EVENTS_LIST_TARGETS_HEAD.to_string();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since_rv)];
@@ -240,6 +270,10 @@ impl Datastore {
         }
 
         query.push_str(") ORDER BY resource_version ASC");
+        if let Some(limit) = limit {
+            query.push_str(&format!(" LIMIT ?{}", params.len() + 1));
+            params.push(Box::new(limit.get() as i64));
+        }
 
         let param_refs: Vec<&dyn rusqlite::ToSql> =
             params.iter().map(|param| param.as_ref()).collect();
@@ -339,6 +373,25 @@ pub(super) fn gc_watch_events_in_tx(
     );
     delete.push(')');
     tx.execute(&delete, rusqlite::params_from_iter(ids.iter()))
+}
+
+fn watch_replay_expired_for_targets(
+    conn: &rusqlite::Connection,
+    targets: &[WatchTarget],
+    since_rv: i64,
+) -> rusqlite::Result<bool> {
+    if since_rv <= 0 {
+        return Ok(false);
+    }
+
+    for target in targets {
+        if let Some(floor_rv) = target_floor(conn, target)?
+            && since_rv < floor_rv
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn target_floor(

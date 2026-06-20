@@ -6,6 +6,16 @@ use anyhow::Result;
 pub trait WatchReplaySource: Send + Sync {
     async fn replay_since(&self, since_rv: i64) -> Result<Vec<super::events::WatchEvent>>;
 
+    async fn replay_since_checked(
+        &self,
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::datastore::WatchReplayRead<super::events::WatchEvent>> {
+        let mut events = self.replay_since(since_rv).await?;
+        events.truncate(limit.get());
+        Ok(crate::datastore::WatchReplayRead::Events(events))
+    }
+
     /// Lowest `resourceVersion` still retained in the durable watch-event
     /// window, or `None` when no events are retained. Used to detect when a
     /// requested resume point predates the window so the watch can return a

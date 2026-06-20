@@ -2400,6 +2400,15 @@ impl DatastoreBackend for Datastore {
         Datastore::list_watch_events_since_checked(self, targets, since_rv).await
     }
 
+    async fn list_watch_events_since_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead> {
+        Datastore::list_watch_events_since_checked_bounded(self, targets, since_rv, limit).await
+    }
+
     async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
         Datastore::earliest_watch_event_rv(self).await
     }

@@ -3900,6 +3900,55 @@ async fn scoped_replay_floor_allows_retained_in_scope_event_after_unrelated_gc()
     }
 }
 
+#[tokio::test]
+async fn checked_watch_replay_bounded_limits_events() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let start_rv = db.get_current_resource_version().await.unwrap();
+
+    for i in 0..5 {
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("app"),
+            &format!("pod-{i}"),
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"namespace": "app", "name": format!("pod-{i}")},
+                "spec": {"containers": [{"name": "app", "image": "pause"}]}
+            }),
+        )
+        .await
+        .expect("create pod");
+    }
+
+    let replay = db
+        .list_watch_events_since_checked_bounded(
+            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+                "v1", "Pod", "app",
+            )],
+            start_rv,
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .expect("checked replay");
+
+    match replay {
+        crate::datastore::WatchReplayRead::Events(events) => {
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.resource.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["pod-0", "pod-1", "pod-2"]
+            );
+        }
+        crate::datastore::WatchReplayRead::Expired => {
+            panic!("fresh bounded replay should not expire");
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // DSB-05 — restart-recovery and retention tests
 // -----------------------------------------------------------------------

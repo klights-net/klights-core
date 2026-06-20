@@ -364,8 +364,8 @@ pub struct CatchUpResource {
 /// `watch_events` window and callers must relist instead of advancing from a
 /// partial suffix.
 #[derive(Debug, Clone)]
-pub enum WatchReplayRead {
-    Events(Vec<CatchUpResource>),
+pub enum WatchReplayRead<T = CatchUpResource> {
+    Events(Vec<T>),
     Expired,
 }
 
