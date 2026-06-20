@@ -434,6 +434,75 @@ async fn test_projected_secret_delete_event_clears_volume_with_stale_db_secret()
 }
 
 #[tokio::test]
+async fn test_projected_configmap_delete_event_clears_existing_volume_with_missing_phase() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let tmp = TempDir::new().unwrap();
+    let volumes_root = tmp.path().to_str().unwrap();
+    let db = crate::datastore::test_support::in_memory().await;
+
+    db.create_resource(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "deleted-config",
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "deleted-config", "namespace": "default"},
+            "data": {"data-1": "value-1"}
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "projected-pod",
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "projected-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "app", "image": "busybox"}],
+                "volumes": [{
+                    "name": "deletecm-volume",
+                    "projected": {
+                        "sources": [{"configMap": {"name": "deleted-config", "optional": true}}]
+                    }
+                }]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let vol_path = format!(
+        "{}/default_projected-pod/volumes/projected/deletecm-volume",
+        volumes_root
+    );
+    fs::create_dir_all(&vol_path).unwrap();
+    fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
+
+    refresh_secret_configmap_volumes_after_delete(
+        "ConfigMap",
+        "default",
+        "deleted-config",
+        volumes_root,
+        make_pod_reader(&db).as_ref(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !std::path::Path::new(&format!("{}/data-1", vol_path)).exists(),
+        "deleted ConfigMap watch events must clear an existing mounted projected volume even when the fresh Pod list has not observed status.phase yet"
+    );
+}
+
+#[tokio::test]
 async fn test_secret_delete_event_clears_direct_volume_with_stale_db_secret() {
     use base64::Engine;
     use std::fs;

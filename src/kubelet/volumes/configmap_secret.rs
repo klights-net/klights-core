@@ -395,8 +395,10 @@ async fn refresh_secret_configmap_volumes_inner(
             .pointer("/status/phase")
             .and_then(|p| p.as_str())
             .unwrap_or("");
-        // Only refresh volumes for running pods
-        if phase != "Running" && phase != "Pending" {
+        // Kubelet-owned mounted volumes can exist before the leader has observed
+        // status.phase. Skip only terminal pods; directory existence below tells
+        // us whether this node actually mounted the volume.
+        if phase == "Succeeded" || phase == "Failed" {
             continue;
         }
 
