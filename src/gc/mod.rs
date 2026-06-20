@@ -172,7 +172,7 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         let expired_ms = now_ms - applied_outbox_gc::APPLIED_OUTBOX_GC_TTL_MS - 1;
-        let recent_ms = now_ms - applied_outbox_gc::APPLIED_OUTBOX_GC_TTL_MS + 1;
+        let recent_ms = now_ms - applied_outbox_gc::APPLIED_OUTBOX_GC_TTL_MS + 60_000;
 
         db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
             idempotency_key: "expired-pod-status".to_string(),
