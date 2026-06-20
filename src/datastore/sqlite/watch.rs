@@ -27,6 +27,7 @@ pub fn publish_pending(pending: PendingWatchEvent, bus: &crate::watch::WatchBus)
     if let Some(signal) = WatchSignal::from_event(&event) {
         bus.publish_signal(signal);
     }
+    #[cfg(test)]
     bus.publish(event);
 }
 

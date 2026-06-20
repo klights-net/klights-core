@@ -152,7 +152,7 @@ async fn start_worker_store_adapter(
             node_name,
         ),
     );
-    let discovery_rx = worker_store.watch_topic(crate::watch::WatchTopic::new("v1", "Node"));
+    let discovery_rx = worker_store.watch_signals(crate::watch::WatchTopic::new("v1", "Node"));
     worker_store
         .start_watch_mirrors(supervisor.clone(), shutdown_token.clone())
         .await
@@ -164,16 +164,16 @@ async fn start_worker_store_adapter(
         };
         use std::collections::HashMap;
         let mut discovery_rx = discovery_rx;
+        let discovery_store = worker_store.clone();
         let cancel = shutdown_token.clone();
         supervisor
             .spawn_async(
                 crate::task_supervisor::TaskCategory::Background,
                 "controlplane_endpoint_discovery",
                 async move {
-                    let mut discovered: HashMap<String, String> = HashMap::new();
                     loop {
-                        let event = match discovery_rx.recv().await {
-                            Ok(e) => e,
+                        match discovery_rx.recv().await {
+                            Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(_) => {
                                 if cancel.is_cancelled() {
@@ -182,22 +182,51 @@ async fn start_worker_store_adapter(
                                 continue;
                             }
                         };
-                        match extract_controlplane_endpoint(&event) {
-                            ControlplaneDiscoveryEvent::Upsert {
-                                node_name,
-                                endpoint,
-                                is_leader,
-                            } => {
-                                discovered.insert(node_name, endpoint.clone());
-                                if is_leader {
-                                    discovery_client.set_current_leader_endpoint(Some(endpoint));
+                        let nodes = match crate::datastore::DatastoreBackend::list_resources(
+                            discovery_store.as_ref(),
+                            "v1",
+                            "Node",
+                            None,
+                            crate::datastore::ResourceListQuery::all(),
+                        )
+                        .await
+                        {
+                            Ok(nodes) => nodes,
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "controlplane endpoint discovery Node relist failed"
+                                );
+                                continue;
+                            }
+                        };
+                        let mut next_discovered: HashMap<String, String> = HashMap::new();
+                        let mut leader_endpoint = None;
+                        for node in nodes.items {
+                            let event = crate::watch::WatchEvent {
+                                event_type: crate::watch::EventType::Added,
+                                object: node.data.clone(),
+                                encoded_payload: None,
+                            };
+                            match extract_controlplane_endpoint(&event) {
+                                ControlplaneDiscoveryEvent::Upsert {
+                                    node_name,
+                                    endpoint,
+                                    is_leader,
+                                } => {
+                                    if is_leader {
+                                        leader_endpoint = Some(endpoint.clone());
+                                    }
+                                    next_discovered.insert(node_name, endpoint);
                                 }
+                                ControlplaneDiscoveryEvent::Remove { .. }
+                                | ControlplaneDiscoveryEvent::Ignore => {}
                             }
-                            ControlplaneDiscoveryEvent::Remove { node_name } => {
-                                discovered.remove(&node_name);
-                            }
-                            ControlplaneDiscoveryEvent::Ignore => continue,
                         }
+                        if let Some(endpoint) = leader_endpoint {
+                            discovery_client.set_current_leader_endpoint(Some(endpoint));
+                        }
+                        let discovered = next_discovered;
                         let mut merged = initial_leader_endpoints.clone();
                         for ep in discovered.values() {
                             if !merged.contains(ep) {

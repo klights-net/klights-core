@@ -74,6 +74,11 @@ impl WorkerStoreAdapter {
         Ok(handles)
     }
 
+    pub fn watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+        self.watch_bus.subscribe_signals(topic)
+    }
+
+    #[cfg(test)]
     pub fn watch_topic(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
         self.watch_bus.subscribe(topic)
     }
@@ -250,6 +255,7 @@ impl WorkerStoreAdapter {
         if let Some(signal) = WatchSignal::from_event(&event) {
             self.watch_bus.publish_signal(signal);
         }
+        #[cfg(test)]
         self.watch_bus.publish(event);
     }
 

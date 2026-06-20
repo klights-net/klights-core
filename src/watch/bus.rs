@@ -65,6 +65,7 @@ impl WatchTopic {
 /// Per-topic broadcast fan-out. This is the only Kubernetes watch
 /// publish/subscribe surface.
 pub struct WatchBus {
+    #[cfg(test)]
     topics: Mutex<HashMap<WatchTopic, broadcast::Sender<WatchEvent>>>,
     signal_topics: Mutex<HashMap<WatchTopic, broadcast::Sender<WatchSignal>>>,
     /// Per-topic buffer capacity. Far smaller than the old global 8192/kind is
@@ -110,12 +111,14 @@ impl WatchSignal {
 impl WatchBus {
     pub fn new(capacity: usize) -> Self {
         Self {
+            #[cfg(test)]
             topics: Mutex::new(HashMap::new()),
             signal_topics: Mutex::new(HashMap::new()),
             capacity: capacity.max(1),
         }
     }
 
+    #[cfg(test)]
     /// Subscribe to exactly one topic. The topic sender is created lazily on
     /// first subscribe. The returned receiver only ever observes events for
     /// `topic`; drop it to release the slot (the topic self-collects on the
@@ -128,6 +131,7 @@ impl WatchBus {
             .subscribe()
     }
 
+    #[cfg(test)]
     pub fn subscribe_many(&self, topics: impl IntoIterator<Item = WatchTopic>) -> WatchReceiver {
         WatchReceiver::new(
             topics
@@ -149,6 +153,7 @@ impl WatchBus {
     /// subscriber is registered for that topic (idle-silent: no topic, no
     /// wakeups). Once a topic's last receiver has dropped, the send fails and
     /// the topic is collected so memory tracks only active kinds.
+    #[cfg(test)]
     pub fn publish(&self, event: WatchEvent) {
         let Some(topic) = WatchTopic::of_event(&event) else {
             return;
@@ -179,10 +184,12 @@ impl WatchBus {
     }
 
     /// Test/observability seam: number of live topics currently held.
+    #[cfg(test)]
     pub fn topic_count(&self) -> usize {
-        self.lock().len()
+        self.lock().len() + self.lock_signals().len()
     }
 
+    #[cfg(test)]
     fn lock(
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<WatchTopic, broadcast::Sender<WatchEvent>>> {
@@ -234,10 +241,12 @@ impl From<broadcast::Receiver<WatchSignal>> for WatchSignalReceiver {
     }
 }
 
+#[cfg(test)]
 pub struct WatchReceiver {
     receivers: Vec<broadcast::Receiver<WatchEvent>>,
 }
 
+#[cfg(test)]
 impl WatchReceiver {
     pub fn new(receivers: Vec<broadcast::Receiver<WatchEvent>>) -> Self {
         Self { receivers }
@@ -266,6 +275,7 @@ impl WatchReceiver {
     }
 }
 
+#[cfg(test)]
 impl From<broadcast::Receiver<WatchEvent>> for WatchReceiver {
     fn from(receiver: broadcast::Receiver<WatchEvent>) -> Self {
         Self::from_receiver(receiver)

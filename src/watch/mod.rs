@@ -1,20 +1,26 @@
 mod bookmark;
 pub mod bus;
+#[cfg(test)]
 mod cursor;
 pub mod events;
+mod filter;
 mod replay;
 mod scope;
 mod signal_cursor;
 mod window;
 
+#[cfg(test)]
+pub use bus::WatchReceiver;
 pub use bus::{
-    DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, WatchAdvance, WatchBus, WatchReceiver, WatchSignal,
-    WatchSignalReceiver, WatchTopic,
+    DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, WatchAdvance, WatchBus, WatchSignal, WatchSignalReceiver,
+    WatchTopic,
 };
-pub use cursor::{WatchBootstrap, WatchCursor, WatchEventFilter};
+#[cfg(test)]
+pub use cursor::{WatchBootstrap, WatchCursor};
 pub use events::{
     EventType, WatchContentType, WatchEvent, encode_watch_payload, value_matches_field_selector,
 };
+pub use filter::WatchEventFilter;
 pub use replay::{WatchCursorError, WatchReplaySource};
 pub use scope::WatchDeliveryScope;
 pub use signal_cursor::SignalWatchCursor;
