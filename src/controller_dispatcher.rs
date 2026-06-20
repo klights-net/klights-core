@@ -27,14 +27,15 @@ use crate::controllers::{
     service_controller::ServiceController,
     statefulset_controller::StatefulSetController,
     workqueue::{
-        Key, MAX_RETRY_ATTEMPTS, ReconcileKey, WorkQueue, backoff_for, controller_kind_static,
+        Key, MAX_RETRY_ATTEMPTS, QueuePriority, ReconcileKey, WorkQueue, backoff_for,
+        controller_kind_static,
     },
 };
 use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_repository::PodRepository;
 use anyhow::{Context as _, Result};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -70,6 +71,13 @@ pub struct ControllerDispatcher {
     /// starts; required by the Deployment and ReplicaSet controllers
     /// (they fail-fast at reconcile time if it is missing).
     pod_repository: Arc<Mutex<Option<Arc<PodRepository>>>>,
+    active_reconciles: Arc<Mutex<ActiveReconciles>>,
+}
+
+#[derive(Default)]
+struct ActiveReconciles {
+    in_flight: HashSet<Key>,
+    pending_followup: HashSet<Key>,
 }
 
 impl ControllerDispatcher {
@@ -168,6 +176,7 @@ impl ControllerDispatcher {
             sync_ctx: Arc::new(Mutex::new(None)),
             services: Arc::new(Mutex::new(None)),
             pod_repository: Arc::new(Mutex::new(None)),
+            active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
         }
     }
 
@@ -305,6 +314,16 @@ impl ControllerDispatcher {
         *self.sync_ctx.lock().await = Some((db_handle, node_name));
     }
 
+    #[cfg(test)]
+    fn replace_controller_for_test(
+        &mut self,
+        api_version: &'static str,
+        kind: &'static str,
+        controller: Arc<dyn Controller>,
+    ) {
+        self.controllers.insert((api_version, kind), controller);
+    }
+
     /// Run the worker loop until `cancel` fires. Drains the workqueue: for
     /// each key, fetches the latest resource from the datastore (the
     /// resource may have changed since the producer enqueued it) and
@@ -318,22 +337,83 @@ impl ControllerDispatcher {
         node_name: String,
         cancel: tokio_util::sync::CancellationToken,
     ) {
+        self.run_worker_pool(1, db_handle, node_name, cancel).await;
+    }
+
+    pub async fn run_worker_pool(
+        self: Arc<Self>,
+        worker_count: usize,
+        db_handle: DatastoreHandle,
+        node_name: String,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
         // Mark the worker as running so subsequent `enqueue` calls go through
         // the queue instead of falling back to synchronous reconcile.
         self.worker_running
             .store(true, std::sync::atomic::Ordering::Release);
+        let worker_count = worker_count.max(1);
+        tracing::info!(
+            workers = worker_count,
+            "Controller workqueue worker pool started"
+        );
+        let workers = (0..worker_count).map(|worker_id| {
+            let dispatcher = self.clone();
+            let db_handle = db_handle.clone();
+            let node_name = node_name.clone();
+            let cancel = cancel.clone();
+            async move {
+                dispatcher
+                    .run_worker_loop(worker_id, db_handle, node_name, cancel)
+                    .await;
+            }
+        });
+        futures::future::join_all(workers).await;
+        self.worker_running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    async fn run_worker_loop(
+        self: Arc<Self>,
+        worker_id: usize,
+        db_handle: DatastoreHandle,
+        node_name: String,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    tracing::info!("Controller workqueue worker shutting down");
-                    self.worker_running
-                        .store(false, std::sync::atomic::Ordering::Release);
+                    tracing::info!(worker_id, "Controller workqueue worker shutting down");
                     return;
                 }
                 key = self.queue.take() => {
+                    if !self.begin_key_dispatch(&key).await {
+                        continue;
+                    }
                     self.dispatch_key(&key, &db_handle, &node_name).await;
+                    self.finish_key_dispatch(key).await;
                 }
             }
+        }
+    }
+
+    async fn begin_key_dispatch(&self, key: &Key) -> bool {
+        let mut active = self.active_reconciles.lock().await;
+        if active.in_flight.contains(key) {
+            active.pending_followup.insert(key.clone());
+            return false;
+        }
+        active.in_flight.insert(key.clone());
+        true
+    }
+
+    async fn finish_key_dispatch(&self, key: Key) {
+        let should_requeue = {
+            let mut active = self.active_reconciles.lock().await;
+            active.in_flight.remove(&key);
+            active.pending_followup.remove(&key)
+        };
+        if should_requeue {
+            self.queue.add_with_priority(key, QueuePriority::High).await;
         }
     }
 
@@ -563,11 +643,146 @@ impl Default for ControllerDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controllers::workqueue::QueuePriority;
     use crate::datastore::sqlite::Datastore;
+    use async_trait::async_trait;
     use serde_json::json;
+    use tokio::sync::Notify;
 
     fn handle_for(db: Datastore) -> DatastoreHandle {
         Arc::new(db)
+    }
+
+    struct BlockingController {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Controller for BlockingController {
+        fn name(&self) -> &'static str {
+            "blocking"
+        }
+
+        async fn reconcile(&self, _resource: Value, _ctx: Context) -> Result<()> {
+            self.started.notify_waiters();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    struct SignalController {
+        called: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Controller for SignalController {
+        fn name(&self) -> &'static str {
+            "signal"
+        }
+
+        async fn reconcile(&self, _resource: Value, _ctx: Context) -> Result<()> {
+            self.called.notify_waiters();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_pool_dispatches_high_priority_service_while_other_controller_is_blocked() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "slow",
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"namespace": "default", "name": "slow", "uid": "slow-uid"},
+                "spec": {}
+            }),
+        )
+        .await
+        .expect("create slow deployment");
+        db.create_resource(
+            "v1",
+            "Service",
+            Some("default"),
+            "fast",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"namespace": "default", "name": "fast", "uid": "fast-uid"},
+                "spec": {"ports": [{"port": 80}]}
+            }),
+        )
+        .await
+        .expect("create fast service");
+
+        let service_ipam = Arc::new(ServiceIpam::new("10.43.128.0/17"));
+        let mut dispatcher = ControllerDispatcher::new(service_ipam);
+        let slow_started = Arc::new(Notify::new());
+        let slow_release = Arc::new(Notify::new());
+        let fast_called = Arc::new(Notify::new());
+        dispatcher.replace_controller_for_test(
+            "apps/v1",
+            "Deployment",
+            Arc::new(BlockingController {
+                started: slow_started.clone(),
+                release: slow_release.clone(),
+            }),
+        );
+        dispatcher.replace_controller_for_test(
+            "v1",
+            "Service",
+            Arc::new(SignalController {
+                called: fast_called.clone(),
+            }),
+        );
+        let dispatcher = Arc::new(dispatcher);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker = tokio::spawn({
+            let dispatcher = dispatcher.clone();
+            let db_handle = handle_for(db);
+            let cancel = cancel.clone();
+            async move {
+                dispatcher
+                    .run_worker_pool(2, db_handle, "test-node".to_string(), cancel)
+                    .await;
+            }
+        });
+
+        dispatcher
+            .enqueue_reconcile_key(ReconcileKey::namespaced(
+                "apps/v1",
+                "Deployment",
+                "default",
+                "slow",
+            ))
+            .await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            slow_started.notified(),
+        )
+        .await
+        .expect("slow reconcile should start");
+
+        dispatcher
+            .enqueue_reconcile_key_with_priority(
+                ReconcileKey::namespaced("v1", "Service", "default", "fast"),
+                QueuePriority::High,
+            )
+            .await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            fast_called.notified(),
+        )
+        .await
+        .expect("high-priority Service reconcile must dispatch while another worker is blocked");
+
+        cancel.cancel();
+        slow_release.notify_waiters();
+        worker.await.expect("worker pool task should join");
     }
 
     #[tokio::test]

@@ -15,6 +15,8 @@ use crate::task_supervisor::TaskSupervisor;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
+const CONTROLLER_WORKQUEUE_WORKERS: usize = 8;
+
 pub struct LeaderStart<'a> {
     pub config: &'a Arc<KlightsConfig>,
     /// T2 step 2: runtime leader lease instead of a compile-time bool.
@@ -156,14 +158,18 @@ async fn start_leader_scoped_tasks(
             crate::task_supervisor::TaskCategory::Background,
             "runtime_controller_workqueue_worker",
             async move {
-                d.run_worker(dhw, nn, c).await;
+                d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, dhw, nn, c)
+                    .await;
             },
         )
         .await
     {
         tracing::warn!("Failed to spawn workqueue worker: {}", e);
     }
-    tracing::info!("Controller workqueue worker started");
+    tracing::info!(
+        workers = CONTROLLER_WORKQUEUE_WORKERS,
+        "Controller workqueue worker pool started"
+    );
 
     let scheduler_state = scheduler_state.clone();
     let scheduler_cancel = lease_cancel.child_token();
