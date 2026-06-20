@@ -180,6 +180,16 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
          ON watch_events(api_version, kind, resource_version)",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS watch_replay_floors (
+            api_version   TEXT NOT NULL,
+            kind          TEXT NOT NULL,
+            namespace_key TEXT NOT NULL,
+            floor_rv      INTEGER NOT NULL,
+            PRIMARY KEY(api_version, kind, namespace_key)
+        )",
+        [],
+    )?;
 
     // Applied outbox idempotency ledger. Leader-side outbox apply stores one
     // row in the same cluster datastore that owns the corresponding mutation,

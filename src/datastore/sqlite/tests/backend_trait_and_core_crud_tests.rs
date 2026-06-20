@@ -3840,6 +3840,66 @@ async fn gc_triggers_incremental_vacuum_after_sweep() {
     assert!(removed > 0, "GC should have removed rows");
 }
 
+#[tokio::test]
+async fn scoped_replay_floor_allows_retained_in_scope_event_after_unrelated_gc() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    for i in 0..20 {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("noise"),
+            &format!("cm-{i}"),
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "noise", "name": format!("cm-{i}")}
+            }),
+        )
+        .await
+        .expect("create noise");
+    }
+
+    let pod = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("app"),
+            "frontend",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"namespace": "app", "name": "frontend"},
+                "spec": {"containers": [{"name": "app", "image": "pause"}]}
+            }),
+        )
+        .await
+        .expect("create pod");
+
+    db.gc_watch_events(1, 1000).await.expect("gc");
+    let since_rv = pod.resource_version - 10;
+
+    let replay = db
+        .list_watch_events_since_checked(
+            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+                "v1", "Pod", "app",
+            )],
+            since_rv,
+        )
+        .await
+        .expect("checked replay");
+
+    match replay {
+        crate::datastore::WatchReplayRead::Events(events) => {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].resource.name, "frontend");
+        }
+        crate::datastore::WatchReplayRead::Expired => {
+            panic!("unrelated lower-RV churn must not expire app/Pod replay");
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // DSB-05 — restart-recovery and retention tests
 // -----------------------------------------------------------------------

@@ -19,6 +19,8 @@ pub(super) const RES_NS: TableDefinition<&[u8], (u64, &[u8])> = TableDefinition:
 pub(super) const NAMESPACES: TableDefinition<&str, &[u8]> = TableDefinition::new("namespaces");
 
 pub(super) const WATCH_EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("watch_events");
+pub(super) const WATCH_REPLAY_FLOORS: TableDefinition<&[u8], u64> =
+    TableDefinition::new("watch_replay_floors");
 
 pub(super) const APPLIED_OUTBOX: TableDefinition<&str, &[u8]> =
     TableDefinition::new("applied_outbox");

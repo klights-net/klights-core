@@ -2,6 +2,9 @@ use super::queries;
 use super::*;
 use crate::datastore::WatchReplayRead;
 use anyhow::Result;
+use std::collections::HashMap;
+
+const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 
 impl Datastore {
     pub async fn list_cluster_resources_modified_since(
@@ -113,12 +116,10 @@ impl Datastore {
     pub async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
         let deleted = self
             .db_call("gc_watch_events", move |conn| {
-                let removed = conn.execute(
-                    queries::WATCH_EVENTS_GC,
-                    rusqlite::params![max_rows, batch_cap],
-                )?;
-                // After deleting rows, release freed pages back to the OS if
-                // at least one page worth of rows was removed.
+                let tx = conn.transaction()?;
+                let removed = gc_watch_events_in_tx(&tx, max_rows, batch_cap)?;
+                tx.commit()?;
+
                 if removed > 0 {
                     let _ = conn.execute("PRAGMA incremental_vacuum(1000)", []);
                 }
@@ -185,12 +186,12 @@ impl Datastore {
         let targets = targets.to_vec();
         self.db_call("list_watch_events_since_checked", move |conn| {
             if since_rv > 0 {
-                let mut stmt = conn.prepare(queries::WATCH_EVENTS_MIN_RV)?;
-                let earliest = stmt.query_row([], |row| row.get::<_, i64>(0)).optional()?;
-                if let Some(earliest) = earliest
-                    && since_rv + 1 < earliest
-                {
-                    return Ok(WatchReplayRead::Expired);
+                for target in &targets {
+                    if let Some(floor_rv) = target_floor(conn, target)?
+                        && since_rv < floor_rv
+                    {
+                        return Ok(WatchReplayRead::Expired);
+                    }
                 }
             }
             Ok(
@@ -287,4 +288,101 @@ impl Datastore {
 
         Ok(items)
     }
+}
+
+pub(super) fn gc_watch_events_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    max_rows: i64,
+    batch_cap: i64,
+) -> rusqlite::Result<usize> {
+    let (ids, floors) = {
+        let mut stmt = tx.prepare(queries::WATCH_EVENTS_GC_CANDIDATES)?;
+        let rows = stmt.query_map(rusqlite::params![max_rows, batch_cap], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+
+        let mut ids = Vec::new();
+        let mut floors: HashMap<(String, String, String), i64> = HashMap::new();
+        for row in rows {
+            let (id, api_version, kind, namespace_key, resource_version) = row?;
+            ids.push(id);
+            floors
+                .entry((api_version, kind, namespace_key))
+                .and_modify(|floor| *floor = (*floor).max(resource_version))
+                .or_insert(resource_version);
+        }
+        (ids, floors)
+    };
+
+    for ((api_version, kind, namespace_key), floor_rv) in floors {
+        tx.execute(
+            queries::WATCH_REPLAY_FLOOR_UPSERT,
+            rusqlite::params![api_version, kind, namespace_key, floor_rv],
+        )?;
+    }
+
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut delete = String::from("DELETE FROM watch_events WHERE id IN (");
+    delete.push_str(
+        &std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    delete.push(')');
+    tx.execute(&delete, rusqlite::params_from_iter(ids.iter()))
+}
+
+fn target_floor(
+    conn: &rusqlite::Connection,
+    target: &WatchTarget,
+) -> rusqlite::Result<Option<i64>> {
+    match &target.scope {
+        WatchTargetScope::Cluster => read_floor(
+            conn,
+            &target.api_version,
+            &target.kind,
+            CLUSTER_NAMESPACE_KEY,
+        ),
+        WatchTargetScope::Namespaced(Some(namespace)) => {
+            read_floor(conn, &target.api_version, &target.kind, namespace)
+        }
+        WatchTargetScope::Namespaced(None) => {
+            read_namespaced_all_floor(conn, &target.api_version, &target.kind)
+        }
+    }
+}
+
+fn read_floor(
+    conn: &rusqlite::Connection,
+    api_version: &str,
+    kind: &str,
+    namespace_key: &str,
+) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        queries::WATCH_REPLAY_FLOOR_FOR_SCOPE,
+        rusqlite::params![api_version, kind, namespace_key],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+}
+
+fn read_namespaced_all_floor(
+    conn: &rusqlite::Connection,
+    api_version: &str,
+    kind: &str,
+) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        queries::WATCH_REPLAY_FLOOR_FOR_NAMESPACED_ALL,
+        rusqlite::params![api_version, kind],
+        |row| row.get::<_, Option<i64>>(0),
+    )
 }

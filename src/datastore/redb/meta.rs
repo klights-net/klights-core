@@ -39,6 +39,7 @@ pub(super) fn schema_check(db: &Database) -> Result<(), OpenError> {
     check!(tables::RES_NS);
     check!(tables::NAMESPACES);
     check!(tables::WATCH_EVENTS);
+    check!(tables::WATCH_REPLAY_FLOORS);
     check!(tables::RESOURCES_BY_OWNER);
     check!(tables::RV_TO_KEY);
     check!(tables::POD_SANDBOXES);

@@ -105,13 +105,25 @@ pub(super) const WATCH_EVENTS_COUNT: &str = "SELECT COUNT(*) FROM watch_events";
 pub(super) const WATCH_EVENTS_MIN_RV: &str =
     "SELECT resource_version FROM watch_events ORDER BY id ASC LIMIT 1";
 
-pub(super) const WATCH_EVENTS_GC: &str = "DELETE FROM watch_events
-     WHERE id IN (
-         SELECT id FROM watch_events
-         WHERE id <= COALESCE((SELECT MAX(id) FROM watch_events), 0) - ?1
-         ORDER BY id ASC
-         LIMIT ?2
-     )";
+pub(super) const WATCH_REPLAY_FLOOR_UPSERT: &str =
+    "INSERT INTO watch_replay_floors (api_version, kind, namespace_key, floor_rv)
+     VALUES (?1, ?2, ?3, ?4)
+     ON CONFLICT(api_version, kind, namespace_key)
+     DO UPDATE SET floor_rv = MAX(watch_replay_floors.floor_rv, excluded.floor_rv)";
+
+pub(super) const WATCH_REPLAY_FLOOR_FOR_SCOPE: &str = "SELECT floor_rv FROM watch_replay_floors
+     WHERE api_version = ?1 AND kind = ?2 AND namespace_key = ?3";
+
+pub(super) const WATCH_REPLAY_FLOOR_FOR_NAMESPACED_ALL: &str =
+    "SELECT MAX(floor_rv) FROM watch_replay_floors
+     WHERE api_version = ?1 AND kind = ?2 AND namespace_key <> '#cluster'";
+
+pub(super) const WATCH_EVENTS_GC_CANDIDATES: &str =
+    "SELECT id, api_version, kind, COALESCE(namespace, '#cluster'), resource_version
+     FROM watch_events
+     WHERE id <= COALESCE((SELECT MAX(id) FROM watch_events), 0) - ?1
+     ORDER BY id ASC
+     LIMIT ?2";
 
 pub(super) const WATCH_EVENTS_GC_PRUNABLE_COUNT: &str = "SELECT COUNT(*) FROM (
          SELECT id FROM watch_events

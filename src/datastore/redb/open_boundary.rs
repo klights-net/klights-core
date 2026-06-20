@@ -149,6 +149,7 @@ fn initialize_tables(db: &Database) -> anyhow::Result<()> {
         let _ = w.open_table(tables::RES_NS);
         let _ = w.open_table(tables::NAMESPACES);
         let _ = w.open_table(tables::WATCH_EVENTS);
+        let _ = w.open_table(tables::WATCH_REPLAY_FLOORS);
         let _ = w.open_table(tables::APPLIED_OUTBOX);
         let _ = w.open_table(tables::RESOURCES_BY_OWNER);
         let _ = w.open_table(tables::RV_TO_KEY);

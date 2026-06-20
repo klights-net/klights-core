@@ -769,6 +769,131 @@ parametrize_backends!(gc_watch_events, |db| {
     assert!(removed >= 2);
 });
 
+parametrize_backends!(
+    scoped_replay_floor_allows_retained_in_scope_event_after_unrelated_gc,
+    |db| {
+        for i in 0..20 {
+            db.create_resource(
+                "v1",
+                "ConfigMap",
+                Some("noise"),
+                &format!("cm-{i}"),
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"namespace": "noise", "name": format!("cm-{i}")}
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let pod = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("app"),
+                "frontend",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"namespace": "app", "name": "frontend"},
+                    "spec": {"containers": [{"name": "app", "image": "pause"}]}
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.gc_watch_events(1, 1000).await.unwrap();
+        let since_rv = pod.resource_version - 10;
+
+        let replay = db
+            .list_watch_events_since_checked(
+                &[WatchTarget::namespaced_in_namespace("v1", "Pod", "app")],
+                since_rv,
+            )
+            .await
+            .unwrap();
+
+        match replay {
+            WatchReplayRead::Events(events) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].resource.name, "frontend");
+            }
+            WatchReplayRead::Expired => {
+                panic!("unrelated lower-RV churn must not expire app/Pod replay");
+            }
+        }
+    }
+);
+
+parametrize_backends!(
+    scoped_replay_floor_expires_when_in_scope_event_was_gc_collected,
+    |db| {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("app"),
+            "baseline",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "app", "name": "baseline"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let pod = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("app"),
+                "frontend",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"namespace": "app", "name": "frontend"},
+                    "spec": {"containers": [{"name": "app", "image": "pause"}]}
+                }),
+            )
+            .await
+            .unwrap();
+
+        for i in 0..20 {
+            db.create_resource(
+                "v1",
+                "ConfigMap",
+                Some("noise"),
+                &format!("cm-{i}"),
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"namespace": "noise", "name": format!("cm-{i}")}
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        db.gc_watch_events(1, 1000).await.unwrap();
+        let since_rv = pod.resource_version - 1;
+
+        let replay = db
+            .list_watch_events_since_checked(
+                &[WatchTarget::namespaced_in_namespace("v1", "Pod", "app")],
+                since_rv,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(replay, WatchReplayRead::Expired),
+            "missing in-scope event must expire checked replay"
+        );
+    }
+);
+
 parametrize_backends!(list_resource_keys_for_scope, |db| {
     db.create_resource(
         "v1",

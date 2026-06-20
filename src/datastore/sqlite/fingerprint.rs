@@ -28,7 +28,7 @@ use rusqlite::OptionalExtension;
 /// writes to `sqlite_master`, sorted by table name for stability.
 /// Indexes are excluded; only the core data model (tables) is fingerprinted.
 pub(super) const SCHEMA_FINGERPRINT: &str =
-    "09ce583a854dcffb9080ae75f576c8625896019813e9f3cbe8485069af983fab";
+    "2fc09ab1fdc318b125148f18e8fc42792a3ffa785a9bcfe4b1f99cbf5d397ca6";
 
 /// Verify the fingerprint matches or initialize it for a fresh DB.
 ///
@@ -175,7 +175,7 @@ mod tests {
             )
             .expect("count");
 
-        assert_eq!(count, 13, "expecting 13 cluster tables in schema");
+        assert_eq!(count, 14, "expecting 14 cluster tables in schema");
     }
 
     #[test]

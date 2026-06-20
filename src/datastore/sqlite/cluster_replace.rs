@@ -397,10 +397,7 @@ fn apply_commit_in_tx_with_watch_events(
                 max_rows,
                 batch_cap,
             } => {
-                let removed = tx.execute(
-                    queries::WATCH_EVENTS_GC,
-                    rusqlite::params![max_rows, batch_cap],
-                )?;
+                let removed = super::gc::gc_watch_events_in_tx(tx, max_rows, batch_cap)?;
                 if removed > 0 {
                     let _ = tx.execute("PRAGMA incremental_vacuum(1000)", []);
                 }
