@@ -955,6 +955,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         pod_repository: &pod_repository,
         scheduler_state: &scheduler_state,
         cri_for_shutdown: &cri_for_shutdown,
+        datapath: &network.datapath,
         is_leader_rx: is_leader_rx.clone(),
         shutdown_token: shutdown_token.clone(),
     })

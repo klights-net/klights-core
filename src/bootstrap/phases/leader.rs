@@ -12,7 +12,7 @@ use crate::KlightsConfig;
 use crate::datastore::DatastoreHandle;
 use crate::leader_election::{LeaderElection, LeaderScope};
 use crate::task_supervisor::TaskSupervisor;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use tokio_util::sync::CancellationToken;
 
 const CONTROLLER_WORKQUEUE_WORKERS: usize = 8;
@@ -31,6 +31,7 @@ pub struct LeaderStart<'a> {
     pub pod_repository: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
     pub scheduler_state: &'a Arc<crate::api::AppState>,
     pub cri_for_shutdown: &'a Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
+    pub datapath: &'a Arc<dyn crate::networking::Datapath>,
     pub is_leader_rx: tokio::sync::watch::Receiver<bool>,
     pub shutdown_token: CancellationToken,
 }
@@ -45,6 +46,7 @@ struct LeaderScopedTaskContext {
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     scheduler_state: Arc<crate::api::AppState>,
     cri_for_shutdown: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
+    datapath: Arc<dyn crate::networking::Datapath>,
 }
 
 pub async fn start(args: LeaderStart<'_>) -> Result<()> {
@@ -58,6 +60,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         pod_repository,
         scheduler_state,
         cri_for_shutdown,
+        datapath,
         is_leader_rx,
         shutdown_token,
     } = args;
@@ -76,6 +79,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
         pod_repository: pod_repository.clone(),
         scheduler_state: scheduler_state.clone(),
         cri_for_shutdown: cri_for_shutdown.clone(),
+        datapath: datapath.clone(),
     };
 
     task_supervisor
@@ -108,6 +112,71 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::networking::test_support::MockNetworkProvider;
+    use serde_json::Value;
+    use std::net::Ipv4Addr;
+
+    fn endpoint_address(resource: &Value) -> &str {
+        resource["subsets"][0]["addresses"][0]["ip"]
+            .as_str()
+            .expect("endpoint address should be a string")
+    }
+
+    fn endpointslice_address(resource: &Value) -> &str {
+        resource["endpoints"][0]["addresses"][0]
+            .as_str()
+            .expect("endpointslice address should be a string")
+    }
+
+    #[tokio::test]
+    async fn leader_kubernetes_service_reconcile_moves_endpoint_to_current_gateway() {
+        let db = crate::datastore::test_support::in_memory().await;
+        crate::controllers::namespace::init_default_namespaces(&db)
+            .await
+            .expect("default namespaces");
+        let db_handle: DatastoreHandle = Arc::new(db);
+        let mut config = KlightsConfig::test_default();
+        config.service_cidr = "10.51.0.0/24".to_string();
+        config.tls_port = 7679;
+
+        let first_leader_datapath = MockNetworkProvider::new();
+        first_leader_datapath.set_pod_gateway_ip(Ipv4Addr::new(10, 50, 0, 1));
+        reconcile_kubernetes_service_for_leader(&config, &db_handle, &first_leader_datapath)
+            .await
+            .expect("first leader should seed kubernetes service endpoints");
+
+        let next_leader_datapath = MockNetworkProvider::new();
+        next_leader_datapath.set_pod_gateway_ip(Ipv4Addr::new(10, 50, 4, 1));
+        reconcile_kubernetes_service_for_leader(&config, &db_handle, &next_leader_datapath)
+            .await
+            .expect("new leader should reconcile kubernetes service endpoints");
+
+        let endpoints = db_handle
+            .get_resource("v1", "Endpoints", Some("default"), "kubernetes")
+            .await
+            .expect("get endpoints")
+            .expect("kubernetes endpoints should exist")
+            .data;
+        assert_eq!(endpoint_address(&endpoints), "10.50.4.1");
+
+        let endpointslice = db_handle
+            .get_resource(
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                Some("default"),
+                "kubernetes",
+            )
+            .await
+            .expect("get endpointslice")
+            .expect("kubernetes endpointslice should exist")
+            .data;
+        assert_eq!(endpointslice_address(&endpointslice), "10.50.4.1");
+    }
+}
+
 async fn start_leader_scoped_tasks(
     context: LeaderScopedTaskContext,
     lease_cancel: CancellationToken,
@@ -121,10 +190,15 @@ async fn start_leader_scoped_tasks(
         pod_repository,
         scheduler_state,
         cri_for_shutdown,
+        datapath,
     } = context;
 
     tracing::info!("Acquired leader lease");
     use crate::{controllers, gc};
+
+    reconcile_kubernetes_service_for_leader(config.as_ref(), &db_handle, datapath.as_ref())
+        .await
+        .context("reconcile kubernetes Service endpoint for active leader")?;
 
     let scheduler = controllers::cronjob_scheduler::CronJobScheduler::new(
         db_handle.clone(),
@@ -251,4 +325,23 @@ async fn start_leader_scoped_tasks(
     }
 
     Ok(())
+}
+
+async fn reconcile_kubernetes_service_for_leader(
+    config: &KlightsConfig,
+    db_handle: &DatastoreHandle,
+    datapath: &dyn crate::networking::Datapath,
+) -> Result<()> {
+    crate::controllers::kube_service::bootstrap_default_service_cidr(
+        db_handle.as_ref(),
+        &config.service_cidr,
+    )
+    .await?;
+    crate::controllers::kube_service::bootstrap_kubernetes_service(
+        db_handle.as_ref(),
+        &config.service_cidr,
+        config.tls_port,
+        datapath,
+    )
+    .await
 }
