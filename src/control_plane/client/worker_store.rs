@@ -859,16 +859,21 @@ impl DatastoreBackend for WorkerStoreAdapter {
     async fn list_watch_events_since(
         &self,
         targets: &[WatchTarget],
-        _since_rv: i64,
+        since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
         let mut events = Vec::new();
         for target in targets {
             let list = self.list_for_target(target).await?;
             self.observe_rv(list.resource_version);
-            events.extend(list.items.into_iter().map(|resource| CatchUpResource {
-                resource,
-                event_type: std::borrow::Cow::Borrowed("ADDED"),
-            }));
+            events.extend(
+                list.items
+                    .into_iter()
+                    .filter(|resource| resource.resource_version > since_rv)
+                    .map(|resource| CatchUpResource {
+                        resource,
+                        event_type: std::borrow::Cow::Borrowed("ADDED"),
+                    }),
+            );
         }
         Ok(events)
     }
@@ -1608,6 +1613,75 @@ mod tests {
         assert!(
             second.continue_token.is_none(),
             "final page must not advertise a continue token"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_watch_replay_respects_resume_resource_version() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        for name in ["cm-a", "cm-b", "cm-c"] {
+            cluster_db
+                .create_resource(
+                    "v1",
+                    "ConfigMap",
+                    Some("default"),
+                    name,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {"namespace": "default", "name": name}
+                    }),
+                )
+                .await
+                .expect("create configmap");
+        }
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db.clone()),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-watch-resume-rv-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let targets = [WatchTarget::namespaced_in_namespace(
+            "v1",
+            "ConfigMap",
+            "default",
+        )];
+        let limit = std::num::NonZeroUsize::new(3).expect("non-zero limit");
+
+        let first = adapter
+            .list_watch_events_since_checked_bounded(&targets, 0, limit)
+            .await
+            .expect("initial watch replay");
+        let crate::datastore::WatchReplayRead::Events(first_events) = first else {
+            panic!("worker adapter replay should not expire");
+        };
+        assert_eq!(first_events.len(), 3);
+        let max_rv = first_events
+            .iter()
+            .map(|event| event.resource.resource_version)
+            .max()
+            .expect("initial replay should have a max rv");
+
+        let second = adapter
+            .list_watch_events_since_checked_bounded(&targets, max_rv, limit)
+            .await
+            .expect("resumed watch replay");
+        let crate::datastore::WatchReplayRead::Events(second_events) = second else {
+            panic!("worker adapter replay should not expire");
+        };
+        assert!(
+            second_events.is_empty(),
+            "resumed worker replay must not return resources at or below the resume RV"
         );
     }
 
