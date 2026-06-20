@@ -377,7 +377,7 @@ pub async fn gather_custom_resources_across_served_versions(
     namespace: Option<String>,
     label_selector: Option<String>,
 ) -> Result<(Vec<Resource>, i64), AppError> {
-    let mut highest_rv = 0i64;
+    let mut safe_snapshot_rv = None::<i64>;
     let mut merged: std::collections::HashMap<(Option<String>, String), Resource> =
         std::collections::HashMap::new();
 
@@ -410,9 +410,12 @@ pub async fn gather_custom_resources_across_served_versions(
                 ),
             )
             .await?;
-        highest_rv = highest_rv.max(list.resource_version);
+        safe_snapshot_rv = Some(
+            safe_snapshot_rv
+                .map(|rv| rv.min(list.resource_version))
+                .unwrap_or(list.resource_version),
+        );
         for item in list.items {
-            highest_rv = highest_rv.max(item.resource_version);
             let key = (item.namespace.clone(), item.name.clone());
             match merged.get(&key) {
                 Some(existing) if existing.resource_version >= item.resource_version => {}
@@ -423,9 +426,17 @@ pub async fn gather_custom_resources_across_served_versions(
         }
     }
 
-    let mut items: Vec<Resource> = merged.into_values().collect();
+    // The merged conversion view is assembled from multiple live LIST snapshots.
+    // It is only watch-resume safe through the earliest component snapshot: an
+    // object committed after the storage-version read but before a later served
+    // version read must be omitted here and replayed by the follow-up watch.
+    let safe_snapshot_rv = safe_snapshot_rv.unwrap_or(0);
+    let mut items: Vec<Resource> = merged
+        .into_values()
+        .filter(|item| item.resource_version <= safe_snapshot_rv)
+        .collect();
     items.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok((items, highest_rv))
+    Ok((items, safe_snapshot_rv))
 }
 
 pub async fn gather_custom_resource_events_across_served_versions(
@@ -506,4 +517,84 @@ pub async fn convert_custom_resource_watch_event_to_requested_version(
         event.object = Arc::new(object);
     }
     Ok(event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datastore::sqlite::Datastore;
+    use serde_json::json;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conversion_merged_list_rv_does_not_skip_storage_create_between_version_reads() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let conversion = CrdConversionConfig {
+            storage_version: "v1".to_string(),
+            served_versions: vec!["v1".to_string(), "v2".to_string()],
+            strategy: None,
+            webhook_client_config: None,
+            webhook_review_versions: Vec::new(),
+        };
+
+        let pause = Datastore::install_list_resources_snapshot_pause_for_test(
+            "example.com/v2",
+            "Widget",
+            Some("default"),
+            None,
+            None,
+            None,
+            None,
+        );
+        let list_db = db.clone();
+        let list_conversion = conversion.clone();
+        let list_task = tokio::spawn(async move {
+            gather_custom_resources_across_served_versions(
+                &list_db,
+                &list_conversion,
+                "example.com",
+                "Widget",
+                Some("default".to_string()),
+                None,
+            )
+            .await
+            .unwrap()
+        });
+
+        pause.wait_for_hit().await;
+        let storage_object = db
+            .create_resource(
+                "example.com/v1",
+                "Widget",
+                Some("default"),
+                "late-storage",
+                json!({
+                    "apiVersion": "example.com/v1",
+                    "kind": "Widget",
+                    "metadata": {
+                        "name": "late-storage",
+                        "namespace": "default"
+                    },
+                    "hostPort": "host1:80"
+                }),
+            )
+            .await
+            .unwrap();
+        let advanced_rv = db
+            .advance_resource_version_after(storage_object.resource_version + 10)
+            .await
+            .unwrap();
+        assert!(advanced_rv > storage_object.resource_version);
+        pause.resume();
+
+        let (items, list_rv) = list_task.await.expect("conversion list task panicked");
+        assert!(
+            items.is_empty(),
+            "storage object created after the storage-version read should be absent from this merged list"
+        );
+        assert!(
+            list_rv < storage_object.resource_version,
+            "merged conversion list rv {list_rv} must let a follow-up watch replay omitted storage object rv {}",
+            storage_object.resource_version
+        );
+    }
 }
