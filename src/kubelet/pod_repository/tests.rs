@@ -51,6 +51,8 @@ struct RecordingPodDeleteHook {
 struct FakeLeaderApiClient {
     pod: crate::datastore::Resource,
     fresh_pod: Option<crate::datastore::Resource>,
+    cached_list_items: Option<Vec<crate::datastore::Resource>>,
+    fresh_list_items: Option<Vec<crate::datastore::Resource>>,
 }
 
 impl FakeLeaderApiClient {
@@ -58,12 +60,44 @@ impl FakeLeaderApiClient {
         Self {
             pod,
             fresh_pod: None,
+            cached_list_items: None,
+            fresh_list_items: None,
         }
     }
 
     fn with_fresh_pod(mut self, pod: crate::datastore::Resource) -> Self {
         self.fresh_pod = Some(pod);
         self
+    }
+
+    fn with_cached_list_items(mut self, items: Vec<crate::datastore::Resource>) -> Self {
+        self.cached_list_items = Some(items);
+        self
+    }
+
+    fn with_fresh_list_items(mut self, items: Vec<crate::datastore::Resource>) -> Self {
+        self.fresh_list_items = Some(items);
+        self
+    }
+
+    fn pod_list_response(
+        &self,
+        req: &ListRequest,
+        items: &[crate::datastore::Resource],
+    ) -> ListResponse {
+        let mut list = crate::datastore::ResourceList {
+            items: Vec::new(),
+            resource_version: self.pod.resource_version,
+            continue_token: None,
+            remaining_item_count: None,
+        };
+        if req.api_version == "v1"
+            && req.kind == "Pod"
+            && req.namespace.as_deref() == self.pod.namespace.as_deref()
+        {
+            list.items.extend(items.iter().cloned());
+        }
+        list
     }
 }
 
@@ -96,19 +130,18 @@ impl LeaderApiClient for FakeLeaderApiClient {
     }
 
     async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
-        let mut list = crate::datastore::ResourceList {
-            items: Vec::new(),
-            resource_version: self.pod.resource_version,
-            continue_token: None,
-            remaining_item_count: None,
-        };
-        if req.api_version == "v1"
-            && req.kind == "Pod"
-            && req.namespace.as_deref() == self.pod.namespace.as_deref()
-        {
-            list.items.push(self.pod.clone());
-        }
-        Ok(list)
+        let default_items = [self.pod.clone()];
+        let items = self.cached_list_items.as_deref().unwrap_or(&default_items);
+        Ok(self.pod_list_response(&req, items))
+    }
+
+    async fn list_resources_fresh(&self, req: ListRequest) -> Result<ListResponse> {
+        let default_items = self
+            .cached_list_items
+            .as_deref()
+            .unwrap_or_else(|| std::slice::from_ref(&self.pod));
+        let items = self.fresh_list_items.as_deref().unwrap_or(default_items);
+        Ok(self.pod_list_response(&req, items))
     }
 
     async fn watch_resources(&self, _req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
@@ -2579,6 +2612,64 @@ async fn pod_reader_list_pods_paginates_via_limit_and_continue_token() {
         .unwrap();
     assert_eq!(page2.items.len(), 1);
     assert_ne!(page1.items[0].name, page2.items[0].name);
+}
+
+#[tokio::test]
+async fn cluster_backed_pod_reader_list_pods_uses_fresh_leader_list() {
+    use super::PodReader;
+    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let pod = crate::datastore::Resource {
+        id: 1,
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("refresh-ns".to_string()),
+        name: "mounted-pod".to_string(),
+        uid: "mounted-pod-uid".to_string(),
+        resource_version: 22,
+        data: Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "refresh-ns",
+                "name": "mounted-pod",
+                "uid": "mounted-pod-uid",
+                "resourceVersion": "22"
+            },
+            "spec": {
+                "nodeName": "node-a",
+                "containers": [{"name": "app", "image": "busybox"}]
+            },
+            "status": {"phase": "Running"}
+        })),
+    };
+    let repo = PodRepository::new_with_scheduling_mode_outbox_and_cluster_api(
+        db,
+        fixture_supervisor(),
+        fixture_side_effects(),
+        crate::side_effects::SideEffectMetrics::new(),
+        super::api::PodSchedulingMode::InlineSingleNode,
+        None,
+        Arc::new(
+            FakeLeaderApiClient::new(pod.clone())
+                .with_cached_list_items(Vec::new())
+                .with_fresh_list_items(vec![pod.clone()]),
+        ),
+    );
+
+    let listed = repo
+        .list_pods(Some("refresh-ns"), None, None, None, None)
+        .await
+        .expect("cluster-backed pod list should succeed");
+
+    assert_eq!(
+        listed
+            .items
+            .iter()
+            .map(|pod| pod.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mounted-pod"],
+        "volume refresh and lifecycle decisions must not use a stale ready pod-list cache"
+    );
 }
 
 #[tokio::test]

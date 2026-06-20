@@ -911,7 +911,7 @@ impl PodReader for PodRepository {
     ) -> Result<ResourceList> {
         if let Some(cluster_api) = &self.cluster_api {
             return cluster_api
-                .list_resources(ListRequest {
+                .list_resources_fresh(ListRequest {
                     api_version: "v1".to_string(),
                     kind: "Pod".to_string(),
                     namespace: ns.map(str::to_string),
