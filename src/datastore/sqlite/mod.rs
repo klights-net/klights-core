@@ -39,7 +39,7 @@ use tokio::sync::broadcast;
 use crate::datastore::WatchReplayRead;
 use crate::networking::{NodeName, PodSubnet, VtepMac};
 use crate::task_supervisor::TaskSupervisor;
-use crate::watch::{WatchBus, WatchEvent, WatchReceiver, WatchTopic};
+use crate::watch::{WatchBus, WatchEvent, WatchReceiver, WatchSignal, WatchTopic};
 
 impl std::fmt::Debug for Datastore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1892,6 +1892,10 @@ impl DatastoreBackend for Datastore {
 
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
         Datastore::subscribe_watch_many(self, topics)
+    }
+
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+        Datastore::subscribe_watch_signals(self, topic)
     }
 
     fn broadcast_watch_event(&self, pending: PendingWatchEvent) {

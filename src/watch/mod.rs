@@ -5,7 +5,10 @@ pub mod events;
 mod replay;
 mod window;
 
-pub use bus::{WatchBus, WatchReceiver, WatchTopic};
+pub use bus::{
+    DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, WatchAdvance, WatchBus, WatchReceiver, WatchSignal,
+    WatchTopic,
+};
 pub use cursor::{WatchBootstrap, WatchCursor, WatchEventFilter};
 pub use events::{
     EventType, WatchContentType, WatchEvent, encode_watch_payload, value_matches_field_selector,

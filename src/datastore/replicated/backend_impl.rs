@@ -10,7 +10,7 @@ use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::types::*;
 use crate::networking::VtepMac;
-use crate::watch::{WatchEvent, WatchReceiver, WatchTopic};
+use crate::watch::{WatchEvent, WatchReceiver, WatchSignal, WatchTopic};
 
 use super::{ReplicatedDatastore, apply_command_to_backend};
 
@@ -33,6 +33,13 @@ impl DatastoreBackend for ReplicatedDatastore {
             self.inner.subscribe_watch_many(topics)
         } else {
             WatchReceiver::from_receiver(broadcast::channel(1).1)
+        }
+    }
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+        if true {
+            self.inner.subscribe_watch_signals(topic)
+        } else {
+            broadcast::channel(1).1
         }
     }
     fn broadcast_watch_event(&self, pending: PendingWatchEvent) {

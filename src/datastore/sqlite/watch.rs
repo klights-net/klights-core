@@ -1,7 +1,9 @@
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::watch::{WatchContentType, WatchReceiver, WatchTopic, encode_watch_payload};
+use crate::watch::{
+    WatchContentType, WatchReceiver, WatchSignal, WatchTopic, encode_watch_payload,
+};
 
 use super::{
     CatchUpResource, Datastore, PendingWatchEvent, PodEndpointEvent, PodSlotAdmissionEvent,
@@ -22,6 +24,9 @@ use super::{
 pub fn publish_pending(pending: PendingWatchEvent, bus: &crate::watch::WatchBus) {
     let event = pending.event;
     crate::datastore::diagnostics::log_watch_event_broadcast(&event);
+    if let Some(signal) = WatchSignal::from_event(&event) {
+        bus.publish_signal(signal);
+    }
     bus.publish(event);
 }
 
@@ -89,6 +94,10 @@ impl Datastore {
 
     pub fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
         self.watch_bus.subscribe_many(topics)
+    }
+
+    pub fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+        self.watch_bus.subscribe_signals(topic)
     }
 
     /// Broadcast a watch event after the DB transaction has committed.

@@ -21,7 +21,7 @@ use crate::datastore::sqlite::publish_pending;
 use crate::datastore::types::*;
 use crate::networking::VtepMac;
 use crate::networking::types::HostPortRange;
-use crate::watch::{WatchEvent, WatchReceiver, WatchTopic};
+use crate::watch::{WatchEvent, WatchReceiver, WatchSignal, WatchTopic};
 
 use super::RedbDatastore;
 
@@ -36,6 +36,9 @@ impl DatastoreBackend for RedbDatastore {
     }
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
         self.watch_bus.subscribe_many(topics)
+    }
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+        self.watch_bus.subscribe_signals(topic)
     }
     fn broadcast_watch_event(&self, p: PendingWatchEvent) {
         publish_pending(p, &self.watch_bus);

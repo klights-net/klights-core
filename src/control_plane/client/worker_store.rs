@@ -18,7 +18,7 @@ use crate::datastore::{
     ResourcePreconditions, SandboxRef, WatchTarget, WatchTargetScope,
 };
 use crate::networking::VtepMac;
-use crate::watch::{EventType, WatchBus, WatchEvent, WatchReceiver, WatchTopic};
+use crate::watch::{EventType, WatchBus, WatchEvent, WatchReceiver, WatchSignal, WatchTopic};
 
 /// Worker-local compatibility store for legacy kubelet call sites.
 ///
@@ -247,7 +247,10 @@ impl WorkerStoreAdapter {
         {
             self.observe_rv(rv);
         }
-        self.watch_bus.publish(event.clone());
+        if let Some(signal) = WatchSignal::from_event(&event) {
+            self.watch_bus.publish_signal(signal);
+        }
+        self.watch_bus.publish(event);
     }
 
     fn is_pod_resource(api_version: &str, kind: &str) -> bool {
@@ -368,6 +371,10 @@ impl DatastoreBackend for WorkerStoreAdapter {
 
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
         self.watch_bus.subscribe_many(topics)
+    }
+
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+        self.watch_bus.subscribe_signals(topic)
     }
 
     fn broadcast_watch_event(&self, pending: PendingWatchEvent) {

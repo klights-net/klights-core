@@ -66,16 +66,52 @@ impl WatchTopic {
 /// publish/subscribe surface.
 pub struct WatchBus {
     topics: Mutex<HashMap<WatchTopic, broadcast::Sender<WatchEvent>>>,
+    signal_topics: Mutex<HashMap<WatchTopic, broadcast::Sender<WatchSignal>>>,
     /// Per-topic buffer capacity. Far smaller than the old global 8192/kind is
     /// viable because a topic only carries its own kind's events; the durable
     /// `watch_events` replay still backstops a lagging receiver.
     capacity: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchAdvance {
+    pub namespace: Option<String>,
+    pub high_rv: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchSignal {
+    pub topic: WatchTopic,
+    pub advances: Vec<WatchAdvance>,
+}
+
+pub const DEFAULT_WATCH_ADVANCE_GROUP_LIMIT: usize = 3;
+
+impl WatchSignal {
+    pub fn from_event(event: &WatchEvent) -> Option<Self> {
+        let topic = WatchTopic::of_event(event)?;
+        let high_rv = event.resource_version()?;
+        if high_rv <= 0 {
+            return None;
+        }
+        let namespace = event
+            .object
+            .get("metadata")
+            .and_then(|metadata| metadata.get("namespace"))
+            .and_then(|namespace| namespace.as_str())
+            .map(str::to_string);
+        Some(Self {
+            topic,
+            advances: vec![WatchAdvance { namespace, high_rv }],
+        })
+    }
+}
+
 impl WatchBus {
     pub fn new(capacity: usize) -> Self {
         Self {
             topics: Mutex::new(HashMap::new()),
+            signal_topics: Mutex::new(HashMap::new()),
             capacity: capacity.max(1),
         }
     }
@@ -101,6 +137,14 @@ impl WatchBus {
         )
     }
 
+    pub fn subscribe_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+        let mut topics = self.lock_signals();
+        topics
+            .entry(topic)
+            .or_insert_with(|| broadcast::channel(self.capacity).0)
+            .subscribe()
+    }
+
     /// Route `event` to its own `(apiVersion, kind)` topic. A no-op when no
     /// subscriber is registered for that topic (idle-silent: no topic, no
     /// wakeups). Once a topic's last receiver has dropped, the send fails and
@@ -120,6 +164,20 @@ impl WatchBus {
         }
     }
 
+    pub fn publish_signal(&self, signal: WatchSignal) {
+        if signal.advances.is_empty() {
+            return;
+        }
+        let topic = signal.topic.clone();
+        let mut topics = self.lock_signals();
+        let Some(sender) = topics.get(&topic) else {
+            return;
+        };
+        if sender.send(signal).is_err() || sender.receiver_count() == 0 {
+            topics.remove(&topic);
+        }
+    }
+
     /// Test/observability seam: number of live topics currently held.
     pub fn topic_count(&self) -> usize {
         self.lock().len()
@@ -129,6 +187,14 @@ impl WatchBus {
         &self,
     ) -> std::sync::MutexGuard<'_, HashMap<WatchTopic, broadcast::Sender<WatchEvent>>> {
         self.topics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_signals(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<WatchTopic, broadcast::Sender<WatchSignal>>> {
+        self.signal_topics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -273,5 +339,43 @@ mod tests {
         // Event with no apiVersion/kind cannot be routed; must be a no-op.
         bus.publish(WatchEvent::added(json!({"metadata": {"name": "x"}})));
         assert_eq!(bus.topic_count(), 1);
+    }
+
+    #[test]
+    fn watch_bus_signal_subscriber_receives_per_topic_advance() {
+        let bus = WatchBus::new(16);
+        let topic = WatchTopic::new("v1", "Pod");
+        let mut rx = bus.subscribe_signals(topic.clone());
+
+        bus.publish_signal(WatchSignal {
+            topic,
+            advances: vec![WatchAdvance {
+                namespace: Some("default".to_string()),
+                high_rv: 42,
+            }],
+        });
+
+        let got = rx.try_recv().expect("signal must be delivered");
+        assert_eq!(got.advances.len(), 1);
+        assert_eq!(got.advances[0].high_rv, 42);
+    }
+
+    #[test]
+    fn watch_bus_signal_does_not_reach_other_topics() {
+        let bus = WatchBus::new(16);
+        let mut cm_rx = bus.subscribe_signals(WatchTopic::new("v1", "ConfigMap"));
+
+        bus.publish_signal(WatchSignal {
+            topic: WatchTopic::new("v1", "Pod"),
+            advances: vec![WatchAdvance {
+                namespace: Some("default".to_string()),
+                high_rv: 42,
+            }],
+        });
+
+        assert!(matches!(
+            cm_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 }

@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::networking::VtepMac;
-use crate::watch::{WatchEvent, WatchReceiver, WatchTopic};
+use crate::watch::{WatchEvent, WatchReceiver, WatchSignal, WatchTopic};
 
 use super::command::{CommandMeta, StorageCommand};
 use super::types::{
@@ -49,6 +49,7 @@ pub trait DatastoreBackend: Send + Sync {
 
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal>;
 
     /// Broadcast a watch event after DB transaction commits.
     fn broadcast_watch_event(&self, pending: PendingWatchEvent);
@@ -1184,6 +1185,7 @@ impl<T: DatastoreBackend + ?Sized> OwnershipStore for T {
 pub trait WatchStore: Send + Sync {
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal>;
     async fn list_watch_events_since(
         &self,
         targets: &[WatchTarget],
@@ -1198,6 +1200,9 @@ impl<T: DatastoreBackend + ?Sized> WatchStore for T {
     }
     fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver {
         DatastoreBackend::subscribe_watch_many(self, topics)
+    }
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+        DatastoreBackend::subscribe_watch_signals(self, topic)
     }
     async fn list_watch_events_since(
         &self,
