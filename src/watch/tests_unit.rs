@@ -162,6 +162,232 @@ impl WatchReplaySource for FixedReplaySource {
     }
 }
 
+#[derive(Clone)]
+struct SignalCursorReplaySource {
+    events: std::sync::Arc<Vec<WatchEvent>>,
+    expired: bool,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<(i64, usize)>>>,
+}
+
+impl SignalCursorReplaySource {
+    fn events(events: Vec<WatchEvent>) -> Self {
+        Self {
+            events: std::sync::Arc::new(events),
+            expired: false,
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn expired() -> Self {
+        Self {
+            events: std::sync::Arc::new(Vec::new()),
+            expired: true,
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn calls(&self) -> Vec<(i64, usize)> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl WatchReplaySource for SignalCursorReplaySource {
+    async fn replay_since(&self, since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+        Ok(self
+            .events
+            .iter()
+            .filter(|event| event.resource_version().unwrap_or_default() > since_rv)
+            .cloned()
+            .collect())
+    }
+
+    async fn replay_since_checked(
+        &self,
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<crate::datastore::WatchReplayRead<WatchEvent>> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((since_rv, limit.get()));
+        if self.expired {
+            return Ok(crate::datastore::WatchReplayRead::Expired);
+        }
+        Ok(crate::datastore::WatchReplayRead::Events(
+            self.events
+                .iter()
+                .filter(|event| event.resource_version().unwrap_or_default() > since_rv)
+                .take(limit.get())
+                .cloned()
+                .collect(),
+        ))
+    }
+}
+
+fn signal_cursor_topic() -> WatchTopic {
+    WatchTopic::new("v1", "Pod")
+}
+
+fn signal_cursor_pod(namespace: &str, name: &str, rv: i64) -> WatchEvent {
+    WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "namespace": namespace,
+            "name": name,
+            "resourceVersion": rv.to_string(),
+        }
+    }))
+}
+
+fn signal_cursor_signal(namespace: Option<&str>, high_rv: i64) -> WatchSignal {
+    WatchSignal {
+        topic: signal_cursor_topic(),
+        advances: vec![WatchAdvance {
+            namespace: namespace.map(str::to_string),
+            high_rv,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn signal_cursor_default_window_three_delivers_single_event_without_waiting_for_three() {
+    let (tx, rx) = broadcast::channel(4);
+    let source = SignalCursorReplaySource::events(vec![signal_cursor_pod("default", "pod-11", 11)]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+
+    let event = cursor.next_event().await.unwrap();
+    assert_eq!(event.resource_version(), Some(11));
+    assert_eq!(cursor.accepted_rv(), 11);
+    assert_eq!(source.calls(), vec![(10, 3)]);
+}
+
+#[tokio::test]
+async fn signal_cursor_default_window_three_delivers_two_events_without_waiting_for_three() {
+    let (tx, rx) = broadcast::channel(4);
+    let source = SignalCursorReplaySource::events(vec![
+        signal_cursor_pod("default", "pod-11", 11),
+        signal_cursor_pod("default", "pod-12", 12),
+    ]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 12)).unwrap();
+
+    let first = cursor.next_event().await.unwrap();
+    let second = cursor.next_event().await.unwrap();
+    assert_eq!(first.resource_version(), Some(11));
+    assert_eq!(second.resource_version(), Some(12));
+    assert_eq!(cursor.accepted_rv(), 12);
+    assert_eq!(source.calls(), vec![(10, 3)]);
+}
+
+#[tokio::test]
+async fn signal_cursor_lost_signal_replays_all_missing_events_on_next_signal() {
+    let (tx, rx) = broadcast::channel(4);
+    let source = SignalCursorReplaySource::events(vec![
+        signal_cursor_pod("default", "pod-11", 11),
+        signal_cursor_pod("default", "pod-12", 12),
+        signal_cursor_pod("default", "pod-13", 13),
+    ]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 13)).unwrap();
+
+    let delivered = vec![
+        cursor.next_event().await.unwrap().resource_version(),
+        cursor.next_event().await.unwrap().resource_version(),
+        cursor.next_event().await.unwrap().resource_version(),
+    ];
+    assert_eq!(delivered, vec![Some(11), Some(12), Some(13)]);
+    assert_eq!(source.calls(), vec![(10, 3)]);
+}
+
+#[tokio::test]
+async fn signal_cursor_lagged_signal_receiver_uses_replay_instead_of_failing() {
+    let (tx, rx) = broadcast::channel(1);
+    let source = SignalCursorReplaySource::events(vec![
+        signal_cursor_pod("default", "pod-11", 11),
+        signal_cursor_pod("default", "pod-12", 12),
+        signal_cursor_pod("default", "pod-13", 13),
+    ]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    tx.send(signal_cursor_signal(Some("default"), 12)).unwrap();
+    tx.send(signal_cursor_signal(Some("default"), 13)).unwrap();
+
+    let event = cursor.next_event().await.unwrap();
+    assert_eq!(event.resource_version(), Some(11));
+    assert_eq!(source.calls(), vec![(10, 3)]);
+}
+
+#[tokio::test]
+async fn signal_cursor_expired_replay_returns_expired() {
+    let (tx, rx) = broadcast::channel(4);
+    let source = SignalCursorReplaySource::expired();
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source,
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+
+    match cursor.next_event().await {
+        Err(WatchCursorError::Expired) => {}
+        other => panic!("expected Expired, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn signal_cursor_namespaced_all_does_not_match_cluster_scoped_signal() {
+    assert!(!WatchDeliveryScope::NamespacedAll.matches_namespace(None));
+    assert!(WatchDeliveryScope::NamespacedAll.matches_namespace(Some("default")));
+}
+
+#[tokio::test]
+async fn signal_cursor_cluster_does_not_match_namespaced_signal() {
+    assert!(WatchDeliveryScope::Cluster.matches_namespace(None));
+    assert!(!WatchDeliveryScope::Cluster.matches_namespace(Some("default")));
+}
+
 #[tokio::test]
 async fn watch_replay_source_checked_replay_respects_limit() {
     let source = FixedReplaySource::new(vec![

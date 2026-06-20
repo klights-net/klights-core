@@ -3,6 +3,8 @@ pub mod bus;
 mod cursor;
 pub mod events;
 mod replay;
+mod scope;
+mod signal_cursor;
 mod window;
 
 pub use bus::{
@@ -14,6 +16,8 @@ pub use events::{
     EventType, WatchContentType, WatchEvent, encode_watch_payload, value_matches_field_selector,
 };
 pub use replay::{WatchCursorError, WatchReplaySource};
+pub use scope::WatchDeliveryScope;
+pub use signal_cursor::SignalWatchCursor;
 pub use window::WindowPolicy;
 
 #[cfg(test)]
