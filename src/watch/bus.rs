@@ -200,6 +200,40 @@ impl WatchBus {
     }
 }
 
+pub struct WatchSignalReceiver {
+    receivers: Vec<broadcast::Receiver<WatchSignal>>,
+}
+
+impl WatchSignalReceiver {
+    pub fn new(receivers: Vec<broadcast::Receiver<WatchSignal>>) -> Self {
+        Self { receivers }
+    }
+
+    pub async fn recv(&mut self) -> Result<WatchSignal, RecvError> {
+        if self.receivers.is_empty() {
+            return Err(RecvError::Closed);
+        }
+        if self.receivers.len() == 1 {
+            return self.receivers[0].recv().await;
+        }
+
+        let futures = self
+            .receivers
+            .iter_mut()
+            .map(|receiver| Box::pin(receiver.recv()));
+        let (result, _index, _remaining) = select_all(futures).await;
+        result
+    }
+}
+
+impl From<broadcast::Receiver<WatchSignal>> for WatchSignalReceiver {
+    fn from(receiver: broadcast::Receiver<WatchSignal>) -> Self {
+        Self {
+            receivers: vec![receiver],
+        }
+    }
+}
+
 pub struct WatchReceiver {
     receivers: Vec<broadcast::Receiver<WatchEvent>>,
 }

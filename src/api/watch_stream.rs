@@ -4,8 +4,8 @@ use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{DatastoreHandle, WatchTarget};
 use crate::label_selector::LabelSelector;
 use crate::watch::{
-    EventType, SignalWatchCursor, WatchContentType, WatchCursor, WatchCursorError,
-    WatchDeliveryScope, WatchEvent, WatchSignal, WatchTopic, WindowPolicy,
+    EventType, SignalWatchCursor, WatchContentType, WatchCursorError, WatchDeliveryScope,
+    WatchEvent, WatchSignal, WatchTopic, WindowPolicy,
 };
 use axum::body::Body;
 use serde_json::Value;
@@ -129,33 +129,6 @@ pub fn resource_to_seen_key(resource: &crate::datastore::Resource) -> (Option<St
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
     (namespace, resource.name.clone())
-}
-
-/// Seed a freshly-created [`WatchCursor`] from a selector watch's baseline.
-///
-/// Two establishment-window fixes, applied identically by the built-in and
-/// custom-resource watch builders (the latter previously diverged and missed
-/// both):
-///
-/// * `delivered_rvs` — rvs already emitted to the client as ADDED from the
-///   rv-less baseline list. Marking them delivered lets the live floor stay low
-///   (so a genuinely live ADDED broadcast below the collection rv is not
-///   dropped) without re-delivering the baseline items.
-/// * `low_rv_allowlist` — `((namespace, name), baseline_rv)` for each current
-///   selector member of a `resourceVersion>0` watch. It grants a per-key
-///   exception so a later transition (e.g. a replicated DELETED tombstone whose
-///   broadcast rv lands below the resume floor) still reaches the client.
-pub fn seed_watch_cursor_baseline<S: crate::watch::WatchReplaySource>(
-    cursor: &mut WatchCursor<S>,
-    delivered_rvs: Vec<i64>,
-    low_rv_allowlist: Vec<((Option<String>, String), i64)>,
-) {
-    for rv in delivered_rvs {
-        cursor.mark_delivered(rv);
-    }
-    for ((namespace, name), after_rv) in low_rv_allowlist {
-        cursor.allow_low_rv_for_key(namespace, name, after_rv);
-    }
 }
 
 pub fn apply_selector_transition_event(

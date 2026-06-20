@@ -1,21 +1,20 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::datastore::WatchReplayRead;
 
 use super::{
-    WatchCursorError, WatchDeliveryScope, WatchEvent, WatchReplaySource, WatchSignal, WatchTopic,
-    WindowPolicy,
+    WatchCursorError, WatchDeliveryScope, WatchEvent, WatchReplaySource, WatchSignal,
+    WatchSignalReceiver, WatchTopic, WindowPolicy,
 };
 
 const RECENT_SIGNAL_SEEN_RV_CAPACITY: usize = 32_768;
 
 pub struct SignalWatchCursor<S> {
-    signal_rx: broadcast::Receiver<WatchSignal>,
+    signal_rx: WatchSignalReceiver,
     replay_source: S,
-    topic: WatchTopic,
+    topics: HashSet<WatchTopic>,
     scope: WatchDeliveryScope,
     accepted_rv: i64,
     pending: VecDeque<WatchEvent>,
@@ -29,17 +28,35 @@ pub struct SignalWatchCursor<S> {
 
 impl<S: WatchReplaySource> SignalWatchCursor<S> {
     pub fn new(
-        signal_rx: broadcast::Receiver<WatchSignal>,
+        signal_rx: impl Into<WatchSignalReceiver>,
         replay_source: S,
         topic: WatchTopic,
         scope: WatchDeliveryScope,
         accepted_rv: i64,
         window: WindowPolicy,
     ) -> Self {
-        Self {
+        Self::new_many(
             signal_rx,
             replay_source,
-            topic,
+            vec![topic],
+            scope,
+            accepted_rv,
+            window,
+        )
+    }
+
+    pub fn new_many(
+        signal_rx: impl Into<WatchSignalReceiver>,
+        replay_source: S,
+        topics: Vec<WatchTopic>,
+        scope: WatchDeliveryScope,
+        accepted_rv: i64,
+        window: WindowPolicy,
+    ) -> Self {
+        Self {
+            signal_rx: signal_rx.into(),
+            replay_source,
+            topics: topics.into_iter().collect(),
             scope,
             accepted_rv,
             pending: VecDeque::new(),
@@ -153,7 +170,7 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
     }
 
     fn matching_signal_replay_since(&self, signal: &WatchSignal) -> Option<i64> {
-        if signal.topic != self.topic {
+        if !self.topics.contains(&signal.topic) {
             return None;
         }
         let mut replay_since: Option<i64> = None;
@@ -174,12 +191,10 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
     }
 
     fn event_matches(&self, event: &WatchEvent) -> bool {
-        let api_version = event
-            .object
-            .get("apiVersion")
-            .and_then(|value| value.as_str());
-        let kind = event.object.get("kind").and_then(|value| value.as_str());
-        if api_version != Some(self.topic.api_version()) || kind != Some(self.topic.kind()) {
+        let Some(topic) = event_topic(event) else {
+            return false;
+        };
+        if !self.topics.contains(&topic) {
             return false;
         }
         self.scope.matches_namespace(event_namespace(event))
@@ -223,6 +238,15 @@ fn event_namespace(event: &WatchEvent) -> Option<&str> {
         .get("metadata")
         .and_then(|metadata| metadata.get("namespace"))
         .and_then(|namespace| namespace.as_str())
+}
+
+fn event_topic(event: &WatchEvent) -> Option<WatchTopic> {
+    let api_version = event
+        .object
+        .get("apiVersion")
+        .and_then(|value| value.as_str())?;
+    let kind = event.object.get("kind").and_then(|value| value.as_str())?;
+    Some(WatchTopic::new(api_version, kind))
 }
 
 fn event_key(event: &WatchEvent) -> Option<(Option<String>, String)> {

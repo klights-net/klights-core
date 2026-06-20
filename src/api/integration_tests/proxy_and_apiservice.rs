@@ -6818,22 +6818,34 @@ async fn test_cluster_custom_resource_watch_skips_stale_backlog_event_when_rv_ze
         event: crate::watch::WatchEvent::added(old_object.clone()),
     });
 
-    let fresh_rv = old_rv + 1;
-    db.broadcast_watch_event(crate::datastore::PendingWatchEvent {
-        event: crate::watch::WatchEvent::added(json!({
-            "apiVersion": "mygroup.example.com/v1beta1",
-            "kind": "WishIHadChosenNoxu",
-            "metadata": {
-                "name": "name1",
-                "resourceVersion": fresh_rv.to_string(),
-                "uid": old_object["metadata"]["uid"].clone(),
-                "creationTimestamp": old_object["metadata"]["creationTimestamp"].clone(),
-                "generation": 1
-            },
-            "content": {"key": "fresh"},
-            "num": {"num1": 9223372036854775807_i64, "num2": 1000000}
-        })),
-    });
+    let patch_fresh = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/apis/mygroup.example.com/v1beta1/noxus/name1")
+                .header("content-type", "application/merge-patch+json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"content": {"key": "fresh"}})).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patch_fresh.status(), StatusCode::OK);
+    let patch_fresh_body = axum::body::to_bytes(patch_fresh.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let fresh_object: serde_json::Value = serde_json::from_slice(&patch_fresh_body).unwrap();
+    let fresh_rv = fresh_object["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    assert!(
+        fresh_rv > old_rv,
+        "fresh patch rv {fresh_rv} must be newer than baseline rv {old_rv}"
+    );
 
     // An rv-less selector watch delivers the establishment-time state
     // (name1 @ old_rv) as a baseline ADDED, then the fresh update (@ fresh_rv).
@@ -6853,15 +6865,19 @@ async fn test_cluster_custom_resource_watch_skips_stale_backlog_event_when_rv_ze
             .filter(|l| !l.trim().is_empty())
         {
             let event: serde_json::Value = serde_json::from_str(line).unwrap();
-            assert_eq!(event["type"], "ADDED");
             let rv = event["object"]["metadata"]["resourceVersion"]
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
             if rv == old_rv.to_string() {
+                assert_eq!(event["type"], "ADDED");
                 old_count += 1;
             } else if rv == fresh_rv.to_string() {
                 saw_fresh = true;
+                assert!(
+                    event["type"] == "ADDED" || event["type"] == "MODIFIED",
+                    "fresh event may be an ADDED selector transition or a MODIFIED update"
+                );
                 assert_eq!(event["object"]["content"]["key"], "fresh");
             }
         }

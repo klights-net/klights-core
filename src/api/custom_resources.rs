@@ -648,12 +648,14 @@ async fn list_cr_inner(
             requested_rv = floor;
         }
 
-        let rx = state.db.subscribe_watch_many(crd_watch_topics(
-            group,
-            &kind,
-            conversion.as_ref(),
-            version,
-        ));
+        let watch_topics = crd_watch_topics(group, &kind, conversion.as_ref(), version);
+        let signal_rx = crate::watch::WatchSignalReceiver::new(
+            watch_topics
+                .iter()
+                .cloned()
+                .map(|topic| state.db.subscribe_watch_signals(topic))
+                .collect(),
+        );
         let db = state.db.clone();
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let task_supervisor = state.task_supervisor.clone();
@@ -1103,29 +1105,46 @@ async fn list_cr_inner(
                     })
                     .collect::<Vec<_>>()
             };
-            let replay_source = DatastoreWatchReplaySource::new(
-                db.clone(),
-                replay_targets,
+            let replay_source = DatastoreWatchReplaySource::new(db.clone(), replay_targets);
+            let delivery_scope = if is_cluster_scope {
+                crate::watch::WatchDeliveryScope::Cluster
+            } else if let Some(ns) = watch_ns.clone() {
+                crate::watch::WatchDeliveryScope::Namespaced(ns)
+            } else {
+                crate::watch::WatchDeliveryScope::NamespacedAll
+            };
+            let mut cursor = crate::watch::SignalWatchCursor::new_many(
+                signal_rx,
+                replay_source,
+                watch_topics,
+                delivery_scope,
+                initial_list_rv.max(requested_rv),
+                crate::watch::WindowPolicy::default_watch_delivery(),
             );
-            let mut cursor = WatchCursor::new(rx, replay_source, initial_list_rv.max(requested_rv))
-                .with_ordered_replay()
-                // Confine floor-drop expiration to the replay's namespace scope
-                // (the live broadcast is cluster-wide). Only a namespaced,
-                // namespace-scoped CR watch has a narrower replay than the
-                // broadcast; cluster-scoped and all-namespace watches replay
-                // everything they receive.
-                .with_replay_namespace(if is_cluster_scope {
-                    None
-                } else {
-                    watch_ns.clone()
-                });
-            // Dedup baseline ADDEDs and grant per-key low-rv exceptions; shared
-            // with the built-in watch builder via `seed_watch_cursor_baseline`.
-            crate::api::watch_stream::seed_watch_cursor_baseline(
-                &mut cursor,
-                baseline_delivered_rvs,
-                baseline_low_rv_allowlist,
-            );
+            for rv in baseline_delivered_rvs {
+                cursor.mark_delivered(rv);
+            }
+            for ((namespace, name), after_rv) in baseline_low_rv_allowlist {
+                cursor.allow_low_rv_for_key(namespace, name, after_rv);
+            }
+            if requested_rv > 0 || send_initial_events {
+                match cursor.prime_replay_or_expired().await {
+                    Ok(_) => {}
+                    Err(WatchCursorError::Expired) => {
+                        yield Ok::<_, std::convert::Infallible>(
+                            crate::api::watch_stream::serialize_watch_status_line(
+                                410,
+                                "Expired",
+                                "too old resource version: requested resourceVersion is older than the watch history window",
+                            ),
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!("Initial {} watch replay failed for {}: {:#?}", log_prefix, kind, err);
+                    }
+                }
+            }
             let bookmark_task_name = format!(
                 "{}_watch_bookmarks_{}_{}",
                 task_prefix, group_for_watch, plural_for_watch
@@ -1152,7 +1171,7 @@ async fn list_cr_inner(
                     Some(()) = recv_watch_timeout(&mut timeout_tick) => {
                         break;
                     }
-                    result = cursor.next_event(&task_supervisor) => {
+                    result = cursor.next_event() => {
                         let event = match result {
                             Ok(event) => event,
                             Err(WatchCursorError::Replay(err)) => {
@@ -1210,12 +1229,14 @@ async fn list_cr_inner(
                         ) else {
                             continue;
                         };
-                        if let Some(delivered_rv) = event.resource_version() {
-                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(delivered_rv);
-                        }
+                        let delivered_rv = event.resource_version();
                         let mut json = serde_json::to_vec(&event).unwrap_or_default();
                         json.push(b'\n');
                         yield Ok::<_, std::convert::Infallible>(json);
+                        if let Some(delivered_rv) = delivered_rv {
+                            cursor.accept_event(delivered_rv);
+                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(delivered_rv);
+                        }
                     }
                     Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
                         let decision = crate::api::watch_stream::resolve_periodic_bookmark_decision(
@@ -1228,7 +1249,7 @@ async fn list_cr_inner(
                                 field_selector: field_selector.as_deref(),
                                 requested_rv,
                                 has_scope_filter,
-                                cursor_high_water_rv: cursor.high_water_rv(),
+                                cursor_high_water_rv: cursor.accepted_rv(),
                                 last_delivered_scoped_rv,
                             },
                         )

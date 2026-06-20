@@ -9,7 +9,7 @@ mod window;
 
 pub use bus::{
     DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, WatchAdvance, WatchBus, WatchReceiver, WatchSignal,
-    WatchTopic,
+    WatchSignalReceiver, WatchTopic,
 };
 pub use cursor::{WatchBootstrap, WatchCursor, WatchEventFilter};
 pub use events::{
