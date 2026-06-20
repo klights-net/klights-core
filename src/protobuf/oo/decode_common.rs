@@ -151,7 +151,9 @@ pub fn meta_to_json(meta: &k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta
     if let Some(generate_name) = &meta.generate_name {
         obj["generateName"] = json!(generate_name);
     }
-    if let Some(namespace) = &meta.namespace {
+    if let Some(namespace) = &meta.namespace
+        && !namespace.is_empty()
+    {
         obj["namespace"] = json!(namespace);
     }
     if let Some(uid) = &meta.uid {

@@ -389,6 +389,13 @@ async fn signal_cursor_cluster_does_not_match_namespaced_signal() {
 }
 
 #[tokio::test]
+async fn signal_cursor_empty_namespace_is_cluster_scoped() {
+    assert!(WatchDeliveryScope::Cluster.matches_namespace(Some("")));
+    assert!(!WatchDeliveryScope::NamespacedAll.matches_namespace(Some("")));
+    assert!(!WatchDeliveryScope::Namespaced("default".to_string()).matches_namespace(Some("")));
+}
+
+#[tokio::test]
 async fn signal_cursor_all_matches_cluster_and_namespaced_signals() {
     assert!(WatchDeliveryScope::All.matches_namespace(None));
     assert!(WatchDeliveryScope::All.matches_namespace(Some("default")));

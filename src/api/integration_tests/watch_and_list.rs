@@ -1194,6 +1194,244 @@ async fn test_serviceaccount_watch_modified_via_replicated_patch_latest() {
     );
 }
 
+#[tokio::test]
+async fn test_cluster_scoped_selector_watch_from_list_rv_delivers_modified_without_pre_poll() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use prost::Message;
+    use serde_json::json;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    fn go_style_vapb_protobuf_body(name: &str, label_key: &str, label_value: &str) -> Vec<u8> {
+        let binding = k8s_pb::api::admissionregistration::v1::ValidatingAdmissionPolicyBinding {
+            metadata: Some(k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some(name.to_string()),
+                generate_name: Some(String::new()),
+                namespace: Some(String::new()),
+                labels: vec![(label_key.to_string(), label_value.to_string())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            }),
+            spec: Some(
+                k8s_pb::api::admissionregistration::v1::ValidatingAdmissionPolicyBindingSpec {
+                    policy_name: Some("missing-policy.example.com".to_string()),
+                    validation_actions: vec!["Deny".to_string()],
+                    ..Default::default()
+                },
+            ),
+        };
+        let mut raw = Vec::new();
+        binding.encode(&mut raw).unwrap();
+        let envelope = crate::protobuf::Unknown {
+            type_meta: Some(crate::protobuf::TypeMeta {
+                api_version: "admissionregistration.k8s.io/v1".to_string(),
+                kind: "ValidatingAdmissionPolicyBinding".to_string(),
+            }),
+            raw,
+            content_encoding: String::new(),
+            content_type: String::new(),
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(b"k8s\0");
+        envelope.encode(&mut body).unwrap();
+        body
+    }
+
+    let app = build_test_router().await;
+    let label_key = "example-e2e-vapb-label";
+    let label_value = "lazy-watch";
+    let target_name = "e2e-example-vapb-lazy-target";
+
+    for name in [
+        "e2e-example-vapb-lazy-a",
+        "e2e-example-vapb-lazy-b",
+        target_name,
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings")
+                    .header("content-type", "application/vnd.kubernetes.protobuf")
+                    .header(
+                        "accept",
+                        "application/vnd.kubernetes.protobuf,application/json",
+                    )
+                    .body(Body::from(go_style_vapb_protobuf_body(
+                        name,
+                        label_key,
+                        label_value,
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "create {name} failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    let list_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings?labelSelector={label_key}%3D{label_value}"
+                ))
+                .header(
+                    "accept",
+                    "application/vnd.kubernetes.protobuf,application/json",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+    let list = crate::protobuf::decode_protobuf(&list_body).unwrap();
+    let list_rv = list
+        .pointer("/metadata/resourceVersion")
+        .and_then(|value| value.as_str())
+        .expect("list response must include a resourceVersion");
+
+    let watch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings?labelSelector={label_key}%3D{label_value}&resourceVersion={list_rv}&watch=true"
+                ))
+                .header(
+                    "accept",
+                    "application/vnd.kubernetes.protobuf,application/json",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+
+    let patch_body = json!({
+        "metadata": {"annotations": {"patched": "true"}},
+        "spec": {"validationActions": ["Warn"]}
+    });
+    let patch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!(
+                    "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/{target_name}"
+                ))
+                .header("content-type", "application/merge-patch+json")
+                .body(Body::from(serde_json::to_vec(&patch_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(patch_resp.status(), StatusCode::OK);
+
+    let get_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/{target_name}"
+                ))
+                .header(
+                    "accept",
+                    "application/vnd.kubernetes.protobuf,application/json",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let get_body = to_bytes(get_resp.into_body(), usize::MAX).await.unwrap();
+    let mut updated = crate::protobuf::decode_protobuf(&get_body).unwrap();
+    updated["metadata"]["annotations"]["updated"] = json!("true");
+    updated["spec"]["validationActions"] = json!(["Deny"]);
+
+    let update_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/{target_name}"
+                ))
+                .header("content-type", "application/vnd.kubernetes.protobuf")
+                .header(
+                    "accept",
+                    "application/vnd.kubernetes.protobuf,application/json",
+                )
+                .body(Body::from(
+                    crate::protobuf::encode_protobuf(&updated).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_resp.status(), StatusCode::OK);
+
+    let mut stream = watch_resp.into_body().into_data_stream();
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(Ok(chunk))) =
+            tokio::time::timeout(Duration::from_millis(500), stream.next()).await
+        else {
+            break;
+        };
+        for line in chunk.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let event: serde_json::Value = serde_json::from_slice(line).unwrap();
+            if event
+                .pointer("/object/metadata/name")
+                .and_then(|value| value.as_str())
+                != Some(target_name)
+            {
+                continue;
+            }
+            let ty = event["type"].as_str().unwrap_or("").to_string();
+            let patched = event
+                .pointer("/object/metadata/annotations/patched")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string();
+            seen.push((ty, patched));
+        }
+        if seen
+            .iter()
+            .any(|(ty, patched)| ty == "MODIFIED" && patched == "true")
+        {
+            break;
+        }
+    }
+    assert!(
+        seen.iter()
+            .any(|(ty, patched)| ty == "MODIFIED" && patched == "true"),
+        "expected patched MODIFIED event after lazy watch read; saw {seen:?}"
+    );
+}
+
 /// Run-2 reproduction: under the cluster-wide `v1/ServiceAccount` event
 /// flood the watch's broadcast receiver overflows (capacity 1024) and lags;
 /// the cursor must replay and still deliver the patch's MODIFIED. The watch

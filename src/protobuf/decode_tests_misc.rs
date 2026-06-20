@@ -241,6 +241,45 @@ pub fn test_protobuf_decode_full_path() {
 }
 
 #[test]
+pub fn test_decode_protobuf_omits_empty_objectmeta_namespace() {
+    use k8s_pb::api::admissionregistration::v1::{
+        ValidatingAdmissionPolicyBinding, ValidatingAdmissionPolicyBindingSpec,
+    };
+    use k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+    let binding = ValidatingAdmissionPolicyBinding {
+        metadata: Some(ObjectMeta {
+            name: Some("vapb-empty-namespace".to_string()),
+            namespace: Some(String::new()),
+            labels: vec![("example-e2e-vapb-label".to_string(), "decode".to_string())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        }),
+        spec: Some(ValidatingAdmissionPolicyBindingSpec {
+            policy_name: Some("missing-policy.example.com".to_string()),
+            validation_actions: vec!["Deny".to_string()],
+            ..Default::default()
+        }),
+    };
+    let mut raw = Vec::new();
+    binding.encode(&mut raw).unwrap();
+    let envelope = build_unknown_envelope(
+        "admissionregistration.k8s.io/v1",
+        "ValidatingAdmissionPolicyBinding",
+        &raw,
+    );
+    let decoded = decode_protobuf(&envelope).unwrap();
+
+    assert_eq!(decoded["metadata"]["name"], "vapb-empty-namespace");
+    assert!(
+        decoded.pointer("/metadata/namespace").is_none(),
+        "empty protobuf ObjectMeta.namespace must not be persisted as a cluster-scoped JSON namespace"
+    );
+    assert_eq!(decoded["spec"]["validationActions"][0], "Deny");
+}
+
+#[test]
 pub fn test_protobuf_decode_json_in_envelope() {
     use prost::Message;
 

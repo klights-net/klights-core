@@ -28,6 +28,7 @@ pub fn json_validating_admission_policy_binding_to_pb(
             .as_ref()
             .map(|spec| admissionv1::ValidatingAdmissionPolicyBindingSpec {
                 policy_name: spec.policy_name.clone(),
+                validation_actions: spec.validation_actions.clone().unwrap_or_default(),
                 ..Default::default()
             }),
     })
