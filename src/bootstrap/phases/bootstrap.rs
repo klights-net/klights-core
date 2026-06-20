@@ -289,10 +289,33 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let pod_lifecycle_router = pod_subsystem.lifecycle_router.clone();
     pod_repository
         .set_pod_lifecycle_router_for_node(pod_lifecycle_router.clone(), config.node_name.clone());
+    let api_pod_repository = if kubelet_uses_worker_store_adapter {
+        let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
+            crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+                db: db_handle.clone(),
+                supervisor: supervisor.clone(),
+                side_effects: side_effects.clone(),
+                metrics: metrics.clone(),
+                network_events: crate::networking::global_pod_network_events(),
+                scheduling_mode,
+                outbox: Some(outbox_runtime.clone()),
+                cluster_api: Some(cluster_api.clone()),
+            },
+        );
+        let repo = Arc::new(parts.repository);
+        repo.set_pod_lifecycle_router_for_node(
+            pod_lifecycle_router.clone(),
+            config.node_name.clone(),
+        );
+        parts.background.start();
+        repo
+    } else {
+        pod_repository.clone()
+    };
     let pod_start_retry_state: crate::kubelet::pod_creation_state::PodStartRetryTracker = Arc::new(
         tokio::sync::Mutex::new(crate::kubelet::pod_creation_state::PodStartRetryState::new()),
     );
-    side_effects.set_pod_repository(pod_repository.clone());
+    side_effects.set_pod_repository(api_pod_repository.clone());
     let oidc_authenticator =
         crate::auth::oidc::build_oidc_authenticator_from_config(config, supervisor.as_ref())
             .await
@@ -379,7 +402,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         apiservice_proxy_identity_cache: Arc::new(tokio::sync::OnceCell::new()),
         apiservice_proxy_cache: Arc::new(api::apiservice_proxy::ApiServiceProxyCache::default()),
         task_supervisor: supervisor.clone(),
-        pod_repository: pod_repository.clone(),
+        pod_repository: api_pod_repository.clone(),
         outbox: outbox_runtime.clone(),
         node_lease_tracker: node_lease_tracker.clone(),
         pod_lifecycle_router: Some(pod_lifecycle_router),
@@ -390,7 +413,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         authorizer: std::sync::Arc::new(
             crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
                 db_handle.clone(),
-                pod_repository.clone(),
+                api_pod_repository.clone(),
             ),
         ),
         rbac_policy_store: std::sync::Arc::new(
@@ -402,7 +425,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     });
     watcher_state
         .controller_dispatcher
-        .set_pod_repository(pod_repository.clone())
+        .set_pod_repository(api_pod_repository.clone())
         .await;
 
     // VTEP reconciler
@@ -869,7 +892,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     Ok(BootstrapPhase {
         _watcher_state: watcher_state,
-        pod_repository,
+        pod_repository: api_pod_repository,
         local_vtep_annotation_handle,
         crd_registry_watch_handle,
         leader_peer_endpoint_observer_handle,
