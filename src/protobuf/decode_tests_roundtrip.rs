@@ -392,6 +392,13 @@ pub fn test_encode_protobuf_pod_conditions_roundtrip() {
                     "type": "Ready",
                     "status": "True",
                     "lastTransitionTime": "2026-04-12T00:00:02Z"
+                },
+                {
+                    "type": "DisruptionTarget",
+                    "status": "True",
+                    "lastTransitionTime": "2026-06-20T05:33:54.249213609Z",
+                    "reason": "PreemptionByScheduler",
+                    "message": "Preempted by pod sched-preemption-3016/preemptor-pod on node"
                 }
             ],
             "containerStatuses": [{
@@ -411,7 +418,7 @@ pub fn test_encode_protobuf_pod_conditions_roundtrip() {
 
     // Verify conditions survive the roundtrip
     let conditions = decoded["status"]["conditions"].as_array().unwrap();
-    assert_eq!(conditions.len(), 4, "All 4 conditions must be preserved");
+    assert_eq!(conditions.len(), 5, "All 5 conditions must be preserved");
 
     // Verify Ready condition specifically (this is what Sonobuoy checks)
     let ready = conditions
@@ -432,6 +439,13 @@ pub fn test_encode_protobuf_pod_conditions_roundtrip() {
         .find(|c| c["type"] == "ContainersReady")
         .expect("ContainersReady condition must exist");
     assert_eq!(containers_ready["status"], "True");
+
+    let disruption_target = conditions
+        .iter()
+        .find(|c| c["type"] == "DisruptionTarget")
+        .expect("DisruptionTarget condition must exist");
+    assert_eq!(disruption_target["status"], "True");
+    assert_eq!(disruption_target["reason"], "PreemptionByScheduler");
 
     // Verify other status fields
     assert_eq!(decoded["status"]["phase"], "Running");
