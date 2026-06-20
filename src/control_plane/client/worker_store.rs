@@ -271,6 +271,10 @@ impl WorkerStoreAdapter {
             .is_some_and(|node| node == self.node_name)
     }
 
+    fn snapshot_replay_event_type(since_rv: i64) -> &'static str {
+        if since_rv > 0 { "MODIFIED" } else { "ADDED" }
+    }
+
     fn local_pod_field_selector(&self, field_selector: Option<&str>) -> String {
         let local_selector = format!("spec.nodeName={}", self.node_name);
         match field_selector
@@ -776,7 +780,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
         &self,
         api_version: &str,
         kind: &str,
-        _since_rv: i64,
+        since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
         let list = self
             .list_resources(
@@ -786,12 +790,14 @@ impl DatastoreBackend for WorkerStoreAdapter {
                 crate::datastore::ResourceListQuery::all(),
             )
             .await?;
+        let event_type = Self::snapshot_replay_event_type(since_rv);
         Ok(list
             .items
             .into_iter()
+            .filter(|resource| resource.resource_version > since_rv)
             .map(|resource| CatchUpResource {
                 resource,
-                event_type: std::borrow::Cow::Borrowed("ADDED"),
+                event_type: std::borrow::Cow::Borrowed(event_type),
             })
             .collect())
     }
@@ -805,7 +811,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-        _since_rv: i64,
+        since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
         let list = self
             .list_resources(
@@ -815,12 +821,14 @@ impl DatastoreBackend for WorkerStoreAdapter {
                 crate::datastore::ResourceListQuery::all(),
             )
             .await?;
+        let event_type = Self::snapshot_replay_event_type(since_rv);
         Ok(list
             .items
             .into_iter()
+            .filter(|resource| resource.resource_version > since_rv)
             .map(|resource| CatchUpResource {
                 resource,
-                event_type: std::borrow::Cow::Borrowed("ADDED"),
+                event_type: std::borrow::Cow::Borrowed(event_type),
             })
             .collect())
     }
@@ -868,6 +876,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
         let mut events = Vec::new();
+        let event_type = Self::snapshot_replay_event_type(since_rv);
         for target in targets {
             let list = self.list_for_target(target).await?;
             self.observe_rv(list.resource_version);
@@ -877,7 +886,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
                     .filter(|resource| resource.resource_version > since_rv)
                     .map(|resource| CatchUpResource {
                         resource,
-                        event_type: std::borrow::Cow::Borrowed("ADDED"),
+                        event_type: std::borrow::Cow::Borrowed(event_type),
                     }),
             );
         }
@@ -1688,6 +1697,114 @@ mod tests {
         assert!(
             second_events.is_empty(),
             "resumed worker replay must not return resources at or below the resume RV"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_watch_replay_marks_resumed_bound_pod_snapshot_changes_modified() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let created = cluster_db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "deadline-pod",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "deadline-pod",
+                        "uid": "uid-deadline"
+                    },
+                    "spec": {
+                        "nodeName": "worker-a",
+                        "containers": [{
+                            "name": "pause",
+                            "image": "registry.k8s.io/pause:3.10"
+                        }]
+                    }
+                }),
+            )
+            .await
+            .expect("create pod");
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db.clone()),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-watch-resume-pod-modified-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let targets = [WatchTarget::namespaced_in_namespace("v1", "Pod", "default")];
+        let limit = std::num::NonZeroUsize::new(4).expect("non-zero limit");
+
+        let first = adapter
+            .list_watch_events_since_checked_bounded(&targets, 0, limit)
+            .await
+            .expect("initial watch replay");
+        let crate::datastore::WatchReplayRead::Events(first_events) = first else {
+            panic!("worker adapter replay should not expire");
+        };
+        assert_eq!(first_events.len(), 1);
+        assert_eq!(first_events[0].event_type.as_ref(), "ADDED");
+
+        cluster_db
+            .update_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "deadline-pod",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "deadline-pod",
+                        "uid": "uid-deadline"
+                    },
+                    "spec": {
+                        "nodeName": "worker-a",
+                        "activeDeadlineSeconds": 1,
+                        "containers": [{
+                            "name": "pause",
+                            "image": "registry.k8s.io/pause:3.10"
+                        }]
+                    }
+                }),
+                created.resource_version,
+            )
+            .await
+            .expect("update pod");
+
+        let resumed = adapter
+            .list_watch_events_since_checked_bounded(&targets, created.resource_version, limit)
+            .await
+            .expect("resumed watch replay");
+        let crate::datastore::WatchReplayRead::Events(resumed_events) = resumed else {
+            panic!("worker adapter replay should not expire");
+        };
+        assert_eq!(resumed_events.len(), 1);
+        assert_eq!(
+            resumed_events[0].event_type.as_ref(),
+            "MODIFIED",
+            "worker snapshot replay after a resume RV must preserve update semantics"
+        );
+        assert_eq!(
+            resumed_events[0]
+                .resource
+                .data
+                .pointer("/spec/activeDeadlineSeconds")
+                .and_then(|value| value.as_i64()),
+            Some(1)
         );
     }
 
