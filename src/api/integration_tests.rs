@@ -913,6 +913,90 @@ async fn test_replicationcontroller_scale_put_triggers_reconcile() {
 }
 
 #[tokio::test]
+async fn test_replicationcontroller_main_put_triggers_reconcile() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "default",
+        json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}),
+    )
+    .await
+    .unwrap();
+
+    let create_rc = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/default/replicationcontrollers")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "apiVersion": "v1",
+                "kind": "ReplicationController",
+                "metadata": {
+                    "name": "rc-put-e2e",
+                    "namespace": "default",
+                    "uid": "rc-put-e2e-uid"
+                },
+                "spec": {
+                    "replicas": 1,
+                    "selector": { "app": "rc-put-e2e" },
+                    "template": {
+                        "metadata": { "labels": { "app": "rc-put-e2e" } },
+                        "spec": { "containers": [{ "name": "c", "image": "busybox:1.36" }] }
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let create_resp = app.clone().oneshot(create_rc).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+    let get_rc = Request::builder()
+        .method("GET")
+        .uri("/api/v1/namespaces/default/replicationcontrollers/rc-put-e2e")
+        .body(Body::empty())
+        .unwrap();
+    let get_resp = app.clone().oneshot(get_rc).await.unwrap();
+    assert_eq!(get_resp.status(), StatusCode::OK);
+    let get_body = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let mut rc: Value = serde_json::from_slice(&get_body).unwrap();
+
+    rc["spec"]["replicas"] = json!(3);
+    let update_rc = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/namespaces/default/replicationcontrollers/rc-put-e2e")
+        .header("content-type", "application/json")
+        .body(Body::from(rc.to_string()))
+        .unwrap();
+    let update_resp = app.clone().oneshot(update_rc).await.unwrap();
+    assert_eq!(update_resp.status(), StatusCode::OK);
+
+    let pods = db
+        .list_resources(
+            "v1",
+            "Pod",
+            Some("default"),
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pods.items.len(),
+        3,
+        "main ReplicationController update must trigger reconcile to desired replicas"
+    );
+}
+
+#[tokio::test]
 async fn test_replicationcontroller_status_patch_triggers_reconcile() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

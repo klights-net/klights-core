@@ -505,3 +505,49 @@ reconcile_handlers!(
     patch_replicaset_base
 );
 reconcile_create_handler!(replicationcontroller, create_replicationcontroller_base);
+
+#[allow(hidden_glob_reexports)]
+async fn update_replicationcontroller(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(query): Query<CreateUpdateQuery>,
+    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    LenientJson(body): LenientJson<Value>,
+) -> Result<Json<Value>, AppError> {
+    let result = generated_handlers::update_replicationcontroller(
+        State(state.clone()),
+        Path((namespace, name)),
+        Query(query),
+        axum::Extension(identity),
+        LenientJson(body),
+    )
+    .await?;
+
+    state.controller_dispatcher.enqueue(&result.0).await;
+
+    Ok(result)
+}
+
+#[allow(hidden_glob_reexports)]
+async fn patch_replicationcontroller(
+    State(state): State<Arc<AppState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    Query(query): Query<CreateUpdateQuery>,
+    headers: HeaderMap,
+    axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
+    body: Bytes,
+) -> Result<Json<Value>, AppError> {
+    let result = generated_handlers::patch_replicationcontroller(
+        State(state.clone()),
+        Path((namespace, name)),
+        Query(query),
+        headers,
+        axum::Extension(identity),
+        body,
+    )
+    .await?;
+
+    state.controller_dispatcher.enqueue(&result.0).await;
+
+    Ok(result)
+}
