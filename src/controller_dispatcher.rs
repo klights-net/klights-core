@@ -36,7 +36,7 @@ use anyhow::{Context as _, Result};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 /// Controller dispatcher that routes resources to the appropriate controller.
 ///
@@ -71,6 +71,7 @@ pub struct ControllerDispatcher {
     /// (they fail-fast at reconcile time if it is missing).
     pod_repository: Arc<Mutex<Option<Arc<PodRepository>>>>,
     active_reconciles: Arc<Mutex<ActiveReconciles>>,
+    active_reconciles_changed: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -176,6 +177,7 @@ impl ControllerDispatcher {
             services: Arc::new(Mutex::new(None)),
             pod_repository: Arc::new(Mutex::new(None)),
             active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
+            active_reconciles_changed: Arc::new(Notify::new()),
         }
     }
 
@@ -397,12 +399,27 @@ impl ControllerDispatcher {
         true
     }
 
+    async fn wait_for_key_dispatch_slot(&self, key: &Key) {
+        loop {
+            let notified = self.active_reconciles_changed.notified();
+            {
+                let mut active = self.active_reconciles.lock().await;
+                if !active.in_flight.contains(key) {
+                    active.in_flight.insert(key.clone());
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
     async fn finish_key_dispatch(&self, key: Key) {
         let should_requeue = {
             let mut active = self.active_reconciles.lock().await;
             active.in_flight.remove(&key);
             active.pending_followup.remove(&key)
         };
+        self.active_reconciles_changed.notify_waiters();
         if should_requeue {
             self.queue.add(key).await;
         }
@@ -434,7 +451,7 @@ impl ControllerDispatcher {
         };
 
         let value = crate::api::inject_resource_version(resource.data, resource.resource_version);
-        match self.reconcile(&value, db_handle, node_name).await {
+        match self.reconcile_unlocked(&value, db_handle, node_name).await {
             Ok(()) => {
                 self.retry_count.lock().await.remove(key);
                 if let Err(e) = self
@@ -532,6 +549,25 @@ impl ControllerDispatcher {
     /// Returns `Ok(())` if reconciliation succeeded or no controller is registered
     /// for this resource type. Returns `Err` if reconciliation failed.
     pub async fn reconcile(
+        &self,
+        resource: &Value,
+        db_handle: &DatastoreHandle,
+        node_name: &str,
+    ) -> Result<()> {
+        let Some(key) = key_for_value(resource) else {
+            return self
+                .reconcile_unlocked(resource, db_handle, node_name)
+                .await;
+        };
+        self.wait_for_key_dispatch_slot(&key).await;
+        let result = self
+            .reconcile_unlocked(resource, db_handle, node_name)
+            .await;
+        self.finish_key_dispatch(key).await;
+        result
+    }
+
+    async fn reconcile_unlocked(
         &self,
         resource: &Value,
         db_handle: &DatastoreHandle,
@@ -675,6 +711,141 @@ mod tests {
             self.called.notify_waiters();
             Ok(())
         }
+    }
+
+    struct SerialProbeController {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        overlapped: Arc<std::sync::atomic::AtomicBool>,
+        first_started: Arc<Notify>,
+        second_started: Arc<Notify>,
+        release_first: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Controller for SerialProbeController {
+        fn name(&self) -> &'static str {
+            "serial-probe"
+        }
+
+        async fn reconcile(&self, _resource: Value, _ctx: Context) -> Result<()> {
+            if self
+                .active
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                != 0
+            {
+                self.overlapped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if call == 1 {
+                self.first_started.notify_waiters();
+                self.release_first.notified().await;
+            } else {
+                self.second_started.notify_waiters();
+            }
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_reconcile_is_serialized_with_worker_for_same_key() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let service = db
+            .create_resource(
+                "v1",
+                "Service",
+                Some("default"),
+                "same",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Service",
+                    "metadata": {"namespace": "default", "name": "same", "uid": "svc-uid"},
+                    "spec": {"ports": [{"port": 80}]}
+                }),
+            )
+            .await
+            .expect("create service");
+        let resource = crate::api::inject_resource_version(service.data, service.resource_version);
+
+        let service_ipam = Arc::new(ServiceIpam::new("10.43.128.0/17"));
+        let mut dispatcher = ControllerDispatcher::new(service_ipam);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlapped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_started = Arc::new(Notify::new());
+        let second_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        dispatcher.replace_controller_for_test(
+            "v1",
+            "Service",
+            Arc::new(SerialProbeController {
+                calls: calls.clone(),
+                active: active.clone(),
+                overlapped: overlapped.clone(),
+                first_started: first_started.clone(),
+                second_started: second_started.clone(),
+                release_first: release_first.clone(),
+            }),
+        );
+        let dispatcher = Arc::new(dispatcher);
+        let db_handle = handle_for(db);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker = tokio::spawn({
+            let dispatcher = dispatcher.clone();
+            let db_handle = db_handle.clone();
+            let cancel = cancel.clone();
+            async move {
+                dispatcher
+                    .run_worker_pool(2, db_handle, "test-node".to_string(), cancel)
+                    .await;
+            }
+        });
+
+        dispatcher
+            .enqueue_reconcile_key(ReconcileKey::namespaced("v1", "Service", "default", "same"))
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_started.notified())
+            .await
+            .expect("worker reconcile should start");
+
+        let direct = tokio::spawn({
+            let dispatcher = dispatcher.clone();
+            let db_handle = db_handle.clone();
+            let resource = resource.clone();
+            async move {
+                dispatcher
+                    .reconcile(&resource, &db_handle, "test-node")
+                    .await
+                    .expect("direct reconcile should complete")
+            }
+        });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                second_started.notified()
+            )
+            .await
+            .is_err(),
+            "direct reconcile must not enter the same Service key while worker reconcile is active"
+        );
+
+        release_first.notify_waiters();
+        direct.await.expect("direct reconcile task should join");
+        assert!(
+            !overlapped.load(std::sync::atomic::Ordering::SeqCst),
+            "same-key reconciles must not overlap"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "worker reconcile and direct reconcile should both run, but serially"
+        );
+
+        cancel.cancel();
+        worker.await.expect("worker pool task should join");
     }
 
     #[tokio::test]
