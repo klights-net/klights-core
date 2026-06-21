@@ -827,27 +827,9 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_uid: &str,
         node_name: &str,
     ) -> Result<PodSlotAdmissionResult> {
-        let command = StorageCommand::PodSlotTryAdmit {
-            namespace: namespace.to_string(),
-            pod_name: pod_name.to_string(),
-            pod_uid: pod_uid.to_string(),
-            node_name: node_name.to_string(),
-        };
-        let result = self
-            .inner
+        self.inner
             .pod_slot_try_admit(namespace, pod_name, pod_uid, node_name)
-            .await?;
-        let rv = match result {
-            PodSlotAdmissionResult::Admitted { resource_version }
-            | PodSlotAdmissionResult::Blocked {
-                resource_version, ..
-            } => resource_version,
-        };
-        if matches!(result, PodSlotAdmissionResult::Admitted { .. }) {
-            self.notify_if_configured(command, self.meta_for_rv(rv, Some(pod_uid.to_string())))
-                .await;
-        }
-        Ok(result)
+            .await
     }
 
     async fn pod_slot_mark_terminating(
@@ -857,20 +839,9 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_uid: &str,
         node_name: &str,
     ) -> Result<()> {
-        let command = StorageCommand::PodSlotMarkTerminating {
-            namespace: namespace.to_string(),
-            pod_name: pod_name.to_string(),
-            pod_uid: pod_uid.to_string(),
-            node_name: node_name.to_string(),
-        };
-        let before_rv = self.inner.get_current_resource_version().await.unwrap_or(0);
         self.inner
             .pod_slot_mark_terminating(namespace, pod_name, pod_uid, node_name)
-            .await?;
-        let rv = resource_version_after_non_resource_write(self.inner.as_ref(), before_rv).await?;
-        self.notify_if_configured(command, self.meta_for_rv(rv, Some(pod_uid.to_string())))
-            .await;
-        Ok(())
+            .await
     }
 
     async fn pod_slot_clear_if_uid(
@@ -880,20 +851,9 @@ impl DatastoreBackend for ReplicatedDatastore {
         pod_uid: &str,
         node_name: &str,
     ) -> Result<()> {
-        let command = StorageCommand::PodSlotClearIfUid {
-            namespace: namespace.to_string(),
-            pod_name: pod_name.to_string(),
-            pod_uid: pod_uid.to_string(),
-            node_name: node_name.to_string(),
-        };
-        let before_rv = self.inner.get_current_resource_version().await.unwrap_or(0);
         self.inner
             .pod_slot_clear_if_uid(namespace, pod_name, pod_uid, node_name)
-            .await?;
-        let rv = resource_version_after_non_resource_write(self.inner.as_ref(), before_rv).await?;
-        self.notify_if_configured(command, self.meta_for_rv(rv, Some(pod_uid.to_string())))
-            .await;
-        Ok(())
+            .await
     }
 
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
@@ -1155,22 +1115,5 @@ impl DatastoreBackend for ReplicatedDatastore {
 
     async fn current_log_apply_index(&self) -> Result<i64> {
         self.inner.current_log_apply_index().await
-    }
-}
-
-async fn resource_version_after_non_resource_write<B>(backend: &B, before_rv: i64) -> Result<i64>
-where
-    B: DatastoreBackend + ?Sized,
-{
-    let after_rv = backend
-        .get_current_resource_version()
-        .await
-        .unwrap_or(before_rv);
-    if after_rv > before_rv {
-        Ok(after_rv)
-    } else {
-        backend
-            .advance_resource_version_after(before_rv.saturating_add(1))
-            .await
     }
 }

@@ -332,6 +332,56 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn raft_mode_pod_slot_admissions_remain_node_local() {
+        let inner: crate::datastore::backend::DatastoreHandle =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let observer = ReplicationObserver::new();
+        let observed_for_callback = observed.clone();
+        observer
+            .set(Arc::new(move |command, _meta| {
+                observed_for_callback
+                    .lock()
+                    .unwrap()
+                    .push(command.variant_name().to_string());
+            }))
+            .await;
+        let ds = ReplicatedDatastore::with_observer(
+            inner.clone(),
+            ReplicationMode::Raft {
+                node_name: "leader".into(),
+            },
+            Some(observer),
+        );
+        let before = inner.get_current_resource_version().await.unwrap();
+
+        let admitted = ds
+            .pod_slot_try_admit("default", "slot-pod", "slot-uid", "node-a")
+            .await
+            .expect("pod slot admit is node-local and must not require raft proposer");
+        assert!(matches!(
+            admitted,
+            PodSlotAdmissionResult::Admitted { resource_version } if resource_version > 0
+        ));
+        ds.pod_slot_mark_terminating("default", "slot-pod", "slot-uid", "node-a")
+            .await
+            .expect("pod slot termination is node-local and must not require raft proposer");
+        ds.pod_slot_clear_if_uid("default", "slot-pod", "slot-uid", "node-a")
+            .await
+            .expect("pod slot clear is node-local and must not require raft proposer");
+
+        assert_eq!(
+            inner.get_current_resource_version().await.unwrap(),
+            before,
+            "node-local pod slot mutations must not allocate cluster resourceVersion"
+        );
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "node-local pod slot mutations must not emit cluster replication commands"
+        );
+    }
+
+    #[tokio::test]
     async fn raft_mode_watch_events_gc_routes_through_proposer_and_prunes_via_apply() {
         let (ds, calls) = make_ds_with_inline_proposer().await;
         for i in 0..12 {

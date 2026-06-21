@@ -26,7 +26,6 @@ use std::sync::{Arc, OnceLock};
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::command::{COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand};
 use crate::datastore::types::{ReplicatedCreateOptions, ResourcePatchRequest};
-use crate::log_apply::LogApplyMutation;
 use crate::networking::VtepMac;
 
 mod backend_impl;
@@ -244,27 +243,6 @@ impl ReplicatedDatastore {
             uid,
             timestamp_ms: current_epoch_millis(),
             authoring_node: self.authoring_node(),
-        }
-    }
-
-    async fn notify_if_configured(&self, command: StorageCommand, meta: CommandMeta) {
-        self.notify_with_extra_mutations(command, meta, Vec::new())
-            .await;
-    }
-
-    async fn notify_with_extra_mutations(
-        &self,
-        command: StorageCommand,
-        meta: CommandMeta,
-        _extra_mutations: Vec<LogApplyMutation>,
-    ) {
-        // T3: the `log_apply_entries` table and `append_log_apply_entry`
-        // backend method are removed. Raft `AppendEntries` through
-        // `apply_log_apply_commit` is the sole replication log (T1.3).
-        // The observer (broadcast channel) remains for the worker
-        // `Connect` stream.
-        if let Some(observer) = &self.observer {
-            observer.notify(command, meta).await;
         }
     }
 
