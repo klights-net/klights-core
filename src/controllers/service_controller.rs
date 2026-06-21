@@ -38,12 +38,8 @@ impl Controller for ServiceController {
             &self.nodeport_alloc,
         )
         .await?;
-        // Synchronously rebuild nft rules so callers see updated routing
-        // immediately. The coalescer alone has a 200ms delay, which causes
-        // session-affinity E2E tests to observe stale jhash rules right
-        // after a PATCH to sessionAffinity:None.
         if let Some(services) = ctx.services() {
-            services.sync_services_now().await?;
+            services.request_services_sync();
         }
         Ok(())
     }
@@ -118,5 +114,54 @@ mod tests {
 
         let bad = json!({"spec": {"type": "ClusterIP"}});
         assert!(controller.reconcile(bad, ctx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn service_reconcile_requests_coalesced_service_sync_without_blocking_on_nft() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let ipam = Arc::new(service_core::ServiceIpam::new("10.43.128.0/17"));
+        let controller = ServiceController {
+            service_ipam: ipam,
+            nodeport_alloc: Arc::new(service_core::NodePortAllocator::new()),
+        };
+        let service = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": "my-svc",
+                "namespace": "default"
+            },
+            "spec": {
+                "type": "ClusterIP",
+                "selector": {"app": "web"},
+                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}]
+            }
+        });
+        let created = db
+            .create_resource("v1", "Service", Some("default"), "my-svc", service)
+            .await
+            .unwrap();
+        let service_with_rv =
+            crate::api::inject_resource_version(created.data, created.resource_version);
+        let services = Arc::new(crate::networking::test_support::MockServiceRouter::new());
+        let ctx = Context::with_services(
+            std::sync::Arc::new(db.clone()),
+            "test-node".to_string(),
+            services.clone(),
+        )
+        .with_pod_repository(crate::controllers::test_utils::pod_repository_for_test(&db));
+
+        controller.reconcile(service_with_rv, ctx).await.unwrap();
+
+        assert_eq!(
+            services.sync_count(),
+            1,
+            "normal Service reconcile must enqueue a coalesced service sync"
+        );
+        assert_eq!(
+            services.sync_now_count(),
+            0,
+            "normal Service reconcile must not block the API/workqueue on a full nft rebuild"
+        );
     }
 }

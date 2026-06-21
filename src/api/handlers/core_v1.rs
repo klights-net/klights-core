@@ -473,6 +473,11 @@ async fn update_service(
         ));
     }
 
+    let previous_service = state
+        .db
+        .get_resource("v1", "Service", Some(&namespace), &name)
+        .await?;
+
     // F3-04: nothing reads `body` after the inner call, so move it.
     let result = update_service_base(
         State(state.clone()),
@@ -503,9 +508,38 @@ async fn update_service(
                 namespace, name
             ))
         })?;
+    sync_service_routes_now_if_spec_changed(
+        state.as_ref(),
+        &namespace,
+        &name,
+        previous_service.as_ref(),
+        &updated_svc.data,
+        "update",
+    )
+    .await;
     let service_with_rv = inject_resource_version(updated_svc.data, updated_svc.resource_version);
 
     Ok(Json(service_with_rv))
+}
+
+fn service_routing_spec_changed(old: &Value, new: &Value) -> bool {
+    old.get("spec") != new.get("spec")
+}
+
+async fn sync_service_routes_now_if_spec_changed(
+    state: &AppState,
+    namespace: &str,
+    name: &str,
+    previous_service: Option<&crate::datastore::Resource>,
+    updated_service: &Value,
+    operation: &'static str,
+) {
+    let sync_now = previous_service
+        .map(|old| service_routing_spec_changed(&old.data, updated_service))
+        .unwrap_or(false);
+    if sync_now && let Err(e) = state.network.services.sync_services_now().await {
+        tracing::error!(namespace = %namespace, name = %name, operation, error = %e, "Failed to sync service routes after Service spec change");
+    }
 }
 
 async fn patch_service(
@@ -523,6 +557,11 @@ async fn patch_service(
             "NodePort allocator is not ready, please retry".to_string(),
         ));
     }
+
+    let previous_service = state
+        .db
+        .get_resource("v1", "Service", Some(&namespace), &name)
+        .await?;
 
     let result = patch_service_base(
         State(state.clone()),
@@ -554,6 +593,15 @@ async fn patch_service(
                 namespace, name
             ))
         })?;
+    sync_service_routes_now_if_spec_changed(
+        state.as_ref(),
+        &namespace,
+        &name,
+        previous_service.as_ref(),
+        &updated_svc.data,
+        "patch",
+    )
+    .await;
     let service_with_rv = inject_resource_version(updated_svc.data, updated_svc.resource_version);
 
     Ok(Json(service_with_rv))
@@ -800,4 +848,90 @@ async fn create_serviceaccount_token(
             "expirationTimestamp": expiration_timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         }
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn service_metadata_only_update_does_not_need_immediate_service_sync() {
+        let old = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "labels": {"app": "web"}
+            },
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.51.0.10",
+                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}],
+                "sessionAffinity": "None"
+            }
+        });
+        let new = json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": "web",
+                "namespace": "default",
+                "labels": {"app": "web", "tier": "frontend"}
+            },
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.51.0.10",
+                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}],
+                "sessionAffinity": "None"
+            }
+        });
+
+        assert!(!super::service_routing_spec_changed(&old, &new));
+    }
+
+    #[test]
+    fn service_session_affinity_update_needs_immediate_service_sync() {
+        let old = json!({
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.51.0.10",
+                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}],
+                "sessionAffinity": "ClientIP",
+                "sessionAffinityConfig": {"clientIP": {"timeoutSeconds": 10800}}
+            }
+        });
+        let new = json!({
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.51.0.10",
+                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}],
+                "sessionAffinity": "None"
+            }
+        });
+
+        assert!(super::service_routing_spec_changed(&old, &new));
+    }
+
+    #[test]
+    fn service_port_update_needs_immediate_service_sync() {
+        let old = json!({
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.51.0.10",
+                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}],
+                "sessionAffinity": "None"
+            }
+        });
+        let new = json!({
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.51.0.10",
+                "ports": [{"port": 8080, "targetPort": 8080, "protocol": "TCP"}],
+                "sessionAffinity": "None"
+            }
+        });
+
+        assert!(super::service_routing_spec_changed(&old, &new));
+    }
 }

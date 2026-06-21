@@ -422,6 +422,18 @@ mod integration_tests {
         }
     }
 
+    fn spec_with_affinity(
+        cluster_ip: [u8; 4],
+        ports: Vec<PortSpec>,
+        session_affinity: SessionAffinity,
+    ) -> ServiceSpec {
+        ServiceSpec {
+            cluster_ip: Ipv4Addr::from(cluster_ip),
+            ports,
+            session_affinity,
+        }
+    }
+
     fn port(
         service_port: u16,
         target_port: u16,
@@ -538,6 +550,45 @@ mod integration_tests {
         assert!(
             chain.contains("random"),
             "multi-endpoint rules must include `meta random` for LB:\n{chain}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_replace_services_writes_client_ip_affinity_rules() {
+        let name = unique_name("klights_sr_svc_clientip");
+        let _guard = TableGuard { name: name.clone() };
+        let table = build(&name);
+        table.init().await.expect("init");
+
+        let services = vec![spec_with_affinity(
+            [10, 43, 128, 5],
+            vec![port(
+                80,
+                8080,
+                None,
+                Protocol::Tcp,
+                vec![[10, 43, 0, 10], [10, 43, 0, 11], [10, 43, 0, 12]],
+            )],
+            SessionAffinity::ClientIp,
+        )];
+        table.replace_services(&services).await.expect("replace");
+
+        let chain = nft_chain(&name, "services");
+        let dnat_count = chain.matches("dnat").count();
+        assert_eq!(
+            dnat_count, 3,
+            "expected one ClientIP affinity dnat rule per endpoint, got {dnat_count}:\n{chain}"
+        );
+        assert!(
+            chain.contains("jhash") || chain.contains("symhash"),
+            "ClientIP service rules must use an nft hash expression:\n{chain}"
+        );
+        assert!(
+            chain.contains("jhash @nh,96,32 mod 3 seed 0xcafe 0")
+                && chain.contains("jhash @nh,96,32 mod 3 seed 0xcafe 1")
+                && chain.contains("jhash @nh,96,32 mod 3 seed 0xcafe 2"),
+            "ClientIP affinity must create one source-IP hash bucket for each endpoint:\n{chain}"
         );
     }
 
