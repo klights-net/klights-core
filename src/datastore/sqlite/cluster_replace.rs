@@ -1012,8 +1012,21 @@ fn merge_status_only_row_with_existing(
         .get("status")
         .cloned()
         .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+    let mut status = status;
     let mut live: serde_json::Value =
         serde_json::from_slice(existing_bytes).map_err(serde_to_sqlite_error)?;
+    if row
+        .precondition_uid
+        .as_deref()
+        .is_some_and(|uid| !uid.is_empty())
+    {
+        crate::resource_semantics::preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
+            &row.api_version,
+            &row.kind,
+            &live,
+            &mut status,
+        );
+    }
     let Some(live_obj) = live.as_object_mut() else {
         return Err(other_error(
             "status-only log_apply target is not a JSON object",

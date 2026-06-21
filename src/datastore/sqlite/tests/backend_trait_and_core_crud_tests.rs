@@ -729,6 +729,130 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
 }
 
 #[tokio::test]
+async fn raft_status_apply_built_before_preemption_preserves_disruption_target() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "preempted-status-race",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "preempted-status-race",
+                    "namespace": "default",
+                    "uid": "preempted-status-race-uid"
+                },
+                "spec": {
+                    "nodeName": "worker-a",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True"},
+                        {"type": "Initialized", "status": "True"},
+                        {"type": "ContainersReady", "status": "True"},
+                        {"type": "Ready", "status": "True"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let command = StorageCommand::UpdateStatus {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "preempted-status-race".to_string(),
+        status: json!({
+            "phase": "Running",
+            "conditions": [
+                {"type": "PodScheduled", "status": "True"},
+                {"type": "Initialized", "status": "True"},
+                {"type": "ContainersReady", "status": "True"},
+                {"type": "Ready", "status": "True"}
+            ]
+        }),
+        expected_rv: None,
+        preconditions: ResourcePreconditions {
+            uid: Some("preempted-status-race-uid".to_string()),
+            resource_version: None,
+        },
+        observed_status_stamp: None,
+    };
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "raft-status-preemption-condition-race",
+            "PodStatus",
+            payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .expect("build stale status commit");
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+        panic!("expected a fresh status commit");
+    };
+
+    let mut preempted = (*created.data).clone();
+    preempted["metadata"]["deletionTimestamp"] = json!("2026-06-21T14:57:11Z");
+    preempted["metadata"]["deletionGracePeriodSeconds"] = json!(0);
+    preempted["status"]["conditions"] = json!([
+        {"type": "PodScheduled", "status": "True"},
+        {"type": "Initialized", "status": "True"},
+        {"type": "ContainersReady", "status": "True"},
+        {"type": "Ready", "status": "True"},
+        {
+            "type": "DisruptionTarget",
+            "status": "True",
+            "reason": "PreemptionByScheduler",
+            "message": "Preempted by scheduler"
+        }
+    ]);
+    db.update_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "preempted-status-race",
+        preempted,
+        created.resource_version,
+    )
+    .await
+    .expect("preemption update applies before stale status commit");
+
+    db.apply_log_apply_commit(commit)
+        .await
+        .expect("status commit applies after preemption update");
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "preempted-status-race")
+        .await
+        .unwrap()
+        .expect("pod remains");
+    let conditions = live
+        .data
+        .pointer("/status/conditions")
+        .and_then(|value| value.as_array())
+        .expect("pod status conditions must remain an array");
+    assert!(
+        conditions.iter().any(|condition| {
+            condition.get("type").and_then(|value| value.as_str()) == Some("DisruptionTarget")
+                && condition.get("status").and_then(|value| value.as_str()) == Some("True")
+                && condition.get("reason").and_then(|value| value.as_str())
+                    == Some("PreemptionByScheduler")
+        }),
+        "stale kubelet status raft apply must preserve scheduler-owned DisruptionTarget: {:?}",
+        live.data.pointer("/status/conditions")
+    );
+}
+
+#[tokio::test]
 async fn raft_scale_patch_applies_against_live_resource_after_status_rv_race() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
