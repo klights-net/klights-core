@@ -927,7 +927,7 @@ async fn test_configmap_volume_refresh_clears_files_on_source_delete() {
 }
 
 #[tokio::test]
-async fn test_secret_volume_refresh_skips_non_running_pods() {
+async fn test_secret_volume_refreshes_existing_terminal_pod_mounts() {
     use std::fs;
     use tempfile::TempDir;
 
@@ -954,7 +954,8 @@ async fn test_secret_volume_refresh_skips_non_running_pods() {
     .await
     .unwrap();
 
-    // Create a Succeeded pod (should be skipped)
+    // Create a Succeeded pod. The API phase can race ahead of source watch
+    // delivery under load while the node-local mounted volume still exists.
     db.create_resource(
         "v1",
         "Pod",
@@ -979,7 +980,8 @@ async fn test_secret_volume_refresh_skips_non_running_pods() {
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/key", vol_path), "stale").unwrap();
 
-    // Refresh should skip Succeeded pods — file stays unchanged
+    // Refresh should use mounted volume existence, not API phase, as the
+    // node-local truth that the Secret projection can still need updates.
     let secret = db
         .get_resource("v1", "Secret", Some("default"), "skip-secret")
         .await
@@ -998,8 +1000,8 @@ async fn test_secret_volume_refresh_skips_non_running_pods() {
 
     let content = crate::utils::read_utf8_file(format!("{}/key", vol_path)).unwrap();
     assert_eq!(
-        content, "stale",
-        "Succeeded pod volumes must not be refreshed"
+        content, "data",
+        "terminal API phase must not suppress refresh for an existing mounted Secret volume"
     );
 }
 

@@ -391,17 +391,6 @@ async fn refresh_secret_configmap_volumes_inner(
 
     for pod_resource in &pods.items {
         let pod = &pod_resource.data;
-        let phase = pod
-            .pointer("/status/phase")
-            .and_then(|p| p.as_str())
-            .unwrap_or("");
-        // Kubelet-owned mounted volumes can exist before the leader has observed
-        // status.phase. Skip only terminal pods; directory existence below tells
-        // us whether this node actually mounted the volume.
-        if phase == "Succeeded" || phase == "Failed" {
-            continue;
-        }
-
         let pod_name = pod
             .pointer("/metadata/name")
             .and_then(|n| n.as_str())
