@@ -249,32 +249,33 @@ pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<Ser
             .ok()
             .flatten();
 
-        if let Some(eps) = endpoints {
-            if let Some(spec) = ServiceSpec::from_service_and_endpoints(svc, Some(&eps.data)) {
+        if let Some(eps) = endpoints.as_ref()
+            && let Some(spec) = ServiceSpec::from_service_and_endpoints(svc, Some(&eps.data))
+        {
+            specs.push(spec);
+            continue;
+        }
+
+        let label_selector = format!("kubernetes.io/service-name={svc_name}");
+        let slices = api
+            .list_resources_fresh(ListRequest {
+                api_version: "discovery.k8s.io/v1".to_string(),
+                kind: "EndpointSlice".to_string(),
+                namespace: Some(namespace.to_string()),
+                label_selector: Some(label_selector),
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+            })
+            .await
+            .ok();
+        if let Some(slice_list) = slices
+            && !slice_list.items.is_empty()
+        {
+            let slice_refs: Vec<&serde_json::Value> =
+                slice_list.items.iter().map(|r| r.data.as_ref()).collect();
+            if let Some(spec) = ServiceSpec::from_service_and_endpointslices(svc, &slice_refs) {
                 specs.push(spec);
-            }
-        } else {
-            let label_selector = format!("kubernetes.io/service-name={svc_name}");
-            let slices = api
-                .list_resources_fresh(ListRequest {
-                    api_version: "discovery.k8s.io/v1".to_string(),
-                    kind: "EndpointSlice".to_string(),
-                    namespace: Some(namespace.to_string()),
-                    label_selector: Some(label_selector),
-                    field_selector: None,
-                    limit: None,
-                    continue_token: None,
-                })
-                .await
-                .ok();
-            if let Some(slice_list) = slices
-                && !slice_list.items.is_empty()
-            {
-                let slice_refs: Vec<&serde_json::Value> =
-                    slice_list.items.iter().map(|r| r.data.as_ref()).collect();
-                if let Some(spec) = ServiceSpec::from_service_and_endpointslices(svc, &slice_refs) {
-                    specs.push(spec);
-                }
             }
         }
     }
@@ -611,44 +612,47 @@ impl KlightsTable {
                 _ => continue,
             };
 
-            // Selector-based: try Endpoints first.
+            // Selector-based: try Endpoints first. If the legacy Endpoints
+            // object exists but has no routable ready addresses yet, fall back
+            // to EndpointSlices; kube-proxy and conformance wait on slices.
             let endpoints = db
                 .get_resource("v1", "Endpoints", Some(namespace), svc_name)
                 .await
                 .ok()
                 .flatten();
 
-            if let Some(eps) = endpoints {
-                if let Some(spec) = ServiceSpec::from_service_and_endpoints(svc, Some(&eps.data)) {
+            if let Some(eps) = endpoints.as_ref()
+                && let Some(spec) = ServiceSpec::from_service_and_endpoints(svc, Some(&eps.data))
+            {
+                specs.push(spec);
+                continue;
+            }
+
+            // Selectorless services, and selector-based services whose
+            // Endpoints have not produced routable data yet, match
+            // EndpointSlices by service-name label.
+            let label_selector = format!("kubernetes.io/service-name={svc_name}");
+            let slices = db
+                .list_resources(
+                    "discovery.k8s.io/v1",
+                    "EndpointSlice",
+                    Some(namespace),
+                    crate::datastore::ResourceListQuery::new(
+                        Some(&label_selector),
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .ok();
+            if let Some(slice_list) = slices
+                && !slice_list.items.is_empty()
+            {
+                let slice_refs: Vec<&serde_json::Value> =
+                    slice_list.items.iter().map(|r| r.data.as_ref()).collect();
+                if let Some(spec) = ServiceSpec::from_service_and_endpointslices(svc, &slice_refs) {
                     specs.push(spec);
-                }
-            } else {
-                // Selectorless: match EndpointSlices by service-name label.
-                let label_selector = format!("kubernetes.io/service-name={svc_name}");
-                let slices = db
-                    .list_resources(
-                        "discovery.k8s.io/v1",
-                        "EndpointSlice",
-                        Some(namespace),
-                        crate::datastore::ResourceListQuery::new(
-                            Some(&label_selector),
-                            None,
-                            None,
-                            None,
-                        ),
-                    )
-                    .await
-                    .ok();
-                if let Some(slice_list) = slices
-                    && !slice_list.items.is_empty()
-                {
-                    let slice_refs: Vec<&serde_json::Value> =
-                        slice_list.items.iter().map(|r| r.data.as_ref()).collect();
-                    if let Some(spec) =
-                        ServiceSpec::from_service_and_endpointslices(svc, &slice_refs)
-                    {
-                        specs.push(spec);
-                    }
                 }
             }
         }

@@ -652,6 +652,7 @@ fn test_prefix_len_from_mask_round_trips() {
 struct FreshServiceInventoryClient {
     cached_list_calls: std::sync::atomic::AtomicUsize,
     cached_get_calls: std::sync::atomic::AtomicUsize,
+    legacy_endpoints_empty: bool,
 }
 
 fn inventory_resource(
@@ -703,6 +704,45 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
         &self,
         req: crate::control_plane::client::ListRequest,
     ) -> anyhow::Result<crate::control_plane::client::ListResponse> {
+        if req.api_version == "discovery.k8s.io/v1" && req.kind == "EndpointSlice" {
+            return Ok(crate::datastore::ResourceList {
+                items: if self.legacy_endpoints_empty {
+                    vec![inventory_resource(
+                        "discovery.k8s.io/v1",
+                        "EndpointSlice",
+                        "kube-system",
+                        "kube-dns-klights",
+                        73,
+                        json!({
+                            "apiVersion": "discovery.k8s.io/v1",
+                            "kind": "EndpointSlice",
+                            "metadata": {
+                                "namespace": "kube-system",
+                                "name": "kube-dns-klights",
+                                "labels": {
+                                    "kubernetes.io/service-name": "kube-dns"
+                                }
+                            },
+                            "addressType": "IPv4",
+                            "ports": [
+                                {"name": "dns", "port": 53, "protocol": "UDP"},
+                                {"name": "dns-tcp", "port": 53, "protocol": "TCP"}
+                            ],
+                            "endpoints": [{
+                                "addresses": ["10.50.0.20"],
+                                "conditions": {"ready": true}
+                            }]
+                        }),
+                    )]
+                } else {
+                    Vec::new()
+                },
+                resource_version: 73,
+                continue_token: None,
+                remaining_item_count: None,
+            });
+        }
+
         assert_eq!(req.api_version, "v1");
         assert_eq!(req.kind, "Service");
         Ok(crate::datastore::ResourceList {
@@ -758,13 +798,17 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                         "name": "kube-dns",
                         "uid": "kube-dns-endpoints-uid",
                     },
-                    "subsets": [{
+                    "subsets": if self.legacy_endpoints_empty {
+                        json!([])
+                    } else {
+                        json!([{
                         "addresses": [{"ip": "10.50.0.2"}],
                         "ports": [
                             {"name": "dns", "port": 53, "protocol": "UDP"},
                             {"name": "dns-tcp", "port": 53, "protocol": "TCP"}
                         ]
-                    }]
+                    }])
+                    }
                 }),
             )));
         }
@@ -942,5 +986,40 @@ async fn service_specs_from_api_uses_fresh_reads_for_routing_snapshot() {
             (Protocol::Tcp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 2)]),
             (Protocol::Udp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 2)]),
         ]
+    );
+}
+
+#[tokio::test]
+async fn service_specs_from_api_falls_back_to_ready_endpointslices_when_legacy_endpoints_empty() {
+    let api = FreshServiceInventoryClient {
+        legacy_endpoints_empty: true,
+        ..Default::default()
+    };
+
+    let specs = service_specs_from_api(&api)
+        .await
+        .expect("service specs should build from EndpointSlices");
+
+    assert_eq!(specs.len(), 1);
+    let mut tuples: Vec<_> = specs[0]
+        .ports
+        .iter()
+        .map(|port| {
+            (
+                port.protocol,
+                port.service_port,
+                port.target_port,
+                port.endpoints.clone(),
+            )
+        })
+        .collect();
+    tuples.sort_by_key(|(protocol, service_port, _, _)| (*protocol, *service_port));
+    assert_eq!(
+        tuples,
+        vec![
+            (Protocol::Tcp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 20)]),
+            (Protocol::Udp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 20)]),
+        ],
+        "EndpointSlice-ready endpoints must program service routing when the legacy Endpoints object is still empty"
     );
 }
