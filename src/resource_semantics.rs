@@ -118,6 +118,10 @@ pub fn pod_delete_mark_patch_without_status(patch: &Value) -> Value {
 
 pub fn mark_terminating_pod_unready(data: &mut Value) {
     let now = crate::utils::k8s_timestamp();
+    mark_terminating_pod_unready_at(data, &now);
+}
+
+pub fn mark_terminating_pod_unready_at(data: &mut Value, now: &str) {
     let Some(status) = data
         .get_mut("status")
         .and_then(|value| value.as_object_mut())
@@ -148,7 +152,7 @@ pub fn mark_terminating_pod_unready(data: &mut Value) {
         return;
     };
     for condition_type in ["Ready", "ContainersReady"] {
-        upsert_terminating_readiness_condition(conditions, condition_type, &now);
+        upsert_terminating_readiness_condition(conditions, condition_type, now);
     }
 }
 

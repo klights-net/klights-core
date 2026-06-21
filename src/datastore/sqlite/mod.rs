@@ -1152,6 +1152,13 @@ impl Datastore {
                     &patch,
                     &preconditions,
                 ) {
+                    let terminating_pod_unready_timestamp =
+                        crate::resource_semantics::is_zero_grace_pod_delete_mark_patch(
+                            &api_version,
+                            &kind,
+                            &patch,
+                        )
+                        .then(crate::utils::k8s_timestamp);
                     return Ok((
                         LogApplyCommit::new(
                             rv,
@@ -1167,6 +1174,7 @@ impl Datastore {
                                     require_existing: true,
                                     precondition_uid: Some(live_uid),
                                     precondition_resource_version: None,
+                                    terminating_pod_unready_timestamp,
                                 },
                             )],
                         ),

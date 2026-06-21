@@ -279,6 +279,8 @@ pub struct LogApplyResourcePatch {
     pub precondition_uid: Option<String>,
     #[serde(default)]
     pub precondition_resource_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminating_pod_unready_timestamp: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -577,6 +579,8 @@ struct ProtoLogApplyResourcePatch {
     precondition_uid: Option<String>,
     #[prost(int64, optional, tag = "10")]
     precondition_resource_version: Option<i64>,
+    #[prost(string, optional, tag = "11")]
+    terminating_pod_unready_timestamp: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -928,6 +932,7 @@ impl From<LogApplyResourcePatch> for ProtoLogApplyResourcePatch {
             require_existing: patch.require_existing,
             precondition_uid: patch.precondition_uid,
             precondition_resource_version: patch.precondition_resource_version,
+            terminating_pod_unready_timestamp: patch.terminating_pod_unready_timestamp,
         }
     }
 }
@@ -952,6 +957,7 @@ impl TryFrom<ProtoLogApplyResourcePatch> for LogApplyResourcePatch {
             require_existing: patch.require_existing,
             precondition_uid: patch.precondition_uid,
             precondition_resource_version: patch.precondition_resource_version,
+            terminating_pod_unready_timestamp: patch.terminating_pod_unready_timestamp,
         })
     }
 }
@@ -1259,15 +1265,23 @@ mod parity_tests {
             }),
             "PatchResourceLatest" => LogApplyMutation::PatchResourceLatest(LogApplyResourcePatch {
                 api_version: "v1".to_string(),
-                kind: "ReplicationController".to_string(),
+                kind: "Pod".to_string(),
                 namespace: Some("default".to_string()),
-                name: "rc".to_string(),
+                name: "p1".to_string(),
                 resource_version: 8,
                 patch_kind: PatchKind::Merge,
-                patch: json!({"spec": {"replicas": 2}}),
+                patch: json!({
+                    "metadata": {
+                        "deletionTimestamp": "2026-06-21T01:02:03Z",
+                        "deletionGracePeriodSeconds": 0
+                    }
+                }),
                 require_existing: true,
-                precondition_uid: Some("rc-uid".to_string()),
+                precondition_uid: Some("pod-uid-A".to_string()),
                 precondition_resource_version: None,
+                terminating_pod_unready_timestamp: Some(
+                    "2026-06-21T01:02:04.000000000Z".to_string(),
+                ),
             }),
             "DeleteResource" => LogApplyMutation::DeleteResource(LogApplyResourceKey {
                 api_version: "v1".to_string(),

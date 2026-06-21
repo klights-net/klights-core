@@ -940,7 +940,15 @@ fn apply_latest_patch_to_current_resource(
         }
     }
     if zero_grace_pod_delete {
-        crate::resource_semantics::mark_terminating_pod_unready(&mut patched);
+        let transition_time = patch
+            .terminating_pod_unready_timestamp
+            .as_deref()
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(crate::utils::k8s_timestamp()));
+        crate::resource_semantics::mark_terminating_pod_unready_at(
+            &mut patched,
+            transition_time.as_ref(),
+        );
     }
     crate::datastore::sqlite::resource_shape::validate_metadata_uid_immutable(&patched, &current)
         .map_err(|err| {

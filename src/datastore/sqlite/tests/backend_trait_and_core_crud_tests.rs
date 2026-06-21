@@ -945,6 +945,127 @@ async fn raft_pod_delete_mark_patch_applies_against_live_resource_after_status_r
 }
 
 #[tokio::test]
+async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "zero-grace-replay",
+            "namespace": "default",
+            "uid": "zero-grace-replay-uid",
+            "creationTimestamp": "2026-06-21T00:00:00Z"
+        },
+        "spec": {
+            "automountServiceAccountToken": false,
+            "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+        },
+        "status": {
+            "phase": "Running",
+            "containerStatuses": [{
+                "name": "app",
+                "ready": true,
+                "restartCount": 0
+            }],
+            "conditions": [
+                {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-06-21T00:00:00Z"},
+                {"type": "Initialized", "status": "True", "lastTransitionTime": "2026-06-21T00:00:00Z"},
+                {"type": "ContainersReady", "status": "True", "lastTransitionTime": "2026-06-21T00:00:00Z"},
+                {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-21T00:00:00Z"}
+            ]
+        }
+    });
+    let created = leader
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "zero-grace-replay",
+            pod.clone(),
+        )
+        .await
+        .unwrap();
+    follower
+        .create_resource("v1", "Pod", Some("default"), "zero-grace-replay", pod)
+        .await
+        .unwrap();
+
+    let command = StorageCommand::PatchResource {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "zero-grace-replay".to_string(),
+        patch_kind: crate::datastore::PatchKind::Merge,
+        patch: json!({
+            "metadata": {
+                "deletionTimestamp": "2026-06-21T01:02:03Z",
+                "deletionGracePeriodSeconds": 0
+            }
+        }),
+        preconditions: ResourcePreconditions::uid(created.uid.clone()),
+    };
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+    let outcome = leader
+        .build_log_apply_commit_for_outbox(
+            "raft-zero-grace-delete-mark-deterministic",
+            "PatchResource",
+            payload.as_ref(),
+            "leader",
+        )
+        .await
+        .expect("build zero-grace delete-mark commit");
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+        panic!("expected zero-grace delete-mark proposal");
+    };
+    let rv = commit.resource_version;
+
+    leader
+        .apply_raft_log_apply_commit(commit.clone())
+        .await
+        .expect("leader applies delete-mark patch");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    follower
+        .apply_raft_log_apply_commit(commit)
+        .await
+        .expect("follower applies same delete-mark patch");
+
+    let leader_event = leader
+        .list_watch_events_since(
+            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+                "v1", "Pod", "default",
+            )],
+            1,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.resource.resource_version == rv)
+        .expect("leader delete-mark watch event");
+    let follower_event = follower
+        .list_watch_events_since(
+            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+                "v1", "Pod", "default",
+            )],
+            1,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.resource.resource_version == rv)
+        .expect("follower delete-mark watch event");
+
+    assert_eq!(leader_event.event_type, "MODIFIED");
+    assert_eq!(follower_event.event_type, "MODIFIED");
+    assert_eq!(
+        leader_event.resource.data, follower_event.resource.data,
+        "the same raft commit must produce byte-identical Pod delete-mark watch payloads on every member"
+    );
+}
+
+#[tokio::test]
 async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db

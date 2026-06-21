@@ -1145,6 +1145,7 @@ async fn test_serviceaccount_watch_modified_via_replicated_patch_latest() {
             require_existing: true,
             precondition_uid: None,
             precondition_resource_version: None,
+            terminating_pod_unready_timestamp: None,
         },
     );
     db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
