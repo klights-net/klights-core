@@ -50,6 +50,8 @@ pub struct BootstrapRunArgs<'a> {
     pub skip_seed_bootstrap: bool,
     pub db_handle: &'a DatastoreHandle,
     pub kubelet_db_handle: &'a DatastoreHandle,
+    pub worker_store_adapter:
+        Option<Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>>,
     pub kubelet_uses_worker_store_adapter: bool,
     pub db: &'a dyn crate::datastore::DatastoreBackend,
     pub cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
@@ -96,6 +98,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         skip_seed_bootstrap,
         db_handle,
         kubelet_db_handle,
+        worker_store_adapter,
         kubelet_uses_worker_store_adapter,
         db,
         cluster_api,
@@ -289,6 +292,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let pod_lifecycle_router = pod_subsystem.lifecycle_router.clone();
     pod_repository
         .set_pod_lifecycle_router_for_node(pod_lifecycle_router.clone(), config.node_name.clone());
+    if let Some(worker_store_adapter) = worker_store_adapter.as_ref() {
+        worker_store_adapter.set_pod_lifecycle_router(pod_lifecycle_router.clone());
+    }
     let api_pod_repository = if kubelet_uses_worker_store_adapter {
         let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
             crate::kubelet::pod_repository::PodRepositoryBuildConfig {

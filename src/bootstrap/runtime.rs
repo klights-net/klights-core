@@ -629,6 +629,7 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
     let pod_repository = pod_subsystem.repository.clone();
     let plr = pod_subsystem.lifecycle_router.clone();
     pod_repository.set_pod_lifecycle_router_for_node(plr.clone(), config.node_name.clone());
+    worker_store.set_pod_lifecycle_router(plr.clone());
     side_effects.set_pod_repository(pod_repository.clone());
 
     services.request_services_sync();
@@ -854,24 +855,29 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     // (RS readyReplicas, Service endpoint reconcile).
     let local_api_client = ds.local_api_client;
     let kubelet_uses_worker_store_adapter = should_use_worker_store_adapter_for_kubelet(&cli.role);
-    let kubelet_db_handle = if kubelet_uses_worker_store_adapter {
+    let worker_store_adapter = if kubelet_uses_worker_store_adapter {
         let remote_api_client = remote_api_client
             .clone()
             .ok_or_else(|| anyhow::anyhow!("joining controlplane requires direct leader client"))?;
-        let worker_store = start_worker_store_adapter(
-            remote_api_client,
-            node_local.clone(),
-            config.node_name.clone(),
-            task_supervisor.clone(),
-            shutdown_token.clone(),
-            control_plane_lease_client.clone(),
-            leader_endpoints_for_role(&cli.role),
+        Some(
+            start_worker_store_adapter(
+                remote_api_client,
+                node_local.clone(),
+                config.node_name.clone(),
+                task_supervisor.clone(),
+                shutdown_token.clone(),
+                control_plane_lease_client.clone(),
+                leader_endpoints_for_role(&cli.role),
+            )
+            .await?,
         )
-        .await?;
-        worker_store as crate::datastore::DatastoreHandle
     } else {
-        db_handle.clone()
+        None
     };
+    let kubelet_db_handle = worker_store_adapter
+        .as_ref()
+        .map(|worker_store| worker_store.clone() as crate::datastore::DatastoreHandle)
+        .unwrap_or_else(|| db_handle.clone());
     if should_publish_local_dataplane_metadata(&cli.role) {
         // Self-heal: publish from KLIGHTS_EXTERNAL_ENDPOINT when set, otherwise
         // fall back to the ExternalIP already recorded on the local Node (e.g.
@@ -936,6 +942,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         skip_seed_bootstrap: ds.skip_seed_bootstrap,
         db_handle: &db_handle,
         kubelet_db_handle: &kubelet_db_handle,
+        worker_store_adapter: worker_store_adapter.clone(),
         kubelet_uses_worker_store_adapter,
         db,
         cluster_api: cluster_api.clone(),

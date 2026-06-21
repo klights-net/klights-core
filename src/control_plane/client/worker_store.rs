@@ -19,6 +19,8 @@ use crate::datastore::{
     PodWorkqueueKind, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions,
     SandboxRef, WatchTarget, WatchTargetScope,
 };
+use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
+use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::networking::VtepMac;
 use crate::watch::{EventType, WatchBus, WatchEvent, WatchSignal, WatchTopic};
 
@@ -36,6 +38,7 @@ pub struct WorkerStoreAdapter {
     node_name: String,
     current_rv: AtomicI64,
     event_history: Mutex<VecDeque<WatchEvent>>,
+    pod_lifecycle_router: Mutex<Option<Arc<PodLifecycleRouter>>>,
 }
 
 impl WorkerStoreAdapter {
@@ -51,7 +54,15 @@ impl WorkerStoreAdapter {
             node_name,
             current_rv: AtomicI64::new(0),
             event_history: Mutex::new(VecDeque::new()),
+            pod_lifecycle_router: Mutex::new(None),
         }
+    }
+
+    pub fn set_pod_lifecycle_router(&self, router: Arc<PodLifecycleRouter>) {
+        *self
+            .pod_lifecycle_router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(router);
     }
 
     pub async fn start_watch_mirrors(
@@ -174,7 +185,7 @@ impl WorkerStoreAdapter {
                                             next_resource_version =
                                                 Some(next_resource_version.unwrap_or(0).max(rv));
                                         }
-                                        self.publish_watch(event.event);
+                                        self.publish_watch_from_mirror(event.event).await;
                                     }
                                     Some(Err(err)) => {
                                         if is_watch_window_expired(&err) {
@@ -241,13 +252,41 @@ impl WorkerStoreAdapter {
         self.observe_rv(list.resource_version);
         let resource_version = list.resource_version;
         for resource in list.items {
-            self.publish_watch(WatchEvent {
+            self.publish_watch_from_mirror(WatchEvent {
                 event_type: EventType::Added,
                 object: resource.data.clone(),
                 encoded_payload: None,
-            });
+            })
+            .await;
         }
         Ok(resource_version)
+    }
+
+    async fn publish_watch_from_mirror(&self, event: WatchEvent) {
+        let lifecycle_message = self.local_pod_lifecycle_message(&event);
+        self.publish_watch(event);
+        let Some(message) = lifecycle_message else {
+            return;
+        };
+        let router = self
+            .pod_lifecycle_router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(router) = router else {
+            tracing::debug!(
+                node = %self.node_name,
+                "worker store mirror saw local Pod before lifecycle router was configured"
+            );
+            return;
+        };
+        if let Err(err) = router.route(message).await {
+            tracing::warn!(
+                node = %self.node_name,
+                error = %err,
+                "worker store mirror failed to route local Pod to lifecycle actor"
+            );
+        }
     }
 
     fn publish_watch(&self, event: WatchEvent) {
@@ -264,6 +303,52 @@ impl WorkerStoreAdapter {
         }
         #[cfg(test)]
         self.watch_bus.publish(event);
+    }
+
+    fn local_pod_lifecycle_message(&self, event: &WatchEvent) -> Option<LifecycleMessage> {
+        let pod = event.object.as_ref();
+        if pod.get("apiVersion").and_then(|value| value.as_str()) != Some("v1")
+            || pod.get("kind").and_then(|value| value.as_str()) != Some("Pod")
+        {
+            return None;
+        }
+        if pod
+            .pointer("/spec/nodeName")
+            .and_then(|value| value.as_str())
+            != Some(self.node_name.as_str())
+        {
+            return None;
+        }
+        let namespace = pod
+            .pointer("/metadata/namespace")
+            .and_then(|value| value.as_str())?;
+        let name = pod
+            .pointer("/metadata/name")
+            .and_then(|value| value.as_str())?;
+        let uid = pod
+            .pointer("/metadata/uid")
+            .and_then(|value| value.as_str())
+            .filter(|uid| !uid.trim().is_empty())?;
+        let key = PodLifecycleKey::new(namespace, name, uid);
+        let resource_version = event.resource_version();
+        match event.event_type {
+            EventType::Added => Some(LifecycleMessage::WatchAdded {
+                key,
+                resource_version,
+                pod: pod.clone(),
+            }),
+            EventType::Modified => Some(LifecycleMessage::WatchModified {
+                key,
+                resource_version,
+                pod: pod.clone(),
+            }),
+            EventType::Deleted => Some(LifecycleMessage::WatchDeleted {
+                key,
+                resource_version,
+                pod: pod.clone(),
+            }),
+            EventType::Bookmark | EventType::Error => None,
+        }
     }
 
     fn record_watch_event(&self, event: WatchEvent) {
@@ -2266,6 +2351,240 @@ mod tests {
         assert_eq!(retried.uid, "uid-stuck");
         assert_eq!(retried.attempt_count, 4);
         assert_eq!(retried.payload, serde_json::json!({"source": "test"}));
+    }
+
+    #[tokio::test]
+    async fn worker_store_routes_local_pod_watch_to_lifecycle_actor() {
+        struct LocalPodLeaderApi;
+
+        #[async_trait]
+        impl LeaderApiClient for LocalPodLeaderApi {
+            async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
+                unreachable!("local pod watch test does not use get_resource for {key:?}")
+            }
+
+            async fn list_resources(&self, req: ListRequest) -> Result<ResourceList> {
+                Ok(ResourceList {
+                    items: Vec::new(),
+                    resource_version: if req.api_version == "v1" && req.kind == "Pod" {
+                        41
+                    } else {
+                        0
+                    },
+                    continue_token: None,
+                    remaining_item_count: None,
+                })
+            }
+
+            async fn watch_resources(
+                &self,
+                req: WatchRequest,
+            ) -> Result<WatchStream<ResourceEvent>> {
+                if req.api_version == "v1" && req.kind == "Pod" {
+                    if req.start_resource_version != Some(41) {
+                        return Ok(Box::pin(futures::stream::pending()));
+                    }
+                    let events = vec![
+                        ResourceEvent {
+                            event: WatchEvent::added(serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "namespace": "default",
+                                    "name": "startable",
+                                    "uid": "uid-startable",
+                                    "resourceVersion": "42"
+                                },
+                                "spec": {
+                                    "nodeName": "worker-a",
+                                    "containers": [{"name": "app", "image": "busybox"}]
+                                },
+                                "status": {"phase": "Pending"}
+                            })),
+                        },
+                        ResourceEvent {
+                            event: WatchEvent::modified(serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "namespace": "default",
+                                    "name": "terminating",
+                                    "uid": "uid-terminating",
+                                    "resourceVersion": "43",
+                                    "deletionTimestamp": "2026-06-21T02:07:04Z"
+                                },
+                                "spec": {
+                                    "nodeName": "worker-a",
+                                    "containers": [{"name": "app", "image": "busybox"}]
+                                },
+                                "status": {"phase": "Succeeded"}
+                            })),
+                        },
+                    ];
+                    return Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))));
+                }
+                Ok(Box::pin(futures::stream::pending()))
+            }
+
+            async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
+                Ok(())
+            }
+
+            async fn get_pod(&self, _ns: &str, _name: &str) -> Result<Option<Pod>> {
+                unreachable!("local pod watch test does not use get_pod")
+            }
+
+            async fn get_pod_for_uid(
+                &self,
+                _ns: &str,
+                _name: &str,
+                _uid: &str,
+            ) -> Result<Option<Pod>> {
+                unreachable!("local pod watch test does not use get_pod_for_uid")
+            }
+
+            async fn watch_pods_on_node(&self, _node_name: &str) -> Result<WatchStream<Pod>> {
+                unreachable!("local pod watch test does not use watch_pods_on_node")
+            }
+
+            async fn list_pods_on_node(&self, _node_name: &str) -> Result<Vec<Pod>> {
+                unreachable!("local pod watch test does not use list_pods_on_node")
+            }
+
+            async fn get_configmap(&self, _ns: &str, _name: &str) -> Result<Option<ConfigMap>> {
+                Ok(None)
+            }
+
+            async fn get_secret(&self, _ns: &str, _name: &str) -> Result<Option<Secret>> {
+                Ok(None)
+            }
+
+            async fn get_node(&self, name: &str) -> Result<Node> {
+                unreachable!("local pod watch test does not use get_node for {name}")
+            }
+
+            async fn watch_node(&self, _name: &str) -> Result<WatchStream<Node>> {
+                Ok(Box::pin(futures::stream::pending()))
+            }
+
+            async fn allocate_node_subnet(
+                &self,
+                node_name: &str,
+                _cluster_cidr: &str,
+                _node_ip: &str,
+            ) -> Result<NodeSubnet> {
+                unreachable!("local pod watch test does not allocate subnet for {node_name}")
+            }
+
+            async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+                unreachable!("local pod watch test does not get subnet for {node_name}")
+            }
+
+            async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
+                unreachable!("local pod watch test does not list peer subnets for {my_node_name}")
+            }
+
+            async fn get_node_dataplane(
+                &self,
+                node_name: &str,
+            ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+                unreachable!("local pod watch test does not get dataplane for {node_name}")
+            }
+
+            async fn apply_outbox(
+                &self,
+                _idempotency_key: &str,
+                _operation: crate::kubelet::outbox::payload::OutboxOperation,
+                _payload: bytes::Bytes,
+            ) -> std::result::Result<
+                crate::kubelet::outbox::OutboxApplyResult,
+                crate::kubelet::outbox::OutboxApplyError,
+            > {
+                unreachable!("local pod watch test does not apply outbox")
+            }
+        }
+
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor.clone(),
+            None,
+            "sqlite:worker-store-terminating-pod-watch-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = Arc::new(WorkerStoreAdapter::new(
+            Arc::new(LocalPodLeaderApi),
+            node_local,
+            "worker-a".to_string(),
+        ));
+        let executor = crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor::new();
+        let registry = Arc::new(
+            crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
+                supervisor.clone(),
+                crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+                Arc::new(std::sync::Mutex::new(
+                    executor.clone()
+                        as Arc<
+                            dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor,
+                        >,
+                )),
+            ),
+        );
+        let router = Arc::new(
+            crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
+                registry,
+                executor.clone()
+                    as Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor>,
+            ),
+        );
+        adapter.set_pod_lifecycle_router(router);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handles = adapter
+            .start_watch_mirrors(supervisor, cancel.clone())
+            .await
+            .expect("start watch mirrors");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut observed = Vec::new();
+        loop {
+            observed.extend(executor.take_actions());
+            let start_seen = observed.iter().any(|action| {
+                matches!(
+                    action,
+                    crate::kubelet::pod_lifecycle_core::action::PodAction::StartPod {
+                        key, ..
+                    }
+                    | crate::kubelet::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
+                        key,
+                        ..
+                    } if key.name == "startable" && key.uid == "uid-startable"
+                )
+            });
+            let stop_seen = observed.iter().any(|action| {
+                matches!(
+                    action,
+                    crate::kubelet::pod_lifecycle_core::action::PodAction::StopPod {
+                        key, ..
+                    } if key.name == "terminating" && key.uid == "uid-terminating"
+                )
+            });
+            if start_seen && stop_seen {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "local Pod watch events must wake lifecycle actors; observed actions: {observed:?}"
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+        cancel.cancel();
+        for handle in handles {
+            let _ = handle.join().await;
+        }
     }
 
     #[tokio::test]
