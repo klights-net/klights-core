@@ -249,13 +249,6 @@ pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<Ser
             .ok()
             .flatten();
 
-        if let Some(eps) = endpoints.as_ref()
-            && let Some(spec) = ServiceSpec::from_service_and_endpoints(svc, Some(&eps.data))
-        {
-            specs.push(spec);
-            continue;
-        }
-
         let label_selector = format!("kubernetes.io/service-name={svc_name}");
         let slices = api
             .list_resources_fresh(ListRequest {
@@ -269,18 +262,34 @@ pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<Ser
             })
             .await
             .ok();
-        if let Some(slice_list) = slices
-            && !slice_list.items.is_empty()
+        let slice_items = slices
+            .as_ref()
+            .map(|slice_list| slice_list.items.as_slice())
+            .unwrap_or(&[]);
+        if let Some(spec) =
+            service_spec_from_endpoint_inventory(svc, endpoints.as_ref(), slice_items)
         {
-            let slice_refs: Vec<&serde_json::Value> =
-                slice_list.items.iter().map(|r| r.data.as_ref()).collect();
-            if let Some(spec) = ServiceSpec::from_service_and_endpointslices(svc, &slice_refs) {
-                specs.push(spec);
-            }
+            specs.push(spec);
         }
     }
 
     Ok(specs)
+}
+
+fn service_spec_from_endpoint_inventory(
+    service: &serde_json::Value,
+    endpoints: Option<&crate::datastore::Resource>,
+    endpoint_slices: &[crate::datastore::Resource],
+) -> Option<ServiceSpec> {
+    if !endpoint_slices.is_empty() {
+        let slice_refs: Vec<&serde_json::Value> =
+            endpoint_slices.iter().map(|r| r.data.as_ref()).collect();
+        if let Some(spec) = ServiceSpec::from_service_and_endpointslices(service, &slice_refs) {
+            return Some(spec);
+        }
+    }
+
+    endpoints.and_then(|eps| ServiceSpec::from_service_and_endpoints(service, Some(&eps.data)))
 }
 
 impl KlightsTable {
@@ -612,25 +621,15 @@ impl KlightsTable {
                 _ => continue,
             };
 
-            // Selector-based: try Endpoints first. If the legacy Endpoints
-            // object exists but has no routable ready addresses yet, fall back
-            // to EndpointSlices; kube-proxy and conformance wait on slices.
+            // EndpointSlices are the kube-proxy routing source for modern
+            // clusters. Prefer a routable slice snapshot so a partial legacy
+            // Endpoints object cannot shadow complete protocol/port data.
             let endpoints = db
                 .get_resource("v1", "Endpoints", Some(namespace), svc_name)
                 .await
                 .ok()
                 .flatten();
 
-            if let Some(eps) = endpoints.as_ref()
-                && let Some(spec) = ServiceSpec::from_service_and_endpoints(svc, Some(&eps.data))
-            {
-                specs.push(spec);
-                continue;
-            }
-
-            // Selectorless services, and selector-based services whose
-            // Endpoints have not produced routable data yet, match
-            // EndpointSlices by service-name label.
             let label_selector = format!("kubernetes.io/service-name={svc_name}");
             let slices = db
                 .list_resources(
@@ -646,14 +645,14 @@ impl KlightsTable {
                 )
                 .await
                 .ok();
-            if let Some(slice_list) = slices
-                && !slice_list.items.is_empty()
+            let slice_items = slices
+                .as_ref()
+                .map(|slice_list| slice_list.items.as_slice())
+                .unwrap_or(&[]);
+            if let Some(spec) =
+                service_spec_from_endpoint_inventory(svc, endpoints.as_ref(), slice_items)
             {
-                let slice_refs: Vec<&serde_json::Value> =
-                    slice_list.items.iter().map(|r| r.data.as_ref()).collect();
-                if let Some(spec) = ServiceSpec::from_service_and_endpointslices(svc, &slice_refs) {
-                    specs.push(spec);
-                }
+                specs.push(spec);
             }
         }
 

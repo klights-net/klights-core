@@ -653,6 +653,7 @@ struct FreshServiceInventoryClient {
     cached_list_calls: std::sync::atomic::AtomicUsize,
     cached_get_calls: std::sync::atomic::AtomicUsize,
     legacy_endpoints_empty: bool,
+    legacy_endpoints_partial: bool,
 }
 
 fn inventory_resource(
@@ -706,7 +707,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
     ) -> anyhow::Result<crate::control_plane::client::ListResponse> {
         if req.api_version == "discovery.k8s.io/v1" && req.kind == "EndpointSlice" {
             return Ok(crate::datastore::ResourceList {
-                items: if self.legacy_endpoints_empty {
+                items: if self.legacy_endpoints_empty || self.legacy_endpoints_partial {
                     vec![inventory_resource(
                         "discovery.k8s.io/v1",
                         "EndpointSlice",
@@ -800,6 +801,13 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                     },
                     "subsets": if self.legacy_endpoints_empty {
                         json!([])
+                    } else if self.legacy_endpoints_partial {
+                        json!([{
+                        "addresses": [{"ip": "10.50.0.2"}],
+                        "ports": [
+                            {"name": "dns", "port": 53, "protocol": "UDP"}
+                        ]
+                    }])
                     } else {
                         json!([{
                         "addresses": [{"ip": "10.50.0.2"}],
@@ -1021,5 +1029,40 @@ async fn service_specs_from_api_falls_back_to_ready_endpointslices_when_legacy_e
             (Protocol::Udp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 20)]),
         ],
         "EndpointSlice-ready endpoints must program service routing when the legacy Endpoints object is still empty"
+    );
+}
+
+#[tokio::test]
+async fn service_specs_from_api_prefers_complete_endpointslices_over_partial_legacy_endpoints() {
+    let api = FreshServiceInventoryClient {
+        legacy_endpoints_partial: true,
+        ..Default::default()
+    };
+
+    let specs = service_specs_from_api(&api)
+        .await
+        .expect("service specs should build from EndpointSlices");
+
+    assert_eq!(specs.len(), 1);
+    let mut tuples: Vec<_> = specs[0]
+        .ports
+        .iter()
+        .map(|port| {
+            (
+                port.protocol,
+                port.service_port,
+                port.target_port,
+                port.endpoints.clone(),
+            )
+        })
+        .collect();
+    tuples.sort_by_key(|(protocol, service_port, _, _)| (*protocol, *service_port));
+    assert_eq!(
+        tuples,
+        vec![
+            (Protocol::Tcp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 20)]),
+            (Protocol::Udp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 20)]),
+        ],
+        "complete EndpointSlices must not be shadowed by a partial legacy Endpoints object"
     );
 }
