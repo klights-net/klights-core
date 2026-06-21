@@ -3919,6 +3919,84 @@ async fn service_proxy_fails_over_to_reachable_endpoint() {
 }
 
 #[tokio::test]
+async fn service_proxy_allows_slow_valid_upstream_header_response() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let slow = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow_port = slow.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = slow.accept().await else {
+            return;
+        };
+        let mut buf = vec![0u8; 4096];
+        let _ = stream.read(&mut buf).await;
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Type: text/plain\r\n",
+            "Content-Length: 7\r\n",
+            "\r\n",
+            "updated"
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    });
+
+    let state = std::sync::Arc::new(crate::api::test_support::build_test_app_state().await);
+    state
+        .db
+        .create_resource(
+            "v1",
+            "Service",
+            Some("default"),
+            "svc",
+            json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {"name": "svc", "namespace": "default"},
+                "spec": {"ports": [{"port": 80, "targetPort": 80}]}
+            }),
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .create_resource(
+            "v1",
+            "Endpoints",
+            Some("default"),
+            "svc",
+            json!({
+                "apiVersion": "v1", "kind": "Endpoints",
+                "metadata": {"name": "svc", "namespace": "default"},
+                "subsets": [
+                    {"addresses": [{"ip": "127.0.0.1"}], "ports": [{"port": slow_port}]}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/default/services/svc/proxy/guestbook?cmd=set")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        service_proxy_inner(state, "default", "svc", "guestbook", None, req),
+    )
+    .await
+    .expect("service proxy should wait for a valid upstream response")
+    .expect("slow valid endpoint must not be reported unavailable");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    assert_eq!(&body[..], b"updated");
+}
+
+#[tokio::test]
 async fn k8s_non_resource_info_endpoints_still_require_authorization() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

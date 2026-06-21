@@ -11,6 +11,10 @@ pub const MAX_PROXY_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 /// Maximum size for APIService aggregated backend response bodies.
 pub const MAX_APISERVICE_RESPONSE_BODY_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
+const POD_PROXY_UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const SERVICE_PROXY_UPSTREAM_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
 /// Round-robin cursor for service-proxy endpoint selection. Kubernetes picks
 /// a *random* ready endpoint per service-proxy request; a rotating cursor
 /// gives the same even spread without an RNG and—paired with the failover
@@ -352,13 +356,16 @@ async fn service_proxy_request_with_readiness_retries(
 ) -> Result<Response, AppError> {
     let (max_attempts, retry_delay) = proxy_retry_policy(req.method());
 
-    proxy_request_with_fallback_port_and_retries(
+    proxy_request_with_fallback_port_and_retries_with_options(
         req,
         target_url,
-        false,
-        8080,
-        max_attempts,
-        retry_delay,
+        ProxyRequestOptions {
+            allow_fallback: false,
+            fallback_port: 8080,
+            max_attempts,
+            retry_delay,
+            upstream_request_timeout: SERVICE_PROXY_UPSTREAM_REQUEST_TIMEOUT,
+        },
         task_supervisor,
     )
     .await
@@ -414,6 +421,36 @@ pub async fn proxy_request_with_fallback_port_and_retries(
     retry_delay: std::time::Duration,
     task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
 ) -> Result<Response, AppError> {
+    proxy_request_with_fallback_port_and_retries_with_options(
+        req,
+        target_url,
+        ProxyRequestOptions {
+            allow_fallback,
+            fallback_port,
+            max_attempts,
+            retry_delay,
+            upstream_request_timeout: POD_PROXY_UPSTREAM_REQUEST_TIMEOUT,
+        },
+        task_supervisor,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProxyRequestOptions {
+    allow_fallback: bool,
+    fallback_port: u16,
+    max_attempts: usize,
+    retry_delay: std::time::Duration,
+    upstream_request_timeout: std::time::Duration,
+}
+
+async fn proxy_request_with_fallback_port_and_retries_with_options(
+    req: Request,
+    target_url: &str,
+    options: ProxyRequestOptions,
+    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+) -> Result<Response, AppError> {
     let uri: hyper::Uri = target_url
         .parse()
         .map_err(|e| AppError::Internal(format!("Invalid target URL: {}", e)))?;
@@ -451,7 +488,7 @@ pub async fn proxy_request_with_fallback_port_and_retries(
         }
     }
 
-    let attempts = max_attempts.max(1);
+    let attempts = options.max_attempts.max(1);
     let mut last_bad_gateway = None;
     for attempt in 0..attempts {
         match send_proxy_request_with_fallback_attempt(
@@ -464,9 +501,10 @@ pub async fn proxy_request_with_fallback_port_and_retries(
                 method: &method,
                 req_headers: &req_headers,
                 body_bytes: body_bytes.clone(),
+                upstream_request_timeout: options.upstream_request_timeout,
             },
-            allow_fallback,
-            fallback_port,
+            options.allow_fallback,
+            options.fallback_port,
             task_supervisor.clone(),
         )
         .await
@@ -483,7 +521,7 @@ pub async fn proxy_request_with_fallback_port_and_retries(
                 );
                 last_bad_gateway = Some(AppError::BadGateway(msg));
                 task_supervisor
-                    .sleep("pod_proxy_readiness_retry", retry_delay)
+                    .sleep("pod_proxy_readiness_retry", options.retry_delay)
                     .await
                     .map_err(|err| {
                         AppError::Internal(format!("Proxy retry timer failed: {err}"))
@@ -528,6 +566,7 @@ async fn send_proxy_request_with_fallback_attempt(
         method,
         req_headers,
         body_bytes,
+        upstream_request_timeout,
     } = req;
 
     match send_proxy_request(
@@ -540,6 +579,7 @@ async fn send_proxy_request_with_fallback_attempt(
             method,
             req_headers,
             body_bytes: body_bytes.clone(),
+            upstream_request_timeout,
         },
         task_supervisor.clone(),
     )
@@ -567,6 +607,7 @@ async fn send_proxy_request_with_fallback_attempt(
                     method,
                     req_headers,
                     body_bytes,
+                    upstream_request_timeout,
                 },
                 task_supervisor.clone(),
             )
@@ -591,6 +632,7 @@ async fn send_proxy_request_with_fallback_attempt(
                     method,
                     req_headers,
                     body_bytes,
+                    upstream_request_timeout,
                 },
                 task_supervisor.clone(),
             )
@@ -609,6 +651,7 @@ struct ProxyUpstreamRequest<'a> {
     method: &'a axum::http::Method,
     req_headers: &'a axum::http::HeaderMap,
     body_bytes: Bytes,
+    upstream_request_timeout: std::time::Duration,
 }
 
 async fn send_proxy_request(
@@ -624,6 +667,7 @@ async fn send_proxy_request(
         method,
         req_headers,
         body_bytes,
+        upstream_request_timeout,
     } = req;
     if scheme.eq_ignore_ascii_case("https") {
         return match send_proxy_request_https(
@@ -717,7 +761,7 @@ async fn send_proxy_request(
         })?;
 
     // Bound upstream header response wait.
-    let request_timeout = std::time::Duration::from_secs(2);
+    let request_timeout = upstream_request_timeout;
     let upstream_result = task_supervisor
         .timeout(
             "pod_proxy_upstream_request_timeout",
