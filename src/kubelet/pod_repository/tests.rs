@@ -8652,6 +8652,116 @@ async fn api_delete_pod_sets_deletion_timestamp_and_default_grace_30s() {
 }
 
 #[tokio::test]
+async fn api_delete_pod_zero_grace_marks_terminating_pod_unready() {
+    use super::PodApiWriter;
+
+    let repo = build_repo().await;
+    repo.store
+        .create(
+            "default",
+            "del-ready",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "del-ready",
+                    "namespace": "default",
+                    "uid": "uid-del-ready"
+                },
+                "spec": {
+                    "nodeName": "test-node",
+                    "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [
+                        {"type": "Initialized", "status": "True"},
+                        {"type": "PodScheduled", "status": "True"},
+                        {"type": "ContainersReady", "status": "True", "lastTransitionTime": "2026-04-30T00:00:00Z"},
+                        {"type": "Ready", "status": "True", "lastTransitionTime": "2026-04-30T00:00:00Z"}
+                    ],
+                    "containerStatuses": [{
+                        "name": "app",
+                        "ready": true,
+                        "restartCount": 0,
+                        "state": {"running": {"startedAt": "2026-04-30T00:00:00Z"}}
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let outcome = repo
+        .api_delete_pod(
+            "default",
+            "del-ready",
+            crate::api::DeleteOptions {
+                propagation_policy: None,
+                orphan_dependents: None,
+                _grace_period_seconds: Some(0),
+                preconditions: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    let returned = match outcome {
+        super::PodApiDeleteOutcome::GracefulSet(resource) => resource,
+        _ => panic!("expected GracefulSet"),
+    };
+
+    for pod in [
+        returned,
+        repo.store
+            .get("default", "del-ready")
+            .await
+            .unwrap()
+            .expect("pod remains until actor-owned cleanup"),
+    ] {
+        assert!(pod.data.pointer("/metadata/deletionTimestamp").is_some());
+        assert_eq!(
+            pod.data
+                .pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(|value| value.as_i64()),
+            Some(0)
+        );
+        let conditions = pod
+            .data
+            .pointer("/status/conditions")
+            .and_then(|value| value.as_array())
+            .expect("conditions must remain an array");
+        for condition_type in ["Ready", "ContainersReady"] {
+            let condition = conditions
+                .iter()
+                .find(|condition| {
+                    condition.pointer("/type").and_then(|value| value.as_str())
+                        == Some(condition_type)
+                })
+                .unwrap_or_else(|| panic!("missing {condition_type} condition"));
+            assert_eq!(
+                condition
+                    .pointer("/status")
+                    .and_then(|value| value.as_str()),
+                Some("False"),
+                "terminating pod must not stay {condition_type}=True"
+            );
+            assert_eq!(
+                condition
+                    .pointer("/reason")
+                    .and_then(|value| value.as_str()),
+                Some("PodTerminating")
+            );
+        }
+        let container_ready = pod
+            .data
+            .pointer("/status/containerStatuses/0/ready")
+            .and_then(|value| value.as_bool());
+        assert_eq!(container_ready, Some(false));
+    }
+}
+
+#[tokio::test]
 async fn api_delete_pod_cascades_pod_owner_cycle_without_reentrant_stack_growth() {
     use super::PodApiWriter;
 

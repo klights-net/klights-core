@@ -865,21 +865,35 @@ impl PodApiService {
         const MAX_DELETE_CONFLICT_RETRIES: u32 = 8;
         let mut current = resource;
         let mut attempt = 0u32;
-        let updated = loop {
-            ensure_resource_preconditions_match(&current, &delete_preconditions)?;
-            let grace_period_seconds = pod_delete_grace_period_seconds(&current.data, &options);
-            let data = pod_data_with_deletion_metadata(&current.data, grace_period_seconds);
+        let (updated, previous) = loop {
+            let delete_base = if delete_preconditions.resource_version.is_some() {
+                current.clone()
+            } else {
+                self.store
+                    .get(ns, name)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?
+            };
+            ensure_resource_preconditions_match(&delete_base, &delete_preconditions)?;
+            let grace_period_seconds = pod_delete_grace_period_seconds(&delete_base.data, &options);
+            let data = pod_data_with_deletion_metadata(&delete_base.data, grace_period_seconds);
             let mark_result = if delete_preconditions.resource_version.is_some() {
                 self.store
-                    .update(ns, name, data, current.resource_version)
+                    .mark_deleting_at_resource_version(
+                        ns,
+                        name,
+                        &delete_base.uid,
+                        data,
+                        delete_base.resource_version,
+                    )
                     .await
             } else {
                 self.store
-                    .mark_deleting_latest(ns, name, &current.uid, &data)
+                    .mark_deleting_latest(ns, name, &delete_base.uid, &data)
                     .await
             };
             match mark_result {
-                Ok(updated) => break updated,
+                Ok(updated) => break (updated, std::sync::Arc::unwrap_or_clone(delete_base.data)),
                 Err(e) if is_conflict_error(&e) && attempt + 1 < MAX_DELETE_CONFLICT_RETRIES => {
                     let backoff_ms = std::cmp::min(20u64.saturating_mul(1u64 << attempt), 250);
                     let _ = self
@@ -908,7 +922,6 @@ impl PodApiService {
             .and_then(|u| u.as_str())
             .unwrap_or("")
             .to_string();
-        let previous = std::sync::Arc::unwrap_or_clone(current.data);
         if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_update(
             &previous,
             &updated.data,
@@ -1408,7 +1421,78 @@ fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds: i64) -> V
             json!(grace_period_seconds),
         );
     }
+    if data
+        .pointer("/metadata/deletionTimestamp")
+        .is_some_and(|timestamp| !timestamp.is_null())
+    {
+        mark_terminating_pod_unready(&mut data);
+    }
     data
+}
+
+fn mark_terminating_pod_unready(data: &mut Value) {
+    let now = crate::utils::k8s_timestamp();
+    let Some(status) = data
+        .get_mut("status")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+
+    for status_list_name in ["containerStatuses", "initContainerStatuses"] {
+        if let Some(statuses) = status
+            .get_mut(status_list_name)
+            .and_then(|value| value.as_array_mut())
+        {
+            for container_status in statuses {
+                if let Some(container_status) = container_status.as_object_mut() {
+                    container_status.insert("ready".to_string(), json!(false));
+                }
+            }
+        }
+    }
+
+    let conditions = status
+        .entry("conditions".to_string())
+        .or_insert_with(|| json!([]));
+    if !conditions.is_array() {
+        *conditions = json!([]);
+    }
+    let Some(conditions) = conditions.as_array_mut() else {
+        return;
+    };
+    for condition_type in ["Ready", "ContainersReady"] {
+        upsert_terminating_readiness_condition(conditions, condition_type, &now);
+    }
+}
+
+fn upsert_terminating_readiness_condition(
+    conditions: &mut Vec<Value>,
+    condition_type: &str,
+    now: &str,
+) {
+    if let Some(condition) = conditions.iter_mut().find(|condition| {
+        condition.pointer("/type").and_then(|value| value.as_str()) == Some(condition_type)
+    }) && let Some(condition) = condition.as_object_mut()
+    {
+        let status_changed =
+            condition.get("status").and_then(|value| value.as_str()) != Some("False");
+        condition.insert("status".to_string(), json!("False"));
+        condition.insert("reason".to_string(), json!("PodTerminating"));
+        condition.insert("message".to_string(), json!("Pod is terminating"));
+        if status_changed || !condition.contains_key("lastTransitionTime") {
+            condition.insert("lastTransitionTime".to_string(), json!(now));
+        }
+        return;
+    }
+
+    conditions.push(json!({
+        "type": condition_type,
+        "status": "False",
+        "lastTransitionTime": now,
+        "reason": "PodTerminating",
+        "message": "Pod is terminating"
+    }));
 }
 
 fn pod_delete_grace_period_seconds(data: &Value, options: &DeleteOptions) -> i64 {
