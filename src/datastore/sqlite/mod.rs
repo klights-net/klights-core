@@ -275,15 +275,24 @@ impl Datastore {
     pub async fn delete_uncommitted_applied_outbox_placeholder(
         &self,
         idempotency_key: &str,
+        reserved_rv: i64,
     ) -> Result<bool> {
         let idempotency_key = idempotency_key.to_string();
         self.db_call(
             "db_applied_outbox_delete_uncommitted_placeholder",
             move |conn| {
-                let changed = conn.execute(
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let changed = tx.execute(
                     queries::APPLIED_OUTBOX_DELETE_UNCOMMITTED_PLACEHOLDER_BY_KEY,
                     rusqlite::params![idempotency_key],
                 )?;
+                if changed > 0 {
+                    crate::datastore::sqlite::cluster_replace::rollback_uncommitted_metadata_rv_if_current_tx(
+                        &tx,
+                        reserved_rv,
+                    )?;
+                }
+                tx.commit()?;
                 Ok(changed > 0)
             },
         )
@@ -2713,8 +2722,10 @@ impl DatastoreBackend for Datastore {
     async fn delete_uncommitted_applied_outbox_placeholder(
         &self,
         idempotency_key: &str,
+        reserved_rv: i64,
     ) -> Result<bool> {
-        Datastore::delete_uncommitted_applied_outbox_placeholder(self, idempotency_key).await
+        Datastore::delete_uncommitted_applied_outbox_placeholder(self, idempotency_key, reserved_rv)
+            .await
     }
 
     async fn apply_outbox_transactionally(

@@ -1027,9 +1027,10 @@ impl DatastoreBackend for ReplicatedDatastore {
     async fn delete_uncommitted_applied_outbox_placeholder(
         &self,
         idempotency_key: &str,
+        reserved_rv: i64,
     ) -> Result<bool> {
         self.inner
-            .delete_uncommitted_applied_outbox_placeholder(idempotency_key)
+            .delete_uncommitted_applied_outbox_placeholder(idempotency_key, reserved_rv)
             .await
     }
 

@@ -203,10 +203,10 @@ impl RaftNode {
         }
     }
 
-    async fn cleanup_rejected_materialized_commit(&self, idempotency_key: &str) {
+    async fn cleanup_rejected_materialized_commit(&self, idempotency_key: &str, reserved_rv: i64) {
         match self
             .backend
-            .delete_uncommitted_applied_outbox_placeholder(idempotency_key)
+            .delete_uncommitted_applied_outbox_placeholder(idempotency_key, reserved_rv)
             .await
         {
             Ok(true) => {
@@ -523,6 +523,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
                 return Ok(());
             }
         };
+        let reserved_rv = commit.resource_version;
         let entry_bytes = crate::log_apply::encode_commit_protobuf(&commit)
             .context("encode LogApplyCommit for raft propose")?;
         let apply_result = match self
@@ -531,7 +532,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
         {
             Ok(result) => result,
             Err(err) => {
-                self.cleanup_rejected_materialized_commit(&idempotency_key)
+                self.cleanup_rejected_materialized_commit(&idempotency_key, reserved_rv)
                     .await;
                 return Err(err);
             }
@@ -609,6 +610,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
                 });
             }
         };
+        let reserved_rv = commit.resource_version;
         let entry_bytes = crate::log_apply::encode_commit_protobuf(&commit).map_err(|err| {
             crate::kubelet::outbox::OutboxApplyError::Retryable(format!(
                 "encode LogApplyCommit for raft outbox propose: {err}"
@@ -620,7 +622,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
         {
             Ok(result) => result,
             Err(err) => {
-                self.cleanup_rejected_materialized_commit(idempotency_key)
+                self.cleanup_rejected_materialized_commit(idempotency_key, reserved_rv)
                     .await;
                 return Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
                     format!("raft propose: {err}"),

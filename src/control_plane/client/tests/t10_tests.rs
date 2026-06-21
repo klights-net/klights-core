@@ -819,13 +819,13 @@ async fn cleanup_uncommitted_outbox_claim_deletes_only_placeholder_rows() {
     .expect("insert final row");
 
     assert!(
-        db.delete_uncommitted_applied_outbox_placeholder("placeholder-key")
+        db.delete_uncommitted_applied_outbox_placeholder("placeholder-key", 0)
             .await
             .expect("delete placeholder"),
         "placeholder row should be removed"
     );
     assert!(
-        !db.delete_uncommitted_applied_outbox_placeholder("final-key")
+        !db.delete_uncommitted_applied_outbox_placeholder("final-key", 42)
             .await
             .expect("skip final row"),
         "final applied row must not be removed by placeholder cleanup"

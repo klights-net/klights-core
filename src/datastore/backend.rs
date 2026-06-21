@@ -801,8 +801,10 @@ pub trait DatastoreBackend: Send + Sync {
     async fn delete_uncommitted_applied_outbox_placeholder(
         &self,
         idempotency_key: &str,
+        reserved_rv: i64,
     ) -> Result<bool> {
         let _ = idempotency_key;
+        let _ = reserved_rv;
         Err(anyhow::anyhow!(
             "backend does not support applied_outbox placeholder cleanup"
         ))

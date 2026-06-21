@@ -2568,6 +2568,143 @@ async fn test_datastore_backend_advance_rv_via_trait_returns_at_least_min_rv() {
     assert!(advanced > target);
 }
 
+async fn build_reserved_rv_commit(
+    db: &Datastore,
+    idempotency_key: &str,
+) -> (crate::log_apply::LogApplyCommit, i64) {
+    let before = db.get_current_resource_version().await.unwrap();
+    let command = crate::datastore::command::StorageCommand::AdvanceResourceVersion {
+        min_rv: before,
+        new_rv: before + 1,
+    };
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            idempotency_key,
+            crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+            payload.as_ref(),
+            "mn-controlplane1",
+        )
+        .await
+        .unwrap();
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, applied_rv } = outcome
+    else {
+        panic!("expected a fresh materialized commit");
+    };
+    (commit, applied_rv)
+}
+
+#[tokio::test]
+async fn rejected_materialized_commit_cleanup_rolls_back_single_reserved_rv() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let before = db.get_current_resource_version().await.unwrap();
+    let (_commit, reserved_rv) = build_reserved_rv_commit(&db, "rejected-rv-1").await;
+
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        reserved_rv,
+        "materialization reserves the leader RV before raft accepts the entry"
+    );
+
+    assert!(
+        db.delete_uncommitted_applied_outbox_placeholder("rejected-rv-1", reserved_rv)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        before,
+        "rejected materialized raft entries must not leave leader-only RV drift"
+    );
+}
+
+#[tokio::test]
+async fn rejected_materialized_commit_cleanup_handles_out_of_order_reservations() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let before = db.get_current_resource_version().await.unwrap();
+    let (_first_commit, first_rv) = build_reserved_rv_commit(&db, "rejected-rv-first").await;
+    let (_second_commit, second_rv) = build_reserved_rv_commit(&db, "rejected-rv-second").await;
+
+    assert_eq!(second_rv, first_rv + 1);
+    assert!(
+        db.delete_uncommitted_applied_outbox_placeholder("rejected-rv-first", first_rv)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        second_rv,
+        "cleaning an older rejected reservation must not roll back a later reservation"
+    );
+
+    assert!(
+        db.delete_uncommitted_applied_outbox_placeholder("rejected-rv-second", second_rv)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        before,
+        "out-of-order rejected reservations should settle at the last committed RV"
+    );
+}
+
+#[tokio::test]
+async fn raft_terminal_conflict_rolls_back_materialized_reserved_rv() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.create_resource(
+        "v1",
+        "Node",
+        None,
+        "mn-controlplane2",
+        json!({"metadata": {"name": "mn-controlplane2"}}),
+    )
+    .await
+    .unwrap();
+    let before = db.get_current_resource_version().await.unwrap();
+    let command = crate::datastore::command::StorageCommand::CreateResource {
+        api_version: "v1".to_string(),
+        kind: "Node".to_string(),
+        namespace: None,
+        name: "mn-controlplane2".to_string(),
+        data: json!({"metadata": {"name": "mn-controlplane2"}}),
+    };
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "conflicting-node-registration",
+            crate::kubelet::outbox::payload::OutboxOperation::NodeRegistration.as_str(),
+            payload.as_ref(),
+            "mn-controlplane2",
+        )
+        .await
+        .unwrap();
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, applied_rv } = outcome
+    else {
+        panic!("expected a materialized raft commit");
+    };
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        applied_rv,
+        "commit materialization reserves the next RV on the leader"
+    );
+
+    let result = db.apply_raft_log_apply_commit(commit).await.unwrap();
+    assert!(
+        result.error_message.is_some(),
+        "duplicate Node create should be cached as a terminal raft apply conflict"
+    );
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        before,
+        "terminal raft conflicts must roll back the leader-only materialized RV"
+    );
+}
+
 #[tokio::test]
 async fn test_datastore_backend_list_namespace_resources_via_trait_returns_inserted() {
     let concrete = Datastore::new_in_memory().await.unwrap();

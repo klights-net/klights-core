@@ -234,6 +234,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
 ) -> tokio_rusqlite::Result<RaftLogApplyOutcome> {
+    let reserved_rv = commit.resource_version;
     let outbox_template = commit.mutations.iter().find_map(|mutation| match mutation {
         LogApplyMutation::PutAppliedOutbox(row) => Some(row.clone()),
         _ => None,
@@ -264,6 +265,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             tx.execute("ROLLBACK TO raft_apply_attempt", [])?;
             tx.execute("RELEASE raft_apply_attempt", [])?;
             let message = err.to_string();
+            rollback_uncommitted_metadata_rv_if_current_tx(tx, reserved_rv)?;
             if let Some(mut row) = outbox_template {
                 row.applied_rv = None;
                 row.result_proto = crate::datastore::command::encode_response_protobuf(
@@ -1609,6 +1611,38 @@ fn advance_metadata_rv_to_at_least_tx(
         tx.execute(
             queries::METADATA_SET_RV,
             rusqlite::params![resource_version.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn rollback_uncommitted_metadata_rv_if_current_tx(
+    tx: &rusqlite::Transaction<'_>,
+    reserved_rv: i64,
+) -> tokio_rusqlite::Result<()> {
+    if reserved_rv <= 0 {
+        return Ok(());
+    }
+    let current_rv: i64 = tx.query_row(queries::METADATA_SELECT_RV_INT, [], |row| row.get(0))?;
+    if current_rv != reserved_rv {
+        return Ok(());
+    }
+    let committed_rv: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(rv), 0) FROM (
+            SELECT CAST(resource_version AS INTEGER) AS rv FROM cluster_resources
+            UNION ALL SELECT CAST(resource_version AS INTEGER) FROM namespaced_resources
+            UNION ALL SELECT CAST(resource_version AS INTEGER) FROM namespaces
+            UNION ALL SELECT CAST(resource_version AS INTEGER) FROM watch_events
+            UNION ALL SELECT CAST(resource_version AS INTEGER) FROM pod_cleanup_intents
+            UNION ALL SELECT CAST(applied_rv AS INTEGER) FROM applied_outbox WHERE applied_rv IS NOT NULL
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if committed_rv < reserved_rv {
+        tx.execute(
+            queries::METADATA_SET_RV,
+            rusqlite::params![committed_rv.to_string()],
         )?;
     }
     Ok(())
