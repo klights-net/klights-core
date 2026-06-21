@@ -170,19 +170,32 @@ impl Datastore {
                     })?;
 
                 let mut patched: Value = current.data.clone();
+                let zero_grace_pod_delete =
+                    crate::resource_semantics::is_zero_grace_pod_delete_mark_patch(
+                        &key.api_version,
+                        &key.kind,
+                        &patch,
+                    );
+                let effective_patch = if zero_grace_pod_delete {
+                    crate::resource_semantics::pod_delete_mark_patch_without_status(&patch)
+                } else {
+                    patch
+                };
                 match patch_kind {
                     PatchKind::Merge => {
-                        crate::json_patch::apply_merge_patch(&mut patched, &patch).map_err(
-                            |e| {
+                        crate::json_patch::apply_merge_patch(&mut patched, &effective_patch)
+                            .map_err(|e| {
                                 rusqlite::Error::ToSqlConversionFailure(Box::new(
                                     std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
                                         e.to_string(),
                                     ),
                                 ))
-                            },
-                        )?;
+                            })?;
                     }
+                }
+                if zero_grace_pod_delete {
+                    crate::resource_semantics::mark_terminating_pod_unready(&mut patched);
                 }
 
                 validate_metadata_uid_immutable(&patched, &current.data).map_err(|e| {

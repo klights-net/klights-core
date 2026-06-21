@@ -9047,6 +9047,71 @@ async fn api_delete_pod_without_resource_version_precondition_survives_raft_stat
 }
 
 #[tokio::test]
+async fn api_delete_pod_zero_grace_without_resource_version_precondition_survives_raft_status_race()
+{
+    use super::PodApiWriter;
+    use super::PodReader;
+
+    let (repo, status_bumps) =
+        build_raft_repo_with_status_race_on_delete("del-zero-grace-raft-status-race").await;
+    let created = create_basic_pod_via_api(&repo, "del-zero-grace-raft-status-race").await;
+
+    let outcome = repo
+        .api_delete_pod(
+            "default",
+            "del-zero-grace-raft-status-race",
+            crate::api::DeleteOptions {
+                _grace_period_seconds: Some(0),
+                preconditions: None,
+                ..Default::default()
+            },
+            false,
+        )
+        .await
+        .expect("zero-grace DELETE without an RV precondition must apply to the latest Pod object");
+
+    assert!(
+        status_bumps.load(Ordering::SeqCst) > 0,
+        "test proposer must advance status before the delete mark"
+    );
+    let deleted = match outcome {
+        super::PodApiDeleteOutcome::GracefulSet(resource) => resource,
+        other => panic!("expected GracefulSet, got {other:?}"),
+    };
+    assert!(deleted.resource_version > created.resource_version);
+    assert!(deleted.data["metadata"]["deletionTimestamp"].is_string());
+    assert_eq!(
+        deleted.data["metadata"]["deletionGracePeriodSeconds"],
+        json!(0)
+    );
+    assert_eq!(deleted.data["status"]["phase"], json!("Running"));
+    assert_eq!(deleted.data["status"]["raceBump"], json!(1));
+    for condition_type in ["Ready", "ContainersReady"] {
+        let condition = deleted.data["status"]["conditions"]
+            .as_array()
+            .and_then(|conditions| {
+                conditions
+                    .iter()
+                    .find(|condition| condition.get("type") == Some(&json!(condition_type)))
+            })
+            .expect("terminating zero-grace pod must carry readiness conditions");
+        assert_eq!(condition["status"], json!("False"));
+        assert_eq!(condition["reason"], json!("PodTerminating"));
+    }
+
+    let persisted = repo
+        .get_pod("default", "del-zero-grace-raft-status-race")
+        .await
+        .unwrap()
+        .expect("pod remains until actor-owned finalization");
+    assert_eq!(
+        persisted.data["metadata"]["deletionTimestamp"],
+        deleted.data["metadata"]["deletionTimestamp"]
+    );
+    assert_eq!(persisted.data["status"]["raceBump"], json!(1));
+}
+
+#[tokio::test]
 async fn api_delete_collection_pods_processes_all_matching_label_selector() {
     use super::PodApiWriter;
     use super::PodReader;

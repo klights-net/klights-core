@@ -1425,74 +1425,9 @@ fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds: i64) -> V
         .pointer("/metadata/deletionTimestamp")
         .is_some_and(|timestamp| !timestamp.is_null())
     {
-        mark_terminating_pod_unready(&mut data);
+        crate::resource_semantics::mark_terminating_pod_unready(&mut data);
     }
     data
-}
-
-fn mark_terminating_pod_unready(data: &mut Value) {
-    let now = crate::utils::k8s_timestamp();
-    let Some(status) = data
-        .get_mut("status")
-        .and_then(|value| value.as_object_mut())
-    else {
-        return;
-    };
-
-    for status_list_name in ["containerStatuses", "initContainerStatuses"] {
-        if let Some(statuses) = status
-            .get_mut(status_list_name)
-            .and_then(|value| value.as_array_mut())
-        {
-            for container_status in statuses {
-                if let Some(container_status) = container_status.as_object_mut() {
-                    container_status.insert("ready".to_string(), json!(false));
-                }
-            }
-        }
-    }
-
-    let conditions = status
-        .entry("conditions".to_string())
-        .or_insert_with(|| json!([]));
-    if !conditions.is_array() {
-        *conditions = json!([]);
-    }
-    let Some(conditions) = conditions.as_array_mut() else {
-        return;
-    };
-    for condition_type in ["Ready", "ContainersReady"] {
-        upsert_terminating_readiness_condition(conditions, condition_type, &now);
-    }
-}
-
-fn upsert_terminating_readiness_condition(
-    conditions: &mut Vec<Value>,
-    condition_type: &str,
-    now: &str,
-) {
-    if let Some(condition) = conditions.iter_mut().find(|condition| {
-        condition.pointer("/type").and_then(|value| value.as_str()) == Some(condition_type)
-    }) && let Some(condition) = condition.as_object_mut()
-    {
-        let status_changed =
-            condition.get("status").and_then(|value| value.as_str()) != Some("False");
-        condition.insert("status".to_string(), json!("False"));
-        condition.insert("reason".to_string(), json!("PodTerminating"));
-        condition.insert("message".to_string(), json!("Pod is terminating"));
-        if status_changed || !condition.contains_key("lastTransitionTime") {
-            condition.insert("lastTransitionTime".to_string(), json!(now));
-        }
-        return;
-    }
-
-    conditions.push(json!({
-        "type": condition_type,
-        "status": "False",
-        "lastTransitionTime": now,
-        "reason": "PodTerminating",
-        "message": "Pod is terminating"
-    }));
 }
 
 fn pod_delete_grace_period_seconds(data: &Value, options: &DeleteOptions) -> i64 {

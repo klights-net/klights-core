@@ -181,19 +181,12 @@ impl PodStore {
             .and_then(|m| m.get("deletionGracePeriodSeconds"))
             .cloned()
             .unwrap_or(Value::Null);
-        let should_patch_terminating_status = deletion_grace_period_seconds.as_i64() == Some(0);
-        let status = should_patch_terminating_status
-            .then(|| body.get("status").cloned())
-            .flatten();
-        let mut patch = serde_json::json!({
+        let patch = serde_json::json!({
             "metadata": {
                 "deletionTimestamp": deletion_timestamp,
                 "deletionGracePeriodSeconds": deletion_grace_period_seconds
             }
         });
-        if let Some(status) = status {
-            patch["status"] = status;
-        }
         self.mark_sandbox_dirty();
         self.db
             .patch_resource_latest_with_preconditions(

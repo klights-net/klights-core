@@ -917,15 +917,30 @@ fn apply_latest_patch_to_current_resource(
     let current: serde_json::Value =
         serde_json::from_slice(current_bytes).map_err(serde_to_sqlite_error)?;
     let mut patched = current.clone();
+    let zero_grace_pod_delete = crate::resource_semantics::is_zero_grace_pod_delete_mark_patch(
+        &patch.api_version,
+        &patch.kind,
+        &patch.patch,
+    );
+    let effective_patch = if zero_grace_pod_delete {
+        crate::resource_semantics::pod_delete_mark_patch_without_status(&patch.patch)
+    } else {
+        patch.patch.clone()
+    };
     match patch.patch_kind {
         PatchKind::Merge => {
-            crate::json_patch::apply_merge_patch(&mut patched, &patch.patch).map_err(|err| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    err.to_string(),
-                )))
-            })?;
+            crate::json_patch::apply_merge_patch(&mut patched, &effective_patch).map_err(
+                |err| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        err.to_string(),
+                    )))
+                },
+            )?;
         }
+    }
+    if zero_grace_pod_delete {
+        crate::resource_semantics::mark_terminating_pod_unready(&mut patched);
     }
     crate::datastore::sqlite::resource_shape::validate_metadata_uid_immutable(&patched, &current)
         .map_err(|err| {
