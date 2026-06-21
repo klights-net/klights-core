@@ -835,12 +835,9 @@ impl PodRepository {
         };
 
         dispatcher
-            .enqueue_reconcile_key_with_priority(
-                crate::controllers::workqueue::ReconcileKey::namespaced(
-                    "batch/v1", "Job", namespace, job_name,
-                ),
-                crate::controllers::workqueue::QueuePriority::High,
-            )
+            .enqueue_reconcile_key(crate::controllers::workqueue::ReconcileKey::namespaced(
+                "batch/v1", "Job", namespace, job_name,
+            ))
             .await;
     }
 }

@@ -10,7 +10,7 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::control_plane::client::{LeaderApiClient, ResourceKey};
-use crate::controllers::workqueue::{QueuePriority, ReconcileKey};
+use crate::controllers::workqueue::ReconcileKey;
 use crate::datastore::Resource;
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
@@ -1308,10 +1308,12 @@ impl PodStatusService {
         // child availability: once replacement pods become Ready, the owning
         // Deployment must reconcile once to scale old ReplicaSets down.
         dispatcher
-            .enqueue_reconcile_key_with_priority(
-                ReconcileKey::namespaced("apps/v1", "Deployment", namespace, &deployment_name),
-                QueuePriority::High,
-            )
+            .enqueue_reconcile_key(ReconcileKey::namespaced(
+                "apps/v1",
+                "Deployment",
+                namespace,
+                &deployment_name,
+            ))
             .await;
         Ok(())
     }

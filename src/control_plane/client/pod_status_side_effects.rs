@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use crate::controller_dispatcher::ControllerDispatcher;
-use crate::controllers::workqueue::{QueuePriority, ReconcileKey};
+use crate::controllers::workqueue::ReconcileKey;
 use crate::datastore::DatastoreBackend;
 use crate::datastore::command::StorageCommand;
 use crate::replication::protocol::ForwardedResource;
@@ -116,28 +116,13 @@ pub async fn enqueue_pod_status_side_effects(
         };
     let pdb_keys = pdb_reconcile_keys_for_namespace(db, namespace).await;
     for key in workload_keys {
-        controller_dispatcher
-            .enqueue_reconcile_key_with_priority(key.clone(), pod_status_workload_priority(&key))
-            .await;
+        controller_dispatcher.enqueue_reconcile_key(key).await;
     }
     for key in service_keys {
-        controller_dispatcher
-            .enqueue_reconcile_key_with_priority(key, QueuePriority::High)
-            .await;
+        controller_dispatcher.enqueue_reconcile_key(key).await;
     }
     for key in job_keys.into_iter().chain(pdb_keys) {
         controller_dispatcher.enqueue_reconcile_key(key).await;
-    }
-}
-
-fn pod_status_workload_priority(key: &ReconcileKey) -> QueuePriority {
-    if key.api_version == "apps/v1" && key.kind == "Deployment" {
-        // Deployment rolling updates often enqueue during the create/adopt burst,
-        // before replacement Pod readiness is visible. Preserve the readiness
-        // event as a second reconcile so old ReplicaSets can be scaled down.
-        QueuePriority::High
-    } else {
-        QueuePriority::Normal
     }
 }
 
@@ -398,7 +383,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outbox_ready_pod_status_preserves_followup_deployment_rollout_reconcile() {
+    async fn outbox_ready_pod_status_keeps_deployment_rollout_reconcile_queued() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
             "apps/v1",
@@ -503,26 +488,16 @@ mod tests {
 
         enqueue_pod_status_side_effects(Some(&dispatcher), &command, Some(&resource), &db).await;
 
-        let mut deployment_reconciles = 0;
-        for _ in 0..3 {
-            let key = tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                dispatcher.take_reconcile_key_for_test(),
-            )
-            .await
-            .expect("ready pod status must preserve the queued Deployment follow-up reconcile");
-            if key == deployment_key {
-                deployment_reconciles += 1;
-            }
-        }
+        let keys = dispatcher.queued_reconcile_keys_for_test().await;
         assert_eq!(
-            deployment_reconciles, 2,
-            "worker-applied pod readiness must not collapse into the stale Deployment rollout key"
+            keys.iter().filter(|key| *key == &deployment_key).count(),
+            1,
+            "worker-applied pod readiness must leave one fresh Deployment rollout key queued"
         );
     }
 
     #[tokio::test]
-    async fn outbox_ready_pod_status_preserves_followup_service_endpoint_reconcile() {
+    async fn outbox_ready_pod_status_keeps_service_endpoint_reconcile_queued() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
             "v1",
@@ -595,23 +570,15 @@ mod tests {
 
         enqueue_pod_status_side_effects(Some(&dispatcher), &command, Some(&resource), &db).await;
 
-        let first = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            dispatcher.take_reconcile_key_for_test(),
-        )
-        .await
-        .expect("stale Service endpoint reconcile must already be queued");
-        assert_eq!(first, service_key);
-
-        let second = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            dispatcher.take_reconcile_key_for_test(),
-        )
-        .await
-        .expect("ready Pod status must preserve a fresh Service endpoint reconcile");
         assert_eq!(
-            second, service_key,
-            "worker-applied pod readiness must not collapse into a stale Service endpoint key"
+            dispatcher
+                .queued_reconcile_keys_for_test()
+                .await
+                .iter()
+                .filter(|key| *key == &service_key)
+                .count(),
+            1,
+            "worker-applied pod readiness must leave one fresh Service endpoint key queued"
         );
     }
 }

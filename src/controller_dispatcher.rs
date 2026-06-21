@@ -27,8 +27,7 @@ use crate::controllers::{
     service_controller::ServiceController,
     statefulset_controller::StatefulSetController,
     workqueue::{
-        Key, MAX_RETRY_ATTEMPTS, QueuePriority, ReconcileKey, WorkQueue, backoff_for,
-        controller_kind_static,
+        Key, MAX_RETRY_ATTEMPTS, ReconcileKey, WorkQueue, backoff_for, controller_kind_static,
     },
 };
 use crate::datastore::DatastoreHandle;
@@ -239,14 +238,6 @@ impl ControllerDispatcher {
         self.queue.add(key.into()).await;
     }
 
-    pub async fn enqueue_reconcile_key_with_priority(
-        &self,
-        key: ReconcileKey,
-        priority: crate::controllers::workqueue::QueuePriority,
-    ) {
-        self.queue.add_with_priority(key.into(), priority).await;
-    }
-
     pub async fn enqueue_controller_owner_for_pod(&self, pod: &Value) {
         let Some(owner_refs) = pod
             .pointer("/metadata/ownerReferences")
@@ -413,7 +404,7 @@ impl ControllerDispatcher {
             active.pending_followup.remove(&key)
         };
         if should_requeue {
-            self.queue.add_with_priority(key, QueuePriority::High).await;
+            self.queue.add(key).await;
         }
     }
 
@@ -643,7 +634,6 @@ impl Default for ControllerDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controllers::workqueue::QueuePriority;
     use crate::datastore::sqlite::Datastore;
     use async_trait::async_trait;
     use serde_json::json;
@@ -688,7 +678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_pool_dispatches_high_priority_service_while_other_controller_is_blocked() {
+    async fn worker_pool_dispatches_service_while_other_controller_is_blocked() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
             "apps/v1",
@@ -768,17 +758,14 @@ mod tests {
         .expect("slow reconcile should start");
 
         dispatcher
-            .enqueue_reconcile_key_with_priority(
-                ReconcileKey::namespaced("v1", "Service", "default", "fast"),
-                QueuePriority::High,
-            )
+            .enqueue_reconcile_key(ReconcileKey::namespaced("v1", "Service", "default", "fast"))
             .await;
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
             fast_called.notified(),
         )
         .await
-        .expect("high-priority Service reconcile must dispatch while another worker is blocked");
+        .expect("Service reconcile must dispatch while another worker is blocked");
 
         cancel.cancel();
         slow_release.notify_waiters();

@@ -4008,21 +4008,11 @@ async fn apply_runtime_reconcile_status_enqueues_deployment_rollout_on_readiness
     .await
     .unwrap();
 
-    let mut deployment_reconciles = 0;
-    for _ in 0..3 {
-        let key = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            dispatcher.take_reconcile_key_for_test(),
-        )
-        .await
-        .expect("pod readiness must preserve the queued Deployment follow-up reconcile");
-        if key == deployment_key {
-            deployment_reconciles += 1;
-        }
-    }
+    let keys = dispatcher.queued_reconcile_keys_for_test().await;
     assert_eq!(
-        deployment_reconciles, 2,
-        "a pod readiness transition under a Deployment-owned ReplicaSet must enqueue a fresh Deployment rollout"
+        keys.iter().filter(|key| *key == &deployment_key).count(),
+        1,
+        "a pod readiness transition under a Deployment-owned ReplicaSet must leave one fresh Deployment rollout queued"
     );
 }
 

@@ -2160,30 +2160,21 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
         .await;
     pod_repo.enqueue_job_reconcile_for_pod(&pod).await;
 
-    let first = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        dispatcher.take_reconcile_key_for_test(),
-    )
-    .await
-    .expect("queued Job reconcile should be available immediately");
-    assert_eq!(
-        first,
-        crate::controllers::workqueue::ReconcileKey::namespaced(
-            "batch/v1", "Job", "default", "my-job"
-        ),
-        "terminal Job pod reconcile must preempt normal controller backlog"
-    );
-
     let keys = dispatcher.queued_reconcile_keys_for_test().await;
-    assert_eq!(
-        keys,
-        vec![crate::controllers::workqueue::ReconcileKey::namespaced(
+    assert!(
+        keys.contains(&crate::controllers::workqueue::ReconcileKey::namespaced(
+            "batch/v1", "Job", "default", "my-job"
+        )),
+        "terminal Job pod reconcile must enqueue the owning Job"
+    );
+    assert!(
+        keys.contains(&crate::controllers::workqueue::ReconcileKey::namespaced(
             "apps/v1",
             "Deployment",
             "default",
             "normal-backlog",
-        )],
-        "normal backlog must remain queued after the urgent Job reconcile is taken"
+        )),
+        "normal backlog must remain queued"
     );
 }
 
@@ -2261,21 +2252,24 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
     event_handlers::enqueue_job_reconcile_for_terminal_watch_pod(&pod_repo, &terminal_watch_pod)
         .await;
 
-    let first = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        dispatcher.take_reconcile_key_for_test(),
-    )
-    .await
-    .expect("terminal Pod watch event should enqueue the owning Job immediately");
-    assert_eq!(
-        first,
-        crate::controllers::workqueue::ReconcileKey::namespaced(
+    let keys = dispatcher.queued_reconcile_keys_for_test().await;
+    assert!(
+        keys.contains(&crate::controllers::workqueue::ReconcileKey::namespaced(
             "batch/v1",
             "Job",
             "default",
             "indexed-job",
-        ),
-        "terminal Pod watch events must refresh indexed Job status before normal backlog"
+        )),
+        "terminal Pod watch events must enqueue the owning indexed Job"
+    );
+    assert!(
+        keys.contains(&crate::controllers::workqueue::ReconcileKey::namespaced(
+            "apps/v1",
+            "Deployment",
+            "default",
+            "normal-backlog",
+        )),
+        "normal backlog must remain queued"
     );
 }
 

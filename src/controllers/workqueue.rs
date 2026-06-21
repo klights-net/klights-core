@@ -4,10 +4,9 @@
 //! retry it later (P0-LEAK-02).
 //!
 //! Design (HR1/HR2 compliant):
-//!   * `HashMap<ReconcileKey, ReadyEntry>` for ready keys — last-write-wins
-//!     dedup with priority upgrade. High-priority upgrades preserve one
-//!     follow-up reconcile so terminal owner events cannot be swallowed by
-//!     an older already-queued reconcile.
+//!   * `HashSet<ReconcileKey>` for ready keys — last-write-wins dedup.
+//!     A controller reconcile always fetches the freshest resource state at
+//!     dispatch time, so bursts of queued events collapse to one reconcile.
 //!   * `tokio::sync::Notify` for "ready item available" — zero cost when nobody
 //!     is waiting; not a polling loop.
 //!   * `add_after` schedules a one-shot supervised timer task that re-enqueues
@@ -18,7 +17,7 @@
 //! failures the key is dropped with a structured error log (the next
 //! mutation/watch event will re-enqueue it).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -166,27 +165,6 @@ pub fn backoff_for(attempt: u32) -> Duration {
 
 pub const MAX_RETRY_ATTEMPTS: u32 = 7;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum QueuePriority {
-    Normal,
-    High,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReadyEntry {
-    priority: QueuePriority,
-    rerun_after_take: bool,
-}
-
-impl ReadyEntry {
-    fn new(priority: QueuePriority) -> Self {
-        Self {
-            priority,
-            rerun_after_take: false,
-        }
-    }
-}
-
 /// A workqueue: dedup'ed `add()`, delayed `add_after()`, and a `take()` that
 /// waits on either. Cheap to clone; designed to be shared across mutation
 /// handlers (producers) and a worker task (consumer).
@@ -197,7 +175,7 @@ impl ReadyEntry {
 /// no-op (HR1 idle-silent — no polling, no unnecessary reconciles).
 #[derive(Clone)]
 pub struct WorkQueue {
-    ready: Arc<Mutex<HashMap<Key, ReadyEntry>>>,
+    ready: Arc<Mutex<HashSet<Key>>>,
     /// Tracks the latest generation for each key that has a pending delayed
     /// retry. Fresh `add()` calls bump the generation here so stale timers
     /// self-extinguish.
@@ -219,7 +197,7 @@ impl WorkQueue {
         task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     ) -> Self {
         Self {
-            ready: Arc::new(Mutex::new(HashMap::new())),
+            ready: Arc::new(Mutex::new(HashSet::new())),
             delayed_generations: Arc::new(Mutex::new(HashMap::new())),
             notify: Arc::new(Notify::new()),
             next_gen: Arc::new(AtomicU64::new(1)),
@@ -234,23 +212,9 @@ impl WorkQueue {
     /// in-flight `add_after` timer sees a stale generation and
     /// self-extinguishes.
     pub async fn add(&self, key: Key) {
-        self.add_with_priority(key, QueuePriority::Normal).await;
-    }
-
-    pub async fn add_with_priority(&self, key: Key, priority: QueuePriority) {
         {
             let mut ready = self.ready.lock().await;
-            ready
-                .entry(key.clone())
-                .and_modify(|current| {
-                    if priority > current.priority {
-                        current.priority = priority;
-                    }
-                    if priority == QueuePriority::High {
-                        current.rerun_after_take = true;
-                    }
-                })
-                .or_insert_with(|| ReadyEntry::new(priority));
+            ready.insert(key.clone());
         }
         {
             let mut gens = self.delayed_generations.lock().await;
@@ -301,18 +265,9 @@ impl WorkQueue {
 
             {
                 let mut ready = self.ready.lock().await;
-                let key = ready
-                    .iter()
-                    .find_map(|(key, entry)| {
-                        (entry.priority == QueuePriority::High).then(|| key.clone())
-                    })
-                    .or_else(|| ready.keys().next().cloned());
+                let key = ready.iter().next().cloned();
                 if let Some(k) = key {
-                    if let Some(entry) = ready.remove(&k)
-                        && entry.rerun_after_take
-                    {
-                        ready.insert(k.clone(), ReadyEntry::new(entry.priority));
-                    }
+                    ready.remove(&k);
                     return k;
                 }
             }
@@ -336,7 +291,7 @@ impl WorkQueue {
             .ready
             .lock()
             .await
-            .keys()
+            .iter()
             .cloned()
             .map(ReconcileKey::from)
             .collect();
@@ -395,46 +350,6 @@ mod tests {
         // safe-to-ignore: test-only drain; we only care about the queue length afterwards
         let _ = timeout(TDur::from_millis(100), q.take()).await.unwrap();
         assert_eq!(q.ready_len().await, 0);
-    }
-
-    #[tokio::test]
-    async fn high_priority_add_preempts_normal_backlog_and_upgrades_existing_key() {
-        let q = WorkQueue::new();
-        q.add(k("normal-a")).await;
-        q.add(k("normal-b")).await;
-
-        q.add_with_priority(k("urgent"), QueuePriority::High).await;
-        let first = timeout(TDur::from_millis(100), q.take()).await.unwrap();
-        assert_eq!(
-            first,
-            k("urgent"),
-            "high-priority reconciles must not sit behind normal controller backlog"
-        );
-
-        q.add(k("upgrade")).await;
-        q.add_with_priority(k("upgrade"), QueuePriority::High).await;
-        let second = timeout(TDur::from_millis(100), q.take()).await.unwrap();
-        assert_eq!(
-            second,
-            k("upgrade"),
-            "a high-priority add must upgrade an already queued normal key"
-        );
-    }
-
-    #[tokio::test]
-    async fn high_priority_same_key_upgrade_preserves_followup_reconcile() {
-        let q = WorkQueue::new();
-
-        q.add(k("job")).await;
-        q.add_with_priority(k("job"), QueuePriority::High).await;
-
-        let first = timeout(TDur::from_millis(100), q.take()).await.unwrap();
-        assert_eq!(first, k("job"));
-
-        let second = timeout(TDur::from_millis(100), q.take())
-            .await
-            .expect("high-priority terminal enqueue must not collapse into the stale queued item");
-        assert_eq!(second, k("job"));
     }
 
     #[tokio::test]
