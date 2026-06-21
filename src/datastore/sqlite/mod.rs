@@ -1145,7 +1145,7 @@ impl Datastore {
                 )?;
                 validate_resource_preconditions(&preconditions, Some(&live_uid), live_rv)
                     .map_err(Self::sqlite_conversion_error)?;
-                if Self::is_unconditional_workload_scale_patch(
+                if Self::should_apply_outbox_patch_against_latest(
                     &api_version,
                     &kind,
                     patch_kind,
@@ -1404,7 +1404,7 @@ impl Datastore {
         Ok((commit, rv))
     }
 
-    fn is_unconditional_workload_scale_patch(
+    fn should_apply_outbox_patch_against_latest(
         api_version: &str,
         kind: &str,
         patch_kind: PatchKind,
@@ -1417,6 +1417,11 @@ impl Datastore {
         {
             return false;
         }
+        Self::is_unconditional_workload_scale_patch(api_version, kind, patch)
+            || Self::is_pod_delete_mark_patch(api_version, kind, patch)
+    }
+
+    fn is_unconditional_workload_scale_patch(api_version: &str, kind: &str, patch: &Value) -> bool {
         if !matches!(
             (api_version, kind),
             ("apps/v1", "Deployment")
@@ -1436,6 +1441,30 @@ impl Datastore {
             return false;
         };
         spec_obj.len() == 1 && spec_obj.contains_key("replicas")
+    }
+
+    fn is_pod_delete_mark_patch(api_version: &str, kind: &str, patch: &Value) -> bool {
+        if api_version != "v1" || kind != "Pod" {
+            return false;
+        }
+        let Some(patch_obj) = patch.as_object() else {
+            return false;
+        };
+        if patch_obj.len() != 1 {
+            return false;
+        }
+        let Some(metadata) = patch_obj.get("metadata").and_then(Value::as_object) else {
+            return false;
+        };
+        if !metadata.contains_key("deletionTimestamp") {
+            return false;
+        }
+        metadata.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "deletionTimestamp" | "deletionGracePeriodSeconds"
+            )
+        })
     }
 
     fn apply_outbox_patch(

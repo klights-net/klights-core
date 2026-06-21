@@ -836,6 +836,115 @@ async fn raft_scale_patch_applies_against_live_resource_after_status_rv_race() {
 }
 
 #[tokio::test]
+async fn raft_pod_delete_mark_patch_applies_against_live_resource_after_status_rv_race() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "delete-race-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "delete-race-pod",
+                    "namespace": "default",
+                    "uid": "delete-race-pod-uid"
+                },
+                "spec": {
+                    "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+                },
+                "status": {
+                    "phase": "Pending"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let command = StorageCommand::PatchResource {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "delete-race-pod".to_string(),
+        patch_kind: crate::datastore::PatchKind::Merge,
+        patch: json!({
+            "metadata": {
+                "deletionTimestamp": "2026-06-21T00:20:09Z",
+                "deletionGracePeriodSeconds": 0
+            }
+        }),
+        preconditions: ResourcePreconditions::uid(created.uid.clone()),
+    };
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "raft-pod-delete-mark-latest-patch",
+            "PatchResource",
+            payload.as_ref(),
+            "leader",
+        )
+        .await
+        .expect("build pod delete-mark patch commit");
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+        panic!("expected a fresh commit");
+    };
+
+    db.update_status_only_with_preconditions(
+        "v1",
+        "Pod",
+        Some("default"),
+        "delete-race-pod",
+        json!({
+            "phase": "Pending",
+            "conditions": [{
+                "type": "PodScheduled",
+                "status": "False",
+                "reason": "Unschedulable"
+            }]
+        }),
+        ResourcePreconditions::uid(created.uid.clone()),
+    )
+    .await
+    .expect("status update advances RV before pod delete-mark patch apply");
+
+    let apply_result = db
+        .apply_raft_log_apply_commit(commit)
+        .await
+        .expect("raft pod delete-mark patch apply should return a terminal result");
+    assert!(
+        apply_result.error_message.is_none(),
+        "pod delete-mark patch without an RV precondition must not conflict with status-only RV races, got {apply_result:?}"
+    );
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "delete-race-pod")
+        .await
+        .unwrap()
+        .expect("pod remains for actor-owned finalization");
+    assert_eq!(
+        live.data
+            .pointer("/metadata/deletionTimestamp")
+            .and_then(|value| value.as_str()),
+        Some("2026-06-21T00:20:09Z")
+    );
+    assert_eq!(
+        live.data.pointer("/metadata/deletionGracePeriodSeconds"),
+        Some(&json!(0))
+    );
+    assert_eq!(
+        live.data
+            .pointer("/status/conditions/0/reason")
+            .and_then(|value| value.as_str()),
+        Some("Unschedulable"),
+        "delete-mark patch must preserve newer status written before raft apply"
+    );
+}
+
+#[tokio::test]
 async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
