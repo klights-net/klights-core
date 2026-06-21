@@ -1196,6 +1196,70 @@ async fn test_replicationcontroller_create_defaults_selector_from_template_label
 }
 
 #[tokio::test]
+async fn test_replicationcontroller_create_queues_high_priority_reconcile() {
+    use crate::controllers::workqueue::{QueuePriority, ReconcileKey};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let dispatcher = state.controller_dispatcher.clone();
+    dispatcher.set_worker_running_for_test(true);
+    let app = crate::api::build_router(state);
+
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "default",
+        json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}),
+    )
+    .await
+    .unwrap();
+
+    let create_rc = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/default/replicationcontrollers")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "apiVersion": "v1",
+                "kind": "ReplicationController",
+                "metadata": {
+                    "name": "rc-adopt-priority",
+                    "namespace": "default"
+                },
+                "spec": {
+                    "replicas": 1,
+                    "selector": { "name": "rc-adopt-priority" },
+                    "template": {
+                        "metadata": { "labels": { "name": "rc-adopt-priority" } },
+                        "spec": { "containers": [{ "name": "pause", "image": "registry.k8s.io/pause:3.10.1" }] }
+                    }
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let create_resp = app.clone().oneshot(create_rc).await.unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let key = ReconcileKey::namespaced(
+        "v1",
+        "ReplicationController",
+        "default",
+        "rc-adopt-priority",
+    );
+    assert_eq!(
+        dispatcher.queued_reconcile_priority_for_test(&key).await,
+        Some(QueuePriority::High),
+        "RC creates must not sit behind normal controller backlog because adoption is externally observable"
+    );
+}
+
+#[tokio::test]
 async fn test_replicationcontroller_protobuf_create_defaults_selector_from_template_labels() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

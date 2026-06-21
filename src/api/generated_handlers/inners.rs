@@ -74,11 +74,17 @@ async fn enqueue_generated_controller_after_mutation(
     kind: &'static str,
     resource: &Value,
 ) {
-    if matches!(
-        (api_version, kind),
-        ("certificates.k8s.io/v1", "CertificateSigningRequest")
-    ) {
-        state.controller_dispatcher.enqueue(resource).await;
+    match (api_version, kind) {
+        ("v1", "ReplicationController") => {
+            state
+                .controller_dispatcher
+                .enqueue_high_priority(resource)
+                .await;
+        }
+        ("certificates.k8s.io/v1", "CertificateSigningRequest") => {
+            state.controller_dispatcher.enqueue(resource).await;
+        }
+        _ => {}
     }
 }
 
