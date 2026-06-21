@@ -278,6 +278,60 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn raft_mode_advance_resource_version_requires_proposer_without_local_rv_change() {
+        let inner: crate::datastore::backend::DatastoreHandle =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        let ds = ReplicatedDatastore::new(
+            inner.clone(),
+            ReplicationMode::Raft {
+                node_name: "leader".into(),
+            },
+        );
+        let before = inner.get_current_resource_version().await.unwrap();
+
+        let err = ds
+            .advance_resource_version_after(before)
+            .await
+            .expect_err("raft-mode RV advances must go through the raft proposer");
+
+        assert!(
+            err.to_string().contains("raft proposer not attached"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            inner.get_current_resource_version().await.unwrap(),
+            before,
+            "rejected raft-mode RV advance must not mutate leader-local metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_mode_advance_resource_version_routes_through_proposer() {
+        let (ds, calls) = make_ds_with_inline_proposer().await;
+        let before = ds.get_current_resource_version().await.unwrap();
+
+        let advanced = ds
+            .advance_resource_version_after(before)
+            .await
+            .expect("raft-mode RV advance must commit through proposer");
+
+        assert!(
+            advanced > before,
+            "advance_resource_version_after must return an RV above the requested floor"
+        );
+        assert_eq!(
+            ds.get_current_resource_version().await.unwrap(),
+            advanced,
+            "public RV must reflect the raft-applied commit"
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["AdvanceResourceVersion"],
+            "RV-only metadata writes must route through the raft proposer"
+        );
+    }
+
+    #[tokio::test]
     async fn raft_mode_watch_events_gc_routes_through_proposer_and_prunes_via_apply() {
         let (ds, calls) = make_ds_with_inline_proposer().await;
         for i in 0..12 {

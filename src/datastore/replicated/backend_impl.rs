@@ -575,16 +575,19 @@ impl DatastoreBackend for ReplicatedDatastore {
             .await
     }
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
+        let proposer = self.require_raft_proposer()?;
         let before_rv = self.inner.get_current_resource_version().await.unwrap_or(0);
-        let new_rv = self.inner.advance_resource_version_after(min_rv).await?;
-        if new_rv > before_rv {
-            self.notify_if_configured(
-                StorageCommand::AdvanceResourceVersion { min_rv, new_rv },
-                self.meta_for_rv(new_rv, None),
-            )
-            .await;
-        }
-        Ok(new_rv)
+        let new_rv = before_rv.saturating_add(1).max(min_rv.saturating_add(1));
+        self.propose_command_via_raft(
+            &proposer,
+            StorageCommand::AdvanceResourceVersion { min_rv, new_rv },
+        )
+        .await?;
+        Ok(self
+            .inner
+            .get_current_resource_version()
+            .await
+            .unwrap_or(new_rv))
     }
     async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
         self.inner.list_namespace_resources(namespace).await
