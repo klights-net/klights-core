@@ -18,6 +18,7 @@ pub(super) struct WatchEventHandlerContext<'a> {
     pub db: &'a dyn DatastoreBackend,
     pub cluster_api: &'a Arc<dyn crate::control_plane::client::LeaderApiClient>,
     pub node_name: &'a str,
+    pub containerd_namespace: &'a str,
     pub cluster_reconciliation_enabled: bool,
     pub pod_repo: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
     pub pod_creation_tracker: &'a PodCreationTracker,
@@ -33,6 +34,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         db,
         cluster_api,
         node_name,
+        containerd_namespace,
         cluster_reconciliation_enabled,
         pod_repo,
         pod_creation_tracker,
@@ -76,12 +78,15 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
             .pointer("/metadata/namespace")
             .and_then(|n| n.as_str())
             .unwrap_or("default");
+        let volumes_root = crate::paths::volumes_root_path(containerd_namespace)
+            .to_string_lossy()
+            .into_owned();
         let refresh_result = if event.event_type == EventType::Deleted {
             crate::kubelet::volumes::refresh_secret_configmap_volumes_after_delete(
                 event_kind,
                 event_ns,
                 event_name,
-                &crate::kubelet::volumes::volumes_root(),
+                &volumes_root,
                 pod_repo.as_ref(),
             )
             .await
@@ -91,7 +96,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
                 event_ns,
                 event_name,
                 &event.object,
-                &crate::kubelet::volumes::volumes_root(),
+                &volumes_root,
                 pod_repo.as_ref(),
             )
             .await
@@ -203,11 +208,12 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         enqueue_job_reconcile_for_terminal_watch_pod(pod_repo, &event.object).await;
 
         // Refresh downwardAPI volumes to reflect metadata changes (labels/annotations)
-        if let Err(e) = crate::kubelet::volumes::refresh_downward_api_volumes(
-            &event.object,
-            &crate::kubelet::volumes::volumes_root(),
-        )
-        .await
+        let volumes_root = crate::paths::volumes_root_path(containerd_namespace)
+            .to_string_lossy()
+            .into_owned();
+        if let Err(e) =
+            crate::kubelet::volumes::refresh_downward_api_volumes(&event.object, &volumes_root)
+                .await
         {
             tracing::warn!(
                 "Failed to refresh downwardAPI volumes after pod modification: {}",
@@ -648,6 +654,29 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
 
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(name);
+            unsafe { std::env::set_var(name, value) };
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                unsafe { std::env::set_var(self.name, previous) };
+            } else {
+                unsafe { std::env::remove_var(self.name) };
+            }
+        }
+    }
+
     fn fixture_supervisor() -> Arc<crate::task_supervisor::TaskSupervisor> {
         Arc::new(crate::task_supervisor::TaskSupervisor::new(
             crate::task_supervisor::TaskCategoryConfig::default(),
@@ -792,5 +821,100 @@ mod tests {
         assert_eq!(row.namespace, "terminating-ns");
         assert_eq!(row.name, "left-behind");
         assert_eq!(row.uid, "uid-left-behind");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serializes process-global env used to prove the handler ignores it
+    async fn configmap_watch_refresh_uses_configured_runtime_namespace_not_global_env() {
+        let _env_lock = crate::TEST_ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_ns = "event-handler-runtime-ns";
+        let wrong_global_ns = "event-handler-wrong-global-ns";
+        let _data_root = EnvVarGuard::set("KLIGHTS_DATA_ROOT", temp.path());
+        let _runtime_env = EnvVarGuard::set("KLIGHTS_CONTAINERD_NAMESPACE", wrong_global_ns);
+
+        let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+        let supervisor = fixture_supervisor();
+        let pod_repo = fixture_pod_repo(db_handle.clone(), supervisor.clone());
+        let cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient> =
+            Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+                db_handle.clone(),
+                "worker-a".to_string(),
+                crate::control_plane::client::local::always_leader_watch(),
+            ));
+        let pod_creation_tracker: PodCreationTracker =
+            Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let retry_state: PodStartRetryTracker =
+            Arc::new(tokio::sync::Mutex::new(PodStartRetryState::new()));
+        let pod_lifecycle_state = new_pod_lifecycle_state_tracker();
+        let registry = Arc::new(
+            crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry::new(
+                supervisor.clone(),
+                crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
+                Arc::new(std::sync::Mutex::new(
+                    Arc::new(crate::kubelet::pod_lifecycle_router::executor::NoopExecutor)
+                        as Arc<dyn crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor>,
+                )),
+            ),
+        );
+        let pod_lifecycle_router = Arc::new(
+            crate::kubelet::pod_lifecycle_router::PodLifecycleRouter::new_actor_with_executor(
+                registry,
+                Arc::new(crate::kubelet::pod_lifecycle_router::executor::NoopExecutor),
+            ),
+        );
+
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "cm-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"namespace": "default", "name": "cm-pod", "uid": "uid-cm-pod"},
+                "spec": {
+                    "nodeName": "worker-a",
+                    "containers": [{"name": "app", "image": "registry.k8s.io/e2e-test-images/agnhost:2.40"}],
+                    "volumes": [{"name": "config-vol", "configMap": {"name": "my-config"}}]
+                },
+                "status": {"phase": "Running"}
+            }),
+        )
+        .await
+        .expect("create pod");
+
+        let volume_path = crate::paths::volumes_root_path(runtime_ns)
+            .join("default_cm-pod/volumes/config-map/config-vol");
+        let volume_path = volume_path.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&volume_path).expect("create mounted configmap volume");
+        std::fs::write(format!("{volume_path}/data-1"), "value-1").expect("seed mounted data");
+
+        handle_watch_event(
+            WatchEventHandlerContext {
+                db: db_handle.as_ref(),
+                cluster_api: &cluster_api,
+                node_name: "worker-a",
+                containerd_namespace: runtime_ns,
+                cluster_reconciliation_enabled: false,
+                pod_repo: &pod_repo,
+                pod_creation_tracker: &pod_creation_tracker,
+                retry_state: &retry_state,
+                pod_lifecycle_state: &pod_lifecycle_state,
+                pod_lifecycle_router,
+                task_supervisor: supervisor,
+            },
+            WatchEvent::modified(json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "my-config"},
+                "data": {"data-1": "value-2"}
+            })),
+        )
+        .await;
+
+        let refreshed =
+            crate::utils::read_utf8_file(format!("{volume_path}/data-1")).expect("read refresh");
+        assert_eq!(refreshed, "value-2");
     }
 }

@@ -497,6 +497,7 @@ async fn run_pod_watcher_with_runtime(
                         db,
                         cluster_api: &state.cluster_api,
                         node_name: &config.node_name,
+                        containerd_namespace: &config.containerd_namespace,
                         cluster_reconciliation_enabled: state.cluster_reconciliation_enabled,
                         pod_repo: &state.pod_repository,
                         pod_creation_tracker: &pod_creation_tracker,
