@@ -213,16 +213,6 @@ impl ControllerDispatcher {
     /// to a synchronous `reconcile` so test fixtures that don't spawn the
     /// worker still observe the post-mutation reconcile side effects.
     pub async fn enqueue(&self, resource: &Value) {
-        self.enqueue_with_priority(resource, QueuePriority::Normal)
-            .await;
-    }
-
-    pub async fn enqueue_high_priority(&self, resource: &Value) {
-        self.enqueue_with_priority(resource, QueuePriority::High)
-            .await;
-    }
-
-    async fn enqueue_with_priority(&self, resource: &Value, priority: QueuePriority) {
         if !self
             .worker_running
             .load(std::sync::atomic::Ordering::Acquire)
@@ -238,7 +228,7 @@ impl ControllerDispatcher {
             return;
         }
         if let Some(key) = key_for_value(resource) {
-            self.queue.add_with_priority(key, priority).await;
+            self.queue.add(key).await;
         }
     }
 
@@ -312,22 +302,8 @@ impl ControllerDispatcher {
     }
 
     #[cfg(test)]
-    pub async fn queued_reconcile_priority_for_test(
-        &self,
-        key: &ReconcileKey,
-    ) -> Option<QueuePriority> {
-        self.queue.ready_priority(key).await
-    }
-
-    #[cfg(test)]
     pub async fn take_reconcile_key_for_test(&self) -> ReconcileKey {
         self.queue.take().await.into()
-    }
-
-    #[cfg(test)]
-    pub fn set_worker_running_for_test(&self, running: bool) {
-        self.worker_running
-            .store(running, std::sync::atomic::Ordering::Release);
     }
 
     /// Configure the synchronous-fallback context for [`enqueue`] when no

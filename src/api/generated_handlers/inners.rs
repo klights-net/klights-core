@@ -74,17 +74,8 @@ async fn enqueue_generated_controller_after_mutation(
     kind: &'static str,
     resource: &Value,
 ) {
-    match (api_version, kind) {
-        ("v1", "ReplicationController") => {
-            state
-                .controller_dispatcher
-                .enqueue_high_priority(resource)
-                .await;
-        }
-        ("certificates.k8s.io/v1", "CertificateSigningRequest") => {
-            state.controller_dispatcher.enqueue(resource).await;
-        }
-        _ => {}
+    if crate::controllers::workqueue::controller_kind_static(api_version, kind).is_some() {
+        state.controller_dispatcher.enqueue(resource).await;
     }
 }
 

@@ -331,15 +331,6 @@ impl WorkQueue {
         self.ready_keys_snapshot().await
     }
 
-    #[cfg(test)]
-    pub async fn ready_priority(&self, key: &ReconcileKey) -> Option<QueuePriority> {
-        self.ready
-            .lock()
-            .await
-            .get(&key.clone().into())
-            .map(|entry| entry.priority)
-    }
-
     pub async fn ready_keys_snapshot(&self) -> Vec<ReconcileKey> {
         let mut keys: Vec<_> = self
             .ready

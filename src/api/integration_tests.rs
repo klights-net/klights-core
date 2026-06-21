@@ -1196,18 +1196,13 @@ async fn test_replicationcontroller_create_defaults_selector_from_template_label
 }
 
 #[tokio::test]
-async fn test_replicationcontroller_create_queues_high_priority_reconcile() {
-    use crate::controllers::workqueue::{QueuePriority, ReconcileKey};
+async fn test_replicationcontroller_create_adopts_matching_orphan_pod() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use serde_json::json;
     use tower::ServiceExt;
 
-    let state = build_test_app_state().await;
-    let db = state.db.clone();
-    let dispatcher = state.controller_dispatcher.clone();
-    dispatcher.set_worker_running_for_test(true);
-    let app = crate::api::build_router(state);
+    let (app, db) = build_test_router_with_db().await;
 
     db.create_resource(
         "v1",
@@ -1215,6 +1210,28 @@ async fn test_replicationcontroller_create_queues_high_priority_reconcile() {
         None,
         "default",
         json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}),
+    )
+    .await
+    .unwrap();
+
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "rc-adopt-orphan-pod",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "rc-adopt-orphan-pod",
+                "namespace": "default",
+                "labels": { "name": "rc-adopt-orphan" }
+            },
+            "spec": {
+                "containers": [{ "name": "pause", "image": "registry.k8s.io/pause:3.10.1" }]
+            },
+            "status": { "phase": "Running" }
+        }),
     )
     .await
     .unwrap();
@@ -1228,14 +1245,14 @@ async fn test_replicationcontroller_create_queues_high_priority_reconcile() {
                 "apiVersion": "v1",
                 "kind": "ReplicationController",
                 "metadata": {
-                    "name": "rc-adopt-priority",
+                    "name": "rc-adopt-orphan",
                     "namespace": "default"
                 },
                 "spec": {
                     "replicas": 1,
-                    "selector": { "name": "rc-adopt-priority" },
+                    "selector": { "name": "rc-adopt-orphan" },
                     "template": {
-                        "metadata": { "labels": { "name": "rc-adopt-priority" } },
+                        "metadata": { "labels": { "name": "rc-adopt-orphan" } },
                         "spec": { "containers": [{ "name": "pause", "image": "registry.k8s.io/pause:3.10.1" }] }
                     }
                 }
@@ -1246,16 +1263,49 @@ async fn test_replicationcontroller_create_queues_high_priority_reconcile() {
     let create_resp = app.clone().oneshot(create_rc).await.unwrap();
     assert_eq!(create_resp.status(), StatusCode::CREATED);
 
-    let key = ReconcileKey::namespaced(
-        "v1",
-        "ReplicationController",
-        "default",
-        "rc-adopt-priority",
-    );
+    let pods = db
+        .list_resources(
+            "v1",
+            "Pod",
+            Some("default"),
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await
+        .unwrap();
     assert_eq!(
-        dispatcher.queued_reconcile_priority_for_test(&key).await,
-        Some(QueuePriority::High),
-        "RC creates must not sit behind normal controller backlog because adoption is externally observable"
+        pods.items.len(),
+        1,
+        "RC create must adopt the matching orphan instead of creating a replacement pod"
+    );
+
+    let adopted_pod = db
+        .get_resource("v1", "Pod", Some("default"), "rc-adopt-orphan-pod")
+        .await
+        .unwrap()
+        .unwrap();
+    let owner_ref = adopted_pod
+        .data
+        .pointer("/metadata/ownerReferences")
+        .and_then(|value| value.as_array())
+        .and_then(|refs| refs.iter().find(|owner| owner["controller"] == true))
+        .expect("matching orphan pod must be adopted by the created RC");
+    assert_eq!(owner_ref["apiVersion"], "v1");
+    assert_eq!(owner_ref["kind"], "ReplicationController");
+    assert_eq!(owner_ref["name"], "rc-adopt-orphan");
+
+    let rc = db
+        .get_resource(
+            "v1",
+            "ReplicationController",
+            Some("default"),
+            "rc-adopt-orphan",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        owner_ref["uid"], rc.data["metadata"]["uid"],
+        "adopted pod ownerRef must point at the created RC UID"
     );
 }
 
