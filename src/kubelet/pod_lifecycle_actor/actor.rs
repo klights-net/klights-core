@@ -606,21 +606,31 @@ impl PodLifecycleActor {
         }
     }
 
-    fn reconcile_runtime_action(&mut self, key: PodLifecycleKey) -> PodAction {
+    fn reconcile_runtime_action(
+        &mut self,
+        key: PodLifecycleKey,
+        hint: crate::kubelet::pod_runtime::service::RuntimeReconcileHint,
+    ) -> PodAction {
         let operation_id = self.next_work_operation(&key, PodLifecycleWorkKind::ReconcileRuntime);
         tracing::info!(
             namespace = %key.namespace, pod = %key.name, uid = %key.uid,
             operation_id, phase = ?self.state.phase,
+            hint_container_id = ?hint.container_id,
             "lifecycle-actor: dispatching ReconcileRuntime"
         );
         PodAction::ReconcileRuntime {
             key,
+            hint,
             operation_id,
             permit: None,
         }
     }
 
-    fn runtime_reconcile_action_or_defer(&mut self, key: PodLifecycleKey) -> PodAction {
+    fn runtime_reconcile_action_or_defer(
+        &mut self,
+        key: PodLifecycleKey,
+        container_id: Option<&str>,
+    ) -> PodAction {
         let in_flight = self.state.in_flight_kind_for_uid(&key.uid);
         let defer = in_flight.is_some()
             || matches!(
@@ -629,14 +639,19 @@ impl PodLifecycleActor {
             );
         tracing::info!(
             namespace = %key.namespace, pod = %key.name, uid = %key.uid,
-            phase = ?self.state.phase, ?in_flight, defer,
+            phase = ?self.state.phase, ?in_flight, defer, container_id,
             "lifecycle-actor: CRI event → runtime_reconcile_action_or_defer"
         );
         if defer {
-            self.state.pending_runtime_reconcile = true;
+            self.state.defer_runtime_reconcile(container_id);
             PodAction::Noop
         } else {
-            self.reconcile_runtime_action(key)
+            self.reconcile_runtime_action(
+                key,
+                crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_id(
+                    container_id.unwrap_or(""),
+                ),
+            )
         }
     }
 
@@ -652,8 +667,8 @@ impl PodLifecycleActor {
             && self.state.in_flight.is_none()
             && matches!(self.state.phase, PodPhase::Running)
         {
-            self.state.pending_runtime_reconcile = false;
-            self.reconcile_runtime_action(key)
+            let hint = self.state.take_runtime_reconcile_hint();
+            self.reconcile_runtime_action(key, hint)
         } else {
             PodAction::Noop
         }
@@ -664,8 +679,8 @@ impl PodLifecycleActor {
         key: PodLifecycleKey,
     ) -> PodAction {
         if self.state.pending_runtime_reconcile && self.state.in_flight.is_none() {
-            self.state.pending_runtime_reconcile = false;
-            return self.reconcile_runtime_action(key);
+            let hint = self.state.take_runtime_reconcile_hint();
+            return self.reconcile_runtime_action(key, hint);
         }
         PodAction::Noop
     }
@@ -1249,7 +1264,7 @@ impl PodLifecycleActor {
                         in_flight = ?self.state.in_flight_kind_for_uid(&key.uid),
                         "lifecycle-actor: Pending watch echo has podIP and running containers; reconciling runtime status"
                     );
-                    self.runtime_reconcile_action_or_defer(key)
+                    self.runtime_reconcile_action_or_defer(key, None)
                 } else if self.state.phase == PodPhase::Created {
                     self.state.phase = PodPhase::PendingStart;
                     self.start_or_check_slot_admission(key, pod.clone(), resource_version, true)
@@ -1646,10 +1661,10 @@ impl PodLifecycleActor {
                             uid = %key.uid,
                             "lifecycle-actor: StartPod completed without sandbox id; draining deferred runtime reconcile"
                         );
-                        self.state.pending_runtime_reconcile = false;
+                        let hint = self.state.take_runtime_reconcile_hint();
                         self.state.reset_start_retry_attempts();
                         self.state.pending_start_pod = None;
-                        return self.reconcile_runtime_action(key);
+                        return self.reconcile_runtime_action(key, hint);
                     }
                     // A StartPod can legitimately complete without a sandbox
                     // when the executor skipped an unscheduled pod snapshot.
@@ -1801,13 +1816,15 @@ impl PodLifecycleActor {
             }
 
             // ── Runtime reconcile ──
-            LifecycleMessage::CriEvent { key, .. } => {
+            LifecycleMessage::CriEvent {
+                key, container_id, ..
+            } => {
                 if self.state.active_uid.is_some() && !self.active_uid_is(&key) {
                     self.warn_active_uid_mismatch("cri_event", &key);
                     return PodAction::Noop;
                 }
                 self.ensure_active_uid(&key);
-                self.runtime_reconcile_action_or_defer(key)
+                self.runtime_reconcile_action_or_defer(key, Some(container_id.as_str()))
             }
             LifecycleMessage::ActiveDeadlineDue { key } => {
                 if self.state.active_uid.is_some() && !self.active_uid_is(&key) {
@@ -1815,7 +1832,7 @@ impl PodLifecycleActor {
                     return PodAction::Noop;
                 }
                 self.ensure_active_uid(&key);
-                self.runtime_reconcile_action_or_defer(key)
+                self.runtime_reconcile_action_or_defer(key, None)
             }
 
             // ── Commands ──

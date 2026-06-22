@@ -124,9 +124,11 @@ pub struct MockCriRuntime {
     image_present: Mutex<bool>,
     /// If set, `run_pod_sandbox` cancels this token after recording.
     start_pod_cancel: Mutex<Option<CancellationToken>>,
-    /// Exit code reported by `container_status`.
+    /// Exit code reported by `container_status` when no per-container status
+    /// has been configured for the queried container id.
     container_exit_code: Mutex<i32>,
-    /// State reported by `container_status`.
+    /// State reported by `container_status` when no per-container status
+    /// has been configured for the queried container id.
     container_status_state: Mutex<i32>,
     /// Exit code reported by `exec_sync`.
     exec_exit_code: Mutex<i32>,
@@ -139,6 +141,22 @@ pub struct MockCriRuntime {
     /// Recorded PodSandboxConfig from create_container calls.
     create_sandbox_configs: Mutex<Vec<PodSandboxConfig>>,
     event_sender: tokio::sync::broadcast::Sender<CriRuntimeContainerEvent>,
+    /// Per-container mock status keyed by container id. When an entry exists
+    /// for the queried id, `container_status` returns its values (including a
+    /// populated `metadata.name`), so tests can drive fast-exit/CRI-event
+    /// scenarios where the global scalar fields do not apply.
+    container_status_overrides: Mutex<HashMap<String, MockContainerStatus>>,
+}
+
+/// Per-container mock status record used by `container_status` overrides.
+#[derive(Clone, Debug)]
+struct MockContainerStatus {
+    name: String,
+    state: i32,
+    exit_code: i32,
+    started_at: i64,
+    finished_at: i64,
+    image: String,
 }
 
 impl Default for MockCriRuntime {
@@ -165,6 +183,7 @@ impl MockCriRuntime {
             sandbox_configs: Mutex::new(Vec::new()),
             create_sandbox_configs: Mutex::new(Vec::new()),
             event_sender,
+            container_status_overrides: Mutex::new(HashMap::new()),
         }
     }
 
@@ -187,6 +206,50 @@ impl MockCriRuntime {
     /// Set the CRI state returned by `container_status`.
     pub fn set_container_status_state(&self, state: i32) {
         *self.container_status_state.lock().unwrap() = state;
+    }
+
+    /// Configure a per-container status override. `container_status` for this
+    /// container id returns a `ContainerStatusResponse` populated with the
+    /// given name/state/exit-code/timestamps/image and a `metadata.name` so
+    /// runtime reconcile can match the container to a spec entry by name.
+    /// Used by fast-exit / CRI-event tests where the global scalar fields
+    /// cannot describe an individual container.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_container_status_for_test(
+        &self,
+        container_id: &str,
+        name: &str,
+        state: crate::kubelet::pod_runtime::cri::ContainerRuntimeState,
+        exit_code: i32,
+        started_at: i64,
+        finished_at: i64,
+        image: &str,
+    ) {
+        let cri_state = match state {
+            crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Created => {
+                k8s_cri::v1::ContainerState::ContainerCreated as i32
+            }
+            crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Running => {
+                k8s_cri::v1::ContainerState::ContainerRunning as i32
+            }
+            crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Exited => {
+                k8s_cri::v1::ContainerState::ContainerExited as i32
+            }
+            crate::kubelet::pod_runtime::cri::ContainerRuntimeState::Unknown => {
+                k8s_cri::v1::ContainerState::ContainerUnknown as i32
+            }
+        };
+        self.container_status_overrides.lock().unwrap().insert(
+            container_id.to_string(),
+            MockContainerStatus {
+                name: name.to_string(),
+                state: cri_state,
+                exit_code,
+                started_at,
+                finished_at,
+                image: image.to_string(),
+            },
+        );
     }
 
     pub fn set_exec_exit_code(&self, exit_code: i32) {
@@ -413,6 +476,34 @@ impl crate::kubelet::pod_runtime::cri::CriRuntime for MockCriRuntime {
         container_id: &str,
     ) -> anyhow::Result<k8s_cri::v1::ContainerStatusResponse> {
         self.record(MockCriOperation::ContainerStatus(container_id.to_string()))?;
+        if let Some(override_status) = self
+            .container_status_overrides
+            .lock()
+            .unwrap()
+            .get(container_id)
+            .cloned()
+        {
+            return Ok(k8s_cri::v1::ContainerStatusResponse {
+                status: Some(k8s_cri::v1::ContainerStatus {
+                    id: container_id.to_string(),
+                    metadata: Some(k8s_cri::v1::ContainerMetadata {
+                        name: override_status.name,
+                        attempt: 0,
+                    }),
+                    state: override_status.state,
+                    exit_code: override_status.exit_code,
+                    started_at: override_status.started_at,
+                    finished_at: override_status.finished_at,
+                    image: Some(k8s_cri::v1::ImageSpec {
+                        image: override_status.image.clone(),
+                        ..Default::default()
+                    }),
+                    image_ref: override_status.image,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
         let exit_code = *self.container_exit_code.lock().unwrap();
         let state = *self.container_status_state.lock().unwrap();
         Ok(k8s_cri::v1::ContainerStatusResponse {
@@ -1398,6 +1489,7 @@ pub enum MockRuntimeCall {
         namespace: String,
         name: String,
         uid: String,
+        hint_container_id: Option<String>,
     },
     ReconcileCriLeftovers {
         namespace: String,
@@ -1471,6 +1563,7 @@ impl MockRuntimeCall {
                 namespace,
                 name,
                 uid,
+                hint_container_id: None,
             },
             "reconcile_cri_leftovers" => MockRuntimeCall::ReconcileCriLeftovers {
                 namespace,
@@ -1624,12 +1717,21 @@ impl PodRuntimeService for MockPodRuntimeService {
         Ok(self.finalize_result.lock().unwrap().clone())
     }
 
-    async fn reconcile_runtime(&self, key: PodRuntimeKey) -> anyhow::Result<()> {
+    async fn reconcile_runtime(
+        &self,
+        key: PodRuntimeKey,
+        hint: super::service::RuntimeReconcileHint,
+    ) -> anyhow::Result<()> {
         self.check_fail("reconcile_runtime")?;
         self.calls
             .lock()
             .unwrap()
-            .push(MockRuntimeCall::from_key("reconcile_runtime", &key));
+            .push(MockRuntimeCall::ReconcileRuntime {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+                hint_container_id: hint.container_id,
+            });
         Ok(())
     }
 
@@ -2233,7 +2335,10 @@ impl PodRuntimeHarness {
         key: crate::kubelet::pod_runtime::service::PodRuntimeKey,
     ) {
         self.runtime
-            .reconcile_runtime(key)
+            .reconcile_runtime(
+                key,
+                crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+            )
             .await
             .expect("reconcile runtime");
     }

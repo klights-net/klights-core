@@ -82,6 +82,39 @@ pub enum PodFinalizeStartupResult {
     Unconfirmed,
 }
 
+/// Hint carried from a CRI container event into deferred runtime reconcile.
+///
+/// When a short-lived pod exits while startup finalization is still in
+/// flight, the actor defers the CRI stop event and later runs a runtime
+/// reconcile. By then the sandbox container listing may be empty or stale.
+/// This hint lets the reconciler read the concrete (terminated) container
+/// status via the event's container id instead of synthesizing
+/// `Pending`/`ContainerCreating`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RuntimeReconcileHint {
+    pub container_id: Option<String>,
+}
+
+impl RuntimeReconcileHint {
+    /// No hint — used by callers that have no concrete container id.
+    pub fn none() -> Self {
+        Self { container_id: None }
+    }
+
+    /// Build a hint from a CRI event container id. An empty id collapses to
+    /// `none()` so callers can pass the raw event payload without a guard.
+    pub fn from_container_id(container_id: impl Into<String>) -> Self {
+        let container_id = container_id.into();
+        if container_id.is_empty() {
+            Self::none()
+        } else {
+            Self {
+                container_id: Some(container_id),
+            }
+        }
+    }
+}
+
 /// Backend-neutral lifecycle runtime trait.
 /// Every lifecycle operation below `PodWorkExecutor` takes `PodRuntimeKey`
 /// or another UID-bearing command object.
@@ -114,7 +147,11 @@ pub trait PodRuntimeService: Send + Sync {
         key: PodRuntimeKey,
     ) -> anyhow::Result<PodDeletionFinalizeResult>;
 
-    async fn reconcile_runtime(&self, key: PodRuntimeKey) -> anyhow::Result<()>;
+    async fn reconcile_runtime(
+        &self,
+        key: PodRuntimeKey,
+        hint: RuntimeReconcileHint,
+    ) -> anyhow::Result<()>;
 
     async fn reconcile_cri_leftovers(&self, key: PodRuntimeKey) -> anyhow::Result<()>;
 
@@ -1144,15 +1181,35 @@ impl RealPodRuntimeService {
                 }
             };
             let fallback_spec = spec_containers.get(idx);
-            let container_name = status
+            // Prefer the CRI metadata name, then the existing status entry
+            // whose containerID references this container (so a CRI event
+            // container is never assigned to the wrong spec container when
+            // CRI omits the metadata name), then the spec index.
+            let cri_name = status
                 .as_ref()
                 .and_then(|status| status.metadata.as_ref())
                 .map(|metadata| metadata.name.as_str())
-                .filter(|name| !name.is_empty())
-                .or_else(|| {
-                    fallback_spec
-                        .and_then(|container| container.get("name").and_then(|name| name.as_str()))
-                })
+                .filter(|name| !name.is_empty());
+            let existing_status_name = existing_statuses.iter().find_map(|existing| {
+                let matches_id = existing
+                    .get("containerID")
+                    .and_then(|id| id.as_str())
+                    .map(|id| id.strip_prefix("containerd://").unwrap_or(id) == container_id)
+                    .unwrap_or(false);
+                if matches_id {
+                    existing
+                        .get("name")
+                        .and_then(|name| name.as_str())
+                        .filter(|name| !name.is_empty())
+                } else {
+                    None
+                }
+            });
+            let spec_index_name = fallback_spec
+                .and_then(|container| container.get("name").and_then(|name| name.as_str()));
+            let container_name = cri_name
+                .or(existing_status_name)
+                .or(spec_index_name)
                 .unwrap_or("");
             if container_name.is_empty() || !spec_names.contains(container_name) {
                 continue;
@@ -1317,6 +1374,30 @@ impl RealPodRuntimeService {
         self.filesystem
             .read_termination_message(key, container_name, policy, exit_code)
             .await
+    }
+
+    /// Read the CRI status for a specific container id and map it to the
+    /// runtime-reconcile state enum. Returns `None` when CRI cannot report
+    /// the container (already removed, unknown id) so the caller can decide
+    /// whether to fall back to ContainerCreating or skip the entry.
+    async fn runtime_state_from_container_status(
+        &self,
+        container_id: &str,
+    ) -> anyhow::Result<Option<ContainerRuntimeState>> {
+        let state = match self.cri.container_status(container_id).await {
+            Ok(response) => response
+                .status
+                .map(|status| ContainerRuntimeState::from_cri_state_i32(status.state)),
+            Err(e) => {
+                tracing::warn!(
+                    container_id = container_id,
+                    "failed to inspect hinted container during runtime reconcile: {}",
+                    e
+                );
+                None
+            }
+        };
+        Ok(state)
     }
 
     fn compute_reconciled_phase(
@@ -2909,7 +2990,11 @@ impl PodRuntimeService for RealPodRuntimeService {
         Ok(result)
     }
 
-    async fn reconcile_runtime(&self, key: PodRuntimeKey) -> anyhow::Result<()> {
+    async fn reconcile_runtime(
+        &self,
+        key: PodRuntimeKey,
+        hint: RuntimeReconcileHint,
+    ) -> anyhow::Result<()> {
         let resource = self
             .repository
             .get_pod_for_uid(&key.namespace, &key.name, &key.uid)
@@ -2932,12 +3017,24 @@ impl PodRuntimeService for RealPodRuntimeService {
             None => return Ok(()),
         };
 
-        // 2. List containers in the sandbox.
-        let containers = self
+        // 2. List containers in the sandbox. Fast-exit / lossy scheduling can
+        // race the reconcile so the listing is empty or stale by the time it
+        // runs. When a CRI event carried a concrete container id, fall back to
+        // reading its status directly so the pod does not stay API-visible as
+        // Pending/ContainerCreating.
+        let mut containers = self
             .container_control
             .list_containers(Some(&sandbox_id))
             .await
             .unwrap_or_default();
+        if containers.is_empty()
+            && let Some(container_id) = hint.container_id.as_deref()
+            && let Some(state) = self
+                .runtime_state_from_container_status(container_id)
+                .await?
+        {
+            containers.push((container_id.to_string(), state));
+        }
 
         // 3. Build phase and container statuses from CRI state plus the Pod spec.
         let (mut phase, mut container_statuses) = self

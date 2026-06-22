@@ -909,7 +909,12 @@ async fn mock_pod_runtime_service_records_all_methods() {
         .await
         .unwrap();
     mock.finalize_deletion(key.clone()).await.unwrap();
-    mock.reconcile_runtime(key.clone()).await.unwrap();
+    mock.reconcile_runtime(
+        key.clone(),
+        crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+    )
+    .await
+    .unwrap();
     mock.reconcile_cri_leftovers(key.clone()).await.unwrap();
     mock.reconcile_ephemeral(key.clone(), None).await.unwrap();
     let (tx, _rx) = tokio::sync::mpsc::channel::<
@@ -954,6 +959,7 @@ async fn mock_pod_runtime_service_records_all_methods() {
                 namespace,
                 name,
                 uid,
+                ..
             }
             | MockRuntimeCall::ReconcileCriLeftovers {
                 namespace,
@@ -5287,7 +5293,13 @@ async fn real_runtime_reconcile_runtime_noop_when_no_sandbox() {
     let harness = PodRuntimeHarness::new().await;
     let key = PodRuntimeKey::new("ns", "rec-pod", "uid-1");
     // No sandbox recorded — should be a no-op.
-    let result = harness.runtime.reconcile_runtime(key).await;
+    let result = harness
+        .runtime
+        .reconcile_runtime(
+            key,
+            crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+        )
+        .await;
     assert!(result.is_ok());
 }
 
@@ -5371,7 +5383,10 @@ async fn real_runtime_reconcile_runtime_restarts_exited_restart_policy_always_co
 
     harness
         .runtime
-        .reconcile_runtime(key.clone())
+        .reconcile_runtime(
+            key.clone(),
+            crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+        )
         .await
         .unwrap();
 
@@ -5527,7 +5542,10 @@ async fn real_runtime_reconcile_restart_policy_always_publishes_replacement_runn
 
     harness
         .runtime
-        .reconcile_runtime(key.clone())
+        .reconcile_runtime(
+            key.clone(),
+            crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+        )
         .await
         .unwrap();
 
@@ -5625,7 +5643,10 @@ async fn reconcile_runtime_writes_pod_and_host_ips_with_parity() {
 
     harness
         .runtime
-        .reconcile_runtime(key.clone())
+        .reconcile_runtime(
+            key.clone(),
+            crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+        )
         .await
         .unwrap();
 
@@ -5717,7 +5738,10 @@ async fn reconcile_runtime_writes_pod_and_host_ips_with_parity() {
 
     harness
         .runtime
-        .reconcile_runtime(ready_key.clone())
+        .reconcile_runtime(
+            ready_key.clone(),
+            crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+        )
         .await
         .unwrap();
 
@@ -5807,7 +5831,10 @@ async fn reconcile_runtime_duplicate_status_does_not_emit_second_watch_event() {
 
     harness
         .runtime
-        .reconcile_runtime(key.clone())
+        .reconcile_runtime(
+            key.clone(),
+            crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+        )
         .await
         .unwrap();
     let first_event = tokio::time::timeout(std::time::Duration::from_secs(1), watch_rx.recv())
@@ -5832,7 +5859,10 @@ async fn reconcile_runtime_duplicate_status_does_not_emit_second_watch_event() {
 
     harness
         .runtime
-        .reconcile_runtime(key.clone())
+        .reconcile_runtime(
+            key.clone(),
+            crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+        )
         .await
         .unwrap();
     assert!(
@@ -5914,7 +5944,10 @@ async fn active_deadline_enforcement_marks_failed_with_parity() {
 
     harness
         .runtime
-        .reconcile_runtime(key.clone())
+        .reconcile_runtime(
+            key.clone(),
+            crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+        )
         .await
         .unwrap();
 
@@ -8299,7 +8332,14 @@ async fn real_runtime_reconcile_does_not_preserve_ready_started_for_missing_cont
         .await
         .unwrap();
 
-    harness.runtime.reconcile_runtime(key).await.unwrap();
+    harness
+        .runtime
+        .reconcile_runtime(
+            key,
+            crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+        )
+        .await
+        .unwrap();
 
     let updated = harness
         .repo
@@ -9995,5 +10035,109 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
             .unwrap()
             .is_none(),
         "actor finalization must remove the unstarted terminating pod row"
+    );
+}
+
+// ── Task 1 (fixnow): CRI event fast-exit hint ──
+//
+// Short-lived pods (ConfigMap-volume / ReplicaSet-adoption) can exit while
+// startup finalization is still in flight. The actor defers the CRI stop
+// event and later runs a runtime reconcile. If sandbox container listing
+// returns empty/stale by then, the reconciler must not synthesize
+// Pending/ContainerCreating — it must use the CRI event's container id to
+// read the concrete (terminated) status and publish Succeeded.
+
+#[tokio::test]
+async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty() {
+    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
+    use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
+    use crate::kubelet::pod_runtime::store::PodRuntimeStore;
+
+    let harness = PodRuntimeHarness::new().await;
+    let key = PodRuntimeKey::new("container-runtime", "fast-exit", "uid-fast-exit");
+    let image = "registry.k8s.io/e2e-test-images/busybox:1.37.0-1";
+    let pod = serde_json::json!({
+        "apiVersion":"v1","kind":"Pod",
+        "metadata":{"namespace":"container-runtime","name":"fast-exit","uid":"uid-fast-exit","resourceVersion":"1"},
+        "spec":{"nodeName":"test-node","restartPolicy":"Never","containers":[{"name":"app","image":image,"imagePullPolicy":"Never","command":["/bin/sh","-c","exit 0"]}]},
+        "status":{"phase":"Pending","containerStatuses":[{"name":"app","image":image,"imageID":image,"ready":false,"started":false,"restartCount":0,"state":{"waiting":{"reason":"ContainerCreating"}}}]}
+    });
+    harness.create_runtime_pod(pod.clone()).await;
+    harness
+        .repo
+        .set_pod_status_for_uid(
+            "container-runtime",
+            "fast-exit",
+            "uid-fast-exit",
+            PodStatusUpdate {
+                phase: "Pending".to_string(),
+                pod_ip: "10.50.2.44".to_string(),
+                host_ip: String::new(),
+                container_statuses: pod
+                    .pointer("/status/containerStatuses")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap(),
+                init_container_statuses: None,
+                qos_class: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    harness
+        .store
+        .record_sandbox(&key, "sandbox-fast-exit")
+        .await
+        .unwrap();
+    // Sandbox container listing is empty (the container already exited and
+    // was removed, or the listing lagged behind the CRI event).
+    harness.container_control.set_container_states(Vec::new());
+    // Per-container mock status keyed by container id — the CRI event hint.
+    harness.cri.set_container_status_for_test(
+        "ctr-fast-exit",
+        "app",
+        ContainerRuntimeState::Exited,
+        0,
+        1_000_000_000,
+        1_250_000_000,
+        image,
+    );
+    harness
+        .runtime
+        .reconcile_runtime(
+            key.clone(),
+            RuntimeReconcileHint::from_container_id("ctr-fast-exit"),
+        )
+        .await
+        .unwrap();
+
+    let updated = harness.stored_pod(&key).await;
+    assert_eq!(
+        updated.pointer("/status/phase").and_then(|v| v.as_str()),
+        Some("Succeeded"),
+        "fast-exit pod must reach Succeeded phase via CRI event hint, got: {:?}",
+        updated.pointer("/status/phase")
+    );
+    let status = updated
+        .pointer("/status/containerStatuses/0")
+        .expect("container status must exist");
+    assert_eq!(
+        status.pointer("/state/terminated/exitCode"),
+        Some(&serde_json::json!(0)),
+        "container state must be terminated with exit code 0, got: {:?}",
+        status.pointer("/state")
+    );
+    assert_eq!(
+        status.pointer("/state/terminated/reason"),
+        Some(&serde_json::json!("Completed")),
+        "terminated reason must be Completed, got: {:?}",
+        status.pointer("/state/terminated/reason")
+    );
+    assert!(
+        status.pointer("/state/waiting").is_none(),
+        "fast-exit pod must not remain ContainerCreating, got: {:?}",
+        status.pointer("/state")
     );
 }

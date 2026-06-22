@@ -79,6 +79,11 @@ pub struct PodLifecycleState {
     /// Runtime reconciliation must run after startup finalizers complete so
     /// fast-exiting containers cannot be hidden by the final Running write.
     pub pending_runtime_reconcile: bool,
+    /// Container id carried by the deferred CRI event, if any. Drained into a
+    /// `RuntimeReconcileHint` when the deferred reconcile runs so the
+    /// reconciler can read the concrete (terminated) container status instead
+    /// of synthesizing Pending/ContainerCreating under a lossy listing.
+    pub pending_runtime_reconcile_container_id: Option<String>,
     /// A Running watch echo arrived while startup finalization was in flight.
     /// If that in-flight finalizer still cannot confirm probe startup, retry
     /// once with the newer watch state instead of waiting for another event.
@@ -105,6 +110,7 @@ impl Default for PodLifecycleState {
             retry_attempts: 0,
             last_resource_version: None,
             pending_runtime_reconcile: false,
+            pending_runtime_reconcile_container_id: None,
             pending_startup_finalization_retry: false,
         }
     }
@@ -139,6 +145,7 @@ impl PodLifecycleState {
         self.finalized = false;
         self.retry_attempts = 0;
         self.pending_runtime_reconcile = false;
+        self.pending_runtime_reconcile_container_id = None;
         self.pending_startup_finalization_retry = false;
         self.phase = PodPhase::Created;
     }
@@ -366,6 +373,39 @@ impl PodLifecycleState {
         self.finalized = false;
         self.pending_startup_finalization_retry = false;
         FinalizationAction::RunFinalizers
+    }
+
+    /// Defer a runtime reconcile that could not run because startup or another
+    /// operation is still in flight. `container_id` carries the CRI event's
+    /// concrete container id (if any) so the later reconcile can read its
+    /// status instead of synthesizing Pending/ContainerCreating under a
+    /// lossy sandbox container listing.
+    pub fn defer_runtime_reconcile(&mut self, container_id: Option<&str>) {
+        self.pending_runtime_reconcile = true;
+        // Preserve an earlier hint if the new one is empty — a subsequent
+        // CRI event with no container id must not erase a prior one.
+        if let Some(id) = container_id.filter(|id| !id.is_empty()) {
+            self.pending_runtime_reconcile_container_id = Some(id.to_string());
+        }
+    }
+
+    /// Drain a deferred runtime reconcile into a `RuntimeReconcileHint`.
+    /// Clears both the boolean flag and the carried container id. Returns
+    /// `none()` when nothing was deferred.
+    pub fn take_runtime_reconcile_hint(
+        &mut self,
+    ) -> crate::kubelet::pod_runtime::service::RuntimeReconcileHint {
+        if !self.pending_runtime_reconcile {
+            return crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none();
+        }
+        self.pending_runtime_reconcile = false;
+        let container_id = self.pending_runtime_reconcile_container_id.take();
+        match container_id {
+            Some(id) => {
+                crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_id(id)
+            }
+            None => crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
+        }
     }
 }
 

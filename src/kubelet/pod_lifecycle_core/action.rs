@@ -66,8 +66,12 @@ pub enum PodAction {
         permit: Option<WorkPermit>,
     },
     /// Reconcile pod runtime state (CRI event response, deadline check).
+    /// `hint.container_id` carries a CRI event's concrete container id when a
+    /// deferred stop event triggered the reconcile, so fast-exit pods are not
+    /// hidden by an empty/stale sandbox container listing.
     ReconcileRuntime {
         key: PodLifecycleKey,
+        hint: crate::kubelet::pod_runtime::service::RuntimeReconcileHint,
         operation_id: u64,
         permit: Option<WorkPermit>,
     },
@@ -315,6 +319,7 @@ mod tests {
     fn reconcile_runtime_accessors() {
         let action = PodAction::ReconcileRuntime {
             key: test_key(),
+            hint: crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
             operation_id: 45,
             permit: None,
         };

@@ -453,11 +453,14 @@ async fn dispatch_via_runtime(
             Ok(())
         }
         PodAction::ReconcileRuntime {
-            key, operation_id, ..
+            key,
+            hint,
+            operation_id,
+            ..
         } => {
             let kind = PodLifecycleWorkKind::ReconcileRuntime;
             let runtime_key = PodRuntimeKey::from(&key);
-            match runtime.reconcile_runtime(runtime_key).await {
+            match runtime.reconcile_runtime(runtime_key, hint).await {
                 Ok(()) => {
                     let _ = reply_to
                         .route(LifecycleMessage::PodWorkCompleted {
@@ -630,6 +633,7 @@ mod tests {
             (
                 PodAction::ReconcileRuntime {
                     key: key.clone(),
+                    hint: crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
                     operation_id: 4,
                     permit: None,
                 },
@@ -939,6 +943,7 @@ mod tests {
             mock.as_ref() as &dyn PodRuntimeService,
             PodAction::ReconcileRuntime {
                 key: PodLifecycleKey::new("ns", "rec-runtime", "uid-rr"),
+                hint: crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
                 operation_id: 1,
                 permit: None,
             },
@@ -1002,7 +1007,7 @@ mod tests {
         assert_eq!(calls.len(), 4, "four runtime calls");
         assert!(matches!(&calls[0],
             crate::kubelet::pod_runtime::test_support::MockRuntimeCall::ReconcileRuntime {
-                namespace, name, uid
+                namespace, name, uid, ..
             } if namespace == "ns" && name == "rec-runtime" && uid == "uid-rr"
         ));
         assert!(matches!(&calls[1],

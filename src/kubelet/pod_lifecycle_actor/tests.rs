@@ -1498,6 +1498,86 @@ fn cri_event_during_runtime_reconcile_dispatches_followup_after_completion() {
 }
 
 #[test]
+fn cri_event_during_startup_finalization_preserves_container_id_hint() {
+    use crate::kubelet::cri_events::KubeletEventKind;
+    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
+
+    // A fast-exit pod (ConfigMap-volume / ReplicaSet-adoption) can stop while
+    // startup finalization is still in flight. The actor defers the CRI stop
+    // event and the deferred reconcile must carry the event's container id so
+    // runtime reconcile can read the concrete (terminated) status instead of
+    // synthesizing Pending/ContainerCreating under an empty sandbox listing.
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+
+    let start = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: test_pod("default", "pod-a", "uid-a"),
+    });
+    assert!(matches!(
+        start,
+        PodAction::StartPod {
+            operation_id: 1,
+            ..
+        }
+    ));
+
+    // StartPod completes → FinalizeStartup dispatched (in flight).
+    let finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: 1,
+        kind: super::message::PodLifecycleWorkKind::StartPod,
+        sandbox_id: Some("sandbox-a".to_string()),
+    });
+    assert!(matches!(
+        finalize,
+        PodAction::FinalizeStartup {
+            operation_id: 2,
+            ..
+        }
+    ));
+
+    // CRI stop event arrives while FinalizeStartup is in flight → must defer.
+    let deferred = actor.handle_for_test(LifecycleMessage::CriEvent {
+        key: key.clone(),
+        container_id: "ctr-fast-exit".to_string(),
+        kind: KubeletEventKind::Stopped,
+    });
+    assert!(
+        matches!(deferred, PodAction::Noop),
+        "CRI event during startup finalization must be deferred, got {deferred:?}"
+    );
+
+    // FinalizeStartup completes → deferred reconcile drains, carrying the hint.
+    let reconciled = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key,
+        operation_id: 2,
+        kind: super::message::PodLifecycleWorkKind::FinalizeStartup,
+        sandbox_id: Some("sandbox-a".to_string()),
+    });
+    match reconciled {
+        PodAction::ReconcileRuntime {
+            hint, operation_id, ..
+        } => {
+            assert_eq!(
+                operation_id, 3,
+                "deferred runtime reconcile must use the next operation id"
+            );
+            assert_eq!(
+                hint,
+                RuntimeReconcileHint::from_container_id("ctr-fast-exit"),
+                "deferred reconcile must carry the CRI event's container id so the reconciler can read the concrete terminated status"
+            );
+        }
+        other => panic!(
+            "FinalizeStartup completion must drain the deferred CRI event as a ReconcileRuntime carrying the container id hint, got {other:?}"
+        ),
+    }
+}
+
+#[test]
 fn runtime_reconcile_after_unconfirmed_startup_finalization_retries_finalization() {
     use crate::kubelet::cri_events::KubeletEventKind;
     use crate::kubelet::pod_lifecycle_core::action::PodAction;
