@@ -53,6 +53,14 @@ pub struct GrpcTransportPolicy {
     /// keepalive-alive but response-wedged call so lane self-heal + durable
     /// retry can re-send on a fresh connection.
     pub unary_deadline: Duration,
+    /// bug-grpc T6: per-call deadline for the three Raft consensus RPCs
+    /// (AppendEntries/Vote/InstallSnapshot). Shorter than the generic unary
+    /// deadline — long enough to absorb a ~200 ms WAN round-trip, short
+    /// enough that a keepalive-alive but response-wedged peer cannot stall
+    /// consensus under packet loss. Bounds the call so the Raft lane is
+    /// evicted and openraft's own retry/backoff re-sends on a fresh
+    /// connection.
+    pub raft_unary_deadline: Duration,
 
     // --- tls ---
     /// Server-side TLS handshake timeout.
@@ -124,6 +132,10 @@ impl Default for GrpcTransportPolicy {
             max_message_bytes: 32 * 1024 * 1024,
             // Former `DEFAULT_UNARY_DEADLINE`.
             unary_deadline: Duration::from_secs(15),
+            // bug-grpc T6: shorter than `unary_deadline` so a wedged peer
+            // aborts near 5 s instead of 15 s — well inside openraft's
+            // election timeout and long enough for a slow WAN round-trip.
+            raft_unary_deadline: Duration::from_secs(5),
             // Former `tls::TLS_HANDSHAKE_TIMEOUT`.
             tls_handshake_timeout: Duration::from_secs(10),
             evict_lane_on_transport_error: true,

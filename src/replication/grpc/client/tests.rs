@@ -1260,6 +1260,94 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn raft_append_entries_rpc_times_out_and_evicts_raft_lane() {
+        // bug-grpc T6: the three Raft consensus RPCs (AppendEntries/Vote/
+        // InstallSnapshot) used to bypass the supervised-deadline wrapper that
+        // bounds every other unary worker→leader RPC. Under partial packet
+        // loss the HTTP/2 keepalive PING still gets through (connection deemed
+        // alive) while the RPC's response is wedged, so a follower's
+        // AppendEntries could stall consensus indefinitely. Routed through
+        // `raft_unary_call`, a wedged call must abort at the per-call
+        // `raft_unary_deadline`, surface a deadline-exceeded error, and evict
+        // ONLY the Raft lane so the next attempt rebuilds a fresh connection
+        // while sibling lanes keep their warm pools.
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+            .await
+            .unwrap();
+        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+            .await
+            .unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let app = crate::replication::grpc::server::mount_service(
+            axum::Router::new(),
+            service,
+            db.clone(),
+            default_transport_policy(),
+        );
+        let app = mount_test_service_with_node_cert(app, "worker-1");
+        // Wedge every RaftAppendEntries call far longer than the client
+        // deadline, simulating a response that never arrives over a lossy link.
+        let app = app.layer(axum::middleware::from_fn(
+            |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                if request.uri().path().ends_with("/RaftAppendEntries") {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                next.run(request).await
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // Use `new` (not `connect`) so the wedged /Connect path is never hit.
+        let mut client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: endpoint,
+                token,
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: dataplane(),
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+        );
+        client.override_raft_unary_deadline(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.raft_append_entries_rpc(Vec::new()),
+        )
+        .await;
+
+        let result = outcome.expect(
+            "raft_append_entries_rpc must return within the wall-clock bound (deadline must fire)",
+        );
+        let message = format!("{}", result.unwrap_err());
+        assert!(
+            message.contains("deadline exceeded"),
+            "a wedged raft_append_entries must surface a deadline-exceeded error, got: {message}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must abort near the 50ms raft deadline, not the 30s server wedge"
+        );
+        assert!(
+            !client.lane_pool_present_for_test(ChannelLane::Raft).await,
+            "the per-call deadline must evict the wedged Raft lane so the retry rebuilds"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn client_snapshot_decodes_entries() {
         let (client, _service, db, handle) = client_and_service().await;
         db.create_namespace(

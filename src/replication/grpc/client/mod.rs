@@ -840,6 +840,18 @@ impl ReplicationGrpcClient {
         self.policy = Arc::new(policy);
     }
 
+    /// Test seam: shrink the Raft unary RPC deadline so timeout behaviour
+    /// can be exercised in milliseconds instead of the production value.
+    /// bug-grpc T6: the three Raft consensus RPCs now have their own
+    /// per-call deadline (`raft_unary_deadline`) so a wedged peer cannot
+    /// stall consensus under partial packet loss.
+    #[cfg(test)]
+    pub(crate) fn override_raft_unary_deadline(&mut self, deadline: Duration) {
+        let mut policy = *self.policy;
+        policy.raft_unary_deadline = deadline;
+        self.policy = Arc::new(policy);
+    }
+
     /// bug-grpc: number of real channel builds (TLS handshakes) so far.
     /// Test seam asserting unary RPCs reuse a cached channel.
     #[cfg(test)]
@@ -1313,6 +1325,52 @@ impl ReplicationGrpcClient {
         )))
     }
 
+    /// bug-grpc T6: the raft analogue of [`unary_call`] for the three Raft
+    /// consensus RPCs (AppendEntries/Vote/InstallSnapshot). Bounds the call
+    /// with `policy.raft_unary_deadline` via the supervised-timeout helper
+    /// so a keepalive-alive but response-wedged peer cannot stall consensus
+    /// under partial packet loss, and heals the Raft lane on transport
+    /// failure or an elapsed deadline so the next attempt rebuilds a fresh
+    /// connection.
+    ///
+    /// Unlike the worker→leader [`unary_call`], raft RPCs address a fixed
+    /// peer (not a leader-endpoint failover set) and have no `not raft
+    /// leader` retry semantics, so this wrapper does not iterate
+    /// [`leader_endpoint_candidates`]. The caller (`GrpcRaftNetwork` in
+    /// `datastore::raft::grpc_network`) already owns the per-peer client
+    /// lifecycle and openraft's own retry/backoff drives re-sends.
+    async fn raft_unary_call<T, F, Fut>(&self, name: &'static str, make_call: F) -> Result<T>
+    where
+        F: FnOnce(TonicClient<Channel>) -> Fut,
+        Fut: Future<Output = std::result::Result<T, tonic::Status>>,
+    {
+        let client = self.tonic_client_lane(ChannelLane::Raft).await?;
+        match self
+            .supervisor
+            .timeout(name, self.policy.raft_unary_deadline, make_call(client))
+            .await
+        {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(status))) if is_transport_status(&status) => {
+                self.heal_lane_on_transport(ChannelLane::Raft, &status)
+                    .await;
+                Err(anyhow::anyhow!("{name} transport failure: {status}"))
+            }
+            Ok(Ok(Err(status))) => Err(anyhow::anyhow!("{name} failed: {status}")),
+            Ok(Err(_elapsed)) => {
+                // Per-call deadline elapsed: the connection is wedged. Evict
+                // the Raft lane so the next attempt rebuilds a fresh
+                // connection against the peer.
+                self.invalidate_lane(ChannelLane::Raft).await;
+                Err(anyhow::anyhow!(
+                    "{name} deadline exceeded after {:?}",
+                    self.policy.raft_unary_deadline
+                ))
+            }
+            Err(err) => Err(anyhow::anyhow!("{name} supervisor timeout failed: {err}")),
+        }
+    }
+
     pub async fn apply_outbox_rpc(
         &self,
         idempotency_key: &str,
@@ -1375,14 +1433,16 @@ impl ReplicationGrpcClient {
         &self,
         payload: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, String>> {
-        let mut client = self.tonic_client_lane(ChannelLane::Raft).await?;
-        let mut request = tonic::Request::new(generated::RaftAppendEntriesRequest { payload });
-        self.add_join_token(&mut request)?;
-        let response = client
-            .raft_append_entries(request)
-            .await
-            .context("gRPC RaftAppendEntries failed")?
-            .into_inner();
+        let response = self
+            .raft_unary_call("grpc_raft_append_entries", move |mut client| async move {
+                client
+                    .raft_append_entries(tonic::Request::new(generated::RaftAppendEntriesRequest {
+                        payload,
+                    }))
+                    .await
+                    .map(|r| r.into_inner())
+            })
+            .await?;
         Ok(match response.result {
             Some(generated::raft_append_entries_response::Result::Ok(bytes)) => Ok(bytes),
             Some(generated::raft_append_entries_response::Result::Error(msg)) => Err(msg),
@@ -1394,14 +1454,14 @@ impl ReplicationGrpcClient {
         &self,
         payload: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, String>> {
-        let mut client = self.tonic_client_lane(ChannelLane::Raft).await?;
-        let mut request = tonic::Request::new(generated::RaftVoteRequest { payload });
-        self.add_join_token(&mut request)?;
-        let response = client
-            .raft_vote(request)
-            .await
-            .context("gRPC RaftVote failed")?
-            .into_inner();
+        let response = self
+            .raft_unary_call("grpc_raft_vote", move |mut client| async move {
+                client
+                    .raft_vote(tonic::Request::new(generated::RaftVoteRequest { payload }))
+                    .await
+                    .map(|r| r.into_inner())
+            })
+            .await?;
         Ok(match response.result {
             Some(generated::raft_vote_response::Result::Ok(bytes)) => Ok(bytes),
             Some(generated::raft_vote_response::Result::Error(msg)) => Err(msg),
@@ -1413,14 +1473,16 @@ impl ReplicationGrpcClient {
         &self,
         payload: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, String>> {
-        let mut client = self.tonic_client_lane(ChannelLane::Raft).await?;
-        let mut request = tonic::Request::new(generated::RaftInstallSnapshotRequest { payload });
-        self.add_join_token(&mut request)?;
-        let response = client
-            .raft_install_snapshot(request)
-            .await
-            .context("gRPC RaftInstallSnapshot failed")?
-            .into_inner();
+        let response = self
+            .raft_unary_call("grpc_raft_install_snapshot", move |mut client| async move {
+                client
+                    .raft_install_snapshot(tonic::Request::new(
+                        generated::RaftInstallSnapshotRequest { payload },
+                    ))
+                    .await
+                    .map(|r| r.into_inner())
+            })
+            .await?;
         Ok(match response.result {
             Some(generated::raft_install_snapshot_response::Result::Ok(bytes)) => Ok(bytes),
             Some(generated::raft_install_snapshot_response::Result::Error(msg)) => Err(msg),
