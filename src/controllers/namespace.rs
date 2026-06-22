@@ -333,6 +333,20 @@ fn extension_apiserver_authentication_configmap(ca_cert_pem: &str) -> serde_json
     })
 }
 
+/// Test-only seam that re-drives namespace termination reconcile event-style
+/// (no production polling). Used by liveness regression tests that need to
+/// advance a Terminating namespace to finalized after driving the
+/// actor-owned Pod finalization seam. Production callers must instead trigger
+/// reconcile from the watch / side-effect notification after a child removal.
+#[cfg(test)]
+pub async fn reconcile_namespace_for_test(
+    db: &dyn DatastoreBackend,
+    namespace: &str,
+) -> Result<(), crate::api::AppError> {
+    let metrics = crate::side_effects::SideEffectMetrics::new();
+    crate::api::reconcile_namespace_termination(db, namespace, metrics.as_ref()).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

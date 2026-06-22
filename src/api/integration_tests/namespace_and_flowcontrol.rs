@@ -5341,3 +5341,146 @@ async fn test_namespace_root_crud_lifecycle_with_labels_and_label_selector() {
         "DELETE namespace must return 200 or 202 (got {deleted_status})"
     );
 }
+
+/// Regression: namespace DELETE and GC cleanup must NOT block an HTTP request
+/// on picked-up Pod row removal (HR #11). Once a Pod has `spec.nodeName` set,
+/// only the pod lifecycle actor may remove its datastore row; namespace/GC
+/// paths must mark/queue UID-bound actor cleanup and return promptly. The
+/// namespace final deletion is then re-driven event-style from the
+/// actor-owned Pod row removal — no synchronous wait, no production polling.
+#[tokio::test]
+async fn namespace_delete_returns_while_picked_up_pods_wait_for_actor_finalization() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let pod_repository = state.pod_repository.clone();
+    let app = crate::api::build_router(state);
+
+    // Create the namespace via the HTTP path so all namespace-finalizer wiring
+    // (default finalizers, status Active) matches production.
+    let create_ns_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"gc-cleanup"}}"#,
+        ))
+        .unwrap();
+    let create_ns_resp = app.clone().oneshot(create_ns_req).await.unwrap();
+    assert_eq!(create_ns_resp.status(), StatusCode::CREATED);
+
+    // Create 12 PICKED-UP pods (spec.nodeName set) — actor-owned delete path
+    // applies. The lossy run that motivated this task hung here.
+    let mut pod_uids: Vec<(String, String)> = Vec::with_capacity(12);
+    for i in 0..12 {
+        let name = format!("simpletest-rc-{i}");
+        let uid = format!("uid-{i}");
+        let pod = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("gc-cleanup"),
+                &name,
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": name,
+                        "namespace": "gc-cleanup",
+                        "uid": uid,
+                    },
+                    "spec": {
+                        "nodeName": "worker-a",
+                        "containers": [{"name": "app", "image": "busybox"}]
+                    },
+                    "status": {"phase": "Running"}
+                }),
+            )
+            .await
+            .unwrap();
+        pod_uids.push((pod.name.clone(), pod.uid.clone()));
+    }
+
+    // The DELETE must return within 2s — it must NOT block on actor-owned Pod
+    // finalization. OK (sync delete, no finalizers/content) or ACCEPTED (async)
+    // are both acceptable per the K8s contract.
+    let delete = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        app.clone().oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/namespaces/gc-cleanup")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("namespace DELETE must not block on actor-owned Pod finalization")
+    .unwrap();
+    assert!(
+        matches!(delete.status(), StatusCode::OK | StatusCode::ACCEPTED),
+        "unexpected delete status: {}",
+        delete.status()
+    );
+
+    // The namespace must remain Terminating — picked-up Pods are not yet
+    // finalized, so the actor-owned delete invariant forbids removing the
+    // namespace content synchronously.
+    let ns = db
+        .get_namespace("gc-cleanup")
+        .await
+        .unwrap()
+        .expect("namespace should remain terminating until pods finalize");
+    assert_eq!(
+        ns.data.pointer("/status/phase"),
+        Some(&json!("Terminating")),
+        "namespace must be in Terminating phase while picked-up Pods await actor finalization"
+    );
+
+    // No picked-up Pod row may have been hard-deleted by the namespace/GC path
+    // (HR #11): every Pod must still be present, now marked terminating.
+    for (name, _uid) in &pod_uids {
+        let pod = db
+            .get_resource("v1", "Pod", Some("gc-cleanup"), name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| {
+                panic!(
+                    "picked-up Pod {name} must not be hard-deleted by namespace/GC cleanup (HR #11)"
+                )
+            });
+        assert!(
+            pod.data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "picked-up Pod {name} must be marked terminating, not hard-deleted (HR #11)"
+        );
+    }
+
+    // Drive each picked-up Pod through the actor-owned finalization seam. This
+    // is the ONLY production path allowed to remove a picked-up Pod row.
+    for (name, uid) in &pod_uids {
+        assert!(
+            pod_repository
+                .finalize_pod_deletion_after_actor_cleanup("gc-cleanup", name, uid)
+                .await
+                .unwrap(),
+            "actor-owned finalization should remove picked-up Pod {name} by UID"
+        );
+    }
+
+    // Namespace finalization must be re-drivable event-style from the
+    // actor-owned Pod row removal — no production polling.
+    crate::controllers::namespace::reconcile_namespace_for_test(db.as_ref(), "gc-cleanup")
+        .await
+        .unwrap();
+    assert!(
+        db.get_namespace("gc-cleanup").await.unwrap().is_none(),
+        "namespace must finalize once actor-owned Pod rows are removed"
+    );
+}
