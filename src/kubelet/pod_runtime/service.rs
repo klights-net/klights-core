@@ -3052,28 +3052,22 @@ impl PodRuntimeService for RealPodRuntimeService {
             container_statuses = restarted_statuses;
             phase = "Running".to_string();
         }
-        let current_phase = resource
-            .data
-            .pointer("/status/phase")
-            .and_then(|v| v.as_str());
-        if matches!(current_phase, Some("Failed" | "Succeeded"))
-            && !matches!(phase.as_str(), "Failed" | "Succeeded")
-        {
-            phase = current_phase.unwrap_or(phase.as_str()).to_string();
-            if let Some(existing_statuses) = resource
-                .data
-                .pointer("/status/containerStatuses")
-                .and_then(|value| value.as_array())
-                .cloned()
-            {
-                container_statuses = existing_statuses;
-            }
-        }
-
         let status = serde_json::json!({
             "phase": phase,
             "containerStatuses": container_statuses,
         });
+        // Route the computed status through the central Pod status merge
+        // policy before emission so a stale reconcile cannot regress terminal
+        // phase/container state (e.g. a CRI list racing the reconcile seeing
+        // an empty sandbox after the pod already Succeeded).
+        let mut status = status;
+        crate::pod_status_merge::merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &resource.data,
+            &mut status,
+            crate::pod_status_merge::PodStatusUpdateSource::KubeletRuntime,
+        );
         let emit_key = key.clone();
         let emitted = self
             .status_emitter

@@ -632,3 +632,94 @@ async fn test_update_status_only_missing_resource_returns_error() {
         err
     );
 }
+
+// OCC for the status subresource: a status PATCH/PUT carrying a stale
+// `metadata.resourceVersion` must be rejected with a 409/conflict at the
+// precondition-validation layer that the API status subresource feeds.
+#[tokio::test]
+async fn pod_status_patch_with_resource_version_conflict_returns_409() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "occ-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "occ-pod",
+                    "namespace": "default",
+                    "uid": "uid-occ"
+                },
+                "spec": {
+                    "nodeName": "worker-a",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+    let stale_rv = created.resource_version;
+
+    // Advance the live resourceVersion via a regular update before the stale
+    // status writer runs, mirroring a concurrent edit between the client's
+    // read and its /status write.
+    db.update_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "occ-pod",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "occ-pod",
+                "namespace": "default",
+                "uid": "uid-occ",
+                "resourceVersion": stale_rv.to_string()
+            },
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "app", "image": "nginx:1.25"}]
+            },
+            "status": {"phase": "Pending"}
+        }),
+        stale_rv,
+    )
+    .await
+    .unwrap();
+
+    // Status write carrying the STALE resource_version precondition must be
+    // rejected. This is the exact call the API status PATCH/PUT handler makes
+    // once it forwards `metadata.resourceVersion` into ResourcePreconditions.
+    let result = db
+        .update_status_only_with_preconditions(
+            "v1",
+            "Pod",
+            Some("default"),
+            "occ-pod",
+            json!({"phase": "Running"}),
+            ResourcePreconditions {
+                uid: Some("uid-occ".to_string()),
+                resource_version: Some(stale_rv),
+            },
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "stale resourceVersion precondition must be rejected (OCC 409)"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.downcast_ref::<crate::datastore::errors::DatastoreError>()
+            .is_some_and(crate::datastore::errors::DatastoreError::is_conflict)
+            || err.to_string().contains("409")
+            || err.to_string().to_lowercase().contains("conflict"),
+        "expected 409/conflict error, got: {}",
+        err
+    );
+}

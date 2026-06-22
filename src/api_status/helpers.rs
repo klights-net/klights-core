@@ -217,6 +217,20 @@ pub async fn patch_status_subresource(
 
     let patched = apply_patch(&resource.data, &patch, content_type)?;
 
+    // Honor a CLIENT-SUPPLIED `metadata.resourceVersion` as the OCC guard when
+    // the caller put one in the patch body (kubectl status PATCH with a stale
+    // RV must 409); otherwise skip CAS (K8s contract for unconditional status
+    // updates). The RV is read from the raw client patch body, not from the
+    // merged `patched` result, so a resourceVersion carried in the live
+    // resource data is never mistaken for a client precondition. This applies
+    // only to API status-subresource clients — the kubelet forwarded status
+    // outbox keeps its UID + observed_status_stamp + apply-against-latest
+    // behavior and does NOT go through this path.
+    let expected_rv = patch
+        .pointer("/metadata/resourceVersion")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<i64>().ok());
+
     // 1. Status write — atomic, preserves spec.
     if let Some(new_status) = patched.get("status") {
         state
@@ -229,7 +243,7 @@ pub async fn patch_status_subresource(
                 new_status.clone(),
                 ResourcePreconditions {
                     uid: Some(resource.uid.clone()),
-                    resource_version: None,
+                    resource_version: expected_rv,
                 },
             )
             .await?;
@@ -573,6 +587,15 @@ pub async fn patch_cluster_status_subresource(
 
     let patched = apply_patch(&resource.data, &patch, content_type)?;
 
+    // OCC: honor a CLIENT-SUPPLIED `metadata.resourceVersion` from the raw
+    // patch body (kubectl status PATCH with stale RV must 409). Unconditional
+    // when the client omitted it. Read from the patch body, not the merged
+    // result, so live-data RV is never mistaken for a client precondition.
+    let expected_rv = patch
+        .pointer("/metadata/resourceVersion")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<i64>().ok());
+
     if let Some(new_status) = patched.get("status") {
         state
             .db
@@ -584,7 +607,7 @@ pub async fn patch_cluster_status_subresource(
                 new_status.clone(),
                 ResourcePreconditions {
                     uid: Some(resource.uid.clone()),
-                    resource_version: None,
+                    resource_version: expected_rv,
                 },
             )
             .await?;

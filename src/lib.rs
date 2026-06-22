@@ -25,6 +25,7 @@ pub mod node_lease_tracker;
 pub mod paths;
 pub mod pidfile;
 pub mod pod_identity;
+pub mod pod_status_merge;
 pub mod portforward;
 pub mod protobuf;
 pub mod replication;

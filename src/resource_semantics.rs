@@ -188,65 +188,26 @@ fn upsert_terminating_readiness_condition(
     }));
 }
 
+/// Delegate to the central Pod status merge policy.
+///
+/// All kubelet-status write paths (raft apply, cluster-replace merge,
+/// replicated apply, sqlite/redb appliers) historically called this helper
+/// for the ad hoc condition-preservation. They now route through the single
+/// DRY policy in [`crate::pod_status_merge`], which additionally preserves
+/// terminal/confirmed runtime state over a stale `ContainerCreating`
+/// snapshot — this thin wrapper keeps the existing call sites working while
+/// consolidating the rules in one place.
 pub fn preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
     api_version: &str,
     kind: &str,
     current: &Value,
     status: &mut Value,
 ) {
-    if api_version != "v1" || kind != "Pod" {
-        return;
-    }
-
-    let Some(existing_conditions) = current
-        .pointer("/status/conditions")
-        .and_then(|conditions| conditions.as_array())
-    else {
-        return;
-    };
-    let preservable: Vec<Value> = existing_conditions
-        .iter()
-        .filter(|condition| {
-            condition
-                .get("type")
-                .and_then(|value| value.as_str())
-                .is_some_and(|condition_type| !is_kubelet_rebuilt_pod_condition(condition_type))
-        })
-        .cloned()
-        .collect();
-    if preservable.is_empty() {
-        return;
-    }
-
-    let Some(status_obj) = status.as_object_mut() else {
-        return;
-    };
-    let conditions = status_obj
-        .entry("conditions".to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    if !conditions.is_array() {
-        *conditions = Value::Array(Vec::new());
-    }
-    let Some(conditions) = conditions.as_array_mut() else {
-        return;
-    };
-
-    for condition in preservable {
-        let Some(condition_type) = condition.get("type").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        if conditions.iter().any(|existing| {
-            existing.get("type").and_then(|value| value.as_str()) == Some(condition_type)
-        }) {
-            continue;
-        }
-        conditions.push(condition);
-    }
-}
-
-fn is_kubelet_rebuilt_pod_condition(condition_type: &str) -> bool {
-    matches!(
-        condition_type,
-        "PodScheduled" | "Initialized" | "ContainersReady" | "Ready"
-    )
+    crate::pod_status_merge::merge_pod_status_for_update(
+        api_version,
+        kind,
+        current,
+        status,
+        crate::pod_status_merge::PodStatusUpdateSource::KubeletRuntime,
+    );
 }
