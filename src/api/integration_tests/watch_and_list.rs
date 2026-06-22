@@ -7690,3 +7690,115 @@ async fn test_rv_selector_cr_watch_delivers_baseline_delete_below_floor() {
         "rv>0 selector CR watch from list rv={list_rv} must deliver delete rv={delete_rv} for baseline member; saw {seen:?}"
     );
 }
+
+/// Regression: a metadata-only annotation strategic-merge patch on an
+/// RC-owned pod must not make the pod disappear from label-selected lists.
+/// kubectl conformance patches controller pods with metadata annotations
+/// and expects the pod to remain selector-visible with its labels and
+/// RC ownerReferences intact. This pins the API PATCH path
+/// (strategic-merge of object metadata) plus the label-selector list path.
+#[tokio::test]
+async fn pod_metadata_patch_preserves_rc_selector_visibility() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "kubectl-rc",
+        json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"kubectl-rc"}}),
+    )
+    .await
+    .unwrap();
+
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("kubectl-rc"),
+        "agnhost-primary",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "agnhost-primary",
+                "namespace": "kubectl-rc",
+                "uid": "agnhost-primary-uid",
+                "labels": {"name": "agnhost-primary"},
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "ReplicationController",
+                    "name": "agnhost-primary",
+                    "uid": "agnhost-rc-uid",
+                    "controller": true,
+                    "blockOwnerDeletion": true
+                }]
+            },
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "agnhost", "image": "registry.k8s.io/e2e-test-images/agnhost:2.56"}]
+            },
+            "status": {"phase": "Running"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let patch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/namespaces/kubectl-rc/pods/agnhost-primary")
+                .header("content-type", "application/strategic-merge-patch+json")
+                .body(Body::from(
+                    r#"{"metadata":{"annotations":{"patched":"true"}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        patch_resp.status(),
+        StatusCode::OK,
+        "metadata patch must succeed"
+    );
+
+    let list_resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/namespaces/kubectl-rc/pods?labelSelector=name%3Dagnhost-primary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = list
+        .pointer("/items")
+        .and_then(|v| v.as_array())
+        .expect("items array");
+    assert_eq!(
+        items.len(),
+        1,
+        "patched pod must remain selector-visible after metadata annotation patch"
+    );
+    assert_eq!(
+        items[0].pointer("/metadata/labels/name"),
+        Some(&serde_json::json!("agnhost-primary")),
+        "metadata annotation patch must preserve selector label"
+    );
+    assert_eq!(
+        items[0].pointer("/metadata/ownerReferences/0/uid"),
+        Some(&serde_json::json!("agnhost-rc-uid")),
+        "metadata annotation patch must preserve RC ownerRef"
+    );
+}

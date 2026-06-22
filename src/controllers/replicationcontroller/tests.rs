@@ -1498,3 +1498,104 @@ fn rc_selector_with_non_string_value_returns_error() {
         "non-string selector value must be rejected"
     );
 }
+
+/// Regression: a pod created by an RC reconcile must remain selector-visible
+/// after a metadata annotation patch is applied directly through the datastore.
+/// This pins the selector-index refresh on the datastore patch path so a
+/// metadata-only patch does not drop the pod's labels out of the label index.
+#[tokio::test]
+async fn rc_reconcile_created_pod_remains_selector_visible_after_annotation_patch() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "kubectl-rc",
+        json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"kubectl-rc"}}),
+    )
+    .await
+    .unwrap();
+
+    let rc = json!({
+        "apiVersion": "v1",
+        "kind": "ReplicationController",
+        "metadata": {"name": "agnhost-primary", "namespace": "kubectl-rc", "uid": "agnhost-rc-uid"},
+        "spec": {
+            "replicas": 1,
+            "selector": {"name": "agnhost-primary"},
+            "template": {
+                "metadata": {"labels": {"name": "agnhost-primary"}},
+                "spec": {"containers": [{"name": "agnhost", "image": "registry.k8s.io/e2e-test-images/agnhost:2.56"}]}
+            }
+        }
+    });
+    db.create_resource(
+        "v1",
+        "ReplicationController",
+        Some("kubectl-rc"),
+        "agnhost-primary",
+        rc.clone(),
+    )
+    .await
+    .unwrap();
+
+    reconcile_rc_test(&db, &rc, "worker-a").await.unwrap();
+
+    let pods = db
+        .list_resources(
+            "v1",
+            "Pod",
+            Some("kubectl-rc"),
+            crate::datastore::ResourceListQuery::new(
+                Some("name=agnhost-primary"),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pods.items.len(),
+        1,
+        "RC reconcile must create one matching pod"
+    );
+    let pod_name = pods.items[0].name.clone();
+
+    db.patch_resource_latest(
+        "v1",
+        "Pod",
+        Some("kubectl-rc"),
+        &pod_name,
+        crate::datastore::PatchKind::Merge,
+        json!({"metadata": {"annotations": {"patched": "true"}}}),
+    )
+    .await
+    .unwrap();
+
+    let patched = db
+        .list_resources(
+            "v1",
+            "Pod",
+            Some("kubectl-rc"),
+            crate::datastore::ResourceListQuery::new(
+                Some("name=agnhost-primary"),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        patched.items.len(),
+        1,
+        "patched RC-owned pod must remain selector-visible"
+    );
+    assert_eq!(
+        patched.items[0].data.pointer("/metadata/labels/name"),
+        Some(&json!("agnhost-primary")),
+        "metadata annotation patch must preserve selector label"
+    );
+}

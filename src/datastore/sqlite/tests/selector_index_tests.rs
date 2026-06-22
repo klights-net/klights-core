@@ -708,3 +708,93 @@ async fn selector_with_limit_returns_correct_remaining_count() {
     // signals more items exist.
     assert_eq!(result.remaining_item_count, None);
 }
+
+/// Regression: a metadata-only annotation patch (labels untouched) must keep
+/// the pod visible under its existing label selector, and must preserve
+/// `metadata.ownerReferences`. This pins the conformance scenario where
+/// kubectl patches an RC-owned pod's annotations and the pod must remain
+/// selector-visible with its ownerRefs intact — the index refresh on the
+/// datastore patch path must rebuild from the merged object, not the patch
+/// body, so unchanged labels and ownerRefs survive.
+#[tokio::test]
+async fn metadata_annotation_patch_preserves_selector_visibility_and_owner_refs() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "agnhost-primary",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "agnhost-primary",
+                "namespace": "default",
+                "uid": "agnhost-primary-uid",
+                "labels": {"name": "agnhost-primary"},
+                "ownerReferences": [{
+                    "apiVersion": "v1",
+                    "kind": "ReplicationController",
+                    "name": "agnhost-primary",
+                    "uid": "agnhost-rc-uid",
+                    "controller": true,
+                    "blockOwnerDeletion": true
+                }]
+            },
+            "spec": {"nodeName": "node-1", "restartPolicy": "Always"},
+            "status": {"phase": "Running"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    db.patch_resource_latest(
+        "v1",
+        "Pod",
+        Some("default"),
+        "agnhost-primary",
+        PatchKind::Merge,
+        json!({"metadata": {"annotations": {"patched": "true"}}}),
+    )
+    .await
+    .unwrap();
+
+    let result = db
+        .list_resources(
+            "v1",
+            "Pod",
+            Some("default"),
+            crate::datastore::ResourceListQuery::new(
+                Some("name=agnhost-primary"),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.items.len(),
+        1,
+        "metadata annotation patch must keep pod selector-visible"
+    );
+    assert_eq!(
+        result.items[0].data.pointer("/metadata/labels/name"),
+        Some(&json!("agnhost-primary")),
+        "metadata annotation patch must preserve selector label"
+    );
+    assert_eq!(
+        result.items[0]
+            .data
+            .pointer("/metadata/ownerReferences/0/uid"),
+        Some(&json!("agnhost-rc-uid")),
+        "metadata annotation patch must preserve RC ownerRef"
+    );
+    assert_eq!(
+        result.items[0]
+            .data
+            .pointer("/metadata/annotations/patched"),
+        Some(&json!("true")),
+        "annotation patch must be applied"
+    );
+}
