@@ -48,6 +48,14 @@ pub fn has_builtin_status_subresource(api_version: &str, kind: &str) -> bool {
 
 /// Main-resource writes must not mutate `.status` for built-in resources
 /// that expose a status subresource. The status endpoint owns that field.
+///
+/// For Pods the live status is preserved verbatim, but any scheduler-owned
+/// condition the main write was itself setting (e.g. `DisruptionTarget` from
+/// scheduler preemption) is folded back in through the central Pod status
+/// merge. Without this, a leader-side preemption `UpdateResource` replicated
+/// through raft would have its `DisruptionTarget` condition stripped whenever a
+/// newer kubelet status snapshot landed on the live row first — the very race
+/// the central merge exists to close.
 pub fn preserve_status_subresource_on_main_update(
     api_version: &str,
     kind: &str,
@@ -58,12 +66,30 @@ pub fn preserve_status_subresource_on_main_update(
         return;
     }
 
-    let Some(obj) = proposed.as_object_mut() else {
+    if !proposed.is_object() {
         return;
-    };
-    if let Some(status) = current.get("status").cloned() {
-        obj.insert("status".to_string(), status);
-    } else {
+    }
+    if let Some(mut status) = current.get("status").cloned() {
+        // Carry scheduler-owned Pod conditions (DisruptionTarget, ...) that the
+        // main write was setting into the preserved live status. The central
+        // merge treats `proposed` as the source of non-kubelet conditions to
+        // preserve and `status` (the live snapshot) as the incoming target, so
+        // a preemption termination's DisruptionTarget survives even when the
+        // live kubelet status omits it. The `UserStatusSubresource` source is
+        // used intentionally: only condition preservation applies, not the
+        // kubelet terminal-state rewrite, since this is a main-resource update
+        // preserving the authoritative live status — not a kubelet snapshot.
+        crate::pod_status_merge::merge_pod_status_for_update(
+            api_version,
+            kind,
+            proposed,
+            &mut status,
+            crate::pod_status_merge::PodStatusUpdateSource::UserStatusSubresource,
+        );
+        if let Some(obj) = proposed.as_object_mut() {
+            obj.insert("status".to_string(), status);
+        }
+    } else if let Some(obj) = proposed.as_object_mut() {
         obj.remove("status");
     }
 }

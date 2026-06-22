@@ -1977,4 +1977,160 @@ mod cases {
             "inner backend must not be mutated on follower"
         );
     }
+
+    /// Live multinode regression: a leader-side scheduler preemption writes the
+    /// victim's termination as a full `UpdateResource` (metadata.deletionTimestamp
+    /// plus a status carrying the scheduler-owned `DisruptionTarget` condition).
+    /// That write is replicated through raft, so it lands in
+    /// `apply_command_to_backend`. A concurrent kubelet status write can bump the
+    /// live row's resourceVersion ahead of the preemption command's meta RV
+    /// before the preemption command applies. In that case the apply path
+    /// preserves the live `.status` over the proposed one via
+    /// `preserve_status_subresource_on_main_update` — and that preserve step
+    /// MUST route through the central Pod status merge so the scheduler-owned
+    /// `DisruptionTarget` condition is not dropped on the floor.
+    #[tokio::test]
+    async fn replicated_update_resource_preserves_disruption_target_over_newer_kubelet_status() {
+        use crate::datastore::replicated::apply_command_to_backend;
+
+        let db = crate::datastore::test_support::in_memory().await;
+        // Victim is already Running on the node with the four kubelet-rebuilt
+        // conditions and no DisruptionTarget.
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "victim-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "victim-pod",
+                    "namespace": "default",
+                    "uid": "victim-uid"
+                },
+                "spec": {"nodeName": "worker-a"},
+                "status": {
+                    "phase": "Running",
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True"},
+                        {"type": "Initialized", "status": "True"},
+                        {"type": "ContainersReady", "status": "True"},
+                        {"type": "Ready", "status": "True"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // A kubelet status write lands while the preemption command is in
+        // flight, bumping the live resourceVersion past the preemption
+        // command's meta RV (meta.resource_version = 2 below). The fresh
+        // status still lacks DisruptionTarget — it is a pure kubelet snapshot
+        // (it carries a podIP that was not present at create time, so the
+        // write is a real mutation that advances the resourceVersion).
+        db.update_status_only(
+            "v1",
+            "Pod",
+            Some("default"),
+            "victim-pod",
+            json!({
+                "phase": "Running",
+                "podIP": "10.244.1.5",
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True"},
+                    {"type": "Initialized", "status": "True"},
+                    {"type": "ContainersReady", "status": "True"},
+                    {"type": "Ready", "status": "True"}
+                ]
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let before_preempt = db
+            .get_resource("v1", "Pod", Some("default"), "victim-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before_preempt.resource_version, 2,
+            "kubelet status write must have advanced the live resourceVersion"
+        );
+
+        // The scheduler preemption termination: full UpdateResource carrying
+        // metadata.deletionTimestamp and a status that includes the
+        // scheduler-owned DisruptionTarget condition (PreemptionByScheduler).
+        apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateResource {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                namespace: Some("default".into()),
+                name: "victim-pod".into(),
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "victim-pod",
+                        "namespace": "default",
+                        "uid": "victim-uid",
+                        "deletionTimestamp": "2026-06-22T12:00:00Z",
+                        "deletionGracePeriodSeconds": 0
+                    },
+                    "spec": {"nodeName": "worker-a"},
+                    "status": {
+                        "phase": "Running",
+                        "conditions": [
+                            {"type": "PodScheduled", "status": "True"},
+                            {"type": "Initialized", "status": "True"},
+                            {"type": "ContainersReady", "status": "True"},
+                            {"type": "Ready", "status": "True"},
+                            {"type": "DisruptionTarget", "status": "True", "reason": "PreemptionByScheduler"}
+                        ]
+                    }
+                }),
+                expected_rv: 0,
+                preconditions: ResourcePreconditions {
+                    uid: Some("victim-uid".into()),
+                    resource_version: None,
+                },
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                // Deliberately older than the live RV after the kubelet status
+                // write so the apply path takes the preserve-live-status branch.
+                resource_version: 2,
+                uid: Some("victim-uid".into()),
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_resource("v1", "Pod", Some("default"), "victim-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .data
+                .pointer("/status/conditions")
+                .and_then(|value| value.as_array())
+                .unwrap_or(&Vec::new())
+                .iter()
+                .any(|condition| {
+                    condition.pointer("/type").and_then(|v| v.as_str()) == Some("DisruptionTarget")
+                        && condition.pointer("/reason").and_then(|v| v.as_str())
+                            == Some("PreemptionByScheduler")
+                }),
+            "replicated preemption UpdateResource must preserve scheduler-owned DisruptionTarget when a newer kubelet status landed first: {:?}",
+            stored.data.pointer("/status/conditions")
+        );
+    }
 }
