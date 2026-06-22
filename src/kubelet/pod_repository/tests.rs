@@ -7879,6 +7879,203 @@ async fn scheduler_preemption_victim_terminating_event_includes_disruption_targe
 }
 
 #[tokio::test]
+async fn scheduler_preemption_condition_survives_interleaved_worker_status_and_get() {
+    use super::{PodApiWriter, PodReader};
+    use crate::datastore::ResourcePreconditions;
+    use crate::datastore::command::StorageCommand;
+    use crate::datastore::sqlite::BuildOutboxOutcome;
+    use crate::kubelet::outbox::payload::OutboxPayload;
+
+    let repo =
+        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
+            .await;
+    let db = repo.store.db().clone();
+
+    db.create_resource(
+        "v1",
+        "Node",
+        None,
+        "worker-a",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "worker-a"},
+            "spec": {"unschedulable": false},
+            "status": {
+                "allocatable": {"cpu": "1", "memory": "32Gi", "pods": "110"},
+                "capacity": {"cpu": "1", "memory": "32Gi", "pods": "110"},
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    for (name, value) in [("low-priority", 10), ("high-priority", 1000)] {
+        db.create_resource(
+            "scheduling.k8s.io/v1",
+            "PriorityClass",
+            None,
+            name,
+            json!({
+                "apiVersion": "scheduling.k8s.io/v1",
+                "kind": "PriorityClass",
+                "metadata": {"name": name},
+                "value": value
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    repo.store
+        .create(
+            "default",
+            "victim-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "victim-pod",
+                    "namespace": "default",
+                    "uid": "victim-uid",
+                    "finalizers": ["example.com/test-finalizer"]
+                },
+                "spec": {
+                    "nodeName": "worker-a",
+                    "priorityClassName": "low-priority",
+                    "priority": 10,
+                    "containers": [{
+                        "name": "app",
+                        "image": "registry.k8s.io/pause:3.10",
+                        "resources": {"requests": {"cpu": "900m"}}
+                    }]
+                },
+                "status": {"phase": "Running"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    repo.api_create_pod(api_create_request(
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "preemptor-pod", "namespace": "default"},
+            "spec": {
+                "priorityClassName": "high-priority",
+                "containers": [{
+                    "name": "app",
+                    "image": "registry.k8s.io/pause:3.10",
+                    "resources": {"requests": {"cpu": "900m"}}
+                }]
+            }
+        }),
+        false,
+    ))
+    .await
+    .unwrap();
+    repo.schedule_all_unbound_pods().await.unwrap();
+    let scheduled = repo
+        .get_pod("default", "preemptor-pod")
+        .await
+        .unwrap()
+        .expect("preemptor must be scheduled");
+    assert_eq!(
+        scheduled
+            .data
+            .pointer("/spec/nodeName")
+            .and_then(|value| value.as_str()),
+        Some("worker-a"),
+        "preemptor should win the node via preemption"
+    );
+
+    // Simulate a lagged kubelet status outbox apply landing after preemption:
+    // a Running status snapshot (without DisruptionTarget) encoded as a worker
+    // PodStatus outbox command and applied through the leader raft-apply path.
+    let stale_status = json!({
+        "phase": "Running",
+        "conditions": [
+            {"type": "PodScheduled", "status": "True"},
+            {"type": "Initialized", "status": "True"},
+            {"type": "ContainersReady", "status": "True"},
+            {"type": "Ready", "status": "True"}
+        ],
+        "containerStatuses": [{
+            "name": "app",
+            "containerID": "containerd://victim-ctr",
+            "ready": true,
+            "started": true,
+            "restartCount": 0,
+            "state": {"running": {"startedAt": "2026-06-22T12:08:53Z"}}
+        }]
+    });
+    let command = StorageCommand::UpdateStatus {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "victim-pod".to_string(),
+        status: stale_status,
+        expected_rv: None,
+        preconditions: ResourcePreconditions {
+            uid: Some("victim-uid".to_string()),
+            resource_version: None,
+        },
+        observed_status_stamp: None,
+    };
+    let payload = OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "stale-worker-status-after-preemption",
+            "PodStatus",
+            payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .expect("build stale status commit");
+    let BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+        panic!("expected a fresh status commit");
+    };
+    db.apply_log_apply_commit(commit)
+        .await
+        .expect("stale worker status apply must not strand the outbox row");
+
+    let victim = repo
+        .get_pod("default", "victim-pod")
+        .await
+        .unwrap()
+        .expect("victim remains until actor finalization");
+    assert!(
+        victim
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .and_then(|value| value.as_str())
+            .is_some(),
+        "victim must be terminating: {:?}",
+        victim.data.pointer("/metadata")
+    );
+    assert!(
+        victim
+            .data
+            .pointer("/status/conditions")
+            .and_then(|value| value.as_array())
+            .unwrap_or(&Vec::new())
+            .iter()
+            .any(|condition| {
+                condition.pointer("/type").and_then(|value| value.as_str())
+                    == Some("DisruptionTarget")
+                    && condition
+                        .pointer("/reason")
+                        .and_then(|value| value.as_str())
+                        == Some("PreemptionByScheduler")
+            }),
+        "terminating preemption victim must include DisruptionTarget after stale worker status: {:?}",
+        victim.data.pointer("/status/conditions")
+    );
+}
+
+#[tokio::test]
 async fn api_create_pod_resolves_priority_class_name_before_storage() {
     use super::PodApiWriter;
 
