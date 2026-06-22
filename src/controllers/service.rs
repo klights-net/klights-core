@@ -416,6 +416,112 @@ pub async fn reconcile_service_with_nodeport(
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
 ) -> Result<Value> {
+    let Some(updated_data) =
+        allocate_service_fields_for_api_write(db, service, service_ipam, nodeport_alloc).await?
+    else {
+        // Live Service is absent or already deleting — allocation/defaulting
+        // was skipped, so endpoint reconciliation must be skipped too (it
+        // would otherwise recreate Endpoints for a gone/terminating Service).
+        return Ok(service.clone());
+    };
+
+    // Skip Endpoints and EndpointSlice for ExternalName services
+    // ExternalName services return CNAME DNS records, not pod IPs
+    let updated_metadata = updated_data
+        .get("metadata")
+        .ok_or_else(|| anyhow::anyhow!("Missing updated metadata"))?;
+    let updated_spec = updated_data
+        .get("spec")
+        .ok_or_else(|| anyhow::anyhow!("Missing updated spec"))?;
+    let service_type = updated_spec
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("ClusterIP");
+
+    if service_type != "ExternalName" {
+        // Check publishNotReadyAddresses (spec field or legacy annotation)
+        let publish_not_ready = updated_spec
+            .get("publishNotReadyAddresses")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || updated_metadata
+                .get("annotations")
+                .and_then(|a| a.get("service.alpha.kubernetes.io/tolerate-unready-endpoints"))
+                .and_then(|v| v.as_str())
+                .map(|v| v == "true")
+                .unwrap_or(false);
+
+        // Create or update Endpoints
+        crate::controllers::endpoints::reconcile_endpoints(
+            db,
+            pod_reader,
+            updated_metadata
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing updated name"))?,
+            updated_metadata
+                .get("namespace")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing updated namespace"))?,
+            updated_spec.get("selector"),
+            updated_spec.get("ports"),
+            publish_not_ready,
+        )
+        .await?;
+
+        // Create or update EndpointSlice (discovery.k8s.io/v1)
+        let service_uid = updated_metadata
+            .get("uid")
+            .and_then(|u| u.as_str())
+            .unwrap_or("");
+        crate::controllers::endpoints::reconcile_endpointslice(
+            db,
+            pod_reader,
+            updated_metadata
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing updated name"))?,
+            service_uid,
+            updated_metadata
+                .get("namespace")
+                .and_then(|n| n.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing updated namespace"))?,
+            updated_spec.get("selector"),
+            updated_spec.get("ports"),
+        )
+        .await?;
+    }
+
+    // The synchronous nft rebuild used to live here; it's been moved to
+    // `ServiceController::reconcile` (Task 5 of the network refactor) so
+    // this DB-only path stays callable without a live ServiceRouter.
+
+    Ok(updated_data)
+}
+
+/// Synchronous Service allocation/defaulting for the HTTP write path.
+///
+/// Loads the live Service, applies K8s defaulting (`spec.type`,
+/// `sessionAffinity`, ServicePort `protocol`/`targetPort`, ExternalName
+/// field clearing), allocates `clusterIP`/`clusterIPs` and per-port
+/// `nodePort` values when missing, and persists the result with
+/// resourceVersion preconditions. Endpoint/EndpointSlice reconciliation and
+/// dataplane route syncing are intentionally NOT done here — those run
+/// asynchronously via the controller dispatcher after the handler enqueues a
+/// Service reconcile key. This keeps API responses K8s-compatible (allocated
+/// fields are present) without running endpoint/dataplane work inline on the
+/// request path.
+///
+/// Returns `Ok(None)` when the live Service is absent or already carrying a
+/// `deletionTimestamp`: callers (the HTTP handler returns the input object
+/// as-is; the controller skips endpoint reconciliation) must not treat those
+/// as allocated services.
+pub async fn allocate_service_fields_for_api_write(
+    db: &dyn DatastoreBackend,
+    service: &Value,
+    service_ipam: &ServiceIpam,
+    nodeport_alloc: &NodePortAllocator,
+) -> Result<Option<Value>> {
     let input_metadata = service
         .get("metadata")
         .ok_or_else(|| anyhow::anyhow!("Missing metadata"))?;
@@ -432,7 +538,7 @@ pub async fn reconcile_service_with_nodeport(
         .get_resource("v1", "Service", Some(namespace), name)
         .await?
     else {
-        return Ok(service.clone());
+        return Ok(None);
     };
     let service =
         crate::api::inject_resource_version(live_service.data, live_service.resource_version);
@@ -440,7 +546,7 @@ pub async fn reconcile_service_with_nodeport(
         .get("metadata")
         .ok_or_else(|| anyhow::anyhow!("Missing metadata"))?;
     if metadata.get("deletionTimestamp").is_some() {
-        return Ok(service);
+        return Ok(None);
     }
     let current_rv = crate::utils::extract_resource_version(metadata);
     let update_preconditions = ResourcePreconditions::from_metadata(metadata, current_rv)?;
@@ -563,67 +669,8 @@ pub async fn reconcile_service_with_nodeport(
     };
     drop(cluster_ip_guard);
 
-    // Skip Endpoints and EndpointSlice for ExternalName services
-    // ExternalName services return CNAME DNS records, not pod IPs
-    let updated_metadata = updated_data
-        .get("metadata")
-        .ok_or_else(|| anyhow::anyhow!("Missing updated metadata"))?;
-    let updated_spec = updated_data
-        .get("spec")
-        .ok_or_else(|| anyhow::anyhow!("Missing updated spec"))?;
-    let service_type = updated_spec
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("ClusterIP");
-
-    if service_type != "ExternalName" {
-        // Check publishNotReadyAddresses (spec field or legacy annotation)
-        let publish_not_ready = updated_spec
-            .get("publishNotReadyAddresses")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-            || updated_metadata
-                .get("annotations")
-                .and_then(|a| a.get("service.alpha.kubernetes.io/tolerate-unready-endpoints"))
-                .and_then(|v| v.as_str())
-                .map(|v| v == "true")
-                .unwrap_or(false);
-
-        // Create or update Endpoints
-        crate::controllers::endpoints::reconcile_endpoints(
-            db,
-            pod_reader,
-            name,
-            namespace,
-            updated_spec.get("selector"),
-            updated_spec.get("ports"),
-            publish_not_ready,
-        )
-        .await?;
-
-        // Create or update EndpointSlice (discovery.k8s.io/v1)
-        let service_uid = updated_metadata
-            .get("uid")
-            .and_then(|u| u.as_str())
-            .unwrap_or("");
-        crate::controllers::endpoints::reconcile_endpointslice(
-            db,
-            pod_reader,
-            name,
-            service_uid,
-            namespace,
-            updated_spec.get("selector"),
-            updated_spec.get("ports"),
-        )
-        .await?;
-    }
-
-    // The synchronous nft rebuild used to live here; it's been moved to
-    // `ServiceController::reconcile` (Task 5 of the network refactor) so
-    // this DB-only path stays callable without a live ServiceRouter.
-
     let service_with_rv = crate::api::inject_resource_version(updated_data.clone(), updated_rv);
-    Ok(service_with_rv)
+    Ok(Some(service_with_rv))
 }
 
 #[cfg(test)]

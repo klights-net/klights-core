@@ -426,32 +426,42 @@ async fn create_service(
 
     let (status, json_response) = &result;
     if *status == StatusCode::CREATED {
-        // Reconcile applies defaults (sessionAffinity, type, ports), allocates
-        // ClusterIP/NodePort, writes Endpoints/EndpointSlice, then triggers an
-        // nft sync. The first three are persisted before nft sync; if nft sync
-        // fails (e.g. runtime not initialized in test env), the defaults are
-        // still in the DB. Re-fetch in both branches so the response always
-        // reflects what was persisted.
-        if let Err(e) = state
-            .controller_dispatcher
-            .reconcile(&json_response.0, &state.db, &state.config.node_name)
-            .await
+        // Allocation/defaulting (ClusterIP, NodePort, type, sessionAffinity,
+        // ServicePort fields) runs synchronously so the API response carries
+        // the same allocated fields a client expects. Endpoint/EndpointSlice
+        // reconciliation and the dataplane route sync are NOT done here — they
+        // run asynchronously via the controller dispatcher after the enqueue
+        // below. See `controllers::service::allocate_service_fields_for_api_write`.
+        match crate::controllers::service::allocate_service_fields_for_api_write(
+            state.db.as_ref(),
+            &json_response.0,
+            state.service_ipam.as_ref(),
+            state.nodeport_alloc.as_ref(),
+        )
+        .await
         {
-            tracing::error!("Failed to reconcile service after create: {}", e);
-        }
-        let svc_name = json_response
-            .0
-            .pointer("/metadata/name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if let Some(updated) = state
-            .db
-            .get_resource("v1", "Service", Some(&namespace), svc_name)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to fetch updated service: {}", e)))?
-        {
-            let svc_with_rv = inject_resource_version(updated.data, updated.resource_version);
-            return Ok((StatusCode::CREATED, Json(svc_with_rv)));
+            Ok(Some(allocated)) => {
+                // Enqueue a Service reconcile so the controller reconciles
+                // Endpoints/EndpointSlice and requests a coalesced route sync.
+                state.controller_dispatcher.enqueue(&allocated).await;
+                return Ok((StatusCode::CREATED, Json(allocated)));
+            }
+            Ok(None) => {
+                // Service was deleted or is terminating between the persist
+                // and the allocation step — return the persisted object as-is.
+                tracing::warn!(
+                    "Service {}/{} absent or terminating during create allocation",
+                    namespace,
+                    json_response
+                        .0
+                        .pointer("/metadata/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                );
+            }
+            Err(e) => {
+                tracing::error!("Failed to allocate service fields after create: {}", e);
+            }
         }
     }
 
@@ -473,11 +483,6 @@ async fn update_service(
         ));
     }
 
-    let previous_service = state
-        .db
-        .get_resource("v1", "Service", Some(&namespace), &name)
-        .await?;
-
     // F3-04: nothing reads `body` after the inner call, so move it.
     let result = update_service_base(
         State(state.clone()),
@@ -488,58 +493,27 @@ async fn update_service(
     )
     .await?;
 
-    if let Err(e) = state
-        .controller_dispatcher
-        .reconcile(&result.0, &state.db, &state.config.node_name)
-        .await
-    {
-        tracing::error!("Failed to reconcile service after update: {}", e);
-        return Ok(result);
-    }
-
-    let updated_svc = state
-        .db
-        .get_resource("v1", "Service", Some(&namespace), &name)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to fetch updated service: {}", e)))?
-        .ok_or_else(|| {
-            AppError::Internal(format!(
-                "Service {}/{} disappeared after reconcile",
-                namespace, name
-            ))
-        })?;
-    sync_service_routes_now_if_spec_changed(
-        state.as_ref(),
-        &namespace,
-        &name,
-        previous_service.as_ref(),
-        &updated_svc.data,
-        "update",
+    // Allocation/defaulting runs synchronously so the API response reflects
+    // allocated fields. Endpoint/EndpointSlice reconciliation and the dataplane
+    // route sync run asynchronously via the controller dispatcher after the
+    // enqueue below — never inline on the request path.
+    let allocated = crate::controllers::service::allocate_service_fields_for_api_write(
+        state.db.as_ref(),
+        &result.0,
+        state.service_ipam.as_ref(),
+        state.nodeport_alloc.as_ref(),
     )
-    .await;
-    let service_with_rv = inject_resource_version(updated_svc.data, updated_svc.resource_version);
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to allocate service fields: {}", e)))?;
 
-    Ok(Json(service_with_rv))
-}
-
-fn service_routing_spec_changed(old: &Value, new: &Value) -> bool {
-    old.get("spec") != new.get("spec")
-}
-
-async fn sync_service_routes_now_if_spec_changed(
-    state: &AppState,
-    namespace: &str,
-    name: &str,
-    previous_service: Option<&crate::datastore::Resource>,
-    updated_service: &Value,
-    operation: &'static str,
-) {
-    let sync_now = previous_service
-        .map(|old| service_routing_spec_changed(&old.data, updated_service))
-        .unwrap_or(false);
-    if sync_now && let Err(e) = state.network.services.sync_services_now().await {
-        tracing::error!(namespace = %namespace, name = %name, operation, error = %e, "Failed to sync service routes after Service spec change");
-    }
+    let response = match allocated {
+        Some(allocated) => {
+            state.controller_dispatcher.enqueue(&allocated).await;
+            allocated
+        }
+        None => result.0.clone(),
+    };
+    Ok(Json(response))
 }
 
 async fn patch_service(
@@ -558,11 +532,6 @@ async fn patch_service(
         ));
     }
 
-    let previous_service = state
-        .db
-        .get_resource("v1", "Service", Some(&namespace), &name)
-        .await?;
-
     let result = patch_service_base(
         State(state.clone()),
         Path((namespace.clone(), name.clone())),
@@ -573,38 +542,27 @@ async fn patch_service(
     )
     .await?;
 
-    if let Err(e) = state
-        .controller_dispatcher
-        .reconcile(&result.0, &state.db, &state.config.node_name)
-        .await
-    {
-        tracing::error!("Failed to reconcile service after patch: {}", e);
-        return Ok(result);
-    }
-
-    let updated_svc = state
-        .db
-        .get_resource("v1", "Service", Some(&namespace), &name)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to fetch updated service: {}", e)))?
-        .ok_or_else(|| {
-            AppError::Internal(format!(
-                "Service {}/{} disappeared after reconcile",
-                namespace, name
-            ))
-        })?;
-    sync_service_routes_now_if_spec_changed(
-        state.as_ref(),
-        &namespace,
-        &name,
-        previous_service.as_ref(),
-        &updated_svc.data,
-        "patch",
+    // Allocation/defaulting runs synchronously so the API response reflects
+    // allocated fields. Endpoint/EndpointSlice reconciliation and the dataplane
+    // route sync run asynchronously via the controller dispatcher after the
+    // enqueue below — never inline on the request path.
+    let allocated = crate::controllers::service::allocate_service_fields_for_api_write(
+        state.db.as_ref(),
+        &result.0,
+        state.service_ipam.as_ref(),
+        state.nodeport_alloc.as_ref(),
     )
-    .await;
-    let service_with_rv = inject_resource_version(updated_svc.data, updated_svc.resource_version);
+    .await
+    .map_err(|e| AppError::Internal(format!("Failed to allocate service fields: {}", e)))?;
 
-    Ok(Json(service_with_rv))
+    let response = match allocated {
+        Some(allocated) => {
+            state.controller_dispatcher.enqueue(&allocated).await;
+            allocated
+        }
+        None => result.0.clone(),
+    };
+    Ok(Json(response))
 }
 
 async fn delete_service(
@@ -848,90 +806,4 @@ async fn create_serviceaccount_token(
             "expirationTimestamp": expiration_timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string()
         }
     })))
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    #[test]
-    fn service_metadata_only_update_does_not_need_immediate_service_sync() {
-        let old = json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {
-                "name": "web",
-                "namespace": "default",
-                "labels": {"app": "web"}
-            },
-            "spec": {
-                "type": "ClusterIP",
-                "clusterIP": "10.51.0.10",
-                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}],
-                "sessionAffinity": "None"
-            }
-        });
-        let new = json!({
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {
-                "name": "web",
-                "namespace": "default",
-                "labels": {"app": "web", "tier": "frontend"}
-            },
-            "spec": {
-                "type": "ClusterIP",
-                "clusterIP": "10.51.0.10",
-                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}],
-                "sessionAffinity": "None"
-            }
-        });
-
-        assert!(!super::service_routing_spec_changed(&old, &new));
-    }
-
-    #[test]
-    fn service_session_affinity_update_needs_immediate_service_sync() {
-        let old = json!({
-            "spec": {
-                "type": "ClusterIP",
-                "clusterIP": "10.51.0.10",
-                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}],
-                "sessionAffinity": "ClientIP",
-                "sessionAffinityConfig": {"clientIP": {"timeoutSeconds": 10800}}
-            }
-        });
-        let new = json!({
-            "spec": {
-                "type": "ClusterIP",
-                "clusterIP": "10.51.0.10",
-                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}],
-                "sessionAffinity": "None"
-            }
-        });
-
-        assert!(super::service_routing_spec_changed(&old, &new));
-    }
-
-    #[test]
-    fn service_port_update_needs_immediate_service_sync() {
-        let old = json!({
-            "spec": {
-                "type": "ClusterIP",
-                "clusterIP": "10.51.0.10",
-                "ports": [{"port": 80, "targetPort": 8080, "protocol": "TCP"}],
-                "sessionAffinity": "None"
-            }
-        });
-        let new = json!({
-            "spec": {
-                "type": "ClusterIP",
-                "clusterIP": "10.51.0.10",
-                "ports": [{"port": 8080, "targetPort": 8080, "protocol": "TCP"}],
-                "sessionAffinity": "None"
-            }
-        });
-
-        assert!(super::service_routing_spec_changed(&old, &new));
-    }
 }
