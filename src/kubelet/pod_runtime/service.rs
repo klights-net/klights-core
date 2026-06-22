@@ -84,36 +84,10 @@ pub enum PodFinalizeStartupResult {
 
 /// Hint carried from a CRI container event into deferred runtime reconcile.
 ///
-/// When a short-lived pod exits while startup finalization is still in
-/// flight, the actor defers the CRI stop event and later runs a runtime
-/// reconcile. By then the sandbox container listing may be empty or stale.
-/// This hint lets the reconciler read the concrete (terminated) container
-/// status via the event's container id instead of synthesizing
-/// `Pending`/`ContainerCreating`.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RuntimeReconcileHint {
-    pub container_id: Option<String>,
-}
-
-impl RuntimeReconcileHint {
-    /// No hint — used by callers that have no concrete container id.
-    pub fn none() -> Self {
-        Self { container_id: None }
-    }
-
-    /// Build a hint from a CRI event container id. An empty id collapses to
-    /// `none()` so callers can pass the raw event payload without a guard.
-    pub fn from_container_id(container_id: impl Into<String>) -> Self {
-        let container_id = container_id.into();
-        if container_id.is_empty() {
-            Self::none()
-        } else {
-            Self {
-                container_id: Some(container_id),
-            }
-        }
-    }
-}
+/// Extracted into `reconcile_hint` to keep this hub under its size cap; the
+/// type is re-exported here so the public path
+/// `crate::kubelet::pod_runtime::service::RuntimeReconcileHint` stays stable.
+pub use crate::kubelet::pod_runtime::reconcile_hint::RuntimeReconcileHint;
 
 /// Backend-neutral lifecycle runtime trait.
 /// Every lifecycle operation below `PodWorkExecutor` takes `PodRuntimeKey`
@@ -212,12 +186,18 @@ use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::filesystem::PodFilesystem;
 use crate::kubelet::pod_runtime::hooks::{HookOutcome, PodHookRuntime};
 use crate::kubelet::pod_runtime::hostports::HostPortRuntime;
+use crate::kubelet::pod_runtime::init_container_status::{
+    InitContainerStop, build_completed_init_container_status, build_failed_init_container_statuses,
+    build_init_failure_terminated_state, build_pod_start_failure_app_statuses,
+    build_retrying_init_container_statuses, init_container_completed,
+    init_container_stop_from_status, record_completed_init_container_status,
+};
 use crate::kubelet::pod_runtime::network::PodNetworkRuntime;
 use crate::kubelet::pod_runtime::probes::{ProbeRuntime, StartupFinalizationAction};
 use crate::kubelet::pod_runtime::repository::{LivePodUidCheck, PodRuntimeRepository};
 use crate::kubelet::pod_runtime::status_emitter::PodStatusEmitter;
 use crate::kubelet::pod_runtime::status_helpers::{
-    json_number_as_i64, replace_container_status, restart_last_state_from_reconciled_status,
+    replace_container_status, restart_last_state_from_reconciled_status,
     restarted_running_container_status, runtime_status_container_id,
 };
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
@@ -235,14 +215,6 @@ use crate::task_supervisor::TaskSupervisor;
 const INIT_CONTAINER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const INIT_CONTAINER_FAST_EXIT_RECHECK_DELAY: std::time::Duration =
     std::time::Duration::from_millis(50);
-const REASON_CREATE_CONTAINER_ERROR: &str = "CreateContainerError";
-const REASON_POD_INITIALIZING: &str = "PodInitializing";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InitContainerStop {
-    exit_code: i32,
-    finished_at: i64,
-}
 
 struct ContainerConfigBuildRequest<'a> {
     key: &'a PodRuntimeKey,
@@ -265,30 +237,6 @@ struct ReconcileContainerInfo {
     image: String,
     image_ref: String,
     termination_message: String,
-}
-
-fn init_container_stop_from_status(
-    status: &k8s_cri::v1::ContainerStatusResponse,
-) -> Option<InitContainerStop> {
-    let status = status.status.as_ref()?;
-    if status.state != k8s_cri::v1::ContainerState::ContainerExited as i32 {
-        return None;
-    }
-    Some(InitContainerStop {
-        exit_code: status.exit_code,
-        finished_at: unix_seconds_from_cri_ns(status.finished_at),
-    })
-}
-
-fn unix_seconds_from_cri_ns(ns: i64) -> i64 {
-    if ns > 0 {
-        ns / 1_000_000_000
-    } else {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
-    }
 }
 
 fn pod_status_container_name_by_id(
@@ -398,279 +346,6 @@ fn append_managed_hosts_mount(mounts: &mut Vec<k8s_cri::v1::Mount>, hosts_file_p
         recursive_read_only: false,
     });
 }
-
-fn record_completed_init_container_status(
-    statuses: &mut Vec<serde_json::Value>,
-    container_name: &str,
-    completed: serde_json::Value,
-) {
-    if let Some(pos) = statuses
-        .iter()
-        .position(|status| status.get("name").and_then(|v| v.as_str()) == Some(container_name))
-    {
-        statuses.truncate(pos);
-    }
-    statuses.push(completed);
-}
-
-fn init_container_completed(statuses: &[serde_json::Value], container_name: &str) -> bool {
-    statuses.iter().any(|status| {
-        status.get("name").and_then(|v| v.as_str()) == Some(container_name)
-            && status
-                .pointer("/state/terminated/exitCode")
-                .and_then(json_number_as_i64)
-                == Some(0)
-    })
-}
-
-fn build_completed_init_container_status(
-    name: &str,
-    image: &str,
-    container_id: &str,
-    exit_code: i32,
-    started_at: i64,
-    finished_at: i64,
-) -> serde_json::Value {
-    let timestamp_from_seconds = |seconds: i64| {
-        chrono::DateTime::from_timestamp(seconds, 0)
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_else(crate::utils::k8s_timestamp)
-    };
-    serde_json::json!({
-        "name": name,
-        "state": {
-            "terminated": {
-                "exitCode": exit_code,
-                "reason": if exit_code == 0 { "Completed" } else { "Error" },
-                "startedAt": timestamp_from_seconds(started_at),
-                "finishedAt": timestamp_from_seconds(finished_at),
-            }
-        },
-        "ready": exit_code == 0,
-        "restartCount": 0,
-        "image": image,
-        "imageID": image,
-        "containerID": format!("containerd://{}", container_id),
-    })
-}
-
-fn init_failure_timestamp_from_seconds(seconds: i64) -> String {
-    chrono::DateTime::from_timestamp(seconds, 0)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_else(crate::utils::k8s_timestamp)
-}
-
-fn build_init_failure_terminated_state(
-    exit_code: i32,
-    started_at: i64,
-    finished_at: i64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "exitCode": exit_code,
-        "reason": if exit_code == 0 { "Completed" } else { "Error" },
-        "startedAt": init_failure_timestamp_from_seconds(started_at),
-        "finishedAt": init_failure_timestamp_from_seconds(finished_at),
-    })
-}
-
-fn build_pod_start_failure_app_statuses(
-    pod: &serde_json::Value,
-    message: &str,
-) -> Vec<serde_json::Value> {
-    pod.pointer("/spec/containers")
-        .and_then(|value| value.as_array())
-        .map(|containers| {
-            containers
-                .iter()
-                .map(|container| {
-                    let name = container
-                        .get("name")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown");
-                    let image = container
-                        .get("image")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown");
-                    serde_json::json!({
-                        "name": name,
-                        "image": image,
-                        "imageID": "",
-                        "ready": false,
-                        "started": false,
-                        "restartCount": 0,
-                        "state": {
-                            "waiting": {
-                                "reason": REASON_CREATE_CONTAINER_ERROR,
-                                "message": message
-                            }
-                        }
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn build_retrying_init_container_statuses(
-    pod: &serde_json::Value,
-    failed_name: &str,
-    existing_statuses: &[serde_json::Value],
-    fallback_terminated: serde_json::Value,
-) -> Vec<serde_json::Value> {
-    let Some(init_containers) = pod
-        .pointer("/spec/initContainers")
-        .and_then(|value| value.as_array())
-    else {
-        return Vec::new();
-    };
-
-    let mut statuses = Vec::new();
-    let mut saw_failed = false;
-    for container in init_containers {
-        let name = container
-            .get("name")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown");
-        let image = container
-            .get("image")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown");
-        let existing = existing_statuses
-            .iter()
-            .find(|status| status.get("name").and_then(|value| value.as_str()) == Some(name));
-
-        if name == failed_name {
-            saw_failed = true;
-            let restart_count = existing
-                .and_then(|status| status.get("restartCount"))
-                .and_then(|value| value.as_i64())
-                .unwrap_or(0)
-                + 1;
-            let terminated = existing
-                .and_then(|status| status.pointer("/state/terminated"))
-                .cloned()
-                .or_else(|| {
-                    existing
-                        .and_then(|status| status.pointer("/lastState/terminated"))
-                        .cloned()
-                })
-                .unwrap_or_else(|| fallback_terminated.clone());
-            statuses.push(serde_json::json!({
-                "name": name,
-                "image": image,
-                "imageID": existing
-                    .and_then(|status| status.get("imageID"))
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!("")),
-                "ready": false,
-                "started": false,
-                "restartCount": restart_count,
-                "state": {
-                    "waiting": {
-                        "reason": REASON_POD_INITIALIZING
-                    }
-                },
-                "lastState": {
-                    "terminated": terminated
-                }
-            }));
-        } else if saw_failed {
-            statuses.push(serde_json::json!({
-                "name": name,
-                "image": image,
-                "imageID": "",
-                "ready": false,
-                "started": false,
-                "restartCount": 0,
-                "state": {
-                    "waiting": {
-                        "reason": REASON_POD_INITIALIZING
-                    }
-                }
-            }));
-        } else if let Some(existing) = existing {
-            statuses.push(existing.clone());
-        } else {
-            statuses.push(serde_json::json!({
-                "name": name,
-                "image": image,
-                "imageID": "",
-                "ready": true,
-                "restartCount": 0,
-                "state": {
-                    "terminated": {
-                        "exitCode": 0,
-                        "reason": "Completed",
-                        "startedAt": crate::utils::k8s_timestamp(),
-                        "finishedAt": crate::utils::k8s_timestamp()
-                    }
-                }
-            }));
-        }
-    }
-    statuses
-}
-
-fn build_failed_init_container_statuses(
-    pod: &serde_json::Value,
-    failed_name: &str,
-    exit_code: i32,
-    started_at: i64,
-    finished_at: i64,
-) -> Vec<serde_json::Value> {
-    let Some(init_containers) = pod
-        .pointer("/spec/initContainers")
-        .and_then(|value| value.as_array())
-    else {
-        return Vec::new();
-    };
-
-    let mut statuses = Vec::new();
-    for container in init_containers {
-        let name = container
-            .get("name")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown");
-        let image = container
-            .get("image")
-            .and_then(|value| value.as_str())
-            .unwrap_or("unknown");
-        if name == failed_name {
-            statuses.push(serde_json::json!({
-                "name": name,
-                "image": image,
-                "imageID": "",
-                "ready": false,
-                "restartCount": 0,
-                "state": {
-                    "terminated": build_init_failure_terminated_state(
-                        exit_code,
-                        started_at,
-                        finished_at,
-                    )
-                }
-            }));
-            break;
-        }
-        statuses.push(serde_json::json!({
-            "name": name,
-            "image": image,
-            "imageID": "",
-            "ready": true,
-            "restartCount": 0,
-            "state": {
-                "terminated": {
-                    "exitCode": 0,
-                    "reason": "Completed",
-                    "startedAt": crate::utils::k8s_timestamp(),
-                    "finishedAt": crate::utils::k8s_timestamp()
-                }
-            }
-        }));
-    }
-    statuses
-}
-
 fn cri_timestamp_from_ns(ns: i64) -> String {
     if ns <= 0 {
         return crate::utils::k8s_timestamp();
