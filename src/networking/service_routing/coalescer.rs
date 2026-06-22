@@ -235,7 +235,7 @@ impl<'a> NftServiceRouterDefaultBoot<'a> {
 /// The coalescer is a `tokio::sync::Notify`-driven loop. Callers signal
 /// "services need re-sync" via `request_services_sync`; the worker
 /// waits on the Notify, then sleeps `min_sync_period`, then runs ONE
-/// `sync_services_from_db` covering all collapsed events.
+/// `sync_services_from_api` covering all collapsed events.
 /// `Notify::notify_one` is idempotent if no waiter, so N rapid calls
 /// between two ticks coalesce into one sync.
 ///

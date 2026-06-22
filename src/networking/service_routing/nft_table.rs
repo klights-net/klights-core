@@ -224,6 +224,55 @@ pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<Ser
         .await
         .context("list Services through LeaderApiClient")?;
 
+    let endpoints_list = api
+        .list_resources_fresh(ListRequest {
+            api_version: "v1".to_string(),
+            kind: "Endpoints".to_string(),
+            namespace: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+        })
+        .await
+        .context("list Endpoints through LeaderApiClient")?;
+
+    let endpoint_slices_list = api
+        .list_resources_fresh(ListRequest {
+            api_version: "discovery.k8s.io/v1".to_string(),
+            kind: "EndpointSlice".to_string(),
+            namespace: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+        })
+        .await
+        .context("list EndpointSlices through LeaderApiClient")?;
+
+    let mut endpoints_by_service: std::collections::HashMap<
+        (String, String),
+        &crate::datastore::Resource,
+    > = std::collections::HashMap::with_capacity(endpoints_list.items.len());
+    for endpoints in &endpoints_list.items {
+        if let Some((namespace, name)) = resource_namespace_name(endpoints) {
+            endpoints_by_service.insert((namespace.to_string(), name.to_string()), endpoints);
+        }
+    }
+
+    let mut endpoint_slices_by_service: std::collections::HashMap<
+        (String, String),
+        Vec<&crate::datastore::Resource>,
+    > = std::collections::HashMap::new();
+    for slice in &endpoint_slices_list.items {
+        if let Some((namespace, service_name)) = endpoint_slice_service_key(slice) {
+            endpoint_slices_by_service
+                .entry((namespace.to_string(), service_name.to_string()))
+                .or_default()
+                .push(slice);
+        }
+    }
+
     let mut specs: Vec<ServiceSpec> = Vec::with_capacity(services_list.items.len());
     for svc_resource in &services_list.items {
         let svc = &svc_resource.data;
@@ -238,36 +287,14 @@ pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<Ser
             _ => continue,
         };
 
-        let endpoints = api
-            .get_resource_fresh(ResourceKey {
-                api_version: "v1".to_string(),
-                kind: "Endpoints".to_string(),
-                namespace: Some(namespace.to_string()),
-                name: svc_name.to_string(),
-            })
-            .await
-            .ok()
-            .flatten();
-
-        let label_selector = format!("kubernetes.io/service-name={svc_name}");
-        let slices = api
-            .list_resources_fresh(ListRequest {
-                api_version: "discovery.k8s.io/v1".to_string(),
-                kind: "EndpointSlice".to_string(),
-                namespace: Some(namespace.to_string()),
-                label_selector: Some(label_selector),
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-            })
-            .await
-            .ok();
-        let slice_items = slices
-            .as_ref()
-            .map(|slice_list| slice_list.items.as_slice())
+        let key = (namespace.to_string(), svc_name.to_string());
+        let endpoints = endpoints_by_service.get(&key).copied();
+        let slice_items = endpoint_slices_by_service
+            .get(&key)
+            .map(Vec::as_slice)
             .unwrap_or(&[]);
         if let Some(spec) =
-            service_spec_from_endpoint_inventory(svc, endpoints.as_ref(), slice_items)
+            service_spec_from_endpoint_inventory(svc, endpoints, slice_items.iter().copied())
         {
             specs.push(spec);
         }
@@ -276,17 +303,46 @@ pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<Ser
     Ok(specs)
 }
 
-fn service_spec_from_endpoint_inventory(
+fn resource_namespace_name(resource: &crate::datastore::Resource) -> Option<(&str, &str)> {
+    let metadata = resource.data.get("metadata");
+    let namespace = metadata
+        .and_then(|m| m.get("namespace"))
+        .and_then(|v| v.as_str())
+        .or(resource.namespace.as_deref())?;
+    let name = metadata
+        .and_then(|m| m.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(resource.name.as_str());
+    Some((namespace, name))
+}
+
+fn endpoint_slice_service_key(resource: &crate::datastore::Resource) -> Option<(&str, &str)> {
+    let namespace = resource_namespace_name(resource)?.0;
+    let service_name = resource
+        .data
+        .get("metadata")
+        .and_then(|m| m.get("labels"))
+        .and_then(|l| l.get("kubernetes.io/service-name"))
+        .and_then(|v| v.as_str())?;
+    Some((namespace, service_name))
+}
+
+fn service_spec_from_endpoint_inventory<'a, I>(
     service: &serde_json::Value,
     endpoints: Option<&crate::datastore::Resource>,
-    endpoint_slices: &[crate::datastore::Resource],
-) -> Option<ServiceSpec> {
-    if !endpoint_slices.is_empty() {
-        let slice_refs: Vec<&serde_json::Value> =
-            endpoint_slices.iter().map(|r| r.data.as_ref()).collect();
-        if let Some(spec) = ServiceSpec::from_service_and_endpointslices(service, &slice_refs) {
-            return Some(spec);
-        }
+    endpoint_slices: I,
+) -> Option<ServiceSpec>
+where
+    I: IntoIterator<Item = &'a crate::datastore::Resource>,
+{
+    let slice_refs: Vec<&serde_json::Value> = endpoint_slices
+        .into_iter()
+        .map(|r| r.data.as_ref())
+        .collect();
+    if !slice_refs.is_empty()
+        && let Some(spec) = ServiceSpec::from_service_and_endpointslices(service, &slice_refs)
+    {
+        return Some(spec);
     }
 
     endpoints.and_then(|eps| ServiceSpec::from_service_and_endpoints(service, Some(&eps.data)))
@@ -650,7 +706,7 @@ impl KlightsTable {
                 .map(|slice_list| slice_list.items.as_slice())
                 .unwrap_or(&[]);
             if let Some(spec) =
-                service_spec_from_endpoint_inventory(svc, endpoints.as_ref(), slice_items)
+                service_spec_from_endpoint_inventory(svc, endpoints.as_ref(), slice_items.iter())
             {
                 specs.push(spec);
             }

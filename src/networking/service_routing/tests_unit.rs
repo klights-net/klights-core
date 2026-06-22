@@ -652,6 +652,11 @@ fn test_prefix_len_from_mask_round_trips() {
 struct FreshServiceInventoryClient {
     cached_list_calls: std::sync::atomic::AtomicUsize,
     cached_get_calls: std::sync::atomic::AtomicUsize,
+    fresh_get_calls: std::sync::atomic::AtomicUsize,
+    service_list_calls: std::sync::atomic::AtomicUsize,
+    endpoints_list_calls: std::sync::atomic::AtomicUsize,
+    endpointslice_list_calls: std::sync::atomic::AtomicUsize,
+    filtered_endpointslice_list_calls: std::sync::atomic::AtomicUsize,
     legacy_endpoints_empty: bool,
     legacy_endpoints_partial: bool,
 }
@@ -706,6 +711,12 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
         req: crate::control_plane::client::ListRequest,
     ) -> anyhow::Result<crate::control_plane::client::ListResponse> {
         if req.api_version == "discovery.k8s.io/v1" && req.kind == "EndpointSlice" {
+            self.endpointslice_list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if req.label_selector.is_some() {
+                self.filtered_endpointslice_list_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             return Ok(crate::datastore::ResourceList {
                 items: if self.legacy_endpoints_empty || self.legacy_endpoints_partial {
                     vec![inventory_resource(
@@ -744,8 +755,54 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
             });
         }
 
+        if req.api_version == "v1" && req.kind == "Endpoints" {
+            self.endpoints_list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(crate::datastore::ResourceList {
+                items: vec![inventory_resource(
+                    "v1",
+                    "Endpoints",
+                    "kube-system",
+                    "kube-dns",
+                    72,
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "Endpoints",
+                        "metadata": {
+                            "namespace": "kube-system",
+                            "name": "kube-dns",
+                            "uid": "kube-dns-endpoints-uid",
+                        },
+                        "subsets": if self.legacy_endpoints_empty {
+                            json!([])
+                        } else if self.legacy_endpoints_partial {
+                            json!([{
+                            "addresses": [{"ip": "10.50.0.2"}],
+                            "ports": [
+                                {"name": "dns", "port": 53, "protocol": "UDP"}
+                            ]
+                        }])
+                        } else {
+                            json!([{
+                            "addresses": [{"ip": "10.50.0.2"}],
+                            "ports": [
+                                {"name": "dns", "port": 53, "protocol": "UDP"},
+                                {"name": "dns-tcp", "port": 53, "protocol": "TCP"}
+                            ]
+                        }])
+                        }
+                    }),
+                )],
+                resource_version: 72,
+                continue_token: None,
+                remaining_item_count: None,
+            });
+        }
+
         assert_eq!(req.api_version, "v1");
         assert_eq!(req.kind, "Service");
+        self.service_list_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(crate::datastore::ResourceList {
             items: vec![inventory_resource(
                 "v1",
@@ -780,6 +837,8 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
         &self,
         key: crate::control_plane::client::ResourceKey,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.fresh_get_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if key.api_version == "v1"
             && key.kind == "Endpoints"
             && key.namespace.as_deref() == Some("kube-system")
@@ -994,6 +1053,50 @@ async fn service_specs_from_api_uses_fresh_reads_for_routing_snapshot() {
             (Protocol::Tcp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 2)]),
             (Protocol::Udp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 2)]),
         ]
+    );
+}
+
+#[tokio::test]
+async fn service_specs_from_api_uses_bounded_bulk_fresh_inventory() {
+    let api = FreshServiceInventoryClient {
+        legacy_endpoints_partial: true,
+        ..Default::default()
+    };
+
+    let specs = service_specs_from_api(&api)
+        .await
+        .expect("service specs should build from bulk inventory");
+
+    assert_eq!(specs.len(), 1);
+    assert_eq!(
+        api.service_list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "routing snapshots should list Services once"
+    );
+    assert_eq!(
+        api.endpoints_list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "routing snapshots should list Endpoints once for the whole inventory"
+    );
+    assert_eq!(
+        api.endpointslice_list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "routing snapshots should list EndpointSlices once for the whole inventory"
+    );
+    assert_eq!(
+        api.filtered_endpointslice_list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "routing snapshots must not issue one EndpointSlice list per Service"
+    );
+    assert_eq!(
+        api.fresh_get_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "routing snapshots must not issue one fresh Endpoints get per Service"
     );
 }
 

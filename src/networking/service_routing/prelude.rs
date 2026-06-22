@@ -14,7 +14,7 @@ pub use std::net::Ipv4Addr;
 pub use std::str::FromStr;
 pub use tokio_util::sync::CancellationToken;
 
-pub use crate::control_plane::client::{LeaderApiClient, ListRequest, ResourceKey};
+pub use crate::control_plane::client::{LeaderApiClient, ListRequest};
 pub use crate::datastore::DatastoreBackend;
 pub use crate::datastore::node_local::{NodeLocalBackend, NodeLocalHandle};
 pub use crate::networking::netfilter::JhashExpr;
