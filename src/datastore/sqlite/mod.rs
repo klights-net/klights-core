@@ -332,9 +332,7 @@ impl Datastore {
             })
             .await
             .map_err(|e| anyhow!("move pod to cleanup intent failed: {e}"))?;
-        for event in pending {
-            self.publish_watch_event(event);
-        }
+        self.publish_watch_events(pending);
         Ok(())
     }
 
@@ -422,9 +420,7 @@ impl Datastore {
             })
             .await
             .map_err(|e| anyhow!("apply cluster maintenance command failed: {e}"))?;
-        for event in pending {
-            self.publish_watch_event(event);
-        }
+        self.publish_watch_events(pending);
         Ok(())
     }
 

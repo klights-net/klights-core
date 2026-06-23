@@ -22,13 +22,30 @@ use super::{
 /// watch bus directly — they hand a `PendingWatchEvent` back
 /// and this function publishes it. tests/source_guard_tests.py enforces this.
 pub fn publish_pending(pending: PendingWatchEvent, bus: &crate::watch::WatchBus) {
-    let event = pending.event;
-    crate::datastore::diagnostics::log_watch_event_broadcast(&event);
-    if let Some(signal) = WatchSignal::from_event(&event) {
+    publish_pending_batch(std::iter::once(pending), bus);
+}
+
+pub fn publish_pending_batch(
+    pending: impl IntoIterator<Item = PendingWatchEvent>,
+    bus: &crate::watch::WatchBus,
+) {
+    let events = pending
+        .into_iter()
+        .map(|pending| pending.event)
+        .collect::<Vec<_>>();
+
+    for event in &events {
+        crate::datastore::diagnostics::log_watch_event_broadcast(event);
+    }
+
+    for signal in WatchSignal::from_events(events.iter()) {
         bus.publish_signal(signal);
     }
+
     #[cfg(test)]
-    bus.publish(event);
+    for event in events {
+        bus.publish(event);
+    }
 }
 
 /// Map a DB-stored event_type string back to a `Cow<'static, str>` reusing
@@ -109,6 +126,14 @@ impl Datastore {
     /// Raft FSM apply hook.
     pub fn publish_watch_event(&self, pending: PendingWatchEvent) {
         publish_pending(pending, &self.watch_bus);
+    }
+
+    /// Broadcast a batch of watch events after the DB transaction has
+    /// committed. Multi-event apply paths (raft/cluster replace) use this so
+    /// the post-commit signals are grouped per `(topic, namespace)` through
+    /// `publish_pending_batch` instead of emitting one signal per event.
+    pub fn publish_watch_events(&self, pending: impl IntoIterator<Item = PendingWatchEvent>) {
+        publish_pending_batch(pending, &self.watch_bus);
     }
 
     #[cfg(test)]
@@ -441,5 +466,58 @@ mod tests {
             event.object.get("kind").and_then(|kind| kind.as_str()),
             Some("Pod")
         );
+    }
+
+    #[tokio::test]
+    async fn publish_pending_batch_sends_grouped_signal_for_same_topic() {
+        use crate::watch::WatchAdvance;
+
+        let ds = crate::datastore::test_support::in_memory().await;
+        let topic = WatchTopic::new("v1", "Pod");
+        let mut signals = ds.subscribe_watch_signals(topic);
+
+        publish_pending_batch(
+            vec![
+                create_pending_watch_event(
+                    "v1",
+                    "Pod",
+                    Some("default"),
+                    "pod-a",
+                    10,
+                    "MODIFIED",
+                    serde_json::json!({"metadata": {"labels": {"app": "a"}}}),
+                ),
+                create_pending_watch_event(
+                    "v1",
+                    "Pod",
+                    Some("default"),
+                    "pod-b",
+                    12,
+                    "MODIFIED",
+                    serde_json::json!({"metadata": {"labels": {"app": "b"}}}),
+                ),
+                create_pending_watch_event(
+                    "v1",
+                    "Pod",
+                    Some("kube-system"),
+                    "pod-c",
+                    11,
+                    "MODIFIED",
+                    serde_json::json!({"metadata": {"labels": {"app": "c"}}}),
+                ),
+            ],
+            &ds.watch_bus,
+        );
+
+        let signal = signals.try_recv().expect("grouped signal");
+        assert_eq!(signal.advances.len(), 2);
+        assert!(signal.advances.contains(&WatchAdvance {
+            namespace: Some("default".to_string()),
+            high_rv: 12,
+        }));
+        assert!(signal.advances.contains(&WatchAdvance {
+            namespace: Some("kube-system".to_string()),
+            high_rv: 11,
+        }));
     }
 }

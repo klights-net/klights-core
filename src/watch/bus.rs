@@ -90,21 +90,64 @@ pub const DEFAULT_WATCH_ADVANCE_GROUP_LIMIT: usize = 3;
 
 impl WatchSignal {
     pub fn from_event(event: &WatchEvent) -> Option<Self> {
-        let topic = WatchTopic::of_event(event)?;
-        let high_rv = event.resource_version()?;
-        if high_rv <= 0 {
-            return None;
+        Self::from_events(std::iter::once(event)).into_iter().next()
+    }
+
+    /// Build grouped watch signals from a batch of events.
+    ///
+    /// Events for the same `(apiVersion, kind)` topic and the same namespace
+    /// collapse into a single `WatchAdvance` carrying the highest resource
+    /// version seen for that namespace, so a post-commit batch publishes one
+    /// replay hint per (topic, namespace) rather than one per event. When a
+    /// topic's distinct namespaces exceed `DEFAULT_WATCH_ADVANCE_GROUP_LIMIT`,
+    /// the advances are chunked into multiple signals so no single signal
+    /// grows unbounded. This is the single source of truth for grouped signal
+    /// construction; single-event callers reuse it through `from_event`.
+    pub fn from_events<'a>(events: impl IntoIterator<Item = &'a WatchEvent>) -> Vec<Self> {
+        let mut grouped: HashMap<WatchTopic, HashMap<Option<String>, i64>> = HashMap::new();
+
+        for event in events {
+            let Some(topic) = WatchTopic::of_event(event) else {
+                continue;
+            };
+            let Some(high_rv) = event.resource_version() else {
+                continue;
+            };
+            if high_rv <= 0 {
+                continue;
+            }
+            let namespace = event
+                .object
+                .get("metadata")
+                .and_then(|metadata| metadata.get("namespace"))
+                .and_then(|namespace| namespace.as_str())
+                .map(str::to_string);
+
+            let topic_advances = grouped.entry(topic).or_default();
+            let entry = topic_advances.entry(namespace).or_insert(high_rv);
+            *entry = (*entry).max(high_rv);
         }
-        let namespace = event
-            .object
-            .get("metadata")
-            .and_then(|metadata| metadata.get("namespace"))
-            .and_then(|namespace| namespace.as_str())
-            .map(str::to_string);
-        Some(Self {
-            topic,
-            advances: vec![WatchAdvance { namespace, high_rv }],
-        })
+
+        let mut signals = Vec::new();
+        for (topic, namespace_rvs) in grouped {
+            let mut advances = namespace_rvs
+                .into_iter()
+                .map(|(namespace, high_rv)| WatchAdvance { namespace, high_rv })
+                .collect::<Vec<_>>();
+            advances.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+
+            for chunk in advances.chunks(DEFAULT_WATCH_ADVANCE_GROUP_LIMIT) {
+                signals.push(WatchSignal {
+                    topic: topic.clone(),
+                    advances: chunk.to_vec(),
+                });
+            }
+        }
+        signals.sort_by(|left, right| {
+            (left.topic.api_version(), left.topic.kind())
+                .cmp(&(right.topic.api_version(), right.topic.kind()))
+        });
+        signals
     }
 }
 
@@ -421,5 +464,106 @@ mod tests {
             cm_rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    fn watch_event_for_signal(
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        rv: i64,
+    ) -> WatchEvent {
+        let mut metadata = json!({
+            "name": name,
+            "resourceVersion": rv.to_string(),
+        });
+        if let Some(namespace) = namespace {
+            metadata["namespace"] = serde_json::Value::String(namespace.to_string());
+        }
+        WatchEvent::modified(json!({
+            "apiVersion": api_version,
+            "kind": kind,
+            "metadata": metadata,
+        }))
+    }
+
+    #[test]
+    fn watch_signal_from_events_groups_by_topic_and_namespace() {
+        let events = vec![
+            watch_event_for_signal("v1", "Pod", Some("default"), "pod-a", 10),
+            watch_event_for_signal("v1", "Pod", Some("default"), "pod-b", 12),
+            watch_event_for_signal("v1", "Pod", Some("kube-system"), "pod-c", 11),
+            watch_event_for_signal("v1", "ConfigMap", Some("default"), "cm-a", 13),
+        ];
+
+        let mut signals = WatchSignal::from_events(events.iter());
+        signals.sort_by(|left, right| {
+            (
+                left.topic.api_version(),
+                left.topic.kind(),
+                left.advances.len(),
+            )
+                .cmp(&(
+                    right.topic.api_version(),
+                    right.topic.kind(),
+                    right.advances.len(),
+                ))
+        });
+
+        let pod_signal = signals
+            .iter()
+            .find(|signal| signal.topic == WatchTopic::new("v1", "Pod"))
+            .expect("pod signal");
+        assert_eq!(pod_signal.advances.len(), 2);
+        assert!(pod_signal.advances.contains(&WatchAdvance {
+            namespace: Some("default".to_string()),
+            high_rv: 12,
+        }));
+        assert!(pod_signal.advances.contains(&WatchAdvance {
+            namespace: Some("kube-system".to_string()),
+            high_rv: 11,
+        }));
+
+        let cm_signal = signals
+            .iter()
+            .find(|signal| signal.topic == WatchTopic::new("v1", "ConfigMap"))
+            .expect("configmap signal");
+        assert_eq!(
+            cm_signal.advances,
+            vec![WatchAdvance {
+                namespace: Some("default".to_string()),
+                high_rv: 13,
+            }]
+        );
+    }
+
+    #[test]
+    fn watch_signal_from_events_chunks_advances_by_group_limit() {
+        let events = vec![
+            watch_event_for_signal("v1", "Pod", Some("ns-a"), "pod-a", 10),
+            watch_event_for_signal("v1", "Pod", Some("ns-b"), "pod-b", 11),
+            watch_event_for_signal("v1", "Pod", Some("ns-c"), "pod-c", 12),
+            watch_event_for_signal("v1", "Pod", Some("ns-d"), "pod-d", 13),
+        ];
+
+        let signals = WatchSignal::from_events(events.iter());
+        let pod_signals = signals
+            .iter()
+            .filter(|signal| signal.topic == WatchTopic::new("v1", "Pod"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(pod_signals.len(), 2);
+        assert!(
+            pod_signals
+                .iter()
+                .all(|signal| signal.advances.len() <= DEFAULT_WATCH_ADVANCE_GROUP_LIMIT)
+        );
+        assert_eq!(
+            pod_signals
+                .iter()
+                .flat_map(|signal| signal.advances.iter())
+                .count(),
+            4
+        );
     }
 }

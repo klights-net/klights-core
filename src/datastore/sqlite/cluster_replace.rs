@@ -36,9 +36,7 @@ impl Datastore {
             .await
             .map_err(|err| anyhow!("failed to replace replicated resource state: {err}"))?;
 
-        for event in pending {
-            self.publish_watch_event(event);
-        }
+        self.publish_watch_events(pending);
         Ok(())
     }
 }
@@ -198,9 +196,7 @@ impl Datastore {
             .await
             .map_err(|err| anyhow!("failed to apply log_apply commit: {err}"))?;
 
-        for event in pending {
-            self.publish_watch_event(event);
-        }
+        self.publish_watch_events(pending);
         Ok(())
     }
 
@@ -218,9 +214,7 @@ impl Datastore {
             .await
             .map_err(|err| anyhow!("failed to apply raft log_apply commit: {err}"))?;
 
-        for event in outcome.pending {
-            self.publish_watch_event(event);
-        }
+        self.publish_watch_events(outcome.pending);
         Ok(outcome.result)
     }
 }
