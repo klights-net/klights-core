@@ -1589,6 +1589,10 @@ pub struct MockPodRuntimeService {
     finalize_startup_result: Mutex<PodFinalizeStartupResult>,
     finalize_result: Mutex<PodDeletionFinalizeResult>,
     fail_method: Mutex<Option<String>>,
+    /// When set, `stop_pod` returns a typed `PodOwnershipError` instead of
+    /// the generic injected failure. Used to exercise the lifecycle
+    /// executor's ownership-mismatch classification (P0 StopPod loop).
+    stop_ownership_error: Mutex<Option<crate::kubelet::pod_runtime::service::PodOwnershipError>>,
     /// CancellationToken captured from the last `start_pod` call; cloned
     /// into the mock so tests can signal cancellation externally.
     start_pod_cancel: Mutex<Option<CancellationToken>>,
@@ -1608,6 +1612,7 @@ impl MockPodRuntimeService {
             finalize_startup_result: Mutex::new(PodFinalizeStartupResult::Unconfirmed),
             finalize_result: Mutex::new(PodDeletionFinalizeResult::DeletedOrAlreadyGone),
             fail_method: Mutex::new(None),
+            stop_ownership_error: Mutex::new(None),
             start_pod_cancel: Mutex::new(None),
         }
     }
@@ -1627,6 +1632,16 @@ impl MockPodRuntimeService {
     /// Cause the next call to the named method to return an error.
     pub fn set_fail_method(&self, method_name: &str) {
         *self.fail_method.lock().unwrap() = Some(method_name.to_string());
+    }
+
+    /// Cause the next `stop_pod` call to fail with a typed `PodOwnershipError`
+    /// (terminal/non-retryable) instead of a generic injected failure.
+    pub fn set_stop_pod_ownership_error(&self, local_node: &str, target_node: Option<&str>) {
+        *self.stop_ownership_error.lock().unwrap() =
+            Some(crate::kubelet::pod_runtime::service::PodOwnershipError {
+                local_node: local_node.to_string(),
+                target_node: target_node.map(|s| s.to_string()),
+            });
     }
 
     pub fn recorded_calls(&self) -> Vec<MockRuntimeCall> {
@@ -1675,6 +1690,15 @@ impl PodRuntimeService for MockPodRuntimeService {
         _pod: Option<serde_json::Value>,
         sandbox_id: Option<String>,
     ) -> anyhow::Result<()> {
+        if let Some(own) = self.stop_ownership_error.lock().unwrap().take() {
+            self.calls.lock().unwrap().push(MockRuntimeCall::StopPod {
+                namespace: key.namespace.clone(),
+                name: key.name.clone(),
+                uid: key.uid.clone(),
+                sandbox_id,
+            });
+            return Err(anyhow::Error::new(own));
+        }
         self.check_fail("stop_pod")?;
         self.calls.lock().unwrap().push(MockRuntimeCall::StopPod {
             namespace: key.namespace.clone(),

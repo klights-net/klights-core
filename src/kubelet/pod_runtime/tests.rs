@@ -11,7 +11,8 @@ use crate::kubelet::pod_runtime::hooks::HookOutcome;
 use crate::kubelet::pod_runtime::hostports::HostPortRuntime;
 use crate::kubelet::pod_runtime::probes::ProbeRuntime;
 use crate::kubelet::pod_runtime::service::{
-    PodDeletionFinalizeResult, PodRuntimeKey, PodStartResult, RealPodRuntimeServiceDependencies,
+    PodDeletionFinalizeResult, PodOwnershipError, PodRuntimeKey, PodStartResult,
+    RealPodRuntimeServiceDependencies,
 };
 use crate::kubelet::pod_runtime::service::{PodFinalizeStartupResult, PodRuntimeService};
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
@@ -3205,6 +3206,51 @@ async fn real_runtime_stop_pod_stops_and_removes_containers_idempotently() {
 
 // --- Task 9.3: Stop Pod Sandbox, Cgroup, Store Row, and CNI Cleanup ---
 
+/// P0 StopPod loop: the runtime service must refuse cleanup for a Pod it
+/// does not own with a *typed* `PodOwnershipError` (downcastable), so the
+/// lifecycle executor can classify it terminal/non-retryable instead of
+/// spinning the actor forever on a generic retryable `DispatchFailed`.
+#[tokio::test]
+async fn real_runtime_stop_pod_returns_typed_ownership_error_for_non_owned_pod() {
+    let harness = PodRuntimeHarness::new().await;
+    let key = PodRuntimeKey::new("default", "non-owned", "uid-no");
+
+    // Unscheduled Pod: spec.nodeName absent -> target_node == None.
+    let unscheduled = serde_json::json!({
+        "metadata": {"namespace": "default", "name": "non-owned", "uid": "uid-no"}
+    });
+    let err = harness
+        .runtime
+        .stop_pod(key.clone(), Some(unscheduled), None)
+        .await
+        .expect_err("unscheduled Pod must be refused");
+    let own = err
+        .downcast_ref::<PodOwnershipError>()
+        .expect("refusal must be a typed PodOwnershipError, not a string bail");
+    assert_eq!(own.local_node, "test-node");
+    assert_eq!(own.target_node, None, "unscheduled Pod has no target node");
+
+    // Pod assigned to another node -> target_node == Some(other).
+    let other_node = serde_json::json!({
+        "metadata": {"namespace": "default", "name": "non-owned", "uid": "uid-no"},
+        "spec": {"nodeName": "other-node"}
+    });
+    let err = harness
+        .runtime
+        .stop_pod(key, Some(other_node), None)
+        .await
+        .expect_err("other-node Pod must be refused");
+    let own = err
+        .downcast_ref::<PodOwnershipError>()
+        .expect("refusal must be a typed PodOwnershipError");
+    assert_eq!(own.local_node, "test-node");
+    assert_eq!(
+        own.target_node.as_deref(),
+        Some("other-node"),
+        "target node must be preserved for routing/diagnostics"
+    );
+}
+
 #[tokio::test]
 async fn real_runtime_stop_pod_cleans_up_by_uid_and_releases_network() {
     let harness = PodRuntimeHarness::new().await;
@@ -4004,9 +4050,17 @@ async fn cross_node_delete_is_rejected_on_non_owner_node() {
         .stop_pod(cross_key, Some(cross_pod), Some("sb-cross".into()))
         .await
         .expect_err("non-owner node must not report Pod cleanup success");
-    assert!(
-        err.to_string().contains("not owned by local node"),
+    let own = err
+        .downcast_ref::<PodOwnershipError>()
+        .expect("non-owner cleanup refusal must be a typed PodOwnershipError");
+    assert_eq!(
+        own.local_node, "worker-1",
         "unexpected non-owner cleanup error: {err:#}"
+    );
+    assert_eq!(
+        own.target_node.as_deref(),
+        Some("worker-2"),
+        "target node must be preserved for cross-node cleanup refusal"
     );
 
     // CRI must NOT have been called (no sandbox stop/remove for non-owned pod).

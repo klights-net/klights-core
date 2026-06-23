@@ -1080,6 +1080,129 @@ fn slot_admission_not_cleared_after_retryable_stop_failure() {
 }
 
 #[test]
+fn stop_pod_unscheduled_not_owned_failure_does_not_retry() {
+    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::kubelet::pod_lifecycle_core::message::PodLifecycleWorkFailure;
+
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let pod = test_pod("default", "pod-a", "uid-a");
+
+    let start = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: pod.clone(),
+    });
+    let start_op = start.operation_id().expect("start op");
+    let finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: start_op,
+        kind: super::message::PodLifecycleWorkKind::StartPod,
+        sandbox_id: Some("sandbox-a".to_string()),
+    });
+    let finalize_op = finalize.operation_id().expect("finalize op");
+    let _ = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: finalize_op,
+        kind: super::message::PodLifecycleWorkKind::FinalizeStartup,
+        sandbox_id: None,
+    });
+
+    let stop = actor.handle_for_test(LifecycleMessage::WatchDeleted {
+        key: key.clone(),
+        resource_version: Some(2),
+        pod,
+    });
+    let stop_op = stop.operation_id().expect("stop op");
+
+    // P0 StopPod loop: an unscheduled Pod (target_node == None) reaching a
+    // kubelet that does not own it must be terminal/non-retryable. The actor
+    // must NOT schedule a retry, must NOT hard-delete via FinalizePodDeletion,
+    // and must cancel the in-flight stop.
+    let action = actor.handle_for_test(LifecycleMessage::PodWorkFailed {
+        key: key.clone(),
+        operation_id: stop_op,
+        kind: super::message::PodLifecycleWorkKind::StopPod,
+        retryable: false,
+        failure: PodLifecycleWorkFailure::NotOwned {
+            local_node: "this-node".to_string(),
+            target_node: None,
+        },
+    });
+    assert!(
+        matches!(action, PodAction::Noop),
+        "unscheduled/not-owned StopPod failure must no-op locally, not retry; got {action:?}"
+    );
+    assert!(
+        !matches!(action, PodAction::FinalizePodDeletion { .. }),
+        "not-owned StopPod must not hard-delete a row this node does not own"
+    );
+    assert_eq!(
+        actor.in_flight_for_test(),
+        None,
+        "in-flight stop must be cancelled after a not-owned StopPod failure"
+    );
+}
+
+#[test]
+fn stop_pod_other_node_not_owned_failure_does_not_retry() {
+    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::kubelet::pod_lifecycle_core::message::PodLifecycleWorkFailure;
+
+    let mut actor = direct_test_actor();
+    let key = PodLifecycleKey::new("default", "pod-b", "uid-b");
+    let pod = test_pod("default", "pod-b", "uid-b");
+
+    let start = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key.clone(),
+        resource_version: Some(1),
+        pod: pod.clone(),
+    });
+    let start_op = start.operation_id().expect("start op");
+    let finalize = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: start_op,
+        kind: super::message::PodLifecycleWorkKind::StartPod,
+        sandbox_id: Some("sandbox-b".to_string()),
+    });
+    let finalize_op = finalize.operation_id().expect("finalize op");
+    let _ = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key.clone(),
+        operation_id: finalize_op,
+        kind: super::message::PodLifecycleWorkKind::FinalizeStartup,
+        sandbox_id: None,
+    });
+
+    let stop = actor.handle_for_test(LifecycleMessage::WatchDeleted {
+        key: key.clone(),
+        resource_version: Some(2),
+        pod,
+    });
+    let stop_op = stop.operation_id().expect("stop op");
+
+    // A Pod assigned to another node is equally non-retryable on this actor.
+    let action = actor.handle_for_test(LifecycleMessage::PodWorkFailed {
+        key,
+        operation_id: stop_op,
+        kind: super::message::PodLifecycleWorkKind::StopPod,
+        retryable: false,
+        failure: PodLifecycleWorkFailure::NotOwned {
+            local_node: "this-node".to_string(),
+            target_node: Some("other-node".to_string()),
+        },
+    });
+    assert!(
+        matches!(action, PodAction::Noop),
+        "other-node StopPod failure must no-op locally, not retry; got {action:?}"
+    );
+    assert_eq!(
+        actor.in_flight_for_test(),
+        None,
+        "in-flight stop must be cancelled after a not-owned StopPod failure"
+    );
+}
+
+#[test]
 fn running_pod_observation_seeds_slot_admission_without_startpod() {
     use crate::kubelet::pod_lifecycle_core::action::PodAction;
 

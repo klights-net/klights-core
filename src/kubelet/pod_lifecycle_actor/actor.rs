@@ -1497,6 +1497,9 @@ impl PodLifecycleActor {
                                 PodLifecycleWorkFailure::FinalizersPending => {
                                     "finalizers pending".to_string()
                                 }
+                                PodLifecycleWorkFailure::NotOwned { .. } => {
+                                    "pod not owned by local node".to_string()
+                                }
                             };
                             self.start_pod_retry_action(key, error_message)
                         } else {
@@ -1530,6 +1533,22 @@ impl PodLifecycleActor {
                         if matches!(failure, PodLifecycleWorkFailure::ContainerNotFound) =>
                     {
                         self.stop_pod_completed_action(key)
+                    }
+                    // HR#11 / P0 StopPod loop: the local node does not own
+                    // this Pod (unscheduled or assigned to another node), so
+                    // there is no local CRI/CNI/volume state to clean. This is
+                    // terminal on the local actor — retrying can never succeed
+                    // and would spin the actor forever. The Pod row is owned by
+                    // `PodStore::delete_unscheduled_with_uid` (unscheduled) or
+                    // the owning node's lifecycle actor. Cancel the in-flight
+                    // stop and drop the pending snapshot without finalizing a
+                    // hard delete on a row this node does not own.
+                    (PodLifecycleWorkKind::StopPod, false)
+                        if matches!(failure, PodLifecycleWorkFailure::NotOwned { .. }) =>
+                    {
+                        self.state.cancel_in_flight();
+                        self.state.pending_stop_pod = None;
+                        PodAction::Noop
                     }
                     (PodLifecycleWorkKind::StopPod, false) => {
                         self.state.phase = PodPhase::Stopping;

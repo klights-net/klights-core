@@ -264,6 +264,21 @@ pub enum PodLifecycleWorkFailure {
     /// Synthesized by the actor backend or multiplex adapter when dispatch
     /// itself fails (e.g. executor error, spawn rejection).
     DispatchFailed(String),
+    /// The local kubelet does not own this Pod's runtime. Produced when
+    /// [`crate::kubelet::pod_runtime::service::PodRuntimeService::stop_pod`]
+    /// refuses cleanup for a Pod whose `spec.nodeName` is absent
+    /// (`target_node == None`) or names another node.
+    ///
+    /// This is terminal on the local actor: retrying can never succeed
+    /// because the local node holds no CRI/CNI/volume state for the Pod.
+    /// Row cleanup is owned by
+    /// `PodStore::delete_unscheduled_with_uid` (unscheduled) or the
+    /// owning node's lifecycle actor.
+    NotOwned {
+        local_node: String,
+        /// Owning node, or `None` when the Pod was never scheduled.
+        target_node: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

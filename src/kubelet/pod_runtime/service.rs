@@ -82,6 +82,58 @@ pub enum PodFinalizeStartupResult {
     Unconfirmed,
 }
 
+/// Typed error raised by runtime cleanup paths (e.g. [`PodRuntimeService::stop_pod`])
+/// when the local node does not own a Pod's runtime.
+///
+/// This MUST NOT be classified as a retryable kubelet-lifecycle failure: the
+/// local node has no CRI/CNI/volume state for a Pod it does not own, so retrying
+/// `StopPod` locally can never succeed and would spin the lifecycle actor
+/// forever. Row cleanup is owned by `PodStore::delete_unscheduled_with_uid`
+/// (unscheduled Pods, HR#11 exception) or the owning node's lifecycle actor
+/// (node-assigned Pods).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodOwnershipError {
+    /// Node performing the (refused) cleanup.
+    pub local_node: String,
+    /// Node that owns the Pod, or `None` when `spec.nodeName` is absent (the
+    /// Pod was never scheduled / picked up by any kubelet).
+    pub target_node: Option<String>,
+}
+
+impl PodOwnershipError {
+    /// Build the ownership error from the local node name and the Pod's
+    /// `spec.nodeName` value (parsed from the raw Pod JSON).
+    pub fn from_pod_node_name(local_node: impl Into<String>, pod: &serde_json::Value) -> Self {
+        let target_node = pod
+            .pointer("/spec/nodeName")
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string());
+        Self {
+            local_node: local_node.into(),
+            target_node,
+        }
+    }
+}
+
+impl std::fmt::Display for PodOwnershipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.target_node {
+            Some(target) => write!(
+                f,
+                "pod runtime is owned by node {target}, not by local node {}",
+                self.local_node
+            ),
+            None => write!(
+                f,
+                "pod has no assigned node; local node {} cannot own runtime cleanup",
+                self.local_node
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PodOwnershipError {}
+
 /// Hint carried from a CRI container event into deferred runtime reconcile.
 ///
 /// Extracted into `reconcile_hint` to keep this hub under its size cap; the
@@ -2376,12 +2428,16 @@ impl PodRuntimeService for RealPodRuntimeService {
         // Node ownership check: only clean up CRI/CNI/volumes for pods
         // owned by this node. Cross-node deletes must not release network
         // or clear sandbox rows on a node that doesn't own the pod.
+        //
+        // The refusal is returned as a typed `PodOwnershipError` so the
+        // lifecycle executor can classify it as terminal/non-retryable
+        // (HR#11). An unscheduled (`spec.nodeName` absent) or other-node
+        // Pod can never be cleaned up locally; retrying would spin the
+        // actor forever (P0 high-CPU StopPod loop).
         let owned_by_this_node = self.node_view.owns_pod_runtime(&pod);
         if !owned_by_this_node {
-            let target_node = pod
-                .pointer("/spec/nodeName")
-                .and_then(|value| value.as_str())
-                .unwrap_or("<unscheduled>");
+            let ownership = PodOwnershipError::from_pod_node_name(self.node_view.node_name(), &pod);
+            let target_node = ownership.target_node.as_deref().unwrap_or("<unscheduled>");
             tracing::warn!(
                 namespace = %key.namespace,
                 name = %key.name,
@@ -2390,14 +2446,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                 target_node = %target_node,
                 "refusing Pod cleanup on non-owner node"
             );
-            anyhow::bail!(
-                "pod {}/{} uid {} is not owned by local node {} (target node {})",
-                key.namespace,
-                key.name,
-                key.uid,
-                self.node_view.node_name(),
-                target_node
-            );
+            return Err(anyhow::Error::new(ownership));
         }
 
         // --- Sandbox resolution ladder ---

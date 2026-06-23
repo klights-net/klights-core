@@ -340,7 +340,22 @@ async fn dispatch_via_runtime(
                         .await;
                 }
                 Err(e) => {
-                    let (retryable, failure) = if is_container_not_found_runtime_error(&e) {
+                    let (retryable, failure) = if let Some(own) =
+                        e.downcast_ref::<crate::kubelet::pod_runtime::service::PodOwnershipError>()
+                    {
+                        // HR#11 / P0 StopPod loop: a Pod the local node
+                        // does not own (unscheduled or assigned to another
+                        // node) can never be cleaned up locally. Mark it
+                        // terminal so the actor no-ops instead of retrying
+                        // forever at 1 Hz.
+                        (
+                            false,
+                            PodLifecycleWorkFailure::NotOwned {
+                                local_node: own.local_node.clone(),
+                                target_node: own.target_node.clone(),
+                            },
+                        )
+                    } else if is_container_not_found_runtime_error(&e) {
                         (false, PodLifecycleWorkFailure::ContainerNotFound)
                     } else if e.to_string().to_ascii_lowercase().contains("timed out") {
                         (true, PodLifecycleWorkFailure::DeadlineExceeded)
@@ -1261,6 +1276,93 @@ mod tests {
             )),
             "generic pod not found must remain retryable"
         );
+    }
+
+    /// P0 StopPod loop: a typed `PodOwnershipError` from `stop_pod` must be
+    /// classified as `NotOwned` with `retryable=false` (terminal), not as a
+    /// generic retryable `DispatchFailed`.
+    #[tokio::test]
+    async fn stop_pod_ownership_error_is_classified_not_owned_and_non_retryable() {
+        use crate::kubelet::pod_lifecycle_core::message::PodLifecycleWorkFailure;
+
+        let mock = std::sync::Arc::new(MockPodRuntimeService::new());
+
+        // Unscheduled Pod: spec.nodeName absent -> target_node == None.
+        mock.set_stop_pod_ownership_error("this-node", None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LifecycleMessage>(64);
+        let reply_to = LifecycleReplyHandle::direct(tx);
+        dispatch_via_runtime(
+            mock.as_ref() as &dyn PodRuntimeService,
+            PodAction::StopPod {
+                key: PodLifecycleKey::new("ns", "unscheduled-pod", "uid-unsched"),
+                pod: Some(serde_json::json!({
+                    "metadata": {"name": "unscheduled-pod", "namespace": "ns", "uid": "uid-unsched"}
+                })),
+                sandbox_id: String::new(),
+                operation_id: 1,
+                permit: None,
+            },
+            reply_to.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch must succeed");
+        match rx.recv().await.expect("PodWorkFailed must be routed") {
+            LifecycleMessage::PodWorkFailed {
+                retryable, failure, ..
+            } => {
+                assert!(!retryable, "ownership mismatch must be non-retryable");
+                assert!(
+                    matches!(
+                        failure,
+                        PodLifecycleWorkFailure::NotOwned {
+                            ref local_node,
+                            target_node: None
+                        } if local_node == "this-node"
+                    ),
+                    "unscheduled stop must classify as NotOwned with no target node; got {failure:?}"
+                );
+            }
+            other => panic!("expected PodWorkFailed, got {other:?}"),
+        }
+
+        // Pod assigned to another node: target_node == Some(other).
+        mock.set_stop_pod_ownership_error("this-node", Some("other-node"));
+        dispatch_via_runtime(
+            mock.as_ref() as &dyn PodRuntimeService,
+            PodAction::StopPod {
+                key: PodLifecycleKey::new("ns", "other-node-pod", "uid-other"),
+                pod: Some(serde_json::json!({
+                    "metadata": {"name": "other-node-pod", "namespace": "ns", "uid": "uid-other"},
+                    "spec": {"nodeName": "other-node"}
+                })),
+                sandbox_id: String::new(),
+                operation_id: 2,
+                permit: None,
+            },
+            reply_to.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dispatch must succeed");
+        match rx.recv().await.expect("PodWorkFailed must be routed") {
+            LifecycleMessage::PodWorkFailed {
+                retryable, failure, ..
+            } => {
+                assert!(!retryable, "ownership mismatch must be non-retryable");
+                assert!(
+                    matches!(
+                        failure,
+                        PodLifecycleWorkFailure::NotOwned {
+                            ref local_node,
+                            target_node: Some(ref t)
+                        } if local_node == "this-node" && t == "other-node"
+                    ),
+                    "other-node stop must classify as NotOwned with the target node; got {failure:?}"
+                );
+            }
+            other => panic!("expected PodWorkFailed, got {other:?}"),
+        }
     }
 }
 
