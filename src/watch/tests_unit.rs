@@ -271,6 +271,8 @@ async fn signal_cursor_default_window_three_delivers_single_event_without_waitin
 
     let event = cursor.next_event().await.unwrap();
     assert_eq!(event.resource_version(), Some(11));
+    assert_eq!(cursor.accepted_rv(), 10);
+    cursor.accept_event(11);
     assert_eq!(cursor.accepted_rv(), 11);
     assert_eq!(source.calls(), vec![(10, 3)]);
 }
@@ -294,9 +296,72 @@ async fn signal_cursor_default_window_three_delivers_two_events_without_waiting_
     tx.send(signal_cursor_signal(Some("default"), 12)).unwrap();
 
     let first = cursor.next_event().await.unwrap();
-    let second = cursor.next_event().await.unwrap();
     assert_eq!(first.resource_version(), Some(11));
+    assert_eq!(cursor.accepted_rv(), 10);
+    cursor.accept_event(11);
+    let second = cursor.next_event().await.unwrap();
     assert_eq!(second.resource_version(), Some(12));
+    assert_eq!(cursor.accepted_rv(), 11);
+    cursor.accept_event(12);
+    assert_eq!(cursor.accepted_rv(), 12);
+    assert_eq!(source.calls(), vec![(10, 3)]);
+}
+
+#[tokio::test]
+async fn signal_cursor_returned_event_does_not_advance_until_explicit_accept() {
+    let (tx, rx) = broadcast::channel(4);
+    let source = SignalCursorReplaySource::events(vec![signal_cursor_pod("default", "pod-11", 11)]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+
+    let event = cursor.next_event().await.unwrap();
+    assert_eq!(event.resource_version(), Some(11));
+    assert_eq!(
+        cursor.accepted_rv(),
+        10,
+        "returned events must not advance accepted_rv before stream acceptance"
+    );
+
+    cursor.accept_event(11);
+    assert_eq!(cursor.accepted_rv(), 11);
+    assert_eq!(source.calls(), vec![(10, 3)]);
+}
+
+#[tokio::test]
+async fn signal_cursor_skipped_out_of_scope_event_advances_replay_safe_frontier() {
+    let (tx, rx) = broadcast::channel(4);
+    let source = SignalCursorReplaySource::events(vec![
+        signal_cursor_pod("other", "pod-11", 11),
+        signal_cursor_pod("default", "pod-12", 12),
+    ]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 12)).unwrap();
+
+    let event = cursor.next_event().await.unwrap();
+    assert_eq!(event.resource_version(), Some(12));
+    assert_eq!(
+        cursor.accepted_rv(),
+        11,
+        "out-of-scope replay entries can be processed without caller acceptance"
+    );
+
+    cursor.accept_event(12);
     assert_eq!(cursor.accepted_rv(), 12);
     assert_eq!(source.calls(), vec![(10, 3)]);
 }

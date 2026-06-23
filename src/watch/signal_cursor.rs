@@ -80,6 +80,21 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
         }
     }
 
+    /// Advance the replay-safe frontier for a replay entry that is consumed
+    /// internally and never returned to a caller (duplicate, out-of-scope, or
+    /// otherwise skipped). Such entries do not need caller-side stream
+    /// acceptance because they will never be delivered, so the cursor may move
+    /// its accepted frontier past them immediately. This is the counterpart to
+    /// the deliverable path, which only calls `record_seen` so the returned
+    /// event does not advance `accepted_rv` until the caller confirms
+    /// server-local stream acceptance via `accept_event`.
+    fn advance_processed_rv(&mut self, rv: i64) {
+        self.record_seen(rv);
+        if rv > self.accepted_rv {
+            self.accepted_rv = rv;
+        }
+    }
+
     pub fn mark_delivered(&mut self, rv: i64) {
         self.record_seen(rv);
     }
@@ -156,14 +171,14 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
                 }
             }
             if self.seen_rvs.contains(&rv) {
-                self.accept_event(rv);
+                self.advance_processed_rv(rv);
                 continue;
             }
             if !self.event_matches(&event) {
-                self.accept_event(rv);
+                self.advance_processed_rv(rv);
                 continue;
             }
-            self.accept_event(rv);
+            self.record_seen(rv);
             return Some(event);
         }
         None
