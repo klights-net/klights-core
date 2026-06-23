@@ -28,7 +28,6 @@ use crate::datastore::DatastoreBackend;
 use crate::datastore::node_local::SqliteNodeLocalDb;
 use crate::datastore::raft::snapshot::{RaftSnapshotData, SqliteRaftSnapshotBuilder};
 use crate::datastore::raft::types::{NodeId, StorageCommandResult, TypeConfig};
-use crate::log_apply::LogApplyCommit;
 
 const META_KEY_LAST_APPLIED: &str = "last_applied";
 const META_KEY_LAST_MEMBERSHIP: &str = "last_membership";
@@ -232,22 +231,22 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
         let data = RaftSnapshotData::deserialize_from_bytes(&bytes).map_err(ioerr_write)?;
-        for commit in data.commits {
-            self.backend
-                .apply_log_apply_commit(commit)
-                .await
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
-                })?;
-        }
-        if data.current_rv > 0 {
-            self.backend
-                .apply_log_apply_commit(LogApplyCommit::advance_resource_version(data.current_rv))
-                .await
-                .map_err(|e| StorageError::IO {
-                    source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
-                })?;
-        }
+        // Raft snapshot install semantics: the destination state machine
+        // must become byte/key-identical to the leader snapshot at the
+        // snapshot index. Applying snapshot commits over the existing local
+        // store (merge) is a correctness bug — rows the leader has deleted
+        // but a lagging follower/learner still holds are never removed, so
+        // the member silently diverges (observed after lossy Sonobuoy:
+        // followers/learner carry more rows than the leader). Use the
+        // authoritative replace primitive, which deletes all replicated
+        // tables first, then replays the snapshot commits and restores the
+        // leader RV. (finding.md H1 / P0 cluster.db divergence.)
+        self.backend
+            .replace_replicated_resource_state(data.commits, data.current_rv, None)
+            .await
+            .map_err(|e| StorageError::IO {
+                source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
+            })?;
         if let Some(id) = meta.last_log_id {
             self.write_last_applied(id).await?;
         }
@@ -456,6 +455,138 @@ mod tests {
             "installed snapshot must be cached for future outgoing transfer"
         );
         assert_eq!(cur.unwrap().meta.last_log_id.unwrap().index, 42);
+    }
+
+    /// finding.md H1 / P0 cluster.db divergence: installing a leader snapshot
+    /// must atomically REPLACE the local replicated state, not merge snapshot
+    /// commits over it. A follower/learner that holds a `stale` row the leader
+    /// has already deleted must end up key-identical to the leader (stale row
+    /// removed) after snapshot install. Previously this looped
+    /// `apply_log_apply_commit` over the existing store (merge-only), so stale
+    /// rows survived forever and members silently diverged under loss.
+    #[tokio::test]
+    async fn install_snapshot_replaces_local_state_and_removes_stale_rows() {
+        // Leader: namespace snap-ns + ConfigMap `live`.
+        let backend_src: Arc<dyn DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        backend_src
+            .create_namespace(
+                "snap-ns",
+                serde_json::json!({"metadata": {"name": "snap-ns"}}),
+            )
+            .await
+            .expect("create leader namespace");
+        backend_src
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("snap-ns"),
+                "live",
+                serde_json::json!({
+                    "metadata": {"name": "live", "namespace": "snap-ns", "uid": "uid-live"}
+                }),
+            )
+            .await
+            .expect("create leader live resource");
+
+        let mut sm_src = build_sm_with_backend(backend_src.clone()).await;
+        // Advance last_applied so the snapshot meta is non-trivial.
+        let entry = Entry::<TypeConfig> {
+            log_id: LogId::new(LeaderId::new(4, 10), 42),
+            payload: EntryPayload::Blank,
+        };
+        sm_src.apply(vec![entry]).await.unwrap();
+        let mut builder = sm_src.get_snapshot_builder().await;
+        let snapshot = builder
+            .build_snapshot()
+            .await
+            .expect("build leader snapshot");
+        let snapshot_bytes = snapshot.snapshot.clone().into_inner();
+
+        // Follower: same namespace + `live`, PLUS a stale `stale` ConfigMap
+        // that the leader has already deleted. This is the divergent member.
+        let backend_dst: Arc<dyn DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        backend_dst
+            .create_namespace(
+                "snap-ns",
+                serde_json::json!({"metadata": {"name": "snap-ns"}}),
+            )
+            .await
+            .expect("create follower namespace");
+        backend_dst
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("snap-ns"),
+                "live",
+                serde_json::json!({
+                    "metadata": {"name": "live", "namespace": "snap-ns", "uid": "uid-live"}
+                }),
+            )
+            .await
+            .expect("create follower live resource");
+        backend_dst
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("snap-ns"),
+                "stale",
+                serde_json::json!({
+                    "metadata": {"name": "stale", "namespace": "snap-ns", "uid": "uid-stale"}
+                }),
+            )
+            .await
+            .expect("seed stale follower resource absent from leader snapshot");
+
+        let mut sm_dst = build_sm_with_backend(backend_dst.clone()).await;
+        sm_dst
+            .install_snapshot(&snapshot.meta, Box::new(Cursor::new(snapshot_bytes)))
+            .await
+            .expect("install leader snapshot onto divergent follower");
+
+        // The destination must now be key-identical to the leader: the stale
+        // row must be GONE, not merged. Compare by identity + resourceVersion,
+        // ignoring `creationTimestamp` (a server-set field that legitimately
+        // differs microsecond-to-microsecond when the same object is created
+        // independently on two in-memory backends during the test setup).
+        let dst_fp = resource_identity_fingerprint(backend_dst.as_ref()).await;
+        let leader_fp_id = resource_identity_fingerprint(backend_src.as_ref()).await;
+        assert_eq!(
+            dst_fp, leader_fp_id,
+            "install_snapshot must replace (not merge) local state: the stale row must be removed so the follower's resource identity set matches the leader snapshot"
+        );
+        // Spot-check the stale row is truly gone.
+        let stale = backend_dst
+            .get_resource("v1", "ConfigMap", Some("snap-ns"), "stale")
+            .await
+            .expect("get stale resource");
+        assert!(
+            stale.is_none(),
+            "stale row absent from the leader snapshot must be removed on install_snapshot; got {stale:?}"
+        );
+    }
+
+    /// Identity + resourceVersion fingerprint, ignoring server-set volatile
+    /// fields (`creationTimestamp`) that can legitimately differ when the same
+    /// object is created independently on two backends during test setup.
+    async fn resource_identity_fingerprint(
+        backend: &dyn DatastoreBackend,
+    ) -> Vec<(String, String, Option<String>, String, String, i64)> {
+        let full = resource_fingerprint(backend).await;
+        full.into_iter()
+            .map(|(api_version, kind, namespace, name, uid, rv, mut data)| {
+                // Drop creationTimestamp so the comparison is over stable
+                // identity + version, not the moment a backend wrote the row.
+                if let Some(obj) = data.as_object_mut() {
+                    if let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+                        meta.remove("creationTimestamp");
+                    }
+                }
+                let _ = data; // creationTimestamp removed; remaining body ignored for identity
+                (api_version, kind, namespace, name, uid, rv)
+            })
+            .collect()
     }
 
     #[tokio::test]
