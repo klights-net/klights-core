@@ -416,13 +416,57 @@ pub async fn reconcile_service_with_nodeport(
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
 ) -> Result<Value> {
-    let Some(updated_data) =
-        allocate_service_fields_for_api_write(db, service, service_ipam, nodeport_alloc).await?
-    else {
-        // Live Service is absent or already deleting — allocation/defaulting
-        // was skipped, so endpoint reconciliation must be skipped too (it
-        // would otherwise recreate Endpoints for a gone/terminating Service).
-        return Ok(service.clone());
+    // Bounded optimistic-concurrency retry around Service allocation/defaulting.
+    // The allocator does a read-then-write with a resourceVersion CAS, but under
+    // churn (concurrent Pod status writes, other reconciles) the Service RV can
+    // advance between the read and the raft propose, surfacing as a terminal
+    // outbox conflict. Without a retry here each conflict fails the whole
+    // reconcile and the workqueue backs off (~1s each); a Service that loses
+    // the race dozens of times takes ~60s to get its first Endpoints, blowing
+    // up the service-latency p99. Re-read fresh state + re-allocate on 409,
+    // mirroring the Endpoints reconcile's own conflict handling.
+    const SERVICE_ALLOC_MAX_ATTEMPTS: usize = 20;
+    let mut updated_data = None;
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 0..SERVICE_ALLOC_MAX_ATTEMPTS {
+        match allocate_service_fields_for_api_write(db, service, service_ipam, nodeport_alloc).await
+        {
+            Ok(Some(data)) => {
+                updated_data = Some(data);
+                last_err = None;
+                break;
+            }
+            Ok(None) => {
+                // Live Service is absent or already deleting — allocation/defaulting
+                // was skipped, so endpoint reconciliation must be skipped too (it
+                // would otherwise recreate Endpoints for a gone/terminating Service).
+                return Ok(service.clone());
+            }
+            Err(err) if attempt + 1 < SERVICE_ALLOC_MAX_ATTEMPTS => {
+                if crate::datastore::errors::is_conflict_error(&err) {
+                    // Transient RV race: `allocate_service_fields_for_api_write`
+                    // re-reads fresh Service state (current RV) on the next
+                    // attempt, so retry immediately without a delay (matches
+                    // the Endpoints reconcile's conflict handling; no supervisor
+                    // needed because there is no sleep).
+                    last_err = Some(err);
+                    continue;
+                }
+                // Non-conflict error: surface immediately.
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    let Some(updated_data) = updated_data else {
+        // Exhausted conflict retries: surface the last conflict so the workqueue
+        // can keep backing off, but the bounded loop above already absorbed the
+        // common transient races.
+        return Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "service allocation exhausted {SERVICE_ALLOC_MAX_ATTEMPTS} conflict retries"
+            )
+        }));
     };
 
     // Skip Endpoints and EndpointSlice for ExternalName services
