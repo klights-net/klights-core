@@ -44,6 +44,7 @@ pub async fn patch_pod_status_subresource(
 
     let patch_value: Value = serde_json::from_slice(&body)
         .map_err(|e| AppError::BadRequest(format!("Invalid patch body: {}", e)))?;
+    let requested_rv = metadata_resource_version(&patch_value);
 
     let pod = crate::kubelet::pod_repository::PodReader::get_pod(
         state.pod_repository.as_ref(),
@@ -59,10 +60,10 @@ pub async fn patch_pod_status_subresource(
         &name,
         patch_value,
         patch_type,
-        pod.resource_version,
+        requested_rv.unwrap_or(pod.resource_version),
     )
     .await
-    .map_err(|e| AppError::InternalError(format!("status patch failed: {e}")))?;
+    .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;
 
     let result = crate::api::inject_resource_version(updated.data, updated.resource_version);
     Ok(Json(result))
@@ -91,17 +92,24 @@ pub async fn update_pod_status_subresource(
         .cloned()
         .or_else(|| pod.data.get("status").cloned())
         .unwrap_or(Value::Null);
+    let requested_rv = metadata_resource_version(&body);
 
     let updated = crate::kubelet::pod_repository::PodSubresourceWriter::replace_status_from_api(
         state.pod_repository.as_ref(),
         &namespace,
         &name,
         new_status,
-        pod.resource_version,
+        requested_rv.unwrap_or(pod.resource_version),
     )
     .await
-    .map_err(|e| AppError::InternalError(format!("status update failed: {e}")))?;
+    .map_err(|e| AppError::from(e).with_resource_context("v1", "Pod", &name))?;
 
     let result = crate::api::inject_resource_version(updated.data, updated.resource_version);
     Ok(Json(result))
+}
+
+fn metadata_resource_version(body: &Value) -> Option<i64> {
+    body.pointer("/metadata/resourceVersion")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<i64>().ok())
 }

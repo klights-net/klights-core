@@ -4086,3 +4086,192 @@ async fn pod_list_authorization_attributes_recorded_by_middleware() {
     assert_eq!(authz.namespace.as_deref(), Some("default"));
     assert!(authz.subresource.is_none());
 }
+
+// ── Pod /status OCC (client metadata.resourceVersion precondition) ──
+
+/// Helper: create a pod through the API and return (app, initial resourceVersion).
+async fn occ_setup_pod() -> (axum::Router, String) {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = crate::api::test_support::build_test_router().await;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/default/pods")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "occ-stale", "namespace": "default"},
+                "spec": {"containers": [{"name": "c", "image": "nginx"}]}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "pod create must succeed"
+    );
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let pod: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let initial_rv = pod["metadata"]["resourceVersion"]
+        .as_str()
+        .expect("created pod carries a resourceVersion")
+        .to_string();
+
+    // Advance the RV with a metadata (label) merge patch — this is the write
+    // the stale client has not observed.
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/namespaces/default/pods/occ-stale")
+        .header("content-type", "application/merge-patch+json")
+        .body(Body::from(
+            serde_json::json!({"metadata": {"labels": {"bump": "yes"}}}).to_string(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "metadata bump to advance RV must succeed"
+    );
+
+    (app, initial_rv)
+}
+
+/// PATCH /status with a STALE client `metadata.resourceVersion` must return
+/// 409 Conflict, not 200 (silent overwrite) or 500 (unmapped conflict).
+#[tokio::test]
+async fn pod_status_patch_with_stale_client_rv_returns_409() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (app, stale_rv) = occ_setup_pod().await;
+
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/namespaces/default/pods/occ-stale/status")
+        .header("content-type", "application/merge-patch+json")
+        .body(Body::from(
+            serde_json::json!({
+                "metadata": {"resourceVersion": stale_rv},
+                "status": {"phase": "Running"}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "stale client RV on /status PATCH must 409, got {}",
+        resp.status()
+    );
+}
+
+/// PUT /status with a STALE client `metadata.resourceVersion` must return
+/// 409 Conflict.
+#[tokio::test]
+async fn pod_status_put_with_stale_client_rv_returns_409() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (app, stale_rv) = occ_setup_pod().await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/namespaces/default/pods/occ-stale/status")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "occ-stale",
+                    "namespace": "default",
+                    "resourceVersion": stale_rv
+                },
+                "status": {"phase": "Running"}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "stale client RV on /status PUT must 409, got {}",
+        resp.status()
+    );
+}
+
+/// PATCH /status WITHOUT a client `metadata.resourceVersion` is an
+/// unconditional apply — must succeed (no OCC precondition).
+#[tokio::test]
+async fn pod_status_patch_without_client_rv_succeeds() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (app, _stale_rv) = occ_setup_pod().await;
+
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/namespaces/default/pods/occ-stale/status")
+        .header("content-type", "application/merge-patch+json")
+        .body(Body::from(
+            serde_json::json!({"status": {"phase": "Succeeded"}}).to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "no-RV /status PATCH must succeed, got {}",
+        resp.status()
+    );
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let pod: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pod["status"]["phase"], "Succeeded");
+}
+
+/// PUT /status WITHOUT a client `metadata.resourceVersion` must succeed.
+#[tokio::test]
+async fn pod_status_put_without_client_rv_succeeds() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (app, _stale_rv) = occ_setup_pod().await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/namespaces/default/pods/occ-stale/status")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "occ-stale", "namespace": "default"},
+                "status": {"phase": "Failed"}
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "no-RV /status PUT must succeed, got {}",
+        resp.status()
+    );
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let pod: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pod["status"]["phase"], "Failed");
+}

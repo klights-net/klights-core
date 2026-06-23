@@ -2622,6 +2622,164 @@ async fn test_patch_pod_status_not_found_returns_404() {
     );
 }
 
+#[tokio::test]
+async fn test_patch_pod_status_with_stale_resource_version_returns_409() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "default",
+        serde_json::json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}),
+    )
+    .await
+    .unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "status-occ-patch",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "status-occ-patch", "namespace": "default", "uid": "uid-status-occ-patch"},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+    let stale_rv = created.resource_version;
+    db.update_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "status-occ-patch",
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "status-occ-patch",
+                "namespace": "default",
+                "uid": "uid-status-occ-patch",
+                "resourceVersion": stale_rv.to_string()
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx:1.25"}]},
+            "status": {"phase": "Pending"}
+        }),
+        stale_rv,
+    )
+    .await
+    .unwrap();
+
+    let patch = serde_json::json!({
+        "metadata": {"resourceVersion": stale_rv.to_string()},
+        "status": {"phase": "Running"}
+    });
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/namespaces/default/pods/status-occ-patch/status")
+        .header("content-type", "application/merge-patch+json")
+        .body(Body::from(patch.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "PATCH pods/status must reject stale metadata.resourceVersion"
+    );
+}
+
+#[tokio::test]
+async fn test_put_pod_status_with_stale_resource_version_returns_409() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "default",
+        serde_json::json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}),
+    )
+    .await
+    .unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "status-occ-put",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "status-occ-put", "namespace": "default", "uid": "uid-status-occ-put"},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]},
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+    let stale_rv = created.resource_version;
+    db.update_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "status-occ-put",
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "status-occ-put",
+                "namespace": "default",
+                "uid": "uid-status-occ-put",
+                "resourceVersion": stale_rv.to_string()
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx:1.25"}]},
+            "status": {"phase": "Pending"}
+        }),
+        stale_rv,
+    )
+    .await
+    .unwrap();
+
+    let body = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "status-occ-put",
+            "namespace": "default",
+            "resourceVersion": stale_rv.to_string()
+        },
+        "status": {"phase": "Running"}
+    });
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/namespaces/default/pods/status-occ-put/status")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "PUT pods/status must reject stale metadata.resourceVersion"
+    );
+}
+
 // ========================
 // API chunking list tests
 // ========================
