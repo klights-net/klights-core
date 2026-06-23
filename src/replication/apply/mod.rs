@@ -218,19 +218,39 @@ pub async fn apply_forwarded_command(
             observed_status_stamp,
         } => {
             let mut status = status;
-            if observed_status_stamp.is_some()
-                && api_version == "v1"
+            // Scheduler-owned Pod conditions (e.g. DisruptionTarget set by
+            // preemption) are never rebuilt by any status writer, so they must
+            // be preserved on every v1/Pod UpdateStatus apply — including the
+            // leader-direct path that carries no outbox stamp. Without this, a
+            // kubelet runtime-reconcile snapshot computed before a preemption
+            // write (and forwarded as UpdateStatus with stamp=None) verbatim-
+            // replaces the live status and permanently drops DisruptionTarget,
+            // which is the live SchedulerPreemption conformance failure.
+            if api_version == "v1"
                 && kind == "Pod"
                 && let Some(current) = db
                     .get_resource(&api_version, &kind, namespace.as_deref(), &name)
                     .await?
             {
-                crate::resource_semantics::preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
+                crate::pod_status_merge::merge_pod_status_for_update(
                     &api_version,
                     &kind,
                     current.data.as_ref(),
                     &mut status,
+                    crate::pod_status_merge::PodStatusUpdateSource::UserStatusSubresource,
                 );
+                // Terminal/running-state preservation (guards against a stale
+                // ContainerCreating snapshot regressing confirmed runtime
+                // state) only applies to stamped worker/outbox snapshots; the
+                // leader-direct path carries no stamp.
+                if observed_status_stamp.is_some() {
+                    crate::resource_semantics::preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
+                        &api_version,
+                        &kind,
+                        current.data.as_ref(),
+                        &mut status,
+                    );
+                }
             }
             let mut preconditions = preconditions;
             if preconditions.resource_version.is_none() {

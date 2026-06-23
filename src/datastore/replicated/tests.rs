@@ -2133,4 +2133,119 @@ mod cases {
             stored.data.pointer("/status/conditions")
         );
     }
+
+    /// Reproduces the live SchedulerPreemption conformance failure: after the
+    /// leader-side scheduler preemption writes `DisruptionTarget` to the victim,
+    /// the leader's own kubelet runtime-reconcile status write races the
+    /// preemption and lands a snapshot computed BEFORE preemption (no
+    /// DisruptionTarget). That status write is proposed through raft as
+    /// `StorageCommand::UpdateStatus` with `observed_status_stamp: None` — the
+    /// leader-direct path never carries an outbox stamp. The raft apply must
+    /// still preserve scheduler-owned Pod conditions, otherwise the stale
+    /// kubelet snapshot permanently clobbers `DisruptionTarget` (subsequent
+    /// reconciles read the clobbered row and never restore the condition),
+    /// which is exactly what the live run observed: victim terminating with no
+    /// DisruptionTarget.
+    #[tokio::test]
+    async fn leader_direct_status_apply_preserves_disruption_target_without_outbox_stamp() {
+        use crate::datastore::replicated::apply_command_to_backend;
+
+        let db = crate::datastore::test_support::in_memory().await;
+        // Post-preemption victim: terminating with the four kubelet-rebuilt
+        // conditions plus the scheduler-owned DisruptionTarget condition.
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "victim-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "victim-pod",
+                    "namespace": "default",
+                    "uid": "victim-uid",
+                    "deletionTimestamp": "2026-06-22T12:00:00Z",
+                    "deletionGracePeriodSeconds": 0
+                },
+                "spec": {"nodeName": "controlplane1"},
+                "status": {
+                    "phase": "Running",
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True"},
+                        {"type": "Initialized", "status": "True"},
+                        {"type": "ContainersReady", "status": "True"},
+                        {"type": "Ready", "status": "True"},
+                        {"type": "DisruptionTarget", "status": "True", "reason": "PreemptionByScheduler"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        // A leader-direct kubelet runtime-reconcile status write (no outbox
+        // stamp) carrying a snapshot computed before preemption: the four
+        // kubelet-rebuilt conditions and a freshly observed podIP, but NO
+        // DisruptionTarget. This is the exact payload shape the leader's
+        // `apply_runtime_reconcile_status_inner` forwards when its read of the
+        // live row raced the preemption write.
+        apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateStatus {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                namespace: Some("default".into()),
+                name: "victim-pod".into(),
+                status: json!({
+                    "phase": "Running",
+                    "podIP": "10.244.0.5",
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True"},
+                        {"type": "Initialized", "status": "True"},
+                        {"type": "ContainersReady", "status": "True"},
+                        {"type": "Ready", "status": "True"}
+                    ]
+                }),
+                expected_rv: None,
+                preconditions: ResourcePreconditions {
+                    uid: Some("victim-uid".into()),
+                    resource_version: None,
+                },
+                // Leader-direct writes never carry an outbox stamp.
+                observed_status_stamp: None,
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 1,
+                uid: Some("victim-uid".into()),
+                timestamp_ms: 0,
+                authoring_node: "controlplane1".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_resource("v1", "Pod", Some("default"), "victim-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .data
+                .pointer("/status/conditions")
+                .and_then(|value| value.as_array())
+                .unwrap_or(&Vec::new())
+                .iter()
+                .any(|condition| {
+                    condition.pointer("/type").and_then(|v| v.as_str()) == Some("DisruptionTarget")
+                        && condition.pointer("/reason").and_then(|v| v.as_str())
+                            == Some("PreemptionByScheduler")
+                }),
+            "leader-direct UpdateStatus apply (no outbox stamp) must preserve scheduler-owned DisruptionTarget over a stale kubelet snapshot: {:?}",
+            stored.data.pointer("/status/conditions")
+        );
+    }
 }
