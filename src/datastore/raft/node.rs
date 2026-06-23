@@ -88,6 +88,29 @@ impl RaftNode {
         const RAFT_HEARTBEAT_INTERVAL_MS: u64 = 3000;
         const RAFT_ELECTION_TIMEOUT_MIN_MS: u64 = 9000;
         const RAFT_ELECTION_TIMEOUT_MAX_MS: u64 = 12000;
+        // Lossy-link transport sizing (finding.md H3). OpenRaft defaults are
+        // sized for LAN-fast clusters and amplify packet loss on a 200 ms RTT /
+        // 1 percent-loss harness:
+        // - install_snapshot_timeout default 200 ms is below a single lossy
+        //   round-trip; a snapshot install RPC that loses one packet can never
+        //   complete before the timeout, forcing repeated full restarts.
+        // - max_payload_entries default 300 lets one AppendEntries RPC carry
+        //   hundreds of (potentially large JSON/protobuf) entries; losing one
+        //   frame resends the whole batch, multiplying logical RPC loss far
+        //   above the 1 percent wire loss and stalling follower catch-up.
+        // - snapshot_max_chunk_size default 3 MiB makes each snapshot segment
+        //   many HTTP/2 frames; a single dropped frame re-sends the segment.
+        // These bounds keep each replication RPC small enough that loss is
+        // absorbed by OpenRaft's built-in retry instead of logical RPC
+        // blow-up, and give snapshot install a deadline well above the lossy
+        // RTT plus SQLite apply budget. `replication_lag_threshold` stays
+        // above `snapshot_policy`'s LogsSinceLast so a lagging member still
+        // crosses the snapshot-replace path (which is now correct, above).
+        const RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS: u64 = 5_000;
+        const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 48;
+        const RAFT_SNAPSHOT_MAX_CHUNK_SIZE_BYTES: u64 = 512 * 1024;
+        const RAFT_REPLICATION_LAG_THRESHOLD: u64 = 5000;
+        const _: () = assert!(RAFT_REPLICATION_LAG_THRESHOLD >= 5000);
         // Cross-subsystem safety: worst-case failover (<= election_timeout_max)
         // must finish before observed node leases go stale, or a single leader
         // change would false-evict every node (lease renewals can't commit
@@ -103,6 +126,10 @@ impl RaftNode {
                 heartbeat_interval: RAFT_HEARTBEAT_INTERVAL_MS,
                 election_timeout_min: RAFT_ELECTION_TIMEOUT_MIN_MS,
                 election_timeout_max: RAFT_ELECTION_TIMEOUT_MAX_MS,
+                install_snapshot_timeout: RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS,
+                max_payload_entries: RAFT_MAX_PAYLOAD_ENTRIES,
+                snapshot_max_chunk_size: RAFT_SNAPSHOT_MAX_CHUNK_SIZE_BYTES,
+                replication_lag_threshold: RAFT_REPLICATION_LAG_THRESHOLD,
                 enable_tick: true,
                 ..Default::default()
             }
