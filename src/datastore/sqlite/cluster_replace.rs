@@ -85,7 +85,7 @@ fn replace_resource_state_in_conn(
             )));
         }
         let (_applied_rv, commit_pending) =
-            apply_commit_in_tx_with_watch_events(&tx, commit, !has_explicit_watch_history)?;
+            apply_commit_in_tx_with_watch_events(&tx, commit, !has_explicit_watch_history, false)?;
         pending.extend(commit_pending);
     }
     if has_explicit_watch_history {
@@ -243,8 +243,14 @@ pub(crate) fn apply_commit_in_tx_for_raft(
         });
     }
 
+    // Authoritative apply: committed raft entries are ground truth.
+    // Staleness-related preconditions (precondition_resource_version / precondition_uid) are
+    // bypassed so a stale follower converges from the log without relying solely on snapshot
+    // install (finding.md H2). Structural conditions (require_absent / require_existing) are
+    // still enforced — they represent true API-level invariants (e.g. duplicate-create detection
+    // on the leader) and must be propagated back to the proposer as terminal results.
     tx.execute("SAVEPOINT raft_apply_attempt", [])?;
-    match apply_commit_in_tx_returning_rv(tx, commit) {
+    match apply_commit_in_tx_returning_rv(tx, commit, true) {
         Ok((rv, pending)) => {
             tx.execute("RELEASE raft_apply_attempt", [])?;
             Ok(RaftLogApplyOutcome {
@@ -290,25 +296,32 @@ pub(crate) fn apply_commit_in_tx(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
 ) -> tokio_rusqlite::Result<Vec<PendingWatchEvent>> {
-    let (_applied_rv, pending) = apply_commit_in_tx_returning_rv(tx, commit)?;
+    let (_applied_rv, pending) = apply_commit_in_tx_returning_rv(tx, commit, false)?;
     Ok(pending)
 }
 
 pub(crate) fn apply_commit_in_tx_returning_rv(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
+    raft_authoritative: bool,
 ) -> tokio_rusqlite::Result<(i64, Vec<PendingWatchEvent>)> {
     let has_explicit_watch_history = commit
         .mutations
         .iter()
         .any(|mutation| matches!(mutation, LogApplyMutation::PutWatchEvent(_)));
-    apply_commit_in_tx_with_watch_events(tx, commit, !has_explicit_watch_history)
+    apply_commit_in_tx_with_watch_events(
+        tx,
+        commit,
+        !has_explicit_watch_history,
+        raft_authoritative,
+    )
 }
 
 fn apply_commit_in_tx_with_watch_events(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
     emit_watch_events: bool,
+    raft_authoritative: bool,
 ) -> tokio_rusqlite::Result<(i64, Vec<PendingWatchEvent>)> {
     if commit.resource_version < 0 {
         return Err(other_error(
@@ -324,7 +337,9 @@ fn apply_commit_in_tx_with_watch_events(
                 if row.resource_version != commit.resource_version {
                     return Err(other_error("resource row RV does not match commit RV"));
                 }
-                if let Some(event) = put_resource_row(tx, row, emit_watch_events)? {
+                if let Some(event) =
+                    put_resource_row(tx, row, emit_watch_events, raft_authoritative)?
+                {
                     pending.push(event);
                 }
             }
@@ -332,14 +347,20 @@ fn apply_commit_in_tx_with_watch_events(
                 if patch.resource_version != commit.resource_version {
                     return Err(other_error("resource patch RV does not match commit RV"));
                 }
-                if let Some(event) = patch_resource_latest_row(tx, patch, emit_watch_events)? {
+                if let Some(event) =
+                    patch_resource_latest_row(tx, patch, emit_watch_events, raft_authoritative)?
+                {
                     pending.push(event);
                 }
             }
             LogApplyMutation::DeleteResource(key) => {
-                if let Some(event) =
-                    delete_resource_row(tx, commit.resource_version, key, emit_watch_events)?
-                {
+                if let Some(event) = delete_resource_row(
+                    tx,
+                    commit.resource_version,
+                    key,
+                    emit_watch_events,
+                    raft_authoritative,
+                )? {
                     pending.push(event);
                 }
             }
@@ -514,6 +535,7 @@ fn put_resource_row(
     tx: &rusqlite::Transaction<'_>,
     mut row: LogApplyResourceRow,
     emit_watch_events: bool,
+    raft_authoritative: bool,
 ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
     let namespaced = use_namespaced_table(&row.api_version, &row.kind, &row.namespace.as_deref());
     if namespaced {
@@ -535,7 +557,16 @@ fn put_resource_row(
                 },
             )
             .optional()?;
-        validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
+        if raft_authoritative {
+            // In raft-authoritative mode, enforce structural conditions (require_absent /
+            // require_existing) so the leader can detect true conflicts (duplicate create,
+            // missing-row update). Bypass staleness-related conditions (precondition_uid /
+            // precondition_resource_version) — the committed value wins over stale local state.
+            validate_put_resource_presence_preconditions(&row, existing.as_ref())?;
+            log_raft_put_conflict_if_any(&row, existing.as_ref());
+        } else {
+            validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
+        }
         merge_status_only_row_with_existing(&mut row, existing.as_ref())?;
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -631,7 +662,12 @@ fn put_resource_row(
                 },
             )
             .optional()?;
-        validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
+        if raft_authoritative {
+            validate_put_resource_presence_preconditions(&row, existing.as_ref())?;
+            log_raft_put_conflict_if_any(&row, existing.as_ref());
+        } else {
+            validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
+        }
         merge_status_only_row_with_existing(&mut row, existing.as_ref())?;
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -719,6 +755,7 @@ fn patch_resource_latest_row(
     tx: &rusqlite::Transaction<'_>,
     patch: LogApplyResourcePatch,
     emit_watch_events: bool,
+    raft_authoritative: bool,
 ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
     let namespaced =
         use_namespaced_table(&patch.api_version, &patch.kind, &patch.namespace.as_deref());
@@ -753,6 +790,7 @@ fn patch_resource_latest_row(
             &current_uid,
             &current_bytes,
             Some(namespace),
+            raft_authoritative,
         )?;
         let data_bytes = serde_json::to_vec(&patched_data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -834,6 +872,7 @@ fn patch_resource_latest_row(
             &current_uid,
             &current_bytes,
             None,
+            raft_authoritative,
         )?;
         let data_bytes = serde_json::to_vec(&patched_data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -897,18 +936,37 @@ fn apply_latest_patch_to_current_resource(
     current_uid: &str,
     current_bytes: &[u8],
     namespace: Option<&str>,
+    raft_authoritative: bool,
 ) -> tokio_rusqlite::Result<serde_json::Value> {
     if let Some(expected_uid) = patch.precondition_uid.as_deref()
         && expected_uid != current_uid
     {
-        return Err(other_error("UID precondition failed (409 Conflict)"));
+        if raft_authoritative {
+            tracing::warn!(
+                api_version = %patch.api_version, kind = %patch.kind,
+                namespace = ?patch.namespace, name = %patch.name,
+                local_uid = %current_uid, committed_uid = %expected_uid,
+                "raft authoritative PATCH: uid precondition bypassed, applying patch to current row"
+            );
+        } else {
+            return Err(other_error("UID precondition failed (409 Conflict)"));
+        }
     }
     if let Some(expected_rv) = patch.precondition_resource_version
         && expected_rv != current_rv
     {
-        return Err(other_error(format!(
-            "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-        )));
+        if raft_authoritative {
+            tracing::warn!(
+                api_version = %patch.api_version, kind = %patch.kind,
+                namespace = ?patch.namespace, name = %patch.name,
+                local_rv = %current_rv, committed_rv = %expected_rv,
+                "raft authoritative PATCH: rv precondition bypassed, applying patch to current row"
+            );
+        } else {
+            return Err(other_error(format!(
+                "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
+            )));
+        }
     }
     let current: serde_json::Value =
         serde_json::from_slice(current_bytes).map_err(serde_to_sqlite_error)?;
@@ -1075,11 +1133,28 @@ fn validate_put_resource_apply_preconditions(
     Ok(())
 }
 
+/// Raft-authoritative variant: enforces only structural conditions (require_absent /
+/// require_existing) and skips staleness-related conditions (precondition_uid /
+/// precondition_resource_version). The committed raft entry wins over stale local rv/uid.
+fn validate_put_resource_presence_preconditions(
+    row: &LogApplyResourceRow,
+    existing: Option<&(i64, String, Vec<u8>)>,
+) -> tokio_rusqlite::Result<()> {
+    if row.require_absent && existing.is_some() {
+        return Err(other_error("Resource already exists (409 Conflict)"));
+    }
+    if row.require_existing && existing.is_none() {
+        return Err(other_error("Resource not found (404 Not Found)"));
+    }
+    Ok(())
+}
+
 fn delete_resource_row(
     tx: &rusqlite::Transaction<'_>,
     resource_version: i64,
     key: LogApplyResourceKey,
     emit_watch_events: bool,
+    raft_authoritative: bool,
 ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
     let namespace_ref = key.namespace.as_deref();
     if use_namespaced_table(&key.api_version, &key.kind, &namespace_ref) {
@@ -1106,15 +1181,26 @@ fn delete_resource_row(
         // UID, this delete is stale (a same-name replacement landed) and
         // must be a no-op. Empty key.uid is permitted only for snapshot /
         // backfill paths that reconstruct deletes without UID context.
+        // This guard is preserved even in raft-authoritative mode: a stale-uid
+        // delete must not evict a same-name replacement regardless of authority.
         if !key.uid.is_empty() && key.uid != current_uid {
             return Ok(None);
         }
         if let Some(expected_rv) = key.precondition_resource_version
             && expected_rv != current_rv
         {
-            return Err(other_error(format!(
-                "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-            )));
+            if raft_authoritative {
+                tracing::warn!(
+                    api_version = %key.api_version, kind = %key.kind,
+                    namespace = ?key.namespace, name = %key.name,
+                    local_rv = %current_rv, committed_rv = %expected_rv,
+                    "raft authoritative DELETE: rv precondition bypassed, removing stale row"
+                );
+            } else {
+                return Err(other_error(format!(
+                    "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
+                )));
+            }
         }
         tx.execute(
             queries::NAMESPACED_DELETE_BY_KEY,
@@ -1176,9 +1262,17 @@ fn delete_resource_row(
         if let Some(expected_rv) = key.precondition_resource_version
             && expected_rv != current_rv
         {
-            return Err(other_error(format!(
-                "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-            )));
+            if raft_authoritative {
+                tracing::warn!(
+                    api_version = %key.api_version, kind = %key.kind, name = %key.name,
+                    local_rv = %current_rv, committed_rv = %expected_rv,
+                    "raft authoritative DELETE: rv precondition bypassed, removing stale cluster row"
+                );
+            } else {
+                return Err(other_error(format!(
+                    "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
+                )));
+            }
         }
         tx.execute(
             queries::CLUSTER_DELETE_BY_KEY,
@@ -1487,6 +1581,39 @@ fn storage_result_from_applied_outbox(
 fn is_terminal_apply_conflict(err: &tokio_rusqlite::Error) -> bool {
     let msg = err.to_string();
     msg.contains("409 Conflict") || msg.contains("404 Not Found")
+}
+
+/// Emit a warning when a committed raft PUT bypasses staleness-related preconditions
+/// (precondition_uid or precondition_resource_version). Only these two are bypassed in
+/// raft-authoritative mode; require_absent and require_existing are still enforced so
+/// the leader can detect true API-level conflicts (duplicate create, missing update target).
+fn log_raft_put_conflict_if_any(
+    row: &LogApplyResourceRow,
+    existing: Option<&(i64, String, Vec<u8>)>,
+) {
+    let Some((current_rv, current_uid, _)) = existing else {
+        return;
+    };
+    if let Some(expected_uid) = row.precondition_uid.as_deref()
+        && expected_uid != current_uid.as_str()
+    {
+        tracing::warn!(
+            api_version = %row.api_version, kind = %row.kind,
+            namespace = ?row.namespace, name = %row.name,
+            local_uid = %current_uid, committed_uid = %expected_uid,
+            "raft authoritative PUT: uid precondition bypassed, reconciling to committed value"
+        );
+    }
+    if let Some(expected_rv) = row.precondition_resource_version
+        && expected_rv != *current_rv
+    {
+        tracing::warn!(
+            api_version = %row.api_version, kind = %row.kind,
+            namespace = ?row.namespace, name = %row.name,
+            local_rv = %current_rv, committed_rv = %expected_rv,
+            "raft authoritative PUT: rv precondition bypassed, reconciling to committed value"
+        );
+    }
 }
 
 fn put_pod_cleanup_intent_row(
@@ -2024,6 +2151,11 @@ mod tests {
         );
     }
 
+    /// A committed PUT with require_existing=true on a row that is absent on the follower
+    /// returns a terminal "404 Not Found" result because require_existing is a structural
+    /// API invariant (not a staleness-related precondition) and is preserved in the raft
+    /// authoritative apply path. Staleness-related preconditions (precondition_rv /
+    /// precondition_uid) are bypassed by the raft path.
     #[tokio::test]
     async fn raft_apply_missing_required_resource_returns_terminal_result() {
         let db = crate::datastore::test_support::in_memory().await;
@@ -2260,5 +2392,521 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(watch_data, leader_watch_row.to_string());
+    }
+
+    // ── Task 1: Committed Raft Apply Authoritative Over Stale Follower State ─────────────────
+
+    /// Committed delete must remove a row even when the follower's local rv differs from the
+    /// precondition the leader encoded (the follower missed an intermediate update).
+    #[tokio::test]
+    async fn committed_delete_applies_even_when_local_row_is_stale() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "stale-cm",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "stale-cm", "namespace": "default", "uid": "cm-stale-del"}
+            }),
+        )
+        .await
+        .unwrap();
+        // Committed delete carries precondition_rv=999 (the leader's rv at delete time). The
+        // follower has the row at rv=1 (it missed an intermediate update). The delete must
+        // converge the follower: the row is removed despite the rv mismatch.
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                50,
+                vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "stale-cm".to_string(),
+                    uid: "cm-stale-del".to_string(),
+                    precondition_resource_version: Some(999),
+                })],
+            ))
+            .await
+            .expect("raft delete must not error on stale rv");
+        assert!(
+            result.error_message.is_none(),
+            "committed delete must succeed without error_message: {result:?}"
+        );
+        let row = db
+            .get_resource("v1", "ConfigMap", Some("default"), "stale-cm")
+            .await
+            .unwrap();
+        assert!(
+            row.is_none(),
+            "committed delete must remove stale row; row still present: {row:?}"
+        );
+    }
+
+    /// Committed put must overwrite a stale local row regardless of precondition_resource_version
+    /// mismatch (the follower has an older rv than the precondition the leader captured).
+    #[tokio::test]
+    async fn committed_put_overwrites_stale_local_row() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "put-target",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "put-target", "namespace": "default", "uid": "cm-put-uid"},
+                "data": {"k": "old"}
+            }),
+        )
+        .await
+        .unwrap();
+        // Committed PUT carries precondition_rv=500 (the leader's rv). Follower has rv=1.
+        // The PUT must overwrite the local row with the committed value.
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                60,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "put-target".to_string(),
+                    uid: "cm-put-uid".to_string(),
+                    resource_version: 60,
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "put-target",
+                            "namespace": "default",
+                            "uid": "cm-put-uid",
+                            "resourceVersion": "60"
+                        },
+                        "data": {"k": "committed"}
+                    }),
+                    require_absent: false,
+                    require_existing: false,
+                    precondition_uid: Some("cm-put-uid".to_string()),
+                    precondition_resource_version: Some(500), // mismatch: follower has rv≠500
+                    status_only: false,
+                })],
+            ))
+            .await
+            .expect("raft put must not error on stale rv");
+        assert!(
+            result.error_message.is_none(),
+            "committed PUT must succeed: {result:?}"
+        );
+        let row = db
+            .get_resource("v1", "ConfigMap", Some("default"), "put-target")
+            .await
+            .unwrap()
+            .expect("committed PUT must materialise the row");
+        assert_eq!(
+            row.data.pointer("/data/k").and_then(|v| v.as_str()),
+            Some("committed"),
+            "row data must reflect the committed value"
+        );
+        assert_eq!(row.resource_version, 60, "row must carry the committed rv");
+    }
+
+    /// Committed patch must apply to the current local state regardless of precondition mismatch,
+    /// reconciling the follower toward the committed result before last_applied advances.
+    #[tokio::test]
+    async fn committed_patch_conflict_reconciles_to_committed_value_before_advancing() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "patch-target",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "patch-target", "namespace": "default", "uid": "cm-patch"},
+                "data": {"existing": "yes"}
+            }),
+        )
+        .await
+        .unwrap();
+        // Committed patch has precondition_rv=888 (leader rv). Follower has rv=1. The patch
+        // must still be applied to the current local state.
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                70,
+                vec![LogApplyMutation::PatchResourceLatest(
+                    LogApplyResourcePatch {
+                        api_version: "v1".to_string(),
+                        kind: "ConfigMap".to_string(),
+                        namespace: Some("default".to_string()),
+                        name: "patch-target".to_string(),
+                        resource_version: 70,
+                        patch_kind: crate::datastore::types::PatchKind::Merge,
+                        patch: serde_json::json!({"data": {"added": "by-patch"}}),
+                        precondition_uid: Some("cm-patch".to_string()),
+                        precondition_resource_version: Some(888), // mismatch
+                        require_existing: true,
+                        terminating_pod_unready_timestamp: None,
+                    },
+                )],
+            ))
+            .await
+            .expect("raft patch must not error on stale rv");
+        assert!(
+            result.error_message.is_none(),
+            "committed PATCH must succeed: {result:?}"
+        );
+        let row = db
+            .get_resource("v1", "ConfigMap", Some("default"), "patch-target")
+            .await
+            .unwrap()
+            .expect("committed PATCH must preserve the row");
+        assert_eq!(
+            row.data.pointer("/data/added").and_then(|v| v.as_str()),
+            Some("by-patch"),
+            "patch field must be present after committed apply"
+        );
+    }
+
+    /// A committed patch conflict must NOT advance last_applied while leaving the local state
+    /// divergent — the follower must reconcile before the index is recorded as applied.
+    ///
+    /// This test exercises the `apply_commit_in_tx_for_raft` path and verifies that the returned
+    /// result does not carry `error_message` (the old "conflict swallowed, last_applied advanced"
+    /// signal), which is the prior buggy behavior.
+    #[tokio::test]
+    async fn committed_patch_conflict_does_not_advance_applied_index_with_divergence() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "diverge-cm",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "diverge-cm", "namespace": "default", "uid": "cm-div"},
+                "data": {"state": "stale"}
+            }),
+        )
+        .await
+        .unwrap();
+        // Committed patch with precondition_rv mismatch. With the fix the apply succeeds
+        // (no error_message). Without the fix the conflict is swallowed with error_message set,
+        // which is the "advanced index with divergence" bug.
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                75,
+                vec![LogApplyMutation::PatchResourceLatest(
+                    LogApplyResourcePatch {
+                        api_version: "v1".to_string(),
+                        kind: "ConfigMap".to_string(),
+                        namespace: Some("default".to_string()),
+                        name: "diverge-cm".to_string(),
+                        resource_version: 75,
+                        patch_kind: crate::datastore::types::PatchKind::Merge,
+                        patch: serde_json::json!({"data": {"state": "reconciled"}}),
+                        precondition_uid: Some("cm-div".to_string()),
+                        precondition_resource_version: Some(777),
+                        require_existing: true,
+                        terminating_pod_unready_timestamp: None,
+                    },
+                )],
+            ))
+            .await
+            .expect("raft patch must succeed even with stale precondition");
+        assert!(
+            result.error_message.is_none(),
+            "committed patch must reconcile state rather than swallow conflict: got error_message={:?}",
+            result.error_message
+        );
+        assert!(
+            result.applied_rv.is_some(),
+            "applied_rv must be set after successful reconcile"
+        );
+    }
+
+    /// Re-applying an already-committed entry (local state already equals the committed state)
+    /// must advance last_applied silently without emitting a conflict.
+    #[tokio::test]
+    async fn idempotent_reapply_of_already_committed_state_advances_silently() {
+        let db = crate::datastore::test_support::in_memory().await;
+        // Apply a committed PUT once to establish local state.
+        let first = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                80,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "idempotent-cm".to_string(),
+                    uid: "cm-idem".to_string(),
+                    resource_version: 80,
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "idempotent-cm",
+                            "namespace": "default",
+                            "uid": "cm-idem",
+                            "resourceVersion": "80"
+                        },
+                        "data": {"v": "1"}
+                    }),
+                    require_absent: false,
+                    require_existing: false,
+                    precondition_uid: None,
+                    precondition_resource_version: None,
+                    status_only: false,
+                })],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            first.error_message.is_none(),
+            "first apply must succeed: {first:?}"
+        );
+
+        // Re-apply the identical commit (simulating restart or redundant delivery).
+        let second = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                80,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "idempotent-cm".to_string(),
+                    uid: "cm-idem".to_string(),
+                    resource_version: 80,
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "idempotent-cm",
+                            "namespace": "default",
+                            "uid": "cm-idem",
+                            "resourceVersion": "80"
+                        },
+                        "data": {"v": "1"}
+                    }),
+                    require_absent: false,
+                    require_existing: false,
+                    precondition_uid: None,
+                    precondition_resource_version: None,
+                    status_only: false,
+                })],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            second.error_message.is_none(),
+            "idempotent re-apply must not set error_message: {second:?}"
+        );
+    }
+
+    /// An apply conflict (local diverges from committed) must be observable: the result must NOT
+    /// carry error_message (swallowing the divergence), and the row must be reconciled.
+    #[tokio::test]
+    async fn apply_conflict_is_observable_not_silently_successful() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "observable-cm",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "observable-cm",
+                    "namespace": "default",
+                    "uid": "cm-obs"
+                },
+                "data": {"state": "stale"}
+            }),
+        )
+        .await
+        .unwrap();
+        // Committed PUT with precondition_rv=999 (mismatch with local rv=1).
+        // Old behavior: swallowed as error_message, stale row unchanged.
+        // New behavior: row reconciled to committed value, no error_message.
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                90,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "observable-cm".to_string(),
+                    uid: "cm-obs".to_string(),
+                    resource_version: 90,
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "observable-cm",
+                            "namespace": "default",
+                            "uid": "cm-obs",
+                            "resourceVersion": "90"
+                        },
+                        "data": {"state": "authoritative"}
+                    }),
+                    require_absent: false,
+                    require_existing: false,
+                    precondition_uid: Some("cm-obs".to_string()),
+                    precondition_resource_version: Some(999),
+                    status_only: false,
+                })],
+            ))
+            .await
+            .unwrap();
+        // The conflict must NOT be silently swallowed as error_message — the committed value wins.
+        assert!(
+            result.error_message.is_none(),
+            "conflict must be reconciled (not swallowed as error_message): {result:?}"
+        );
+        let row = db
+            .get_resource("v1", "ConfigMap", Some("default"), "observable-cm")
+            .await
+            .unwrap()
+            .expect("row must exist after authoritative PUT");
+        assert_eq!(
+            row.data.pointer("/data/state").and_then(|v| v.as_str()),
+            Some("authoritative"),
+            "row must reflect the committed value after conflict reconciliation"
+        );
+    }
+
+    /// A follower that holds a stale row (the leader already deleted it via a committed log entry)
+    /// must converge to the leader fingerprint (row absent) without requiring a snapshot install.
+    #[tokio::test]
+    async fn follower_converges_to_leader_fingerprint_without_snapshot_after_stale_delete() {
+        // Simulate a follower that holds a row the leader committed as deleted.
+        let follower = crate::datastore::test_support::in_memory().await;
+        follower
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "conv-cm",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "conv-cm",
+                        "namespace": "default",
+                        "uid": "cm-conv"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Leader backend has the resource deleted (empty). Committed delete arrives via log.
+        let result = follower
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                100,
+                vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "conv-cm".to_string(),
+                    uid: "cm-conv".to_string(),
+                    precondition_resource_version: None, // no precondition — pure committed delete
+                })],
+            ))
+            .await
+            .expect("committed log delete must not fail");
+        assert!(
+            result.error_message.is_none(),
+            "no error_message after authoritative delete"
+        );
+
+        // Follower now matches leader fingerprint: row absent.
+        let row = follower
+            .get_resource("v1", "ConfigMap", Some("default"), "conv-cm")
+            .await
+            .unwrap();
+        assert!(
+            row.is_none(),
+            "follower must converge to leader fingerprint without snapshot; row still present"
+        );
+    }
+
+    /// Applying the same committed entry encoded as JSON and as protobuf must produce identical
+    /// cluster.db rows (api_version, kind, namespace, name, uid, rv, data).
+    #[tokio::test]
+    async fn committed_apply_json_and_protobuf_paths_produce_identical_rows() {
+        let commit = LogApplyCommit::new(
+            110,
+            vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "encoding-cm".to_string(),
+                uid: "cm-enc".to_string(),
+                resource_version: 110,
+                data: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "encoding-cm",
+                        "namespace": "default",
+                        "uid": "cm-enc",
+                        "resourceVersion": "110"
+                    },
+                    "data": {"encoded": "true"}
+                }),
+                require_absent: false,
+                require_existing: false,
+                precondition_uid: None,
+                precondition_resource_version: None,
+                status_only: false,
+            })],
+        );
+
+        // JSON path
+        let json_bytes = crate::log_apply::encode_commit_json(&commit).unwrap();
+        let commit_from_json = crate::log_apply::decode_commit_json(&json_bytes).unwrap();
+        let db_json = crate::datastore::test_support::in_memory().await;
+        db_json
+            .apply_raft_log_apply_commit(commit_from_json)
+            .await
+            .unwrap();
+        let row_json = db_json
+            .get_resource("v1", "ConfigMap", Some("default"), "encoding-cm")
+            .await
+            .unwrap()
+            .expect("json path must materialise row");
+
+        // Protobuf path
+        let proto_bytes = crate::log_apply::encode_commit_protobuf(&commit).unwrap();
+        let commit_from_proto = crate::log_apply::decode_commit_protobuf(&proto_bytes).unwrap();
+        let db_proto = crate::datastore::test_support::in_memory().await;
+        db_proto
+            .apply_raft_log_apply_commit(commit_from_proto)
+            .await
+            .unwrap();
+        let row_proto = db_proto
+            .get_resource("v1", "ConfigMap", Some("default"), "encoding-cm")
+            .await
+            .unwrap()
+            .expect("proto path must materialise row");
+
+        assert_eq!(
+            row_json.uid, row_proto.uid,
+            "JSON and protobuf paths must produce identical uid"
+        );
+        assert_eq!(
+            row_json.resource_version, row_proto.resource_version,
+            "JSON and protobuf paths must produce identical rv"
+        );
+        assert_eq!(
+            row_json.data, row_proto.data,
+            "JSON and protobuf paths must produce identical data"
+        );
     }
 }

@@ -773,7 +773,9 @@ impl Datastore {
         )?;
 
         let (applied_rv, pending) =
-            crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_returning_rv(tx, commit)?;
+            crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_returning_rv(
+                tx, commit, false,
+            )?;
 
         let pending_event = pending.into_iter().next();
         let result_proto = encode_response_protobuf(&StorageResponse::Ack {
