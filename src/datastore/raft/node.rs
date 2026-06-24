@@ -619,6 +619,9 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
                 err.to_string(),
             ));
         }
+        // Match `propose_command`: hold a flow-control permit before the builder can
+        // reserve a resourceVersion for the materialized raft commit.
+        let _flow_permit = self.flow_control.acquire().await;
         let payload_bytes = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
             .map_err(|err| {
@@ -2451,6 +2454,55 @@ mod tests {
         );
 
         // Drop the externally-held propose_fut and clean up the manually-held permits.
+        drop(propose_fut);
+        drop(_p1);
+        drop(_p2);
+        drop(_p3);
+        node.shutdown().await.unwrap();
+    }
+
+    /// The outbox proposer path preserves a caller-provided idempotency key, but it
+    /// still materializes a `LogApplyCommit` and reserves a resourceVersion. It must
+    /// share the same flow-control gate as `propose_command`, acquired before RV
+    /// reservation, or worker outbox dispatch can build an unbounded backlog under
+    /// packet loss.
+    #[tokio::test]
+    async fn raft_outbox_proposal_permit_is_acquired_before_resource_version_reservation() {
+        use crate::datastore::replicated::RaftProposer;
+
+        let (node, backend) = fresh_node(75).await;
+        node.bootstrap_single_voter("https://10.99.0.75:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .expect("become leader");
+
+        let _p1 = node.flow_control.acquire().await;
+        let _p2 = node.flow_control.acquire().await;
+        let _p3 = node.flow_control.acquire().await;
+        assert_eq!(node.flow_control.available_permits(), 0);
+
+        let rv_before = backend.get_current_resource_version().await.unwrap();
+        let timeout = tokio::time::sleep(std::time::Duration::from_millis(300));
+        tokio::pin!(timeout);
+        let mut propose_fut = Box::pin(node.propose_outbox_command(
+            "outbox-permit-ordering",
+            crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+            propose_create_command("outbox-permit-ordering"),
+            "worker-1",
+        ));
+        tokio::select! {
+            _ = &mut propose_fut => panic!("propose_outbox_command must block while flow-control permits are exhausted"),
+            _ = &mut timeout => {}
+        }
+
+        let rv_during = backend.get_current_resource_version().await.unwrap();
+        assert_eq!(
+            rv_during, rv_before,
+            "outbox propose must not reserve an rv until a flow-control permit is available"
+        );
+
         drop(propose_fut);
         drop(_p1);
         drop(_p2);
