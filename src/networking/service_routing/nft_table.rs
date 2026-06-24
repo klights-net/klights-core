@@ -123,6 +123,10 @@ pub struct KlightsTable {
     /// rewriting nft chains when repeated Service/Endpoints watch events
     /// produce identical routing semantics.
     service_snapshot: std::sync::Mutex<Option<ServiceRuleSnapshot>>,
+    /// Last successfully applied semantic ServiceSpec set. This is the planner
+    /// input used by watch-fed cached syncs to avoid nft rewrites for no-op
+    /// inventory events.
+    applied_service_specs: std::sync::Mutex<Vec<ServiceSpec>>,
     /// Cached watch-fed Service route inventory. Populated on the first
     /// `sync_services_from_api` so subsequent watch events can apply diffs
     /// from cached state without re-listing the entire cluster API.
@@ -511,6 +515,7 @@ impl KlightsTable {
             hostport_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             remote_pod_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             service_snapshot: std::sync::Mutex::new(None),
+            applied_service_specs: std::sync::Mutex::new(Vec::new()),
             service_route_inventory: std::sync::Mutex::new(None),
         })
     }
@@ -833,6 +838,15 @@ impl KlightsTable {
             anyhow::bail!("sync_services_from_cached_inventory: inventory not bootstrapped yet");
         };
         let (specs, svc_count) = specs_with_count;
+        let previous_specs = lock_recover(&self.applied_service_specs).clone();
+        let plan = super::RoutePlan::diff(&previous_specs, &specs);
+        if plan.is_empty() {
+            tracing::debug!(
+                "nft service route plan empty: {} services; skipping cached inventory render",
+                svc_count
+            );
+            return Ok(svc_count);
+        }
         self.replace_services(&specs).await?;
         Ok(svc_count)
     }
@@ -937,6 +951,7 @@ impl KlightsTable {
             rule_count
         );
         *lock_recover(&self.service_snapshot) = Some(snapshot);
+        *lock_recover(&self.applied_service_specs) = services.to_vec();
         Ok(())
     }
 

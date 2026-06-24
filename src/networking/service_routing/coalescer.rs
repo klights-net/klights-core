@@ -65,6 +65,7 @@ use super::prelude::*;
 use super::*;
 use crate::networking::service_router::ServiceRouter;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Default coalescing window for the services-sync worker. Matches
 /// kube-proxy's `--iptables-min-sync-period 1s` default in spirit but
@@ -320,11 +321,13 @@ impl NftServiceRouter {
             .context("initial remote pod endpoint DNAT sync")?;
 
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let force_full_sync = std::sync::Arc::new(AtomicBool::new(true));
         let worker_table = table.clone();
         let worker_notify = notify.clone();
         let worker_cancel = cancel.clone();
         let worker_task_supervisor = task_supervisor.clone();
         let worker_cluster_api = cluster_api.clone();
+        let worker_force_full_sync = force_full_sync.clone();
         let worker = task_supervisor
             .spawn_async(
                 crate::task_supervisor::TaskCategory::Network,
@@ -352,11 +355,27 @@ impl NftServiceRouter {
                             _ = worker_task_supervisor
                                 .sleep("service_routing_coalescer_min_sync_period", min_sync_period) => {}
                         }
-                        match worker_table.sync_services_from_api(worker_cluster_api.as_ref()).await {
+                        let full_sync = worker_force_full_sync.swap(false, Ordering::AcqRel);
+                        let sync_result = if full_sync {
+                            worker_table.sync_services_from_api(worker_cluster_api.as_ref()).await
+                        } else {
+                            match worker_table.sync_services_from_cached_inventory().await {
+                                Ok(count) => Ok(count),
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "service routing cached inventory unavailable; falling back to full sync"
+                                    );
+                                    worker_table.sync_services_from_api(worker_cluster_api.as_ref()).await
+                                }
+                            }
+                        };
+                        match sync_result {
                             Ok(_n) => {
                                 backoff = INITIAL_RETRY_BACKOFF;
                             }
                             Err(e) => {
+                                worker_force_full_sync.store(true, Ordering::Release);
                                 let next_backoff =
                                     std::cmp::min(backoff.saturating_mul(2), MAX_RETRY_BACKOFF);
                                 tracing::warn!(
@@ -392,6 +411,8 @@ impl NftServiceRouter {
         let service_watch_cancel = cancel.clone();
         let service_watch_cluster_api = cluster_api.clone();
         let service_watch_task_supervisor = task_supervisor.clone();
+        let service_watch_table = table.clone();
+        let service_watch_force_full_sync = force_full_sync.clone();
         let service_watch_worker = task_supervisor
             .spawn_async(
                 crate::task_supervisor::TaskCategory::Network,
@@ -399,9 +420,11 @@ impl NftServiceRouter {
                 async move {
                     run_service_routing_watch_worker(
                         service_watch_cluster_api,
+                        service_watch_table,
                         service_watch_notify,
                         service_watch_cancel,
                         service_watch_task_supervisor,
+                        service_watch_force_full_sync,
                     )
                     .await;
                 },
@@ -646,11 +669,82 @@ async fn service_routing_watch_reconnect_delay(
     }
 }
 
+fn watch_event_object_identity(object: &serde_json::Value) -> Result<(&str, &str, i64)> {
+    let namespace = object
+        .pointer("/metadata/namespace")
+        .and_then(|value| value.as_str())
+        .context("service routing watch event missing metadata.namespace")?;
+    let name = object
+        .pointer("/metadata/name")
+        .and_then(|value| value.as_str())
+        .context("service routing watch event missing metadata.name")?;
+    let resource_version = crate::utils::extract_resource_version_from_object(object);
+    if resource_version <= 0 {
+        anyhow::bail!("service routing watch event missing metadata.resourceVersion");
+    }
+    Ok((namespace, name, resource_version))
+}
+
+fn apply_service_routing_watch_event_to_inventory(
+    table: &KlightsTable,
+    target: ServiceRoutingWatchTarget,
+    event: crate::control_plane::client::ResourceEvent,
+) -> Result<Option<super::inventory::InventoryApply>> {
+    use crate::watch::EventType;
+
+    match event.event.event_type {
+        EventType::Bookmark => return Ok(Some(super::inventory::InventoryApply::NoChange)),
+        EventType::Error => anyhow::bail!("service routing watch delivered ERROR event"),
+        EventType::Added | EventType::Modified | EventType::Deleted => {}
+    }
+
+    let deleted = event.event.event_type == EventType::Deleted;
+    let object = event.event.object.as_ref();
+    let (namespace, name, resource_version) = watch_event_object_identity(object)?;
+    let data = (!deleted).then(|| (*object).clone());
+
+    match (target.api_version, target.kind) {
+        ("v1", "Service") => Ok(table.apply_service_event_to_inventory(
+            namespace,
+            name,
+            resource_version,
+            deleted,
+            data,
+        )),
+        ("v1", "Endpoints") => Ok(table.apply_endpoints_event_to_inventory(
+            namespace,
+            name,
+            resource_version,
+            deleted,
+            data,
+        )),
+        ("discovery.k8s.io/v1", "EndpointSlice") => {
+            let Some(service_name) = object
+                .pointer("/metadata/labels/kubernetes.io~1service-name")
+                .and_then(|value| value.as_str())
+            else {
+                return Ok(Some(super::inventory::InventoryApply::NoChange));
+            };
+            Ok(table.apply_endpoint_slice_event_to_inventory(
+                namespace,
+                service_name,
+                name,
+                resource_version,
+                deleted,
+                data,
+            ))
+        }
+        _ => Ok(Some(super::inventory::InventoryApply::NoChange)),
+    }
+}
+
 async fn run_service_routing_watch_worker(
     cluster_api: std::sync::Arc<dyn LeaderApiClient>,
+    table: std::sync::Arc<KlightsTable>,
     notify: std::sync::Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
     task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    force_full_sync: std::sync::Arc<AtomicBool>,
 ) {
     use futures::StreamExt;
 
@@ -667,6 +761,7 @@ async fn run_service_routing_watch_worker(
                     error = %err,
                     "service routing failed to open cluster watches; scheduling full service sync"
                 );
+                force_full_sync.store(true, Ordering::Release);
                 notify.notify_one();
                 if !service_routing_watch_reconnect_delay(
                     &task_supervisor,
@@ -686,6 +781,7 @@ async fn run_service_routing_watch_worker(
         // opened. A full sync after the watch set is established closes the
         // bootstrap race where an existing Service, such as kube-dns, gains
         // ready Endpoints before this node's watch streams are active.
+        force_full_sync.store(true, Ordering::Release);
         notify.notify_one();
 
         let mut reopen_watch_set = false;
@@ -697,9 +793,29 @@ async fn run_service_routing_watch_worker(
                 }
                 event = streams.next() => {
                     match event {
-                        Some(ServiceRoutingWatchItem::Event { event: Ok(_), .. }) => {
+                        Some(ServiceRoutingWatchItem::Event { target, event: Ok(event) }) => {
                             reconnect_attempt = 0;
-                            notify.notify_one();
+                            match apply_service_routing_watch_event_to_inventory(table.as_ref(), target, event) {
+                                Ok(Some(super::inventory::InventoryApply::Applied | super::inventory::InventoryApply::Removed)) => {
+                                    notify.notify_one();
+                                }
+                                Ok(Some(super::inventory::InventoryApply::NoChange)) => {}
+                                Ok(None) => {
+                                    force_full_sync.store(true, Ordering::Release);
+                                    notify.notify_one();
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        api_version = target.api_version,
+                                        kind = target.kind,
+                                        error = %err,
+                                        "service routing watch event could not update inventory; scheduling full service sync"
+                                    );
+                                    force_full_sync.store(true, Ordering::Release);
+                                    notify.notify_one();
+                                    reopen_watch_set = true;
+                                }
+                            }
                         }
                         Some(ServiceRoutingWatchItem::Event { target, event: Err(err) }) => {
                             tracing::warn!(
@@ -708,6 +824,7 @@ async fn run_service_routing_watch_worker(
                                 error = %err,
                                 "service routing watch stream failed; scheduling full service sync"
                             );
+                            force_full_sync.store(true, Ordering::Release);
                             notify.notify_one();
                             reopen_watch_set = true;
                         }
@@ -717,6 +834,7 @@ async fn run_service_routing_watch_worker(
                                 kind = target.kind,
                                 "service routing watch stream closed; scheduling full service sync"
                             );
+                            force_full_sync.store(true, Ordering::Release);
                             notify.notify_one();
                             reopen_watch_set = true;
                         }
@@ -724,6 +842,7 @@ async fn run_service_routing_watch_worker(
                             tracing::warn!(
                                 "service routing watch set closed; scheduling full service sync"
                             );
+                            force_full_sync.store(true, Ordering::Release);
                             notify.notify_one();
                             reopen_watch_set = true;
                         }
@@ -899,10 +1018,27 @@ mod tests {
     use bytes::Bytes;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
+
+    fn test_service_table(
+        task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    ) -> Arc<KlightsTable> {
+        let nf = Netfilter::new(task_supervisor).expect("Netfilter::new");
+        Arc::new(
+            KlightsTable::with_name(
+                nf,
+                "klights-test-watch",
+                PodSubnet::parse("10.99.0.0/24").expect("static pod cidr"),
+                ClusterCidr::parse("10.99.0.0/16").expect("static cluster cidr"),
+                ClusterCidr::parse("10.99.128.0/17").expect("static service cidr"),
+                ServiceRoutingMode::default_root_for_test(),
+            )
+            .expect("build service routing table"),
+        )
+    }
 
     #[derive(Default)]
     struct WatchOnlyLeaderApiClient {
@@ -1127,6 +1263,8 @@ mod tests {
         let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
             crate::task_supervisor::TaskCategoryConfig::default(),
         ));
+        let table = test_service_table(supervisor.clone());
+        let force_full_sync = Arc::new(AtomicBool::new(false));
 
         let worker = supervisor
             .spawn_async(
@@ -1134,9 +1272,11 @@ mod tests {
                 "test_service_routing_watch_worker",
                 run_service_routing_watch_worker(
                     client.clone(),
+                    table,
                     notify.clone(),
                     cancel.clone(),
                     supervisor.clone(),
+                    force_full_sync.clone(),
                 ),
             )
             .await
@@ -1145,6 +1285,10 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
             .await
             .expect("watch worker must request an initial full service sync");
+        assert!(
+            force_full_sync.load(Ordering::SeqCst),
+            "watch worker must mark the initial notification as a full sync"
+        );
 
         cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(1), worker.join())
@@ -1167,6 +1311,8 @@ mod tests {
         let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
             crate::task_supervisor::TaskCategoryConfig::default(),
         ));
+        let table = test_service_table(supervisor.clone());
+        let force_full_sync = Arc::new(AtomicBool::new(false));
 
         let worker = supervisor
             .spawn_async(
@@ -1174,9 +1320,11 @@ mod tests {
                 "test_service_routing_watch_worker_reopen",
                 run_service_routing_watch_worker(
                     client.clone(),
+                    table,
                     notify.clone(),
                     cancel.clone(),
                     supervisor.clone(),
+                    force_full_sync.clone(),
                 ),
             )
             .await
@@ -1188,6 +1336,10 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified())
             .await
             .expect("initial watch set must request a full service sync");
+        assert!(
+            force_full_sync.load(Ordering::SeqCst),
+            "initial watch set must request a full service sync flag"
+        );
 
         tokio::time::timeout(std::time::Duration::from_secs(1), client.wait_for_opened(6))
             .await

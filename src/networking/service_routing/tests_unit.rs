@@ -1190,6 +1190,12 @@ async fn coalesced_sync_uses_cached_inventory_after_initial_snapshot() {
     let svc_calls_after_bootstrap = api
         .service_list_calls
         .load(std::sync::atomic::Ordering::SeqCst);
+    let endpoint_calls_after_bootstrap = api
+        .endpoints_list_calls
+        .load(std::sync::atomic::Ordering::SeqCst)
+        + api
+            .endpointslice_list_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
 
     // Subsequent sync from the cached inventory must not list services again.
     let _specs = inventory.to_specs();
@@ -1205,11 +1211,7 @@ async fn coalesced_sync_uses_cached_inventory_after_initial_snapshot() {
             + api
                 .endpointslice_list_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
-        api.endpoints_list_calls
-            .load(std::sync::atomic::Ordering::SeqCst)
-            + api
-                .endpointslice_list_calls
-                .load(std::sync::atomic::Ordering::SeqCst),
+        endpoint_calls_after_bootstrap,
         "to_specs from cached inventory must NOT re-list endpoints/slices"
     );
 }

@@ -112,10 +112,13 @@ impl ServiceRouteInventory {
         data: Option<Value>,
     ) -> InventoryApply {
         if deleted {
-            return match self
-                .entries
-                .remove(&(namespace.to_string(), name.to_string()))
+            let key = (namespace.to_string(), name.to_string());
+            if let Some(entry) = self.entries.get(&key)
+                && resource_version <= entry.service_rv
             {
+                return InventoryApply::NoChange;
+            }
+            return match self.entries.remove(&key) {
                 Some(_) => InventoryApply::Removed,
                 None => InventoryApply::NoChange,
             };
@@ -141,6 +144,9 @@ impl ServiceRouteInventory {
         if deleted {
             return match self.entries.get_mut(&key) {
                 Some(entry) => {
+                    if resource_version <= entry.endpoints_rv {
+                        return InventoryApply::NoChange;
+                    }
                     let had = entry.endpoints.is_some();
                     entry.endpoints = None;
                     entry.endpoints_rv = 0;
@@ -174,10 +180,17 @@ impl ServiceRouteInventory {
         let key = (namespace.to_string(), service_name.to_string());
         if deleted {
             return match self.entries.get_mut(&key) {
-                Some(entry) => match entry.endpoint_slices.remove(slice_name) {
-                    Some(_) => InventoryApply::Removed,
-                    None => InventoryApply::NoChange,
-                },
+                Some(entry) => {
+                    if let Some(existing) = entry.endpoint_slices.get(slice_name)
+                        && resource_version <= existing.resource_version
+                    {
+                        return InventoryApply::NoChange;
+                    }
+                    match entry.endpoint_slices.remove(slice_name) {
+                        Some(_) => InventoryApply::Removed,
+                        None => InventoryApply::NoChange,
+                    }
+                }
                 None => InventoryApply::NoChange,
             };
         }
@@ -352,5 +365,56 @@ mod tests {
             InventoryApply::Removed
         );
         assert!(inv.to_specs().is_empty());
+    }
+
+    #[test]
+    fn route_inventory_ignores_stale_delete_events() {
+        let mut inv = ServiceRouteInventory::new();
+
+        assert_eq!(
+            inv.apply_service_event("kube-system", "kube-dns", 10, false, Some(dns_service())),
+            InventoryApply::Applied
+        );
+        assert_eq!(
+            inv.apply_endpoints_event(
+                "kube-system",
+                "kube-dns",
+                11,
+                false,
+                Some(dns_endpoints("10.50.0.20"))
+            ),
+            InventoryApply::Applied
+        );
+        assert_eq!(
+            inv.apply_endpoint_slice_event(
+                "kube-system",
+                "kube-dns",
+                "kube-dns-1",
+                12,
+                false,
+                Some(dns_slice("kube-dns-1", "10.50.0.30"))
+            ),
+            InventoryApply::Applied
+        );
+
+        assert_eq!(
+            inv.apply_service_event("kube-system", "kube-dns", 9, true, None),
+            InventoryApply::NoChange
+        );
+        assert_eq!(
+            inv.apply_endpoints_event("kube-system", "kube-dns", 10, true, None),
+            InventoryApply::NoChange
+        );
+        assert_eq!(
+            inv.apply_endpoint_slice_event("kube-system", "kube-dns", "kube-dns-1", 11, true, None),
+            InventoryApply::NoChange
+        );
+
+        let specs = inv.to_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].ports[0].endpoints,
+            vec!["10.50.0.30".parse::<std::net::Ipv4Addr>().unwrap()]
+        );
     }
 }
