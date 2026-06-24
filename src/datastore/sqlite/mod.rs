@@ -785,7 +785,9 @@ impl Datastore {
             ensure_pod_status_ip_arrays, ensure_resource_type_meta,
             validate_resource_preconditions,
         };
-        use crate::datastore::types::ResourcePreconditions;
+        use crate::datastore::types::{
+            ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
+        };
         use crate::log_apply::{
             LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
             LogApplyNodeSubnetAllocation, LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow,
@@ -1033,10 +1035,110 @@ impl Datastore {
                 )
             }
 
-            StorageCommand::ApplyResourceBatch { .. } => {
-                return Err(Self::sqlite_conversion_error(anyhow!(
-                    "ApplyResourceBatch cannot be materialized before batch backend support is installed"
-                )));
+            StorageCommand::ApplyResourceBatch { operations } => {
+                let mut mutations = Vec::with_capacity(operations.len());
+                for operation in operations {
+                    match operation {
+                        ResourceBatchOperation::Put {
+                            api_version,
+                            kind,
+                            namespace,
+                            name,
+                            mut data,
+                            mode,
+                            preconditions,
+                        } => {
+                            match mode {
+                                ResourceBatchPutMode::Create => {
+                                    if Self::resource_row_optional_for_update_in_tx(
+                                        tx,
+                                        &api_version,
+                                        &kind,
+                                        namespace.as_deref(),
+                                        &name,
+                                    )?
+                                    .is_some()
+                                    {
+                                        return Err(Self::sqlite_conversion_error(anyhow!(
+                                            "{}/{} {}/{} already exists",
+                                            api_version,
+                                            kind,
+                                            namespace.as_deref().unwrap_or(""),
+                                            name
+                                        )));
+                                    }
+                                }
+                                ResourceBatchPutMode::Update => {
+                                    let (live_rv, live_uid, _) =
+                                        Self::resource_row_for_update_in_tx(
+                                            tx,
+                                            &api_version,
+                                            &kind,
+                                            namespace.as_deref(),
+                                            &name,
+                                        )?;
+                                    validate_resource_preconditions(
+                                        &preconditions,
+                                        Some(&live_uid),
+                                        live_rv,
+                                    )
+                                    .map_err(Self::sqlite_conversion_error)?;
+                                }
+                            }
+                            ensure_resource_type_meta(&mut data, &api_version, &kind);
+                            ensure_metadata_identity(&mut data, namespace.as_deref(), &name);
+                            if mode == ResourceBatchPutMode::Create {
+                                ensure_metadata_create_defaults(&mut data);
+                            }
+                            ensure_pod_status_ip_arrays(&mut data, &api_version, &kind);
+                            let uid = ensure_metadata_uid(&mut data);
+                            mutations.push(LogApplyMutation::PutResource(LogApplyResourceRow {
+                                api_version,
+                                kind,
+                                namespace,
+                                name,
+                                uid,
+                                resource_version: rv,
+                                data,
+                                require_absent: mode == ResourceBatchPutMode::Create,
+                                require_existing: mode == ResourceBatchPutMode::Update,
+                                precondition_uid: preconditions.uid,
+                                precondition_resource_version: preconditions.resource_version,
+                                status_only: false,
+                            }));
+                        }
+                        ResourceBatchOperation::Delete {
+                            api_version,
+                            kind,
+                            namespace,
+                            name,
+                            preconditions,
+                        } => {
+                            let (live_rv, live_uid, _) = Self::resource_row_for_update_in_tx(
+                                tx,
+                                &api_version,
+                                &kind,
+                                namespace.as_deref(),
+                                &name,
+                            )?;
+                            validate_resource_preconditions(
+                                &preconditions,
+                                Some(&live_uid),
+                                live_rv,
+                            )
+                            .map_err(Self::sqlite_conversion_error)?;
+                            mutations.push(LogApplyMutation::DeleteResource(LogApplyResourceKey {
+                                api_version,
+                                kind,
+                                namespace,
+                                name,
+                                uid: live_uid,
+                                precondition_resource_version: preconditions.resource_version,
+                            }));
+                        }
+                    }
+                }
+                LogApplyCommit::new(rv, mutations)
             }
 
             StorageCommand::DeleteResource {
@@ -1701,6 +1803,32 @@ impl Datastore {
                 )),
                 other => tokio_rusqlite::Error::Rusqlite(other),
             })
+        }
+    }
+
+    fn resource_row_optional_for_update_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> tokio_rusqlite::Result<Option<(i64, String, Vec<u8>)>> {
+        if use_namespaced_table(api_version, kind, &namespace) {
+            tx.query_row(
+                queries::NAMESPACED_GET_DATA_FOR_DELETE,
+                rusqlite::params![api_version, kind, namespace.unwrap_or("default"), name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(tokio_rusqlite::Error::Rusqlite)
+        } else {
+            tx.query_row(
+                queries::CLUSTER_GET_DATA_FOR_DELETE,
+                rusqlite::params![api_version, kind, name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(tokio_rusqlite::Error::Rusqlite)
         }
     }
 

@@ -2,7 +2,8 @@ use super::*;
 use crate::datastore::command::StorageCommand;
 use crate::datastore::{
     MetaStore, NamespaceContentStore, NetworkMetadataStore, OwnershipStore, PodWorkqueueStore,
-    ReplicationStore, ResourceListStore, ResourcePreconditions, StatusStore, WatchHistoryStore,
+    ReplicationStore, ResourceBatchOperation, ResourceBatchPutMode, ResourceListStore,
+    ResourcePreconditions, StatusStore, WatchHistoryStore,
 };
 use crate::datastore::{PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState};
 use serde_json::json;
@@ -50,6 +51,124 @@ async fn schema_namespaces_includes_uid_column() {
     let (present, not_null) = table_column_info(&db, "namespaces", "uid").await;
     assert!(present, "namespaces.uid must exist");
     assert!(not_null, "namespaces.uid must be NOT NULL");
+}
+
+#[tokio::test]
+async fn apply_resource_batch_command_builds_one_commit_with_two_puts() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let command = StorageCommand::apply_resource_batch(vec![
+        ResourceBatchOperation::Put {
+            api_version: "discovery.k8s.io/v1".to_string(),
+            kind: "EndpointSlice".to_string(),
+            namespace: Some("default".to_string()),
+            name: "batched-klights".to_string(),
+            data: json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {"name": "batched-klights", "namespace": "default"},
+                "addressType": "IPv4",
+                "endpoints": [],
+                "ports": []
+            }),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        },
+        ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "Endpoints".to_string(),
+            namespace: Some("default".to_string()),
+            name: "batched".to_string(),
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "Endpoints",
+                "metadata": {"name": "batched", "namespace": "default"},
+                "subsets": []
+            }),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        },
+    ]);
+
+    let commit = db
+        .db_call("test_build_apply_resource_batch_commit", move |conn| {
+            let tx = conn.transaction()?;
+            let (commit, rv) = Datastore::build_log_apply_commit_in_tx_from_command(
+                &tx,
+                command,
+                "ServiceEndpointReconcile",
+                "test-node",
+            )?;
+            assert_eq!(rv, commit.resource_version);
+            tx.commit()?;
+            Ok(commit)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(commit.mutations.len(), 2);
+    assert!(commit.mutations.iter().all(|mutation| matches!(
+        mutation,
+        crate::log_apply::LogApplyMutation::PutResource(row)
+            if row.resource_version == commit.resource_version
+    )));
+}
+
+#[tokio::test]
+async fn apply_resource_batch_update_requires_resource_version_precondition() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let existing = db
+        .create_resource(
+            "v1",
+            "Endpoints",
+            Some("default"),
+            "batched-update",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Endpoints",
+                "metadata": {"name": "batched-update", "namespace": "default"},
+                "subsets": []
+            }),
+        )
+        .await
+        .unwrap();
+    let command = StorageCommand::apply_resource_batch(vec![ResourceBatchOperation::Put {
+        api_version: "v1".to_string(),
+        kind: "Endpoints".to_string(),
+        namespace: Some("default".to_string()),
+        name: "batched-update".to_string(),
+        data: json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": {"name": "batched-update", "namespace": "default"},
+            "subsets": [{"addresses": [], "ports": []}]
+        }),
+        mode: ResourceBatchPutMode::Update,
+        preconditions: ResourcePreconditions {
+            uid: Some(existing.uid.clone()),
+            resource_version: Some(existing.resource_version + 100),
+        },
+    }]);
+
+    let err = db
+        .db_call("test_build_apply_resource_batch_conflict", move |conn| {
+            let tx = conn.transaction()?;
+            let result = Datastore::build_log_apply_commit_in_tx_from_command(
+                &tx,
+                command,
+                "ServiceEndpointReconcile",
+                "test-node",
+            );
+            tx.rollback()?;
+            result.map(|_| ())
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("resourceVersion precondition failed"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test]
