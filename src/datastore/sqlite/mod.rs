@@ -280,8 +280,13 @@ impl Datastore {
             return Ok(());
         }
         let command = crate::datastore::command::StorageCommand::ApplyResourceBatch { operations };
-        let commit = self
-            .db_call("db_apply_resource_batch_build", move |conn| {
+        // Build + apply in a single IMMEDIATE transaction so the reserved
+        // resourceVersion and the written rows are always committed together.
+        // A two-step approach (build in one txn, apply in a second) leaves a
+        // window where the metadata_rv is advanced but no rows exist yet —
+        // visible to concurrent readers as a reserved-but-not-applied batch.
+        let pending = self
+            .db_call("db_apply_resource_batch", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
@@ -289,12 +294,15 @@ impl Datastore {
                     "ResourceBatch",
                     "",
                 )?;
+                let pending =
+                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx(&tx, commit)?;
                 tx.commit()?;
-                Ok(commit)
+                Ok(pending)
             })
             .await
-            .map_err(|e| anyhow!("apply resource batch build failed: {e}"))?;
-        self.apply_log_apply_commit(commit).await
+            .map_err(|e| anyhow!("apply resource batch failed: {e}"))?;
+        self.publish_watch_events(pending);
+        Ok(())
     }
 
     pub async fn delete_uncommitted_applied_outbox_placeholder(

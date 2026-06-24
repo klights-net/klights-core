@@ -4932,3 +4932,174 @@ async fn retention_bounds_db_file_size_after_churn() {
         size
     );
 }
+
+// ── Task 5: Atomic batch apply ───────────────────────────────────────────────
+
+/// Build + apply must happen in a single transaction: after a successful batch,
+/// all resources are visible at the same resource_version and no extra RV was
+/// allocated between build and apply.
+#[tokio::test]
+async fn apply_resource_batch_builds_and_applies_in_one_transaction() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let before_rv = db.get_current_resource_version().await.unwrap();
+    db.apply_resource_batch(vec![
+        ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "Endpoints".to_string(),
+            namespace: Some("default".to_string()),
+            name: "atomic-ep".to_string(),
+            data: json!({"apiVersion":"v1","kind":"Endpoints","metadata":{"name":"atomic-ep","namespace":"default"},"subsets":[]}),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        },
+        ResourceBatchOperation::Put {
+            api_version: "discovery.k8s.io/v1".to_string(),
+            kind: "EndpointSlice".to_string(),
+            namespace: Some("default".to_string()),
+            name: "atomic-eps".to_string(),
+            data: json!({"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"atomic-eps","namespace":"default"},"addressType":"IPv4","endpoints":[],"ports":[]}),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        },
+    ])
+    .await
+    .unwrap();
+
+    let ep = db
+        .get_resource("v1", "Endpoints", Some("default"), "atomic-ep")
+        .await
+        .unwrap()
+        .expect("Endpoints must exist");
+    let eps = db
+        .get_resource(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            "atomic-eps",
+        )
+        .await
+        .unwrap()
+        .expect("EndpointSlice must exist");
+    // Both resources must share the same rv (single commit).
+    assert_eq!(
+        ep.resource_version, eps.resource_version,
+        "atomic batch: both resources must share the same rv"
+    );
+    // The current metadata rv must equal exactly the batch rv — no extra rv
+    // was allocated between a separate build and apply step.
+    let after_rv = db.get_current_resource_version().await.unwrap();
+    assert_eq!(
+        after_rv, ep.resource_version,
+        "metadata rv must equal batch rv; no extra allocation expected"
+    );
+    assert!(after_rv > before_rv, "rv must have advanced");
+}
+
+/// A batch that fails at build time (pre-condition failure) must not advance
+/// the resource_version counter at all — no partial RV reservation.
+#[tokio::test]
+async fn apply_resource_batch_no_partial_visibility_on_failure() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    // Seed a resource so a Create-mode batch for the same name will fail.
+    db.create_resource("v1","ConfigMap",Some("default"),"already-exists",
+        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"already-exists","namespace":"default"}}))
+        .await.unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+
+    // Batch tries to CREATE an existing resource — must fail at build time with no RV leak.
+    let err = db.apply_resource_batch(vec![
+        ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "already-exists".to_string(),
+            data: json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"already-exists","namespace":"default"}}),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        },
+    ]).await;
+    assert!(err.is_err(), "batch with duplicate Create must fail");
+    let rv_after = db.get_current_resource_version().await.unwrap();
+    assert_eq!(
+        rv_before, rv_after,
+        "failed batch must not leak a resource_version; rv before={rv_before} after={rv_after}"
+    );
+}
+
+/// After a successful batch, the current resource_version must exactly equal
+/// the batch resources' rv. No extra rv must have been allocated between a
+/// separate "build" and "apply" step.
+#[tokio::test]
+async fn apply_resource_batch_reserved_rv_not_observable_before_apply() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+    db.apply_resource_batch(vec![
+        ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "atomic-cm".to_string(),
+            data: json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"atomic-cm","namespace":"default"}}),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        },
+    ]).await.unwrap();
+    let cm = db
+        .get_resource("v1", "ConfigMap", Some("default"), "atomic-cm")
+        .await
+        .unwrap()
+        .expect("must exist");
+    let rv_after = db.get_current_resource_version().await.unwrap();
+    // With a two-step build+apply: the build step commits rv=N and the apply
+    // step applies at rv=N. A reader between these steps would see rv=N in
+    // metadata but no row yet. With the atomic single-transaction approach,
+    // the rv and the row are always committed together.
+    // Observable invariant: current_rv == batch rv, no extra allocation.
+    assert_eq!(
+        rv_after, cm.resource_version,
+        "batch rv must equal metadata rv after atomic build+apply; before={rv_before}"
+    );
+}
+
+/// Watch events emitted by a batch must all carry the same resource_version,
+/// consistent with a single committed transaction.
+#[tokio::test]
+async fn apply_resource_batch_emits_watch_events_consistent_with_single_commit() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let mut rx = db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Endpoints"));
+    let mut rx_eps = db.subscribe_watch(crate::watch::WatchTopic::new(
+        "discovery.k8s.io/v1",
+        "EndpointSlice",
+    ));
+
+    db.apply_resource_batch(vec![
+        ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "Endpoints".to_string(),
+            namespace: Some("default".to_string()),
+            name: "watch-ep".to_string(),
+            data: json!({"apiVersion":"v1","kind":"Endpoints","metadata":{"name":"watch-ep","namespace":"default"},"subsets":[]}),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        },
+        ResourceBatchOperation::Put {
+            api_version: "discovery.k8s.io/v1".to_string(),
+            kind: "EndpointSlice".to_string(),
+            namespace: Some("default".to_string()),
+            name: "watch-eps".to_string(),
+            data: json!({"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"watch-eps","namespace":"default"},"addressType":"IPv4","endpoints":[],"ports":[]}),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        },
+    ]).await.unwrap();
+
+    let ev_ep = rx.try_recv().expect("Endpoints watch event must fire");
+    let ev_eps = rx_eps
+        .try_recv()
+        .expect("EndpointSlice watch event must fire");
+    assert_eq!(
+        ev_ep.resource_version(),
+        ev_eps.resource_version(),
+        "batch watch events must all carry the same rv (single commit)"
+    );
+}
