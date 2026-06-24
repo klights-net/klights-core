@@ -5123,3 +5123,102 @@ async fn apply_resource_batch_emits_watch_events_consistent_with_single_commit()
         "batch watch events must all carry the same rv (single commit)"
     );
 }
+
+/// Fence for atomic build+apply: if the *apply* phase of a batch fails after the
+/// build phase already succeeded, the reserved resourceVersion must be rolled
+/// back and no rows from the batch may be visible.
+///
+/// This is the decisive regression guard. The seam is a two-operation batch on
+/// the same resource:
+///   1. Update `cm` (no precondition) — passes build, and at apply time rewrites
+///      the row to the batch rv.
+///   2. Delete `cm` with `precondition_resource_version = <original rv>` — passes
+///      build (build validates against the *pre-batch* live rv, which still
+///      equals the original), but FAILS at apply time because operation (1) has
+///      already advanced the row's rv past the precondition.
+///
+/// Under the OLD two-step shape (build commits the reserved rv in one DB call,
+/// then apply runs in a second step), the build commit would leak the advanced
+/// metadata resourceVersion while the apply step rolls back, leaving rv > before
+/// with no rows changed. Under the current single-IMMEDIATE-transaction shape,
+/// the apply failure rolls back the whole transaction, so the rv is unchanged.
+#[tokio::test]
+async fn apply_resource_batch_rolls_back_reserved_rv_on_apply_failure() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.create_resource(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "rollback-cm",
+        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"rollback-cm","namespace":"default"},"data":{"k":"v0"}}),
+    )
+    .await
+    .unwrap();
+    let original = db
+        .get_resource("v1", "ConfigMap", Some("default"), "rollback-cm")
+        .await
+        .unwrap()
+        .expect("seed ConfigMap must exist");
+    let original_rv = original.resource_version;
+    let original_uid = original.uid.clone();
+    let rv_before = db.get_current_resource_version().await.unwrap();
+    assert_eq!(
+        rv_before, original_rv,
+        "precondition: metadata rv equals the seeded row rv"
+    );
+
+    // Two ops on the SAME resource. Op 1 (Update) passes build and at apply time
+    // rewrites the row to the batch rv. Op 2 (Delete with precondition = original
+    // rv) passes build (validated against the pre-batch live rv) but fails at
+    // apply because op 1 already advanced the row's rv.
+    let err = db
+        .apply_resource_batch(vec![
+            ResourceBatchOperation::Put {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "rollback-cm".to_string(),
+                // Preserve the original UID so op 2's delete is not no-op'd by
+                // the same-name UID guard — it must instead fail on the rv
+                // precondition that op 1 has invalidated.
+                data: json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"rollback-cm","namespace":"default","uid":original_uid},"data":{"k":"v1"}}),
+                mode: ResourceBatchPutMode::Update,
+                preconditions: ResourcePreconditions::default(),
+            },
+            ResourceBatchOperation::Delete {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "rollback-cm".to_string(),
+                preconditions: ResourcePreconditions::resource_version(original_rv),
+            },
+        ])
+        .await;
+    assert!(
+        err.is_err(),
+        "batch must fail at apply time (op 2 rv precondition no longer holds)"
+    );
+
+    // The reserved rv must be rolled back: metadata rv unchanged.
+    let rv_after = db.get_current_resource_version().await.unwrap();
+    assert_eq!(
+        rv_before, rv_after,
+        "apply failure must roll back the reserved rv; before={rv_before} after={rv_after}"
+    );
+
+    // No batch effect may be visible: the row must be unchanged (still present,
+    // same rv, original data) — op 1's Update must not have leaked through.
+    let after = db
+        .get_resource("v1", "ConfigMap", Some("default"), "rollback-cm")
+        .await
+        .unwrap()
+        .expect("ConfigMap must still exist (delete rolled back)");
+    assert_eq!(
+        after.resource_version, original_rv,
+        "row rv must be unchanged after a rolled-back batch"
+    );
+    assert_eq!(
+        after.data, original.data,
+        "row data must be unchanged after a rolled-back batch (op 1 must not leak)"
+    );
+}
