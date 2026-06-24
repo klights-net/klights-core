@@ -16,6 +16,13 @@ use crate::log_apply::{
 };
 use anyhow::{Result, anyhow};
 use rusqlite::OptionalExtension;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static RAFT_AUTHORITATIVE_APPLY_CONFLICTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn record_raft_authoritative_apply_conflict() {
+    RAFT_AUTHORITATIVE_APPLY_CONFLICTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
 
 impl Datastore {
     /// Replace cluster-replicated Kubernetes resources from a full leader snapshot.
@@ -942,6 +949,7 @@ fn apply_latest_patch_to_current_resource(
         && expected_uid != current_uid
     {
         if raft_authoritative {
+            record_raft_authoritative_apply_conflict();
             tracing::warn!(
                 api_version = %patch.api_version, kind = %patch.kind,
                 namespace = ?patch.namespace, name = %patch.name,
@@ -956,6 +964,7 @@ fn apply_latest_patch_to_current_resource(
         && expected_rv != current_rv
     {
         if raft_authoritative {
+            record_raft_authoritative_apply_conflict();
             tracing::warn!(
                 api_version = %patch.api_version, kind = %patch.kind,
                 namespace = ?patch.namespace, name = %patch.name,
@@ -1191,6 +1200,7 @@ fn delete_resource_row(
             && expected_rv != current_rv
         {
             if raft_authoritative {
+                record_raft_authoritative_apply_conflict();
                 tracing::warn!(
                     api_version = %key.api_version, kind = %key.kind,
                     namespace = ?key.namespace, name = %key.name,
@@ -1264,6 +1274,7 @@ fn delete_resource_row(
             && expected_rv != current_rv
         {
             if raft_authoritative {
+                record_raft_authoritative_apply_conflict();
                 tracing::warn!(
                     api_version = %key.api_version, kind = %key.kind, name = %key.name,
                     local_rv = %current_rv, committed_rv = %expected_rv,
@@ -1598,6 +1609,7 @@ fn log_raft_put_conflict_if_any(
     if let Some(expected_uid) = row.precondition_uid.as_deref()
         && expected_uid != current_uid.as_str()
     {
+        record_raft_authoritative_apply_conflict();
         tracing::warn!(
             api_version = %row.api_version, kind = %row.kind,
             namespace = ?row.namespace, name = %row.name,
@@ -1608,6 +1620,7 @@ fn log_raft_put_conflict_if_any(
     if let Some(expected_rv) = row.precondition_resource_version
         && expected_rv != *current_rv
     {
+        record_raft_authoritative_apply_conflict();
         tracing::warn!(
             api_version = %row.api_version, kind = %row.kind,
             namespace = ?row.namespace, name = %row.name,
@@ -2734,6 +2747,7 @@ mod tests {
         // Committed PUT with precondition_rv=999 (mismatch with local rv=1).
         // Old behavior: swallowed as error_message, stale row unchanged.
         // New behavior: row reconciled to committed value, no error_message.
+        let conflicts_before = RAFT_AUTHORITATIVE_APPLY_CONFLICTS_TOTAL.load(Ordering::Relaxed);
         let result = db
             .apply_raft_log_apply_commit(LogApplyCommit::new(
                 90,
@@ -2768,6 +2782,10 @@ mod tests {
         assert!(
             result.error_message.is_none(),
             "conflict must be reconciled (not swallowed as error_message): {result:?}"
+        );
+        assert!(
+            RAFT_AUTHORITATIVE_APPLY_CONFLICTS_TOTAL.load(Ordering::Relaxed) > conflicts_before,
+            "authoritative apply conflict must increment the observability counter"
         );
         let row = db
             .get_resource("v1", "ConfigMap", Some("default"), "observable-cm")
