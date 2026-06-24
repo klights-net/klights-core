@@ -45,6 +45,120 @@ fn test_endpointslice_desired_state_match_detects_endpoint_changes() {
 }
 
 #[tokio::test]
+async fn service_endpoint_batch_reconcile_creates_slice_and_endpoints_with_same_rv() {
+    let db = crate::datastore::test_support::in_memory().await;
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "batch-pod",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "batch-pod",
+                "namespace": "default",
+                "uid": "batch-pod-uid",
+                "labels": {"app": "batch"}
+            },
+            "spec": {
+                "containers": [{
+                    "name": "app",
+                    "image": "nginx",
+                    "ports": [{"containerPort": 8080}]
+                }]
+            },
+            "status": {
+                "phase": "Running",
+                "podIP": "10.43.0.30",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    reconcile_service_endpoints_batch(
+        &db,
+        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        ServiceEndpointBatchReconcileRequest {
+            service_name: "batch-svc",
+            service_uid: "batch-svc-uid",
+            namespace: "default",
+            selector: Some(&json!({"app": "batch"})),
+            service_ports: Some(
+                &json!([{"name": "http", "port": 80, "targetPort": 8080, "protocol": "TCP"}]),
+            ),
+            publish_not_ready: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let endpoints = db
+        .get_resource("v1", "Endpoints", Some("default"), "batch-svc")
+        .await
+        .unwrap()
+        .expect("Endpoints should exist");
+    let slices = db
+        .list_resources(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            crate::datastore::ResourceListQuery::new(
+                Some("kubernetes.io/service-name=batch-svc"),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    let slice = slices.items.first().expect("EndpointSlice should exist");
+
+    assert_eq!(slice.resource_version, endpoints.resource_version);
+}
+
+#[tokio::test]
+async fn service_endpoint_batch_reconcile_is_noop_when_desired_state_matches() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let pod_repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+    reconcile_service_endpoints_batch(
+        &db,
+        pod_repo.as_ref(),
+        ServiceEndpointBatchReconcileRequest {
+            service_name: "noop-svc",
+            service_uid: "noop-svc-uid",
+            namespace: "default",
+            selector: Some(&json!({"app": "none"})),
+            service_ports: Some(&json!([{"port": 80, "targetPort": 80, "protocol": "TCP"}])),
+            publish_not_ready: false,
+        },
+    )
+    .await
+    .unwrap();
+    let rv_after_first = db.get_current_resource_version().await.unwrap();
+
+    reconcile_service_endpoints_batch(
+        &db,
+        pod_repo.as_ref(),
+        ServiceEndpointBatchReconcileRequest {
+            service_name: "noop-svc",
+            service_uid: "noop-svc-uid",
+            namespace: "default",
+            selector: Some(&json!({"app": "none"})),
+            service_ports: Some(&json!([{"port": 80, "targetPort": 80, "protocol": "TCP"}])),
+            publish_not_ready: false,
+        },
+    )
+    .await
+    .unwrap();
+    let rv_after_second = db.get_current_resource_version().await.unwrap();
+
+    assert_eq!(rv_after_second, rv_after_first);
+}
+
+#[tokio::test]
 async fn test_reconcile_endpoints_skips_terminating_namespace() {
     let db = crate::datastore::test_support::in_memory().await;
 

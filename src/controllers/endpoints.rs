@@ -1,4 +1,6 @@
-use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
+use crate::datastore::{
+    DatastoreBackend, Resource, ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
+};
 use crate::kubelet::pod_repository::PodReader;
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -219,6 +221,280 @@ fn endpointslice_desired_state_matches(current: &Value, desired: &Value) -> bool
         && current.get("ports") == desired.get("ports")
 }
 
+struct EndpointSubsetGroup {
+    ports: Vec<Value>,
+    addresses: Vec<Value>,
+    not_ready_addresses: Vec<Value>,
+}
+
+struct EndpointSliceGroup {
+    ports: Vec<Value>,
+    endpoints: Vec<Value>,
+}
+
+pub struct ServiceEndpointBatchReconcileRequest<'a> {
+    pub service_name: &'a str,
+    pub service_uid: &'a str,
+    pub namespace: &'a str,
+    pub selector: Option<&'a Value>,
+    pub service_ports: Option<&'a Value>,
+    pub publish_not_ready: bool,
+}
+
+fn build_desired_endpoints(
+    service_name: &str,
+    namespace: &str,
+    service_ports: Option<&Value>,
+    publish_not_ready: bool,
+    pods: &[Resource],
+    selector: &crate::label_selector::LabelSelector,
+) -> Value {
+    let mut subset_groups: Vec<EndpointSubsetGroup> = Vec::new();
+    let mut subset_group_indexes: BTreeMap<String, usize> = BTreeMap::new();
+
+    for pod_resource in pods {
+        if pod_is_terminating(&pod_resource.data) {
+            continue;
+        }
+        if !selector.matches_resource(&pod_resource.data) {
+            continue;
+        }
+
+        if let Some(pod_ip) = pod_resource
+            .data
+            .get("status")
+            .and_then(|s| s.get("podIP"))
+            .and_then(|ip| ip.as_str())
+            && pod_ip != "0.0.0.0"
+            && !pod_ip.is_empty()
+            && let Some(pod_name) = pod_resource
+                .data
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+        {
+            let mut target_ref = json!({
+                "kind": "Pod",
+                "namespace": namespace,
+                "name": pod_name
+            });
+            if let Some(pod_uid) = pod_resource
+                .data
+                .get("metadata")
+                .and_then(|m| m.get("uid"))
+                .and_then(|u| u.as_str())
+            {
+                target_ref["uid"] = json!(pod_uid);
+            }
+
+            let mut addr = json!({
+                "ip": pod_ip,
+                "targetRef": target_ref
+            });
+
+            let pod_hostname = pod_resource
+                .data
+                .pointer("/spec/hostname")
+                .and_then(|v| v.as_str());
+            let pod_subdomain = pod_resource
+                .data
+                .pointer("/spec/subdomain")
+                .and_then(|v| v.as_str());
+            if let (Some(hostname), Some(subdomain)) = (pod_hostname, pod_subdomain)
+                && subdomain == service_name
+            {
+                addr.as_object_mut()
+                    .unwrap()
+                    .insert("hostname".to_string(), json!(hostname));
+            }
+
+            let ports = build_endpoints_ports_for_pod(service_ports, &pod_resource.data);
+            let group_key = ports_signature(&ports);
+            let group_idx = if let Some(idx) = subset_group_indexes.get(&group_key) {
+                *idx
+            } else {
+                let idx = subset_groups.len();
+                subset_groups.push(EndpointSubsetGroup {
+                    ports,
+                    addresses: Vec::new(),
+                    not_ready_addresses: Vec::new(),
+                });
+                subset_group_indexes.insert(group_key, idx);
+                idx
+            };
+
+            if publish_not_ready || is_pod_ready(&pod_resource.data) {
+                subset_groups[group_idx].addresses.push(addr);
+            } else {
+                subset_groups[group_idx].not_ready_addresses.push(addr);
+            }
+        }
+    }
+
+    let mut subsets = Vec::with_capacity(subset_groups.len());
+    for group in subset_groups {
+        if group.addresses.is_empty() && group.not_ready_addresses.is_empty() {
+            continue;
+        }
+        let mut subset = json!({
+            "addresses": group.addresses,
+            "ports": group.ports
+        });
+
+        if !group.not_ready_addresses.is_empty() {
+            subset.as_object_mut().unwrap().insert(
+                "notReadyAddresses".to_string(),
+                json!(group.not_ready_addresses),
+            );
+        }
+
+        subsets.push(subset);
+    }
+
+    json!({
+        "apiVersion": "v1",
+        "kind": "Endpoints",
+        "metadata": {
+            "name": service_name,
+            "namespace": namespace
+        },
+        "subsets": subsets
+    })
+}
+
+fn build_desired_endpointslices(
+    service_name: &str,
+    service_uid: &str,
+    namespace: &str,
+    service_ports: Option<&Value>,
+    pods: &[Resource],
+    selector: &crate::label_selector::LabelSelector,
+) -> Vec<(String, Value)> {
+    let mut slice_groups: Vec<EndpointSliceGroup> = Vec::new();
+    let mut slice_group_indexes: BTreeMap<String, usize> = BTreeMap::new();
+
+    for pod_resource in pods {
+        if pod_is_terminating(&pod_resource.data) {
+            continue;
+        }
+        if !selector.matches_resource(&pod_resource.data) {
+            continue;
+        }
+
+        if let Some(pod_ip) = pod_resource
+            .data
+            .get("status")
+            .and_then(|s| s.get("podIP"))
+            .and_then(|ip| ip.as_str())
+            && pod_ip != "0.0.0.0"
+            && !pod_ip.is_empty()
+            && let Some(pod_name) = pod_resource
+                .data
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+        {
+            let is_ready = is_pod_ready(&pod_resource.data);
+            let mut target_ref = json!({
+                "kind": "Pod",
+                "namespace": namespace,
+                "name": pod_name
+            });
+            if let Some(pod_uid) = pod_resource
+                .data
+                .get("metadata")
+                .and_then(|m| m.get("uid"))
+                .and_then(|u| u.as_str())
+            {
+                target_ref["uid"] = json!(pod_uid);
+            }
+
+            let mut ep_entry = json!({
+                "addresses": [pod_ip],
+                "conditions": {
+                    "ready": is_ready,
+                    "serving": is_ready,
+                    "terminating": false
+                },
+                "targetRef": target_ref
+            });
+
+            let pod_hostname = pod_resource
+                .data
+                .pointer("/spec/hostname")
+                .and_then(|v| v.as_str());
+            let pod_subdomain = pod_resource
+                .data
+                .pointer("/spec/subdomain")
+                .and_then(|v| v.as_str());
+            if let (Some(hostname), Some(subdomain)) = (pod_hostname, pod_subdomain)
+                && subdomain == service_name
+            {
+                ep_entry["hostname"] = json!(hostname);
+            }
+
+            let ports = build_endpointslice_ports_for_pod(service_ports, &pod_resource.data);
+            let group_key = ports_signature(&ports);
+            let group_idx = if let Some(idx) = slice_group_indexes.get(&group_key) {
+                *idx
+            } else {
+                let idx = slice_groups.len();
+                slice_groups.push(EndpointSliceGroup {
+                    ports,
+                    endpoints: Vec::new(),
+                });
+                slice_group_indexes.insert(group_key, idx);
+                idx
+            };
+
+            slice_groups[group_idx].endpoints.push(ep_entry);
+        }
+    }
+
+    if slice_groups.is_empty() {
+        slice_groups.push(EndpointSliceGroup {
+            ports: Vec::new(),
+            endpoints: Vec::new(),
+        });
+    }
+
+    slice_groups
+        .into_iter()
+        .enumerate()
+        .map(|(idx, group)| {
+            let endpointslice_name = if idx == 0 {
+                format!("{}-{}", service_name, "klights")
+            } else {
+                format!("{}-{}-{}", service_name, "klights", idx)
+            };
+            let endpointslice = json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {
+                    "name": endpointslice_name.clone(),
+                    "namespace": namespace,
+                    "labels": {
+                        "kubernetes.io/service-name": service_name,
+                        "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
+                    },
+                    "ownerReferences": [{
+                        "apiVersion": "v1",
+                        "kind": "Service",
+                        "name": service_name,
+                        "uid": service_uid,
+                        "controller": false,
+                        "blockOwnerDeletion": true
+                    }]
+                },
+                "addressType": "IPv4",
+                "endpoints": group.endpoints,
+                "ports": group.ports
+            });
+            (endpointslice_name, endpointslice)
+        })
+        .collect()
+}
+
 async fn update_endpoints_with_retry(
     db: &dyn DatastoreBackend,
     namespace: &str,
@@ -423,9 +699,6 @@ pub async fn reconcile_endpoints(
     service_ports: Option<&Value>,
     publish_not_ready: bool,
 ) -> Result<()> {
-    // K8s behavior: Services WITHOUT selector do not get controller-managed Endpoints.
-    // This includes explicit empty selectors (`{}` / `matchLabels: {}`).
-    // The user creates Endpoints manually for headless/external services.
     let Some(parsed_selector) = endpoints_selector(selector) else {
         return Ok(());
     };
@@ -439,144 +712,23 @@ pub async fn reconcile_endpoints(
         return Ok(());
     }
 
-    // Check if endpoints already exist
     let existing = db
         .get_resource("v1", "Endpoints", Some(namespace), service_name)
         .await?;
-
-    struct EndpointSubsetGroup {
-        ports: Vec<Value>,
-        addresses: Vec<Value>,
-        not_ready_addresses: Vec<Value>,
-    }
-
-    let mut subset_groups: Vec<EndpointSubsetGroup> = Vec::new();
-    let mut subset_group_indexes: BTreeMap<String, usize> = BTreeMap::new();
-
-    // Find matching pods for selector labels.
     let pod_list = pod_reader
         .list_pods(Some(namespace), None, None, None, None)
         .await?;
-
-    for pod_resource in &pod_list.items {
-        if pod_is_terminating(&pod_resource.data) {
-            continue;
-        }
-        if !parsed_selector.matches_resource(&pod_resource.data) {
-            continue;
-        }
-
-        // Extract pod IP from status.podIP (set by kubelet)
-        if let Some(pod_ip) = pod_resource
-            .data
-            .get("status")
-            .and_then(|s| s.get("podIP"))
-            .and_then(|ip| ip.as_str())
-            && pod_ip != "0.0.0.0"
-            && !pod_ip.is_empty()
-            && let Some(pod_name) = pod_resource
-                .data
-                .get("metadata")
-                .and_then(|m| m.get("name"))
-                .and_then(|n| n.as_str())
-        {
-            let mut target_ref = json!({
-                "kind": "Pod",
-                "namespace": namespace,
-                "name": pod_name
-            });
-            if let Some(pod_uid) = pod_resource
-                .data
-                .get("metadata")
-                .and_then(|m| m.get("uid"))
-                .and_then(|u| u.as_str())
-            {
-                target_ref["uid"] = json!(pod_uid);
-            }
-
-            let mut addr = json!({
-                "ip": pod_ip,
-                "targetRef": target_ref
-            });
-
-            // Include hostname for pods with subdomain matching the service name
-            // (enables CoreDNS <hostname>.<service> resolution for StatefulSet pods)
-            let pod_hostname = pod_resource
-                .data
-                .pointer("/spec/hostname")
-                .and_then(|v| v.as_str());
-            let pod_subdomain = pod_resource
-                .data
-                .pointer("/spec/subdomain")
-                .and_then(|v| v.as_str());
-            if let (Some(hostname), Some(subdomain)) = (pod_hostname, pod_subdomain)
-                && subdomain == service_name
-            {
-                addr.as_object_mut()
-                    .unwrap()
-                    .insert("hostname".to_string(), json!(hostname));
-            }
-
-            let ports = build_endpoints_ports_for_pod(service_ports, &pod_resource.data);
-            let group_key = ports_signature(&ports);
-            let group_idx = if let Some(idx) = subset_group_indexes.get(&group_key) {
-                *idx
-            } else {
-                let idx = subset_groups.len();
-                subset_groups.push(EndpointSubsetGroup {
-                    ports,
-                    addresses: Vec::new(),
-                    not_ready_addresses: Vec::new(),
-                });
-                subset_group_indexes.insert(group_key, idx);
-                idx
-            };
-
-            if publish_not_ready || is_pod_ready(&pod_resource.data) {
-                subset_groups[group_idx].addresses.push(addr);
-            } else {
-                subset_groups[group_idx].not_ready_addresses.push(addr);
-            }
-        }
-    }
-
-    let mut subsets = Vec::with_capacity(subset_groups.len());
-    for group in subset_groups {
-        if group.addresses.is_empty() && group.not_ready_addresses.is_empty() {
-            continue;
-        }
-        let mut subset = json!({
-            "addresses": group.addresses,
-            "ports": group.ports
-        });
-
-        if !group.not_ready_addresses.is_empty() {
-            subset.as_object_mut().unwrap().insert(
-                "notReadyAddresses".to_string(),
-                json!(group.not_ready_addresses),
-            );
-        }
-
-        subsets.push(subset);
-    }
-
-    let endpoints = json!({
-        "apiVersion": "v1",
-        "kind": "Endpoints",
-        "metadata": {
-            "name": service_name,
-            "namespace": namespace
-        },
-        "subsets": subsets
-    });
+    let endpoints = build_desired_endpoints(
+        service_name,
+        namespace,
+        service_ports,
+        publish_not_ready,
+        &pod_list.items,
+        &parsed_selector,
+    );
 
     if let Some(existing_resource) = existing {
-        // Check if subsets actually changed before updating
-        let existing_subsets = existing_resource.data.get("subsets");
-        let new_subsets = endpoints.get("subsets");
-
-        // Skip update if subsets are identical
-        if existing_subsets == new_subsets {
+        if endpoints_desired_state_matches(&existing_resource.data, &endpoints) {
             tracing::debug!(
                 "Skipping endpoint reconciliation for {}/{} - no changes",
                 namespace,
@@ -585,11 +737,9 @@ pub async fn reconcile_endpoints(
             return Ok(());
         }
 
-        // Update existing endpoints.
         update_endpoints_with_retry(db, namespace, service_name, endpoints, existing_resource)
             .await?;
     } else {
-        // Create new endpoints — handle concurrent create race.
         match db
             .create_resource(
                 "v1",
@@ -629,8 +779,6 @@ pub async fn reconcile_endpointslice(
     selector: Option<&Value>,
     service_ports: Option<&Value>,
 ) -> Result<()> {
-    // K8s behavior: Services WITHOUT selector do not get controller-managed EndpointSlices.
-    // This includes explicit empty selectors (`{}` / `matchLabels: {}`).
     let Some(parsed_selector) = endpoints_selector(selector) else {
         return Ok(());
     };
@@ -644,105 +792,9 @@ pub async fn reconcile_endpointslice(
         return Ok(());
     }
 
-    struct EndpointSliceGroup {
-        ports: Vec<Value>,
-        endpoints: Vec<Value>,
-    }
-
-    let mut slice_groups: Vec<EndpointSliceGroup> = Vec::new();
-    let mut slice_group_indexes: BTreeMap<String, usize> = BTreeMap::new();
-
-    // Find matching pods for selector labels.
     let pod_list = pod_reader
         .list_pods(Some(namespace), None, None, None, None)
         .await?;
-
-    for pod_resource in pod_list.items {
-        if pod_is_terminating(&pod_resource.data) {
-            continue;
-        }
-        if !parsed_selector.matches_resource(&pod_resource.data) {
-            continue;
-        }
-
-        // Extract pod IP and status
-        if let Some(pod_ip) = pod_resource
-            .data
-            .get("status")
-            .and_then(|s| s.get("podIP"))
-            .and_then(|ip| ip.as_str())
-            && pod_ip != "0.0.0.0"
-            && !pod_ip.is_empty()
-            && let Some(pod_name) = pod_resource
-                .data
-                .get("metadata")
-                .and_then(|m| m.get("name"))
-                .and_then(|n| n.as_str())
-        {
-            let is_ready = is_pod_ready(&pod_resource.data);
-            let mut target_ref = json!({
-                "kind": "Pod",
-                "namespace": namespace,
-                "name": pod_name
-            });
-            if let Some(pod_uid) = pod_resource
-                .data
-                .get("metadata")
-                .and_then(|m| m.get("uid"))
-                .and_then(|u| u.as_str())
-            {
-                target_ref["uid"] = json!(pod_uid);
-            }
-
-            let mut ep_entry = json!({
-                "addresses": [pod_ip],
-                "conditions": {
-                    "ready": is_ready,
-                    "serving": is_ready,
-                    "terminating": false
-                },
-                "targetRef": target_ref
-            });
-
-            // Add hostname for StatefulSet pod DNS
-            let pod_hostname = pod_resource
-                .data
-                .pointer("/spec/hostname")
-                .and_then(|v| v.as_str());
-            let pod_subdomain = pod_resource
-                .data
-                .pointer("/spec/subdomain")
-                .and_then(|v| v.as_str());
-            if let (Some(hostname), Some(subdomain)) = (pod_hostname, pod_subdomain)
-                && subdomain == service_name
-            {
-                ep_entry["hostname"] = json!(hostname);
-            }
-
-            let ports = build_endpointslice_ports_for_pod(service_ports, &pod_resource.data);
-            let group_key = ports_signature(&ports);
-            let group_idx = if let Some(idx) = slice_group_indexes.get(&group_key) {
-                *idx
-            } else {
-                let idx = slice_groups.len();
-                slice_groups.push(EndpointSliceGroup {
-                    ports,
-                    endpoints: Vec::new(),
-                });
-                slice_group_indexes.insert(group_key, idx);
-                idx
-            };
-
-            slice_groups[group_idx].endpoints.push(ep_entry);
-        }
-    }
-
-    if slice_groups.is_empty() {
-        slice_groups.push(EndpointSliceGroup {
-            ports: Vec::new(),
-            endpoints: Vec::new(),
-        });
-    }
 
     let existing_slices = db
         .list_resources(
@@ -759,37 +811,15 @@ pub async fn reconcile_endpointslice(
         .await?;
 
     let mut desired_names = BTreeSet::new();
-    for (idx, group) in slice_groups.into_iter().enumerate() {
-        let endpointslice_name = if idx == 0 {
-            format!("{}-{}", service_name, "klights")
-        } else {
-            format!("{}-{}-{}", service_name, "klights", idx)
-        };
+    for (endpointslice_name, endpointslice) in build_desired_endpointslices(
+        service_name,
+        service_uid,
+        namespace,
+        service_ports,
+        &pod_list.items,
+        &parsed_selector,
+    ) {
         desired_names.insert(endpointslice_name.clone());
-
-        let endpointslice = json!({
-            "apiVersion": "discovery.k8s.io/v1",
-            "kind": "EndpointSlice",
-            "metadata": {
-                "name": endpointslice_name.clone(),
-                "namespace": namespace,
-                "labels": {
-                    "kubernetes.io/service-name": service_name,
-                    "endpointslice.kubernetes.io/managed-by": "endpointslice-controller.k8s.io"
-                },
-                "ownerReferences": [{
-                    "apiVersion": "v1",
-                    "kind": "Service",
-                    "name": service_name,
-                    "uid": service_uid,
-                    "controller": false,
-                    "blockOwnerDeletion": true
-                }]
-            },
-            "addressType": "IPv4",
-            "endpoints": group.endpoints,
-            "ports": group.ports
-        });
 
         let existing = existing_slices
             .items
@@ -797,12 +827,7 @@ pub async fn reconcile_endpointslice(
             .find(|resource| resource.name == endpointslice_name);
 
         if let Some(existing_resource) = existing {
-            let existing_endpoints = existing_resource.data.get("endpoints");
-            let new_endpoints = endpointslice.get("endpoints");
-            let existing_ports = existing_resource.data.get("ports");
-            let new_ports = endpointslice.get("ports");
-
-            if existing_endpoints == new_endpoints && existing_ports == new_ports {
+            if endpointslice_desired_state_matches(&existing_resource.data, &endpointslice) {
                 tracing::debug!(
                     "Skipping endpointslice reconciliation for {}/{} - no changes",
                     namespace,
@@ -846,6 +871,141 @@ pub async fn reconcile_endpointslice(
     }
 
     Ok(())
+}
+
+pub async fn reconcile_service_endpoints_batch(
+    db: &dyn DatastoreBackend,
+    pod_reader: &dyn PodReader,
+    request: ServiceEndpointBatchReconcileRequest<'_>,
+) -> Result<()> {
+    let ServiceEndpointBatchReconcileRequest {
+        service_name,
+        service_uid,
+        namespace,
+        selector,
+        service_ports,
+        publish_not_ready,
+    } = request;
+    let Some(parsed_selector) = endpoints_selector(selector) else {
+        return Ok(());
+    };
+
+    if namespace_is_terminating(db, namespace).await? {
+        tracing::debug!(
+            namespace = %namespace,
+            service = %service_name,
+            "skipping batched endpoint reconcile in terminating namespace"
+        );
+        return Ok(());
+    }
+
+    let pod_list = pod_reader
+        .list_pods(Some(namespace), None, None, None, None)
+        .await?;
+    let desired_endpoints = build_desired_endpoints(
+        service_name,
+        namespace,
+        service_ports,
+        publish_not_ready,
+        &pod_list.items,
+        &parsed_selector,
+    );
+    let desired_slices = build_desired_endpointslices(
+        service_name,
+        service_uid,
+        namespace,
+        service_ports,
+        &pod_list.items,
+        &parsed_selector,
+    );
+
+    let existing_endpoints = db
+        .get_resource("v1", "Endpoints", Some(namespace), service_name)
+        .await?;
+    let existing_slices = db
+        .list_resources(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some(namespace),
+            crate::datastore::ResourceListQuery::new(
+                Some(&format!("kubernetes.io/service-name={service_name}")),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await?;
+
+    let mut operations = Vec::new();
+    match existing_endpoints {
+        Some(existing) if endpoints_desired_state_matches(&existing.data, &desired_endpoints) => {}
+        Some(existing) => operations.push(ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "Endpoints".to_string(),
+            namespace: Some(namespace.to_string()),
+            name: service_name.to_string(),
+            data: desired_endpoints,
+            mode: ResourceBatchPutMode::Update,
+            preconditions: ResourcePreconditions::from_resource(&existing),
+        }),
+        None => operations.push(ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "Endpoints".to_string(),
+            namespace: Some(namespace.to_string()),
+            name: service_name.to_string(),
+            data: desired_endpoints,
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        }),
+    }
+
+    let mut desired_names = BTreeSet::new();
+    for (slice_name, desired_slice) in desired_slices {
+        desired_names.insert(slice_name.clone());
+        match existing_slices
+            .items
+            .iter()
+            .find(|resource| resource.name == slice_name)
+        {
+            Some(existing)
+                if endpointslice_desired_state_matches(&existing.data, &desired_slice) => {}
+            Some(existing) => operations.push(ResourceBatchOperation::Put {
+                api_version: "discovery.k8s.io/v1".to_string(),
+                kind: "EndpointSlice".to_string(),
+                namespace: Some(namespace.to_string()),
+                name: slice_name,
+                data: desired_slice,
+                mode: ResourceBatchPutMode::Update,
+                preconditions: ResourcePreconditions::from_resource(existing),
+            }),
+            None => operations.push(ResourceBatchOperation::Put {
+                api_version: "discovery.k8s.io/v1".to_string(),
+                kind: "EndpointSlice".to_string(),
+                namespace: Some(namespace.to_string()),
+                name: slice_name,
+                data: desired_slice,
+                mode: ResourceBatchPutMode::Create,
+                preconditions: ResourcePreconditions::default(),
+            }),
+        }
+    }
+
+    for existing in existing_slices.items {
+        if !desired_names.contains(&existing.name) {
+            operations.push(ResourceBatchOperation::Delete {
+                api_version: "discovery.k8s.io/v1".to_string(),
+                kind: "EndpointSlice".to_string(),
+                namespace: Some(namespace.to_string()),
+                name: existing.name,
+                preconditions: ResourcePreconditions::uid(existing.uid),
+            });
+        }
+    }
+
+    if operations.is_empty() {
+        return Ok(());
+    }
+    db.apply_resource_batch(operations).await
 }
 
 /// Mirror manually-created Endpoints to EndpointSlice.
