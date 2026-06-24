@@ -1,6 +1,6 @@
 pub use super::sqlite::{
     DeadLetterRow, OutboxInsert, OutboxRow, OutboxStats, PodRuntimeRow, PodStatusCheckpoint,
-    ProbeStateRow, ReplicationCheckpoint,
+    ProbeStateRow, ReplicationCheckpoint, RuntimeObservationCheckpoint,
 };
 
 #[cfg(test)]

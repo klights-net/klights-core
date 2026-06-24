@@ -45,6 +45,21 @@ pub struct PodStatusCheckpoint {
     pub updated_ms: i64,
 }
 
+/// Node-local snapshot of runtime reconcile observations.
+///
+/// Mirrors `RuntimeReconcileObservations` (kubelet/pod_runtime/observations.rs)
+/// but persisted to node.db so CRI events observed for a Pod UID survive an
+/// actor or worker restart when CRI/containerd may have already dropped the
+/// short-lived container details. UID-bound and node-local only; never
+/// replicated through cluster.db or raft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeObservationCheckpoint {
+    pub pod_uid: String,
+    pub container_ids: Vec<String>,
+    pub generation: u64,
+    pub updated_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxInsert {
     pub idempotency_key: String,
@@ -386,6 +401,68 @@ impl SqliteNodeLocalDb {
         })
         .await
         .map_err(|e| anyhow!("pod_status_checkpoint delete failed: {e}"))
+    }
+
+    pub async fn upsert_runtime_observation_checkpoint(
+        &self,
+        checkpoint: RuntimeObservationCheckpoint,
+    ) -> Result<()> {
+        let RuntimeObservationCheckpoint {
+            pod_uid,
+            container_ids,
+            generation,
+            updated_ms,
+        } = checkpoint;
+        let container_ids_json = serde_json::to_string(&container_ids)?;
+        self.db_call(
+            "node_local:runtime_observation_checkpoint_upsert",
+            move |conn| {
+                conn.execute(
+                    queries::RUNTIME_OBSERVATION_CHECKPOINT_UPSERT,
+                    rusqlite::params![pod_uid, container_ids_json, generation, updated_ms],
+                )?;
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("runtime_observation_checkpoint upsert failed: {e}"))
+    }
+
+    pub async fn get_runtime_observation_checkpoint(
+        &self,
+        pod_uid: &str,
+    ) -> Result<Option<RuntimeObservationCheckpoint>> {
+        let pod_uid = pod_uid.to_string();
+        self.db_call(
+            "node_local:runtime_observation_checkpoint_get",
+            move |conn| {
+                conn.query_row(
+                    queries::RUNTIME_OBSERVATION_CHECKPOINT_GET_UID,
+                    [pod_uid],
+                    row_to_runtime_observation_checkpoint,
+                )
+                .optional()
+                .map_err(tokio_rusqlite::Error::from)
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("runtime_observation_checkpoint get failed: {e}"))
+    }
+
+    pub async fn delete_runtime_observation_checkpoint(&self, pod_uid: &str) -> Result<()> {
+        let pod_uid = pod_uid.to_string();
+        self.db_call(
+            "node_local:runtime_observation_checkpoint_delete",
+            move |conn| {
+                conn.execute(
+                    queries::RUNTIME_OBSERVATION_CHECKPOINT_DELETE_UID,
+                    [pod_uid],
+                )?;
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("runtime_observation_checkpoint delete failed: {e}"))
     }
 
     pub async fn enqueue_outbox(&self, row: OutboxInsert) -> Result<()> {
@@ -1643,5 +1720,20 @@ fn row_to_pod_status_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<Pod
         applied_rv: row.get(4)?,
         status,
         updated_ms: row.get(6)?,
+    })
+}
+
+fn row_to_runtime_observation_checkpoint(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RuntimeObservationCheckpoint> {
+    let container_ids_json: String = row.get(1)?;
+    let container_ids: Vec<String> = serde_json::from_str(&container_ids_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(RuntimeObservationCheckpoint {
+        pod_uid: row.get(0)?,
+        container_ids,
+        generation: row.get::<_, i64>(2)? as u64,
+        updated_ms: row.get(3)?,
     })
 }

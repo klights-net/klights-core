@@ -39,6 +39,18 @@ pub(super) const POD_STATUS_CHECKPOINT_MARK_APPLIED: &str = "UPDATE pod_status_c
 pub(super) const POD_STATUS_CHECKPOINT_DELETE_UID: &str =
     "DELETE FROM pod_status_checkpoints WHERE pod_uid = ?1";
 
+pub(super) const RUNTIME_OBSERVATION_CHECKPOINT_UPSERT: &str = "INSERT INTO pod_runtime_observation_checkpoints \
+     (pod_uid, container_ids, generation, updated_ms) \
+     VALUES (?1, ?2, ?3, ?4) \
+     ON CONFLICT(pod_uid) DO UPDATE SET \
+       container_ids = excluded.container_ids, \
+       generation = excluded.generation, \
+       updated_ms = excluded.updated_ms";
+pub(super) const RUNTIME_OBSERVATION_CHECKPOINT_GET_UID: &str = "SELECT pod_uid, container_ids, generation, updated_ms \
+     FROM pod_runtime_observation_checkpoints WHERE pod_uid = ?1";
+pub(super) const RUNTIME_OBSERVATION_CHECKPOINT_DELETE_UID: &str =
+    "DELETE FROM pod_runtime_observation_checkpoints WHERE pod_uid = ?1";
+
 pub(super) const OUTBOX_INSERT: &str = "INSERT INTO outbox \
      (idempotency_key, enqueued_ms, subject_key, subject_api_version, subject_kind, \
       subject_namespace, subject_name, subject_uid, pod_uid, operation, payload_proto, next_due_ms) \

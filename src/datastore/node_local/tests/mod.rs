@@ -250,3 +250,196 @@ fn node_local_backend_is_not_exposed_by_datastore_backend() {
 fn node_local_backend_has_no_cluster_resource_crud() {
     // R4: invariant now enforced by check_supervisor_spawn.sh
 }
+
+// ── Task 9: RuntimeObservationCheckpoint tests ────────────────────
+
+#[tokio::test]
+async fn runtime_observation_checkpoint_survives_actor_restart() {
+    use crate::datastore::node_local::sqlite::RuntimeObservationCheckpoint;
+    let db = open_node_local_in_memory().await;
+
+    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+        pod_uid: "uid-restart".to_string(),
+        container_ids: vec![
+            "containerd://ctr-abc".to_string(),
+            "containerd://ctr-def".to_string(),
+        ],
+        generation: 2,
+        updated_ms: 1000,
+    })
+    .await
+    .expect("upsert checkpoint");
+
+    // Simulate actor restart: a new actor reads back the persisted checkpoint.
+    let loaded = db
+        .get_runtime_observation_checkpoint("uid-restart")
+        .await
+        .expect("get checkpoint")
+        .expect("checkpoint must exist after actor restart");
+
+    assert_eq!(loaded.pod_uid, "uid-restart");
+    assert_eq!(loaded.generation, 2);
+    assert!(
+        loaded
+            .container_ids
+            .contains(&"containerd://ctr-abc".to_string())
+    );
+    assert!(
+        loaded
+            .container_ids
+            .contains(&"containerd://ctr-def".to_string())
+    );
+    assert_eq!(loaded.updated_ms, 1000);
+}
+
+#[tokio::test]
+async fn runtime_observation_checkpoint_survives_worker_restart() {
+    use crate::datastore::node_local::sqlite::RuntimeObservationCheckpoint;
+    let db = open_node_local_in_memory().await;
+
+    // Write checkpoints for two pods
+    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+        pod_uid: "uid-pod-a".to_string(),
+        container_ids: vec!["containerd://ctr-a1".to_string()],
+        generation: 1,
+        updated_ms: 500,
+    })
+    .await
+    .expect("upsert pod-a checkpoint");
+
+    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+        pod_uid: "uid-pod-b".to_string(),
+        container_ids: vec!["containerd://ctr-b1".to_string()],
+        generation: 3,
+        updated_ms: 750,
+    })
+    .await
+    .expect("upsert pod-b checkpoint");
+
+    // Simulate worker restart: both checkpoints survive and can be loaded.
+    let a = db
+        .get_runtime_observation_checkpoint("uid-pod-a")
+        .await
+        .expect("get a")
+        .expect("a exists");
+    assert_eq!(a.generation, 1);
+    let b = db
+        .get_runtime_observation_checkpoint("uid-pod-b")
+        .await
+        .expect("get b")
+        .expect("b exists");
+    assert_eq!(b.generation, 3);
+
+    // Reconcile pod-a; checkpoint deleted. pod-b checkpoint survives.
+    db.delete_runtime_observation_checkpoint("uid-pod-a")
+        .await
+        .expect("delete a");
+    assert!(
+        db.get_runtime_observation_checkpoint("uid-pod-a")
+            .await
+            .expect("get a after delete")
+            .is_none()
+    );
+    assert!(
+        db.get_runtime_observation_checkpoint("uid-pod-b")
+            .await
+            .expect("get b after a delete")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn runtime_observation_checkpoint_is_uid_bound() {
+    use crate::datastore::node_local::sqlite::RuntimeObservationCheckpoint;
+    let db = open_node_local_in_memory().await;
+
+    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+        pod_uid: "uid-alpha".to_string(),
+        container_ids: vec!["containerd://alpha-1".to_string()],
+        generation: 5,
+        updated_ms: 100,
+    })
+    .await
+    .expect("upsert alpha");
+
+    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+        pod_uid: "uid-beta".to_string(),
+        container_ids: vec![
+            "containerd://beta-1".to_string(),
+            "containerd://beta-2".to_string(),
+        ],
+        generation: 7,
+        updated_ms: 200,
+    })
+    .await
+    .expect("upsert beta");
+
+    // Each UID returns only its own checkpoint.
+    let alpha = db
+        .get_runtime_observation_checkpoint("uid-alpha")
+        .await
+        .expect("get alpha")
+        .expect("alpha exists");
+    assert_eq!(alpha.container_ids, vec!["containerd://alpha-1"]);
+    assert_eq!(alpha.generation, 5);
+
+    let beta = db
+        .get_runtime_observation_checkpoint("uid-beta")
+        .await
+        .expect("get beta")
+        .expect("beta exists");
+    assert_eq!(beta.container_ids.len(), 2);
+    assert_eq!(beta.generation, 7);
+
+    // Deleting alpha must not affect beta.
+    db.delete_runtime_observation_checkpoint("uid-alpha")
+        .await
+        .expect("delete alpha");
+    assert!(
+        db.get_runtime_observation_checkpoint("uid-alpha")
+            .await
+            .expect("get alpha gone")
+            .is_none()
+    );
+    assert!(
+        db.get_runtime_observation_checkpoint("uid-beta")
+            .await
+            .expect("get beta still")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn runtime_observation_checkpoint_is_removed_after_successful_reconcile() {
+    use crate::datastore::node_local::sqlite::RuntimeObservationCheckpoint;
+    let db = open_node_local_in_memory().await;
+
+    db.upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+        pod_uid: "uid-reconcile".to_string(),
+        container_ids: vec!["containerd://ctr-99".to_string()],
+        generation: 1,
+        updated_ms: 300,
+    })
+    .await
+    .expect("upsert before reconcile");
+
+    assert!(
+        db.get_runtime_observation_checkpoint("uid-reconcile")
+            .await
+            .expect("pre-reconcile get")
+            .is_some()
+    );
+
+    // Successful reconcile: actor removes its checkpoint.
+    db.delete_runtime_observation_checkpoint("uid-reconcile")
+        .await
+        .expect("delete after reconcile");
+
+    assert!(
+        db.get_runtime_observation_checkpoint("uid-reconcile")
+            .await
+            .expect("post-reconcile get")
+            .is_none(),
+        "checkpoint must be gone after successful reconcile"
+    );
+}

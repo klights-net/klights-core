@@ -71,6 +71,13 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
         CREATE INDEX IF NOT EXISTS idx_pod_status_checkpoints_name
             ON pod_status_checkpoints(namespace, pod_name);
 
+        CREATE TABLE IF NOT EXISTS pod_runtime_observation_checkpoints (
+            pod_uid          TEXT NOT NULL PRIMARY KEY,
+            container_ids    TEXT NOT NULL,
+            generation       INTEGER NOT NULL,
+            updated_ms       INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS pod_slot_admissions (
             namespace        TEXT NOT NULL,
             pod_name         TEXT NOT NULL,

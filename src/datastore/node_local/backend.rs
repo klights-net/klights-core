@@ -102,6 +102,16 @@ pub trait NodeLocalBackend: Send + Sync {
     ) -> Result<()>;
     async fn delete_pod_status_checkpoint(&self, pod_uid: &str) -> Result<()>;
 
+    async fn upsert_runtime_observation_checkpoint(
+        &self,
+        checkpoint: super::sqlite::RuntimeObservationCheckpoint,
+    ) -> Result<()>;
+    async fn get_runtime_observation_checkpoint(
+        &self,
+        pod_uid: &str,
+    ) -> Result<Option<super::sqlite::RuntimeObservationCheckpoint>>;
+    async fn delete_runtime_observation_checkpoint(&self, pod_uid: &str) -> Result<()>;
+
     async fn reserve_ip_and_insert_network(
         &self,
         request: PodNetworkAllocationRequest<'_>,
@@ -350,6 +360,24 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
 
     async fn delete_pod_status_checkpoint(&self, pod_uid: &str) -> Result<()> {
         SqliteNodeLocalDb::delete_pod_status_checkpoint(self, pod_uid).await
+    }
+
+    async fn upsert_runtime_observation_checkpoint(
+        &self,
+        checkpoint: super::sqlite::RuntimeObservationCheckpoint,
+    ) -> Result<()> {
+        SqliteNodeLocalDb::upsert_runtime_observation_checkpoint(self, checkpoint).await
+    }
+
+    async fn get_runtime_observation_checkpoint(
+        &self,
+        pod_uid: &str,
+    ) -> Result<Option<super::sqlite::RuntimeObservationCheckpoint>> {
+        SqliteNodeLocalDb::get_runtime_observation_checkpoint(self, pod_uid).await
+    }
+
+    async fn delete_runtime_observation_checkpoint(&self, pod_uid: &str) -> Result<()> {
+        SqliteNodeLocalDb::delete_runtime_observation_checkpoint(self, pod_uid).await
     }
 
     async fn reserve_ip_and_insert_network(
