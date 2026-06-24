@@ -726,6 +726,7 @@ pub fn test_node_protobuf_decode_preserves_spec_and_status() {
         }),
         spec: Some(NodeSpec {
             pod_cidr: Some("10.244.0.0/24".to_string()),
+            unschedulable: Some(true),
             taints: vec![Taint {
                 key: Some("node-role.kubernetes.io/control-plane".to_string()),
                 value: Some("".to_string()),
@@ -760,6 +761,10 @@ pub fn test_node_protobuf_decode_preserves_spec_and_status() {
     let result = pb_node_to_json(&node).unwrap();
 
     assert_eq!(result["spec"]["podCIDR"], "10.244.0.0/24");
+    assert_eq!(
+        result["spec"]["unschedulable"], true,
+        "protobuf Node decode must preserve spec.unschedulable so fake ready nodes stay unschedulable"
+    );
     assert_eq!(
         result["spec"]["taints"][0]["key"],
         "node-role.kubernetes.io/control-plane"

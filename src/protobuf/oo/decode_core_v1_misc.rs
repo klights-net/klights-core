@@ -401,6 +401,9 @@ pb_decode!(
             if !spec.pod_cid_rs.is_empty() {
                 spec_obj["podCIDRs"] = json!(spec.pod_cid_rs);
             }
+            if spec.unschedulable == Some(true) {
+                spec_obj["unschedulable"] = json!(true);
+            }
             if !spec.taints.is_empty() {
                 let taints: Vec<Value> = spec
                     .taints
