@@ -123,6 +123,12 @@ pub struct KlightsTable {
     /// rewriting nft chains when repeated Service/Endpoints watch events
     /// produce identical routing semantics.
     service_snapshot: std::sync::Mutex<Option<ServiceRuleSnapshot>>,
+    /// Cached watch-fed Service route inventory. Populated on the first
+    /// `sync_services_from_api` so subsequent watch events can apply diffs
+    /// from cached state without re-listing the entire cluster API.
+    /// `None` means the cache must be re-bootstrapped from the API
+    /// (initial sync or after watch compaction / inventory corruption).
+    service_route_inventory: std::sync::Mutex<Option<super::inventory::ServiceRouteInventory>>,
 }
 
 #[derive(Clone, Copy)]
@@ -208,6 +214,88 @@ fn rule_has_comment(rule: &serde_json::Value, comment: &str) -> bool {
         .into_iter()
         .flatten()
         .any(|expr| expr.get("comment").and_then(serde_json::Value::as_str) == Some(comment))
+}
+
+/// Bulk-load the cluster Service / Endpoints / EndpointSlice state into a
+/// fresh [`ServiceRouteInventory`]. Used by `sync_services_from_api` as the
+/// initial-snapshot path and for recovery after watch compaction.
+pub async fn bootstrap_inventory_from_api(
+    api: &dyn LeaderApiClient,
+) -> Result<super::inventory::ServiceRouteInventory> {
+    use crate::control_plane::client::ListRequest;
+
+    let services_list = api
+        .list_resources_fresh(ListRequest {
+            api_version: "v1".to_string(),
+            kind: "Service".to_string(),
+            namespace: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+        })
+        .await
+        .context("list Services through LeaderApiClient")?;
+
+    let endpoints_list = api
+        .list_resources_fresh(ListRequest {
+            api_version: "v1".to_string(),
+            kind: "Endpoints".to_string(),
+            namespace: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+        })
+        .await
+        .context("list Endpoints through LeaderApiClient")?;
+
+    let endpoint_slices_list = api
+        .list_resources_fresh(ListRequest {
+            api_version: "discovery.k8s.io/v1".to_string(),
+            kind: "EndpointSlice".to_string(),
+            namespace: None,
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+        })
+        .await
+        .context("list EndpointSlices through LeaderApiClient")?;
+
+    let services = services_list.items.iter().filter_map(|r| {
+        let ns = r.namespace.clone()?;
+        Some((
+            ns,
+            r.name.clone(),
+            r.resource_version,
+            r.data.as_ref().clone(),
+        ))
+    });
+    let endpoints = endpoints_list.items.iter().filter_map(|r| {
+        let ns = r.namespace.clone()?;
+        Some((
+            ns,
+            r.name.clone(),
+            r.resource_version,
+            r.data.as_ref().clone(),
+        ))
+    });
+    let endpoint_slices = endpoint_slices_list.items.iter().filter_map(|r| {
+        let ns = r.namespace.clone()?;
+        let (_, service_name) = endpoint_slice_service_key(r)?;
+        Some((
+            ns,
+            service_name.to_string(),
+            r.name.clone(),
+            r.resource_version,
+            r.data.as_ref().clone(),
+        ))
+    });
+
+    let mut inv = super::inventory::ServiceRouteInventory::new();
+    inv.replace_from_snapshot(services, endpoints, endpoint_slices);
+    Ok(inv)
 }
 
 pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<ServiceSpec>> {
@@ -423,6 +511,7 @@ impl KlightsTable {
             hostport_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             remote_pod_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             service_snapshot: std::sync::Mutex::new(None),
+            service_route_inventory: std::sync::Mutex::new(None),
         })
     }
 
@@ -718,10 +807,86 @@ impl KlightsTable {
     }
 
     pub async fn sync_services_from_api(&self, api: &dyn LeaderApiClient) -> Result<usize> {
-        let specs = service_specs_from_api(api).await?;
+        let inventory = bootstrap_inventory_from_api(api).await?;
+        let specs = inventory.to_specs();
         let svc_count = specs.len();
         self.replace_services(&specs).await?;
+        *lock_recover(&self.service_route_inventory) = Some(inventory);
         Ok(svc_count)
+    }
+
+    /// Re-emit the services chain from the cached
+    /// [`ServiceRouteInventory`] without touching the cluster API. The
+    /// coalescer calls this for every watch event after the initial
+    /// snapshot is established. Returns `Err` if no inventory has been
+    /// bootstrapped — the caller must fall back to
+    /// `sync_services_from_api` for re-bootstrap.
+    pub async fn sync_services_from_cached_inventory(&self) -> Result<usize> {
+        let Some(specs_with_count) = ({
+            let guard = lock_recover(&self.service_route_inventory);
+            guard.as_ref().map(|inv| {
+                let specs = inv.to_specs();
+                let len = specs.len();
+                (specs, len)
+            })
+        }) else {
+            anyhow::bail!("sync_services_from_cached_inventory: inventory not bootstrapped yet");
+        };
+        let (specs, svc_count) = specs_with_count;
+        self.replace_services(&specs).await?;
+        Ok(svc_count)
+    }
+
+    /// Apply a single Service watch event to the cached inventory. Returns
+    /// whether the inventory changed (so the coalescer can skip the nft
+    /// rewrite entirely when nothing changed).
+    pub fn apply_service_event_to_inventory(
+        &self,
+        namespace: &str,
+        name: &str,
+        resource_version: i64,
+        deleted: bool,
+        data: Option<serde_json::Value>,
+    ) -> Option<super::inventory::InventoryApply> {
+        let mut guard = lock_recover(&self.service_route_inventory);
+        let inv = guard.as_mut()?;
+        Some(inv.apply_service_event(namespace, name, resource_version, deleted, data))
+    }
+
+    /// Apply a single Endpoints watch event to the cached inventory.
+    pub fn apply_endpoints_event_to_inventory(
+        &self,
+        namespace: &str,
+        name: &str,
+        resource_version: i64,
+        deleted: bool,
+        data: Option<serde_json::Value>,
+    ) -> Option<super::inventory::InventoryApply> {
+        let mut guard = lock_recover(&self.service_route_inventory);
+        let inv = guard.as_mut()?;
+        Some(inv.apply_endpoints_event(namespace, name, resource_version, deleted, data))
+    }
+
+    /// Apply a single EndpointSlice watch event to the cached inventory.
+    pub fn apply_endpoint_slice_event_to_inventory(
+        &self,
+        namespace: &str,
+        service_name: &str,
+        slice_name: &str,
+        resource_version: i64,
+        deleted: bool,
+        data: Option<serde_json::Value>,
+    ) -> Option<super::inventory::InventoryApply> {
+        let mut guard = lock_recover(&self.service_route_inventory);
+        let inv = guard.as_mut()?;
+        Some(inv.apply_endpoint_slice_event(
+            namespace,
+            service_name,
+            slice_name,
+            resource_version,
+            deleted,
+            data,
+        ))
     }
 
     /// Atomically rebuild the `services` chain from the supplied

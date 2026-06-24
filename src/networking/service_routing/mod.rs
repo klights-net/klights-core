@@ -1,10 +1,15 @@
 mod coalescer;
 mod hostport;
+mod inventory;
 mod mode;
 mod nft_table;
+mod planner;
 mod prelude;
 mod service_rules;
 mod session_affinity;
+
+pub use inventory::{InventoryApply, ServiceRouteInventory};
+pub use planner::RoutePlan;
 
 pub use coalescer::{
     NftServiceRouter, NftServiceRouterBoot, NftServiceRouterDefaultBoot,

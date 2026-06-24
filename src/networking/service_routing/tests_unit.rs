@@ -1169,3 +1169,96 @@ async fn service_specs_from_api_prefers_complete_endpointslices_over_partial_leg
         "complete EndpointSlices must not be shadowed by a partial legacy Endpoints object"
     );
 }
+
+// ── Task 6: cached-inventory route sync tests ──────────────────────
+
+#[tokio::test]
+async fn coalesced_sync_uses_cached_inventory_after_initial_snapshot() {
+    let api = FreshServiceInventoryClient::default();
+    // Initial snapshot: builds inventory from the API.
+    let inventory = bootstrap_inventory_from_api(&api)
+        .await
+        .expect("bootstrap inventory");
+    assert!(
+        !inventory.is_empty()
+            || api
+                .service_list_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 1,
+        "first bootstrap must list services once"
+    );
+    let svc_calls_after_bootstrap = api
+        .service_list_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    // Subsequent sync from the cached inventory must not list services again.
+    let _specs = inventory.to_specs();
+    assert_eq!(
+        api.service_list_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        svc_calls_after_bootstrap,
+        "to_specs from cached inventory must NOT re-list services"
+    );
+    assert_eq!(
+        api.endpoints_list_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            + api
+                .endpointslice_list_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+        api.endpoints_list_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            + api
+                .endpointslice_list_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+        "to_specs from cached inventory must NOT re-list endpoints/slices"
+    );
+}
+
+#[tokio::test]
+async fn service_route_sync_does_not_query_api_per_service() {
+    // Set up several services so the count is meaningful.
+    let api = FreshServiceInventoryClient::default();
+    let inventory = bootstrap_inventory_from_api(&api)
+        .await
+        .expect("bootstrap inventory");
+    let svc_count = inventory.to_specs().len();
+
+    // Whatever the number of Services discovered, the bootstrap must use
+    // exactly ONE list call per resource type — never one per Service.
+    let svc_list_calls = api
+        .service_list_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let eps_list_calls = api
+        .endpoints_list_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let slice_list_calls = api
+        .endpointslice_list_calls
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    assert!(
+        svc_list_calls <= 1,
+        "Service list must be at most 1, was {svc_list_calls} for {svc_count} services"
+    );
+    assert!(
+        eps_list_calls <= 1,
+        "Endpoints list must be at most 1, was {eps_list_calls}"
+    );
+    assert!(
+        slice_list_calls <= 1,
+        "EndpointSlice list must be at most 1, was {slice_list_calls}"
+    );
+
+    // Confirm no per-Service get_resource calls were issued.
+    assert_eq!(
+        api.fresh_get_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "per-Service fresh get must not be used during route sync"
+    );
+    assert_eq!(
+        api.cached_get_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "per-Service cached get must not be used during route sync"
+    );
+}
