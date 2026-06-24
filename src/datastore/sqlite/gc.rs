@@ -58,7 +58,7 @@ impl Datastore {
                     params.push(Box::new(ns.clone()));
                 }
 
-                query.push_str(" ORDER BY resource_version ASC");
+                query.push_str(" ORDER BY resource_version ASC, id ASC");
 
                 let param_refs: Vec<&dyn rusqlite::ToSql> =
                     params.iter().map(|p| p.as_ref()).collect();
@@ -269,7 +269,7 @@ impl Datastore {
             query.push(')');
         }
 
-        query.push_str(") ORDER BY resource_version ASC");
+        query.push_str(") ORDER BY resource_version ASC, id ASC");
         if let Some(limit) = limit {
             query.push_str(&format!(" LIMIT ?{}", params.len() + 1));
             params.push(Box::new(limit.get() as i64));

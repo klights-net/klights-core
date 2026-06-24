@@ -20,8 +20,9 @@ use super::types::{
     AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PatchKind, PodCleanupIntent,
     PodEndpointEvent, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
     PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, ReplicatedCreateOptions,
-    ReplicatedSnapshotMetadata, Resource, ResourceList, ResourceListQuery, ResourcePatchRequest,
-    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayRead, WatchTarget,
+    ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation, ResourceList, ResourceListQuery,
+    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayRead,
+    WatchTarget,
 };
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
@@ -278,6 +279,13 @@ pub trait DatastoreBackend: Send + Sync {
             preconditions,
         )
         .await
+    }
+
+    async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
+        let _ = operations;
+        Err(anyhow::anyhow!(
+            "backend does not support raft-backed resource batch writes"
+        ))
     }
 
     /// Update only the `.status` subtree of a resource atomically.

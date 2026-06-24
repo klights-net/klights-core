@@ -726,8 +726,17 @@ pub async fn apply_forwarded_command(
                 authoring_node,
             ))
         }
+        StorageCommand::ApplyResourceBatch { operations } => {
+            let before_rv = db.get_current_resource_version().await.unwrap_or(0);
+            db.apply_resource_batch(operations.clone()).await?;
+            let rv = resource_version_after_mutation(db, before_rv).await?;
+            Ok(ack_apply(
+                StorageCommand::ApplyResourceBatch { operations },
+                rv,
+                authoring_node,
+            ))
+        }
         StorageCommand::WatchEventAppend { .. }
-        | StorageCommand::ApplyResourceBatch { .. }
         | StorageCommand::AdvanceResourceVersion { .. }
         | StorageCommand::EnsureClusterMetadata { .. }
         | StorageCommand::SetKlightsMeta { .. } => Err(anyhow!(

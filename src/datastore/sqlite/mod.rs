@@ -57,8 +57,8 @@ pub use super::types::{
     PendingWatchEvent, PodCleanupIntent, PodEndpointEvent, PodEndpointMode, PodEndpointRow,
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState,
     PodWorkqueueEntry, PodWorkqueueKind, ReplicatedCreateOptions, ReplicatedSnapshotMetadata,
-    Resource, ResourceList, ResourceListQuery, ResourcePatchRequest, ResourcePreconditions,
-    SandboxRef, WatchTarget, WatchTargetScope,
+    Resource, ResourceBatchOperation, ResourceList, ResourceListQuery, ResourcePatchRequest,
+    ResourcePreconditions, SandboxRef, WatchTarget, WatchTargetScope,
 };
 
 pub use executor::DbExecutor;
@@ -270,6 +270,31 @@ impl Datastore {
         })
         .await
         .map_err(|e| anyhow!("applied outbox list failed: {e}"))
+    }
+
+    pub async fn apply_resource_batch(
+        &self,
+        operations: Vec<ResourceBatchOperation>,
+    ) -> Result<()> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let command = crate::datastore::command::StorageCommand::ApplyResourceBatch { operations };
+        let commit = self
+            .db_call("db_apply_resource_batch_build", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
+                    &tx,
+                    command,
+                    "ResourceBatch",
+                    "",
+                )?;
+                tx.commit()?;
+                Ok(commit)
+            })
+            .await
+            .map_err(|e| anyhow!("apply resource batch build failed: {e}"))?;
+        self.apply_log_apply_commit(commit).await
     }
 
     pub async fn delete_uncommitted_applied_outbox_placeholder(
@@ -2228,6 +2253,10 @@ impl DatastoreBackend for Datastore {
             preconditions,
         )
         .await
+    }
+
+    async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
+        Datastore::apply_resource_batch(self, operations).await
     }
 
     async fn update_status_only(

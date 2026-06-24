@@ -37,13 +37,13 @@ pub fn needs_event_v1_compat(api_version: &str, kind: &str) -> bool {
 /// Replication is at-least-once: after a follower disconnects and
 /// reconnects, the leader's snapshot may include an entry the follower
 /// already applied (then later mutated). The follower's apply path may
-/// then call this helper for an RV that already exists in `watch_events`,
-/// hitting the `UNIQUE(resource_version)` constraint and rolling back
-/// the entire apply transaction. To make replay idempotent, on a UNIQUE
-/// failure we look up the existing row at this RV: if it has the same
-/// `event_type` and identical `data`, the duplicate is a benign replay
-/// and we silently succeed; otherwise the divergence is real and we
-/// propagate the original error.
+/// then call this helper for the same resource identity and RV, hitting
+/// the unique identity/RV index and rolling back the entire apply
+/// transaction. To make replay idempotent, on a UNIQUE failure we look up
+/// the existing row at this identity/RV: if it has the same `event_type`
+/// and identical `data`, the duplicate is a benign replay and we silently
+/// succeed; otherwise the divergence is real and we propagate the
+/// original error.
 pub struct WatchEventInsert<'a> {
     pub api_version: &'a str,
     pub kind: &'a str,
@@ -106,25 +106,20 @@ pub fn insert_watch_event_in_conn(
             if !is_watch_events_unique_violation(&err) {
                 return Err(err);
             }
-            // UNIQUE(resource_version) hit. Check the existing row matches.
+            // UNIQUE(identity, resource_version) hit. Check the existing row matches.
+            let namespace_key = namespace.unwrap_or("#cluster");
             let existing = conn.query_row(
-                queries::WATCH_EVENTS_SELECT_BY_RV,
-                rusqlite::params![resource_version],
+                queries::WATCH_EVENTS_SELECT_BY_IDENTITY_RV,
+                rusqlite::params![api_version, kind, namespace_key, name, resource_version],
                 |row| {
                     Ok(ExistingWatchEvent {
-                        api_version: row.get(0)?,
-                        kind: row.get(1)?,
-                        namespace: row.get(2)?,
-                        name: row.get(3)?,
-                        event_type: row.get(4)?,
-                        data: row.get(5)?,
+                        event_type: row.get(0)?,
+                        data: row.get(1)?,
                     })
                 },
             );
             match existing {
-                Ok(ex) if ex.matches(api_version, kind, namespace, name, event_type, data) => {
-                    Ok(())
-                }
+                Ok(ex) if ex.matches(event_type, data) => Ok(()),
                 _ => Err(err),
             }
         }
@@ -132,30 +127,13 @@ pub fn insert_watch_event_in_conn(
 }
 
 pub struct ExistingWatchEvent {
-    api_version: String,
-    kind: String,
-    namespace: Option<String>,
-    name: String,
     event_type: String,
     data: Vec<u8>,
 }
 
 impl ExistingWatchEvent {
-    fn matches(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        event_type: &str,
-        data: &[u8],
-    ) -> bool {
-        self.api_version == api_version
-            && self.kind == kind
-            && self.namespace.as_deref() == namespace
-            && self.name == name
-            && self.event_type == event_type
-            && self.data == data
+    fn matches(&self, event_type: &str, data: &[u8]) -> bool {
+        self.event_type == event_type && self.data == data
     }
 }
 
@@ -164,7 +142,11 @@ pub fn is_watch_events_unique_violation(err: &rusqlite::Error) -> bool {
         && sql_err.code == rusqlite::ErrorCode::ConstraintViolation
         && let Some(m) = msg.as_deref()
     {
-        return m.contains("watch_events.resource_version");
+        return m.contains("idx_watch_events_identity_rv")
+            || (m.contains("watch_events.api_version")
+                && m.contains("watch_events.kind")
+                && m.contains("watch_events.name")
+                && m.contains("watch_events.resource_version"));
     }
     false
 }
@@ -332,26 +314,18 @@ mod tests {
     #[test]
     fn existing_watch_event_matches() {
         let ev = ExistingWatchEvent {
-            api_version: "v1".into(),
-            kind: "Pod".into(),
-            namespace: Some("ns".into()),
-            name: "p".into(),
             event_type: "ADDED".into(),
             data: b"x".to_vec(),
         };
-        assert!(ev.matches("v1", "Pod", Some("ns"), "p", "ADDED", b"x"));
+        assert!(ev.matches("ADDED", b"x"));
     }
 
     #[test]
     fn existing_watch_event_rejects_type_mismatch() {
         let ev = ExistingWatchEvent {
-            api_version: "v1".into(),
-            kind: "Pod".into(),
-            namespace: Some("ns".into()),
-            name: "p".into(),
             event_type: "ADDED".into(),
             data: b"x".to_vec(),
         };
-        assert!(!ev.matches("v1", "Pod", Some("ns"), "p", "MODIFIED", b"x"));
+        assert!(!ev.matches("MODIFIED", b"x"));
     }
 }

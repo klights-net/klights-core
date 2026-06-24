@@ -66,17 +66,18 @@ pub(super) const WATCH_EVENTS_INSERT: &str = "INSERT INTO watch_events (api_vers
 // Removed: WATCH_EVENTS_INSERT_COMMAND, NAMESPACE_WATCH_INSERT_*. All
 // watch_events insertions now route through
 // crud::resources::insert_watch_event_in_conn so at-least-once
-// replication replay is idempotent on UNIQUE(resource_version) for
-// every code path.
-/// Lookup an existing watch_events row by resource_version so the apply path
-/// can recognize a benign at-least-once replay (same RV, same content) and
-/// distinguish it from real divergence (same RV, different content).
-pub(super) const WATCH_EVENTS_SELECT_BY_RV: &str = "SELECT api_version, kind, namespace, name, event_type, data FROM watch_events WHERE resource_version = ?1";
+// replication replay is idempotent on the unique
+// (resource identity, resource_version) index while allowing different
+// resources to share one raft/etcd-style revision.
+/// Lookup an existing watch_events row by identity + resource_version so the
+/// apply path can recognize a benign at-least-once replay (same object, same
+/// RV, same content) and distinguish it from real divergence.
+pub(super) const WATCH_EVENTS_SELECT_BY_IDENTITY_RV: &str = "SELECT event_type, data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5";
 
 pub(super) const WATCH_EVENTS_LIST_CLUSTER_SINCE: &str = "SELECT api_version, kind, NULL as namespace, name, resource_version, event_type, data \
      FROM watch_events \
      WHERE api_version = ?1 AND kind = ?2 AND namespace IS NULL AND resource_version > ?3 \
-     ORDER BY resource_version ASC";
+     ORDER BY resource_version ASC, id ASC";
 
 pub(super) const WATCH_EVENTS_LIST_NAMESPACED_SINCE_HEAD: &str = "SELECT api_version, kind, namespace, name, resource_version, event_type, data \
      FROM watch_events \
@@ -88,12 +89,12 @@ pub(super) const WATCH_EVENTS_LIST_TARGETS_HEAD: &str = "SELECT api_version, kin
 pub(super) const WATCH_EVENTS_LIST_ALL_SINCE: &str = "SELECT api_version, kind, namespace, name, resource_version, event_type, data \
      FROM watch_events \
      WHERE resource_version > ?1 \
-     ORDER BY resource_version ASC";
+     ORDER BY resource_version ASC, id ASC";
 
 pub(super) const WATCH_EVENTS_LIST_DELETED_SINCE: &str = "SELECT api_version, kind, namespace, name, resource_version, event_type, data \
      FROM watch_events \
      WHERE resource_version > ?1 AND event_type = 'DELETED' \
-     ORDER BY resource_version ASC";
+     ORDER BY resource_version ASC, id ASC";
 
 #[cfg(test)]
 pub(super) const WATCH_EVENTS_COUNT: &str = "SELECT COUNT(*) FROM watch_events";

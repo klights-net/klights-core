@@ -116,9 +116,8 @@ impl Datastore {
                 //    (created_rv = None).
                 let mut current: HashMap<String, (i64, Option<i64>, Resource)> = HashMap::new();
                 if is_namespace {
-                    let mut stmt = tx.prepare(
-                        "SELECT name, resource_version, uid, data FROM namespaces",
-                    )?;
+                    let mut stmt =
+                        tx.prepare("SELECT name, resource_version, uid, data FROM namespaces")?;
                     let rows = stmt.query_map([], |row| {
                         let name: String = row.get(0)?;
                         let rv: i64 = row.get(1)?;
@@ -144,9 +143,10 @@ impl Datastore {
                         current.insert(name, (rv, None, res));
                     }
                 } else if namespaced {
-                    let mut sql = "SELECT name, namespace, resource_version, created_rv, uid, data \
+                    let mut sql =
+                        "SELECT name, namespace, resource_version, created_rv, uid, data \
                          FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2"
-                        .to_string();
+                            .to_string();
                     let mut params: Vec<Box<dyn ToSql>> =
                         vec![Box::new(av.clone()), Box::new(k.clone())];
                     if let Some(ns) = &ns_owned {
@@ -324,35 +324,64 @@ impl Datastore {
                     return Ok(RawSnapshot::Expired);
                 }
 
-                // 4. Fetch object bytes for the rebuilt keys (one row per rv —
-                //    resource_version is UNIQUE in watch_events).
+                // 4. Fetch object bytes for the rebuilt keys. A raft/etcd-style
+                //    transaction may produce several object events at one RV, so
+                //    historical bytes are keyed by (name, rv), not rv alone.
                 if !to_apply.is_empty() {
-                    let rvs: Vec<i64> = to_apply.iter().map(|(_, rv)| *rv).collect();
-                    let placeholders = (0..rvs.len())
-                        .map(|i| format!("?{}", i + 1))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let sql = format!(
-                        "SELECT resource_version, data FROM watch_events WHERE resource_version IN ({placeholders})"
-                    );
-                    let pref: Vec<&dyn ToSql> =
-                        rvs.iter().map(|rv| rv as &dyn ToSql).collect();
+                    let mut sql = "SELECT name, resource_version, data FROM watch_events \
+                         WHERE api_version = ?1 AND kind = ?2"
+                        .to_string();
+                    let mut params: Vec<Box<dyn ToSql>> =
+                        vec![Box::new(av.clone()), Box::new(k.clone())];
+                    if namespaced {
+                        if let Some(ns) = &ns_owned {
+                            sql.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
+                            params.push(Box::new(ns.clone()));
+                        } else {
+                            sql.push_str(" AND namespace IS NOT NULL");
+                        }
+                    } else {
+                        sql.push_str(" AND namespace IS NULL");
+                    }
+                    sql.push_str(" AND (");
+                    for (idx, (name, rv)) in to_apply.iter().enumerate() {
+                        if idx > 0 {
+                            sql.push_str(" OR ");
+                        }
+                        sql.push_str(&format!(
+                            "(name = ?{} AND resource_version = ?{})",
+                            params.len() + 1,
+                            params.len() + 2
+                        ));
+                        params.push(Box::new(name.clone()));
+                        params.push(Box::new(*rv));
+                    }
+                    sql.push(')');
+                    let pref: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
                     let mut stmt = tx.prepare(&sql)?;
                     let rows = stmt.query_map(&pref[..], |row| {
-                        let rv: i64 = row.get(0)?;
-                        let data = Arc::new(json_from_bytes(row.get(1)?)?);
-                        Ok((rv, data))
+                        let name: String = row.get(0)?;
+                        let rv: i64 = row.get(1)?;
+                        let data = Arc::new(json_from_bytes(row.get(2)?)?);
+                        Ok((name, rv, data))
                     })?;
-                    let mut data_by_rv: HashMap<i64, Arc<Value>> = HashMap::new();
+                    let mut data_by_name_rv: HashMap<(String, i64), Arc<Value>> = HashMap::new();
                     for row in rows {
-                        let (rv, data) = row?;
-                        data_by_rv.insert(rv, data);
+                        let (name, rv, data) = row?;
+                        data_by_name_rv.insert((name, rv), data);
                     }
                     for (name, le_rv) in &to_apply {
-                        if let Some(data) = data_by_rv.get(le_rv) {
+                        if let Some(data) = data_by_name_rv.get(&(name.clone(), *le_rv)) {
                             result.insert(
                                 name.clone(),
-                                resource_from_event(&av, &k, name, *le_rv, data.clone(), namespaced),
+                                resource_from_event(
+                                    &av,
+                                    &k,
+                                    name,
+                                    *le_rv,
+                                    data.clone(),
+                                    namespaced,
+                                ),
                             );
                         }
                     }

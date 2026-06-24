@@ -1206,6 +1206,90 @@ mod cases {
         }
     }
 
+    #[tokio::test]
+    async fn replicated_apply_resource_batch_proposes_one_raft_command() {
+        use crate::datastore::backend::DatastoreHandle;
+
+        struct RecordingProposer {
+            calls: std::sync::Mutex<Vec<StorageCommand>>,
+        }
+
+        #[async_trait]
+        impl super::super::RaftProposer for RecordingProposer {
+            async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+                self.calls.lock().unwrap().push(command);
+                Ok(())
+            }
+
+            async fn propose_outbox_command(
+                &self,
+                _idempotency_key: &str,
+                _operation: &str,
+                _command: StorageCommand,
+                _authoring_node: &str,
+            ) -> std::result::Result<
+                crate::kubelet::outbox::OutboxApplyResult,
+                crate::kubelet::outbox::OutboxApplyError,
+            > {
+                unreachable!("resource batch routing should use propose_command")
+            }
+        }
+
+        let inner: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = ReplicatedDatastore::new(
+            inner,
+            ReplicationMode::Raft {
+                node_name: "cp1".to_string(),
+            },
+        );
+        let proposer = Arc::new(RecordingProposer {
+            calls: Default::default(),
+        });
+        db.set_raft_proposer(proposer.clone());
+
+        db.apply_resource_batch(vec![
+            ResourceBatchOperation::Put {
+                api_version: "v1".to_string(),
+                kind: "Endpoints".to_string(),
+                namespace: Some("default".to_string()),
+                name: "batched".to_string(),
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "Endpoints",
+                    "metadata": {"name": "batched", "namespace": "default"},
+                    "subsets": []
+                }),
+                mode: ResourceBatchPutMode::Create,
+                preconditions: ResourcePreconditions::default(),
+            },
+            ResourceBatchOperation::Put {
+                api_version: "discovery.k8s.io/v1".to_string(),
+                kind: "EndpointSlice".to_string(),
+                namespace: Some("default".to_string()),
+                name: "batched-klights".to_string(),
+                data: json!({
+                    "apiVersion": "discovery.k8s.io/v1",
+                    "kind": "EndpointSlice",
+                    "metadata": {"name": "batched-klights", "namespace": "default"},
+                    "addressType": "IPv4",
+                    "endpoints": [],
+                    "ports": []
+                }),
+                mode: ResourceBatchPutMode::Create,
+                preconditions: ResourcePreconditions::default(),
+            },
+        ])
+        .await
+        .unwrap();
+
+        let calls = proposer.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(
+            &calls[0],
+            StorageCommand::ApplyResourceBatch { operations } if operations.len() == 2
+        ));
+    }
+
     /// T7.2: without a raft proposer attached, writes must return a
     /// typed error and must not mutate local cluster.db.
     #[tokio::test]

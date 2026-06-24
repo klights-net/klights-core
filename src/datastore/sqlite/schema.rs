@@ -1,6 +1,7 @@
 use std::net::Ipv4Addr;
 
 use crate::networking::{NodeName, PodSubnet, VtepMac};
+use rusqlite::OptionalExtension;
 
 use super::NodeSubnet;
 
@@ -164,20 +165,26 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
             kind TEXT NOT NULL,
             namespace TEXT,
             name TEXT NOT NULL,
-            resource_version INTEGER NOT NULL UNIQUE,
+            resource_version INTEGER NOT NULL,
             event_type TEXT NOT NULL,
             data BLOB NOT NULL
         )",
         [],
     )?;
+    migrate_watch_events_allow_same_rv(conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_watch_events_ns
-         ON watch_events(api_version, kind, namespace, resource_version)",
+         ON watch_events(api_version, kind, namespace, resource_version, id)",
         [],
     )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_watch_events_cluster
-         ON watch_events(api_version, kind, resource_version)",
+         ON watch_events(api_version, kind, resource_version, id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_events_identity_rv
+         ON watch_events(api_version, kind, COALESCE(namespace, '#cluster'), name, resource_version)",
         [],
     )?;
     conn.execute(
@@ -291,6 +298,48 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
         [],
     )?;
     Ok(())
+}
+
+fn migrate_watch_events_allow_same_rv(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let create_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'watch_events'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(create_sql) = create_sql else {
+        return Ok(());
+    };
+    if !create_sql.contains("resource_version INTEGER NOT NULL UNIQUE") {
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute("ALTER TABLE watch_events RENAME TO watch_events_old", [])?;
+    tx.execute(
+        "CREATE TABLE watch_events (
+            id INTEGER PRIMARY KEY,
+            api_version TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            namespace TEXT,
+            name TEXT NOT NULL,
+            resource_version INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            data BLOB NOT NULL
+        )",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO watch_events
+         (id, api_version, kind, namespace, name, resource_version, event_type, data)
+         SELECT id, api_version, kind, namespace, name, resource_version, event_type, data
+         FROM watch_events_old
+         ORDER BY id ASC",
+        [],
+    )?;
+    tx.execute("DROP TABLE watch_events_old", [])?;
+    tx.commit()
 }
 
 pub(super) fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeSubnet> {

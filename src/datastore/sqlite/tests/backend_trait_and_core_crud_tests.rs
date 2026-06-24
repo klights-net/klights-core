@@ -172,6 +172,70 @@ async fn apply_resource_batch_update_requires_resource_version_precondition() {
 }
 
 #[tokio::test]
+async fn apply_resource_batch_public_api_writes_resources_with_one_rv() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.apply_resource_batch(vec![
+        ResourceBatchOperation::Put {
+            api_version: "discovery.k8s.io/v1".to_string(),
+            kind: "EndpointSlice".to_string(),
+            namespace: Some("default".to_string()),
+            name: "public-batch-klights".to_string(),
+            data: json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {"name": "public-batch-klights", "namespace": "default"},
+                "addressType": "IPv4",
+                "endpoints": [],
+                "ports": []
+            }),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        },
+        ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "Endpoints".to_string(),
+            namespace: Some("default".to_string()),
+            name: "public-batch".to_string(),
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "Endpoints",
+                "metadata": {"name": "public-batch", "namespace": "default"},
+                "subsets": []
+            }),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        },
+    ])
+    .await
+    .unwrap();
+
+    let slice = db
+        .get_resource(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            "public-batch-klights",
+        )
+        .await
+        .unwrap()
+        .expect("EndpointSlice should exist");
+    let endpoints = db
+        .get_resource("v1", "Endpoints", Some("default"), "public-batch")
+        .await
+        .unwrap()
+        .expect("Endpoints should exist");
+    assert_eq!(slice.resource_version, endpoints.resource_version);
+
+    let watch_events = db.list_all_watch_events_since(0).await.unwrap();
+    assert_eq!(watch_events.len(), 2);
+    assert!(
+        watch_events
+            .iter()
+            .all(|event| event.resource.resource_version == slice.resource_version)
+    );
+}
+
+#[tokio::test]
 async fn raft_commit_builder_rejects_update_for_deleted_resource() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db

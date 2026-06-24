@@ -251,6 +251,16 @@ impl DatastoreBackend for ReplicatedDatastore {
                 )
             })
     }
+
+    async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let proposer = self.require_raft_proposer()?;
+        let command = StorageCommand::ApplyResourceBatch { operations };
+        self.propose_command_via_raft(&proposer, command).await
+    }
+
     async fn update_status_only(
         &self,
         api_version: &str,

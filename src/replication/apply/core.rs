@@ -10,7 +10,7 @@
 use crate::datastore::command::{
     COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand, StorageResponse,
 };
-use crate::datastore::types::Resource;
+use crate::datastore::types::{Resource, ResourceBatchOperation};
 use crate::replication::protocol::{
     ForwardedNodeSubnet, ForwardedPodSlotAdmission, ForwardedResource, ReplicationEntry,
 };
@@ -152,6 +152,27 @@ pub(super) fn subject_key_for_command(command: &StorageCommand) -> String {
         | StorageCommand::DeleteNamespaceContents { name } => {
             resource_key_parts("v1", "Namespace", None, name, None)
         }
+        StorageCommand::ApplyResourceBatch { operations } => match operations.first() {
+            Some(ResourceBatchOperation::Put {
+                api_version,
+                kind,
+                namespace,
+                name,
+                ..
+            })
+            | Some(ResourceBatchOperation::Delete {
+                api_version,
+                kind,
+                namespace,
+                name,
+                ..
+            }) => format!(
+                "batch:{api_version}/{kind}/{}/{}",
+                namespace.as_deref().unwrap_or(""),
+                name
+            ),
+            None => "batch:empty".to_string(),
+        },
         other => other.variant_name().to_string(),
     }
 }

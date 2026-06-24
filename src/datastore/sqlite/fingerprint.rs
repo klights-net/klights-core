@@ -28,7 +28,7 @@ use rusqlite::OptionalExtension;
 /// writes to `sqlite_master`, sorted by table name for stability.
 /// Indexes are excluded; only the core data model (tables) is fingerprinted.
 pub(super) const SCHEMA_FINGERPRINT: &str =
-    "2fc09ab1fdc318b125148f18e8fc42792a3ffa785a9bcfe4b1f99cbf5d397ca6";
+    "5dbcaa97f21a8a251e97945bbfa85f3fc2664aeed9bbf3fb67f7940afef1c70a";
 
 /// Verify the fingerprint matches or initialize it for a fresh DB.
 ///
