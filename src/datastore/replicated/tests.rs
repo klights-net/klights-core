@@ -751,7 +751,7 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn replicated_apply_update_uses_local_current_rv() {
+    async fn replicated_apply_update_rejects_stale_resource_version() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
             "v1",
@@ -766,7 +766,7 @@ mod cases {
         .await
         .unwrap();
 
-        apply_command_to_backend(
+        let err = apply_command_to_backend(
             &db,
             StorageCommand::UpdateResource {
                 api_version: "v1".into(),
@@ -793,17 +793,146 @@ mod cases {
             },
         )
         .await
-        .unwrap();
+        .expect_err("stale replicated update must preserve the command RV precondition");
+        assert!(
+            err.to_string()
+                .contains("resourceVersion precondition failed")
+                && err.to_string().contains("409 Conflict"),
+            "expected stale RV conflict, got: {err:#}"
+        );
 
         let stored = db
             .get_resource("v1", "ConfigMap", Some("default"), "apply-update-local-rv")
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.resource_version, 2);
+        assert_eq!(stored.resource_version, 1);
         assert_eq!(
-            stored.data.pointer("/data/after").and_then(|v| v.as_str()),
+            stored.data.pointer("/data/before").and_then(|v| v.as_str()),
             Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_apply_patch_rejects_stale_resource_version() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "apply-patch-local-rv",
+            json!({
+                "metadata": {"name": "apply-patch-local-rv", "namespace": "default"},
+                "data": {"before": "true"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = apply_command_to_backend(
+            &db,
+            StorageCommand::PatchResource {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: Some("default".into()),
+                name: "apply-patch-local-rv".into(),
+                patch_kind: PatchKind::Merge,
+                patch: json!({"data": {"after": "true"}}),
+                preconditions: ResourcePreconditions::resource_version(99),
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 2,
+                uid: None,
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .expect_err("stale replicated patch must preserve the command RV precondition");
+        assert!(
+            err.to_string()
+                .contains("resourceVersion precondition failed")
+                && err.to_string().contains("409 Conflict"),
+            "expected stale RV conflict, got: {err:#}"
+        );
+
+        let stored = db
+            .get_resource("v1", "ConfigMap", Some("default"), "apply-patch-local-rv")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.resource_version, 1);
+        assert_eq!(
+            stored.data.pointer("/data/before").and_then(|v| v.as_str()),
+            Some("true")
+        );
+        assert!(
+            stored.data.pointer("/data/after").is_none(),
+            "stale patch must not mutate live data"
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_apply_status_rejects_stale_resource_version() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "apply-status-local-rv",
+            json!({
+                "metadata": {"name": "apply-status-local-rv", "namespace": "default"},
+                "spec": {
+                    "containers": [{"name": "app", "image": "nginx"}]
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateStatus {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                namespace: Some("default".into()),
+                name: "apply-status-local-rv".into(),
+                status: json!({"phase": "Running"}),
+                expected_rv: Some(99),
+                preconditions: ResourcePreconditions::resource_version(99),
+                observed_status_stamp: None,
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 2,
+                uid: None,
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .expect_err("stale replicated status update must preserve the command RV precondition");
+        assert!(
+            err.to_string().contains("409 Conflict"),
+            "expected stale RV conflict, got: {err:#}"
+        );
+
+        let stored = db
+            .get_resource("v1", "Pod", Some("default"), "apply-status-local-rv")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.resource_version, 1);
+        assert_eq!(
+            stored
+                .data
+                .pointer("/status/phase")
+                .and_then(|v| v.as_str()),
+            Some("Pending")
         );
     }
 

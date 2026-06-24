@@ -293,7 +293,7 @@ where
             namespace,
             name,
             mut data,
-            expected_rv,
+            expected_rv: _,
             preconditions,
         } => {
             let current = backend
@@ -312,13 +312,6 @@ where
                     &current.data,
                     &mut data,
                 );
-            }
-            let mut preconditions = preconditions;
-            if preconditions.resource_version.is_some() {
-                preconditions.resource_version = current
-                    .as_ref()
-                    .map(|resource| resource.resource_version)
-                    .or(Some(expected_rv));
             }
             backend
                 .update_resource_with_preconditions(
@@ -357,14 +350,6 @@ where
             patch,
             preconditions,
         } => {
-            let current = backend
-                .get_resource(&api_version, &kind, namespace.as_deref(), &name)
-                .await?;
-            let mut preconditions = preconditions;
-            if preconditions.resource_version.is_some() {
-                preconditions.resource_version =
-                    current.as_ref().map(|resource| resource.resource_version);
-            }
             backend
                 .patch_resource_latest_with_preconditions(
                     &api_version,
@@ -381,7 +366,7 @@ where
             namespace,
             name,
             status,
-            expected_rv,
+            expected_rv: _,
             preconditions,
             observed_status_stamp,
         } => {
@@ -413,13 +398,6 @@ where
                     &mut status,
                     owner,
                 );
-            }
-            let mut preconditions = preconditions;
-            if preconditions.resource_version.is_some() {
-                preconditions.resource_version = current
-                    .as_ref()
-                    .map(|resource| resource.resource_version)
-                    .or(expected_rv);
             }
             backend
                 .update_status_only_with_preconditions(
