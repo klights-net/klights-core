@@ -10,7 +10,8 @@
 //! `bytes` (serde-encoded openraft RPC payload). Encoder/decoder live in
 //! this module so the gRPC layer stays openraft-type-free.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -23,6 +24,159 @@ use openraft::raft::{
 };
 
 use crate::datastore::raft::types::{NodeId, TypeConfig};
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PeerRaftRpcMetricsSnapshot {
+    pub append_entries_calls_total: u64,
+    pub append_entries_failures_total: u64,
+    pub vote_calls_total: u64,
+    pub vote_failures_total: u64,
+    pub install_snapshot_calls_total: u64,
+    pub install_snapshot_failures_total: u64,
+    pub client_invalidations_total: u64,
+    pub last_append_entries_payload_bytes: u64,
+    pub last_append_entries_entries: u64,
+    pub last_append_entries_lag_entries: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GrpcRaftNetworkMetricsSnapshot {
+    pub append_entries_calls_total: u64,
+    pub append_entries_bytes_total: u64,
+    pub append_entries_failures_total: u64,
+    pub vote_calls_total: u64,
+    pub vote_bytes_total: u64,
+    pub vote_failures_total: u64,
+    pub install_snapshot_calls_total: u64,
+    pub install_snapshot_bytes_total: u64,
+    pub install_snapshot_failures_total: u64,
+    pub client_invalidations_total: u64,
+    pub peers: BTreeMap<NodeId, PeerRaftRpcMetricsSnapshot>,
+}
+
+#[derive(Default)]
+struct GrpcRaftNetworkMetrics {
+    append_entries_calls_total: AtomicU64,
+    append_entries_bytes_total: AtomicU64,
+    append_entries_failures_total: AtomicU64,
+    vote_calls_total: AtomicU64,
+    vote_bytes_total: AtomicU64,
+    vote_failures_total: AtomicU64,
+    install_snapshot_calls_total: AtomicU64,
+    install_snapshot_bytes_total: AtomicU64,
+    install_snapshot_failures_total: AtomicU64,
+    client_invalidations_total: AtomicU64,
+    peers: RwLock<BTreeMap<NodeId, PeerRaftRpcMetricsSnapshot>>,
+}
+
+impl GrpcRaftNetworkMetrics {
+    fn record_append_entries_call(
+        &self,
+        target: NodeId,
+        payload_bytes: usize,
+        entries: usize,
+        lag_entries: Option<u64>,
+    ) {
+        self.append_entries_calls_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.append_entries_bytes_total
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+        let mut peers = self.peers.write().unwrap();
+        let peer = peers.entry(target).or_default();
+        peer.append_entries_calls_total += 1;
+        peer.last_append_entries_payload_bytes = payload_bytes as u64;
+        peer.last_append_entries_entries = entries as u64;
+        peer.last_append_entries_lag_entries = lag_entries;
+    }
+
+    fn record_vote_call(&self, target: NodeId, payload_bytes: usize) {
+        self.vote_calls_total.fetch_add(1, Ordering::Relaxed);
+        self.vote_bytes_total
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+        self.peers
+            .write()
+            .unwrap()
+            .entry(target)
+            .or_default()
+            .vote_calls_total += 1;
+    }
+
+    fn record_install_snapshot_call(&self, target: NodeId, payload_bytes: usize) {
+        self.install_snapshot_calls_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.install_snapshot_bytes_total
+            .fetch_add(payload_bytes as u64, Ordering::Relaxed);
+        self.peers
+            .write()
+            .unwrap()
+            .entry(target)
+            .or_default()
+            .install_snapshot_calls_total += 1;
+    }
+
+    fn record_append_entries_failure(&self, target: NodeId) {
+        self.append_entries_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.peers
+            .write()
+            .unwrap()
+            .entry(target)
+            .or_default()
+            .append_entries_failures_total += 1;
+    }
+
+    fn record_vote_failure(&self, target: NodeId) {
+        self.vote_failures_total.fetch_add(1, Ordering::Relaxed);
+        self.peers
+            .write()
+            .unwrap()
+            .entry(target)
+            .or_default()
+            .vote_failures_total += 1;
+    }
+
+    fn record_install_snapshot_failure(&self, target: NodeId) {
+        self.install_snapshot_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.peers
+            .write()
+            .unwrap()
+            .entry(target)
+            .or_default()
+            .install_snapshot_failures_total += 1;
+    }
+
+    fn record_client_invalidation(&self, target: NodeId) {
+        self.client_invalidations_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.peers
+            .write()
+            .unwrap()
+            .entry(target)
+            .or_default()
+            .client_invalidations_total += 1;
+    }
+
+    fn snapshot(&self) -> GrpcRaftNetworkMetricsSnapshot {
+        GrpcRaftNetworkMetricsSnapshot {
+            append_entries_calls_total: self.append_entries_calls_total.load(Ordering::Relaxed),
+            append_entries_bytes_total: self.append_entries_bytes_total.load(Ordering::Relaxed),
+            append_entries_failures_total: self
+                .append_entries_failures_total
+                .load(Ordering::Relaxed),
+            vote_calls_total: self.vote_calls_total.load(Ordering::Relaxed),
+            vote_bytes_total: self.vote_bytes_total.load(Ordering::Relaxed),
+            vote_failures_total: self.vote_failures_total.load(Ordering::Relaxed),
+            install_snapshot_calls_total: self.install_snapshot_calls_total.load(Ordering::Relaxed),
+            install_snapshot_bytes_total: self.install_snapshot_bytes_total.load(Ordering::Relaxed),
+            install_snapshot_failures_total: self
+                .install_snapshot_failures_total
+                .load(Ordering::Relaxed),
+            client_invalidations_total: self.client_invalidations_total.load(Ordering::Relaxed),
+            peers: self.peers.read().unwrap().clone(),
+        }
+    }
+}
 
 /// Per-peer reusable client surface. Production wires this to the
 /// existing `ReplicationGrpcClient`; tests can swap in an in-process
@@ -78,6 +232,7 @@ pub struct GrpcRaftNetwork {
     /// stamps the target id so subsequent RPC calls know which peer
     /// they're talking to.
     bound_target: Option<NodeId>,
+    metrics: Arc<GrpcRaftNetworkMetrics>,
 }
 
 impl GrpcRaftNetwork {
@@ -87,7 +242,12 @@ impl GrpcRaftNetwork {
             clients: Arc::new(RwLock::new(HashMap::new())),
             addrs: Arc::new(RwLock::new(HashMap::new())),
             bound_target: None,
+            metrics: Arc::new(GrpcRaftNetworkMetrics::default()),
         }
+    }
+
+    pub fn metrics_snapshot(&self) -> GrpcRaftNetworkMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Return the cached client for the bound peer, rebuilding it from the
@@ -127,6 +287,7 @@ impl GrpcRaftNetwork {
     /// retained for the rebuild.
     fn invalidate(&self, target: NodeId) {
         if self.clients.write().unwrap().remove(&target).is_some() {
+            self.metrics.record_client_invalidation(target);
             tracing::warn!(
                 target,
                 "GrpcRaftNetwork: evicting wedged peer client; will rebuild on next RPC"
@@ -162,6 +323,7 @@ impl RaftNetworkFactory<TypeConfig> for GrpcRaftNetwork {
             clients: self.clients.clone(),
             addrs: self.addrs.clone(),
             bound_target: Some(target),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -187,17 +349,29 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         );
         let payload = serde_json::to_vec(&rpc)
             .map_err(|e| RPCError::Unreachable(unreachable_io(format!("encode AE: {e}"))))?;
+        let lag_entries = rpc.leader_commit.as_ref().map(|commit| {
+            let prev_index = rpc
+                .prev_log_id
+                .as_ref()
+                .map(|log_id| log_id.index)
+                .unwrap_or(0);
+            commit.index.saturating_sub(prev_index)
+        });
+        self.metrics
+            .record_append_entries_call(target, payload.len(), entries_len, lag_entries);
         let bytes = match client.append_entries(payload).await {
             Ok(b) => {
                 tracing::debug!(target, "GrpcRaftNetwork::append_entries: success");
                 b
             }
             Err(GrpcRaftRpcError::Unreachable(msg)) | Err(GrpcRaftRpcError::Server(msg)) => {
+                self.metrics.record_append_entries_failure(target);
                 tracing::warn!(target, %msg, "GrpcRaftNetwork::append_entries: unreachable/server error");
                 self.invalidate(target);
                 return Err(RPCError::Unreachable(unreachable_io(msg)));
             }
             Err(GrpcRaftRpcError::Remote(msg)) => {
+                self.metrics.record_append_entries_failure(target);
                 // Consensus-layer error encoded as a plain string at
                 // the gRPC envelope level. Translate into a generic
                 // RemoteError carrying the string in a RaftError shell.
@@ -220,13 +394,16 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         let client = self.client_for_bound().map_err(RPCError::Unreachable)?;
         let payload = serde_json::to_vec(&rpc)
             .map_err(|e| RPCError::Unreachable(unreachable_io(format!("encode Vote: {e}"))))?;
+        self.metrics.record_vote_call(target, payload.len());
         let bytes = match client.vote(payload).await {
             Ok(b) => b,
             Err(GrpcRaftRpcError::Unreachable(msg)) | Err(GrpcRaftRpcError::Server(msg)) => {
+                self.metrics.record_vote_failure(target);
                 self.invalidate(target);
                 return Err(RPCError::Unreachable(unreachable_io(msg)));
             }
             Err(GrpcRaftRpcError::Remote(msg)) => {
+                self.metrics.record_vote_failure(target);
                 let raft_err: RaftError<NodeId> =
                     RaftError::Fatal(openraft::error::Fatal::Panicked);
                 tracing::warn!(target, %msg, "raft Vote RPC remote error (synthetic)");
@@ -249,13 +426,17 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         let client = self.client_for_bound().map_err(RPCError::Unreachable)?;
         let payload = serde_json::to_vec(&rpc)
             .map_err(|e| RPCError::Unreachable(unreachable_io(format!("encode IS: {e}"))))?;
+        self.metrics
+            .record_install_snapshot_call(target, payload.len());
         let bytes = match client.install_snapshot(payload).await {
             Ok(b) => b,
             Err(GrpcRaftRpcError::Unreachable(msg)) | Err(GrpcRaftRpcError::Server(msg)) => {
+                self.metrics.record_install_snapshot_failure(target);
                 self.invalidate(target);
                 return Err(RPCError::Unreachable(unreachable_io(msg)));
             }
             Err(GrpcRaftRpcError::Remote(msg)) => {
+                self.metrics.record_install_snapshot_failure(target);
                 let raft_err: RaftError<NodeId, InstallSnapshotError> =
                     RaftError::Fatal(openraft::error::Fatal::Panicked);
                 tracing::warn!(target, %msg, "raft InstallSnapshot RPC remote error (synthetic)");
@@ -354,6 +535,23 @@ mod tests {
         serde_json::to_vec(&AppendEntriesResponse::<NodeId>::Success).unwrap()
     }
 
+    fn sample_snapshot_request() -> InstallSnapshotRequest<TypeConfig> {
+        InstallSnapshotRequest {
+            vote: openraft::Vote::new(2, 10),
+            meta: openraft::SnapshotMeta::default(),
+            offset: 0,
+            data: vec![1, 2, 3, 4],
+            done: true,
+        }
+    }
+
+    fn sample_snapshot_response() -> Vec<u8> {
+        serde_json::to_vec(&InstallSnapshotResponse::<NodeId> {
+            vote: openraft::Vote::new(2, 10),
+        })
+        .unwrap()
+    }
+
     /// Factory whose `client_for` hands out `fail_first` on the very first
     /// build and `then` on every subsequent build, counting calls. Lets a
     /// test prove that a transport error evicts the cached client and the
@@ -416,6 +614,18 @@ mod tests {
             .await
             .expect_err("wedged peer must error");
         assert!(matches!(err, RPCError::Unreachable(_)));
+        let metrics = peer.metrics_snapshot();
+        assert_eq!(metrics.append_entries_calls_total, 1);
+        assert_eq!(metrics.append_entries_failures_total, 1);
+        assert_eq!(metrics.client_invalidations_total, 1);
+        assert_eq!(
+            metrics
+                .peers
+                .get(&20u64)
+                .expect("peer metrics")
+                .client_invalidations_total,
+            1
+        );
 
         // The dead client must have been evicted from the per-peer cache.
         assert!(
@@ -439,6 +649,7 @@ mod tests {
             "factory must rebuild the client after invalidation"
         );
         assert_eq!(working.ae_log.lock().unwrap().len(), 1);
+        assert_eq!(peer.metrics_snapshot().append_entries_calls_total, 2);
     }
 
     #[tokio::test]
@@ -473,6 +684,57 @@ mod tests {
             1,
             "client wrote one request through the envelope"
         );
+        drop(log);
+        let metrics = peer.metrics_snapshot();
+        assert_eq!(metrics.vote_calls_total, 1);
+        assert!(metrics.vote_bytes_total > 0);
+        assert_eq!(
+            metrics
+                .peers
+                .get(&20u64)
+                .expect("peer metrics")
+                .vote_calls_total,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_rpc_records_snapshot_metrics() {
+        let loopback = Arc::new(LoopbackClient {
+            ae_log: Mutex::new(Vec::new()),
+            vote_log: Mutex::new(Vec::new()),
+            snap_log: Mutex::new(Vec::new()),
+            ae_reply: Vec::new(),
+            vote_reply: Vec::new(),
+            snap_reply: sample_snapshot_response(),
+        });
+        let factory = Arc::new(FixedFactory {
+            client: loopback.clone(),
+        });
+        let mut network = GrpcRaftNetwork::new(factory);
+        let mut peer = network
+            .new_client(20u64, &BasicNode { addr: "x".into() })
+            .await;
+        let response = peer
+            .install_snapshot(
+                sample_snapshot_request(),
+                RPCOption::new(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .expect("install snapshot round-trip");
+        assert_eq!(response.vote.leader_id().get_term(), 2);
+        assert_eq!(loopback.snap_log.lock().unwrap().len(), 1);
+        let metrics = peer.metrics_snapshot();
+        assert_eq!(metrics.install_snapshot_calls_total, 1);
+        assert!(metrics.install_snapshot_bytes_total > 0);
+        assert_eq!(
+            metrics
+                .peers
+                .get(&20u64)
+                .expect("peer metrics")
+                .install_snapshot_calls_total,
+            1
+        );
     }
 
     #[tokio::test]
@@ -500,6 +762,16 @@ mod tests {
             RPCError::Unreachable(_) => {}
             other => panic!("expected Unreachable, got {other:?}"),
         }
+        let metrics = peer.metrics_snapshot();
+        assert_eq!(metrics.vote_failures_total, 1);
+        assert_eq!(
+            metrics
+                .peers
+                .get(&20u64)
+                .expect("peer metrics")
+                .vote_failures_total,
+            1
+        );
     }
 
     #[tokio::test]
