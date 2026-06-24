@@ -324,7 +324,13 @@ impl PodStatusService {
             };
             let containers_ready_status = bool_status(all_containers_ready);
             let ready_status = bool_status(update.phase == "Running" && all_containers_ready);
-            let conditions = preserve_non_kubelet_pod_conditions(
+            // The kubelet rebuilds its owned lifecycle conditions and routes the
+            // result through the typed Pod status ownership policy, which
+            // preserves by `type` every condition the kubelet runtime does not
+            // own (e.g. the scheduler's DisruptionTarget). Ownership is decided
+            // by PodStatusOwner, not by an ad hoc condition-type heuristic here.
+            let conditions = crate::pod_status_merge::merge_owned_and_preserved_conditions(
+                crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
                 vec![
                     build_pod_condition(
                         &existing_conditions,
@@ -1832,35 +1838,6 @@ fn upsert_runtime_readiness_condition(
         "status": cond_status,
         "lastTransitionTime": transition_time,
     }));
-}
-
-fn preserve_non_kubelet_pod_conditions(
-    mut rebuilt: Vec<Value>,
-    existing_conditions: &[Value],
-) -> Vec<Value> {
-    for condition in existing_conditions {
-        let Some(condition_type) = condition.get("type").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if is_kubelet_rebuilt_pod_condition(condition_type) {
-            continue;
-        }
-        if rebuilt
-            .iter()
-            .any(|rebuilt| rebuilt.get("type").and_then(|v| v.as_str()) == Some(condition_type))
-        {
-            continue;
-        }
-        rebuilt.push(condition.clone());
-    }
-    rebuilt
-}
-
-fn is_kubelet_rebuilt_pod_condition(condition_type: &str) -> bool {
-    matches!(
-        condition_type,
-        "PodScheduled" | "Initialized" | "ContainersReady" | "Ready"
-    )
 }
 
 fn upsert_terminal_readiness_condition(

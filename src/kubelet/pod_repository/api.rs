@@ -1340,17 +1340,18 @@ async fn write_preemption_termination(
     for attempt in 0..MAX_RETRIES {
         mark_pod_preempted_metadata(&mut data);
         let mut status = preempted_status(&data, preemptor_namespace, preemptor_name);
-        // Route the preemption status through the central Pod status merge
-        // policy so the single visible object written by preemption carries
-        // the scheduler-owned `DisruptionTarget` condition consistently with
-        // every other kubelet/status writer, and a concurrent status snapshot
-        // cannot drop scheduler-owned conditions from the preempted victim.
+        // This is a scheduler-originated write (preemption sets the
+        // scheduler-owned `DisruptionTarget` condition). Route it through the
+        // central Pod status merge policy as the Scheduler owner so it is
+        // authoritative for scheduler conditions while kubelet-owned lifecycle
+        // conditions present in the live status are preserved, and no terminal
+        // container-state rewrite is applied (that is a kubelet-only guarantee).
         crate::pod_status_merge::merge_pod_status_for_update(
             "v1",
             "Pod",
             &data,
             &mut status,
-            crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
+            crate::pod_status_merge::PodStatusOwner::Scheduler,
         );
         if let Some(object) = data.as_object_mut() {
             object.insert("status".to_string(), status);
