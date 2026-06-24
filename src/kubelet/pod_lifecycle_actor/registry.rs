@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::kubelet::outbox::Outbox;
 use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor;
 use crate::task_supervisor::{TaskCategory, TaskSupervisor};
@@ -130,6 +131,7 @@ pub struct PodLifecycleRegistry {
     executor_holder: Arc<std::sync::Mutex<Arc<dyn PodWorkExecutor>>>,
     reply_handle: std::sync::Mutex<Option<LifecycleReplyHandle>>,
     idle_grace: Duration,
+    runtime_observation_store: Option<Arc<Outbox>>,
 }
 
 #[derive(Clone, Debug)]
@@ -175,7 +177,16 @@ impl PodLifecycleRegistry {
             executor_holder,
             reply_handle: std::sync::Mutex::new(None),
             idle_grace,
+            runtime_observation_store: None,
         }
+    }
+
+    pub fn with_runtime_observation_store(
+        mut self,
+        runtime_observation_store: Option<Arc<Outbox>>,
+    ) -> Self {
+        self.runtime_observation_store = runtime_observation_store;
+        self
     }
 
     #[cfg(test)]
@@ -254,6 +265,7 @@ impl PodLifecycleRegistry {
                     shutdown_token,
                     instance,
                     idle_grace: self.idle_grace,
+                    runtime_observation_store: self.runtime_observation_store.clone(),
                 })
                 .run(rx),
             )

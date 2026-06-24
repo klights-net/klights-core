@@ -3,9 +3,8 @@
 //! `PodLifecycleState` tracks pod phase, in-flight work, monotonic operation ids,
 //! and sandbox identity so both actor and multiplex can share state-machine logic.
 
-use std::collections::BTreeSet;
-
 use super::message::{PodLifecycleKey, PodLifecycleWorkKind};
+use crate::kubelet::pod_runtime::observations::RuntimeReconcileObservations;
 
 /// Phases a pod transitions through during its lifecycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,7 +88,7 @@ pub struct PodLifecycleState {
     ///
     /// Replaces the singular `pending_runtime_reconcile_container_id` field so
     /// that multi-container pods and multiple CRI events are all preserved.
-    pub runtime_reconcile_observed_ids: BTreeSet<String>,
+    pub runtime_reconcile_observations: RuntimeReconcileObservations,
     /// A Running watch echo arrived while startup finalization was in flight.
     /// If that in-flight finalizer still cannot confirm probe startup, retry
     /// once with the newer watch state instead of waiting for another event.
@@ -116,7 +115,7 @@ impl Default for PodLifecycleState {
             retry_attempts: 0,
             last_resource_version: None,
             pending_runtime_reconcile: false,
-            runtime_reconcile_observed_ids: BTreeSet::new(),
+            runtime_reconcile_observations: RuntimeReconcileObservations::default(),
             pending_startup_finalization_retry: false,
         }
     }
@@ -151,7 +150,7 @@ impl PodLifecycleState {
         self.finalized = false;
         self.retry_attempts = 0;
         self.pending_runtime_reconcile = false;
-        self.runtime_reconcile_observed_ids.clear();
+        self.runtime_reconcile_observations = RuntimeReconcileObservations::new(uid.to_string());
         self.pending_startup_finalization_retry = false;
         self.phase = PodPhase::Created;
     }
@@ -390,8 +389,36 @@ impl PodLifecycleState {
     pub fn defer_runtime_reconcile(&mut self, container_id: Option<&str>) {
         self.pending_runtime_reconcile = true;
         if let Some(id) = container_id.filter(|id| !id.is_empty()) {
-            self.runtime_reconcile_observed_ids.insert(id.to_string());
+            self.runtime_reconcile_observations.observe(id);
         }
+    }
+
+    pub fn restore_runtime_reconcile_observations(
+        &mut self,
+        pod_uid: impl Into<String>,
+        container_ids: impl IntoIterator<Item = impl Into<String>>,
+        generation: u64,
+    ) {
+        let mut observations =
+            RuntimeReconcileObservations::from_checkpoint(pod_uid, container_ids, generation);
+        let current_ids = self.runtime_reconcile_observation_container_ids();
+        observations.observe_all(current_ids);
+        if observations.is_empty() {
+            return;
+        }
+        self.pending_runtime_reconcile = true;
+        self.runtime_reconcile_observations = observations;
+    }
+
+    pub fn runtime_reconcile_observation_container_ids(&self) -> Vec<String> {
+        self.runtime_reconcile_observations
+            .container_ids()
+            .map(str::to_string)
+            .collect()
+    }
+
+    pub fn runtime_reconcile_observation_generation(&self) -> u64 {
+        self.runtime_reconcile_observations.generation()
     }
 
     /// Drain all deferred runtime reconcile observations into a `RuntimeReconcileHint`.
@@ -404,7 +431,7 @@ impl PodLifecycleState {
             return crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none();
         }
         self.pending_runtime_reconcile = false;
-        let ids = std::mem::take(&mut self.runtime_reconcile_observed_ids);
+        let ids = self.runtime_reconcile_observations.drain();
         crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_ids(ids)
     }
 }

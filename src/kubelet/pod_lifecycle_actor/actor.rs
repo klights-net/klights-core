@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::kubelet::outbox::Outbox;
 use crate::kubelet::pod_lifecycle_core::action::PodAction;
 use crate::kubelet::pod_lifecycle_core::message::{
     LifecycleMessage, PodLifecycleKey, PodLifecycleWorkFailure, PodLifecycleWorkKind, PodSlotKey,
@@ -34,6 +35,13 @@ pub fn pod_actor_idle_grace_duration() -> Duration {
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_POD_ACTOR_IDLE_GRACE_SECS))
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
 pub type PodLifecycleActorStateMap = Arc<Mutex<HashMap<PodSlotKey, PodLifecycleActorStateEntry>>>;
 
 pub struct PodLifecycleActorRuntime {
@@ -47,6 +55,7 @@ pub struct PodLifecycleActorRuntime {
     pub shutdown_token: CancellationToken,
     pub instance: ActorInstanceToken,
     pub idle_grace: Duration,
+    pub runtime_observation_store: Option<Arc<Outbox>>,
 }
 
 fn pod_has_ephemeral_containers(pod: &serde_json::Value) -> bool {
@@ -163,6 +172,8 @@ pub struct PodLifecycleActor {
     idle_generation: u64,
     idle_timer_armed_generation: Option<u64>,
     last_key: Option<PodLifecycleKey>,
+    runtime_observation_store: Option<Arc<Outbox>>,
+    runtime_observation_checkpoint_loaded_for: Option<String>,
     #[cfg(test)]
     event_sink: Option<mpsc::Sender<&'static str>>,
     #[cfg(test)]
@@ -198,6 +209,8 @@ impl PodLifecycleActor {
             idle_generation: 0,
             idle_timer_armed_generation: None,
             last_key: None,
+            runtime_observation_store: None,
+            runtime_observation_checkpoint_loaded_for: None,
             event_sink: Some(event_sink),
             uid_mismatch_warnings: Vec::new(),
             fail_next_spawn: false,
@@ -224,6 +237,8 @@ impl PodLifecycleActor {
             idle_generation: 0,
             idle_timer_armed_generation: None,
             last_key: None,
+            runtime_observation_store: runtime.runtime_observation_store,
+            runtime_observation_checkpoint_loaded_for: None,
             #[cfg(test)]
             event_sink: None,
             #[cfg(test)]
@@ -378,6 +393,27 @@ impl PodLifecycleActor {
         completion_tx: &mpsc::Sender<LifecycleMessage>,
     ) -> Option<SupervisedJoinHandle<()>> {
         let key = message.key().clone();
+        let checkpoint_after_defer_candidate = match &message {
+            LifecycleMessage::CriEvent { key, .. }
+            | LifecycleMessage::ActiveDeadlineDue { key } => Some(key.clone()),
+            _ => None,
+        };
+        let completed_runtime_reconcile = match &message {
+            LifecycleMessage::PodWorkCompleted {
+                key,
+                kind: PodLifecycleWorkKind::ReconcileRuntime,
+                ..
+            } => Some(key.clone()),
+            _ => None,
+        };
+        let completed_pod_finalization = match &message {
+            LifecycleMessage::PodWorkCompleted {
+                key,
+                kind: PodLifecycleWorkKind::FinalizePodDeletion,
+                ..
+            } => Some(key.clone()),
+            _ => None,
+        };
         if self.slot.is_none() {
             self.slot = Some(PodSlotKey::from(&key));
         }
@@ -395,7 +431,7 @@ impl PodLifecycleActor {
         {
             let mut trace = self.trace.lock().await;
             trace.record(LifecycleTraceEntry::new(
-                key,
+                key.clone(),
                 message.event_name(),
                 message.resource_version(),
                 message.sandbox_id_hint(),
@@ -403,8 +439,133 @@ impl PodLifecycleActor {
             ));
         }
 
+        self.load_runtime_observation_checkpoint_once(&key).await;
         let action = self.handle(message);
+        self.load_runtime_observation_checkpoint_once(&key).await;
+        if let Some(key) = checkpoint_after_defer_candidate {
+            self.persist_pending_runtime_observation_checkpoint(&key)
+                .await;
+        }
+        let dispatches_runtime_reconcile = matches!(&action, PodAction::ReconcileRuntime { .. });
+        self.persist_runtime_reconcile_action_checkpoint(&action)
+            .await;
+        if let Some(key) = completed_runtime_reconcile
+            && !dispatches_runtime_reconcile
+            && !self.state.pending_runtime_reconcile
+        {
+            self.delete_runtime_observation_checkpoint(&key).await;
+        }
+        if let Some(key) = completed_pod_finalization {
+            self.delete_runtime_observation_checkpoint(&key).await;
+        }
         self.dispatch_action(action, completion_tx).await
+    }
+
+    async fn load_runtime_observation_checkpoint_once(&mut self, key: &PodLifecycleKey) {
+        if self.runtime_observation_checkpoint_loaded_for.as_deref() == Some(key.uid.as_str()) {
+            return;
+        }
+        if !self.state.active_uid_matches(&key.uid) {
+            return;
+        }
+        let Some(store) = &self.runtime_observation_store else {
+            self.runtime_observation_checkpoint_loaded_for = Some(key.uid.clone());
+            return;
+        };
+        match store.get_runtime_observation_checkpoint(&key.uid).await {
+            Ok(Some(checkpoint)) => {
+                let count = checkpoint.container_ids.len();
+                self.state.restore_runtime_reconcile_observations(
+                    checkpoint.pod_uid,
+                    checkpoint.container_ids,
+                    checkpoint.generation,
+                );
+                tracing::info!(
+                    namespace = %key.namespace,
+                    pod = %key.name,
+                    uid = %key.uid,
+                    container_count = count,
+                    "lifecycle-actor: restored runtime observation checkpoint"
+                );
+                self.runtime_observation_checkpoint_loaded_for = Some(key.uid.clone());
+            }
+            Ok(None) => {
+                self.runtime_observation_checkpoint_loaded_for = Some(key.uid.clone());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    namespace = %key.namespace,
+                    pod = %key.name,
+                    uid = %key.uid,
+                    "lifecycle-actor: failed to load runtime observation checkpoint: {err:#}"
+                );
+            }
+        }
+    }
+
+    async fn persist_pending_runtime_observation_checkpoint(&self, key: &PodLifecycleKey) {
+        if !self.state.pending_runtime_reconcile || !self.state.active_uid_matches(&key.uid) {
+            return;
+        }
+        let ids = self.state.runtime_reconcile_observation_container_ids();
+        if ids.is_empty() {
+            return;
+        }
+        self.persist_runtime_observation_checkpoint_ids(
+            key,
+            ids,
+            self.state.runtime_reconcile_observation_generation(),
+        )
+        .await;
+    }
+
+    async fn persist_runtime_reconcile_action_checkpoint(&self, action: &PodAction) {
+        let PodAction::ReconcileRuntime { key, hint, .. } = action else {
+            return;
+        };
+        let ids = hint.container_ids().map(str::to_string).collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        let generation = ids.len() as u64;
+        self.persist_runtime_observation_checkpoint_ids(key, ids, generation)
+            .await;
+    }
+
+    async fn persist_runtime_observation_checkpoint_ids(
+        &self,
+        key: &PodLifecycleKey,
+        ids: Vec<String>,
+        generation: u64,
+    ) {
+        let Some(store) = &self.runtime_observation_store else {
+            return;
+        };
+        if let Err(err) = store
+            .record_runtime_observation_checkpoint(&key.uid, ids, generation.max(1), now_ms())
+            .await
+        {
+            tracing::warn!(
+                namespace = %key.namespace,
+                pod = %key.name,
+                uid = %key.uid,
+                "lifecycle-actor: failed to persist runtime observation checkpoint: {err:#}"
+            );
+        }
+    }
+
+    async fn delete_runtime_observation_checkpoint(&self, key: &PodLifecycleKey) {
+        let Some(store) = &self.runtime_observation_store else {
+            return;
+        };
+        if let Err(err) = store.delete_runtime_observation_checkpoint(&key.uid).await {
+            tracing::warn!(
+                namespace = %key.namespace,
+                pod = %key.name,
+                uid = %key.uid,
+                "lifecycle-actor: failed to delete runtime observation checkpoint: {err:#}"
+            );
+        }
     }
 
     async fn dispatch_action(

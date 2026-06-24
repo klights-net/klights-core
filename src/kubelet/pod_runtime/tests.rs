@@ -10234,6 +10234,28 @@ mod task4_runtime_observations {
         );
     }
 
+    #[test]
+    fn restored_runtime_observation_checkpoint_drains_into_reconcile_hint() {
+        let mut state = PodLifecycleState::new();
+        state.admit_uid("uid-restored");
+        state.restore_runtime_reconcile_observations(
+            "uid-restored",
+            ["ctr-restored-a", "ctr-restored-b"],
+            7,
+        );
+
+        let hint = state.take_runtime_reconcile_hint();
+        let ids: std::collections::BTreeSet<_> = hint.container_ids().collect();
+        assert_eq!(
+            ids,
+            ["ctr-restored-a", "ctr-restored-b"]
+                .iter()
+                .copied()
+                .collect()
+        );
+        assert!(state.take_runtime_reconcile_hint().is_empty());
+    }
+
     #[tokio::test]
     async fn runtime_reconcile_uses_hinted_container_when_listing_is_partially_stale() {
         use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;

@@ -33,6 +33,22 @@ impl RuntimeReconcileObservations {
         }
     }
 
+    pub fn from_checkpoint(
+        pod_uid: impl Into<String>,
+        container_ids: impl IntoIterator<Item = impl Into<String>>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            pod_uid: pod_uid.into(),
+            container_ids: container_ids
+                .into_iter()
+                .map(Into::into)
+                .filter(|id: &String| !id.is_empty())
+                .collect(),
+            generation,
+        }
+    }
+
     pub fn pod_uid(&self) -> &str {
         &self.pod_uid
     }

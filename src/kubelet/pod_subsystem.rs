@@ -116,13 +116,16 @@ impl PodSubsystem {
             cluster_api: config.cluster_api.clone(),
         });
 
-        let registry = Arc::new(PodLifecycleRegistry::new(
-            config.supervisor.clone(),
-            config.lifecycle_concurrency,
-            Arc::new(std::sync::Mutex::new(Arc::new(
-                crate::kubelet::pod_lifecycle_router::executor::NoopExecutor,
-            ))),
-        ));
+        let registry = Arc::new(
+            PodLifecycleRegistry::new(
+                config.supervisor.clone(),
+                config.lifecycle_concurrency,
+                Arc::new(std::sync::Mutex::new(Arc::new(
+                    crate::kubelet::pod_lifecycle_router::executor::NoopExecutor,
+                ))),
+            )
+            .with_runtime_observation_store(outbox.clone()),
+        );
         let lifecycle_router = Arc::new(PodLifecycleRouter::new_actor(registry));
         let lifecycle_service = PodLifecycleService::new(lifecycle_router.clone());
         let repository = Arc::new(parts.repository);

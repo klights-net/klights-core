@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::Resource;
 use crate::datastore::command::StorageCommand;
+use crate::datastore::node_local::sqlite::RuntimeObservationCheckpoint;
 use crate::datastore::node_local::{NodeLocalHandle, OutboxInsert, OutboxRow};
 use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
@@ -442,6 +443,38 @@ impl Outbox {
 
     pub async fn delete_pod_status_checkpoint(&self, pod_uid: &str) -> Result<()> {
         self.node_db.delete_pod_status_checkpoint(pod_uid).await
+    }
+
+    pub async fn record_runtime_observation_checkpoint(
+        &self,
+        pod_uid: &str,
+        container_ids: Vec<String>,
+        generation: u64,
+        updated_ms: i64,
+    ) -> Result<()> {
+        self.node_db
+            .upsert_runtime_observation_checkpoint(RuntimeObservationCheckpoint {
+                pod_uid: pod_uid.to_string(),
+                container_ids,
+                generation,
+                updated_ms,
+            })
+            .await
+    }
+
+    pub async fn get_runtime_observation_checkpoint(
+        &self,
+        pod_uid: &str,
+    ) -> Result<Option<RuntimeObservationCheckpoint>> {
+        self.node_db
+            .get_runtime_observation_checkpoint(pod_uid)
+            .await
+    }
+
+    pub async fn delete_runtime_observation_checkpoint(&self, pod_uid: &str) -> Result<()> {
+        self.node_db
+            .delete_runtime_observation_checkpoint(pod_uid)
+            .await
     }
 }
 
@@ -946,6 +979,47 @@ mod tests {
         )
         .await
         .expect("open node-local test db")
+    }
+
+    #[tokio::test]
+    async fn outbox_runtime_observation_checkpoint_round_trips_by_uid() {
+        let node_db = node_db().await;
+        let outbox = Outbox::new(node_db);
+
+        outbox
+            .record_runtime_observation_checkpoint(
+                "uid-runtime-checkpoint",
+                vec!["ctr-a".to_string(), "ctr-b".to_string()],
+                2,
+                1234,
+            )
+            .await
+            .expect("record runtime observation checkpoint");
+
+        let loaded = outbox
+            .get_runtime_observation_checkpoint("uid-runtime-checkpoint")
+            .await
+            .expect("load runtime observation checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(loaded.pod_uid, "uid-runtime-checkpoint");
+        assert_eq!(
+            loaded.container_ids,
+            vec!["ctr-a".to_string(), "ctr-b".to_string()]
+        );
+        assert_eq!(loaded.generation, 2);
+        assert_eq!(loaded.updated_ms, 1234);
+
+        outbox
+            .delete_runtime_observation_checkpoint("uid-runtime-checkpoint")
+            .await
+            .expect("delete runtime observation checkpoint");
+        assert!(
+            outbox
+                .get_runtime_observation_checkpoint("uid-runtime-checkpoint")
+                .await
+                .expect("load after delete")
+                .is_none()
+        );
     }
 
     /// A worker restart resets the in-memory stamp allocator, and the host
