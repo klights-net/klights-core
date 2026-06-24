@@ -398,3 +398,121 @@ async fn service_create_releases_cluster_ip_when_nodeport_allocation_fails() {
         "ClusterIP reserved before the failed NodePort allocation must be released"
     );
 }
+
+/// Task 10 regression: when Service allocation/defaulting fails inside the
+/// create path (`create_inner` -> `prepare_service_for_create`), the handler
+/// must return an error BEFORE reaching the
+/// `enqueue_generated_controller_after_mutation` call at the bottom of
+/// `create_inner`. A regression that swallows the allocation error and falls
+/// through to the enqueue (or that enqueues before allocation) would re-arm a
+/// Service reconcile for a Service that was never persisted.
+///
+/// This drives the real HTTP create path end-to-end and observes the enqueue
+/// through `MockServiceRouter`: every successful Service reconcile (synchronous
+/// fallback in the test dispatcher) bumps `sync_count`, so an enqueue after the
+/// failed create would make `sync_count` non-zero. The test fails if a future
+/// change enqueues after an allocation failure.
+#[tokio::test]
+async fn create_service_does_not_enqueue_reconcile_after_allocation_failure() {
+    use axum::http::StatusCode;
+
+    let state = crate::api::test_support::build_test_app_state().await;
+    // Exhaust the NodePort range so NodePort allocation inside
+    // `prepare_service_for_create` fails for a NodePort Service.
+    for port in 30000..=32767 {
+        state.nodeport_alloc.mark_used(port);
+    }
+    let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
+    state
+        .controller_dispatcher
+        .set_services(services.clone() as Arc<dyn crate::networking::ServiceRouter>)
+        .await;
+    let app = crate::api::build_router(state);
+
+    let (status, _) = post_service(
+        app,
+        "alloc-fail-no-enqueue-svc",
+        json!({
+            "type": "NodePort",
+            "selector": {"app": "web"},
+            "ports": [{"port": 80}]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Service create must fail when NodePort allocation is exhausted"
+    );
+
+    assert_eq!(
+        services.sync_count(),
+        0,
+        "create path must NOT enqueue a Service reconcile after allocation failure"
+    );
+    assert_eq!(
+        services.sync_now_count(),
+        0,
+        "create path must NOT run an immediate route sync after allocation failure"
+    );
+}
+
+/// Task 10 regression: a successful Service create must (a) populate the
+/// allocated identity fields (`spec.clusterIP` / `spec.clusterIPs`) in the
+/// persisted+returned object and (b) enqueue EXACTLY one Service reconcile
+/// through `controller_dispatcher.enqueue(` at the end of `create_inner`.
+///
+/// Driving the real HTTP create path is required because
+/// `prepare_service_for_create` performs allocation only — the enqueue happens
+/// later in `create_inner`. Asserting `sync_count() == 1` here fences both an
+/// accidental second enqueue and a regression that drops the enqueue entirely.
+#[tokio::test]
+async fn create_service_success_response_contains_allocated_fields_and_enqueues_once() {
+    use axum::http::StatusCode;
+
+    let state = crate::api::test_support::build_test_app_state().await;
+    let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
+    state
+        .controller_dispatcher
+        .set_services(services.clone() as Arc<dyn crate::networking::ServiceRouter>)
+        .await;
+    let app = crate::api::build_router(state);
+
+    let (status, body) = post_service(
+        app,
+        "allocated-and-enqueued-svc",
+        json!({
+            "type": "ClusterIP",
+            "selector": {"app": "web"},
+            "ports": [{"port": 80}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let cluster_ip = body
+        .pointer("/spec/clusterIP")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    assert!(
+        !cluster_ip.is_empty() && cluster_ip != "None",
+        "create response must carry an allocated clusterIP, got: {cluster_ip:?}"
+    );
+    assert!(
+        body.pointer("/spec/clusterIPs")
+            .and_then(|value| value.as_array())
+            .is_some_and(|arr| !arr.is_empty()),
+        "create response must carry non-empty clusterIPs"
+    );
+
+    assert_eq!(
+        services.sync_count(),
+        1,
+        "successful Service create must enqueue exactly one Service reconcile"
+    );
+    assert_eq!(
+        services.sync_now_count(),
+        0,
+        "successful Service create must not run an immediate route sync on the request path"
+    );
+}

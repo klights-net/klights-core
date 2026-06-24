@@ -1264,52 +1264,20 @@ async fn create_service_returns_error_when_allocation_fails() {
     );
 }
 
-#[tokio::test]
-async fn create_service_does_not_enqueue_reconcile_after_allocation_failure() {
-    // Verify that prepare_service_for_create returns Err when allocation fails.
-    // The create_inner handler only enqueues after a successful prepare call,
-    // so an Err return means no enqueue is issued.
-    let db = crate::datastore::test_support::in_memory().await;
-    let service_ipam = ServiceIpam::new("10.0.0.0/30");
-    let nodeport_alloc = NodePortAllocator::new();
-    nodeport_alloc.set_ready();
-
-    db.create_resource(
-        "v1",
-        "Service",
-        Some("default"),
-        "occupying-svc",
-        json!({
-            "apiVersion": "v1", "kind": "Service",
-            "metadata": {"name": "occupying-svc", "namespace": "default"},
-            "spec": {
-                "type": "ClusterIP",
-                "clusterIP": "10.0.0.2",
-                "clusterIPs": ["10.0.0.2"],
-                "ports": [{"port": 80, "protocol": "TCP"}]
-            }
-        }),
-    )
-    .await
-    .unwrap();
-    let _ = service_ipam.allocate();
-
-    let mut new_svc = json!({
-        "apiVersion": "v1", "kind": "Service",
-        "metadata": {"name": "new-svc", "namespace": "default"},
-        "spec": {"type": "ClusterIP", "ports": [{"port": 80, "protocol": "TCP"}]}
-    });
-    let result =
-        prepare_service_for_create(&db, &mut new_svc, &service_ipam, &nodeport_alloc).await;
-    // Err return → create_inner propagates the error before the enqueue call at inners.rs:749
-    assert!(
-        result.is_err(),
-        "allocation failure must propagate as Err so the caller cannot enqueue"
-    );
-}
+// NOTE: The "does not enqueue after allocation failure" and "enqueues exactly
+// once on success" invariants are end-to-end properties of the create handler
+// (`create_inner` -> `prepare_service_for_create` -> ... ->
+// `enqueue_generated_controller_after_mutation`). `prepare_service_for_create`
+// performs allocation only and never enqueues, so it cannot observe the enqueue
+// here. Those two tests therefore live in
+// `src/api/handlers/core_v1_tests.rs` where the HTTP create path is driven and
+// the enqueue is observed via `MockServiceRouter::sync_count`:
+//   - create_service_does_not_enqueue_reconcile_after_allocation_failure
+//   - create_service_success_response_contains_allocated_fields_and_enqueues_once
+// The tests below cover the allocation primitive in isolation.
 
 #[tokio::test]
-async fn create_service_success_response_contains_allocated_fields_and_enqueues_once() {
+async fn prepare_service_for_create_populates_allocated_fields() {
     // A normal Service create allocates a ClusterIP and populates the spec.
     let db = crate::datastore::test_support::in_memory().await;
     let service_ipam = ServiceIpam::new("10.43.128.0/17");
