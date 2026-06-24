@@ -495,43 +495,27 @@ pub async fn reconcile_service_with_nodeport(
                 .map(|v| v == "true")
                 .unwrap_or(false);
 
-        // Create or update Endpoints
-        crate::controllers::endpoints::reconcile_endpoints(
-            db,
-            pod_reader,
-            updated_metadata
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing updated name"))?,
-            updated_metadata
-                .get("namespace")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing updated namespace"))?,
-            updated_spec.get("selector"),
-            updated_spec.get("ports"),
-            publish_not_ready,
-        )
-        .await?;
-
-        // Create or update EndpointSlice (discovery.k8s.io/v1)
         let service_uid = updated_metadata
             .get("uid")
             .and_then(|u| u.as_str())
             .unwrap_or("");
-        crate::controllers::endpoints::reconcile_endpointslice(
+        crate::controllers::endpoints::reconcile_service_endpoints_batch(
             db,
             pod_reader,
-            updated_metadata
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing updated name"))?,
-            service_uid,
-            updated_metadata
-                .get("namespace")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing updated namespace"))?,
-            updated_spec.get("selector"),
-            updated_spec.get("ports"),
+            crate::controllers::endpoints::ServiceEndpointBatchReconcileRequest {
+                service_name: updated_metadata
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing updated name"))?,
+                service_uid,
+                namespace: updated_metadata
+                    .get("namespace")
+                    .and_then(|n| n.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing updated namespace"))?,
+                selector: updated_spec.get("selector"),
+                service_ports: updated_spec.get("ports"),
+                publish_not_ready,
+            },
         )
         .await?;
     }

@@ -94,6 +94,95 @@ async fn test_service_stale_snapshot_after_delete_does_not_recreate_endpoints() 
     );
 }
 
+#[tokio::test]
+async fn service_reconcile_commits_endpointslice_and_legacy_endpoints_in_one_batch() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let service_ipam = ServiceIpam::new("10.43.128.0/17");
+
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "latency-pod",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "latency-pod",
+                "namespace": "default",
+                "uid": "latency-pod-uid",
+                "labels": {"app": "latency"}
+            },
+            "spec": {"containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 8080}]}]},
+            "status": {
+                "phase": "Running",
+                "podIP": "10.43.0.21",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let service = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "latency-svc", "namespace": "default", "uid": "latency-svc-uid"},
+        "spec": {
+            "type": "ClusterIP",
+            "clusterIP": "10.43.128.21",
+            "clusterIPs": ["10.43.128.21"],
+            "sessionAffinity": "None",
+            "selector": {"app": "latency"},
+            "ports": [{"name": "http", "port": 80, "targetPort": 8080, "protocol": "TCP"}]
+        }
+    });
+    let created = db
+        .create_resource("v1", "Service", Some("default"), "latency-svc", service)
+        .await
+        .unwrap();
+    let service_snapshot =
+        crate::api::inject_resource_version(created.data, created.resource_version);
+
+    reconcile_service(
+        &db,
+        crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+        &service_snapshot,
+        &service_ipam,
+    )
+    .await
+    .unwrap();
+
+    let endpoints = db
+        .get_resource("v1", "Endpoints", Some("default"), "latency-svc")
+        .await
+        .unwrap()
+        .expect("legacy Endpoints should be reconciled");
+    let slices = db
+        .list_resources(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            crate::datastore::ResourceListQuery::new(
+                Some("kubernetes.io/service-name=latency-svc"),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    let slice = slices
+        .items
+        .first()
+        .expect("EndpointSlice should be reconciled");
+
+    assert_eq!(
+        slice.resource_version, endpoints.resource_version,
+        "EndpointSlice and legacy Endpoints must be committed in the same raft entry"
+    );
+}
+
 #[test]
 fn test_service_ipam_reserves_dot_one_for_kubernetes_service() {
     // The kubernetes service hardcodes 10.43.128.1 (KUBERNETES_SERVICE_IP)
