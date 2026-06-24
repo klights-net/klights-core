@@ -563,7 +563,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                     let mut delay = std::time::Duration::from_millis(500);
                     let max_delay = std::time::Duration::from_secs(30);
                     loop {
-                        let dispatcher = crate::kubelet::outbox::OutboxDispatcher::new(
+                        let dispatcher = crate::kubelet::outbox::OutboxDispatcher::production(
                             node_local_for_retry.clone(),
                             apply_client_for_retry.clone(),
                             notify_for_retry.clone(),

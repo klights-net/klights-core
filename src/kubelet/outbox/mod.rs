@@ -31,6 +31,7 @@ const MAX_OUTBOX_ATTEMPTS: i64 = 720;
 // Status channel-lane pool size so concurrent `apply_outbox` calls spread
 // one-per-connection across the lane (no single-connection TCP HOL).
 pub const DEFAULT_DISPATCH_INFLIGHT: usize = 4;
+pub const PRODUCTION_DISPATCH_BATCH_SIZE: usize = 16;
 // bug-grpc: backoff after a transient dispatch-iteration error so the
 // dispatcher loop never exits (worker status reporting must not die).
 const DISPATCH_ERROR_BACKOFF_MS: u64 = 500;
@@ -528,6 +529,14 @@ impl OutboxDispatcher {
         }
     }
 
+    pub(crate) fn production(
+        node_db: NodeLocalHandle,
+        client: Arc<dyn OutboxApplyClient>,
+        notify: Arc<Notify>,
+    ) -> Self {
+        Self::new(node_db, client, notify).with_batch_mode(PRODUCTION_DISPATCH_BATCH_SIZE)
+    }
+
     /// Return shared counters so callers (node_admin) can read them
     /// without going through node.db (future optimization).
     pub fn dispatch_counters(
@@ -951,7 +960,7 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use std::collections::HashSet;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
 
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend_kind::BackendKind;
@@ -1394,6 +1403,54 @@ mod tests {
         assert!(
             max <= batch,
             "in-flight window must not exceed the batch size, saw {max} > {batch}"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_dispatcher_drains_multiple_status_subjects_per_tick() {
+        let node_db = node_db().await;
+        let outbox = Outbox::new(node_db.clone());
+        let client = Arc::new(FakeApplyClient::default());
+        let dispatcher =
+            OutboxDispatcher::production(node_db.clone(), client.clone(), Arc::new(Notify::new()));
+
+        for i in 0..8 {
+            let pod = format!("production-pod-{i}");
+            let uid = format!("production-uid-{i}");
+            outbox
+                .enqueue_command(OutboxCommand::new(
+                    format!("production-key-{i}"),
+                    OutboxOperation::PodStatus,
+                    OutboxSubject::new(
+                        format!("v1/Pod/default/{pod}/{uid}"),
+                        Some("default".to_string()),
+                        pod.clone(),
+                        Some(uid.clone()),
+                    ),
+                    &uid,
+                    pod_status_command("default", &pod, &uid),
+                    10,
+                ))
+                .await
+                .expect("enqueue");
+        }
+
+        assert_eq!(
+            dispatcher.dispatch_due_once(20).await.expect("dispatch"),
+            DispatchOutcome::Dispatched
+        );
+        let calls = client.calls().await;
+        assert_eq!(
+            calls.len(),
+            8,
+            "production dispatcher must drain independent due status rows in one tick"
+        );
+        assert!(
+            node_db
+                .claim_next_due_outbox(20, 1_000, "assert-empty")
+                .await
+                .expect("claim after production dispatch")
+                .is_none()
         );
     }
 
