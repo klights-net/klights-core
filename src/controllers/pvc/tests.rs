@@ -183,6 +183,132 @@ async fn test_pvc_binds_to_matching_pv() {
 }
 
 #[tokio::test]
+async fn test_pvc_bind_preserves_status_conditions() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    let pv = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {"name": "condition-pv"},
+        "spec": {
+            "capacity": {"storage": "1Gi"},
+            "accessModes": ["ReadWriteOnce"],
+            "persistentVolumeReclaimPolicy": "Retain"
+        },
+        "status": {"phase": "Available"}
+    });
+    db.create_resource("v1", "PersistentVolume", None, "condition-pv", pv)
+        .await
+        .unwrap();
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "condition-pvc", "namespace": "default"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Gi"}}
+        },
+        "status": {
+            "phase": "Pending",
+            "conditions": [{
+                "type": "StatusPatched",
+                "status": "True",
+                "reason": "E2E patchedStatus",
+                "message": "Set from e2e test"
+            }]
+        }
+    });
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "condition-pvc",
+        pvc,
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "condition-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pvc = get_pvc(&db, "default", "condition-pvc").await;
+    assert_eq!(pvc.pointer("/status/phase"), Some(&json!("Bound")));
+    assert_eq!(
+        pvc.pointer("/status/conditions/0/type"),
+        Some(&json!("StatusPatched")),
+        "PVC binding must preserve conditions written through the status subresource"
+    );
+    assert_eq!(
+        pvc.pointer("/status/conditions/0/reason"),
+        Some(&json!("E2E patchedStatus"))
+    );
+    assert_eq!(
+        pvc.pointer("/status/conditions/0/message"),
+        Some(&json!("Set from e2e test"))
+    );
+}
+
+#[tokio::test]
+async fn test_pv_bind_preserves_status_reason_and_message() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    let pv = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {"name": "message-pv"},
+        "spec": {
+            "capacity": {"storage": "1Gi"},
+            "accessModes": ["ReadWriteOnce"],
+            "persistentVolumeReclaimPolicy": "Retain"
+        },
+        "status": {
+            "phase": "Available",
+            "reason": "E2E patchStatus",
+            "message": "StatusPatched"
+        }
+    });
+    db.create_resource("v1", "PersistentVolume", None, "message-pv", pv)
+        .await
+        .unwrap();
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "message-pvc", "namespace": "default"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Gi"}}
+        }
+    });
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "message-pvc",
+        pvc,
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "message-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pv = get_pv(&db, "message-pv").await;
+    assert_eq!(pv.pointer("/status/phase"), Some(&json!("Bound")));
+    assert_eq!(
+        pv.pointer("/status/reason"),
+        Some(&json!("E2E patchStatus")),
+        "PV binding must preserve reason written through the status subresource"
+    );
+    assert_eq!(
+        pv.pointer("/status/message"),
+        Some(&json!("StatusPatched")),
+        "PV binding must preserve message written through the status subresource"
+    );
+}
+
+#[tokio::test]
 async fn test_pvc_status_pending_when_no_matching_pv() {
     let db = crate::datastore::test_support::in_memory().await;
 

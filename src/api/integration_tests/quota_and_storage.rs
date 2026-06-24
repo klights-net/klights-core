@@ -912,6 +912,65 @@ async fn test_pvc_status_subresource_get() {
 }
 
 #[tokio::test]
+async fn test_patch_pvc_status_merge_patch_returns_conditions() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let ns_body =
+        r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"pvc-status-patch"}}"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(ns_body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let pvc_body = r#"{
+        "apiVersion":"v1",
+        "kind":"PersistentVolumeClaim",
+        "metadata":{"name":"pvc1","namespace":"pvc-status-patch"},
+        "spec":{
+            "accessModes":["ReadWriteOnce"],
+            "resources":{"requests":{"storage":"1Gi"}}
+        }
+    }"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/pvc-status-patch/persistentvolumeclaims")
+        .header("content-type", "application/json")
+        .body(Body::from(pvc_body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let patch = r#"{"status":{"conditions":[{"type":"StatusPatched","status":"True","reason":"E2E patchedStatus","message":"Set from e2e test"}]}}"#;
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/namespaces/pvc-status-patch/persistentvolumeclaims/pvc1/status")
+        .header("content-type", "application/merge-patch+json")
+        .body(Body::from(patch))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let condition = body
+        .pointer("/status/conditions/0")
+        .expect("patched PVC status condition must be returned");
+    assert_eq!(condition["type"], "StatusPatched");
+    assert_eq!(condition["status"], "True");
+    assert_eq!(condition["reason"], "E2E patchedStatus");
+    assert_eq!(condition["message"], "Set from e2e test");
+}
+
+#[tokio::test]
 async fn test_pv_status_defaults_phase_available_on_create() {
     use axum::{
         body::Body,

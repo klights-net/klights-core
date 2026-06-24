@@ -9,6 +9,18 @@ fn inject_resource_version(data: &mut Value, rv: i64) {
     }
 }
 
+fn status_with_updates<const N: usize>(resource: &Value, updates: [(&str, Value); N]) -> Value {
+    let mut status = resource
+        .get("status")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in updates {
+        status.insert(key.to_string(), value);
+    }
+    Value::Object(status)
+}
+
 /// Provision a PV for a PVC that has a storageClassName matching a known provisioner.
 /// Currently supports "local-path" (hostPath under KLIGHTS_DATA_ROOT/local-path-provisioner/).
 /// Returns the created PV name, or None if storageClassName is not provisioned.
@@ -265,11 +277,28 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
 
         // Update PV status to Bound and set claimRef
         if let Some(pv_obj) = updated_pv.as_object_mut() {
-            let pv_status = json!({
-                "phase": "Bound",
-                "accessModes": pv.data.get("spec").and_then(|s| s.get("accessModes")).cloned().unwrap_or(json!([])),
-                "capacity": pv.data.get("spec").and_then(|s| s.get("capacity")).cloned().unwrap_or(json!({}))
-            });
+            let pv_status = status_with_updates(
+                &pv.data,
+                [
+                    ("phase", json!("Bound")),
+                    (
+                        "accessModes",
+                        pv.data
+                            .get("spec")
+                            .and_then(|s| s.get("accessModes"))
+                            .cloned()
+                            .unwrap_or(json!([])),
+                    ),
+                    (
+                        "capacity",
+                        pv.data
+                            .get("spec")
+                            .and_then(|s| s.get("capacity"))
+                            .cloned()
+                            .unwrap_or(json!({})),
+                    ),
+                ],
+            );
             pv_obj.insert("status".to_string(), pv_status);
 
             // Set claimRef in PV spec to reference the bound PVC
@@ -294,14 +323,15 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         // Update PVC status to Bound
         let mut updated_pvc = pvc.clone();
         if let Some(pvc_obj) = updated_pvc.as_object_mut() {
-            let pvc_status = json!({
-                "phase": "Bound",
-                "accessModes": access_modes,
-                "capacity": {
-                    "storage": requested_storage
-                },
-                "volumeName": pv_name
-            });
+            let pvc_status = status_with_updates(
+                &pvc,
+                [
+                    ("phase", json!("Bound")),
+                    ("accessModes", json!(access_modes)),
+                    ("capacity", json!({"storage": requested_storage})),
+                    ("volumeName", json!(pv_name)),
+                ],
+            );
             pvc_obj.insert("status".to_string(), pvc_status);
         }
 
@@ -349,12 +379,15 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
             .cloned()
             .unwrap_or(json!({}));
 
+        let pv_status = status_with_updates(
+            &updated_pv,
+            [
+                ("phase", json!("Bound")),
+                ("accessModes", pv_access_modes),
+                ("capacity", pv_capacity),
+            ],
+        );
         if let Some(pv_obj) = updated_pv.as_object_mut() {
-            let pv_status = json!({
-                "phase": "Bound",
-                "accessModes": pv_access_modes,
-                "capacity": pv_capacity
-            });
             pv_obj.insert("status".to_string(), pv_status);
 
             // Set claimRef in PV spec to reference the bound PVC
@@ -385,14 +418,15 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         // Update PVC status to Bound
         let mut updated_pvc = pvc.clone();
         if let Some(pvc_obj) = updated_pvc.as_object_mut() {
-            let pvc_status = json!({
-                "phase": "Bound",
-                "accessModes": access_modes,
-                "capacity": {
-                    "storage": requested_storage
-                },
-                "volumeName": provisioned_pv_name
-            });
+            let pvc_status = status_with_updates(
+                &pvc,
+                [
+                    ("phase", json!("Bound")),
+                    ("accessModes", json!(access_modes)),
+                    ("capacity", json!({"storage": requested_storage})),
+                    ("volumeName", json!(provisioned_pv_name)),
+                ],
+            );
             pvc_obj.insert("status".to_string(), pvc_status);
         }
 
@@ -431,9 +465,7 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
     // No provisioning happened - set status to Pending
     let mut updated_pvc = pvc.clone();
     if let Some(pvc_obj) = updated_pvc.as_object_mut() {
-        let pvc_status = json!({
-            "phase": "Pending"
-        });
+        let pvc_status = status_with_updates(&pvc, [("phase", json!("Pending"))]);
         pvc_obj.insert("status".to_string(), pvc_status);
     }
 
