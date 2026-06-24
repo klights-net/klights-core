@@ -1033,6 +1033,12 @@ impl Datastore {
                 )
             }
 
+            StorageCommand::ApplyResourceBatch { .. } => {
+                return Err(Self::sqlite_conversion_error(anyhow!(
+                    "ApplyResourceBatch cannot be materialized before batch backend support is installed"
+                )));
+            }
+
             StorageCommand::DeleteResource {
                 api_version,
                 kind,

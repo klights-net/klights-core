@@ -439,6 +439,11 @@ where
                 )
                 .await?;
         }
+        StorageCommand::ApplyResourceBatch { .. } => {
+            return Err(anyhow!(
+                "ApplyResourceBatch cannot be applied before batch backend support is installed"
+            ));
+        }
         StorageCommand::CreateNamespace { name, data } => {
             if let Some(existing) = backend.get_namespace(&name).await? {
                 backend

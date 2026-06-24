@@ -272,6 +272,32 @@ impl ResourcePreconditions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceBatchPutMode {
+    Create,
+    Update,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ResourceBatchOperation {
+    Put {
+        api_version: String,
+        kind: String,
+        namespace: Option<String>,
+        name: String,
+        data: Value,
+        mode: ResourceBatchPutMode,
+        preconditions: ResourcePreconditions,
+    },
+    Delete {
+        api_version: String,
+        kind: String,
+        namespace: Option<String>,
+        name: String,
+        preconditions: ResourcePreconditions,
+    },
+}
+
 /// Patch format for resource updates that do not use optimistic concurrency checks.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PatchKind {

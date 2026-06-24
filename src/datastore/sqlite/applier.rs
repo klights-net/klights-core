@@ -297,6 +297,11 @@ impl DatastoreApplier for Datastore {
                 // Same as EnsureClusterMetadata: applied by
                 // apply_command_to_backend.
             }
+            StorageCommand::ApplyResourceBatch { .. } => {
+                return Err(anyhow!(
+                    "ApplyResourceBatch cannot be applied before batch backend support is installed"
+                ));
+            }
         }
         Ok(())
     }

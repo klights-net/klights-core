@@ -120,7 +120,7 @@ pub struct ProtoErrorResp {
 pub struct ProtoStorageCommand {
     #[prost(
         oneof = "proto_storage_command::Command",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
     )]
     pub command: Option<proto_storage_command::Command>,
 }
@@ -178,6 +178,8 @@ pub mod proto_storage_command {
         DeletePodCleanupIntent(super::ProtoPodCleanupIntentCommand),
         #[prost(message, tag = "25")]
         DeletePodCleanupIntentsForNode(super::ProtoDeletePodCleanupIntentsForNode),
+        #[prost(message, tag = "26")]
+        ApplyResourceBatch(super::ProtoApplyResourceBatch),
     }
 }
 
@@ -273,6 +275,67 @@ pub struct ProtoResourcePreconditions {
     pub uid: Option<String>,
     #[prost(int64, optional, tag = "2")]
     pub resource_version: Option<i64>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoApplyResourceBatch {
+    #[prost(message, repeated, tag = "1")]
+    pub operations: Vec<ProtoResourceBatchOperation>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoResourceBatchOperation {
+    #[prost(oneof = "proto_resource_batch_operation::Operation", tags = "1, 2")]
+    pub operation: Option<proto_resource_batch_operation::Operation>,
+}
+
+pub mod proto_resource_batch_operation {
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    pub enum Operation {
+        #[prost(message, tag = "1")]
+        Put(super::ProtoResourceBatchPut),
+        #[prost(message, tag = "2")]
+        Delete(super::ProtoResourceBatchDelete),
+    }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoResourceBatchPut {
+    #[prost(string, tag = "1")]
+    pub api_version: String,
+    #[prost(string, tag = "2")]
+    pub kind: String,
+    #[prost(string, optional, tag = "3")]
+    pub namespace: Option<String>,
+    #[prost(string, tag = "4")]
+    pub name: String,
+    #[prost(bytes = "vec", tag = "5")]
+    pub data: Vec<u8>,
+    #[prost(enumeration = "ProtoResourceBatchPutMode", tag = "6")]
+    pub mode: i32,
+    #[prost(message, optional, tag = "7")]
+    pub preconditions: Option<ProtoResourcePreconditions>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoResourceBatchDelete {
+    #[prost(string, tag = "1")]
+    pub api_version: String,
+    #[prost(string, tag = "2")]
+    pub kind: String,
+    #[prost(string, optional, tag = "3")]
+    pub namespace: Option<String>,
+    #[prost(string, tag = "4")]
+    pub name: String,
+    #[prost(message, optional, tag = "5")]
+    pub preconditions: Option<ProtoResourcePreconditions>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum ProtoResourceBatchPutMode {
+    Create = 0,
+    Update = 1,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

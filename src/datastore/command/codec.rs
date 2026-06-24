@@ -135,6 +135,106 @@ fn decode_preconditions(
         .ok_or_else(|| anyhow::anyhow!("protobuf {command} is missing resource preconditions"))
 }
 
+impl From<ResourceBatchPutMode> for ProtoResourceBatchPutMode {
+    fn from(mode: ResourceBatchPutMode) -> Self {
+        match mode {
+            ResourceBatchPutMode::Create => Self::Create,
+            ResourceBatchPutMode::Update => Self::Update,
+        }
+    }
+}
+
+impl TryFrom<ProtoResourceBatchPutMode> for ResourceBatchPutMode {
+    type Error = anyhow::Error;
+
+    fn try_from(mode: ProtoResourceBatchPutMode) -> anyhow::Result<Self> {
+        Ok(match mode {
+            ProtoResourceBatchPutMode::Create => Self::Create,
+            ProtoResourceBatchPutMode::Update => Self::Update,
+        })
+    }
+}
+
+impl From<ResourceBatchOperation> for ProtoResourceBatchOperation {
+    fn from(operation: ResourceBatchOperation) -> Self {
+        let operation = match operation {
+            ResourceBatchOperation::Put {
+                api_version,
+                kind,
+                namespace,
+                name,
+                data,
+                mode,
+                preconditions,
+            } => proto_resource_batch_operation::Operation::Put(ProtoResourceBatchPut {
+                api_version,
+                kind,
+                namespace,
+                name,
+                data: json_to_bytes(&data),
+                mode: ProtoResourceBatchPutMode::from(mode) as i32,
+                preconditions: Some(preconditions.into()),
+            }),
+            ResourceBatchOperation::Delete {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions,
+            } => proto_resource_batch_operation::Operation::Delete(ProtoResourceBatchDelete {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions: Some(preconditions.into()),
+            }),
+        };
+        Self {
+            operation: Some(operation),
+        }
+    }
+}
+
+impl TryFrom<ProtoResourceBatchOperation> for ResourceBatchOperation {
+    type Error = anyhow::Error;
+
+    fn try_from(operation: ProtoResourceBatchOperation) -> anyhow::Result<Self> {
+        let operation = operation
+            .operation
+            .ok_or_else(|| anyhow::anyhow!("protobuf ResourceBatchOperation has no variant"))?;
+        match operation {
+            proto_resource_batch_operation::Operation::Put(put) => {
+                let mode = ProtoResourceBatchPutMode::try_from(put.mode)
+                    .map_err(|_| {
+                        anyhow::anyhow!("unknown protobuf ResourceBatchPutMode: {}", put.mode)
+                    })
+                    .and_then(ResourceBatchPutMode::try_from)?;
+                Ok(ResourceBatchOperation::Put {
+                    api_version: put.api_version,
+                    kind: put.kind,
+                    namespace: put.namespace,
+                    name: put.name,
+                    data: bytes_to_json(&put.data),
+                    mode,
+                    preconditions: decode_preconditions(put.preconditions, "ResourceBatchPut")?,
+                })
+            }
+            proto_resource_batch_operation::Operation::Delete(delete) => {
+                Ok(ResourceBatchOperation::Delete {
+                    api_version: delete.api_version,
+                    kind: delete.kind,
+                    namespace: delete.namespace,
+                    name: delete.name,
+                    preconditions: decode_preconditions(
+                        delete.preconditions,
+                        "ResourceBatchDelete",
+                    )?,
+                })
+            }
+        }
+    }
+}
+
 impl From<StorageCommand> for ProtoStorageCommand {
     fn from(cmd: StorageCommand) -> Self {
         let command = match cmd {
@@ -219,6 +319,11 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 preconditions: Some(preconditions.into()),
                 observed_status_stamp,
             }),
+            StorageCommand::ApplyResourceBatch { operations } => {
+                proto_storage_command::Command::ApplyResourceBatch(ProtoApplyResourceBatch {
+                    operations: operations.into_iter().map(Into::into).collect(),
+                })
+            }
             StorageCommand::CreateNamespace { name, data } => {
                 proto_storage_command::Command::CreateNamespace(ProtoCreateNamespace {
                     name,
@@ -446,6 +551,15 @@ impl TryFrom<ProtoStorageCommand> for StorageCommand {
                 preconditions: decode_preconditions(p.preconditions, "UpdateStatus")?,
                 observed_status_stamp: p.observed_status_stamp,
             },
+            proto_storage_command::Command::ApplyResourceBatch(batch) => {
+                StorageCommand::ApplyResourceBatch {
+                    operations: batch
+                        .operations
+                        .into_iter()
+                        .map(ResourceBatchOperation::try_from)
+                        .collect::<anyhow::Result<Vec<_>>>()?,
+                }
+            }
             proto_storage_command::Command::CreateNamespace(p) => StorageCommand::CreateNamespace {
                 name: p.name,
                 data: bytes_to_json(&p.data),
@@ -698,6 +812,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn apply_resource_batch_round_trips_json_and_protobuf() {
+        let cmd = StorageCommand::apply_resource_batch(vec![
+            ResourceBatchOperation::Put {
+                api_version: "discovery.k8s.io/v1".to_string(),
+                kind: "EndpointSlice".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web-klights".to_string(),
+                data: json!({
+                    "apiVersion": "discovery.k8s.io/v1",
+                    "kind": "EndpointSlice",
+                    "metadata": {"name": "web-klights", "namespace": "default"},
+                    "addressType": "IPv4",
+                    "endpoints": [],
+                    "ports": []
+                }),
+                mode: ResourceBatchPutMode::Create,
+                preconditions: ResourcePreconditions::default(),
+            },
+            ResourceBatchOperation::Put {
+                api_version: "v1".to_string(),
+                kind: "Endpoints".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "Endpoints",
+                    "metadata": {"name": "web", "namespace": "default"},
+                    "subsets": []
+                }),
+                mode: ResourceBatchPutMode::Update,
+                preconditions: ResourcePreconditions {
+                    uid: Some("endpoints-uid".to_string()),
+                    resource_version: Some(7),
+                },
+            },
+            ResourceBatchOperation::Delete {
+                api_version: "discovery.k8s.io/v1".to_string(),
+                kind: "EndpointSlice".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web-klights-old".to_string(),
+                preconditions: ResourcePreconditions {
+                    uid: Some("stale-slice-uid".to_string()),
+                    resource_version: None,
+                },
+            },
+        ]);
+
+        let json_bytes = encode_command_json(&cmd).expect("encode JSON command");
+        let json_decoded = decode_command_json(&json_bytes).expect("decode JSON command");
+        assert_eq!(json_decoded, cmd);
+
+        let proto_bytes = encode_command_protobuf(&cmd).expect("encode protobuf command");
+        let proto_decoded = decode_command_protobuf(&proto_bytes).expect("decode protobuf command");
+        assert_eq!(proto_decoded, cmd);
+    }
+
+    #[test]
+    fn apply_resource_batch_variant_name_and_builder() {
+        let cmd = StorageCommand::apply_resource_batch(Vec::new());
+        assert_eq!(cmd.variant_name(), "ApplyResourceBatch");
+        match cmd {
+            StorageCommand::ApplyResourceBatch { operations } => assert!(operations.is_empty()),
+            other => panic!(
+                "expected ApplyResourceBatch, got {:?}",
+                other.variant_name()
+            ),
+        }
+    }
+
     // ---- Helpers ----
 
     fn sample_meta() -> CommandMeta {
@@ -779,6 +963,34 @@ mod tests {
                     observed_status_stamp: Some(7),
                 },
                 "UpdateStatus",
+            ),
+            (
+                StorageCommand::ApplyResourceBatch {
+                    operations: vec![
+                        ResourceBatchOperation::Put {
+                            api_version: "v1".into(),
+                            kind: "Endpoints".into(),
+                            namespace: Some("default".into()),
+                            name: "my-service".into(),
+                            data: json!({
+                                "apiVersion": "v1",
+                                "kind": "Endpoints",
+                                "metadata": {"name": "my-service", "namespace": "default"},
+                                "subsets": []
+                            }),
+                            mode: ResourceBatchPutMode::Create,
+                            preconditions: ResourcePreconditions::default(),
+                        },
+                        ResourceBatchOperation::Delete {
+                            api_version: "discovery.k8s.io/v1".into(),
+                            kind: "EndpointSlice".into(),
+                            namespace: Some("default".into()),
+                            name: "my-service-stale".into(),
+                            preconditions: uid_preconditions("stale-slice-uid"),
+                        },
+                    ],
+                },
+                "ApplyResourceBatch",
             ),
             (
                 StorageCommand::CreateNamespace {
@@ -980,6 +1192,7 @@ mod tests {
             "DeleteResource",
             "PatchResource",
             "UpdateStatus",
+            "ApplyResourceBatch",
             "CreateNamespace",
             "UpdateNamespace",
             "DeleteNamespace",

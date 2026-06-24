@@ -234,6 +234,7 @@ impl DatastoreApplier for RedbDatastore {
                 self.rv_store.advance_rv(min_rv).await?;
             }
             StorageCommand::WatchEventAppend { .. }
+            | StorageCommand::ApplyResourceBatch { .. }
             | StorageCommand::GcWatchEvents { .. }
             | StorageCommand::EnsureClusterMetadata { .. }
             | StorageCommand::SetKlightsMeta { .. }

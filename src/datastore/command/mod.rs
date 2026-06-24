@@ -23,7 +23,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{PatchKind, ResourcePreconditions};
+use super::types::{
+    PatchKind, ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
+};
 use prost::Message;
 
 // ---------------------------------------------------------------------------
@@ -178,6 +180,11 @@ pub enum StorageCommand {
         observed_status_stamp: Option<i64>,
     },
 
+    /// Apply multiple resource mutations under one resourceVersion.
+    ApplyResourceBatch {
+        operations: Vec<ResourceBatchOperation>,
+    },
+
     // -- Namespace operations (ClusterReplicated) --
     /// Create a namespace.
     CreateNamespace {
@@ -324,6 +331,7 @@ impl StorageCommand {
             StorageCommand::DeleteResource { .. } => "DeleteResource",
             StorageCommand::PatchResource { .. } => "PatchResource",
             StorageCommand::UpdateStatus { .. } => "UpdateStatus",
+            StorageCommand::ApplyResourceBatch { .. } => "ApplyResourceBatch",
             StorageCommand::CreateNamespace { .. } => "CreateNamespace",
             StorageCommand::UpdateNamespace { .. } => "UpdateNamespace",
             StorageCommand::DeleteNamespace { .. } => "DeleteNamespace",
@@ -432,6 +440,10 @@ impl StorageCommand {
             patch,
             preconditions: ResourcePreconditions::default(),
         }
+    }
+
+    pub fn apply_resource_batch(operations: Vec<ResourceBatchOperation>) -> Self {
+        Self::ApplyResourceBatch { operations }
     }
 
     /// Build a `CreateNamespace` command from a JSON namespace body.

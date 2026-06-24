@@ -727,6 +727,7 @@ pub async fn apply_forwarded_command(
             ))
         }
         StorageCommand::WatchEventAppend { .. }
+        | StorageCommand::ApplyResourceBatch { .. }
         | StorageCommand::AdvanceResourceVersion { .. }
         | StorageCommand::EnsureClusterMetadata { .. }
         | StorageCommand::SetKlightsMeta { .. } => Err(anyhow!(
