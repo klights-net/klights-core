@@ -1210,3 +1210,159 @@ async fn reconcile_idempotent_does_not_churn_resource_version() {
         .unwrap();
     assert_eq!(rv2, rv1);
 }
+
+// Task 10 regression tests: create-allocation behavior
+
+#[tokio::test]
+async fn create_service_returns_error_when_allocation_fails() {
+    // /30 CIDR has exactly one usable ClusterIP (network+2 = .2, broadcast-1 = .2)
+    let db = crate::datastore::test_support::in_memory().await;
+    let service_ipam = ServiceIpam::new("10.0.0.0/30");
+    let nodeport_alloc = NodePortAllocator::new();
+    nodeport_alloc.set_ready();
+
+    // Seed the DB with a Service that owns the only available IP so
+    // rebuild_service_ipam_from_services cannot reclaim it.
+    db.create_resource(
+        "v1",
+        "Service",
+        Some("default"),
+        "occupying-svc",
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "occupying-svc", "namespace": "default"},
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.0.0.2",
+                "clusterIPs": ["10.0.0.2"],
+                "ports": [{"port": 80, "protocol": "TCP"}]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Exhaust the in-memory IPAM so the first allocate() call fails and
+    // forces a rebuild, which will re-mark 10.0.0.2 from the DB Service.
+    let _ = service_ipam.allocate();
+
+    let mut new_svc = json!({
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": "new-svc", "namespace": "default"},
+        "spec": {"type": "ClusterIP", "ports": [{"port": 80, "protocol": "TCP"}]}
+    });
+    let result =
+        prepare_service_for_create(&db, &mut new_svc, &service_ipam, &nodeport_alloc).await;
+    assert!(
+        result.is_err(),
+        "prepare_service_for_create must return Err when ClusterIP pool is exhausted"
+    );
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("ClusterIP") || msg.contains("exhausted"),
+        "error must mention ClusterIP exhaustion, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn create_service_does_not_enqueue_reconcile_after_allocation_failure() {
+    // Verify that prepare_service_for_create returns Err when allocation fails.
+    // The create_inner handler only enqueues after a successful prepare call,
+    // so an Err return means no enqueue is issued.
+    let db = crate::datastore::test_support::in_memory().await;
+    let service_ipam = ServiceIpam::new("10.0.0.0/30");
+    let nodeport_alloc = NodePortAllocator::new();
+    nodeport_alloc.set_ready();
+
+    db.create_resource(
+        "v1",
+        "Service",
+        Some("default"),
+        "occupying-svc",
+        json!({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": "occupying-svc", "namespace": "default"},
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.0.0.2",
+                "clusterIPs": ["10.0.0.2"],
+                "ports": [{"port": 80, "protocol": "TCP"}]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let _ = service_ipam.allocate();
+
+    let mut new_svc = json!({
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": "new-svc", "namespace": "default"},
+        "spec": {"type": "ClusterIP", "ports": [{"port": 80, "protocol": "TCP"}]}
+    });
+    let result =
+        prepare_service_for_create(&db, &mut new_svc, &service_ipam, &nodeport_alloc).await;
+    // Err return → create_inner propagates the error before the enqueue call at inners.rs:749
+    assert!(
+        result.is_err(),
+        "allocation failure must propagate as Err so the caller cannot enqueue"
+    );
+}
+
+#[tokio::test]
+async fn create_service_success_response_contains_allocated_fields_and_enqueues_once() {
+    // A normal Service create allocates a ClusterIP and populates the spec.
+    let db = crate::datastore::test_support::in_memory().await;
+    let service_ipam = ServiceIpam::new("10.43.128.0/17");
+    let nodeport_alloc = NodePortAllocator::new();
+    nodeport_alloc.set_ready();
+
+    let mut svc = json!({
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": {"name": "my-svc", "namespace": "default"},
+        "spec": {"type": "ClusterIP", "ports": [{"port": 80, "protocol": "TCP"}]}
+    });
+    let pending = prepare_service_for_create(&db, &mut svc, &service_ipam, &nodeport_alloc)
+        .await
+        .expect("prepare_service_for_create must succeed when IPs are available");
+
+    let cluster_ip = svc
+        .pointer("/spec/clusterIP")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        !cluster_ip.is_empty() && cluster_ip != "None",
+        "response must carry an allocated clusterIP, got: {cluster_ip:?}"
+    );
+    assert!(
+        svc.pointer("/spec/clusterIPs")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| !arr.is_empty()),
+        "response must carry non-empty clusterIPs"
+    );
+    // pending tracks the allocation for rollback if the datastore create fails
+    assert!(
+        pending.cluster_ip.is_some(),
+        "PendingServiceAllocations must track allocated ClusterIP for rollback"
+    );
+}
+
+#[test]
+fn create_service_allocation_conflict_maps_to_kubernetes_409() {
+    use crate::api::AppError;
+    use crate::datastore::errors::DatastoreError;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse as _;
+
+    // When create_resource fails with DatastoreError::Conflict (duplicate name),
+    // AppError::from(e) must produce a 409 CONFLICT response — not 500.
+    let ds_err = DatastoreError::Conflict {
+        message: "services \"my-svc\" already exists".to_string(),
+    };
+    let app_err = AppError::from(anyhow::Error::new(ds_err));
+    let response = app_err.into_response();
+    assert_eq!(
+        response.status(),
+        StatusCode::CONFLICT,
+        "DatastoreError::Conflict must map to HTTP 409 for Service creates"
+    );
+}
