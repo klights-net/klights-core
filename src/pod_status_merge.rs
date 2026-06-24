@@ -212,7 +212,8 @@ impl PodStatusPatch {
         // patch) + preserved non-owned live conditions, keyed by `type`.
         let mut merged: Vec<Value> = self.conditions.clone();
         for condition in preservable {
-            let Some(condition_type) = condition.get("type").and_then(|value| value.as_str()) else {
+            let Some(condition_type) = condition.get("type").and_then(|value| value.as_str())
+            else {
                 continue;
             };
             if merged.iter().any(|existing| {
@@ -752,9 +753,7 @@ mod tests {
         });
         let bytes = crate::protobuf::encode_protobuf(&pod).expect("encode pod to protobuf");
         let decoded = crate::protobuf::decode_protobuf(&bytes).expect("decode pod from protobuf");
-        let mut s = decoded.get("status").cloned().unwrap_or_else(|| json!({}));
-        if let Some(o)=s.as_object_mut(){o.remove("conditions");}
-        s
+        decoded.get("status").cloned().unwrap_or_else(|| json!({}))
     }
 
     #[test]
@@ -814,6 +813,16 @@ mod tests {
 
         // Protobuf path: incoming round-tripped through the real protobuf codec.
         let mut incoming_proto = status_through_protobuf(&incoming_status);
+        assert!(
+            incoming_proto
+                .pointer("/conditions")
+                .and_then(|value| value.as_array())
+                .is_some_and(|conditions| conditions.iter().any(|condition| {
+                    condition.get("type").and_then(|value| value.as_str()) == Some("Ready")
+                        && condition.get("status").and_then(|value| value.as_str()) == Some("False")
+                })),
+            "protobuf round-trip must preserve incoming Ready=False condition: {incoming_proto:?}"
+        );
         merge_pod_status_for_update(
             "v1",
             "Pod",
