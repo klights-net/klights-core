@@ -1034,11 +1034,12 @@ impl Datastore {
                     serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
                 let mut next_status = status;
                 if apply_against_latest {
-                    crate::resource_semantics::preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
+                    crate::pod_status_merge::merge_pod_status_for_update(
                         &api_version,
                         &kind,
                         &live,
                         &mut next_status,
+                        crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
                     );
                 }
                 live["status"] = next_status;

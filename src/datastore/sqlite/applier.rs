@@ -105,11 +105,12 @@ impl DatastoreApplier for Datastore {
                         .get_resource(&api_version, &kind, namespace.as_deref(), &name)
                         .await?
                 {
-                    crate::resource_semantics::preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
+                    crate::pod_status_merge::merge_pod_status_for_update(
                         &api_version,
                         &kind,
                         current.data.as_ref(),
                         &mut status,
+                        crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
                     );
                 }
                 let mut preconditions = preconditions;

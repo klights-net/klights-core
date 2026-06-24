@@ -84,7 +84,7 @@ pub fn preserve_status_subresource_on_main_update(
             kind,
             proposed,
             &mut status,
-            crate::pod_status_merge::PodStatusUpdateSource::UserStatusSubresource,
+            crate::pod_status_merge::PodStatusOwner::ApiStatusSubresource,
         );
         if let Some(obj) = proposed.as_object_mut() {
             obj.insert("status".to_string(), status);
@@ -212,28 +212,4 @@ fn upsert_terminating_readiness_condition(
         "reason": "PodTerminating",
         "message": "Pod is terminating"
     }));
-}
-
-/// Delegate to the central Pod status merge policy.
-///
-/// All kubelet-status write paths (raft apply, cluster-replace merge,
-/// replicated apply, sqlite/redb appliers) historically called this helper
-/// for the ad hoc condition-preservation. They now route through the single
-/// DRY policy in [`crate::pod_status_merge`], which additionally preserves
-/// terminal/confirmed runtime state over a stale `ContainerCreating`
-/// snapshot — this thin wrapper keeps the existing call sites working while
-/// consolidating the rules in one place.
-pub fn preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
-    api_version: &str,
-    kind: &str,
-    current: &Value,
-    status: &mut Value,
-) {
-    crate::pod_status_merge::merge_pod_status_for_update(
-        api_version,
-        kind,
-        current,
-        status,
-        crate::pod_status_merge::PodStatusUpdateSource::KubeletRuntime,
-    );
 }

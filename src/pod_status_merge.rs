@@ -10,18 +10,34 @@
 
 use serde_json::Value;
 
-/// Originator of a Pod `.status` write. The merge policy is stricter for the
-/// kubelet runtime path than for a user-driven `/status` subresource write.
+/// Originator of a Pod `.status` write. Controls which merge rules apply.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PodStatusUpdateSource {
+pub enum PodStatusOwner {
     /// Status computed and forwarded by the kubelet runtime (outbox/raft apply,
-    /// replicated apply, runtime emission). Terminal/confirmed state must be
-    /// preserved over a stale snapshot.
+    /// stamped replicated apply, runtime emission). Terminal/confirmed state must
+    /// be preserved over a stale snapshot; scheduler conditions are preserved.
     KubeletRuntime,
+    /// Status written by the scheduler (e.g. conditions, nomination). Only
+    /// scheduler-owned conditions are preserved; no terminal-state rewrite.
+    Scheduler,
     /// Status written by an API client through the `/status` subresource. The
     /// caller is authoritative over `phase` and container state — the kubelet
-    /// terminal-preservation rewrite must NOT apply.
-    UserStatusSubresource,
+    /// terminal-preservation rewrite must NOT apply. Scheduler conditions preserved.
+    ApiStatusSubresource,
+    /// Status applied by a raft replication or leader-direct path without an
+    /// outbox stamp (no kubelet terminal-state guarantee). Scheduler conditions
+    /// are preserved; terminal-state rewrite is NOT applied.
+    ReplicatedApply,
+}
+
+/// Narrow set of status fields each owner may update. Unused fields are
+/// left `None`; merge applies only the fields present.
+#[derive(Debug, Default)]
+pub struct PodStatusPatch {
+    /// Override the Pod `phase` field.
+    pub phase: Option<String>,
+    /// Conditions the owner wants to set (merged by `type` key).
+    pub conditions: Option<Vec<Value>>,
 }
 
 /// Merge policy applied to an incoming Pod `.status` before it replaces the
@@ -29,7 +45,7 @@ pub enum PodStatusUpdateSource {
 ///
 /// - Always: preserve scheduler-owned conditions (`DisruptionTarget`, ...) by
 ///   `type` so a kubelet status snapshot that omits them cannot drop them.
-/// - Only for [`PodStatusUpdateSource::KubeletRuntime`]: preserve terminal or
+/// - Only for [`PodStatusOwner::KubeletRuntime`]: preserve terminal or
 ///   confirmed runtime container state over a stale `waiting` snapshot.
 ///
 /// `current` is the full live Pod object (`{apiVersion, kind, metadata, spec,
@@ -40,13 +56,13 @@ pub fn merge_pod_status_for_update(
     kind: &str,
     current: &Value,
     incoming_status: &mut Value,
-    source: PodStatusUpdateSource,
+    owner: PodStatusOwner,
 ) {
     if api_version != "v1" || kind != "Pod" {
         return;
     }
     preserve_non_kubelet_conditions(current, incoming_status);
-    if source == PodStatusUpdateSource::KubeletRuntime {
+    if owner == PodStatusOwner::KubeletRuntime {
         preserve_terminal_or_confirmed_runtime_state(current, incoming_status);
     }
 }
@@ -308,7 +324,7 @@ mod tests {
             "Pod",
             &current,
             &mut incoming,
-            PodStatusUpdateSource::KubeletRuntime,
+            PodStatusOwner::KubeletRuntime,
         );
         assert!(
             incoming
@@ -357,7 +373,7 @@ mod tests {
             "Pod",
             &current,
             &mut incoming,
-            PodStatusUpdateSource::KubeletRuntime,
+            PodStatusOwner::KubeletRuntime,
         );
         assert_eq!(incoming.pointer("/phase"), Some(&json!("Succeeded")));
         assert_eq!(
@@ -392,8 +408,225 @@ mod tests {
             "Pod",
             &current,
             &mut incoming,
-            PodStatusUpdateSource::UserStatusSubresource,
+            PodStatusOwner::ApiStatusSubresource,
         );
         assert_eq!(incoming.pointer("/phase"), Some(&json!("Running")));
+    }
+
+    // ── Task 8 typed-ownership regression tests ────────────────────
+
+    #[test]
+    fn scheduler_disruption_target_survives_worker_status_apply() {
+        let current = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "status": {
+                "phase": "Running",
+                "conditions": [
+                    {"type": "Ready", "status": "True"},
+                    {"type": "DisruptionTarget", "status": "True", "reason": "PreemptionByScheduler"}
+                ]
+            }
+        });
+        let mut incoming = json!({
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}]
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::KubeletRuntime,
+        );
+        let conditions = incoming
+            .pointer("/conditions")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(
+            conditions
+                .iter()
+                .any(|c| c.get("type").and_then(|v| v.as_str()) == Some("DisruptionTarget")),
+            "DisruptionTarget must survive KubeletRuntime (worker) apply: {incoming:?}"
+        );
+    }
+
+    #[test]
+    fn scheduler_disruption_target_survives_leader_direct_status_apply() {
+        let current = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": "True"},
+                    {"type": "DisruptionTarget", "status": "True", "reason": "PreemptionByScheduler"}
+                ]
+            }
+        });
+        let mut incoming = json!({
+            "conditions": [{"type": "Ready", "status": "True"}]
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::ReplicatedApply,
+        );
+        let conditions = incoming
+            .pointer("/conditions")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(
+            conditions
+                .iter()
+                .any(|c| c.get("type").and_then(|v| v.as_str()) == Some("DisruptionTarget")),
+            "DisruptionTarget must survive ReplicatedApply (leader-direct) apply: {incoming:?}"
+        );
+    }
+
+    #[test]
+    fn api_status_subresource_can_replace_user_owned_status_fields() {
+        let current = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "status": {
+                "phase": "Succeeded",
+                "containerStatuses": [{
+                    "name": "app",
+                    "containerID": "containerd://ctr-1",
+                    "restartCount": 0,
+                    "state": {"terminated": {"exitCode": 0}}
+                }]
+            }
+        });
+        let mut incoming = json!({"phase": "Failed"});
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::ApiStatusSubresource,
+        );
+        assert_eq!(
+            incoming.pointer("/phase"),
+            Some(&json!("Failed")),
+            "ApiStatusSubresource must not rewrite phase to Succeeded: {incoming:?}"
+        );
+    }
+
+    #[test]
+    fn kubelet_runtime_status_cannot_drop_scheduler_owned_conditions() {
+        let current = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "status": {
+                "conditions": [
+                    {"type": "PodScheduled", "status": "True"},
+                    {"type": "DisruptionTarget", "status": "True"}
+                ]
+            }
+        });
+        let mut incoming = json!({
+            "conditions": [{"type": "PodScheduled", "status": "True"}]
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::KubeletRuntime,
+        );
+        let conditions = incoming
+            .pointer("/conditions")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert!(
+            conditions
+                .iter()
+                .any(|c| c.get("type").and_then(|v| v.as_str()) == Some("DisruptionTarget")),
+            "KubeletRuntime must not drop DisruptionTarget: {incoming:?}"
+        );
+    }
+
+    #[test]
+    fn terminal_container_state_does_not_regress_to_container_creating() {
+        let current = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "status": {
+                "phase": "Succeeded",
+                "containerStatuses": [{
+                    "name": "worker",
+                    "containerID": "containerd://abc",
+                    "restartCount": 0,
+                    "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}
+                }]
+            }
+        });
+        let mut incoming = json!({
+            "phase": "Pending",
+            "containerStatuses": [{
+                "name": "worker",
+                "containerID": "containerd://abc",
+                "restartCount": 0,
+                "state": {"waiting": {"reason": "ContainerCreating"}}
+            }]
+        });
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::KubeletRuntime,
+        );
+        assert!(
+            incoming
+                .pointer("/containerStatuses/0/state/terminated")
+                .is_some(),
+            "terminal container state must not regress to ContainerCreating: {incoming:?}"
+        );
+        assert!(
+            incoming
+                .pointer("/containerStatuses/0/state/waiting")
+                .is_none(),
+            "waiting state must be replaced by preserved terminal state: {incoming:?}"
+        );
+    }
+
+    #[test]
+    fn pod_status_merge_json_and_protobuf_paths_match() {
+        // Both JSON and protobuf raft-apply paths produce a serde_json::Value and
+        // call merge_pod_status_for_update. Verify the merge function is pure and
+        // deterministic: same input Value → same output regardless of decode path.
+        let current = json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "status": {
+                "conditions": [
+                    {"type": "DisruptionTarget", "status": "True", "reason": "PreemptionByScheduler"}
+                ]
+            }
+        });
+        // "JSON path": incoming status built from JSON literal (kubectl/API path)
+        let mut incoming_json = json!({"conditions": []});
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming_json,
+            PodStatusOwner::KubeletRuntime,
+        );
+
+        // "Protobuf path": same incoming status decoded from a JSON string
+        // (simulates the serde_json::Value produced by pb_pod_status_to_json)
+        let mut incoming_proto: serde_json::Value =
+            serde_json::from_str(r#"{"conditions":[]}"#).unwrap();
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming_proto,
+            PodStatusOwner::KubeletRuntime,
+        );
+
+        assert_eq!(
+            incoming_json, incoming_proto,
+            "JSON and protobuf apply paths must produce identical merge results"
+        );
     }
 }

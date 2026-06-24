@@ -1074,11 +1074,12 @@ fn merge_status_only_row_with_existing(
         .as_deref()
         .is_some_and(|uid| !uid.is_empty())
     {
-        crate::resource_semantics::preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
+        crate::pod_status_merge::merge_pod_status_for_update(
             &row.api_version,
             &row.kind,
             &live,
             &mut status,
+            crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
         );
     }
     let Some(live_obj) = live.as_object_mut() else {

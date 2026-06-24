@@ -2800,7 +2800,7 @@ impl PodRuntimeService for RealPodRuntimeService {
             "Pod",
             &resource.data,
             &mut status,
-            crate::pod_status_merge::PodStatusUpdateSource::KubeletRuntime,
+            crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
         );
         let emit_key = key.clone();
         let emitted = self

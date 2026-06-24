@@ -1350,7 +1350,7 @@ async fn write_preemption_termination(
             "Pod",
             &data,
             &mut status,
-            crate::pod_status_merge::PodStatusUpdateSource::KubeletRuntime,
+            crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
         );
         if let Some(object) = data.as_object_mut() {
             object.insert("status".to_string(), status);

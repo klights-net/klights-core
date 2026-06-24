@@ -401,25 +401,18 @@ where
                 && kind == "Pod"
                 && let Some(current) = current.as_ref()
             {
+                let owner = if observed_status_stamp.is_some() {
+                    crate::pod_status_merge::PodStatusOwner::KubeletRuntime
+                } else {
+                    crate::pod_status_merge::PodStatusOwner::ReplicatedApply
+                };
                 crate::pod_status_merge::merge_pod_status_for_update(
                     &api_version,
                     &kind,
                     current.data.as_ref(),
                     &mut status,
-                    crate::pod_status_merge::PodStatusUpdateSource::UserStatusSubresource,
+                    owner,
                 );
-                // The terminal/running-state preservation (guards against a
-                // stale ContainerCreating snapshot regressing confirmed
-                // runtime state) only applies to stamped worker/outbox status
-                // snapshots; the leader-direct path carries no stamp.
-                if observed_status_stamp.is_some() {
-                    crate::resource_semantics::preserve_non_kubelet_pod_conditions_on_kubelet_status_update(
-                        &api_version,
-                        &kind,
-                        current.data.as_ref(),
-                        &mut status,
-                    );
-                }
             }
             let mut preconditions = preconditions;
             if preconditions.resource_version.is_some() {
