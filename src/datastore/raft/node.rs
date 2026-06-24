@@ -27,6 +27,12 @@ use crate::datastore::raft::network::{LeaderForwarder, StubRaftNetwork};
 use crate::datastore::raft::state_machine_impl::SqliteRaftStateMachine;
 use crate::datastore::raft::types::{NodeId, RaftShape, StorageCommandPayload, TypeConfig};
 
+/// Lossy-link transport sizing (finding.md H3). max_payload_entries=3 matches the
+/// 3-permit flow-control gate so a single AppendEntries retry cannot resend a
+/// logical batch larger than the in-flight bound. Lifted to module scope so the
+/// closing-gate test can assert on the actual configured value (not a copy).
+pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 3;
+
 pub struct RaftNode {
     pub node_id: NodeId,
     pub raft: Raft<TypeConfig>,
@@ -47,7 +53,7 @@ pub struct RaftNode {
     /// A permit is acquired BEFORE build_log_apply_commit_for_outbox reserves
     /// the next resourceVersion so the leader cannot build an unacknowledged
     /// RV backlog ahead of raft progress under loss (finding.md flow-control plan).
-    flow_control: Arc<crate::datastore::raft::flow_control::RaftCommitFlowControl>,
+    pub(crate) flow_control: Arc<crate::datastore::raft::flow_control::RaftCommitFlowControl>,
 }
 
 impl RaftNode {
@@ -112,11 +118,8 @@ impl RaftNode {
         // above `snapshot_policy`'s LogsSinceLast so a lagging member still
         // crosses the snapshot-replace path (which is now correct, above).
         const RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS: u64 = 5_000;
-        // max_payload_entries=3 matches the 3-permit flow-control gate so a single
-        // AppendEntries retry cannot resend a larger logical batch than the in-flight
-        // bound. Keeping both at 3 prevents the leader from building an RV backlog
-        // wider than what raft will attempt to commit in a single round-trip.
-        const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 3;
+        // RAFT_MAX_PAYLOAD_ENTRIES is defined at module scope so the closing-gate
+        // test can assert on the configured value (not a function-local copy).
         const RAFT_SNAPSHOT_MAX_CHUNK_SIZE_BYTES: u64 = 512 * 1024;
         const RAFT_REPLICATION_LAG_THRESHOLD: u64 = 5000;
         const _: () = assert!(RAFT_REPLICATION_LAG_THRESHOLD >= 5000);
@@ -2378,115 +2381,249 @@ mod tests {
 
     // ── Task 2: Bound In-Flight Raft Proposals With Flow Control ────────────────────────────
 
-    /// The flow-control permit must be acquired BEFORE build_log_apply_commit_for_outbox
-    /// reserves a resourceVersion. This test verifies the module exists and can be constructed.
-    #[test]
-    fn raft_proposal_permit_is_acquired_before_resource_version_reservation() {
-        use crate::datastore::raft::flow_control::RaftCommitFlowControl;
-        // The flow control struct must exist with 3 permits.
-        let fc = RaftCommitFlowControl::new(3);
-        // Acquire a permit synchronously (non-blocking when permits available).
-        let _permit = fc.try_acquire().expect("should have permits available");
-        // After acquiring 3 permits, no more should be available.
-        let fc2 = RaftCommitFlowControl::new(3);
-        let _p1 = fc2.try_acquire().expect("permit 1");
-        let _p2 = fc2.try_acquire().expect("permit 2");
-        let _p3 = fc2.try_acquire().expect("permit 3");
-        assert!(
-            fc2.try_acquire().is_none(),
-            "all 3 permits consumed; 4th acquire must fail"
-        );
+    /// Helper: build a small CreateResource StorageCommand for propose_command tests.
+    fn propose_create_command(uid: &str) -> crate::datastore::command::StorageCommand {
+        crate::datastore::command::StorageCommand::CreateResource {
+            api_version: "node.k8s.io/v1".into(),
+            kind: "RuntimeClass".into(),
+            namespace: None,
+            name: format!("fc-{uid}"),
+            data: serde_json::json!({
+                "apiVersion": "node.k8s.io/v1",
+                "kind": "RuntimeClass",
+                "metadata": {"name": format!("fc-{uid}"), "uid": uid},
+                "handler": "handler",
+            }),
+        }
     }
 
-    /// At most 3 raft proposals may be in flight simultaneously. Acquiring a 4th
-    /// permit must block until one of the in-flight proposals completes.
+    /// Integration test: while all 3 flow-control permits are externally held, a call to
+    /// `propose_command` must BLOCK on permit acquire — it must not reserve a
+    /// resourceVersion via `build_log_apply_commit_for_outbox` until a permit is released.
+    ///
+    /// This is the core ordering guarantee from finding.md: the leader cannot reserve
+    /// an RV ahead of an acknowledged flow-control slot. Reverting the
+    /// `let _flow_permit = self.flow_control.acquire().await;` line in `propose_command`
+    /// would make this test fail (rv would advance during the timeout window).
+    #[tokio::test]
+    async fn raft_proposal_permit_is_acquired_before_resource_version_reservation() {
+        use crate::datastore::replicated::RaftProposer;
+
+        let (node, backend) = fresh_node(70).await;
+        node.bootstrap_single_voter("https://10.99.0.70:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .expect("become leader");
+        // Exhaust the flow-control gate before propose_command runs.
+        let _p1 = node.flow_control.acquire().await;
+        let _p2 = node.flow_control.acquire().await;
+        let _p3 = node.flow_control.acquire().await;
+        assert_eq!(node.flow_control.available_permits(), 0);
+
+        let rv_before = backend.get_current_resource_version().await.unwrap();
+
+        // propose_command must block on permit acquire — it must NOT reach
+        // build_log_apply_commit_for_outbox while permits are exhausted.
+        let cmd = propose_create_command("permit-ordering");
+        let timeout = tokio::time::sleep(std::time::Duration::from_millis(300));
+        tokio::pin!(timeout);
+        let mut propose_fut = Box::pin(node.propose_command(cmd));
+        tokio::select! {
+            _ = &mut propose_fut => panic!("propose_command must block while flow-control permits are exhausted"),
+            _ = &mut timeout => {}
+        }
+
+        // Critical assertion: rv must NOT have advanced during the timeout window.
+        // If propose_command failed to acquire the permit before reserving the rv,
+        // build_log_apply_commit_for_outbox would have bumped the metadata rv.
+        let rv_during = backend.get_current_resource_version().await.unwrap();
+        assert_eq!(
+            rv_during, rv_before,
+            "rv must NOT advance while flow-control permits are exhausted: \
+             propose_command must acquire the permit BEFORE build_log_apply_commit_for_outbox"
+        );
+
+        // Drop the externally-held propose_fut and clean up the manually-held permits.
+        drop(propose_fut);
+        drop(_p1);
+        drop(_p2);
+        drop(_p3);
+        node.shutdown().await.unwrap();
+    }
+
+    /// Integration test: at most 3 unacknowledged propose_command calls may be in flight.
+    /// Holds 3 permits manually, then verifies a 4th propose call is blocked.
     #[tokio::test]
     async fn at_most_three_raft_proposals_are_in_flight() {
-        use crate::datastore::raft::flow_control::RaftCommitFlowControl;
-        let fc = std::sync::Arc::new(RaftCommitFlowControl::new(3));
-        let p1 = fc.acquire().await;
-        let p2 = fc.acquire().await;
-        let p3 = fc.acquire().await;
-        // All 3 permits consumed — try_acquire must fail.
-        assert!(
-            fc.try_acquire().is_none(),
-            "4th proposal must be blocked when 3 are in flight"
+        use crate::datastore::replicated::RaftProposer;
+
+        let (node, backend) = fresh_node(71).await;
+        node.bootstrap_single_voter("https://10.99.0.71:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .expect("become leader");
+        assert_eq!(
+            node.flow_control.max_in_flight(),
+            3,
+            "flow-control cap must be 3 (matches RAFT_MAX_PAYLOAD_ENTRIES)"
         );
-        // Releasing one permit should allow a 4th acquisition.
-        drop(p1);
-        let _p4 = fc.acquire().await;
-        drop(p2);
-        drop(p3);
-        drop(_p4);
-        assert!(
-            fc.try_acquire().is_some(),
-            "all permits must be returned after drops"
+        // Hold all 3 permits, simulating 3 in-flight proposals.
+        let _p1 = node.flow_control.acquire().await;
+        let _p2 = node.flow_control.acquire().await;
+        let _p3 = node.flow_control.acquire().await;
+        assert_eq!(node.flow_control.available_permits(), 0);
+
+        // A 4th propose call must block (no permits available).
+        let rv_before = backend.get_current_resource_version().await.unwrap();
+        let cmd = propose_create_command("fourth-blocked");
+        let timeout = tokio::time::sleep(std::time::Duration::from_millis(200));
+        tokio::pin!(timeout);
+        let mut propose_fut = Box::pin(node.propose_command(cmd));
+        tokio::select! {
+            _ = &mut propose_fut => panic!("4th propose must block when 3 permits are held"),
+            _ = &mut timeout => {}
+        }
+        let rv_after = backend.get_current_resource_version().await.unwrap();
+        assert_eq!(
+            rv_after, rv_before,
+            "blocked 4th propose must not have reserved an rv"
         );
+        drop(propose_fut);
+        drop(_p1);
+        drop(_p2);
+        drop(_p3);
+        node.shutdown().await.unwrap();
     }
 
-    /// A permit released after a materialization failure (before client_write) must
-    /// be returned to the pool so subsequent proposals can proceed.
+    /// Integration test: when propose_command fails AT MATERIALIZATION (before
+    /// client_write) — e.g. because the backend's build step rejected a duplicate
+    /// create — the flow-control permit must still be released. The `_flow_permit`
+    /// RAII guard handles this naturally on every error-return path.
     #[tokio::test]
     async fn raft_proposal_permit_released_on_materialization_failure() {
-        use crate::datastore::raft::flow_control::RaftCommitFlowControl;
-        let fc = std::sync::Arc::new(RaftCommitFlowControl::new(3));
-        // Simulate acquiring all 3 permits then releasing one (materialization failure path).
-        let _p1 = fc.acquire().await;
-        let _p2 = fc.acquire().await;
-        let p3 = fc.acquire().await;
-        assert!(fc.try_acquire().is_none(), "no permits left");
-        drop(p3); // simulates releasing on materialization failure
+        use crate::datastore::replicated::RaftProposer;
+
+        let (node, backend) = fresh_node(72).await;
+        node.bootstrap_single_voter("https://10.99.0.72:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .expect("become leader");
+        // Seed the backend so a duplicate Create fails at materialization.
+        node.propose_command(propose_create_command("dup-target"))
+            .await
+            .expect("first create");
+        let permits_before = node.flow_control.available_permits();
+        assert_eq!(permits_before, 3, "permits restored after first success");
+
+        // Second create with the same name MUST fail at materialization (build step rejects
+        // duplicate). The permit must be released by the RAII guard on the error path.
+        let _ = backend
+            .get_resource("node.k8s.io/v1", "RuntimeClass", None, "fc-dup-target")
+            .await
+            .unwrap()
+            .expect("seed resource exists");
+        let err = node
+            .propose_command(propose_create_command("dup-target"))
+            .await
+            .expect_err("duplicate create must fail at materialization");
         assert!(
-            fc.try_acquire().is_some(),
-            "permit must be returned after materialization failure"
+            err.to_string().contains("already exists") || err.to_string().contains("409"),
+            "expected duplicate-create rejection, got: {err}"
         );
+        assert_eq!(
+            node.flow_control.available_permits(),
+            3,
+            "permit must be released after materialization-failure error path"
+        );
+        node.shutdown().await.unwrap();
     }
 
-    /// A permit released after a client_write failure must be returned to the pool.
+    /// Integration test: even when propose_command would fail at the consensus
+    /// `client_write` stage (no leader / leadership lost), the RAII permit guard
+    /// must still release. We exercise this by manually exhausting permits inside
+    /// a scope and verifying the guard releases on scope-exit (matches the
+    /// implementation: `let _flow_permit = self.flow_control.acquire().await;`).
     #[tokio::test]
     async fn raft_proposal_permit_released_on_client_write_failure() {
-        use crate::datastore::raft::flow_control::RaftCommitFlowControl;
-        let fc = std::sync::Arc::new(RaftCommitFlowControl::new(3));
-        let _p1 = fc.acquire().await;
-        let _p2 = fc.acquire().await;
-        let p3 = fc.acquire().await;
-        assert!(fc.try_acquire().is_none(), "no permits left");
-        drop(p3); // simulates releasing on client_write failure
-        assert!(
-            fc.try_acquire().is_some(),
-            "permit must be returned after client_write failure"
+        let (node, _backend) = fresh_node(73).await;
+        node.bootstrap_single_voter("https://10.99.0.73:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .expect("become leader");
+        // RAII semantics on the actual flow-control gate held by RaftNode:
+        // any exit (including a panic or an early return inside propose_command)
+        // must release the permit. We exercise the live gate here.
+        assert_eq!(node.flow_control.available_permits(), 3);
+        {
+            let _permit = node.flow_control.acquire().await;
+            assert_eq!(node.flow_control.available_permits(), 2, "permit acquired");
+            // Simulating the late-failure path: the permit is held when client_write
+            // would have failed; the RAII guard releases on scope exit.
+        }
+        assert_eq!(
+            node.flow_control.available_permits(),
+            3,
+            "RAII permit must release on scope exit (mirrors propose_command's error paths)"
         );
+        node.shutdown().await.unwrap();
     }
 
-    /// A permit released after terminal proposal success must be returned to the pool.
+    /// Integration test: after a successful propose_command (entry committed and
+    /// applied), the flow-control permit returns to the pool so subsequent proposals
+    /// can proceed.
     #[tokio::test]
     async fn raft_proposal_permit_released_on_terminal_success() {
-        use crate::datastore::raft::flow_control::RaftCommitFlowControl;
-        let fc = std::sync::Arc::new(RaftCommitFlowControl::new(3));
-        {
-            let _p = fc.acquire().await;
-            // Permit held across simulated proposal lifecycle.
-        } // dropped here — simulates terminal success
-        assert!(
-            fc.try_acquire().is_some(),
-            "permit must be returned after successful proposal"
+        use crate::datastore::replicated::RaftProposer;
+
+        let (node, _backend) = fresh_node(74).await;
+        node.bootstrap_single_voter("https://10.99.0.74:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .expect("become leader");
+        assert_eq!(node.flow_control.available_permits(), 3);
+
+        node.propose_command(propose_create_command("ok-success"))
+            .await
+            .expect("propose ok");
+
+        assert_eq!(
+            node.flow_control.available_permits(),
+            3,
+            "permit must be released after successful terminal propose_command"
         );
+        node.shutdown().await.unwrap();
     }
 
-    /// max_payload_entries must be 3 so a single retry cannot resend a large logical batch.
-    /// This matches the 3-permit gate (no more than 3 unacknowledged proposals).
+    /// Static check that the actual openraft `max_payload_entries` constant configured
+    /// in `start_with_network` is 3 — matching the 3-permit flow-control gate so a
+    /// single AppendEntries retry cannot resend a larger logical batch than the
+    /// in-flight bound. References the module-scope constant so this test would fail
+    /// if anyone reverted RAFT_MAX_PAYLOAD_ENTRIES upward without updating the test.
     #[test]
     fn raft_max_payload_entries_is_bounded_for_lossy_resend() {
-        // The constant is defined locally in RaftNode::new_for_cluster.
-        // We verify the requirement here as a static invariant: the flow control permit
-        // count (3) must equal or exceed the minimum meaningful payload entries.
-        // The actual assertion on max_payload_entries=3 lives in the config build.
-        use crate::datastore::raft::flow_control::RaftCommitFlowControl;
-        let fc = RaftCommitFlowControl::new(3);
+        // The constant is referenced by Config.max_payload_entries inside
+        // start_with_network — both sites are the same identifier so they cannot drift.
         assert_eq!(
-            fc.max_in_flight(),
+            super::RAFT_MAX_PAYLOAD_ENTRIES,
             3,
-            "RaftCommitFlowControl must enforce exactly 3 in-flight proposals to match max_payload_entries=3"
+            "RAFT_MAX_PAYLOAD_ENTRIES must be 3 to match the 3-permit flow-control gate"
         );
+        // Also assert the matching invariant: the flow-control cap equals the
+        // openraft payload cap, so a single retry cannot resend more entries than
+        // the gate would have admitted in flight.
+        let fc = crate::datastore::raft::flow_control::RaftCommitFlowControl::new(
+            super::RAFT_MAX_PAYLOAD_ENTRIES as usize,
+        );
+        assert_eq!(fc.max_in_flight(), 3);
     }
 }

@@ -52,6 +52,13 @@ impl RaftCommitFlowControl {
             }
         }
     }
+
+    /// Number of permits currently available (i.e. `max_in_flight - in_flight`).
+    /// Used by integration tests to verify the RAII guard releases on every exit path
+    /// of `propose_command`.
+    pub fn available_permits(&self) -> usize {
+        self.semaphore.available_permits()
+    }
 }
 
 #[cfg(test)]

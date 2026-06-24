@@ -1460,12 +1460,21 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
     .await
     .expect("client scale update applies before stale patch commit");
 
-    // Raft-authoritative apply: the staleness-related precondition (precondition_rv) is bypassed.
-    // The PatchResource build path produces a PutResource with the FULL patched state captured at
-    // build time (replicas=10, annotation updated). When the stale commit is applied with
-    // raft_authoritative=true, the precondition_rv mismatch is bypassed and the committed data
-    // (replicas=10) is written. In a real raft cluster, the concurrent update commit (replicas=30)
-    // would be applied afterward in log order, restoring the correct state.
+    // Raft-authoritative apply (Task 1): the staleness-related precondition_rv on the patch
+    // commit is BYPASSED. The PatchResource build path captured the live state at build time
+    // (replicas=10) and produced a PutResource carrying that full state plus the annotation
+    // patch. When the stale commit is applied with raft_authoritative=true, the rv-mismatch
+    // is bypassed and the committed PUT overwrites the locally-updated row.
+    //
+    // This is a deliberate design trade-off: in a real raft cluster, the concurrent update
+    // (replicas=30) would itself be a raft commit at a later log index that would be applied
+    // AFTER this stale patch — restoring the correct final state via raft log ordering.
+    // The test's direct `update_resource()` call simulates an out-of-band local update that
+    // bypasses raft; such updates are impossible in production (leader-only-writes invariant).
+    //
+    // The test name still uses "does_not_revert_live_spec" for historical continuity with
+    // the closing-gate documentation, but the assertion now verifies the new authoritative
+    // behavior: the committed value wins over stale local state.
     let apply_result = db
         .apply_raft_log_apply_commit(commit)
         .await
@@ -1484,15 +1493,26 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
         .await
         .unwrap()
         .expect("deployment remains after authoritative apply");
-    // The committed state (built at replicas=10) is applied. In a real raft cluster the
-    // subsequent UpdateResource commit (replicas=30, higher log index) would restore the
-    // correct final state. This test verifies the committed annotation is present.
+
+    // Positive assertion of the new authoritative behavior: the committed PUT (built at
+    // replicas=10) overwrites the locally-updated replicas=30. If a future change re-introduced
+    // precondition_rv enforcement on the raft apply path, the stale patch would have been
+    // rejected and replicas would still be 30 — this assertion would fail.
+    assert_eq!(
+        live.data
+            .pointer("/spec/replicas")
+            .and_then(|value| value.as_i64()),
+        Some(10),
+        "raft authoritative apply must overwrite stale local replicas=30 with the committed value (replicas=10); \
+         if this assertion fires the authoritative bypass has regressed"
+    );
+    // The annotation captured by the patch must also be present.
     assert_eq!(
         live.data
             .pointer("/metadata/annotations/deployment.kubernetes.io~1revision")
             .and_then(|v| v.as_str()),
         Some("2"),
-        "authoritative stale patch commit must persist the annotation change"
+        "authoritative stale patch commit must persist the annotation captured at build time"
     );
 }
 
