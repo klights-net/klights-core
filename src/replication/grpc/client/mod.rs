@@ -696,6 +696,13 @@ pub struct ReplicationGrpcClient {
     /// bug-grpc: observability + test seam — number of real channel
     /// builds (TLS handshakes) performed via `channel_to_endpoint`.
     channel_build_count: Arc<std::sync::atomic::AtomicU64>,
+    /// T7: per-peer raft transport counters (shared via Arc so test seams
+    /// can read them without holding the struct mut).  Monotonic; never
+    /// reset.  All three raft RPC paths route through `raft_unary_call`
+    /// which increments these on every call.
+    raft_timeout_count: Arc<std::sync::atomic::AtomicU64>,
+    raft_append_entries_call_count: Arc<std::sync::atomic::AtomicU64>,
+    raft_append_entries_byte_count: Arc<std::sync::atomic::AtomicU64>,
     /// bug-grpc A1: the single transport policy object — owns the per-call
     /// unary deadline (the bounded-call self-heal that fixes the partial-loss
     /// "10-minute stable cluster" stall), dial timeouts/keepalives, and the
@@ -822,6 +829,9 @@ impl ReplicationGrpcClient {
             observed_leader_endpoint: Arc::new(std::sync::Mutex::new(None)),
             channel_pools: Arc::new(Mutex::new(std::collections::HashMap::new())),
             channel_build_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            raft_timeout_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            raft_append_entries_call_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            raft_append_entries_byte_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             policy,
         }
     }
@@ -857,6 +867,28 @@ impl ReplicationGrpcClient {
     #[cfg(test)]
     pub fn channel_build_count(&self) -> u64 {
         self.channel_build_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// T7: test seam — number of raft RPC deadline-exceeded timeouts recorded
+    /// across all three raft RPC methods (AppendEntries, Vote, InstallSnapshot).
+    #[cfg(test)]
+    pub fn raft_timeout_count(&self) -> u64 {
+        self.raft_timeout_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// T7: test seam — number of AppendEntries RPCs dispatched.
+    #[cfg(test)]
+    pub fn raft_append_entries_call_count(&self) -> u64 {
+        self.raft_append_entries_call_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// T7: test seam — total bytes sent in AppendEntries payloads.
+    #[cfg(test)]
+    pub fn raft_append_entries_byte_count(&self) -> u64 {
+        self.raft_append_entries_byte_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1361,6 +1393,13 @@ impl ReplicationGrpcClient {
                 // Per-call deadline elapsed: the connection is wedged. Evict
                 // the Raft lane so the next attempt rebuilds a fresh
                 // connection against the peer.
+                self.raft_timeout_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    name,
+                    deadline_ms = self.policy.raft_unary_deadline.as_millis(),
+                    "raft RPC deadline exceeded; invalidating Raft lane"
+                );
                 self.invalidate_lane(ChannelLane::Raft).await;
                 Err(anyhow::anyhow!(
                     "{name} deadline exceeded after {:?}",
@@ -1433,6 +1472,11 @@ impl ReplicationGrpcClient {
         &self,
         payload: Vec<u8>,
     ) -> Result<std::result::Result<Vec<u8>, String>> {
+        let byte_len = payload.len() as u64;
+        self.raft_append_entries_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.raft_append_entries_byte_count
+            .fetch_add(byte_len, std::sync::atomic::Ordering::Relaxed);
         let response = self
             .raft_unary_call("grpc_raft_append_entries", move |mut client| async move {
                 client

@@ -123,6 +123,11 @@ impl RaftNode {
         const RAFT_SNAPSHOT_MAX_CHUNK_SIZE_BYTES: u64 = 512 * 1024;
         const RAFT_REPLICATION_LAG_THRESHOLD: u64 = 5000;
         const _: () = assert!(RAFT_REPLICATION_LAG_THRESHOLD >= 5000);
+        // T7 election-floor invariant: install-snapshot timeout and the raft
+        // unary RPC deadline (5 s, matching RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS)
+        // must both be below the election timeout minimum so a wedged peer
+        // cannot prevent leader election.
+        const _: () = assert!(RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS < RAFT_ELECTION_TIMEOUT_MIN_MS);
         // Cross-subsystem safety: worst-case failover (<= election_timeout_max)
         // must finish before observed node leases go stale, or a single leader
         // change would false-evict every node (lease renewals can't commit

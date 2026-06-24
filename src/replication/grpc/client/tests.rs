@@ -1876,4 +1876,284 @@ mod cases {
             "wedged Read lane must be evicted so the next watch rebuilds"
         );
     }
+
+    // ── Task 7: raft lane health and per-peer loss observability ─────────────
+
+    /// Helper: build a test client against a server that wedges the given
+    /// gRPC method path for 30 s, with a short raft_unary_deadline.
+    async fn raft_timeout_client(
+        wedge_path_suffix: &'static str,
+    ) -> (ReplicationGrpcClient, tokio::task::JoinHandle<()>) {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+            .await
+            .unwrap();
+        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+            .await
+            .unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let app = crate::replication::grpc::server::mount_service(
+            axum::Router::new(),
+            service,
+            db.clone(),
+            default_transport_policy(),
+        );
+        let app = mount_test_service_with_node_cert(app, "worker-1");
+        let app = app.layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                if request.uri().path().ends_with(wedge_path_suffix) {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                next.run(request).await
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let mut client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: endpoint,
+                token,
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: dataplane(),
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+        );
+        client.override_raft_unary_deadline(Duration::from_millis(50));
+        (client, handle)
+    }
+
+    #[tokio::test]
+    async fn append_entries_timeout_invalidates_lane() {
+        let (client, handle) = raft_timeout_client("/RaftAppendEntries").await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.raft_append_entries_rpc(Vec::new()),
+        )
+        .await
+        .expect("must complete within wall-clock bound");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("deadline exceeded"),
+            "AppendEntries timeout must report deadline exceeded, got: {msg}"
+        );
+        assert!(
+            !client.lane_pool_present_for_test(ChannelLane::Raft).await,
+            "Raft lane must be invalidated after AppendEntries deadline exceeded"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn request_vote_timeout_invalidates_lane() {
+        let (client, handle) = raft_timeout_client("/RaftVote").await;
+        let result = tokio::time::timeout(Duration::from_secs(2), client.raft_vote_rpc(Vec::new()))
+            .await
+            .expect("must complete within wall-clock bound");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("deadline exceeded"),
+            "Vote timeout must report deadline exceeded, got: {msg}"
+        );
+        assert!(
+            !client.lane_pool_present_for_test(ChannelLane::Raft).await,
+            "Raft lane must be invalidated after Vote deadline exceeded"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_timeout_invalidates_lane() {
+        let (client, handle) = raft_timeout_client("/RaftInstallSnapshot").await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.raft_install_snapshot_rpc(Vec::new()),
+        )
+        .await
+        .expect("must complete within wall-clock bound");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("deadline exceeded"),
+            "InstallSnapshot timeout must report deadline exceeded, got: {msg}"
+        );
+        assert!(
+            !client.lane_pool_present_for_test(ChannelLane::Raft).await,
+            "Raft lane must be invalidated after InstallSnapshot deadline exceeded"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn non_transport_raft_error_does_not_invalidate_lane() {
+        // A raft application-layer error (e.g. the openraft state machine
+        // returns an error inside the gRPC response body) must NOT evict the
+        // Raft lane — only a transport-level timeout or connection failure
+        // indicates a wedged connection that needs rebuilding.
+        //
+        // Strategy: call raft_append_entries_rpc against a real server.
+        // The server decodes an empty/invalid payload and returns an error
+        // inside the response body (not a transport-level tonic::Status).
+        // The client must NOT call invalidate_lane — the Raft lane stays warm.
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+            .await
+            .unwrap();
+        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+            .await
+            .unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let app = crate::replication::grpc::server::mount_service(
+            axum::Router::new(),
+            service,
+            db.clone(),
+            default_transport_policy(),
+        );
+        let app = mount_test_service_with_node_cert(app, "worker-1");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: endpoint,
+                token,
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: dataplane(),
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+        );
+        // Send an empty payload — the server returns an raft application error
+        // in the response body, not a transport-level failure.
+        let result = client.raft_append_entries_rpc(Vec::new()).await;
+        // The call must complete (not time out) — it reached the server.
+        // The result may be Ok(Err(msg)) (application error from the raft state
+        // machine) or Err (transport) — we only care that the lane is NOT evicted.
+        match &result {
+            Ok(_) | Err(_) => {} // either is acceptable; lane state is the assertion
+        }
+        // Lane must still be present because no transport failure occurred.
+        assert!(
+            client.lane_pool_present_for_test(ChannelLane::Raft).await,
+            "a non-transport raft error must not invalidate the Raft lane; result: {result:?}"
+        );
+        handle.abort();
+    }
+
+    #[test]
+    fn raft_rpc_deadline_is_below_election_timeout_floor() {
+        // T7 election-floor invariant: the raft unary RPC deadline must be
+        // strictly below the election timeout minimum so a wedged peer cannot
+        // prevent the cluster from electing a new leader.
+        //
+        // Compile-time assertion (RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS <
+        // RAFT_ELECTION_TIMEOUT_MIN_MS) lives in datastore::raft::node.
+        // This runtime test records the same invariant for the transport layer.
+        let policy =
+            crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default();
+        let raft_deadline_ms = policy.raft_unary_deadline.as_millis() as u64;
+        // RAFT_ELECTION_TIMEOUT_MIN_MS = 9000 (must stay in sync with node.rs)
+        let election_floor_ms: u64 = 9000;
+        assert!(
+            raft_deadline_ms < election_floor_ms,
+            "raft_unary_deadline ({raft_deadline_ms} ms) must be below election timeout floor \
+             ({election_floor_ms} ms) so a wedged peer cannot block leader election"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_raft_rpcs_use_raft_unary_call() {
+        // Structural invariant: all three raft RPC methods (AppendEntries, Vote,
+        // InstallSnapshot) must route through raft_unary_call so they share the
+        // same deadline + lane-invalidation policy.  We verify this by calling
+        // all three against a wedge server and asserting:
+        //   1. Each call reports "deadline exceeded" (not a different error).
+        //   2. Each call evicts the Raft lane (which only raft_unary_call does).
+        for (method, path) in [
+            ("AppendEntries", "/RaftAppendEntries"),
+            ("Vote", "/RaftVote"),
+            ("InstallSnapshot", "/RaftInstallSnapshot"),
+        ] {
+            let (client, handle) = raft_timeout_client(path).await;
+
+            let result = match method {
+                "AppendEntries" => tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.raft_append_entries_rpc(Vec::new()),
+                )
+                .await
+                .expect("must finish")
+                .map(|_| ()),
+                "Vote" => {
+                    tokio::time::timeout(Duration::from_secs(2), client.raft_vote_rpc(Vec::new()))
+                        .await
+                        .expect("must finish")
+                        .map(|_| ())
+                }
+                "InstallSnapshot" | _ => tokio::time::timeout(
+                    Duration::from_secs(2),
+                    client.raft_install_snapshot_rpc(Vec::new()),
+                )
+                .await
+                .expect("must finish")
+                .map(|_| ()),
+            };
+
+            let msg = format!("{}", result.unwrap_err());
+            assert!(
+                msg.contains("deadline exceeded"),
+                "{method} must report deadline exceeded (uses raft_unary_call), got: {msg}"
+            );
+            assert!(
+                !client.lane_pool_present_for_test(ChannelLane::Raft).await,
+                "{method} must evict Raft lane (proves raft_unary_call path)"
+            );
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn raft_transport_records_per_peer_append_entries_and_timeout_counters() {
+        // T7: after a deadline-exceeded AppendEntries, the client must have
+        // incremented both raft_append_entries_call_count and raft_timeout_count.
+        let (client, handle) = raft_timeout_client("/RaftAppendEntries").await;
+        let payload = vec![0u8; 16]; // 16 bytes — verifiable in byte counter
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.raft_append_entries_rpc(payload.clone()),
+        )
+        .await;
+        assert_eq!(
+            client.raft_append_entries_call_count(),
+            1,
+            "raft_append_entries_call_count must be 1 after one call"
+        );
+        assert_eq!(
+            client.raft_append_entries_byte_count(),
+            payload.len() as u64,
+            "raft_append_entries_byte_count must equal the payload length"
+        );
+        assert_eq!(
+            client.raft_timeout_count(),
+            1,
+            "raft_timeout_count must be 1 after one deadline-exceeded AppendEntries"
+        );
+        handle.abort();
+    }
 }
