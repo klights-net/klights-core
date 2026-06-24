@@ -1179,6 +1179,65 @@ async fn test_namespace_selector_non_match_skips_namespaced_call() {
 }
 
 #[tokio::test]
+async fn test_namespace_selector_non_match_skips_failing_match_condition() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let engine = AdmissionEngine::new(&db);
+
+    let ns = json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {"name": "default", "labels": {"team": "a"}}
+    });
+    db.create_resource("v1", "Namespace", None, "default", ns)
+        .await
+        .unwrap();
+
+    let mwc = json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "MutatingWebhookConfiguration",
+        "metadata": {"name": "mwc-ns-selector-before-match-condition"},
+        "webhooks": [{
+            "name": "m.example.com",
+            "failurePolicy": "Fail",
+            "namespaceSelector": {"matchLabels": {"team": "b"}},
+            "matchConditions": [{
+                "name": "would-error-if-evaluated",
+                "expression": "request.doesNotExist.field == 'x'"
+            }],
+            "clientConfig": {"url": "https://127.0.0.1:1/mutate"},
+            "rules": [{
+                "operations": ["CREATE"],
+                "apiGroups": [""],
+                "apiVersions": ["v1"],
+                "resources": ["pods"]
+            }]
+        }]
+    });
+    db.create_resource(
+        "admissionregistration.k8s.io/v1",
+        "MutatingWebhookConfiguration",
+        None,
+        "mwc-ns-selector-before-match-condition",
+        mwc,
+    )
+    .await
+    .unwrap();
+
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "p0", "namespace": "default"},
+        "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+    });
+
+    let got = engine
+        .run_mutating(&pod, "v1", "Pod", "CREATE")
+        .await
+        .expect("selector mismatch must skip matchConditions and callout");
+    assert_eq!(got, pod);
+}
+
+#[tokio::test]
 async fn test_namespace_selector_ignored_for_cluster_scoped_request() {
     let db = crate::datastore::test_support::in_memory().await;
     let engine = AdmissionEngine::new(&db);

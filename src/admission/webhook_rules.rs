@@ -111,6 +111,21 @@ pub(super) fn should_call_cached_webhook(
         return Ok(false);
     }
 
+    // Cluster-scoped requests have no namespace, hence no namespace labels;
+    // K8s spec ignores the namespaceSelector for those requests so the
+    // webhook still gets a chance to handle them.
+    if ns_labels.is_some() && !webhook.namespace_selector.matches(ns_labels) {
+        return Ok(false);
+    }
+
+    let resource_labels = resource
+        .get("metadata")
+        .and_then(|m| m.get("labels"))
+        .and_then(|l| l.as_object());
+    if !webhook.object_selector.matches(resource_labels) {
+        return Ok(false);
+    }
+
     if let Some(conditions) = webhook_match_conditions(raw) {
         let failure_policy = raw
             .get("failurePolicy")
@@ -128,21 +143,6 @@ pub(super) fn should_call_cached_webhook(
                 .and_then(|n| n.as_str())
                 .unwrap_or("<unnamed>")
         );
-    }
-
-    // Cluster-scoped requests have no namespace, hence no namespace labels;
-    // K8s spec ignores the namespaceSelector for those requests so the
-    // webhook still gets a chance to handle them.
-    if ns_labels.is_some() && !webhook.namespace_selector.matches(ns_labels) {
-        return Ok(false);
-    }
-
-    let resource_labels = resource
-        .get("metadata")
-        .and_then(|m| m.get("labels"))
-        .and_then(|l| l.as_object());
-    if !webhook.object_selector.matches(resource_labels) {
-        return Ok(false);
     }
 
     Ok(true)
