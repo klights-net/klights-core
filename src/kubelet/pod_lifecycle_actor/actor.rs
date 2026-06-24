@@ -615,7 +615,7 @@ impl PodLifecycleActor {
         tracing::info!(
             namespace = %key.namespace, pod = %key.name, uid = %key.uid,
             operation_id, phase = ?self.state.phase,
-            hint_container_id = ?hint.container_id,
+            hint_container_ids = ?hint.container_ids().collect::<Vec<_>>(),
             "lifecycle-actor: dispatching ReconcileRuntime"
         );
         PodAction::ReconcileRuntime {

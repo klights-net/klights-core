@@ -10195,3 +10195,278 @@ async fn real_runtime_reconcile_uses_cri_event_container_id_when_list_is_empty()
         status.pointer("/state")
     );
 }
+
+// Task 4 tests (red-green): track multiple CRI event container IDs
+#[cfg(test)]
+mod task4_runtime_observations {
+    use super::*;
+    use crate::kubelet::pod_lifecycle_core::state::PodLifecycleState;
+    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
+    use crate::kubelet::pod_runtime::service::PodRuntimeKey;
+    use crate::kubelet::pod_runtime::service::RuntimeReconcileHint;
+    use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
+
+    #[test]
+    fn deferred_runtime_reconcile_preserves_multiple_container_ids() {
+        let mut state = PodLifecycleState::new();
+        state.defer_runtime_reconcile(Some("ctr-a"));
+        state.defer_runtime_reconcile(Some("ctr-b"));
+        state.defer_runtime_reconcile(Some("ctr-c"));
+        let hint = state.take_runtime_reconcile_hint();
+        let ids: std::collections::BTreeSet<_> = hint.container_ids().collect();
+        assert!(ids.contains("ctr-a"), "must preserve ctr-a");
+        assert!(ids.contains("ctr-b"), "must preserve ctr-b");
+        assert!(ids.contains("ctr-c"), "must preserve ctr-c");
+        assert_eq!(ids.len(), 3, "must have all 3 IDs, got: {ids:?}");
+    }
+
+    #[test]
+    fn runtime_reconcile_drains_observations_without_polling() {
+        let mut state = PodLifecycleState::new();
+        state.defer_runtime_reconcile(Some("ctr-x"));
+        state.defer_runtime_reconcile(Some("ctr-y"));
+        let first = state.take_runtime_reconcile_hint();
+        assert!(!first.is_empty(), "first drain must be non-empty");
+        let second = state.take_runtime_reconcile_hint();
+        assert!(
+            second.is_empty(),
+            "second drain must be empty (observations cleared)"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reconcile_uses_hinted_container_when_listing_is_partially_stale() {
+        use crate::kubelet::pod_runtime::test_support::PodRuntimeHarness;
+        let harness = PodRuntimeHarness::new().await;
+        let image = "registry.k8s.io/e2e-test-images/busybox:1.37.0-1";
+        let key = PodRuntimeKey::new("container-runtime", "partial-stale", "uid-partial-stale");
+        let pod = serde_json::json!({
+            "apiVersion":"v1","kind":"Pod",
+            "metadata":{"namespace":"container-runtime","name":"partial-stale","uid":"uid-partial-stale","resourceVersion":"1"},
+            "spec":{"nodeName":"test-node","restartPolicy":"Never","containers":[{"name":"a","image":image,"imagePullPolicy":"Never"},{"name":"b","image":image,"imagePullPolicy":"Never"}]},
+            "status":{"phase":"Running","containerStatuses":[
+                {"name":"a","image":image,"imageID":image,"ready":true,"started":true,"restartCount":0,"state":{"running":{"startedAt":""}}},
+                {"name":"b","image":image,"imageID":image,"ready":true,"started":true,"restartCount":0,"state":{"running":{"startedAt":""}}}
+            ]}
+        });
+        harness.create_runtime_pod(pod.clone()).await;
+        use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+        harness
+            .repo
+            .set_pod_status_for_uid(
+                "container-runtime",
+                "partial-stale",
+                "uid-partial-stale",
+                PodStatusUpdate {
+                    phase: "Running".to_string(),
+                    pod_ip: "10.0.0.1".to_string(),
+                    host_ip: String::new(),
+                    container_statuses: pod
+                        .pointer("/status/containerStatuses")
+                        .unwrap()
+                        .as_array()
+                        .unwrap()
+                        .clone(),
+                    init_container_statuses: None,
+                    qos_class: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        harness
+            .store
+            .record_sandbox(&key, "sandbox-partial")
+            .await
+            .unwrap();
+        // listing is partial: only ctr-a is listed (ctr-b exited and was removed)
+        harness
+            .container_control
+            .set_container_states(vec![("ctr-a".to_string(), ContainerRuntimeState::Running)]);
+        // Both ctr-a and ctr-b are observed (from CRI events)
+        harness.cri.set_container_status_for_test(
+            "ctr-b",
+            "b",
+            ContainerRuntimeState::Exited,
+            0,
+            1_000_000_000,
+            1_250_000_000,
+            image,
+        );
+        let hint =
+            RuntimeReconcileHint::from_container_ids(["ctr-a".to_string(), "ctr-b".to_string()]);
+        harness
+            .runtime
+            .reconcile_runtime(key.clone(), hint)
+            .await
+            .unwrap();
+        let updated = harness.stored_pod(&key).await;
+        let statuses = updated
+            .pointer("/status/containerStatuses")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let b_status = statuses
+            .iter()
+            .find(|s| s.pointer("/name").and_then(|v| v.as_str()) == Some("b"))
+            .expect("container b must have a status");
+        assert!(
+            b_status.pointer("/state/terminated").is_some(),
+            "ctr-b must be terminated even though it's not in the listing: {b_status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reconcile_ignores_unknown_hinted_container_without_regressing_terminal_status()
+    {
+        let harness = PodRuntimeHarness::new().await;
+        let image = "registry.k8s.io/e2e-test-images/busybox:1.37.0-1";
+        let key = PodRuntimeKey::new("container-runtime", "unknown-hint", "uid-unknown-hint");
+        let pod = serde_json::json!({
+            "apiVersion":"v1","kind":"Pod",
+            "metadata":{"namespace":"container-runtime","name":"unknown-hint","uid":"uid-unknown-hint","resourceVersion":"1"},
+            "spec":{"nodeName":"test-node","restartPolicy":"Never","containers":[{"name":"app","image":image,"imagePullPolicy":"Never"}]},
+            "status":{"phase":"Succeeded","containerStatuses":[{"name":"app","image":image,"imageID":image,"ready":false,"started":false,"restartCount":0,"state":{"terminated":{"exitCode":0,"reason":"Completed"}}}]}
+        });
+        harness.create_runtime_pod(pod.clone()).await;
+        use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+        harness
+            .repo
+            .set_pod_status_for_uid(
+                "container-runtime",
+                "unknown-hint",
+                "uid-unknown-hint",
+                PodStatusUpdate {
+                    phase: "Succeeded".to_string(),
+                    pod_ip: String::new(),
+                    host_ip: String::new(),
+                    container_statuses: pod
+                        .pointer("/status/containerStatuses")
+                        .unwrap()
+                        .as_array()
+                        .unwrap()
+                        .clone(),
+                    init_container_statuses: None,
+                    qos_class: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        harness
+            .store
+            .record_sandbox(&key, "sandbox-unknown")
+            .await
+            .unwrap();
+        harness.container_control.set_container_states(Vec::new());
+        // Hint with an unknown ID (no CRI status available for it)
+        let hint = RuntimeReconcileHint::from_container_ids(["ctr-unknown-xyz".to_string()]);
+        harness
+            .runtime
+            .reconcile_runtime(key.clone(), hint)
+            .await
+            .unwrap();
+        let updated = harness.stored_pod(&key).await;
+        // Unknown hinted container must not regress the Succeeded phase
+        assert_eq!(
+            updated.pointer("/status/phase").and_then(|v| v.as_str()),
+            Some("Succeeded"),
+            "unknown hint must not regress terminal phase: {:?}",
+            updated.pointer("/status/phase")
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_exit_multi_container_pod_reaches_terminal_phase_under_empty_listing() {
+        let harness = PodRuntimeHarness::new().await;
+        let image = "registry.k8s.io/e2e-test-images/busybox:1.37.0-1";
+        let key = PodRuntimeKey::new("container-runtime", "multi-exit", "uid-multi-exit");
+        let pod = serde_json::json!({
+            "apiVersion":"v1","kind":"Pod",
+            "metadata":{"namespace":"container-runtime","name":"multi-exit","uid":"uid-multi-exit","resourceVersion":"1"},
+            "spec":{"nodeName":"test-node","restartPolicy":"Never","containers":[
+                {"name":"a","image":image,"imagePullPolicy":"Never"},
+                {"name":"b","image":image,"imagePullPolicy":"Never"}
+            ]},
+            "status":{"phase":"Pending","containerStatuses":[
+                {"name":"a","image":image,"imageID":image,"ready":false,"started":false,"restartCount":0,"state":{"waiting":{"reason":"ContainerCreating"}}},
+                {"name":"b","image":image,"imageID":image,"ready":false,"started":false,"restartCount":0,"state":{"waiting":{"reason":"ContainerCreating"}}}
+            ]}
+        });
+        harness.create_runtime_pod(pod.clone()).await;
+        use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+        harness
+            .repo
+            .set_pod_status_for_uid(
+                "container-runtime",
+                "multi-exit",
+                "uid-multi-exit",
+                PodStatusUpdate {
+                    phase: "Pending".to_string(),
+                    pod_ip: "10.0.0.2".to_string(),
+                    host_ip: String::new(),
+                    container_statuses: pod
+                        .pointer("/status/containerStatuses")
+                        .unwrap()
+                        .as_array()
+                        .unwrap()
+                        .clone(),
+                    init_container_statuses: None,
+                    qos_class: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        harness
+            .store
+            .record_sandbox(&key, "sandbox-multi")
+            .await
+            .unwrap();
+        harness.container_control.set_container_states(Vec::new()); // empty listing
+        harness.cri.set_container_status_for_test(
+            "ctr-a",
+            "a",
+            ContainerRuntimeState::Exited,
+            0,
+            1_000_000_000,
+            1_250_000_000,
+            image,
+        );
+        harness.cri.set_container_status_for_test(
+            "ctr-b",
+            "b",
+            ContainerRuntimeState::Exited,
+            0,
+            1_000_000_000,
+            1_250_000_000,
+            image,
+        );
+        let hint =
+            RuntimeReconcileHint::from_container_ids(["ctr-a".to_string(), "ctr-b".to_string()]);
+        harness
+            .runtime
+            .reconcile_runtime(key.clone(), hint)
+            .await
+            .unwrap();
+        let updated = harness.stored_pod(&key).await;
+        assert_eq!(
+            updated.pointer("/status/phase").and_then(|v| v.as_str()),
+            Some("Succeeded"),
+            "multi-container fast-exit pod must reach Succeeded: {:?}",
+            updated.pointer("/status/phase")
+        );
+        let statuses = updated
+            .pointer("/status/containerStatuses")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(statuses.len(), 2, "both containers must have statuses");
+        for s in statuses {
+            assert!(
+                s.pointer("/state/terminated").is_some(),
+                "container must be terminated: {s}"
+            );
+        }
+    }
+}

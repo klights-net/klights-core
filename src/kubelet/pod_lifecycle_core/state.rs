@@ -3,6 +3,8 @@
 //! `PodLifecycleState` tracks pod phase, in-flight work, monotonic operation ids,
 //! and sandbox identity so both actor and multiplex can share state-machine logic.
 
+use std::collections::BTreeSet;
+
 use super::message::{PodLifecycleKey, PodLifecycleWorkKind};
 
 /// Phases a pod transitions through during its lifecycle.
@@ -79,11 +81,15 @@ pub struct PodLifecycleState {
     /// Runtime reconciliation must run after startup finalizers complete so
     /// fast-exiting containers cannot be hidden by the final Running write.
     pub pending_runtime_reconcile: bool,
-    /// Container id carried by the deferred CRI event, if any. Drained into a
-    /// `RuntimeReconcileHint` when the deferred reconcile runs so the
-    /// reconciler can read the concrete (terminated) container status instead
-    /// of synthesizing Pending/ContainerCreating under a lossy listing.
-    pub pending_runtime_reconcile_container_id: Option<String>,
+    /// All container IDs observed from CRI events since the last reconcile.
+    /// Drained into a `RuntimeReconcileHint` when the deferred reconcile runs
+    /// so the reconciler can read concrete (terminated) container status for
+    /// every exited container instead of synthesizing Pending/ContainerCreating
+    /// under a lossy or partial sandbox listing.
+    ///
+    /// Replaces the singular `pending_runtime_reconcile_container_id` field so
+    /// that multi-container pods and multiple CRI events are all preserved.
+    pub runtime_reconcile_observed_ids: BTreeSet<String>,
     /// A Running watch echo arrived while startup finalization was in flight.
     /// If that in-flight finalizer still cannot confirm probe startup, retry
     /// once with the newer watch state instead of waiting for another event.
@@ -110,7 +116,7 @@ impl Default for PodLifecycleState {
             retry_attempts: 0,
             last_resource_version: None,
             pending_runtime_reconcile: false,
-            pending_runtime_reconcile_container_id: None,
+            runtime_reconcile_observed_ids: BTreeSet::new(),
             pending_startup_finalization_retry: false,
         }
     }
@@ -145,7 +151,7 @@ impl PodLifecycleState {
         self.finalized = false;
         self.retry_attempts = 0;
         self.pending_runtime_reconcile = false;
-        self.pending_runtime_reconcile_container_id = None;
+        self.runtime_reconcile_observed_ids.clear();
         self.pending_startup_finalization_retry = false;
         self.phase = PodPhase::Created;
     }
@@ -377,21 +383,20 @@ impl PodLifecycleState {
 
     /// Defer a runtime reconcile that could not run because startup or another
     /// operation is still in flight. `container_id` carries the CRI event's
-    /// concrete container id (if any) so the later reconcile can read its
-    /// status instead of synthesizing Pending/ContainerCreating under a
-    /// lossy sandbox container listing.
+    /// Record a deferred runtime reconcile triggered by a CRI event. Accumulates
+    /// all observed container IDs into the actor-owned observation set so that
+    /// multi-container pods and multiple CRI events are all preserved until the
+    /// next reconcile drains them.
     pub fn defer_runtime_reconcile(&mut self, container_id: Option<&str>) {
         self.pending_runtime_reconcile = true;
-        // Preserve an earlier hint if the new one is empty — a subsequent
-        // CRI event with no container id must not erase a prior one.
         if let Some(id) = container_id.filter(|id| !id.is_empty()) {
-            self.pending_runtime_reconcile_container_id = Some(id.to_string());
+            self.runtime_reconcile_observed_ids.insert(id.to_string());
         }
     }
 
-    /// Drain a deferred runtime reconcile into a `RuntimeReconcileHint`.
-    /// Clears both the boolean flag and the carried container id. Returns
-    /// `none()` when nothing was deferred.
+    /// Drain all deferred runtime reconcile observations into a `RuntimeReconcileHint`.
+    /// Clears both the boolean flag and the accumulated container IDs. Returns
+    /// an empty hint when nothing was deferred.
     pub fn take_runtime_reconcile_hint(
         &mut self,
     ) -> crate::kubelet::pod_runtime::service::RuntimeReconcileHint {
@@ -399,13 +404,8 @@ impl PodLifecycleState {
             return crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none();
         }
         self.pending_runtime_reconcile = false;
-        let container_id = self.pending_runtime_reconcile_container_id.take();
-        match container_id {
-            Some(id) => {
-                crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_id(id)
-            }
-            None => crate::kubelet::pod_runtime::service::RuntimeReconcileHint::none(),
-        }
+        let ids = std::mem::take(&mut self.runtime_reconcile_observed_ids);
+        crate::kubelet::pod_runtime::service::RuntimeReconcileHint::from_container_ids(ids)
     }
 }
 

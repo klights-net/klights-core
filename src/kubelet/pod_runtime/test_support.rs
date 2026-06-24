@@ -1489,7 +1489,7 @@ pub enum MockRuntimeCall {
         namespace: String,
         name: String,
         uid: String,
-        hint_container_id: Option<String>,
+        hint_container_ids: Vec<String>,
     },
     ReconcileCriLeftovers {
         namespace: String,
@@ -1563,7 +1563,7 @@ impl MockRuntimeCall {
                 namespace,
                 name,
                 uid,
-                hint_container_id: None,
+                hint_container_ids: vec![],
             },
             "reconcile_cri_leftovers" => MockRuntimeCall::ReconcileCriLeftovers {
                 namespace,
@@ -1754,7 +1754,7 @@ impl PodRuntimeService for MockPodRuntimeService {
                 namespace: key.namespace.clone(),
                 name: key.name.clone(),
                 uid: key.uid.clone(),
-                hint_container_id: hint.container_id,
+                hint_container_ids: hint.container_ids().map(str::to_string).collect(),
             });
         Ok(())
     }

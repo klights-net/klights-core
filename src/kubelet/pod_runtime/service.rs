@@ -2751,13 +2751,23 @@ impl PodRuntimeService for RealPodRuntimeService {
             .list_containers(Some(&sandbox_id))
             .await
             .unwrap_or_default();
-        if containers.is_empty()
-            && let Some(container_id) = hint.container_id.as_deref()
-            && let Some(state) = self
+        // Augment with ALL observed container IDs from the hint, not just when
+        // the listing is empty. Multi-container pods and partial listings miss
+        // exited containers that have already been removed from the sandbox;
+        // the hint carries every CRI event's container ID so we can fetch their
+        // terminal state directly even when they're absent from the listing.
+        for container_id in hint.container_ids() {
+            if containers.iter().any(|(id, _)| id == container_id) {
+                continue; // Already present in the listing — skip the direct fetch.
+            }
+            if let Some(state) = self
                 .runtime_state_from_container_status(container_id)
                 .await?
-        {
-            containers.push((container_id.to_string(), state));
+            {
+                containers.push((container_id.to_string(), state));
+            }
+            // If the hinted ID has no runtime status, treat as observation miss
+            // and skip without regressing the Pod's existing phase/container state.
         }
 
         // 3. Build phase and container statuses from CRI state plus the Pod spec.

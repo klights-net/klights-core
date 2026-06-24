@@ -9,6 +9,7 @@ pub mod hostports;
 pub mod images;
 pub mod init_container_status;
 pub mod network;
+pub mod observations;
 pub mod orphan_stop;
 pub mod probes;
 pub mod reconcile_hint;
