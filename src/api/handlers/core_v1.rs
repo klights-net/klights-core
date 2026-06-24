@@ -416,54 +416,13 @@ async fn create_service(
     }
 
     let result = create_service_base(
-        State(state.clone()),
-        Path(namespace.clone()),
+        State(state),
+        Path(namespace),
         Query(query),
         axum::Extension(identity),
         LenientJson(body),
     )
     .await?;
-
-    let (status, json_response) = &result;
-    if *status == StatusCode::CREATED {
-        // Allocation/defaulting (ClusterIP, NodePort, type, sessionAffinity,
-        // ServicePort fields) runs synchronously so the API response carries
-        // the same allocated fields a client expects. Endpoint/EndpointSlice
-        // reconciliation and the dataplane route sync are NOT done here — they
-        // run asynchronously via the controller dispatcher after the enqueue
-        // below. See `controllers::service::allocate_service_fields_for_api_write`.
-        match crate::controllers::service::allocate_service_fields_for_api_write(
-            state.db.as_ref(),
-            &json_response.0,
-            state.service_ipam.as_ref(),
-            state.nodeport_alloc.as_ref(),
-        )
-        .await
-        {
-            Ok(Some(allocated)) => {
-                // Enqueue a Service reconcile so the controller reconciles
-                // Endpoints/EndpointSlice and requests a coalesced route sync.
-                state.controller_dispatcher.enqueue(&allocated).await;
-                return Ok((StatusCode::CREATED, Json(allocated)));
-            }
-            Ok(None) => {
-                // Service was deleted or is terminating between the persist
-                // and the allocation step — return the persisted object as-is.
-                tracing::warn!(
-                    "Service {}/{} absent or terminating during create allocation",
-                    namespace,
-                    json_response
-                        .0
-                        .pointer("/metadata/name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                );
-            }
-            Err(e) => {
-                tracing::error!("Failed to allocate service fields after create: {}", e);
-            }
-        }
-    }
 
     Ok(result)
 }

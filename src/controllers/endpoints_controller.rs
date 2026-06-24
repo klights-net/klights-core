@@ -9,7 +9,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 
-/// `Controller` impl for `Endpoints`. Registered in `ControllerDispatcher`.
+/// Legacy `Controller` wrapper for the Endpoints reconciler.
+///
+/// Production Service reconciliation now owns both Endpoints and EndpointSlice
+/// writes through the Service controller path, so real `v1/Endpoints` API
+/// objects are not registered as dispatcher keys.
 pub struct EndpointsController;
 
 #[async_trait]

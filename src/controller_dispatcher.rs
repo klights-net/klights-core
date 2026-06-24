@@ -17,7 +17,6 @@ use crate::controller::{Context, Controller};
 use crate::controllers::{
     daemonset_controller::DaemonSetController,
     deployment_controller::DeploymentController,
-    endpoints_controller::EndpointsController,
     job_controller::JobController,
     pdb_controller::PDBController,
     pvc_controller::PVCController,
@@ -140,10 +139,6 @@ impl ControllerDispatcher {
                 service_ipam: service_ipam.clone(),
                 nodeport_alloc: nodeport_alloc.clone(),
             }) as Arc<dyn Controller>,
-        );
-        controllers.insert(
-            ("v1", "Endpoints"),
-            Arc::new(EndpointsController) as Arc<dyn Controller>,
         );
         controllers.insert(
             ("v1", "PersistentVolumeClaim"),
@@ -1094,6 +1089,15 @@ mod tests {
             .reconcile(&unknown, &db_handle, "test-node")
             .await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn endpoints_api_objects_are_not_controller_dispatch_keys() {
+        assert_eq!(
+            controller_kind_static("v1", "Endpoints"),
+            None,
+            "real Endpoints API objects are mirrored by side effects; they must not be routed to the Service-shaped EndpointsController"
+        );
     }
 
     #[tokio::test]

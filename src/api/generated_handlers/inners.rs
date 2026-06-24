@@ -660,14 +660,35 @@ pub async fn create_inner(
 
     normalize_resource_for_storage(api_version, kind, &mut body);
 
-    let resource = state
+    let pending_service_allocations = if api_version == "v1" && kind == "Service" {
+        Some(
+            crate::controllers::service::prepare_service_for_create(
+                state.db.as_ref(),
+                &mut body,
+                state.service_ipam.as_ref(),
+                state.nodeport_alloc.as_ref(),
+            )
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to allocate service fields: {e}")))?,
+        )
+    } else {
+        None
+    };
+
+    let resource = match state
         .db
         .create_resource(api_version, kind, ns, &resource_name, body)
         .await
-        .map_err(|e| {
+    {
+        Ok(resource) => resource,
+        Err(e) => {
+            if let Some(pending) = pending_service_allocations {
+                pending.release(state.service_ipam.as_ref(), state.nodeport_alloc.as_ref());
+            }
             // Attach details.{group,kind,name} to AlreadyExists/Conflict.
-            AppError::from(e).with_resource_context(api_version, kind, &resource_name)
-        })?;
+            return Err(AppError::from(e).with_resource_context(api_version, kind, &resource_name));
+        }
+    };
 
     let context = if ns.is_some() {
         "namespaced_create"

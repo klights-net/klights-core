@@ -237,6 +237,23 @@ fn release_pending_service_allocations(
     }
 }
 
+#[derive(Debug, Default)]
+pub struct PendingServiceAllocations {
+    cluster_ip: Option<String>,
+    node_ports: Vec<u32>,
+}
+
+impl PendingServiceAllocations {
+    pub fn release(self, service_ipam: &ServiceIpam, nodeport_alloc: &NodePortAllocator) {
+        release_pending_service_allocations(
+            service_ipam,
+            nodeport_alloc,
+            self.cluster_ip.as_deref(),
+            &self.node_ports,
+        );
+    }
+}
+
 pub fn release_service_allocations_from_resource(
     service_ipam: &ServiceIpam,
     nodeport_alloc: &NodePortAllocator,
@@ -396,6 +413,105 @@ fn clear_externalname_invalid_fields(spec: &mut serde_json::Map<String, Value>) 
             }
         }
     }
+}
+
+async fn allocate_service_fields_in_object(
+    db: &dyn DatastoreBackend,
+    service: &mut Value,
+    service_ipam: &ServiceIpam,
+    nodeport_alloc: &NodePortAllocator,
+) -> Result<PendingServiceAllocations> {
+    let spec_mut = service
+        .get_mut("spec")
+        .and_then(|s| s.as_object_mut())
+        .ok_or_else(|| anyhow::anyhow!("Invalid spec"))?;
+
+    // Normalize spec.type: default to "ClusterIP" if missing or empty
+    normalize_service_type(spec_mut);
+    normalize_service_session_affinity(spec_mut);
+    // Default ServicePort fields to Kubernetes behavior used by kubectl describe.
+    normalize_service_ports(spec_mut);
+
+    // ExternalName services must not have a clusterIP — clear it if type changed to ExternalName
+    clear_externalname_invalid_fields(spec_mut);
+
+    // Allocate ClusterIP if not set (but preserve "None" for headless services)
+    let cluster_ip_value = spec_mut.get("clusterIP").and_then(|v| v.as_str());
+
+    // Check if clusterIP is missing, empty, or None (headless)
+    let needs_cluster_ip = cluster_ip_value.is_none()
+        || cluster_ip_value.map(|s| s.is_empty()).unwrap_or(false)
+        || cluster_ip_value.map(|s| s == "None").unwrap_or(false);
+
+    let service_type = spec_mut
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("ClusterIP")
+        .to_string();
+    let is_headless = cluster_ip_value.map(|s| s == "None").unwrap_or(false);
+    let should_allocate_cluster_ip =
+        needs_cluster_ip && service_type != "ExternalName" && !is_headless;
+    let cluster_ip_guard = if should_allocate_cluster_ip {
+        Some(service_ipam.allocation_guard().await)
+    } else {
+        None
+    };
+    let mut pending = PendingServiceAllocations::default();
+
+    if needs_cluster_ip {
+        // No clusterIP specified - allocate one unless service is ExternalName
+        if service_type != "ExternalName" {
+            // Only allocate if not explicitly "None" (headless)
+            if !is_headless {
+                let cluster_ip = allocate_service_cluster_ip(db, service_ipam).await?;
+
+                spec_mut.insert("clusterIP".to_string(), json!(cluster_ip.clone()));
+                spec_mut.insert("clusterIPs".to_string(), json!([cluster_ip.clone()]));
+                pending.cluster_ip = Some(cluster_ip);
+            }
+        }
+    }
+    // If clusterIP is explicitly set to "None", it's a headless service - don't allocate
+
+    // Allocate NodePort if type is NodePort or LoadBalancer
+    if (service_type == "NodePort" || service_type == "LoadBalancer")
+        && let Some(ports) = spec_mut.get_mut("ports").and_then(|p| p.as_array_mut())
+    {
+        for port in ports {
+            if let Some(port_obj) = port.as_object_mut() {
+                // Allocate NodePort if not set or set to 0
+                let needs_nodeport = port_obj
+                    .get("nodePort")
+                    .and_then(|np| np.as_u64())
+                    .map(|np| np == 0)
+                    .unwrap_or(true); // true if key doesn't exist
+
+                if needs_nodeport {
+                    let node_port = match nodeport_alloc.allocate() {
+                        Ok(node_port) => node_port,
+                        Err(e) => {
+                            pending.release(service_ipam, nodeport_alloc);
+                            return Err(anyhow::anyhow!("NodePort allocation failed: {}", e));
+                        }
+                    };
+                    port_obj.insert("nodePort".to_string(), json!(node_port));
+                    pending.node_ports.push(node_port);
+                }
+            }
+        }
+    }
+    drop(cluster_ip_guard);
+
+    Ok(pending)
+}
+
+pub async fn prepare_service_for_create(
+    db: &dyn DatastoreBackend,
+    service: &mut Value,
+    service_ipam: &ServiceIpam,
+    nodeport_alloc: &NodePortAllocator,
+) -> Result<PendingServiceAllocations> {
+    allocate_service_fields_in_object(db, service, service_ipam, nodeport_alloc).await
 }
 
 #[cfg(test)]
@@ -580,91 +696,9 @@ pub async fn allocate_service_fields_for_api_write(
     let update_preconditions = ResourcePreconditions::from_metadata(metadata, current_rv)?;
 
     let mut updated_service = service.clone();
-    let spec_mut = updated_service
-        .get_mut("spec")
-        .and_then(|s| s.as_object_mut())
-        .ok_or_else(|| anyhow::anyhow!("Invalid spec"))?;
-
-    // Normalize spec.type: default to "ClusterIP" if missing or empty
-    normalize_service_type(spec_mut);
-    normalize_service_session_affinity(spec_mut);
-    // Default ServicePort fields to Kubernetes behavior used by kubectl describe.
-    normalize_service_ports(spec_mut);
-
-    // ExternalName services must not have a clusterIP — clear it if type changed to ExternalName
-    clear_externalname_invalid_fields(spec_mut);
-
-    // Allocate ClusterIP if not set (but preserve "None" for headless services)
-    let cluster_ip_value = spec_mut.get("clusterIP").and_then(|v| v.as_str());
-
-    // Check if clusterIP is missing, empty, or None (headless)
-    let needs_cluster_ip = cluster_ip_value.is_none()
-        || cluster_ip_value.map(|s| s.is_empty()).unwrap_or(false)
-        || cluster_ip_value.map(|s| s == "None").unwrap_or(false);
-
-    let service_type = spec_mut
-        .get("type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("ClusterIP")
-        .to_string();
-    let is_headless = cluster_ip_value.map(|s| s == "None").unwrap_or(false);
-    let should_allocate_cluster_ip =
-        needs_cluster_ip && service_type != "ExternalName" && !is_headless;
-    let cluster_ip_guard = if should_allocate_cluster_ip {
-        Some(service_ipam.allocation_guard().await)
-    } else {
-        None
-    };
-    let mut allocated_cluster_ip: Option<String> = None;
-    let mut allocated_node_ports: Vec<u32> = Vec::new();
-
-    if needs_cluster_ip {
-        // No clusterIP specified - allocate one unless service is ExternalName
-        if service_type != "ExternalName" {
-            // Only allocate if not explicitly "None" (headless)
-            if !is_headless {
-                let cluster_ip = allocate_service_cluster_ip(db, service_ipam).await?;
-
-                spec_mut.insert("clusterIP".to_string(), json!(cluster_ip.clone()));
-                spec_mut.insert("clusterIPs".to_string(), json!([cluster_ip.clone()]));
-                allocated_cluster_ip = Some(cluster_ip);
-            }
-        }
-    }
-    // If clusterIP is explicitly set to "None", it's a headless service - don't allocate
-
-    // Allocate NodePort if type is NodePort or LoadBalancer
-    if (service_type == "NodePort" || service_type == "LoadBalancer")
-        && let Some(ports) = spec_mut.get_mut("ports").and_then(|p| p.as_array_mut())
-    {
-        for port in ports {
-            if let Some(port_obj) = port.as_object_mut() {
-                // Allocate NodePort if not set or set to 0
-                let needs_nodeport = port_obj
-                    .get("nodePort")
-                    .and_then(|np| np.as_u64())
-                    .map(|np| np == 0)
-                    .unwrap_or(true); // true if key doesn't exist
-
-                if needs_nodeport {
-                    let node_port = match nodeport_alloc.allocate() {
-                        Ok(node_port) => node_port,
-                        Err(e) => {
-                            release_pending_service_allocations(
-                                service_ipam,
-                                nodeport_alloc,
-                                allocated_cluster_ip.as_deref(),
-                                &allocated_node_ports,
-                            );
-                            return Err(anyhow::anyhow!("NodePort allocation failed: {}", e));
-                        }
-                    };
-                    port_obj.insert("nodePort".to_string(), json!(node_port));
-                    allocated_node_ports.push(node_port);
-                }
-            }
-        }
-    }
+    let pending =
+        allocate_service_fields_in_object(db, &mut updated_service, service_ipam, nodeport_alloc)
+            .await?;
 
     // Only persist when the normalized object differs from the stored object.
     // Endpoint-only reconcile events must not churn Service resourceVersions.
@@ -683,19 +717,13 @@ pub async fn allocate_service_fields_for_api_write(
         match update_result {
             Ok(updated) => (updated.data, updated.resource_version),
             Err(err) => {
-                release_pending_service_allocations(
-                    service_ipam,
-                    nodeport_alloc,
-                    allocated_cluster_ip.as_deref(),
-                    &allocated_node_ports,
-                );
+                pending.release(service_ipam, nodeport_alloc);
                 return Err(err);
             }
         }
     } else {
         (std::sync::Arc::new(service.clone()), current_rv)
     };
-    drop(cluster_ip_guard);
 
     let service_with_rv = crate::api::inject_resource_version(updated_data.clone(), updated_rv);
     Ok(Some(service_with_rv))

@@ -144,7 +144,6 @@ pub fn controller_kind_static(
         ("apps/v1", "DaemonSet") => Some(("apps/v1", "DaemonSet")),
         ("batch/v1", "Job") => Some(("batch/v1", "Job")),
         ("v1", "Service") => Some(("v1", "Service")),
-        ("v1", "Endpoints") => Some(("v1", "Endpoints")),
         ("v1", "PersistentVolumeClaim") => Some(("v1", "PersistentVolumeClaim")),
         ("v1", "ReplicationController") => Some(("v1", "ReplicationController")),
         ("policy/v1", "PodDisruptionBudget") => Some(("policy/v1", "PodDisruptionBudget")),
