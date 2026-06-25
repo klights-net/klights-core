@@ -266,6 +266,10 @@ pub struct GrpcRaftNetwork {
     /// they're talking to.
     bound_target: Option<NodeId>,
     metrics: Arc<GrpcRaftNetworkMetrics>,
+    /// T4: shared RTT estimator fed by successful AppendEntries round-trips.
+    /// AppendEntries is the most frequent raft RPC (heartbeats), so it is the
+    /// natural RTT source. Idle-silent: no traffic ⇒ no samples ⇒ no work.
+    rtt: Arc<crate::datastore::raft::rtt_estimator::RttEstimator>,
 }
 
 impl GrpcRaftNetwork {
@@ -276,11 +280,18 @@ impl GrpcRaftNetwork {
             addrs: Arc::new(RwLock::new(HashMap::new())),
             bound_target: None,
             metrics: Arc::new(GrpcRaftNetworkMetrics::default()),
+            rtt: Arc::new(crate::datastore::raft::rtt_estimator::RttEstimator::new()),
         }
     }
 
     pub fn metrics_snapshot(&self) -> GrpcRaftNetworkMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    /// T4: the current RTT estimate (ms) derived from AppendEntries
+    /// round-trips, or the default before any traffic has flowed.
+    pub fn estimated_rtt_ms(&self) -> i64 {
+        self.rtt.estimate_ms()
     }
 
     /// Return the cached client for the bound peer, rebuilding it from the
@@ -357,6 +368,7 @@ impl RaftNetworkFactory<TypeConfig> for GrpcRaftNetwork {
             addrs: self.addrs.clone(),
             bound_target: Some(target),
             metrics: self.metrics.clone(),
+            rtt: self.rtt.clone(),
         }
     }
 }
@@ -392,8 +404,12 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         });
         self.metrics
             .record_append_entries_call(target, payload.len(), entries_len, lag_entries);
+        let call_start = std::time::Instant::now();
         let bytes = match client.append_entries(payload).await {
             Ok(b) => {
+                // T4: a successful round-trip is a clean RTT sample. Failures
+                // (timeouts/stalls) are NOT sampled — they reflect loss, not RTT.
+                self.rtt.record_sample(call_start.elapsed());
                 tracing::debug!(target, "GrpcRaftNetwork::append_entries: success");
                 b
             }

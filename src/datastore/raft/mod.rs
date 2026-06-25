@@ -4,6 +4,7 @@ pub mod log_storage;
 pub mod membership_client;
 pub mod network;
 pub mod node;
+pub mod rtt_estimator;
 pub mod snapshot;
 pub mod state_machine;
 pub mod state_machine_impl;
