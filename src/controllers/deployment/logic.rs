@@ -1553,6 +1553,7 @@ pub async fn reconcile_deployment(
         &created_rs_name,
         &matching_rs,
         next_revision,
+        deployment.get("status"),
     );
 
     // Write revision annotation FIRST — metadata mutation bumps RV once.

@@ -497,6 +497,91 @@ async fn test_reconcile_deployment_status_has_progressing_condition() {
     );
 }
 
+#[tokio::test]
+async fn test_reconcile_deployment_status_noops_when_condition_state_unchanged() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let pod_repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let deploy_uid = "deploy-uid-status-noop";
+
+    let deploy = make_deployment("web-noop", "default", deploy_uid, 2, "0");
+    let created = db
+        .create_resource("apps/v1", "Deployment", Some("default"), "web-noop", deploy)
+        .await
+        .unwrap();
+
+    let deploy_with_rv =
+        crate::api::inject_resource_version(created.data, created.resource_version);
+    reconcile_deployment(
+        &db,
+        pod_repo.as_ref(),
+        pod_repo.as_ref(),
+        pod_repo.as_ref(),
+        &deploy_with_rv,
+        "test-node",
+    )
+    .await
+    .unwrap();
+
+    let first = db
+        .get_resource("apps/v1", "Deployment", Some("default"), "web-noop")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let first_with_rv = crate::api::inject_resource_version(first.data, first.resource_version);
+    reconcile_deployment(
+        &db,
+        pod_repo.as_ref(),
+        pod_repo.as_ref(),
+        pod_repo.as_ref(),
+        &first_with_rv,
+        "test-node",
+    )
+    .await
+    .unwrap();
+
+    let second = db
+        .get_resource("apps/v1", "Deployment", Some("default"), "web-noop")
+        .await
+        .unwrap()
+        .unwrap();
+    let second_rv = second.resource_version;
+    let second_status = second.data["status"].clone();
+    assert_eq!(
+        second_status
+            .pointer("/conditions/1/reason")
+            .and_then(|value| value.as_str()),
+        Some("NewReplicaSetAvailable"),
+        "test must settle the legitimate Progressing condition transition"
+    );
+
+    let second_with_rv = crate::api::inject_resource_version(second.data, second.resource_version);
+    reconcile_deployment(
+        &db,
+        pod_repo.as_ref(),
+        pod_repo.as_ref(),
+        pod_repo.as_ref(),
+        &second_with_rv,
+        "test-node",
+    )
+    .await
+    .unwrap();
+
+    let third = db
+        .get_resource("apps/v1", "Deployment", Some("default"), "web-noop")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        third.resource_version, second_rv,
+        "unchanged Deployment status must not bump resourceVersion"
+    );
+    assert_eq!(
+        third.data["status"], second_status,
+        "unchanged condition state must preserve existing timestamps"
+    );
+}
+
 struct ObservedGenerationBeforeCreateWriter {
     db: crate::datastore::sqlite::Datastore,
     inner: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
