@@ -497,6 +497,118 @@ async fn test_reconcile_deployment_status_has_progressing_condition() {
     );
 }
 
+struct ObservedGenerationBeforeCreateWriter {
+    db: crate::datastore::sqlite::Datastore,
+    inner: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
+    namespace: &'static str,
+    deployment_name: &'static str,
+    checked: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::kubelet::pod_repository::PodObjectWriter for ObservedGenerationBeforeCreateWriter {
+    async fn create_controller_pod(
+        &self,
+        ns: &str,
+        name: &str,
+        node_name: &str,
+        pod: Value,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        if !self.checked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let deployment = self
+                .db
+                .get_resource(
+                    "apps/v1",
+                    "Deployment",
+                    Some(self.namespace),
+                    self.deployment_name,
+                )
+                .await?
+                .expect("deployment must exist while creating child pods");
+            let observed = deployment
+                .data
+                .pointer("/status/observedGeneration")
+                .and_then(|v| v.as_i64());
+            anyhow::ensure!(
+                observed == Some(1),
+                "deployment status must observe generation before pod create, got {:?}",
+                observed
+            );
+        }
+        self.inner
+            .create_controller_pod(ns, name, node_name, pod)
+            .await
+    }
+
+    async fn delete_pod(&self, ns: &str, name: &str) -> anyhow::Result<()> {
+        self.inner.delete_pod(ns, name).await
+    }
+
+    async fn update_pod_owner_references(
+        &self,
+        ns: &str,
+        name: &str,
+        owner_refs: Vec<Value>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.inner
+            .update_pod_owner_references(ns, name, owner_refs)
+            .await
+    }
+
+    async fn merge_pod_labels(
+        &self,
+        ns: &str,
+        name: &str,
+        labels: Vec<(String, String)>,
+    ) -> anyhow::Result<crate::datastore::Resource> {
+        self.inner.merge_pod_labels(ns, name, labels).await
+    }
+}
+
+#[tokio::test]
+async fn test_reconcile_deployment_observes_generation_before_pod_create() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let pod_repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+
+    let deploy = make_deployment("web-observed", "default", "deploy-uid-observed", 3, "0");
+    let created = db
+        .create_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "web-observed",
+            deploy,
+        )
+        .await
+        .unwrap();
+
+    let deploy_with_rv =
+        crate::api::inject_resource_version(created.data, created.resource_version);
+    let writer = ObservedGenerationBeforeCreateWriter {
+        db: db.clone(),
+        inner: pod_repo.clone(),
+        namespace: "default",
+        deployment_name: "web-observed",
+        checked: std::sync::atomic::AtomicBool::new(false),
+    };
+
+    reconcile_deployment(
+        &db,
+        pod_repo.as_ref(),
+        &writer,
+        pod_repo.as_ref(),
+        &deploy_with_rv,
+        "test-node",
+    )
+    .await
+    .expect("deployment reconcile should acknowledge observedGeneration before pod creation");
+
+    assert!(
+        writer.checked.load(std::sync::atomic::Ordering::SeqCst),
+        "test must exercise the controller pod create path"
+    );
+}
+
 #[tokio::test]
 async fn test_reconcile_deployment_status_replicas_reflects_new_rs_pods() {
     // Regression test: after creating a new RS and reconciling it, status.replicas

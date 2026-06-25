@@ -162,6 +162,49 @@ fn active_pod_count(pods: &[Resource]) -> usize {
         .count()
 }
 
+async fn acknowledge_observed_generation(
+    db: &dyn DatastoreBackend,
+    deployment: &Value,
+    metadata: &Value,
+) -> Result<()> {
+    let generation = metadata
+        .get("generation")
+        .and_then(|g| g.as_i64())
+        .unwrap_or(1);
+    if deployment
+        .pointer("/status/observedGeneration")
+        .and_then(|g| g.as_i64())
+        .is_some_and(|observed| observed >= generation)
+    {
+        return Ok(());
+    }
+
+    let mut status = deployment
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !status.is_object() {
+        status = json!({});
+    }
+    if let Some(status_obj) = status.as_object_mut() {
+        status_obj.insert("observedGeneration".to_string(), json!(generation));
+        for field in [
+            "replicas",
+            "readyReplicas",
+            "updatedReplicas",
+            "availableReplicas",
+            "unavailableReplicas",
+        ] {
+            status_obj
+                .entry(field.to_string())
+                .or_insert_with(|| json!(0));
+        }
+    }
+
+    crate::controllers::common::write_status(db, deployment, &status).await?;
+    Ok(())
+}
+
 struct ZeroReplicaOldReplicaSetRedrive<'a> {
     db: &'a dyn DatastoreBackend,
     pod_reader: &'a dyn PodReader,
@@ -583,6 +626,8 @@ pub async fn reconcile_deployment(
             return Ok(());
         }
     };
+
+    acknowledge_observed_generation(db, deployment, metadata).await?;
 
     // Get all ReplicaSets owned by this deployment
     let rs_list = db
