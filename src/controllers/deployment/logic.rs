@@ -627,8 +627,6 @@ pub async fn reconcile_deployment(
         }
     };
 
-    acknowledge_observed_generation(db, deployment, metadata).await?;
-
     // Get all ReplicaSets owned by this deployment
     let rs_list = db
         .list_resources(
@@ -776,6 +774,12 @@ pub async fn reconcile_deployment(
             .await?;
         }
         owned_rs_list.push(updated);
+    }
+
+    // Initial creates may acknowledge before child Pod creation, but rollouts
+    // must wait until the matching new ReplicaSet is visible.
+    if owned_rs_list.is_empty() {
+        acknowledge_observed_generation(db, deployment, metadata).await?;
     }
 
     // Check for rollback annotation

@@ -609,6 +609,206 @@ async fn test_reconcile_deployment_observes_generation_before_pod_create() {
     );
 }
 
+struct RollingUpdateObservedGenerationReader {
+    db: crate::datastore::sqlite::Datastore,
+    inner: std::sync::Arc<crate::kubelet::pod_repository::PodRepository>,
+    namespace: &'static str,
+    deployment_name: &'static str,
+    new_image: &'static str,
+    checked: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::kubelet::pod_repository::PodReader for RollingUpdateObservedGenerationReader {
+    async fn get_pod(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.inner.get_pod(ns, name).await
+    }
+
+    async fn get_pod_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.inner.get_pod_for_uid(ns, name, uid).await
+    }
+
+    async fn list_pods(
+        &self,
+        ns: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        limit: Option<i64>,
+        continue_token: Option<&str>,
+    ) -> anyhow::Result<crate::datastore::ResourceList> {
+        self.inner
+            .list_pods(ns, label_selector, field_selector, limit, continue_token)
+            .await
+    }
+
+    async fn list_pods_by_owner_uid(
+        &self,
+        ns: &str,
+        owner_uid: &str,
+    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
+        if !self.checked.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let deployment = self
+                .db
+                .get_resource(
+                    "apps/v1",
+                    "Deployment",
+                    Some(self.namespace),
+                    self.deployment_name,
+                )
+                .await?
+                .expect("deployment must exist while planning rollout");
+            let observed = deployment
+                .data
+                .pointer("/status/observedGeneration")
+                .and_then(|v| v.as_i64());
+            let has_new_rs = self
+                .db
+                .list_resources(
+                    "apps/v1",
+                    "ReplicaSet",
+                    Some(self.namespace),
+                    crate::datastore::ResourceListQuery::all(),
+                )
+                .await?
+                .items
+                .iter()
+                .any(|rs| {
+                    rs.data
+                        .pointer("/spec/template/spec/containers/0/image")
+                        .and_then(|v| v.as_str())
+                        == Some(self.new_image)
+                });
+            anyhow::ensure!(
+                observed != Some(2) || has_new_rs,
+                "deployment observedGeneration advanced to 2 before matching new ReplicaSet existed"
+            );
+        }
+        self.inner.list_pods_by_owner_uid(ns, owner_uid).await
+    }
+}
+
+#[tokio::test]
+async fn test_reconcile_deployment_rollout_observed_generation_waits_for_new_replicaset() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let pod_repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+    let deploy_uid = "deploy-uid-rollout-observed";
+
+    let deploy = make_deployment_with_image(
+        "web-observed-rollout",
+        "default",
+        deploy_uid,
+        3,
+        "0",
+        "nginx:1.14",
+    );
+    let created = db
+        .create_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "web-observed-rollout",
+            deploy,
+        )
+        .await
+        .unwrap();
+    let deploy_with_rv =
+        crate::api::inject_resource_version(created.data, created.resource_version);
+    reconcile_deployment(
+        &db,
+        pod_repo.as_ref(),
+        pod_repo.as_ref(),
+        pod_repo.as_ref(),
+        &deploy_with_rv,
+        "test-node",
+    )
+    .await
+    .unwrap();
+
+    let current_deploy = db
+        .get_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "web-observed-rollout",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut updated_deploy = make_deployment_with_image(
+        "web-observed-rollout",
+        "default",
+        deploy_uid,
+        3,
+        "0",
+        "nginx:1.16",
+    );
+    updated_deploy["metadata"]["generation"] = json!(2);
+    let updated = db
+        .update_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "web-observed-rollout",
+            updated_deploy,
+            current_deploy.resource_version,
+        )
+        .await
+        .unwrap();
+
+    let reader = RollingUpdateObservedGenerationReader {
+        db: db.clone(),
+        inner: pod_repo.clone(),
+        namespace: "default",
+        deployment_name: "web-observed-rollout",
+        new_image: "nginx:1.16",
+        checked: std::sync::atomic::AtomicBool::new(false),
+    };
+    let deploy_with_rv =
+        crate::api::inject_resource_version(updated.data, updated.resource_version);
+    reconcile_deployment(
+        &db,
+        &reader,
+        pod_repo.as_ref(),
+        pod_repo.as_ref(),
+        &deploy_with_rv,
+        "test-node",
+    )
+    .await
+    .expect("rollout reconcile must not acknowledge generation before new RS creation");
+
+    assert!(
+        reader.checked.load(std::sync::atomic::Ordering::SeqCst),
+        "test must exercise the rolling update pod reader path before new RS creation"
+    );
+    let deployment = db
+        .get_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "web-observed-rollout",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        deployment
+            .data
+            .pointer("/status/observedGeneration")
+            .and_then(|v| v.as_i64()),
+        Some(2),
+        "final rollout status should still observe generation 2"
+    );
+}
+
 #[tokio::test]
 async fn test_reconcile_deployment_status_replicas_reflects_new_rs_pods() {
     // Regression test: after creating a new RS and reconciling it, status.replicas
