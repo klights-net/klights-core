@@ -575,6 +575,7 @@ fn put_resource_row(
             validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
         }
         merge_status_only_row_with_existing(&mut row, existing.as_ref())?;
+        preserve_same_uid_pod_deletion_metadata_from_existing(&mut row, existing.as_ref())?;
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         if existing.as_ref().is_some_and(|(rv, _uid, existing_bytes)| {
@@ -676,6 +677,7 @@ fn put_resource_row(
             validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
         }
         merge_status_only_row_with_existing(&mut row, existing.as_ref())?;
+        preserve_same_uid_pod_deletion_metadata_from_existing(&mut row, existing.as_ref())?;
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         if existing.as_ref().is_some_and(|(rv, _uid, existing_bytes)| {
@@ -1112,6 +1114,67 @@ fn merge_status_only_row_with_existing(
     );
     row.uid = current_uid.clone();
     row.data = live;
+    Ok(())
+}
+
+fn preserve_same_uid_pod_deletion_metadata_from_existing(
+    row: &mut LogApplyResourceRow,
+    existing: Option<&(i64, String, Vec<u8>)>,
+) -> tokio_rusqlite::Result<()> {
+    if row.api_version != "v1" || row.kind != "Pod" {
+        return Ok(());
+    }
+    let Some((_current_rv, current_uid, existing_bytes)) = existing else {
+        return Ok(());
+    };
+    let fallback_uid = if row.uid.is_empty() {
+        None
+    } else {
+        Some(row.uid.as_str())
+    };
+    let incoming_uid =
+        crate::datastore::sqlite::resource_shape::metadata_uid(&row.data).or(fallback_uid);
+    if incoming_uid != Some(current_uid.as_str()) {
+        return Ok(());
+    }
+
+    let existing_data: serde_json::Value =
+        serde_json::from_slice(existing_bytes).map_err(serde_to_sqlite_error)?;
+    let Some(existing_meta) = existing_data
+        .get("metadata")
+        .and_then(|value| value.as_object())
+    else {
+        return Ok(());
+    };
+    let Some(deletion_timestamp) = existing_meta
+        .get("deletionTimestamp")
+        .filter(|value| !value.is_null())
+        .filter(|value| {
+            value
+                .as_str()
+                .is_none_or(|timestamp| !timestamp.trim().is_empty())
+        })
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let Some(row_object) = row.data.as_object_mut() else {
+        return Ok(());
+    };
+    let metadata = row_object
+        .entry("metadata".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(metadata_object) = metadata.as_object_mut() else {
+        return Ok(());
+    };
+    metadata_object.insert("deletionTimestamp".to_string(), deletion_timestamp);
+    if let Some(grace) = existing_meta
+        .get("deletionGracePeriodSeconds")
+        .filter(|value| !value.is_null())
+    {
+        metadata_object.insert("deletionGracePeriodSeconds".to_string(), grace.clone());
+    }
+    crate::resource_semantics::mark_terminating_pod_unready(&mut row.data);
     Ok(())
 }
 
@@ -2525,6 +2588,145 @@ mod tests {
             "row data must reflect the committed value"
         );
         assert_eq!(row.resource_version, 60, "row must carry the committed rv");
+    }
+
+    #[tokio::test]
+    async fn committed_pod_put_preserves_existing_deletion_metadata_for_same_uid() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("gc-2688"),
+            "simpletest-01798",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "simpletest-01798",
+                    "namespace": "gc-2688",
+                    "uid": "pod-uid"
+                },
+                "spec": {
+                    "containers": [{"name": "pause", "image": "registry.k8s.io/pause:3.10"}]
+                },
+                "status": {
+                    "phase": "Pending",
+                    "conditions": [
+                        {"type": "Ready", "status": "False"},
+                        {"type": "ContainersReady", "status": "False"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let existing = db
+            .get_resource("v1", "Pod", Some("gc-2688"), "simpletest-01798")
+            .await
+            .unwrap()
+            .expect("pod exists before delete mark");
+        let mut deleting = (*existing.data).clone();
+        deleting["metadata"]["deletionTimestamp"] = serde_json::json!("2026-06-25T02:25:51Z");
+        deleting["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(30);
+        db.update_resource(
+            "v1",
+            "Pod",
+            Some("gc-2688"),
+            "simpletest-01798",
+            deleting,
+            existing.resource_version,
+        )
+        .await
+        .unwrap();
+
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                60,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("gc-2688".to_string()),
+                    name: "simpletest-01798".to_string(),
+                    uid: "pod-uid".to_string(),
+                    resource_version: 60,
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "simpletest-01798",
+                            "namespace": "gc-2688",
+                            "uid": "pod-uid",
+                            "resourceVersion": "60"
+                        },
+                        "spec": {
+                            "nodeName": "mn-worker",
+                            "containers": [{"name": "pause", "image": "registry.k8s.io/pause:3.10"}]
+                        },
+                        "status": {
+                            "phase": "Running",
+                            "conditions": [
+                                {"type": "PodScheduled", "status": "True"},
+                                {"type": "Ready", "status": "True"},
+                                {"type": "ContainersReady", "status": "True"}
+                            ],
+                            "containerStatuses": [{"name": "pause", "ready": true}]
+                        }
+                    }),
+                    require_absent: false,
+                    require_existing: false,
+                    precondition_uid: Some("pod-uid".to_string()),
+                    precondition_resource_version: Some(existing.resource_version),
+                    status_only: false,
+                })],
+            ))
+            .await
+            .expect("raft put applies");
+        assert!(
+            result.error_message.is_none(),
+            "committed Pod PUT must succeed: {result:?}"
+        );
+
+        let row = db
+            .get_resource("v1", "Pod", Some("gc-2688"), "simpletest-01798")
+            .await
+            .unwrap()
+            .expect("pod remains after committed put");
+        assert_eq!(
+            row.data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(|v| v.as_str()),
+            Some("2026-06-25T02:25:51Z"),
+            "same-UID Pod PUT must not erase a live deletionTimestamp"
+        );
+        assert_eq!(
+            row.data
+                .pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(|v| v.as_i64()),
+            Some(30),
+            "same-UID Pod PUT must not erase deletion grace"
+        );
+        let ready = row
+            .data
+            .pointer("/status/conditions")
+            .and_then(|v| v.as_array())
+            .and_then(|conditions| {
+                conditions.iter().find(|condition| {
+                    condition.pointer("/type").and_then(|v| v.as_str()) == Some("Ready")
+                })
+            })
+            .expect("Ready condition present");
+        assert_eq!(
+            ready.pointer("/status").and_then(|v| v.as_str()),
+            Some("False"),
+            "terminating Pod must stay unready after stale committed PUT"
+        );
+        assert_eq!(
+            row.data
+                .pointer("/status/containerStatuses/0/ready")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "terminating Pod container readiness must stay false"
+        );
     }
 
     /// Committed patch must apply to the current local state regardless of precondition mismatch,
