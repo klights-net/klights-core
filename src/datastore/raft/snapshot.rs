@@ -42,11 +42,13 @@ pub struct RaftSnapshotData {
 
 impl RaftSnapshotData {
     pub fn serialize_to_bytes(&self) -> Result<Vec<u8>> {
-        Ok(serde_json::to_vec(self)?)
+        crate::datastore::raft::compressed::encode(serde_json::to_vec(self)?.as_slice())
     }
 
     pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<Self> {
-        Ok(serde_json::from_slice(bytes)?)
+        Ok(serde_json::from_slice(
+            crate::datastore::raft::compressed::decode(bytes)?.as_slice(),
+        )?)
     }
 
     pub fn snapshot_id(&self) -> String {
@@ -70,7 +72,14 @@ impl RaftSnapshotData {
         crate::replication::snapshot::write_snapshot_commits_json_array(db, 0, &mut cursor).await?;
         cursor.write_all(b"}")?;
         cursor.set_position(0);
-        Ok(cursor)
+        // T2: compress the assembled JSON with zstd framing so the snapshot
+        // travels as fewer bytes over the chunked InstallSnapshot transfer
+        // (decode side is `deserialize_from_bytes`). Compress here, after the
+        // streaming JSON build, so the streaming writer stays uncompressed and
+        // the framed payload is what is stored/streamed.
+        let raw_json = cursor.into_inner();
+        let framed = crate::datastore::raft::compressed::encode(&raw_json)?;
+        Ok(Cursor::new(framed))
     }
 }
 

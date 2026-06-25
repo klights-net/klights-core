@@ -1,3 +1,4 @@
+pub mod compressed;
 pub mod flow_control;
 pub mod grpc_network;
 pub mod log_storage;
