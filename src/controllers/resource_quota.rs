@@ -452,16 +452,11 @@ async fn calculate_resource_quota_status(
     Some((hard, Value::Object(used)))
 }
 
-fn apply_resource_quota_status(rq: &mut Value, hard: serde_json::Map<String, Value>, used: Value) {
-    if let Some(obj) = rq.as_object_mut() {
-        obj.insert(
-            "status".to_string(),
-            json!({
-                "hard": hard,
-                "used": used,
-            }),
-        );
-    }
+fn resource_quota_status_value(hard: serde_json::Map<String, Value>, used: Value) -> Value {
+    json!({
+        "hard": hard,
+        "used": used,
+    })
 }
 
 /// Reconcile all ResourceQuotas in a namespace by updating status.used counts.
@@ -489,8 +484,7 @@ pub async fn reconcile_resource_quotas_for_namespace(
         else {
             continue;
         };
-        let mut updated_rq: Value = (**rq).clone();
-        apply_resource_quota_status(&mut updated_rq, hard, used_map);
+        let mut status = resource_quota_status_value(hard, used_map);
 
         // Update the ResourceQuota in the DB with conflict retry.
         // Under concurrent pod creation, multiple side effects may race
@@ -498,7 +492,6 @@ pub async fn reconcile_resource_quotas_for_namespace(
         // re-read to get a fresh resourceVersion.
         let rq_name = rq_resource.name.clone();
         let mut attempt = 0u8;
-        let mut current_rq = updated_rq.clone();
         let mut current_rv = rq_resource.resource_version;
         let mut current_uid = rq_resource.uid.clone();
         loop {
@@ -507,12 +500,12 @@ pub async fn reconcile_resource_quotas_for_namespace(
                 uid: Some(current_uid.clone()),
             };
             match db
-                .update_resource_with_preconditions(
+                .update_status_only_with_preconditions(
                     "v1",
                     "ResourceQuota",
                     Some(namespace),
                     &rq_name,
-                    current_rq.clone(),
+                    status.clone(),
                     preconditions,
                 )
                 .await
@@ -535,8 +528,7 @@ pub async fn reconcile_resource_quotas_for_namespace(
                     };
                     current_rv = fresh.resource_version;
                     current_uid = fresh.uid.clone();
-                    current_rq = (*fresh.data).clone();
-                    apply_resource_quota_status(&mut current_rq, fresh_hard, fresh_used_map);
+                    status = resource_quota_status_value(fresh_hard, fresh_used_map);
                     continue;
                 }
                 Err(e) => return Err(e),

@@ -7,6 +7,76 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+async fn make_raft_resourcequota_datastore() -> (
+    crate::datastore::replicated::ReplicatedDatastore,
+    crate::datastore::sqlite::Datastore,
+) {
+    use crate::datastore::backend::DatastoreHandle;
+    use crate::datastore::command::StorageCommand;
+    use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+
+    struct InlineProposer {
+        inner: DatastoreHandle,
+    }
+
+    #[async_trait]
+    impl crate::datastore::replicated::RaftProposer for InlineProposer {
+        async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+            let payload = OutboxPayload::from_command(command).encode_protobuf()?;
+            let key = format!("resource-quota-inline-{}", uuid::Uuid::new_v4());
+            crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                self.inner.as_ref(),
+                &key,
+                OutboxOperation::PodStatus,
+                bytes::Bytes::from(payload),
+                "resource-quota-inline-proposer",
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("inline resource quota propose: {err}"))?;
+            Ok(())
+        }
+
+        async fn propose_outbox_command(
+            &self,
+            idempotency_key: &str,
+            operation: &str,
+            command: StorageCommand,
+            authoring_node: &str,
+        ) -> std::result::Result<
+            crate::kubelet::outbox::OutboxApplyResult,
+            crate::kubelet::outbox::OutboxApplyError,
+        > {
+            let payload = OutboxPayload::from_command(command)
+                .encode_protobuf()
+                .map_err(|err| {
+                    crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                })?;
+            let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                self.inner.as_ref(),
+                idempotency_key,
+                OutboxOperation::try_from(operation).map_err(|err| {
+                    crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                })?,
+                bytes::Bytes::from(payload),
+                authoring_node,
+            )
+            .await?;
+            Ok(outcome.result)
+        }
+    }
+
+    let inner = crate::datastore::test_support::in_memory().await;
+    let handle: DatastoreHandle = Arc::new(inner.clone());
+    let ds = crate::datastore::replicated::ReplicatedDatastore::new(
+        handle.clone(),
+        crate::datastore::replicated::ReplicationMode::Raft {
+            node_name: "resource-quota-test-node".to_string(),
+        },
+    );
+    ds.set_raft_proposer(Arc::new(InlineProposer { inner: handle }));
+    (ds, inner)
+}
+
 struct ResourceQuotaConflictPodReader {
     inner: Arc<dyn crate::kubelet::pod_repository::PodReader>,
     db: crate::datastore::sqlite::Datastore,
@@ -153,6 +223,52 @@ async fn test_reconcile_resource_quota_conflict_retry_uses_fresh_hard_spec() {
             .and_then(|v| v.as_str()),
         Some("0"),
         "conflict retry must calculate usage for fresh hard keys"
+    );
+}
+
+#[tokio::test]
+async fn test_reconcile_resource_quota_writes_status_through_raft_status_subresource() {
+    let (db, inner) = make_raft_resourcequota_datastore().await;
+
+    db.create_resource(
+        "v1",
+        "ResourceQuota",
+        Some("default"),
+        "test-quota",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": {"name": "test-quota", "namespace": "default"},
+            "spec": {"hard": {"resourcequotas": "1", "secrets": "1"}},
+            "status": {
+                "hard": {"resourcequotas": "1", "secrets": "1"},
+                "used": {"resourcequotas": "0", "secrets": "0"}
+            }
+        }),
+    )
+    .await
+    .expect("create ResourceQuota through raft");
+
+    reconcile_resource_quotas_for_namespace(
+        &db,
+        crate::controllers::test_utils::pod_repository_for_test(&inner).as_ref(),
+        "default",
+    )
+    .await
+    .expect("reconcile ResourceQuota through raft");
+
+    let rq = db
+        .get_resource("v1", "ResourceQuota", Some("default"), "test-quota")
+        .await
+        .expect("get ResourceQuota")
+        .expect("ResourceQuota exists");
+
+    assert_eq!(
+        rq.data
+            .pointer("/status/used/resourcequotas")
+            .and_then(|v| v.as_str()),
+        Some("1"),
+        "raft-routed ResourceQuota reconcile must update status.used.resourcequotas via status subresource"
     );
 }
 
