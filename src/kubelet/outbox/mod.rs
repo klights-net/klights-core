@@ -917,21 +917,48 @@ impl OutboxDispatcher {
     }
 }
 
-fn backoff_ms(attempt: i64) -> i64 {
-    5_000_i64
-        .saturating_mul(attempt.saturating_add(1).max(1))
-        .min(MAX_BACKOFF_MS)
+/// Default RTT estimate (ms) for adaptive outbox retry backoff. There is
+/// deliberately no shared RTT estimator — that only existed to feed the
+/// hedging lever, which was dropped (latency-fix.md §3).
+const DEFAULT_RTT_ESTIMATE_MS: i64 = 200;
+const BACKOFF_RTT_MIN_MS: i64 = 200;
+const BACKOFF_RTT_MAX_MS: i64 = 3_000;
+const BACKOFF_BASE_MIN_MS: i64 = 500;
+const BACKOFF_BASE_MAX_MS: i64 = 3_000;
+const BACKOFF_LOWER_FLOOR_MS: i64 = 250;
+const BACKOFF_EXPONENT_CAP: u32 = 6;
+
+/// `(lower, upper)` sleep window (ms) for an adaptive bounded outbox backoff.
+///
+/// Replaces the former 5 s linear floor, which was far too coarse for a ~200 ms
+/// RTT lossy link: a transient apply error backed off a full 5 s before the
+/// next attempt, starving status propagation. The window is RTT-aware and
+/// bounded: `rtt = clamp(rtt_est, 200, 3000)`; `base = clamp(2*rtt, 500, 3000)`;
+/// `upper = min(MAX_BACKOFF_MS, base * 2^min(attempt, 6))`;
+/// `lower = min(upper, max(250, base/2))`. See latency-fix.md Task 3 / Phase D.
+fn adaptive_backoff_bounds(attempt: i64, rtt_est_ms: i64) -> (i64, i64) {
+    let rtt = rtt_est_ms.clamp(BACKOFF_RTT_MIN_MS, BACKOFF_RTT_MAX_MS);
+    let base = (2 * rtt).clamp(BACKOFF_BASE_MIN_MS, BACKOFF_BASE_MAX_MS);
+    let exp = attempt.clamp(0, i64::from(BACKOFF_EXPONENT_CAP)).max(0) as u32;
+    let upper = base.saturating_mul(1_i64 << exp).min(MAX_BACKOFF_MS);
+    let lower = upper.min(BACKOFF_LOWER_FLOOR_MS.max(base / 2));
+    (lower, upper)
 }
 
+/// Adaptive bounded backoff for a single outbox retry, deterministic in
+/// `(idempotency_key, attempt, rtt_est_ms)` so the same failing row backs off
+/// to the same instant across restarts — no RNG hot path. Picks a deterministic
+/// point inside `[lower, upper]` via the existing FNV jitter.
+fn adaptive_jittered_backoff_ms(attempt: i64, idempotency_key: &str, rtt_est_ms: i64) -> i64 {
+    let (lower, upper) = adaptive_backoff_bounds(attempt, rtt_est_ms);
+    let window = upper.saturating_sub(lower);
+    lower.saturating_add(deterministic_jitter_ms(idempotency_key, attempt, window))
+}
+
+/// Retry backoff used by the dispatch loop. Uses the default RTT estimate
+/// (200 ms).
 fn jittered_backoff_ms(attempt: i64, idempotency_key: &str) -> i64 {
-    let base = backoff_ms(attempt);
-    let window = (base / 5).clamp(1, 1_000);
-    let jitter = deterministic_jitter_ms(idempotency_key, attempt, window);
-    if base >= MAX_BACKOFF_MS {
-        base.saturating_sub(jitter)
-    } else {
-        base.saturating_add(jitter).min(MAX_BACKOFF_MS)
-    }
+    adaptive_jittered_backoff_ms(attempt, idempotency_key, DEFAULT_RTT_ESTIMATE_MS)
 }
 
 fn deterministic_jitter_ms(idempotency_key: &str, attempt: i64, window_ms: i64) -> i64 {
@@ -1301,10 +1328,14 @@ mod tests {
             .await
             .expect("read next jittered wake")
             .expect("retry wake exists");
+        let (backoff_lower, backoff_upper) =
+            super::adaptive_backoff_bounds(0, super::DEFAULT_RTT_ESTIMATE_MS);
         assert!(
-            (20 + super::backoff_ms(0)..=20 + super::backoff_ms(0) + 1_000)
-                .contains(&after_backoff),
-            "retry wake must stay inside the first-attempt jitter window: {after_backoff}"
+            (20 + backoff_lower..=20 + backoff_upper).contains(&after_backoff),
+            "retry wake must stay inside the first-attempt adaptive jitter window \
+             [{},{}]: {after_backoff}",
+            20 + backoff_lower,
+            20 + backoff_upper
         );
         assert_eq!(
             dispatcher
@@ -1749,9 +1780,14 @@ mod tests {
             } => next,
             other => panic!("expected idle retry wake, got {other:?}"),
         };
+        let (backoff_lower, backoff_upper) =
+            super::adaptive_backoff_bounds(0, super::DEFAULT_RTT_ESTIMATE_MS);
         assert!(
-            (6_000..=7_000).contains(&next_retry),
-            "retry wake must stay inside the first-attempt jitter window: {next_retry}"
+            (1_000 + backoff_lower..=1_000 + backoff_upper).contains(&next_retry),
+            "retry wake must stay inside the first-attempt adaptive jitter window \
+             [{},{}]: {next_retry}",
+            1_000 + backoff_lower,
+            1_000 + backoff_upper
         );
 
         client
@@ -1835,38 +1871,78 @@ mod tests {
             unique.len() > 1,
             "retryable rows must not all re-fire at the same millisecond: {next_due_times:?}"
         );
+        let (backoff_lower, backoff_upper) =
+            super::adaptive_backoff_bounds(0, super::DEFAULT_RTT_ESTIMATE_MS);
         assert!(
             next_due_times
                 .iter()
-                .all(|due| *due >= now + super::backoff_ms(0)
-                    && *due <= now + super::backoff_ms(0) + 1_000),
-            "first retry jitter must stay inside the bounded one-second window: {next_due_times:?}"
+                .all(|due| *due >= now + backoff_lower && *due <= now + backoff_upper),
+            "first retry jitter must stay inside the adaptive window \
+             [{},{}]: {next_due_times:?}",
+            now + backoff_lower,
+            now + backoff_upper
         );
     }
 
     #[test]
-    fn retry_backoff_is_linear_five_seconds_until_sixty_seconds() {
-        let cases = [
-            (0, 5_000),
-            (1, 10_000),
-            (2, 15_000),
-            (3, 20_000),
-            (4, 25_000),
-            (5, 30_000),
-            (6, 35_000),
-            (7, 40_000),
-            (8, 45_000),
-            (9, 50_000),
-            (10, 55_000),
-            (11, 60_000),
-            (12, 60_000),
-            (100, 60_000),
-        ];
-        for (attempt, expected) in cases {
+    fn adaptive_backoff_first_retry_is_below_current_five_second_floor() {
+        // RTT 200 ms (the default estimate), first retry (attempt 0) must land
+        // well below the old 5 s linear floor so a transient apply error under
+        // a ~200 ms RTT lossy link does not starve status propagation for a
+        // full 5 s (latency-fix.md Task 3 / Phase D).
+        for key in ["pod-status-a", "pod-status-b", "pod-status-c"] {
+            let sleep = super::adaptive_jittered_backoff_ms(0, key, 200);
+            assert!(
+                (250..=1_000_i64).contains(&sleep),
+                "first retry backoff must be in [250,1000] ms, got {sleep} for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_backoff_caps_at_sixty_seconds() {
+        // High-RTT (3 s) path drives base*2^attempt up toward MAX_BACKOFF_MS;
+        // it must never exceed the cap, even for very large attempt counts.
+        for attempt in [6, 7, 8, 12, 50, 1_000] {
+            let sleep = super::adaptive_jittered_backoff_ms(attempt, "cap-key", 3_000);
+            assert!(
+                sleep <= super::MAX_BACKOFF_MS,
+                "backoff must cap at MAX_BACKOFF_MS ({}) for attempt {attempt}, got {sleep}",
+                super::MAX_BACKOFF_MS
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_backoff_desynchronizes_keys_for_same_attempt() {
+        let times: HashSet<i64> = (0..8)
+            .map(|i| super::adaptive_jittered_backoff_ms(0, &format!("pod-status-{i}"), 200))
+            .collect();
+        assert!(
+            times.len() >= 4,
+            "8 keys at attempt 0 must desynchronize to >=4 distinct backoffs, got {times:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_backoff_changes_for_same_key_across_attempts() {
+        let times: HashSet<i64> = (0_i64..6)
+            .map(|a| super::adaptive_jittered_backoff_ms(a, "pod-status-3", 200))
+            .collect();
+        assert!(
+            times.len() >= 2,
+            "same key across attempts must vary, got {times:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_backoff_is_deterministic_for_same_key_attempt_and_rtt() {
+        for (attempt, key, rtt) in [(0_i64, "k1", 200_i64), (3, "k2", 800), (7, "k3", 3_000)] {
+            let a = super::adaptive_jittered_backoff_ms(attempt, key, rtt);
+            let b = super::adaptive_jittered_backoff_ms(attempt, key, rtt);
             assert_eq!(
-                super::backoff_ms(attempt),
-                expected,
-                "attempt {attempt} should back off linearly by 5s and cap at 60s"
+                a, b,
+                "backoff must be deterministic for key={key} attempt={attempt} rtt={rtt}"
             );
         }
     }
