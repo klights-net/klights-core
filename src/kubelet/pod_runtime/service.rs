@@ -23,6 +23,14 @@ impl PodRuntimeKey {
             uid: uid.to_string(),
         }
     }
+
+    pub fn volume_dir_id(&self) -> String {
+        pod_volume_dir_id(&self.namespace, &self.name, &self.uid)
+    }
+}
+
+pub fn pod_volume_dir_id(namespace: &str, name: &str, uid: &str) -> String {
+    format!("{namespace}_{name}_{uid}")
 }
 
 impl From<&PodLifecycleKey> for PodRuntimeKey {

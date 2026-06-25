@@ -438,6 +438,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         "metadata": {
             "name": "test-pod",
             "namespace": "default",
+            "uid": "uid-test-pod",
             "annotations": {
                 "key1": "initial-value"
             }
@@ -465,14 +466,18 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         .await
         .unwrap();
 
-    // Create downward API volume with initial annotations — use namespace-qualified
-    // dir ID to match what refresh_downward_api_volumes expects
+    // Create downward API volume with initial annotations.
     let items = pod_json["spec"]["volumes"][0]["downwardAPI"]["items"].clone();
+    let pod_dir_id = crate::kubelet::pod_runtime::service::pod_volume_dir_id(
+        "default",
+        "test-pod",
+        "uid-test-pod",
+    );
     create_downward_api_volume_at_with_db_name(DownwardApiVolumeWithDbNameRequest {
         volumes_root,
         sources: &db,
         namespace: "default",
-        pod_dir_id: "default_test-pod",
+        pod_dir_id: &pod_dir_id,
         pod_db_name: "test-pod",
         volume_name: "podinfo",
         default_mode: None,
@@ -482,10 +487,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
     .unwrap();
 
     // Verify initial file content
-    let volume_path = format!(
-        "{}/default_test-pod/volumes/downward-api/podinfo",
-        volumes_root
-    );
+    let volume_path = format!("{}/{pod_dir_id}/volumes/downward-api/podinfo", volumes_root);
     let annotations_path = format!("{}/annotations", volume_path);
     let initial_content = crate::utils::read_utf8_file(&annotations_path).unwrap();
     assert!(
@@ -500,6 +502,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         "metadata": {
             "name": "test-pod",
             "namespace": "default",
+            "uid": "uid-test-pod",
             "annotations": {
                 "key1": "updated-value",
                 "key2": "new-annotation"
@@ -571,7 +574,8 @@ async fn test_refresh_downward_api_skips_projected_volumes() {
         "kind": "Pod",
         "metadata": {
             "name": "sa-pod",
-            "namespace": "default"
+            "namespace": "default",
+            "uid": "uid-sa-pod"
         },
         "spec": {
             "containers": [{"name": "app", "image": "busybox"}],
@@ -605,7 +609,9 @@ async fn test_refresh_downward_api_skips_projected_volumes() {
         .unwrap();
 
     // The volumes/downward-api/ directory must NOT exist
-    let phantom_dir = format!("{}/sa-pod/volumes/downward-api", volumes_root);
+    let pod_dir_id =
+        crate::kubelet::pod_runtime::service::pod_volume_dir_id("default", "sa-pod", "uid-sa-pod");
+    let phantom_dir = format!("{}/{pod_dir_id}/volumes/downward-api", volumes_root);
     assert!(
         !std::path::Path::new(&phantom_dir).exists(),
         "refresh must NOT create volumes/downward-api/ for projected volumes, but found: {}",
@@ -613,7 +619,7 @@ async fn test_refresh_downward_api_skips_projected_volumes() {
     );
 
     // The volumes/projected/ directory must also NOT exist (refresh doesn't create projected volumes)
-    let projected_dir = format!("{}/sa-pod/volumes/projected", volumes_root);
+    let projected_dir = format!("{}/{pod_dir_id}/volumes/projected", volumes_root);
     assert!(
         !std::path::Path::new(&projected_dir).exists(),
         "refresh must NOT create volumes/projected/ either"
@@ -638,6 +644,7 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
         "metadata": {
             "name": "label-pod",
             "namespace": "default",
+            "uid": "uid-label-pod",
             "labels": {"app": "initial"}
         },
         "spec": {
@@ -660,12 +667,13 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
         .await
         .unwrap();
 
-    // Simulate pod startup: create the projected volume directory with initial content
-    // Uses namespace-qualified dir ID to match refresh_downward_api_volumes
-    let vol_dir = format!(
-        "{}/default_label-pod/volumes/projected/podinfo",
-        volumes_root
+    // Simulate pod startup: create the projected volume directory with initial content.
+    let pod_dir_id = crate::kubelet::pod_runtime::service::pod_volume_dir_id(
+        "default",
+        "label-pod",
+        "uid-label-pod",
     );
+    let vol_dir = format!("{}/{pod_dir_id}/volumes/projected/podinfo", volumes_root);
     std::fs::create_dir_all(&vol_dir).unwrap();
     std::fs::write(format!("{}/labels", vol_dir), "app=\"initial\"\n").unwrap();
 
@@ -723,7 +731,7 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
     );
 
     // Must NOT create phantom volumes/downward-api/ directory
-    let phantom_dir = format!("{}/default_label-pod/volumes/downward-api", volumes_root);
+    let phantom_dir = format!("{}/{pod_dir_id}/volumes/downward-api", volumes_root);
     assert!(
         !std::path::Path::new(&phantom_dir).exists(),
         "refresh must NOT create volumes/downward-api/ phantom directory"

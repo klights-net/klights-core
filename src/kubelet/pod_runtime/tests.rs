@@ -606,7 +606,7 @@ async fn real_filesystem_cleanup_removes_entire_pod_root() {
     );
     let key = PodRuntimeKey::new("ns", "pod", "uid-root-cleanup");
     let pod_root = crate::paths::volumes_root_path(runtime_namespace)
-        .join(format!("{}_{}", key.namespace, key.name));
+        .join(format!("{}_{}_{}", key.namespace, key.name, key.uid));
     let pod_log_dir =
         crate::paths::pod_log_dir_path(runtime_namespace, &key.namespace, &key.name, &key.uid);
 
@@ -679,7 +679,7 @@ async fn fs_group_volume_ownership_with_parity() {
 
     let key = PodRuntimeKey::new("projected", "pod-projected-secrets", "uid-fsgroup");
     let volume_dir = crate::paths::volumes_root_path(&containerd_ns)
-        .join(format!("{}_{}", key.namespace, key.name))
+        .join(format!("{}_{}_{}", key.namespace, key.name, key.uid))
         .join("volumes")
         .join("projected")
         .join("secret-vol");

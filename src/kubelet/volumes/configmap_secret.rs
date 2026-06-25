@@ -399,7 +399,17 @@ async fn refresh_secret_configmap_volumes_inner(
             .pointer("/metadata/namespace")
             .and_then(|n| n.as_str())
             .unwrap_or("");
-        let pod_dir_id = format!("{}_{}", pod_ns, pod_name);
+        let Some(pod_uid) = pod.pointer("/metadata/uid").and_then(|uid| uid.as_str()) else {
+            tracing::warn!(
+                "Skipping {} volume refresh for pod {}/{} without metadata.uid",
+                kind,
+                pod_ns,
+                pod_name
+            );
+            continue;
+        };
+        let pod_dir_id =
+            crate::kubelet::pod_runtime::service::pod_volume_dir_id(pod_ns, pod_name, pod_uid);
 
         let volumes = match pod.pointer("/spec/volumes").and_then(|v| v.as_array()) {
             Some(v) => v,

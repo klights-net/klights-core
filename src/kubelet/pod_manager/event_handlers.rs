@@ -884,8 +884,14 @@ mod tests {
         .await
         .expect("create pod");
 
+        let pod_dir_id = crate::kubelet::pod_runtime::service::pod_volume_dir_id(
+            "default",
+            "cm-pod",
+            "uid-cm-pod",
+        );
         let volume_path = crate::paths::volumes_root_path(runtime_ns)
-            .join("default_cm-pod/volumes/config-map/config-vol");
+            .join(pod_dir_id)
+            .join("volumes/config-map/config-vol");
         let volume_path = volume_path.to_string_lossy().into_owned();
         std::fs::create_dir_all(&volume_path).expect("create mounted configmap volume");
         std::fs::write(format!("{volume_path}/data-1"), "value-1").expect("seed mounted data");

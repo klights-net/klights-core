@@ -16,6 +16,25 @@ fn make_pod_reader(
     ))
 }
 
+fn test_pod_dir_id(namespace: &str, pod_name: &str, uid: &str) -> String {
+    crate::kubelet::pod_runtime::service::pod_volume_dir_id(namespace, pod_name, uid)
+}
+
+fn test_volume_path(
+    volumes_root: &str,
+    namespace: &str,
+    pod_name: &str,
+    uid: &str,
+    relative: &str,
+) -> String {
+    format!(
+        "{}/{}/{}",
+        volumes_root,
+        test_pod_dir_id(namespace, pod_name, uid),
+        relative
+    )
+}
+
 #[tokio::test]
 async fn test_projected_volume_configmap_uses_default_mode() {
     use serde_json::json;
@@ -37,7 +56,7 @@ async fn test_projected_volume_configmap_uses_default_mode() {
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": "test-pod", "namespace": "default"},
+        "metadata": {"name": "test-pod", "namespace": "default", "uid": "uid-test-pod"},
         "spec": {"containers": []}
     });
     db.create_resource("v1", "Pod", Some("default"), "test-pod", pod)
@@ -87,7 +106,7 @@ async fn test_projected_volume_downward_api_per_file_mode() {
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": "test-pod", "namespace": "ns1"},
+        "metadata": {"name": "test-pod", "namespace": "ns1", "uid": "uid-test-pod"},
         "spec": {"containers": []}
     });
     db.create_resource("v1", "Pod", Some("ns1"), "test-pod", pod)
@@ -204,7 +223,7 @@ async fn test_secret_volume_refresh_on_update() {
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "test-pod", "namespace": "default"},
+            "metadata": {"name": "test-pod", "namespace": "default", "uid": "uid-test-pod"},
             "spec": {
                 "containers": [{"name": "app", "image": "nginx"}],
                 "volumes": [{
@@ -219,9 +238,12 @@ async fn test_secret_volume_refresh_on_update() {
     .unwrap();
 
     // Create initial secret volume on disk
-    let vol_path = format!(
-        "{}/default_test-pod/volumes/secret/secret-vol",
-        volumes_root
+    let vol_path = test_volume_path(
+        volumes_root,
+        "default",
+        "test-pod",
+        "uid-test-pod",
+        "volumes/secret/secret-vol",
     );
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/password", vol_path), "initial-password").unwrap();
@@ -314,7 +336,7 @@ async fn test_projected_secret_refresh_uses_event_payload_for_new_keys() {
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "projected-pod", "namespace": "default"},
+            "metadata": {"name": "projected-pod", "namespace": "default", "uid": "uid-projected-pod"},
             "spec": {
                 "containers": [{"name": "app", "image": "busybox"}],
                 "volumes": [{
@@ -330,9 +352,12 @@ async fn test_projected_secret_refresh_uses_event_payload_for_new_keys() {
     .await
     .unwrap();
 
-    let vol_path = format!(
-        "{}/default_projected-pod/volumes/projected/projected-vol",
-        volumes_root
+    let vol_path = test_volume_path(
+        volumes_root,
+        "default",
+        "projected-pod",
+        "uid-projected-pod",
+        "volumes/projected/projected-vol",
     );
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
@@ -394,7 +419,7 @@ async fn test_projected_secret_delete_event_clears_volume_with_stale_db_secret()
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "projected-pod", "namespace": "default"},
+            "metadata": {"name": "projected-pod", "namespace": "default", "uid": "uid-projected-pod"},
             "spec": {
                 "containers": [{"name": "app", "image": "busybox"}],
                 "volumes": [{
@@ -410,9 +435,12 @@ async fn test_projected_secret_delete_event_clears_volume_with_stale_db_secret()
     .await
     .unwrap();
 
-    let vol_path = format!(
-        "{}/default_projected-pod/volumes/projected/projected-vol",
-        volumes_root
+    let vol_path = test_volume_path(
+        volumes_root,
+        "default",
+        "projected-pod",
+        "uid-projected-pod",
+        "volumes/projected/projected-vol",
     );
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
@@ -464,7 +492,7 @@ async fn test_projected_configmap_delete_event_clears_existing_volume_with_missi
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "projected-pod", "namespace": "default"},
+            "metadata": {"name": "projected-pod", "namespace": "default", "uid": "uid-projected-pod"},
             "spec": {
                 "containers": [{"name": "app", "image": "busybox"}],
                 "volumes": [{
@@ -479,9 +507,12 @@ async fn test_projected_configmap_delete_event_clears_existing_volume_with_missi
     .await
     .unwrap();
 
-    let vol_path = format!(
-        "{}/default_projected-pod/volumes/projected/deletecm-volume",
-        volumes_root
+    let vol_path = test_volume_path(
+        volumes_root,
+        "default",
+        "projected-pod",
+        "uid-projected-pod",
+        "volumes/projected/deletecm-volume",
     );
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
@@ -535,7 +566,7 @@ async fn test_secret_delete_event_clears_direct_volume_with_stale_db_secret() {
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "secret-pod", "namespace": "default"},
+            "metadata": {"name": "secret-pod", "namespace": "default", "uid": "uid-secret-pod"},
             "spec": {
                 "containers": [{"name": "app", "image": "busybox"}],
                 "volumes": [{
@@ -549,9 +580,12 @@ async fn test_secret_delete_event_clears_direct_volume_with_stale_db_secret() {
     .await
     .unwrap();
 
-    let vol_path = format!(
-        "{}/default_secret-pod/volumes/secret/secret-vol",
-        volumes_root
+    let vol_path = test_volume_path(
+        volumes_root,
+        "default",
+        "secret-pod",
+        "uid-secret-pod",
+        "volumes/secret/secret-vol",
     );
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
@@ -603,7 +637,7 @@ async fn test_configmap_volume_refresh_uses_event_payload_for_new_keys() {
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "cm-pod", "namespace": "default"},
+            "metadata": {"name": "cm-pod", "namespace": "default", "uid": "uid-cm-pod"},
             "spec": {
                 "containers": [{"name": "app", "image": "busybox"}],
                 "volumes": [{
@@ -617,9 +651,12 @@ async fn test_configmap_volume_refresh_uses_event_payload_for_new_keys() {
     .await
     .unwrap();
 
-    let vol_path = format!(
-        "{}/default_cm-pod/volumes/config-map/config-vol",
-        volumes_root
+    let vol_path = test_volume_path(
+        volumes_root,
+        "default",
+        "cm-pod",
+        "uid-cm-pod",
+        "volumes/config-map/config-vol",
     );
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
@@ -684,7 +721,7 @@ async fn test_configmap_volume_refresh_on_update() {
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "cm-pod", "namespace": "default"},
+            "metadata": {"name": "cm-pod", "namespace": "default", "uid": "uid-cm-pod"},
             "spec": {
                 "containers": [{"name": "app", "image": "nginx"}],
                 "volumes": [{
@@ -699,9 +736,12 @@ async fn test_configmap_volume_refresh_on_update() {
     .unwrap();
 
     // Create initial configmap volume on disk
-    let vol_path = format!(
-        "{}/default_cm-pod/volumes/config-map/config-vol",
-        volumes_root
+    let vol_path = test_volume_path(
+        volumes_root,
+        "default",
+        "cm-pod",
+        "uid-cm-pod",
+        "volumes/config-map/config-vol",
     );
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/app.conf", vol_path), "key=old-value").unwrap();
@@ -788,7 +828,7 @@ async fn test_configmap_volume_refresh_prunes_removed_keys() {
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "cm-pod", "namespace": "default"},
+            "metadata": {"name": "cm-pod", "namespace": "default", "uid": "uid-cm-pod"},
             "spec": {
                 "containers": [{"name": "app", "image": "nginx"}],
                 "volumes": [{"name": "config-vol", "configMap": {"name": "my-config"}}]
@@ -799,9 +839,12 @@ async fn test_configmap_volume_refresh_prunes_removed_keys() {
     .await
     .unwrap();
 
-    let vol_path = format!(
-        "{}/default_cm-pod/volumes/config-map/config-vol",
-        volumes_root
+    let vol_path = test_volume_path(
+        volumes_root,
+        "default",
+        "cm-pod",
+        "uid-cm-pod",
+        "volumes/config-map/config-vol",
     );
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
@@ -885,7 +928,7 @@ async fn test_configmap_volume_refresh_clears_files_on_source_delete() {
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "cm-pod", "namespace": "default"},
+            "metadata": {"name": "cm-pod", "namespace": "default", "uid": "uid-cm-pod"},
             "spec": {
                 "containers": [{"name": "app", "image": "nginx"}],
                 "volumes": [{
@@ -899,9 +942,12 @@ async fn test_configmap_volume_refresh_clears_files_on_source_delete() {
     .await
     .unwrap();
 
-    let vol_path = format!(
-        "{}/default_cm-pod/volumes/config-map/config-vol",
-        volumes_root
+    let vol_path = test_volume_path(
+        volumes_root,
+        "default",
+        "cm-pod",
+        "uid-cm-pod",
+        "volumes/config-map/config-vol",
     );
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
@@ -964,7 +1010,7 @@ async fn test_secret_volume_refreshes_existing_terminal_pod_mounts() {
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": "done-pod", "namespace": "default"},
+            "metadata": {"name": "done-pod", "namespace": "default", "uid": "uid-done-pod"},
             "spec": {
                 "containers": [{"name": "app", "image": "nginx"}],
                 "volumes": [{"name": "s", "secret": {"secretName": "skip-secret"}}]
@@ -976,7 +1022,13 @@ async fn test_secret_volume_refreshes_existing_terminal_pod_mounts() {
     .unwrap();
 
     // Create volume dir with stale content
-    let vol_path = format!("{}/default_done-pod/volumes/secret/s", volumes_root);
+    let vol_path = test_volume_path(
+        volumes_root,
+        "default",
+        "done-pod",
+        "uid-done-pod",
+        "volumes/secret/s",
+    );
     fs::create_dir_all(&vol_path).unwrap();
     fs::write(format!("{}/key", vol_path), "stale").unwrap();
 

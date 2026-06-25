@@ -101,7 +101,7 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
         key: &PodRuntimeKey,
         pod: &serde_json::Value,
     ) -> anyhow::Result<HashMap<String, String>> {
-        let pod_dir_id = format!("{}_{}", key.namespace, key.name);
+        let pod_dir_id = key.volume_dir_id();
         let manager = crate::kubelet::pod_volume_manager::PodVolumeManager::new(
             self.sources.as_ref(),
             &self.containerd_namespace,
@@ -116,7 +116,7 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
 
     async fn cleanup_volumes(&self, key: &PodRuntimeKey) -> anyhow::Result<()> {
         self.cancel_projected_sa_refresh(key);
-        let pod_dir_id = format!("{}_{}", key.namespace, key.name);
+        let pod_dir_id = key.volume_dir_id();
         let pod_volumes_dir = crate::paths::volumes_root_path(&self.containerd_namespace)
             .join(&pod_dir_id)
             .join("volumes");
@@ -166,7 +166,7 @@ mod tests {
             uid: "uid-1".to_string(),
         };
         let pod_volumes_dir = crate::paths::volumes_root_path(containerd_ns)
-            .join(format!("{}_{}", key.namespace, key.name))
+            .join(key.volume_dir_id())
             .join("volumes");
         std::fs::create_dir_all(pod_volumes_dir.join("empty-dir")).expect("create volume dir");
         std::fs::write(pod_volumes_dir.join("empty-dir/file.txt"), b"test").expect("write file");
@@ -179,6 +179,78 @@ mod tests {
         assert!(
             !pod_volumes_dir.exists(),
             "volume directory should be removed"
+        );
+
+        unsafe {
+            std::env::remove_var("KLIGHTS_DATA_ROOT");
+            std::env::remove_var("KLIGHTS_CONTAINERD_NAMESPACE");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn real_pod_volume_runtime_emptydir_is_uid_qualified_for_same_name_recreate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let containerd_ns = "rt-volumes-uid-test";
+        unsafe {
+            std::env::set_var("KLIGHTS_DATA_ROOT", temp.path());
+            std::env::set_var("KLIGHTS_CONTAINERD_NAMESPACE", containerd_ns);
+        }
+
+        let runtime = RealPodVolumeRuntime::new(
+            crate::kubelet::volume_sources::empty_volume_source_reader_for_tests(),
+            containerd_ns.to_string(),
+            Arc::new(crate::task_supervisor::TaskSupervisor::new(
+                crate::task_supervisor::TaskCategoryConfig::default(),
+            )),
+        );
+        let pod = serde_json::json!({
+            "spec": {
+                "volumes": [{"name": "results", "emptyDir": {}}],
+            }
+        });
+        let old_key = PodRuntimeKey::new("sonobuoy", "sonobuoy-e2e-job", "uid-old");
+        let new_key = PodRuntimeKey::new("sonobuoy", "sonobuoy-e2e-job", "uid-new");
+
+        let old_paths = runtime
+            .process_volumes(&old_key, &pod)
+            .await
+            .expect("old pod volume setup");
+        let old_results = std::path::PathBuf::from(
+            old_paths
+                .get("results")
+                .expect("old emptyDir results volume"),
+        );
+        std::fs::write(old_results.join("done"), b"stale").expect("write stale done marker");
+
+        let new_paths = runtime
+            .process_volumes(&new_key, &pod)
+            .await
+            .expect("new pod volume setup");
+        let new_results = std::path::PathBuf::from(
+            new_paths
+                .get("results")
+                .expect("new emptyDir results volume"),
+        );
+
+        assert_ne!(
+            old_results, new_results,
+            "same-name replacement Pods must not share emptyDir paths across UIDs"
+        );
+        assert!(
+            old_results.ends_with("sonobuoy_sonobuoy-e2e-job_uid-old/volumes/empty-dir/results"),
+            "old volume path should include old UID: {}",
+            old_results.display()
+        );
+        assert!(
+            new_results.ends_with("sonobuoy_sonobuoy-e2e-job_uid-new/volumes/empty-dir/results"),
+            "new volume path should include new UID: {}",
+            new_results.display()
+        );
+        assert!(
+            !new_results.join("done").exists(),
+            "new same-name Pod must not inherit stale Sonobuoy done marker"
         );
 
         unsafe {

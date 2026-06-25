@@ -643,7 +643,7 @@ async fn test_downward_api_refresh_uses_keyed_blocking_boundary() {
     let pod = json!({
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": {"name": "pod-refresh", "namespace": "default"},
+        "metadata": {"name": "pod-refresh", "namespace": "default", "uid": "uid-pod-refresh"},
         "spec": {
             "containers": [{"name": "app", "image": "busybox"}],
             "volumes": [{
@@ -659,11 +659,16 @@ async fn test_downward_api_refresh_uses_keyed_blocking_boundary() {
         .unwrap();
 
     let items = pod["spec"]["volumes"][0]["downwardAPI"]["items"].clone();
+    let pod_dir_id = crate::kubelet::pod_runtime::service::pod_volume_dir_id(
+        "default",
+        "pod-refresh",
+        "uid-pod-refresh",
+    );
     create_downward_api_volume_at_with_db_name(DownwardApiVolumeWithDbNameRequest {
         volumes_root: root,
         sources: &db,
         namespace: "default",
-        pod_dir_id: "default_pod-refresh",
+        pod_dir_id: &pod_dir_id,
         pod_db_name: "pod-refresh",
         volume_name: "podinfo",
         default_mode: None,

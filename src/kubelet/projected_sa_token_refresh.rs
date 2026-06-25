@@ -230,7 +230,7 @@ pub(crate) async fn refresh_projected_service_account_tokens_once(
         return Ok(ProjectedSaTokenRefreshOutcome::Stop);
     }
 
-    let pod_dir_id = format!("{}_{}", request.key.namespace, request.key.name);
+    let pod_dir_id = request.key.volume_dir_id();
     for token_ref in refs.iter().cloned() {
         let token =
             mint_projected_service_account_token(request.sources.as_ref(), pod, &token_ref).await?;
@@ -494,8 +494,9 @@ mod tests {
         });
 
         let volumes_root = temp.path().join("pods");
+        let key = PodRuntimeKey::new("kube-system", "coredns", "pod-uid");
         let token_dir = volumes_root
-            .join("kube-system_coredns")
+            .join(key.volume_dir_id())
             .join("volumes/projected/kube-api-access-x");
         std::fs::create_dir_all(&token_dir).expect("create projected dir");
         std::fs::write(token_dir.join("token"), "expired").expect("write old token");
@@ -504,7 +505,7 @@ mod tests {
             super::ProjectedSaTokenRefreshRequest {
                 sources: sources.clone(),
                 volumes_root: volumes_root.to_string_lossy().into_owned(),
-                key: PodRuntimeKey::new("kube-system", "coredns", "pod-uid"),
+                key,
             },
         )
         .await

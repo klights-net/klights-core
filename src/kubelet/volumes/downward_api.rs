@@ -126,8 +126,14 @@ pub async fn refresh_downward_api_volumes(
         .and_then(|n| n.as_str())
         .ok_or_else(|| anyhow::anyhow!("Pod missing metadata.name"))?;
 
-    // Use namespace_name as directory key (matches create_pod / delete_pod)
-    let pod_dir_id = format!("{}_{}", namespace, pod_name);
+    let pod_uid = pod
+        .get("metadata")
+        .and_then(|m| m.get("uid"))
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Pod missing metadata.uid"))?;
+
+    let pod_dir_id =
+        crate::kubelet::pod_runtime::service::pod_volume_dir_id(namespace, pod_name, pod_uid);
 
     let volumes = pod
         .get("spec")

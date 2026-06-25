@@ -176,7 +176,7 @@ impl PodFilesystem for RealPodFilesystem {
             return Ok(());
         };
         let gid = u32::try_from(fs_group).context("pod fsGroup exceeds gid range")?;
-        let pod_dir_id = format!("{}_{}", key.namespace, key.name);
+        let pod_dir_id = key.volume_dir_id();
         let volume_root = crate::paths::volumes_root_path(&self.containerd_ns)
             .join(pod_dir_id)
             .join("volumes");
@@ -189,7 +189,7 @@ impl PodFilesystem for RealPodFilesystem {
     }
 
     async fn cleanup_pod_filesystem(&self, key: &PodRuntimeKey) -> anyhow::Result<()> {
-        let pod_dir_id = format!("{}_{}", key.namespace, key.name);
+        let pod_dir_id = key.volume_dir_id();
         let pod_root = crate::paths::volumes_root_path(&self.containerd_ns).join(&pod_dir_id);
         let pod_log_dir = crate::paths::pod_log_dir_path(
             &self.containerd_ns,
