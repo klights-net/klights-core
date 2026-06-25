@@ -1347,6 +1347,31 @@ mod cases {
         handle.abort();
     }
 
+    /// T3: InstallSnapshot must use its own channel lane, NOT the Raft lane, so
+    /// a stalled multi-chunk snapshot transfer cannot head-of-line-block
+    /// heartbeats/AppendEntries multiplexed over the same connection under loss.
+    /// Driving one install_snapshot RPC must materialize the InstallSnapshot
+    /// lane pool and leave the Raft lane untouched.
+    #[tokio::test]
+    async fn install_snapshot_uses_a_lane_separate_from_append_entries() {
+        use crate::replication::grpc::client::ChannelLane;
+        // wedge nothing for IS (empty path never matches), just drive one call
+        // through the client to materialize the lane pool.
+        let (client, handle) = raft_timeout_client("/never-wedges").await;
+        let _ = client.raft_install_snapshot_rpc(Vec::new()).await;
+        assert!(
+            client
+                .lane_pool_present_for_test(ChannelLane::InstallSnapshot)
+                .await,
+            "install_snapshot must use its own InstallSnapshot lane"
+        );
+        assert!(
+            !client.lane_pool_present_for_test(ChannelLane::Raft).await,
+            "install_snapshot must NOT touch the Raft (AppendEntries/Vote) lane"
+        );
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn client_snapshot_decodes_entries() {
         let (client, _service, db, handle) = client_and_service().await;
