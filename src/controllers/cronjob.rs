@@ -561,6 +561,15 @@ async fn sync_active_status(
             .or_insert_with(|| json!(now_str));
     }
 
+    // T6.2: gate on actual status change. An identical status write would still
+    // propose a no-op raft entry (bumping resourceVersion and fanning out a
+    // watch event) on every redundant reconcile — the raft apply path does not
+    // dedupe like the direct sqlite status path does. Skip the write entirely
+    // when the computed status matches the existing one.
+    if cj.get("status") == Some(&status) {
+        return Ok(());
+    }
+
     db.update_status_only_with_preconditions(
         "batch/v1",
         "CronJob",
@@ -1588,5 +1597,85 @@ mod tests {
                 "newest failed Jobs within failedJobsHistoryLimit must be retained"
             );
         }
+    }
+
+    /// T6.2: sync_active_status must not write a status update when the computed
+    /// status matches the existing one — an unchanged reconcile must not churn the
+    /// resourceVersion (and thus the raft/watch fan-out) on every tick. The
+    /// current implementation writes unconditionally, so this fails until the
+    /// write is gated on an actual status change.
+    #[tokio::test]
+    async fn test_cronjob_sync_active_status_skips_unchanged_status() {
+        // Use the replicated/raft harness: this is the production path. If the
+        // raft apply layer does NOT dedupe an identical status write, an unchanged
+        // reconcile would still propose a no-op entry and bump resourceVersion
+        // (latent churn). This test asserts no rv bump on the raft path.
+        let db = make_raft_cronjob_datastore().await;
+
+        // Build the status exactly as sync_active_status would compute it for a
+        // CronJob with no active Jobs and no new schedule: active=[],
+        // observedGeneration=metadata.generation, and a pre-set lastSuccessfulTime
+        // (the `or_insert_with` keeps an existing value).
+        let generation = 1_i64;
+        let now_str = crate::utils::k8s_time_now();
+        let matching_status = json!({
+            "active": [],
+            "observedGeneration": generation,
+            "lastSuccessfulTime": now_str,
+        });
+        let cj = json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": "test-cj-sync",
+                "namespace": "default",
+                "uid": "cj-sync-uid",
+                "generation": generation,
+                "creationTimestamp": crate::utils::k8s_time_now(),
+            },
+            "spec": {
+                "schedule": "* * * * *",
+                "concurrencyPolicy": "Allow",
+                "jobTemplate": {"spec": {"template": {"spec": {
+                    "containers": [{"name": "c", "image": "nginx"}],
+                    "restartPolicy": "Never"
+                }}}}
+            },
+            "status": matching_status,
+        });
+        let created = db
+            .create_resource(
+                "batch/v1",
+                "CronJob",
+                Some("default"),
+                "test-cj-sync",
+                cj.clone(),
+            )
+            .await
+            .unwrap();
+
+        // No active Jobs, no new schedule → sync_active_status computes a status
+        // identical to the one already stored. It must NOT issue a status write.
+        super::sync_active_status(
+            &db,
+            &cj,
+            "test-cj-sync",
+            "default",
+            "cj-sync-uid",
+            created.resource_version,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let after = db
+            .get_resource("batch/v1", "CronJob", Some("default"), "test-cj-sync")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.resource_version, created.resource_version,
+            "sync_active_status must not bump resourceVersion when status is unchanged"
+        );
     }
 }

@@ -773,6 +773,40 @@ pub fn test_node_protobuf_decode_preserves_spec_and_status() {
     assert_eq!(result["status"]["capacity"]["cpu"], "4");
 }
 
+/// T6.1: the existing decode-side test (22870d5) built a proto Node directly
+/// and decoded it, never exercising the JSON→proto encode direction. This
+/// locks in the JOINT round-trip (JSON → openapi::Node → k8s_pb::Node → JSON)
+/// for spec.unschedulable so a future regression on EITHER codepath is caught.
+#[test]
+pub fn test_node_protobuf_round_trip_preserves_unschedulable() {
+    let node_json = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Node",
+        "metadata": {"name": "node-unsched"},
+        "spec": {
+            "podCIDR": "10.244.0.0/24",
+            "unschedulable": true,
+            "taints": [{
+                "key": "node-role.kubernetes.io/control-plane",
+                "effect": "NoSchedule"
+            }]
+        }
+    });
+
+    let wire = encode_protobuf(&node_json).expect("encode node");
+    let decoded = decode_protobuf(&wire[4..]).expect("decode node");
+
+    assert_eq!(
+        decoded["spec"]["unschedulable"], true,
+        "JSON→proto→JSON round-trip must preserve spec.unschedulable (both codepaths)"
+    );
+    assert_eq!(decoded["spec"]["podCIDR"], "10.244.0.0/24");
+    assert_eq!(
+        decoded["spec"]["taints"][0]["key"],
+        "node-role.kubernetes.io/control-plane"
+    );
+}
+
 #[test]
 pub fn test_crd_protobuf_decode_preserves_spec() {
     use k8s_pb::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
