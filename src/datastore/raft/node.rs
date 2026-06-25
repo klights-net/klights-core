@@ -27,10 +27,19 @@ use crate::datastore::raft::network::{LeaderForwarder, StubRaftNetwork};
 use crate::datastore::raft::state_machine_impl::SqliteRaftStateMachine;
 use crate::datastore::raft::types::{NodeId, RaftShape, StorageCommandPayload, TypeConfig};
 
-/// Lossy-link transport sizing (finding.md H3). `max_payload_entries=3` keeps
-/// each AppendEntries retry small. Raft proposal flow control uses those three
-/// general permits plus one reserved control-critical outbox permit.
+/// Lossy-link transport sizing (finding.md H3). `max_payload_entries` keeps each
+/// AppendEntries retry small (it bounds **retransmit cost**: leader→follower).
 pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 3;
+
+/// Leader proposal flow-control cap: the maximum number of unacknowledged
+/// proposals that may be in flight simultaneously. This is DECOUPLED from
+/// `RAFT_MAX_PAYLOAD_ENTRIES` (latency-todo T1): payload entries bounds AppendEntries
+/// **retransmit cost**, while this permit count bounds **RV backlog ahead of
+/// acknowledged raft progress** at the leader. OpenRaft already pipelines
+/// AppendEntries, so a small payload does NOT require a small permit count.
+/// Coupling both to 3 capped leader commit concurrency at 3 — at ~200 ms quorum
+/// RTT a hard ~15 commits/sec ceiling. Default 16 (sweep range 8..=32, see T1).
+pub(crate) const RAFT_MAX_INFLIGHT_PROPOSALS: usize = 16;
 
 pub struct RaftNode {
     pub node_id: NodeId,
@@ -168,7 +177,7 @@ impl RaftNode {
             authoring_node: node_name,
             flow_control: Arc::new(
                 crate::datastore::raft::flow_control::RaftCommitFlowControl::new(
-                    RAFT_MAX_PAYLOAD_ENTRIES as usize,
+                    RAFT_MAX_INFLIGHT_PROPOSALS,
                 ),
             ),
         })
@@ -2469,9 +2478,11 @@ mod tests {
             .await
             .expect("become leader");
         // Exhaust the flow-control gate before propose_command runs.
-        let _p1 = node.flow_control.acquire().await;
-        let _p2 = node.flow_control.acquire().await;
-        let _p3 = node.flow_control.acquire().await;
+        let cap = node.flow_control.max_in_flight();
+        let mut held = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            held.push(node.flow_control.acquire().await);
+        }
         assert_eq!(node.flow_control.available_permits(), 0);
 
         let rv_before = backend.get_current_resource_version().await.unwrap();
@@ -2499,9 +2510,7 @@ mod tests {
 
         // Drop the externally-held propose_fut and clean up the manually-held permits.
         drop(propose_fut);
-        drop(_p1);
-        drop(_p2);
-        drop(_p3);
+        drop(held);
         node.shutdown().await.unwrap();
     }
 
@@ -2522,9 +2531,11 @@ mod tests {
             .await
             .expect("become leader");
 
-        let _p1 = node.flow_control.acquire().await;
-        let _p2 = node.flow_control.acquire().await;
-        let _p3 = node.flow_control.acquire().await;
+        let cap = node.flow_control.max_in_flight();
+        let mut held = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            held.push(node.flow_control.acquire().await);
+        }
         assert_eq!(node.flow_control.available_permits(), 0);
 
         let rv_before = backend.get_current_resource_version().await.unwrap();
@@ -2555,9 +2566,7 @@ mod tests {
             "outbox propose must not reserve an rv when it sheds load under flow-control saturation"
         );
 
-        drop(_p1);
-        drop(_p2);
-        drop(_p3);
+        drop(held);
 
         let retry_result = node
             .propose_outbox_command(
@@ -2588,9 +2597,11 @@ mod tests {
             .await
             .expect("become leader");
 
-        let _p1 = node.flow_control.acquire().await;
-        let _p2 = node.flow_control.acquire().await;
-        let _p3 = node.flow_control.acquire().await;
+        let cap = node.flow_control.max_in_flight();
+        let mut held = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            held.push(node.flow_control.acquire().await);
+        }
         assert_eq!(node.flow_control.available_permits(), 0);
 
         tokio::time::timeout(
@@ -2613,9 +2624,7 @@ mod tests {
             .expect("critical Node was created");
         assert_eq!(stored.uid, "uid-critical-worker");
 
-        drop(_p1);
-        drop(_p2);
-        drop(_p3);
+        drop(held);
         node.shutdown().await.unwrap();
     }
 
@@ -2639,10 +2648,13 @@ mod tests {
         }
     }
 
-    /// Integration test: at most 3 unacknowledged propose_command calls may be in flight.
-    /// Holds 3 permits manually, then verifies a 4th propose call is blocked.
+    /// Integration test: at most `max_in_flight()` unacknowledged propose_command calls
+    /// may be in flight. Holds all general permits, then verifies the next propose
+    /// call is blocked. The cap is DECOUPLED from `RAFT_MAX_PAYLOAD_ENTRIES` (T1):
+    /// this asserts the live gate equals the configured `RAFT_MAX_INFLIGHT_PROPOSALS`,
+    /// not the smaller payload-entries value.
     #[tokio::test]
-    async fn at_most_three_raft_proposals_are_in_flight() {
+    async fn at_most_max_inflight_raft_proposals_are_in_flight() {
         use crate::datastore::replicated::RaftProposer;
 
         let (node, backend) = fresh_node(71).await;
@@ -2652,36 +2664,44 @@ mod tests {
         wait_for_leader(&node, std::time::Duration::from_secs(5))
             .await
             .expect("become leader");
+        // T1: the flow-control gate is the decoupled in-flight value, larger than
+        // the openraft payload cap.
         assert_eq!(
             node.flow_control.max_in_flight(),
-            3,
-            "flow-control cap must be 3 (matches RAFT_MAX_PAYLOAD_ENTRIES)"
+            super::RAFT_MAX_INFLIGHT_PROPOSALS,
+            "flow-control cap must be the decoupled RAFT_MAX_INFLIGHT_PROPOSALS, \
+             not RAFT_MAX_PAYLOAD_ENTRIES"
         );
-        // Hold all 3 permits, simulating 3 in-flight proposals.
-        let _p1 = node.flow_control.acquire().await;
-        let _p2 = node.flow_control.acquire().await;
-        let _p3 = node.flow_control.acquire().await;
+        assert_ne!(
+            node.flow_control.max_in_flight() as u64,
+            super::RAFT_MAX_PAYLOAD_ENTRIES,
+            "flow-control cap must be decoupled from payload entries"
+        );
+        // Hold every general permit, simulating max_in_flight in-flight proposals.
+        let cap = node.flow_control.max_in_flight();
+        let mut held = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            held.push(node.flow_control.acquire().await);
+        }
         assert_eq!(node.flow_control.available_permits(), 0);
 
-        // A 4th propose call must block (no permits available).
+        // The next propose call must block (no permits available).
         let rv_before = backend.get_current_resource_version().await.unwrap();
-        let cmd = propose_create_command("fourth-blocked");
+        let cmd = propose_create_command("next-blocked");
         let timeout = tokio::time::sleep(std::time::Duration::from_millis(200));
         tokio::pin!(timeout);
         let mut propose_fut = Box::pin(node.propose_command(cmd));
         tokio::select! {
-            _ = &mut propose_fut => panic!("4th propose must block when 3 permits are held"),
+            _ = &mut propose_fut => panic!("propose must block when all permits are held"),
             _ = &mut timeout => {}
         }
         let rv_after = backend.get_current_resource_version().await.unwrap();
         assert_eq!(
             rv_after, rv_before,
-            "blocked 4th propose must not have reserved an rv"
+            "blocked propose must not have reserved an rv"
         );
         drop(propose_fut);
-        drop(_p1);
-        drop(_p2);
-        drop(_p3);
+        drop(held);
         node.shutdown().await.unwrap();
     }
 
@@ -2705,7 +2725,11 @@ mod tests {
             .await
             .expect("first create");
         let permits_before = node.flow_control.available_permits();
-        assert_eq!(permits_before, 3, "permits restored after first success");
+        assert_eq!(
+            permits_before,
+            node.flow_control.max_in_flight(),
+            "permits restored after first success"
+        );
 
         // Second create with the same name MUST fail at materialization (build step rejects
         // duplicate). The permit must be released by the RAII guard on the error path.
@@ -2724,7 +2748,7 @@ mod tests {
         );
         assert_eq!(
             node.flow_control.available_permits(),
-            3,
+            node.flow_control.max_in_flight(),
             "permit must be released after materialization-failure error path"
         );
         node.shutdown().await.unwrap();
@@ -2747,16 +2771,23 @@ mod tests {
         // RAII semantics on the actual flow-control gate held by RaftNode:
         // any exit (including a panic or an early return inside propose_command)
         // must release the permit. We exercise the live gate here.
-        assert_eq!(node.flow_control.available_permits(), 3);
+        assert_eq!(
+            node.flow_control.available_permits(),
+            node.flow_control.max_in_flight()
+        );
         {
             let _permit = node.flow_control.acquire().await;
-            assert_eq!(node.flow_control.available_permits(), 2, "permit acquired");
+            assert_eq!(
+                node.flow_control.available_permits(),
+                node.flow_control.max_in_flight() - 1,
+                "permit acquired"
+            );
             // Simulating the late-failure path: the permit is held when client_write
             // would have failed; the RAII guard releases on scope exit.
         }
         assert_eq!(
             node.flow_control.available_permits(),
-            3,
+            node.flow_control.max_in_flight(),
             "RAII permit must release on scope exit (mirrors propose_command's error paths)"
         );
         node.shutdown().await.unwrap();
@@ -2776,7 +2807,10 @@ mod tests {
         wait_for_leader(&node, std::time::Duration::from_secs(5))
             .await
             .expect("become leader");
-        assert_eq!(node.flow_control.available_permits(), 3);
+        assert_eq!(
+            node.flow_control.available_permits(),
+            node.flow_control.max_in_flight()
+        );
 
         node.propose_command(propose_create_command("ok-success"))
             .await
@@ -2784,32 +2818,38 @@ mod tests {
 
         assert_eq!(
             node.flow_control.available_permits(),
-            3,
+            node.flow_control.max_in_flight(),
             "permit must be released after successful terminal propose_command"
         );
         node.shutdown().await.unwrap();
     }
 
-    /// Static check that the actual openraft `max_payload_entries` constant configured
-    /// in `start_with_network` is 3 — matching the 3-permit flow-control gate so a
-    /// single AppendEntries retry cannot resend a larger logical batch than the
-    /// in-flight bound. References the module-scope constant so this test would fail
-    /// if anyone reverted RAFT_MAX_PAYLOAD_ENTRIES upward without updating the test.
+    /// T1: the leader proposal flow-control gate must be DECOUPLED from the
+    /// openraft `max_payload_entries`. These solve different problems: payload
+    /// entries bounds AppendEntries **retransmit cost** (leader→follower), while
+    /// the in-flight permit count bounds **RV backlog ahead of acknowledged raft
+    /// progress** at the leader. Coupling both to 3 caps leader commit concurrency
+    /// at 3 — at ~200 ms quorum RTT that is a hard ~15 commits/sec ceiling. The two
+    /// constants must be independently bounded, and the flow-control gate must be
+    /// wired to the larger in-flight value, not the payload value.
     #[test]
-    fn raft_max_payload_entries_is_bounded_for_lossy_resend() {
-        // The constant is referenced by Config.max_payload_entries inside
-        // start_with_network — both sites are the same identifier so they cannot drift.
-        assert_eq!(
-            super::RAFT_MAX_PAYLOAD_ENTRIES,
-            3,
-            "RAFT_MAX_PAYLOAD_ENTRIES must be 3 to match the 3-permit flow-control gate"
+    fn raft_flow_control_cap_is_decoupled_from_payload_entries() {
+        use crate::datastore::raft::node::{RAFT_MAX_INFLIGHT_PROPOSALS, RAFT_MAX_PAYLOAD_ENTRIES};
+
+        // payload stays small for lossy AppendEntries retransmit cost.
+        assert!(
+            RAFT_MAX_PAYLOAD_ENTRIES <= 16,
+            "RAFT_MAX_PAYLOAD_ENTRIES must stay small for lossy retransmit"
         );
-        // Also assert the matching invariant: the flow-control cap equals the
-        // openraft payload cap, so a single retry cannot resend more entries than
-        // the gate would have admitted in flight.
-        let fc = crate::datastore::raft::flow_control::RaftCommitFlowControl::new(
-            super::RAFT_MAX_PAYLOAD_ENTRIES as usize,
+        // in-flight is independently bounded (latency-todo T1: start 16, sweep 8..=32).
+        assert!(
+            (8..=32).contains(&RAFT_MAX_INFLIGHT_PROPOSALS),
+            "RAFT_MAX_INFLIGHT_PROPOSALS must be a swept value in 8..=32"
         );
-        assert_eq!(fc.max_in_flight(), 3);
+        // The core decoupling: the gate must not equal the payload cap.
+        assert_ne!(
+            RAFT_MAX_INFLIGHT_PROPOSALS as u64, RAFT_MAX_PAYLOAD_ENTRIES,
+            "in-flight proposal gate must be decoupled from payload entries"
+        );
     }
 }
