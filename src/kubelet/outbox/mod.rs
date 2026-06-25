@@ -509,6 +509,11 @@ pub struct OutboxDispatcher {
     batch_size: usize,
     dispatch_total: std::sync::Arc<std::sync::atomic::AtomicU64>,
     dispatch_errors_total: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// T4/T7: RTT estimator fed by successful worker→leader apply_outbox
+    /// round-trips. The retry backoff reads `estimate_ms()` instead of the
+    /// old fixed 200 ms default, so a lossy ~400 ms RTT backs off on the right
+    /// scale. Idle-silent (no applies ⇒ no samples).
+    rtt: std::sync::Arc<crate::datastore::raft::rtt_estimator::RttEstimator>,
 }
 
 impl OutboxDispatcher {
@@ -526,6 +531,7 @@ impl OutboxDispatcher {
             batch_size: 16,
             dispatch_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dispatch_errors_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rtt: std::sync::Arc::new(crate::datastore::raft::rtt_estimator::RttEstimator::new()),
         }
     }
 
@@ -549,6 +555,13 @@ impl OutboxDispatcher {
             self.dispatch_total.clone(),
             self.dispatch_errors_total.clone(),
         )
+    }
+
+    /// T4/T7: current RTT estimate (ms) derived from successful apply
+    /// round-trips, or the default before any traffic has flowed.
+    #[cfg(test)]
+    pub(crate) fn rtt_estimate_ms(&self) -> i64 {
+        self.rtt.estimate_ms()
     }
 
     /// Enable leader dispatch batching: claims multiple rows per node.db
@@ -780,6 +793,9 @@ impl OutboxDispatcher {
         }
         match applied {
             Ok(result) => {
+                // T4/T7: a successful apply round-trip is a clean RTT sample
+                // for the worker→leader path; feed the backoff estimator.
+                self.rtt.record_sample(dispatch_start.elapsed());
                 self.dispatch_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if records_checkpoint
@@ -820,8 +836,11 @@ impl OutboxDispatcher {
                         tracing::warn!(pod_uid = %row.pod_uid, error = %err, "delete checkpoint failed");
                     }
                 } else {
-                    let backoff_until_ms = now_ms
-                        .saturating_add(jittered_backoff_ms(row.attempt, &row.idempotency_key));
+                    let backoff_until_ms = now_ms.saturating_add(adaptive_jittered_backoff_ms(
+                        row.attempt,
+                        &row.idempotency_key,
+                        self.rtt.estimate_ms(),
+                    ));
                     if let Err(err) = self
                         .node_db
                         .mark_outbox_attempt_failed(row.id, lease_token, backoff_until_ms, &err)
@@ -917,10 +936,9 @@ impl OutboxDispatcher {
     }
 }
 
-/// Default RTT estimate (ms) for adaptive outbox retry backoff. There is
-/// deliberately no shared RTT estimator — that only existed to feed the
-/// hedging lever, which was dropped (latency-fix.md §3).
-const DEFAULT_RTT_ESTIMATE_MS: i64 = 200;
+/// RTT bounds for the adaptive outbox backoff window. The estimate itself
+/// comes from the dispatcher's `RttEstimator` (T4/T7) — sampled from
+/// successful worker→leader apply round-trips.
 const BACKOFF_RTT_MIN_MS: i64 = 200;
 const BACKOFF_RTT_MAX_MS: i64 = 3_000;
 const BACKOFF_BASE_MIN_MS: i64 = 500;
@@ -953,12 +971,6 @@ fn adaptive_jittered_backoff_ms(attempt: i64, idempotency_key: &str, rtt_est_ms:
     let (lower, upper) = adaptive_backoff_bounds(attempt, rtt_est_ms);
     let window = upper.saturating_sub(lower);
     lower.saturating_add(deterministic_jitter_ms(idempotency_key, attempt, window))
-}
-
-/// Retry backoff used by the dispatch loop. Uses the default RTT estimate
-/// (200 ms).
-fn jittered_backoff_ms(attempt: i64, idempotency_key: &str) -> i64 {
-    adaptive_jittered_backoff_ms(attempt, idempotency_key, DEFAULT_RTT_ESTIMATE_MS)
 }
 
 fn deterministic_jitter_ms(idempotency_key: &str, attempt: i64, window_ms: i64) -> i64 {
@@ -1328,8 +1340,10 @@ mod tests {
             .await
             .expect("read next jittered wake")
             .expect("retry wake exists");
-        let (backoff_lower, backoff_upper) =
-            super::adaptive_backoff_bounds(0, super::DEFAULT_RTT_ESTIMATE_MS);
+        let (backoff_lower, backoff_upper) = super::adaptive_backoff_bounds(
+            0,
+            crate::datastore::raft::rtt_estimator::RTT_DEFAULT_MS,
+        );
         assert!(
             (20 + backoff_lower..=20 + backoff_upper).contains(&after_backoff),
             "retry wake must stay inside the first-attempt adaptive jitter window \
@@ -1780,8 +1794,10 @@ mod tests {
             } => next,
             other => panic!("expected idle retry wake, got {other:?}"),
         };
-        let (backoff_lower, backoff_upper) =
-            super::adaptive_backoff_bounds(0, super::DEFAULT_RTT_ESTIMATE_MS);
+        let (backoff_lower, backoff_upper) = super::adaptive_backoff_bounds(
+            0,
+            crate::datastore::raft::rtt_estimator::RTT_DEFAULT_MS,
+        );
         assert!(
             (1_000 + backoff_lower..=1_000 + backoff_upper).contains(&next_retry),
             "retry wake must stay inside the first-attempt adaptive jitter window \
@@ -1871,8 +1887,10 @@ mod tests {
             unique.len() > 1,
             "retryable rows must not all re-fire at the same millisecond: {next_due_times:?}"
         );
-        let (backoff_lower, backoff_upper) =
-            super::adaptive_backoff_bounds(0, super::DEFAULT_RTT_ESTIMATE_MS);
+        let (backoff_lower, backoff_upper) = super::adaptive_backoff_bounds(
+            0,
+            crate::datastore::raft::rtt_estimator::RTT_DEFAULT_MS,
+        );
         assert!(
             next_due_times
                 .iter()
@@ -1945,6 +1963,51 @@ mod tests {
                 "backoff must be deterministic for key={key} attempt={attempt} rtt={rtt}"
             );
         }
+    }
+
+    /// T4/T7: the dispatcher must feed successful apply round-trips into its
+    /// RTT estimator, and the retry backoff must then reflect the observed
+    /// RTT rather than the fixed 200 ms default. Seeds a successful apply
+    /// (records the round-trip), then asserts the estimator moved off the
+    /// default before any retry backoff is computed.
+    #[tokio::test]
+    async fn dispatcher_feeds_apply_round_trips_into_rtt_estimator() {
+        let node_db = node_db().await;
+        let outbox = Outbox::new(node_db.clone());
+        let client = Arc::new(FakeApplyClient::default());
+        client
+            .push_response(Ok(OutboxApplyResult::Applied { applied_rv: 1 }))
+            .await;
+        let dispatcher = OutboxDispatcher::for_tests(node_db.clone(), client.clone());
+
+        outbox
+            .enqueue_command(OutboxCommand::new(
+                "rtt-seed",
+                OutboxOperation::PodStatus,
+                OutboxSubject::new(
+                    "v1/Pod/default/web/uid-rtt",
+                    Some("default".to_string()),
+                    "web",
+                    Some("uid-rtt".to_string()),
+                ),
+                "uid-rtt",
+                pod_status_command("default", "web", "uid-rtt"),
+                10,
+            ))
+            .await
+            .expect("enqueue");
+        dispatcher
+            .dispatch_due_once(20)
+            .await
+            .expect("dispatch the successful apply");
+        // The successful round-trip must have been recorded: the estimate is
+        // no longer the unsampled default (200 ms).
+        let estimate = dispatcher.rtt_estimate_ms();
+        assert_ne!(
+            estimate,
+            crate::datastore::raft::rtt_estimator::RTT_DEFAULT_MS,
+            "a successful apply round-trip must update the RTT estimator off the default"
+        );
     }
 
     #[tokio::test]
