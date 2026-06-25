@@ -536,38 +536,37 @@ async fn sync_active_status(
         .collect();
 
     let now_str = crate::utils::k8s_time_now();
-    let mut updated = cj.clone();
-    if let Some(obj) = updated.as_object_mut() {
-        let mut status = obj.remove("status").unwrap_or(json!({}));
-        if let Some(s) = status.as_object_mut() {
-            s.insert("active".to_string(), json!(active_refs));
-            if let Some(t) = new_scheduled {
-                s.insert(
-                    "lastScheduleTime".to_string(),
-                    json!(crate::utils::k8s_time_format(t)),
-                );
-            }
+    let mut status = cj.get("status").cloned().unwrap_or_else(|| json!({}));
+    if !status.is_object() {
+        status = json!({});
+    }
+    if let Some(s) = status.as_object_mut() {
+        s.insert("active".to_string(), json!(active_refs));
+        if let Some(t) = new_scheduled {
             s.insert(
-                "observedGeneration".to_string(),
-                json!(
-                    cj.pointer("/metadata/generation")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(1)
-                ),
+                "lastScheduleTime".to_string(),
+                json!(crate::utils::k8s_time_format(t)),
             );
-            // Mark lastSuccessfulTime if the most recent Job completed successfully.
-            s.entry("lastSuccessfulTime")
-                .or_insert_with(|| json!(now_str));
         }
-        obj.insert("status".to_string(), status);
+        s.insert(
+            "observedGeneration".to_string(),
+            json!(
+                cj.pointer("/metadata/generation")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(1)
+            ),
+        );
+        // Mark lastSuccessfulTime if the most recent Job completed successfully.
+        s.entry("lastSuccessfulTime")
+            .or_insert_with(|| json!(now_str));
     }
 
-    db.update_resource_with_preconditions(
+    db.update_status_only_with_preconditions(
         "batch/v1",
         "CronJob",
         Some(namespace),
         name,
-        updated,
+        status,
         ResourcePreconditions::uid_and_resource_version(cj_uid.to_string(), rv),
     )
     .await?;
@@ -579,7 +578,76 @@ async fn sync_active_status(
 mod tests {
     use super::*;
 
+    use async_trait::async_trait;
     use serde_json::json;
+    use std::sync::Arc;
+
+    async fn make_raft_cronjob_datastore() -> crate::datastore::replicated::ReplicatedDatastore {
+        use crate::datastore::backend::DatastoreHandle;
+        use crate::datastore::command::StorageCommand;
+        use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+
+        struct InlineProposer {
+            inner: DatastoreHandle,
+        }
+
+        #[async_trait]
+        impl crate::datastore::replicated::RaftProposer for InlineProposer {
+            async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+                let payload = OutboxPayload::from_command(command).encode_protobuf()?;
+                let key = format!("cronjob-inline-{}", uuid::Uuid::new_v4());
+                crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                    self.inner.as_ref(),
+                    &key,
+                    OutboxOperation::PodStatus,
+                    bytes::Bytes::from(payload),
+                    "cronjob-inline-proposer",
+                )
+                .await
+                .map_err(|err| anyhow::anyhow!("inline cronjob propose: {err}"))?;
+                Ok(())
+            }
+
+            async fn propose_outbox_command(
+                &self,
+                idempotency_key: &str,
+                operation: &str,
+                command: StorageCommand,
+                authoring_node: &str,
+            ) -> std::result::Result<
+                crate::kubelet::outbox::OutboxApplyResult,
+                crate::kubelet::outbox::OutboxApplyError,
+            > {
+                let payload = OutboxPayload::from_command(command)
+                    .encode_protobuf()
+                    .map_err(|err| {
+                        crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                    })?;
+                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                    self.inner.as_ref(),
+                    idempotency_key,
+                    OutboxOperation::try_from(operation).map_err(|err| {
+                        crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                    })?,
+                    bytes::Bytes::from(payload),
+                    authoring_node,
+                )
+                .await?;
+                Ok(outcome.result)
+            }
+        }
+
+        let inner = crate::datastore::test_support::in_memory().await;
+        let handle: DatastoreHandle = Arc::new(inner);
+        let ds = crate::datastore::replicated::ReplicatedDatastore::new(
+            handle.clone(),
+            crate::datastore::replicated::ReplicationMode::Raft {
+                node_name: "cronjob-test-node".to_string(),
+            },
+        );
+        ds.set_raft_proposer(Arc::new(InlineProposer { inner: handle }));
+        ds
+    }
 
     #[tokio::test]
     async fn test_cronjob_creates_job_when_due() {
@@ -651,6 +719,154 @@ mod tests {
         assert!(
             !jobs.items.is_empty(),
             "CronJob reconcile should create at least one Job"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_reconcile_persists_last_schedule_time_status() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Namespace",
+            None,
+            "default",
+            json!({"metadata": {"name": "default"}}),
+        )
+        .await
+        .unwrap();
+        let old_creation =
+            crate::utils::k8s_time_format(chrono::Utc::now() - chrono::Duration::minutes(2));
+
+        let cj = json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": "test-cj-status",
+                "namespace": "default",
+                "uid": "cj-uid-status",
+                "creationTimestamp": old_creation
+            },
+            "spec": {
+                "schedule": "* * * * *",
+                "concurrencyPolicy": "Allow",
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "containers": [{"name": "c", "image": "nginx"}],
+                                "restartPolicy": "Never"
+                            }
+                        }
+                    }
+                }
+            },
+            "status": {}
+        });
+
+        let created = db
+            .create_resource(
+                "batch/v1",
+                "CronJob",
+                Some("default"),
+                "test-cj-status",
+                cj.clone(),
+            )
+            .await
+            .unwrap();
+
+        reconcile_cronjob_inner(&db, None, &cj, created.resource_version)
+            .await
+            .unwrap();
+
+        let updated = db
+            .get_resource("batch/v1", "CronJob", Some("default"), "test-cj-status")
+            .await
+            .unwrap()
+            .unwrap();
+        let last_schedule_time = updated
+            .data
+            .pointer("/status/lastScheduleTime")
+            .and_then(|v| v.as_str());
+        assert!(
+            last_schedule_time.is_some_and(|value| !value.is_empty()),
+            "CronJob reconcile must persist status.lastScheduleTime so the event-driven scheduler does not re-fire the same schedule: {:?}",
+            updated.data
+        );
+        assert_eq!(
+            updated
+                .data
+                .pointer("/spec/schedule")
+                .and_then(|v| v.as_str()),
+            Some("* * * * *"),
+            "status write must preserve CronJob spec"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_reconcile_persists_last_schedule_time_through_raft_status_path() {
+        let db = make_raft_cronjob_datastore().await;
+        let old_creation =
+            crate::utils::k8s_time_format(chrono::Utc::now() - chrono::Duration::minutes(2));
+
+        let cj = json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": "test-cj-raft-status",
+                "namespace": "default",
+                "uid": "cj-uid-raft-status",
+                "creationTimestamp": old_creation
+            },
+            "spec": {
+                "schedule": "* * * * *",
+                "concurrencyPolicy": "Allow",
+                "jobTemplate": {
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "containers": [{"name": "c", "image": "nginx"}],
+                                "restartPolicy": "Never"
+                            }
+                        }
+                    }
+                }
+            },
+            "status": {}
+        });
+
+        let created = db
+            .create_resource(
+                "batch/v1",
+                "CronJob",
+                Some("default"),
+                "test-cj-raft-status",
+                cj.clone(),
+            )
+            .await
+            .unwrap();
+
+        reconcile_cronjob_inner(&db, None, &cj, created.resource_version)
+            .await
+            .unwrap();
+
+        let updated = db
+            .get_resource(
+                "batch/v1",
+                "CronJob",
+                Some("default"),
+                "test-cj-raft-status",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            updated
+                .data
+                .pointer("/status/lastScheduleTime")
+                .and_then(|v| v.as_str())
+                .is_some_and(|value| !value.is_empty()),
+            "raft-routed CronJob reconcile must persist status.lastScheduleTime: {:?}",
+            updated.data
         );
     }
 
