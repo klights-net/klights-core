@@ -1916,6 +1916,111 @@ fn test_success_policy_status_waits_for_terminating_pods_before_complete() {
 }
 
 #[tokio::test]
+async fn test_job_stale_controller_status_write_preserves_patched_condition() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let job = json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": "status-condition-job",
+            "namespace": "default",
+            "uid": "uid-status-condition-job",
+            "creationTimestamp": "2026-06-25T00:00:00Z"
+        },
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "template": {"spec": {"containers": [{"name": "worker", "image": "busybox"}]}}
+        },
+        "status": {
+            "active": 2,
+            "ready": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "conditions": [],
+            "startTime": "2026-06-25T00:00:00Z",
+            "terminating": 0
+        }
+    });
+    db.create_resource(
+        "batch/v1",
+        "Job",
+        Some("default"),
+        "status-condition-job",
+        job,
+    )
+    .await
+    .unwrap();
+
+    let stale_job_resource = db
+        .get_resource("batch/v1", "Job", Some("default"), "status-condition-job")
+        .await
+        .unwrap()
+        .unwrap();
+    let patched_status = json!({
+        "active": 2,
+        "ready": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "conditions": [{
+            "type": "CustomConditionType",
+            "status": "True",
+            "lastProbeTime": null,
+            "lastTransitionTime": "2026-06-25T05:50:49Z"
+        }],
+        "startTime": "2026-06-25T00:00:00Z",
+        "terminating": 0
+    });
+    db.update_status_only_with_preconditions(
+        "batch/v1",
+        "Job",
+        Some("default"),
+        "status-condition-job",
+        patched_status,
+        crate::datastore::ResourcePreconditions::from_resource(&stale_job_resource),
+    )
+    .await
+    .unwrap();
+
+    let stale_controller_status = json!({
+        "active": 2,
+        "ready": 2,
+        "succeeded": 0,
+        "failed": 0,
+        "conditions": [],
+        "startTime": "2026-06-25T00:00:00Z",
+        "terminating": 0
+    });
+    let stale_write = crate::controllers::common::write_status_for_resource(
+        &db,
+        &stale_job_resource,
+        &stale_controller_status,
+    )
+    .await;
+    assert!(
+        stale_write.is_err(),
+        "stale controller status write must not retry with a payload that can drop patched status conditions"
+    );
+
+    let live = db
+        .get_resource("batch/v1", "Job", Some("default"), "status-condition-job")
+        .await
+        .unwrap()
+        .unwrap();
+    let conditions = live
+        .data
+        .pointer("/status/conditions")
+        .and_then(|value| value.as_array())
+        .expect("live Job status must have conditions");
+    assert!(
+        conditions
+            .iter()
+            .any(|condition| condition["type"] == "CustomConditionType"),
+        "concurrent /status condition must survive stale controller status retry"
+    );
+}
+
+#[tokio::test]
 async fn test_job_reconcile_after_status_update_uses_current_row_resource_version() {
     let db = crate::datastore::test_support::in_memory().await;
     let job = json!({

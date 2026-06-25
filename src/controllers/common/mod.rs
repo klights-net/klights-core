@@ -344,7 +344,7 @@ pub async fn write_status<S: Serialize>(
     let namespace = metadata.get("namespace").and_then(|v| v.as_str());
     let status_value =
         serde_json::to_value(status).context("write_status: failed to serialize status payload")?;
-    let mut expected_rv = metadata
+    let expected_rv = metadata
         .get("resourceVersion")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<i64>().ok());
@@ -378,7 +378,9 @@ pub async fn write_status<S: Serialize>(
                 "write_status: resource spec or generation changed before status fast path"
             ));
         }
-        expected_rv = Some(current.resource_version);
+        return Err(status_retry_conflict(
+            "write_status: resource status changed before status fast path",
+        ));
     }
     write_status_with_retry(
         db,
@@ -405,7 +407,7 @@ pub async fn write_status_for_resource<S: Serialize>(
 ) -> Result<Resource> {
     let status_value = serde_json::to_value(status)
         .context("write_status_for_resource: failed to serialize status payload")?;
-    let mut expected_rv = Some(resource.resource_version);
+    let expected_rv = Some(resource.resource_version);
     if resource.data.get("status") == Some(&status_value)
         && let Some(current) = db
             .get_resource(
@@ -437,7 +439,9 @@ pub async fn write_status_for_resource<S: Serialize>(
                 "write_status_for_resource: resource spec or generation changed before status fast path"
             ));
         }
-        expected_rv = Some(current.resource_version);
+        return Err(status_retry_conflict(
+            "write_status_for_resource: resource status changed before status fast path",
+        ));
     }
     write_status_with_retry(
         db,
@@ -511,10 +515,17 @@ async fn write_status_with_retry(
                 else {
                     return Err(err).context("write_status: resource deleted during CAS retry");
                 };
+                if current.data.get("status") == Some(&status_value) {
+                    return Ok(current);
+                }
                 if !same_status_retry_identity(original, &current.data) {
                     return Err(err).context(
                         "write_status: resource spec or generation changed during CAS retry",
                     );
+                }
+                if current.data.get("status") != original.get("status") {
+                    return Err(err)
+                        .context("write_status: resource status changed during CAS retry");
                 }
                 expected_rv = Some(current.resource_version);
                 last_err = Some(err);
@@ -530,6 +541,10 @@ async fn write_status_with_retry(
 
 fn is_status_cas_error(err: &anyhow::Error) -> bool {
     crate::datastore::errors::is_conflict_error(err)
+}
+
+fn status_retry_conflict(message: &'static str) -> anyhow::Error {
+    crate::datastore::errors::DatastoreError::conflict(message).into()
 }
 
 fn same_status_retry_identity(original: &Value, current: &Value) -> bool {

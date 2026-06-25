@@ -596,7 +596,7 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn test_write_status_retries_stale_snapshot_after_status_only_overlap() {
+    async fn test_write_status_rejects_stale_snapshot_after_status_only_overlap() {
         let db = Datastore::new_in_memory().await.unwrap();
         let created = db
             .create_resource(
@@ -635,13 +635,24 @@ mod cases {
             &json!({"availableReplicas": 0, "observedGeneration": 2}),
         )
         .await;
-        let updated = stale_write.expect("stale status-only overlap must retry");
-        assert_eq!(updated.data["status"]["availableReplicas"], 0);
-        assert_eq!(updated.data["status"]["observedGeneration"], 2);
+        let err =
+            stale_write.expect_err("stale status-only overlap must not overwrite live status");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected status conflict, got {err:#}"
+        );
+
+        let live = db
+            .get_resource("apps/v1", "Deployment", Some("default"), "dep-stale")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.data["status"]["availableReplicas"], 1);
+        assert!(live.data["status"].get("observedGeneration").is_none());
     }
 
     #[tokio::test]
-    async fn test_write_status_for_resource_retries_stale_snapshot_after_status_only_overlap() {
+    async fn test_write_status_for_resource_rejects_stale_snapshot_after_status_only_overlap() {
         let db = Datastore::new_in_memory().await.unwrap();
         let created = db
             .create_resource(
@@ -675,9 +686,20 @@ mod cases {
             &json!({"readyReplicas": 0, "observedGeneration": 2}),
         )
         .await;
-        let updated = stale_write.expect("stale status-only overlap must retry");
-        assert_eq!(updated.data["status"]["readyReplicas"], 0);
-        assert_eq!(updated.data["status"]["observedGeneration"], 2);
+        let err =
+            stale_write.expect_err("stale status-only overlap must not overwrite live status");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected status conflict, got {err:#}"
+        );
+
+        let live = db
+            .get_resource("apps/v1", "ReplicaSet", Some("default"), "rs-stale")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.data["status"]["readyReplicas"], 1);
+        assert!(live.data["status"].get("observedGeneration").is_none());
     }
 
     #[tokio::test]
@@ -747,7 +769,7 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn test_write_status_updates_live_status_when_desired_matches_stale_snapshot() {
+    async fn test_write_status_rejects_when_desired_matches_stale_snapshot_after_status_overlap() {
         let db = Datastore::new_in_memory().await.unwrap();
         let created = db
             .create_resource(
@@ -780,19 +802,34 @@ mod cases {
         .await
         .expect("concurrent status writer must advance live status");
 
-        let updated = write_status(
+        let stale_write = write_status(
             &db as &dyn DatastoreBackend,
             &stale_snapshot,
             &json!({"availableReplicas": 0}),
         )
-        .await
-        .expect("stale unchanged snapshot status must still correct live status");
+        .await;
+        let err = stale_write
+            .expect_err("stale unchanged snapshot status must not overwrite live status");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected status conflict, got {err:#}"
+        );
 
-        assert_eq!(updated.data["status"]["availableReplicas"], 0);
+        let live = db
+            .get_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "dep-stale-unchanged",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.data["status"]["availableReplicas"], 1);
     }
 
     #[tokio::test]
-    async fn test_write_status_for_resource_updates_live_status_when_desired_matches_stale_snapshot()
+    async fn test_write_status_for_resource_rejects_when_desired_matches_stale_snapshot_after_status_overlap()
      {
         let db = Datastore::new_in_memory().await.unwrap();
         let created = db
@@ -821,15 +858,30 @@ mod cases {
         .await
         .expect("concurrent status writer must advance live status");
 
-        let updated = write_status_for_resource(
+        let stale_write = write_status_for_resource(
             &db as &dyn DatastoreBackend,
             &created,
             &json!({"readyReplicas": 0}),
         )
-        .await
-        .expect("stale unchanged resource status must still correct live status");
+        .await;
+        let err = stale_write
+            .expect_err("stale unchanged resource status must not overwrite live status");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected status conflict, got {err:#}"
+        );
 
-        assert_eq!(updated.data["status"]["readyReplicas"], 0);
+        let live = db
+            .get_resource(
+                "apps/v1",
+                "ReplicaSet",
+                Some("default"),
+                "rs-stale-unchanged",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.data["status"]["readyReplicas"], 1);
     }
 
     #[tokio::test]
