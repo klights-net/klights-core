@@ -363,11 +363,20 @@ async fn transactional_worker_node_status_ignores_stale_rv_and_updates_commit() 
                     "unschedulable": false
                 },
                 "status": {
-                    "conditions": [{
-                        "type": "Ready",
-                        "status": "Unknown",
-                        "reason": "NodeStatusUnknown"
-                    }]
+                    "conditions": [
+                        {
+                            "type": "Ready",
+                            "status": "False",
+                            "reason": "NetworkUnavailable",
+                            "lastTransitionTime": "2026-06-19T07:44:56Z"
+                        },
+                        {
+                            "type": "NetworkUnavailable",
+                            "status": "True",
+                            "reason": "DataplaneNotReady",
+                            "lastTransitionTime": "2026-06-19T07:44:56Z"
+                        }
+                    ]
                 }
             }),
         )
@@ -386,22 +395,34 @@ async fn transactional_worker_node_status_ignores_stale_rv_and_updates_commit() 
     .await
     .expect("leader updates node");
 
-    let mut stale_worker_node = (*created.data).clone();
-    stale_worker_node["metadata"]["annotations"]["klights.io/git-commit"] =
-        serde_json::json!("20309897");
-    stale_worker_node["status"]["conditions"] = serde_json::json!([{
-        "type": "Ready",
-        "status": "True",
-        "reason": "KubeletReady"
-    }]);
-    let payload = encode_outbox_command(StorageCommand::UpdateResource {
+    let worker_status = serde_json::json!({
+        "conditions": [
+            {
+                "type": "Ready",
+                "status": "True",
+                "reason": "KubeletReady",
+                "lastTransitionTime": "2026-06-19T07:44:57Z"
+            },
+            {
+                "type": "NetworkUnavailable",
+                "status": "False",
+                "reason": "RouteCreated",
+                "lastTransitionTime": "2026-06-19T07:44:57Z"
+            }
+        ]
+    });
+    let payload = encode_outbox_command(StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Node".to_string(),
         namespace: None,
         name: "local-worker".to_string(),
-        data: stale_worker_node,
-        expected_rv: created.resource_version,
-        preconditions: ResourcePreconditions::from_resource(&created),
+        status: worker_status,
+        expected_rv: None,
+        preconditions: ResourcePreconditions {
+            uid: Some(created.uid.clone()),
+            resource_version: None,
+        },
+        observed_status_stamp: None,
     });
 
     let result = apply_outbox_transactionally(
@@ -425,12 +446,137 @@ async fn transactional_worker_node_status_ignores_stale_rv_and_updates_commit() 
             .data
             .pointer("/metadata/annotations/klights.io~1git-commit")
             .and_then(|v| v.as_str()),
-        Some("20309897")
+        Some("380f96e1"),
+        "status-only NodeStatus must not mutate metadata"
     );
     assert_eq!(
         stored.data.pointer("/spec/unschedulable"),
         Some(&serde_json::json!(true)),
         "leader-owned spec fields must not be rolled back by stale worker NodeStatus"
+    );
+    assert_eq!(
+        stored
+            .data
+            .pointer("/status/conditions")
+            .and_then(|v| v.as_array())
+            .and_then(|conditions| {
+                conditions.iter().find_map(|condition| {
+                    (condition.get("type").and_then(|v| v.as_str()) == Some("Ready"))
+                        .then(|| condition.get("status").and_then(|v| v.as_str()))
+                        .flatten()
+                })
+            }),
+        Some("True"),
+        "worker NodeStatus must update status conditions through raft apply"
+    );
+    assert_eq!(
+        stored
+            .data
+            .pointer("/status/conditions")
+            .and_then(|v| v.as_array())
+            .and_then(|conditions| {
+                conditions.iter().find_map(|condition| {
+                    (condition.get("type").and_then(|v| v.as_str()) == Some("NetworkUnavailable"))
+                        .then(|| condition.get("status").and_then(|v| v.as_str()))
+                        .flatten()
+                })
+            }),
+        Some("False"),
+        "worker NodeStatus must update the paired NetworkUnavailable condition"
+    );
+}
+
+#[tokio::test]
+async fn transactional_worker_node_status_preserves_newer_leader_unknown_condition() {
+    let db = Arc::new(crate::datastore::test_support::in_memory().await);
+    let created = db
+        .create_resource(
+            "v1",
+            "Node",
+            None,
+            "local-worker",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {
+                    "name": "local-worker",
+                    "uid": "node-uid-1"
+                },
+                "status": {
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "KubeletReady",
+                        "lastTransitionTime": "2026-06-18T10:00:00Z"
+                    }]
+                }
+            }),
+        )
+        .await
+        .expect("create node");
+
+    db.update_status_only_with_preconditions(
+        "v1",
+        "Node",
+        None,
+        "local-worker",
+        serde_json::json!({
+            "conditions": [{
+                "type": "Ready",
+                "status": "Unknown",
+                "reason": "NodeStatusUnknown",
+                "lastTransitionTime": "2026-06-18T11:00:00Z"
+            }]
+        }),
+        ResourcePreconditions::from_resource(&created),
+    )
+    .await
+    .expect("leader marks node unknown");
+
+    let payload = encode_outbox_command(StorageCommand::UpdateStatus {
+        api_version: "v1".to_string(),
+        kind: "Node".to_string(),
+        namespace: None,
+        name: "local-worker".to_string(),
+        status: serde_json::json!({
+            "conditions": [{
+                "type": "Ready",
+                "status": "True",
+                "reason": "KubeletReady",
+                "lastTransitionTime": "2026-06-18T10:00:00Z"
+            }]
+        }),
+        expected_rv: None,
+        preconditions: ResourcePreconditions {
+            uid: Some(created.uid.clone()),
+            resource_version: None,
+        },
+        observed_status_stamp: None,
+    });
+
+    let result = apply_outbox_transactionally(
+        db.as_ref(),
+        "node-status-stale-condition-key",
+        OutboxOperation::NodeStatus,
+        &payload,
+        "local-worker",
+    )
+    .await
+    .expect("stale-RV NodeStatus should apply without clobbering fresher conditions");
+    assert!(matches!(result, OutboxApplyResult::Applied { .. }));
+
+    let stored = db
+        .get_resource("v1", "Node", None, "local-worker")
+        .await
+        .expect("get node")
+        .expect("node exists");
+    assert_eq!(
+        stored
+            .data
+            .pointer("/status/conditions/0/status")
+            .and_then(|v| v.as_str()),
+        Some("Unknown"),
+        "a stale worker Ready=True snapshot must not overwrite a fresher leader Unknown"
     );
 }
 

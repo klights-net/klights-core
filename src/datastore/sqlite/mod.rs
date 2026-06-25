@@ -1067,6 +1067,9 @@ impl Datastore {
                         crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
                     );
                 }
+                if api_version == "v1" && kind == "Node" && namespace.is_none() {
+                    crate::kubelet::node::merge_node_status_for_update(&mut next_status, &live);
+                }
                 live["status"] = next_status;
                 ensure_resource_type_meta(&mut live, &api_version, &kind);
                 let uid = ensure_metadata_uid(&mut live);

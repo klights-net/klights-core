@@ -248,6 +248,15 @@ pub async fn apply_forwarded_command(
                     owner,
                 );
             }
+            if api_version == "v1"
+                && kind == "Node"
+                && namespace.is_none()
+                && let Some(current) = db
+                    .get_resource(&api_version, &kind, namespace.as_deref(), &name)
+                    .await?
+            {
+                crate::kubelet::node::merge_node_status_for_update(&mut status, &current.data);
+            }
             let mut preconditions = preconditions;
             if preconditions.resource_version.is_none() {
                 preconditions.resource_version = expected_rv;

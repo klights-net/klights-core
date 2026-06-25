@@ -405,6 +405,13 @@ where
                     owner,
                 );
             }
+            if api_version == "v1"
+                && kind == "Node"
+                && namespace.is_none()
+                && let Some(current) = current.as_ref()
+            {
+                crate::kubelet::node::merge_node_status_for_update(&mut status, &current.data);
+            }
             backend
                 .update_status_only_with_preconditions(
                     &api_version,

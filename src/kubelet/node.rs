@@ -268,31 +268,42 @@ pub async fn refresh_node_network_conditions(
     };
     let conditions = NodeNetworkConditions::from_health(Some(dataplane_health));
     let mut node = existing.data.as_ref().clone();
-    let mut changed = stamp_current_git_commit_annotation(&mut node);
-    changed |= apply_network_conditions(&mut node, &conditions);
-    if !changed {
-        return Ok(NodeNetworkRefreshResult::Unchanged);
-    }
+    let commit_changed = stamp_current_git_commit_annotation(&mut node);
+    let status_changed = apply_network_conditions(&mut node, &conditions);
 
     if let Some(outbox) = outbox {
+        if !status_changed {
+            return Ok(NodeNetworkRefreshResult::Unchanged);
+        }
+        let status = node
+            .get("status")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
         send_node_command(
             Some(outbox),
             OutboxOperation::NodeStatus,
             node_name,
             existing.uid.as_str(),
-            StorageCommand::UpdateResource {
+            StorageCommand::UpdateStatus {
                 api_version: "v1".to_string(),
                 kind: "Node".to_string(),
                 namespace: None,
                 name: node_name.to_string(),
-                data: node,
-                expected_rv: existing.resource_version,
-                preconditions: ResourcePreconditions::from_resource(&existing),
+                status,
+                expected_rv: None,
+                preconditions: ResourcePreconditions {
+                    uid: Some(existing.uid.clone()),
+                    resource_version: None,
+                },
+                observed_status_stamp: None,
             },
         )
         .await
         .context("Failed to enqueue Node network condition refresh")?;
     } else {
+        if !(commit_changed || status_changed) {
+            return Ok(NodeNetworkRefreshResult::Unchanged);
+        }
         db.update_resource_with_preconditions(
             "v1",
             "Node",
@@ -1153,6 +1164,20 @@ pub fn merge_existing_node_mutable_fields(
     // time and loses, while a genuine recovery transition (Unknown->True)
     // stamps a newer time and wins.
     merge_node_status_conditions(desired, existing);
+}
+
+/// Merge an incoming Node `/status` update with the live Node's co-authored
+/// conditions, preserving fresher leader transitions while allowing newer
+/// worker dataplane recovery transitions to apply.
+pub fn merge_node_status_for_update(
+    incoming_status: &mut serde_json::Value,
+    existing: &serde_json::Value,
+) {
+    let mut desired = serde_json::json!({ "status": incoming_status.clone() });
+    merge_node_status_conditions(&mut desired, existing);
+    if let Some(status) = desired.get("status").cloned() {
+        *incoming_status = status;
+    }
 }
 
 fn preserve_existing_network_conditions(
