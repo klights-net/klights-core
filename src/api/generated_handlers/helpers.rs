@@ -183,22 +183,15 @@ pub async fn maybe_reconcile_service_after_controller_endpointslice_delete(
         return Ok(());
     }
 
-    let service_uid = service
-        .data
-        .pointer("/metadata/uid")
-        .and_then(|uid| uid.as_str())
-        .unwrap_or("");
-
-    crate::controllers::endpoints::reconcile_endpointslice(
-        state.db.as_ref(),
-        state.pod_repository.as_ref(),
-        service_name,
-        service_uid,
-        namespace,
-        spec.and_then(|s| s.get("selector")),
-        spec.and_then(|s| s.get("ports")),
-    )
-    .await?;
+    state
+        .controller_dispatcher
+        .enqueue_reconcile_key(crate::controllers::workqueue::ReconcileKey::namespaced(
+            "v1",
+            "Service",
+            namespace,
+            service_name,
+        ))
+        .await;
 
     Ok(())
 }

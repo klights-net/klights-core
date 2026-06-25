@@ -491,7 +491,7 @@ async fn test_list_all_statefulsets_table_includes_ready_and_age_columns() {
 }
 
 #[tokio::test]
-async fn test_delete_controller_managed_endpointslice_recreates_from_service() {
+async fn test_delete_controller_managed_endpointslice_queues_service_reconcile() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
@@ -499,6 +499,7 @@ async fn test_delete_controller_managed_endpointslice_recreates_from_service() {
     let state = build_test_app_state().await;
     let db = state.db.clone();
     let pod_repository = state.pod_repository.clone();
+    let controller_dispatcher = state.controller_dispatcher.clone();
     let app = crate::api::build_router(state);
 
     db.create_resource(
@@ -609,6 +610,47 @@ async fn test_delete_controller_managed_endpointslice_recreates_from_service() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
+    let keys = controller_dispatcher.queued_reconcile_keys_for_test().await;
+    assert_eq!(
+        keys,
+        vec![crate::controllers::workqueue::ReconcileKey::namespaced(
+            "v1", "Service", "default", "example"
+        )],
+        "EndpointSlice delete must queue the owning Service instead of reconciling inline"
+    );
+
+    let slices = db
+        .list_resources(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            crate::datastore::ResourceListQuery::new(
+                Some("kubernetes.io/service-name=example"),
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        slices.items.len(),
+        1,
+        "the DELETE response path must not recreate controller-managed EndpointSlices inline"
+    );
+
+    let queued_key = controller_dispatcher.take_reconcile_key_for_test().await;
+    assert_eq!(
+        queued_key,
+        crate::controllers::workqueue::ReconcileKey::namespaced(
+            "v1", "Service", "default", "example"
+        )
+    );
+    controller_dispatcher
+        .reconcile(&service.data, &db, "test-node")
+        .await
+        .unwrap();
+
     let slices = db
         .list_resources(
             "discovery.k8s.io/v1",
@@ -626,7 +668,7 @@ async fn test_delete_controller_managed_endpointslice_recreates_from_service() {
     assert_eq!(
         slices.items.len(),
         2,
-        "deleting a controller-managed EndpointSlice must converge back to the Service's desired slices"
+        "queued Service reconciliation must converge back to the Service's desired slices"
     );
 }
 
