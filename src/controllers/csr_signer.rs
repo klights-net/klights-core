@@ -230,7 +230,7 @@ async fn update_csr_with_certificate(
         return Ok(());
     }
 
-    let mut csr = Arc::unwrap_or_clone(existing.data);
+    let csr = Arc::unwrap_or_clone(existing.data);
     if has_deletion_timestamp(&csr) || !is_csr_pending(&csr) {
         return Ok(());
     }
@@ -264,17 +264,17 @@ async fn update_csr_with_certificate(
     use base64::Engine;
     let cert_b64 = base64::engine::general_purpose::STANDARD.encode(certificate_pem.as_bytes());
 
-    csr["status"] = serde_json::json!({
+    let status = serde_json::json!({
         "certificate": cert_b64,
         "conditions": conditions,
     });
 
-    db.update_resource_with_preconditions(
+    db.update_status_only_with_preconditions(
         API_VERSION,
         KIND,
         None,
         csr_name,
-        csr,
+        status,
         crate::datastore::ResourcePreconditions {
             resource_version: Some(resource_version),
             uid: Some(uid.to_string()),
@@ -289,6 +289,7 @@ async fn update_csr_with_certificate(
 mod tests {
     use super::*;
     use crate::auth::csr_signer::RecordingCsrSigner;
+    use async_trait::async_trait;
     use base64::Engine;
     use serde_json::json;
 
@@ -296,6 +297,75 @@ mod tests {
         db: &crate::datastore::sqlite::Datastore,
     ) -> crate::datastore::backend::DatastoreHandle {
         Arc::new(db.clone()) as crate::datastore::backend::DatastoreHandle
+    }
+
+    async fn raft_handle() -> crate::datastore::backend::DatastoreHandle {
+        use crate::datastore::backend::DatastoreHandle;
+        use crate::datastore::command::StorageCommand;
+        use crate::datastore::replicated::{RaftProposer, ReplicatedDatastore, ReplicationMode};
+
+        struct InlineProposer {
+            inner: DatastoreHandle,
+        }
+
+        #[async_trait]
+        impl RaftProposer for InlineProposer {
+            async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+                let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                    .encode_protobuf()?;
+                let key = format!("csr-signer-test-{}", uuid::Uuid::new_v4());
+                crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                    self.inner.as_ref(),
+                    &key,
+                    crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
+                    bytes::Bytes::from(payload),
+                    "csr-signer-test",
+                )
+                .await
+                .map_err(|err| anyhow::anyhow!("inline raft propose failed: {err}"))?;
+                Ok(())
+            }
+
+            async fn propose_outbox_command(
+                &self,
+                idempotency_key: &str,
+                operation: &str,
+                command: StorageCommand,
+                authoring_node: &str,
+            ) -> std::result::Result<
+                crate::kubelet::outbox::OutboxApplyResult,
+                crate::kubelet::outbox::OutboxApplyError,
+            > {
+                let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                    .encode_protobuf()
+                    .map_err(|err| {
+                        crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                    })?;
+                let operation =
+                    crate::kubelet::outbox::payload::OutboxOperation::try_from(operation).map_err(
+                        |err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()),
+                    )?;
+                crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                    self.inner.as_ref(),
+                    idempotency_key,
+                    operation,
+                    bytes::Bytes::from(payload),
+                    authoring_node,
+                )
+                .await
+                .map(|outcome| outcome.result)
+            }
+        }
+
+        let inner: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let ds = ReplicatedDatastore::new(
+            inner.clone(),
+            ReplicationMode::Raft {
+                node_name: "test-node".to_string(),
+            },
+        );
+        ds.set_raft_proposer(Arc::new(InlineProposer { inner }));
+        Arc::new(ds)
     }
 
     fn valid_csr_json() -> serde_json::Value {
@@ -421,6 +491,43 @@ mod tests {
         let approved = conditions.iter().find(|c| c["type"] == "Approved");
         assert!(approved.is_some());
         assert_eq!(approved.unwrap()["status"], "True");
+    }
+
+    #[tokio::test]
+    async fn valid_csr_is_signed_and_status_updated_through_raft_backend() {
+        let handle = raft_handle().await;
+
+        let csr = valid_csr_json();
+        handle
+            .create_resource(API_VERSION, KIND, None, "csr-tokyo", csr.clone())
+            .await
+            .unwrap();
+
+        let signer = Arc::new(RecordingCsrSigner::new());
+        let controller = CsrSignerController::new(signer.clone());
+        let ctx = Context::new(handle.clone(), "test-node".to_string());
+
+        controller.reconcile(csr, ctx).await.unwrap();
+
+        assert_eq!(signer.request_count(), 1);
+        let updated = handle
+            .get_resource(API_VERSION, KIND, None, "csr-tokyo")
+            .await
+            .unwrap()
+            .expect("CSR should exist");
+        let cert_b64 = updated
+            .data
+            .pointer("/status/certificate")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let cert_bytes = base64::engine::general_purpose::STANDARD
+            .decode(cert_b64)
+            .expect("certificate should be base64-encoded");
+        let cert_str = std::str::from_utf8(&cert_bytes).unwrap();
+        assert!(
+            cert_str.contains("CERTIFICATE"),
+            "raft-routed CSR signing must persist status.certificate"
+        );
     }
 
     #[tokio::test]
