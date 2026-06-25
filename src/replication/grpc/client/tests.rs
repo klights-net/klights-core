@@ -2156,4 +2156,50 @@ mod cases {
         );
         handle.abort();
     }
+
+    #[tokio::test]
+    async fn try_set_tcp_congestion_bbr_is_infallible_on_a_real_socket() {
+        // The BBR tuning helper must never propagate an error regardless of
+        // whether the host kernel exposes BBR (latency-fix.md Task 2): on a
+        // BBR-less kernel it logs at debug and returns; on a BBR kernel it
+        // sets the algorithm. Either way the caller is unaffected.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Mirrors the connector order: nodelay first, then the BBR helper.
+        assert!(stream.set_nodelay(true).is_ok());
+        super::super::try_set_tcp_congestion_bbr(&stream);
+        // Reaching here means the helper neither panicked nor tore down the
+        // socket; the connector invokes it immediately after set_nodelay.
+        assert!(stream.nodelay().unwrap());
+    }
+
+    #[tokio::test]
+    async fn observed_peer_connector_sets_nodelay_then_bbr_without_failing() {
+        use tonic::transport::Uri;
+        use tower::Service as _;
+
+        // A bound, listening socket completes the TCP handshake from the
+        // kernel listen queue without the test ever calling accept(), so
+        // connect + the connector's stream setup (set_nodelay -> BBR helper)
+        // complete end-to-end.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let observed = Arc::new(std::sync::Mutex::new(None::<String>));
+        let mut connector = super::super::ObservedPeerTcpConnector::new(observed.clone());
+        let uri: Uri = format!("http://{addr}").parse().unwrap();
+        connector
+            .call(uri)
+            .await
+            .expect("connector stream setup (set_nodelay + bbr tuning) must succeed");
+        // observed_peer_ip is recorded *after* set_nodelay and the BBR helper,
+        // so a populated peer IP proves the full stream-setup path ran without
+        // taking the connection down.
+        assert_eq!(
+            *observed.lock().unwrap(),
+            Some("127.0.0.1".to_string()),
+            "connector must record the peer IP after stream setup"
+        );
+    }
 }

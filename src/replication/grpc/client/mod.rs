@@ -799,6 +799,7 @@ impl Service<Uri> for ObservedPeerTcpConnector {
             })?;
             let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
             stream.set_nodelay(true)?;
+            try_set_tcp_congestion_bbr(&stream);
             if let Ok(peer_addr) = stream.peer_addr()
                 && let Ok(mut guard) = observed_peer_ip.lock()
             {
@@ -808,6 +809,48 @@ impl Service<Uri> for ObservedPeerTcpConnector {
         })
     }
 }
+
+/// Best-effort: prefer BBR for inter-node gRPC TCP sockets on Linux.
+///
+/// BBR tolerates the lossy multinode harness (and real WANs) far better than
+/// the default CUBIC, whose congestion window collapses under the ~0.5% loss
+/// profile and widens the raft-commit window that the OCC refactor narrowed
+/// (latency-fix.md Task 2 / Phase A). This must never fail the connection: if
+/// the kernel lacks BBR (older kernels, a restricted netns, or a container
+/// without the module) `setsockopt` returns `ENOENT`/`ENOPROTOOPT`, swallowed
+/// at debug level — startup must not depend on host sysctl state. This mirrors
+/// `set_nodelay`-style socket tuning and performs no blocking I/O.
+#[cfg(target_os = "linux")]
+fn try_set_tcp_congestion_bbr(stream: &tokio::net::TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let algo = b"bbr";
+    // SAFETY: `setsockopt` with `IPPROTO_TCP`/`TCP_CONGESTION` reads a short
+    // NUL-free algorithm-name buffer (`b"bbr"`, 3 bytes) of the given length
+    // and writes nothing back. `fd` is a live, owned `TcpStream` for the
+    // duration of this call, and the static buffer outlives it. This is the
+    // same non-blocking kernel path used by socket tuning such as
+    // `set_nodelay`; it performs no I/O.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            algo.as_ptr() as *const libc::c_void,
+            algo.len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::debug!(
+            error = %std::io::Error::last_os_error(),
+            "could not set TCP_CONGESTION=bbr on inter-node socket; staying on kernel default"
+        );
+    }
+}
+
+/// Non-Linux fallback: BBR socket tuning is Linux-specific; no-op elsewhere.
+#[cfg(not(target_os = "linux"))]
+fn try_set_tcp_congestion_bbr(_stream: &tokio::net::TcpStream) {}
 
 impl ReplicationGrpcClient {
     pub fn new(
