@@ -820,7 +820,8 @@ impl OutboxDispatcher {
                         tracing::warn!(pod_uid = %row.pod_uid, error = %err, "delete checkpoint failed");
                     }
                 } else {
-                    let backoff_until_ms = now_ms.saturating_add(backoff_ms(row.attempt));
+                    let backoff_until_ms = now_ms
+                        .saturating_add(jittered_backoff_ms(row.attempt, &row.idempotency_key));
                     if let Err(err) = self
                         .node_db
                         .mark_outbox_attempt_failed(row.id, lease_token, backoff_until_ms, &err)
@@ -920,6 +921,31 @@ fn backoff_ms(attempt: i64) -> i64 {
     5_000_i64
         .saturating_mul(attempt.saturating_add(1).max(1))
         .min(MAX_BACKOFF_MS)
+}
+
+fn jittered_backoff_ms(attempt: i64, idempotency_key: &str) -> i64 {
+    let base = backoff_ms(attempt);
+    let window = (base / 5).clamp(1, 1_000);
+    let jitter = deterministic_jitter_ms(idempotency_key, attempt, window);
+    if base >= MAX_BACKOFF_MS {
+        base.saturating_sub(jitter)
+    } else {
+        base.saturating_add(jitter).min(MAX_BACKOFF_MS)
+    }
+}
+
+fn deterministic_jitter_ms(idempotency_key: &str, attempt: i64, window_ms: i64) -> i64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in idempotency_key
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(attempt.to_le_bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash % (window_ms.max(0) as u64 + 1)) as i64
 }
 
 fn outbox_operation_records_pod_status_checkpoint(operation: OutboxOperation) -> bool {
@@ -1269,8 +1295,17 @@ mod tests {
             DispatchOutcome::Dispatched
         );
 
-        // The row is backed off; advance past the backoff and redeliver.
-        let after_backoff = 20 + super::backoff_ms(0) + 1;
+        // The row is backed off with bounded jitter; advance to the actual wake and redeliver.
+        let after_backoff = node_db
+            .next_outbox_wake_ms(20)
+            .await
+            .expect("read next jittered wake")
+            .expect("retry wake exists");
+        assert!(
+            (20 + super::backoff_ms(0)..=20 + super::backoff_ms(0) + 1_000)
+                .contains(&after_backoff),
+            "retry wake must stay inside the first-attempt jitter window: {after_backoff}"
+        );
         assert_eq!(
             dispatcher
                 .dispatch_due_once(after_backoff)
@@ -1708,11 +1743,15 @@ mod tests {
             dispatcher.dispatch_due_once(1_000).await.expect("dispatch"),
             DispatchOutcome::Dispatched
         );
-        assert_eq!(
-            dispatcher.dispatch_due_once(1_100).await.expect("dispatch"),
+        let next_retry = match dispatcher.dispatch_due_once(1_100).await.expect("dispatch") {
             DispatchOutcome::Idle {
-                next_wake_ms: Some(6_000)
-            }
+                next_wake_ms: Some(next),
+            } => next,
+            other => panic!("expected idle retry wake, got {other:?}"),
+        };
+        assert!(
+            (6_000..=7_000).contains(&next_retry),
+            "retry wake must stay inside the first-attempt jitter window: {next_retry}"
         );
 
         client
@@ -1722,15 +1761,86 @@ mod tests {
             }))
             .await;
         assert_eq!(
-            dispatcher.dispatch_due_once(6_000).await.expect("dispatch"),
+            dispatcher
+                .dispatch_due_once(next_retry)
+                .await
+                .expect("dispatch"),
             DispatchOutcome::Dispatched
         );
         assert!(
             node_db
-                .claim_next_due_outbox(6_000, 1_000, "assert-empty")
+                .claim_next_due_outbox(next_retry, 1_000, "assert-empty")
                 .await
                 .expect("claim after terminal drop")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_errors_jitter_backoff_to_avoid_synchronized_retry_storm() {
+        let node_db = node_db().await;
+        let outbox = Outbox::new(node_db.clone());
+        let client = Arc::new(FakeApplyClient::default());
+        let dispatcher =
+            OutboxDispatcher::batch_mode_for_tests(node_db.clone(), client.clone(), 16);
+        let now = 1_000;
+
+        for i in 0..8 {
+            client
+                .push_response(Err(OutboxApplyError::Retryable(
+                    "raft proposal flow control saturated".into(),
+                )))
+                .await;
+            let pod_name = format!("storm-{i}");
+            let pod_uid = format!("uid-storm-{i}");
+            outbox
+                .enqueue_command(OutboxCommand::new(
+                    format!("retry-storm-{i}"),
+                    OutboxOperation::PodStatus,
+                    OutboxSubject::new(
+                        format!("v1/Pod/default/{pod_name}/{pod_uid}"),
+                        Some("default".to_string()),
+                        pod_name.clone(),
+                        Some(pod_uid.clone()),
+                    ),
+                    &pod_uid,
+                    pod_status_command("default", &pod_name, &pod_uid),
+                    now,
+                ))
+                .await
+                .expect("enqueue retry storm row");
+        }
+
+        assert_eq!(
+            dispatcher.dispatch_due_once(now).await.expect("dispatch"),
+            DispatchOutcome::Dispatched
+        );
+
+        let mut next_due_times = Vec::new();
+        while let Some(row) = node_db
+            .claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect-jitter")
+            .await
+            .expect("claim retry row")
+        {
+            next_due_times.push(row.next_due_ms);
+            node_db
+                .complete_outbox(row.id, row.lease_token.as_deref().expect("lease token"))
+                .await
+                .expect("complete inspected row");
+        }
+
+        assert_eq!(next_due_times.len(), 8);
+        let unique: HashSet<i64> = next_due_times.iter().copied().collect();
+        assert!(
+            unique.len() > 1,
+            "retryable rows must not all re-fire at the same millisecond: {next_due_times:?}"
+        );
+        assert!(
+            next_due_times
+                .iter()
+                .all(|due| *due >= now + super::backoff_ms(0)
+                    && *due <= now + super::backoff_ms(0) + 1_000),
+            "first retry jitter must stay inside the bounded one-second window: {next_due_times:?}"
         );
     }
 

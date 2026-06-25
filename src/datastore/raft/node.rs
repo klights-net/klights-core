@@ -27,10 +27,9 @@ use crate::datastore::raft::network::{LeaderForwarder, StubRaftNetwork};
 use crate::datastore::raft::state_machine_impl::SqliteRaftStateMachine;
 use crate::datastore::raft::types::{NodeId, RaftShape, StorageCommandPayload, TypeConfig};
 
-/// Lossy-link transport sizing (finding.md H3). max_payload_entries=3 matches the
-/// 3-permit flow-control gate so a single AppendEntries retry cannot resend a
-/// logical batch larger than the in-flight bound. Lifted to module scope so the
-/// closing-gate test can assert on the actual configured value (not a copy).
+/// Lossy-link transport sizing (finding.md H3). `max_payload_entries=3` keeps
+/// each AppendEntries retry small. Raft proposal flow control uses those three
+/// general permits plus one reserved control-critical outbox permit.
 pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 3;
 
 pub struct RaftNode {
@@ -49,7 +48,8 @@ pub struct RaftNode {
     /// T1.4: node name used by `build_log_apply_commit_for_outbox` to
     /// stamp the authoring node on the resulting commit.
     authoring_node: String,
-    /// Flow-control gate: at most 3 proposals may be in flight simultaneously.
+    /// Flow-control gate: at most 3 general proposals plus one reserved
+    /// control-critical outbox proposal may be in flight simultaneously.
     /// A permit is acquired BEFORE build_log_apply_commit_for_outbox reserves
     /// the next resourceVersion so the leader cannot build an unacknowledged
     /// RV backlog ahead of raft progress under loss (finding.md flow-control plan).
@@ -619,9 +619,21 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
                 err.to_string(),
             ));
         }
-        // Match `propose_command`: hold a flow-control permit before the builder can
-        // reserve a resourceVersion for the materialized raft commit.
-        let _flow_permit = self.flow_control.acquire().await;
+        // Outbox writes are durable and retryable. This includes worker status
+        // dispatch and leader-side controller status paths routed through
+        // propose_outbox_on_backend. Under WAN loss they must not sit behind
+        // user-facing API writes in the fair proposal queue until the gRPC
+        // deadline; shed load quickly and let the caller's outbox/reconcile retry.
+        let flow_permit = if outbox_operation_uses_priority_permit(operation) {
+            self.flow_control.try_acquire_priority()
+        } else {
+            self.flow_control.try_acquire()
+        };
+        let Some(_flow_permit) = flow_permit else {
+            return Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+                "raft proposal flow control saturated; retry outbox later".to_string(),
+            ));
+        };
         let payload_bytes = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
             .map_err(|err| {
@@ -707,6 +719,16 @@ fn derive_operation_label(
         StorageCommand::UpdateStatus { kind, .. } if kind == "Lease" => OutboxOperation::LeaseRenew,
         _ => OutboxOperation::PodStatus,
     }
+}
+
+fn outbox_operation_uses_priority_permit(operation: &str) -> bool {
+    use crate::kubelet::outbox::payload::OutboxOperation;
+    matches!(
+        OutboxOperation::try_from(operation),
+        Ok(OutboxOperation::NodeRegistration)
+            | Ok(OutboxOperation::NodeDataplane)
+            | Ok(OutboxOperation::NodeStatus)
+    )
 }
 
 /// Adapter that wraps a `RaftNode` so the gRPC layer can dispatch
@@ -2405,6 +2427,28 @@ mod tests {
         }
     }
 
+    fn propose_node_registration_command(
+        node_name: &str,
+        uid: &str,
+    ) -> crate::datastore::command::StorageCommand {
+        crate::datastore::command::StorageCommand::CreateResource {
+            api_version: "v1".into(),
+            kind: "Node".into(),
+            namespace: None,
+            name: node_name.to_string(),
+            data: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {
+                    "name": node_name,
+                    "uid": uid
+                },
+                "spec": {},
+                "status": {}
+            }),
+        }
+    }
+
     /// Integration test: while all 3 flow-control permits are externally held, a call to
     /// `propose_command` must BLOCK on permit acquire — it must not reserve a
     /// resourceVersion via `build_log_apply_commit_for_outbox` until a permit is released.
@@ -2462,12 +2506,12 @@ mod tests {
     }
 
     /// The outbox proposer path preserves a caller-provided idempotency key, but it
-    /// still materializes a `LogApplyCommit` and reserves a resourceVersion. It must
-    /// share the same flow-control gate as `propose_command`, acquired before RV
-    /// reservation, or worker outbox dispatch can build an unbounded backlog under
-    /// packet loss.
+    /// must not queue behind the same fair flow-control gate as API writes. Retryable
+    /// outbox writes include worker status dispatch and leader-side controller status
+    /// paths; under packet loss they should shed load quickly instead of holding a
+    /// gRPC lane until the client deadline and starving user-facing writes.
     #[tokio::test]
-    async fn raft_outbox_proposal_permit_is_acquired_before_resource_version_reservation() {
+    async fn raft_outbox_proposal_fails_fast_when_flow_control_is_saturated() {
         use crate::datastore::replicated::RaftProposer;
 
         let (node, backend) = fresh_node(75).await;
@@ -2484,30 +2528,115 @@ mod tests {
         assert_eq!(node.flow_control.available_permits(), 0);
 
         let rv_before = backend.get_current_resource_version().await.unwrap();
-        let timeout = tokio::time::sleep(std::time::Duration::from_millis(300));
-        tokio::pin!(timeout);
-        let mut propose_fut = Box::pin(node.propose_outbox_command(
-            "outbox-permit-ordering",
-            crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
-            propose_create_command("outbox-permit-ordering"),
-            "worker-1",
-        ));
-        tokio::select! {
-            _ = &mut propose_fut => panic!("propose_outbox_command must block while flow-control permits are exhausted"),
-            _ = &mut timeout => {}
-        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            node.propose_outbox_command(
+                "outbox-permit-ordering",
+                crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                propose_create_command("outbox-permit-ordering"),
+                "worker-1",
+            ),
+        )
+        .await
+        .expect("saturated outbox proposal must fail fast, not wait for the gRPC deadline");
+        let err = result.expect_err("saturated outbox proposal must be retryable");
+        assert!(
+            matches!(
+                err,
+                crate::kubelet::outbox::OutboxApplyError::Retryable(ref message)
+                    if message.contains("raft proposal flow control saturated")
+            ),
+            "unexpected saturated outbox error: {err}"
+        );
 
         let rv_during = backend.get_current_resource_version().await.unwrap();
         assert_eq!(
             rv_during, rv_before,
-            "outbox propose must not reserve an rv until a flow-control permit is available"
+            "outbox propose must not reserve an rv when it sheds load under flow-control saturation"
         );
 
-        drop(propose_fut);
+        drop(_p1);
+        drop(_p2);
+        drop(_p3);
+
+        let retry_result = node
+            .propose_outbox_command(
+                "outbox-permit-ordering",
+                crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                propose_create_command("outbox-permit-ordering"),
+                "worker-1",
+            )
+            .await
+            .expect("retry after capacity returns must succeed with the same idempotency key");
+        assert!(matches!(
+            retry_result,
+            crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
+        ));
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raft_critical_outbox_uses_reserved_permit_when_general_gate_is_saturated() {
+        use crate::datastore::replicated::RaftProposer;
+        use crate::kubelet::outbox::payload::OutboxOperation;
+
+        let (node, backend) = fresh_node(76).await;
+        node.bootstrap_single_voter("https://10.99.0.76:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .expect("become leader");
+
+        let _p1 = node.flow_control.acquire().await;
+        let _p2 = node.flow_control.acquire().await;
+        let _p3 = node.flow_control.acquire().await;
+        assert_eq!(node.flow_control.available_permits(), 0);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            node.propose_outbox_command(
+                "critical-node-registration",
+                OutboxOperation::NodeRegistration.as_str(),
+                propose_node_registration_command("mn-critical-worker", "uid-critical-worker"),
+                "mn-critical-worker",
+            ),
+        )
+        .await
+        .expect("critical outbox proposal must not wait behind status-saturated general permits")
+        .expect("critical outbox proposal must use reserved capacity");
+
+        let stored = backend
+            .get_resource("v1", "Node", None, "mn-critical-worker")
+            .await
+            .expect("read critical Node")
+            .expect("critical Node was created");
+        assert_eq!(stored.uid, "uid-critical-worker");
+
         drop(_p1);
         drop(_p2);
         drop(_p3);
         node.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn outbox_priority_permit_classifier_is_explicit() {
+        use crate::kubelet::outbox::payload::OutboxOperation;
+
+        let cases = [
+            (OutboxOperation::NodeRegistration, true),
+            (OutboxOperation::NodeDataplane, true),
+            (OutboxOperation::NodeStatus, true),
+            (OutboxOperation::PodStatus, false),
+            (OutboxOperation::EventCreate, false),
+        ];
+        for (operation, expected) in cases {
+            assert_eq!(
+                outbox_operation_uses_priority_permit(operation.as_str()),
+                expected,
+                "{operation:?} priority classification mismatch"
+            );
+        }
     }
 
     /// Integration test: at most 3 unacknowledged propose_command calls may be in flight.
