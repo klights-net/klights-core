@@ -944,7 +944,9 @@ pub async fn update_inner(
     }
 
     let data = inject_resource_version(resource.data, resource.resource_version);
-    enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
+    if !(api_version == "v1" && kind == "Service") {
+        enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
+    }
     Ok(Json(data))
 }
 
@@ -1610,7 +1612,10 @@ pub async fn patch_inner(
                     .await;
 
                 let data = inject_resource_version(resource.data, resource.resource_version);
-                enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
+                if !(api_version == "v1" && kind == "Service") {
+                    enqueue_generated_controller_after_mutation(&state, api_version, kind, &data)
+                        .await;
+                }
                 return Ok(Json(data));
             }
             Err(e)

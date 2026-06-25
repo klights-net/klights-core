@@ -305,6 +305,80 @@ async fn service_create_enqueues_exactly_one_service_reconcile() {
 }
 
 #[tokio::test]
+async fn service_update_externalname_to_clusterip_enqueues_one_allocated_reconcile() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let state = crate::api::test_support::build_test_app_state().await;
+    let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
+    state
+        .controller_dispatcher
+        .set_services(services.clone() as Arc<dyn crate::networking::ServiceRouter>)
+        .await;
+    let app = crate::api::build_router(state);
+
+    let (create_status, create_body) = post_service(
+        app.clone(),
+        "external-to-clusterip",
+        json!({
+            "type": "ExternalName",
+            "externalName": "foo.example.com"
+        }),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::CREATED);
+    assert_eq!(
+        create_body
+            .pointer("/spec/clusterIP")
+            .and_then(|value| value.as_str()),
+        Some(""),
+        "ExternalName create must not allocate a ClusterIP"
+    );
+
+    let sync_after_create = services.sync_count();
+    let update_body = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "external-to-clusterip",
+            "namespace": "default",
+            "resourceVersion": create_body
+                .pointer("/metadata/resourceVersion")
+                .and_then(|value| value.as_str())
+                .expect("create response must include resourceVersion")
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "ports": [{"name": "http", "port": 80, "protocol": "TCP"}]
+        }
+    });
+    let update_req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/namespaces/default/services/external-to-clusterip")
+        .header("content-type", "application/json")
+        .body(Body::from(update_body.to_string()))
+        .unwrap();
+    let update_resp = app.oneshot(update_req).await.unwrap();
+    assert_eq!(update_resp.status(), StatusCode::OK);
+    let update_body: Value =
+        serde_json::from_slice(&to_bytes(update_resp.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(
+        update_body
+            .pointer("/spec/clusterIP")
+            .and_then(|value| value.as_str()),
+        Some("10.43.128.2"),
+        "ExternalName to ClusterIP update response must carry the allocated ClusterIP"
+    );
+    assert_eq!(
+        services.sync_count(),
+        sync_after_create + 1,
+        "Service update wrapper must enqueue only the allocated Service, not the raw generic write"
+    );
+}
+
+#[tokio::test]
 async fn service_create_releases_allocated_cluster_ip_when_initial_create_conflicts() {
     use axum::http::StatusCode;
 
