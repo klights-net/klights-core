@@ -197,11 +197,44 @@ pub trait GrpcRaftRpcClient: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 pub enum GrpcRaftRpcError {
     #[error("peer unreachable: {0}")]
-    Unreachable(String),
+    Unreachable(RaftPeerTransportError),
     #[error("peer returned consensus error: {0}")]
     Remote(String),
     #[error("peer raft router error: {0}")]
     Server(String),
+}
+
+/// P0#3 fix #1: structured transport failure for a Raft peer RPC. Carries the
+/// peer address plus the exact tonic code/message downcast from the production
+/// client's `UnaryRpcError::Status`, instead of flattening them to a generic
+/// "gRPC RaftAppendEntries failed" string that hid whether the peer rejected
+/// auth, timed out, or was unreachable. The network layer still has the openraft
+/// `NodeId` (`target`) at the match sites, so a failure log can carry both peer
+/// id and peer address.
+#[derive(Debug, Clone)]
+pub struct RaftPeerTransportError {
+    /// The gRPC address this client targets (openraft membership addr).
+    pub peer_addr: String,
+    /// The tonic status code, when the failure was a `tonic::Status`
+    /// (Unavailable, DeadlineExceeded, Unauthenticated, …). `None` for
+    /// connect/transport failures that never produced a tonic status.
+    pub tonic_code: Option<tonic::Code>,
+    /// The tonic status message, when available.
+    pub tonic_message: Option<String>,
+    /// Human-readable detail for the non-tonic transport failure, or the
+    /// tonic status rendered as a string when it was a tonic failure.
+    pub detail: String,
+}
+
+impl std::fmt::Display for RaftPeerTransportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "peer {} ", self.peer_addr)?;
+        match (self.tonic_code, self.tonic_message.as_deref()) {
+            (Some(code), Some(msg)) => write!(f, "tonic {code:?}: {msg}"),
+            (Some(code), None) => write!(f, "tonic {code:?}"),
+            (None, _) => write!(f, "{}", self.detail),
+        }
+    }
 }
 
 /// Factory that materializes per-peer `GrpcRaftRpcClient` instances on
@@ -364,9 +397,21 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
                 tracing::debug!(target, "GrpcRaftNetwork::append_entries: success");
                 b
             }
-            Err(GrpcRaftRpcError::Unreachable(msg)) | Err(GrpcRaftRpcError::Server(msg)) => {
+            Err(GrpcRaftRpcError::Unreachable(te)) => {
                 self.metrics.record_append_entries_failure(target);
-                tracing::warn!(target, %msg, "GrpcRaftNetwork::append_entries: unreachable/server error");
+                tracing::warn!(
+                    target,
+                    peer_addr = %te.peer_addr,
+                    tonic_code = ?te.tonic_code,
+                    tonic_message = ?te.tonic_message,
+                    "GrpcRaftNetwork::append_entries: unreachable"
+                );
+                self.invalidate(target);
+                return Err(RPCError::Unreachable(unreachable_io(te.to_string())));
+            }
+            Err(GrpcRaftRpcError::Server(msg)) => {
+                self.metrics.record_append_entries_failure(target);
+                tracing::warn!(target, %msg, "GrpcRaftNetwork::append_entries: server router error");
                 self.invalidate(target);
                 return Err(RPCError::Unreachable(unreachable_io(msg)));
             }
@@ -397,8 +442,21 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
         self.metrics.record_vote_call(target, payload.len());
         let bytes = match client.vote(payload).await {
             Ok(b) => b,
-            Err(GrpcRaftRpcError::Unreachable(msg)) | Err(GrpcRaftRpcError::Server(msg)) => {
+            Err(GrpcRaftRpcError::Unreachable(te)) => {
                 self.metrics.record_vote_failure(target);
+                tracing::warn!(
+                    target,
+                    peer_addr = %te.peer_addr,
+                    tonic_code = ?te.tonic_code,
+                    tonic_message = ?te.tonic_message,
+                    "GrpcRaftNetwork::vote: unreachable"
+                );
+                self.invalidate(target);
+                return Err(RPCError::Unreachable(unreachable_io(te.to_string())));
+            }
+            Err(GrpcRaftRpcError::Server(msg)) => {
+                self.metrics.record_vote_failure(target);
+                tracing::warn!(target, %msg, "GrpcRaftNetwork::vote: server router error");
                 self.invalidate(target);
                 return Err(RPCError::Unreachable(unreachable_io(msg)));
             }
@@ -430,8 +488,21 @@ impl RaftNetwork<TypeConfig> for GrpcRaftNetwork {
             .record_install_snapshot_call(target, payload.len());
         let bytes = match client.install_snapshot(payload).await {
             Ok(b) => b,
-            Err(GrpcRaftRpcError::Unreachable(msg)) | Err(GrpcRaftRpcError::Server(msg)) => {
+            Err(GrpcRaftRpcError::Unreachable(te)) => {
                 self.metrics.record_install_snapshot_failure(target);
+                tracing::warn!(
+                    target,
+                    peer_addr = %te.peer_addr,
+                    tonic_code = ?te.tonic_code,
+                    tonic_message = ?te.tonic_message,
+                    "GrpcRaftNetwork::install_snapshot: unreachable"
+                );
+                self.invalidate(target);
+                return Err(RPCError::Unreachable(unreachable_io(te.to_string())));
+            }
+            Err(GrpcRaftRpcError::Server(msg)) => {
+                self.metrics.record_install_snapshot_failure(target);
+                tracing::warn!(target, %msg, "GrpcRaftNetwork::install_snapshot: server router error");
                 self.invalidate(target);
                 return Err(RPCError::Unreachable(unreachable_io(msg)));
             }
@@ -483,16 +554,25 @@ mod tests {
 
     struct UnreachableClient;
 
+    fn unreachable_peer_down() -> GrpcRaftRpcError {
+        GrpcRaftRpcError::Unreachable(RaftPeerTransportError {
+            peer_addr: "test-peer".to_string(),
+            tonic_code: Some(tonic::Code::Unavailable),
+            tonic_message: Some("peer down".to_string()),
+            detail: "peer down".to_string(),
+        })
+    }
+
     #[async_trait]
     impl GrpcRaftRpcClient for UnreachableClient {
         async fn append_entries(&self, _payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
-            Err(GrpcRaftRpcError::Unreachable("peer down".into()))
+            Err(unreachable_peer_down())
         }
         async fn vote(&self, _payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
-            Err(GrpcRaftRpcError::Unreachable("peer down".into()))
+            Err(unreachable_peer_down())
         }
         async fn install_snapshot(&self, _payload: Vec<u8>) -> Result<Vec<u8>, GrpcRaftRpcError> {
-            Err(GrpcRaftRpcError::Unreachable("peer down".into()))
+            Err(unreachable_peer_down())
         }
     }
 
