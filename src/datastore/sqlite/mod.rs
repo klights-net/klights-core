@@ -58,7 +58,7 @@ pub use super::types::{
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState,
     PodWorkqueueEntry, PodWorkqueueKind, ReplicatedCreateOptions, ReplicatedSnapshotMetadata,
     Resource, ResourceBatchOperation, ResourceList, ResourceListQuery, ResourcePatchRequest,
-    ResourcePreconditions, SandboxRef, WatchTarget, WatchTargetScope,
+    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchTarget, WatchTargetScope,
 };
 
 pub use executor::DbExecutor;
@@ -80,8 +80,9 @@ use filters::{resolve_field_path, split_selector};
 use resource_shape::{
     ensure_metadata_create_defaults, ensure_metadata_identity, ensure_metadata_uid,
     ensure_pod_status_ip_arrays, ensure_resource_type_meta, hydrate_watch_event_data, metadata_uid,
-    preserve_server_metadata_fields_from_existing, validate_metadata_uid_immutable,
-    validate_resource_preconditions, warn_uid_precondition_mismatch,
+    preserve_server_metadata_fields_from_existing, resource_client_owned_state_equal,
+    validate_metadata_uid_immutable, validate_resource_preconditions,
+    warn_uid_precondition_mismatch,
 };
 use scope::use_namespaced_table;
 
@@ -897,6 +898,9 @@ impl Datastore {
                     namespace.as_deref(),
                     &name,
                 )?;
+                let live: Value =
+                    serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
+                let mut effective_preconditions = preconditions.clone();
                 if apply_against_latest {
                     let uid_preconditions = ResourcePreconditions {
                         uid: preconditions.uid.clone(),
@@ -904,8 +908,6 @@ impl Datastore {
                     };
                     validate_resource_preconditions(&uid_preconditions, Some(&live_uid), live_rv)
                         .map_err(Self::sqlite_conversion_error)?;
-                    let live: Value =
-                        serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
                     if api_version == "v1" && kind == "Node" && namespace.is_none() {
                         crate::kubelet::node::merge_existing_node_mutable_fields(&mut data, &live);
                     } else if api_version == "coordination.k8s.io/v1"
@@ -915,27 +917,50 @@ impl Datastore {
                         Self::merge_forwarded_lease_with_live(&live, &mut data);
                     }
                 } else {
-                    validate_resource_preconditions(&preconditions, Some(&live_uid), live_rv)
-                        .map_err(Self::sqlite_conversion_error)?;
-                    if preconditions.resource_version.is_none()
-                        && expected_rv > 0
-                        && expected_rv != live_rv
+                    effective_preconditions.resource_version = preconditions
+                        .resource_version
+                        .or_else(|| (expected_rv > 0).then_some(expected_rv));
+                    if let Some(expected) = effective_preconditions.resource_version
+                        && expected != live_rv
+                        && crate::resource_semantics::has_builtin_status_subresource(
+                            &api_version,
+                            &kind,
+                        )
+                        && let Some(base) = Self::resource_snapshot_for_key_at_rv_in_tx(
+                            tx,
+                            &api_version,
+                            &kind,
+                            namespace.as_deref(),
+                            &name,
+                            expected,
+                        )?
+                        && metadata_uid(&base) == Some(live_uid.as_str())
+                        && resource_client_owned_state_equal(&base, &live)
                     {
-                        return Err(Self::sqlite_conversion_error(anyhow!(
-                            "resourceVersion precondition failed: expected {expected_rv} got {live_rv} (409 Conflict)"
-                        )));
+                        effective_preconditions.resource_version = Some(live_rv);
                     }
+                    validate_resource_preconditions(
+                        &effective_preconditions,
+                        Some(&live_uid),
+                        live_rv,
+                    )
+                    .map_err(Self::sqlite_conversion_error)?;
                 }
                 ensure_resource_type_meta(&mut data, &api_version, &kind);
                 ensure_metadata_identity(&mut data, namespace.as_deref(), &name);
                 ensure_pod_status_ip_arrays(&mut data, &api_version, &kind);
+                crate::resource_semantics::preserve_status_subresource_on_main_update(
+                    &api_version,
+                    &kind,
+                    &live,
+                    &mut data,
+                );
+                preserve_server_metadata_fields_from_existing(&mut data, &live);
                 let uid = ensure_metadata_uid(&mut data);
                 let precondition_resource_version = if apply_against_latest {
                     None
                 } else {
-                    preconditions
-                        .resource_version
-                        .or_else(|| (expected_rv > 0).then_some(expected_rv))
+                    effective_preconditions.resource_version
                 };
                 LogApplyCommit::new(
                     rv,
@@ -1284,6 +1309,7 @@ impl Datastore {
                 patch_kind,
                 patch,
                 preconditions,
+                strict_resource_version,
             } => {
                 let (live_rv, live_uid, live_data) = Self::resource_row_for_update_in_tx(
                     tx,
@@ -1292,7 +1318,30 @@ impl Datastore {
                     namespace.as_deref(),
                     &name,
                 )?;
-                validate_resource_preconditions(&preconditions, Some(&live_uid), live_rv)
+                let live: Value =
+                    serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
+                let mut effective_preconditions = preconditions.clone();
+                if !strict_resource_version
+                    && let Some(expected) = effective_preconditions.resource_version
+                    && expected != live_rv
+                    && crate::resource_semantics::has_builtin_status_subresource(
+                        &api_version,
+                        &kind,
+                    )
+                    && let Some(base) = Self::resource_snapshot_for_key_at_rv_in_tx(
+                        tx,
+                        &api_version,
+                        &kind,
+                        namespace.as_deref(),
+                        &name,
+                        expected,
+                    )?
+                    && metadata_uid(&base) == Some(live_uid.as_str())
+                    && resource_client_owned_state_equal(&base, &live)
+                {
+                    effective_preconditions.resource_version = Some(live_rv);
+                }
+                validate_resource_preconditions(&effective_preconditions, Some(&live_uid), live_rv)
                     .map_err(Self::sqlite_conversion_error)?;
                 if Self::should_apply_outbox_patch_against_latest(
                     &api_version,
@@ -1330,12 +1379,19 @@ impl Datastore {
                         rv,
                     ));
                 }
-                let mut live: Value =
-                    serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
+                let live_before_patch = live.clone();
+                let mut live = live;
                 Self::apply_outbox_patch(&api_version, &kind, &mut live, patch_kind, patch)?;
                 ensure_resource_type_meta(&mut live, &api_version, &kind);
                 ensure_metadata_identity(&mut live, namespace.as_deref(), &name);
                 ensure_pod_status_ip_arrays(&mut live, &api_version, &kind);
+                crate::resource_semantics::preserve_status_subresource_on_main_update(
+                    &api_version,
+                    &kind,
+                    &live_before_patch,
+                    &mut live,
+                );
+                preserve_server_metadata_fields_from_existing(&mut live, &live_before_patch);
                 let uid = ensure_metadata_uid(&mut live);
                 LogApplyCommit::new(
                     rv,
@@ -1349,8 +1405,8 @@ impl Datastore {
                         data: live,
                         require_absent: false,
                         require_existing: true,
-                        precondition_uid: preconditions.uid,
-                        precondition_resource_version: preconditions
+                        precondition_uid: effective_preconditions.uid,
+                        precondition_resource_version: effective_preconditions
                             .resource_version
                             .or(Some(live_rv)),
                         status_only: false,
@@ -1559,6 +1615,48 @@ impl Datastore {
         };
 
         Ok((commit, rv))
+    }
+
+    fn resource_snapshot_for_key_at_rv_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        resource_version: i64,
+    ) -> tokio_rusqlite::Result<Option<Value>> {
+        let earliest: Option<i64> = tx
+            .query_row(queries::WATCH_EVENTS_MIN_RV, [], |row| row.get(0))
+            .optional()?;
+        match earliest {
+            Some(earliest) if resource_version + 1 >= earliest => {}
+            _ => return Ok(None),
+        }
+
+        let namespace_key = namespace.unwrap_or("#cluster");
+        let row: Option<(String, Vec<u8>)> = tx
+            .query_row(
+                "SELECT event_type, data FROM watch_events \
+                 WHERE api_version = ?1 \
+                   AND kind = ?2 \
+                   AND COALESCE(namespace, '#cluster') = ?3 \
+                   AND name = ?4 \
+                   AND resource_version <= ?5 \
+                 ORDER BY resource_version DESC, id DESC \
+                 LIMIT 1",
+                rusqlite::params![api_version, kind, namespace_key, name, resource_version],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((event_type, bytes)) = row else {
+            return Ok(None);
+        };
+        if event_type == "DELETED" {
+            return Ok(None);
+        }
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error)
     }
 
     fn should_apply_outbox_patch_against_latest(

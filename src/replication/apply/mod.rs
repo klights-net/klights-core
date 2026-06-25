@@ -296,6 +296,7 @@ pub async fn apply_forwarded_command(
             patch_kind,
             patch,
             preconditions,
+            strict_resource_version,
         } => {
             let before_rv = db.get_current_resource_version().await.unwrap_or(0);
             let resource = db
@@ -304,7 +305,12 @@ pub async fn apply_forwarded_command(
                     &kind,
                     namespace.as_deref(),
                     &name,
-                    ResourcePatchRequest::new(patch_kind, patch.clone(), preconditions.clone()),
+                    ResourcePatchRequest {
+                        patch_kind,
+                        patch: patch.clone(),
+                        preconditions: preconditions.clone(),
+                        strict_resource_version,
+                    },
                 )
                 .await?;
             if let Some(resource) = resource {
@@ -317,6 +323,7 @@ pub async fn apply_forwarded_command(
                         patch_kind,
                         patch,
                         preconditions,
+                        strict_resource_version,
                     },
                     &resource,
                     authoring_node,
@@ -340,6 +347,7 @@ pub async fn apply_forwarded_command(
                             patch_kind,
                             patch,
                             preconditions,
+                            strict_resource_version,
                         },
                         meta: meta_for_rv(rv, None, authoring_node),
                     }),

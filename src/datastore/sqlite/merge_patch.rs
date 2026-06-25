@@ -62,6 +62,7 @@ impl Datastore {
             patch_kind,
             patch,
             preconditions,
+            strict_resource_version,
         } = request;
         // All four owned strings are captured by the move closure below
         // and consumed by both the SQL parameters and the constructed
@@ -161,13 +162,38 @@ impl Datastore {
                         Some(&current.uid),
                     );
                 }
-                validate_resource_preconditions(&preconditions, Some(&current.uid), current.rv)
-                    .map_err(|e| {
-                        rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            e.to_string(),
-                        )))
-                    })?;
+                let mut effective_preconditions = preconditions.clone();
+                if !strict_resource_version
+                    && let Some(expected) = effective_preconditions.resource_version
+                    && expected != current.rv
+                    && crate::resource_semantics::has_builtin_status_subresource(
+                        &key.api_version,
+                        &key.kind,
+                    )
+                    && let Some(base) = Self::resource_snapshot_for_key_at_rv_in_tx(
+                        &tx,
+                        &key.api_version,
+                        &key.kind,
+                        key.namespace.as_deref(),
+                        &key.name,
+                        expected,
+                    )?
+                    && metadata_uid(&base) == Some(current.uid.as_str())
+                    && resource_client_owned_state_equal(&base, &current.data)
+                {
+                    effective_preconditions.resource_version = Some(current.rv);
+                }
+                validate_resource_preconditions(
+                    &effective_preconditions,
+                    Some(&current.uid),
+                    current.rv,
+                )
+                .map_err(|e| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )))
+                })?;
 
                 let mut patched: Value = current.data.clone();
                 let zero_grace_pod_delete =
@@ -194,16 +220,21 @@ impl Datastore {
                             })?;
                     }
                 }
-                if zero_grace_pod_delete {
-                    crate::resource_semantics::mark_terminating_pod_unready(&mut patched);
-                }
-
                 validate_metadata_uid_immutable(&patched, &current.data).map_err(|e| {
                     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         e.to_string(),
                     )))
                 })?;
+                crate::resource_semantics::preserve_status_subresource_on_main_update(
+                    &key.api_version,
+                    &key.kind,
+                    &current.data,
+                    &mut patched,
+                );
+                if zero_grace_pod_delete {
+                    crate::resource_semantics::mark_terminating_pod_unready(&mut patched);
+                }
                 preserve_server_metadata_fields_from_existing(&mut patched, &current.data);
                 ensure_metadata_identity(&mut patched, key.namespace.as_deref(), &key.name);
                 ensure_resource_type_meta(&mut patched, &key.api_version, &key.kind);

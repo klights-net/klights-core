@@ -892,6 +892,7 @@ impl DatastoreBackend for ReplicatedDatastore {
             patch_kind,
             patch: patch.clone(),
             preconditions: ResourcePreconditions::default(),
+            strict_resource_version: false,
         };
         self.propose_command_via_raft(&proposer, command).await?;
         self.inner
@@ -910,6 +911,7 @@ impl DatastoreBackend for ReplicatedDatastore {
             patch_kind,
             patch,
             preconditions,
+            strict_resource_version,
         } = request;
         let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::PatchResource {
@@ -920,6 +922,7 @@ impl DatastoreBackend for ReplicatedDatastore {
             patch_kind,
             patch: patch.clone(),
             preconditions: preconditions.clone(),
+            strict_resource_version,
         };
         self.propose_command_via_raft(&proposer, command).await?;
         self.inner

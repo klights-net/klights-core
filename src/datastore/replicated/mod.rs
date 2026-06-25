@@ -314,7 +314,7 @@ where
                 );
             }
             backend
-                .update_resource_with_preconditions(
+                .update_main_resource_with_preconditions(
                     &api_version,
                     &kind,
                     namespace.as_deref(),
@@ -349,6 +349,7 @@ where
             patch_kind,
             patch,
             preconditions,
+            strict_resource_version,
         } => {
             backend
                 .patch_resource_latest_with_preconditions(
@@ -356,7 +357,12 @@ where
                     &kind,
                     namespace.as_deref(),
                     &name,
-                    ResourcePatchRequest::new(patch_kind, patch, preconditions),
+                    ResourcePatchRequest {
+                        patch_kind,
+                        patch,
+                        preconditions,
+                        strict_resource_version,
+                    },
                 )
                 .await?;
         }

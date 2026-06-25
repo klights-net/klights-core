@@ -1079,6 +1079,7 @@ async fn raft_scale_patch_applies_against_live_resource_after_status_rv_race() {
         patch_kind: crate::datastore::PatchKind::Merge,
         patch: json!({"spec": {"replicas": 2}}),
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
+        strict_resource_version: false,
     };
     let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
@@ -1183,6 +1184,7 @@ async fn raft_pod_delete_mark_patch_applies_against_live_resource_after_status_r
             }
         }),
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
+        strict_resource_version: false,
     };
     let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
@@ -1310,6 +1312,7 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
                 "deletionGracePeriodSeconds": 0
             }
         }),
+        strict_resource_version: false,
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
     };
     let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
@@ -1429,6 +1432,7 @@ async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
             }
         }),
         preconditions: ResourcePreconditions::uid(created.uid.clone()),
+        strict_resource_version: false,
     };
     let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
@@ -2345,6 +2349,7 @@ async fn raft_patch_merge_preserves_metadata_identity_and_labels() {
                     }
                 }),
                 preconditions: ResourcePreconditions::uid("deploy-uid-1"),
+                strict_resource_version: false,
             },
             "PodStatus",
             "mn-controlplane1",

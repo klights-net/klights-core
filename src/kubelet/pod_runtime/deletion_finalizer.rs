@@ -149,6 +149,7 @@ impl RealPodDeletionFinalizer {
                     uid: Some(uid.to_string()),
                     resource_version: None,
                 },
+                strict_resource_version: false,
             },
             now_ms: crate::kubelet::pod_repository::current_epoch_millis(),
         }

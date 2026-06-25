@@ -156,6 +156,8 @@ pub enum StorageCommand {
         #[serde(with = "serde_bytes_base64")]
         patch: serde_json::Value,
         preconditions: ResourcePreconditions,
+        #[serde(default)]
+        strict_resource_version: bool,
     },
 
     /// Update only the `.status` subtree of a resource.
@@ -439,6 +441,7 @@ impl StorageCommand {
             patch_kind,
             patch,
             preconditions: ResourcePreconditions::default(),
+            strict_resource_version: false,
         }
     }
 

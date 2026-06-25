@@ -22,6 +22,16 @@ struct ResourceUpdateWithPreconditions<'a> {
     preserve_latest_status: bool,
 }
 
+struct MainUpdatePreconditionCheck<'a> {
+    api_version: &'a str,
+    kind: &'a str,
+    namespace: Option<&'a str>,
+    name: &'a str,
+    preconditions: &'a ResourcePreconditions,
+    current: &'a Resource,
+    preserve_latest_status: bool,
+}
+
 impl Datastore {
     fn preserve_latest_status_subresource_in_tx(
         tx: &rusqlite::Transaction<'_>,
@@ -122,6 +132,57 @@ impl Datastore {
         .await
     }
 
+    async fn preconditions_for_main_update_against_current(
+        &self,
+        check: MainUpdatePreconditionCheck<'_>,
+    ) -> Result<ResourcePreconditions> {
+        let MainUpdatePreconditionCheck {
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+            current,
+            preserve_latest_status,
+        } = check;
+        let mut effective = preconditions.clone();
+        let Some(expected_rv) = preconditions.resource_version else {
+            return Ok(effective);
+        };
+        if !preserve_latest_status
+            || !crate::resource_semantics::has_builtin_status_subresource(api_version, kind)
+            || current.resource_version == expected_rv
+            || current.resource_version < expected_rv
+        {
+            return Ok(effective);
+        }
+
+        let field_selector = format!("metadata.name={name}");
+        let snapshot = self
+            .snapshot_resources_at_rv(
+                api_version,
+                kind,
+                namespace,
+                ResourceListQuery::new(None, Some(&field_selector), Some(1), None),
+                expected_rv,
+            )
+            .await?;
+        let SnapshotAtRv::List(snapshot) = snapshot else {
+            return Ok(effective);
+        };
+        let Some(base) = snapshot.items.into_iter().find(|resource| {
+            resource.name == current.name && resource.namespace == current.namespace
+        }) else {
+            return Ok(effective);
+        };
+        if base.uid == current.uid
+            && resource_client_owned_state_equal(base.data.as_ref(), current.data.as_ref())
+        {
+            effective.resource_version = Some(current.resource_version);
+        }
+        Ok(effective)
+    }
+
     async fn update_resource_with_preconditions_impl(
         &self,
         request: ResourceUpdateWithPreconditions<'_>,
@@ -135,6 +196,7 @@ impl Datastore {
             preconditions,
             preserve_latest_status,
         } = request;
+        let mut effective_preconditions = preconditions.clone();
         ensure_resource_type_meta(&mut data, api_version, kind);
         ensure_metadata_identity(&mut data, namespace, name);
         ensure_pod_status_ip_arrays(&mut data, api_version, kind);
@@ -160,8 +222,19 @@ impl Datastore {
                     );
                 }
             }
+            effective_preconditions = self
+                .preconditions_for_main_update_against_current(MainUpdatePreconditionCheck {
+                    api_version,
+                    kind,
+                    namespace,
+                    name,
+                    preconditions: &preconditions,
+                    current: existing_resource,
+                    preserve_latest_status,
+                })
+                .await?;
             validate_resource_preconditions(
-                &preconditions,
+                &effective_preconditions,
                 metadata_uid(&existing_resource.data),
                 existing_resource.resource_version,
             )?;
@@ -192,9 +265,9 @@ impl Datastore {
         let av = api_version.to_string();
         let k = kind.to_string();
         let n = name.to_string();
-        let expected_rv = preconditions.resource_version;
-        let expected_uid_for_log = preconditions.uid.clone();
-        let expected_uid = preconditions.uid;
+        let expected_rv = effective_preconditions.resource_version;
+        let expected_uid_for_log = effective_preconditions.uid.clone();
+        let expected_uid = effective_preconditions.uid;
 
         let result = if use_namespaced_table(api_version, kind, &namespace) {
             let ns = namespace.unwrap_or("default").to_string();

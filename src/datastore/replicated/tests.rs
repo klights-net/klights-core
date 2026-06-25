@@ -814,6 +814,362 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn replicated_apply_main_update_allows_status_only_rv_advance() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "status-overlap-deploy",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "status-overlap-deploy",
+                        "namespace": "default",
+                        "uid": "deploy-status-overlap-uid",
+                        "generation": 1
+                    },
+                    "spec": {"replicas": 1},
+                    "status": {"availableReplicas": 0}
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.update_status_only(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "status-overlap-deploy",
+            json!({"availableReplicas": 1}),
+            Some(created.resource_version),
+        )
+        .await
+        .unwrap();
+
+        let mut proposed = (*created.data).clone();
+        proposed["spec"]["replicas"] = json!(2);
+        proposed["status"] = json!({"availableReplicas": 0});
+
+        apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateResource {
+                api_version: "apps/v1".into(),
+                kind: "Deployment".into(),
+                namespace: Some("default".into()),
+                name: "status-overlap-deploy".into(),
+                data: proposed,
+                expected_rv: created.resource_version,
+                preconditions: ResourcePreconditions::from_resource(&created),
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 3,
+                uid: Some(created.uid.clone()),
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .expect("main update must tolerate a concurrent status-only RV advance");
+
+        let stored = db
+            .get_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "status-overlap-deploy",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.resource_version, 3);
+        assert_eq!(stored.data.pointer("/spec/replicas"), Some(&json!(2)));
+        assert_eq!(
+            stored.data.pointer("/status/availableReplicas"),
+            Some(&json!(1)),
+            "main update must preserve the status that advanced while raft committed"
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_apply_main_update_rejects_true_spec_conflict() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "spec-conflict-deploy",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "spec-conflict-deploy",
+                        "namespace": "default",
+                        "uid": "deploy-spec-conflict-uid",
+                        "generation": 1
+                    },
+                    "spec": {"replicas": 1},
+                    "status": {"availableReplicas": 0}
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut live_update = (*created.data).clone();
+        live_update["metadata"]["generation"] = json!(2);
+        live_update["spec"]["replicas"] = json!(3);
+        db.update_main_resource_with_preconditions(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "spec-conflict-deploy",
+            live_update,
+            ResourcePreconditions::from_resource(&created),
+        )
+        .await
+        .unwrap();
+
+        let mut stale_proposed = (*created.data).clone();
+        stale_proposed["metadata"]["generation"] = json!(2);
+        stale_proposed["spec"]["replicas"] = json!(2);
+        let err = apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateResource {
+                api_version: "apps/v1".into(),
+                kind: "Deployment".into(),
+                namespace: Some("default".into()),
+                name: "spec-conflict-deploy".into(),
+                data: stale_proposed,
+                expected_rv: created.resource_version,
+                preconditions: ResourcePreconditions::from_resource(&created),
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 3,
+                uid: Some(created.uid.clone()),
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .expect_err("stale main update must still reject a real spec conflict");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected spec conflict, got: {err:#}"
+        );
+
+        let stored = db
+            .get_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "spec-conflict-deploy",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.data.pointer("/spec/replicas"), Some(&json!(3)));
+    }
+
+    #[tokio::test]
+    async fn replicated_apply_main_update_rejects_same_name_replacement() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "replacement-deploy",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "replacement-deploy",
+                        "namespace": "default",
+                        "uid": "old-deploy-uid",
+                        "generation": 1
+                    },
+                    "spec": {"replicas": 1},
+                    "status": {"availableReplicas": 0}
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.delete_resource_with_preconditions(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "replacement-deploy",
+            ResourcePreconditions::from_resource(&created),
+        )
+        .await
+        .unwrap();
+        let replacement = db
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "replacement-deploy",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "replacement-deploy",
+                        "namespace": "default",
+                        "uid": "new-deploy-uid",
+                        "generation": 1
+                    },
+                    "spec": {"replicas": 1},
+                    "status": {"availableReplicas": 0}
+                }),
+            )
+            .await
+            .unwrap();
+        db.update_status_only(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "replacement-deploy",
+            json!({"availableReplicas": 1}),
+            Some(replacement.resource_version),
+        )
+        .await
+        .unwrap();
+
+        let mut stale_proposed = (*created.data).clone();
+        stale_proposed["spec"]["replicas"] = json!(2);
+        let err = apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateResource {
+                api_version: "apps/v1".into(),
+                kind: "Deployment".into(),
+                namespace: Some("default".into()),
+                name: "replacement-deploy".into(),
+                data: stale_proposed,
+                expected_rv: created.resource_version,
+                preconditions: ResourcePreconditions::resource_version(created.resource_version),
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 5,
+                uid: Some(created.uid.clone()),
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .expect_err("status-only rebase must not cross a same-name replacement");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected replacement conflict, got: {err:#}"
+        );
+
+        let stored = db
+            .get_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "replacement-deploy",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.uid, "new-deploy-uid");
+        assert_eq!(stored.data.pointer("/spec/replicas"), Some(&json!(1)));
+        assert_eq!(
+            stored.data.pointer("/status/availableReplicas"),
+            Some(&json!(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_apply_status_rejects_status_only_rv_conflict() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "status-conflict-pod",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "status-conflict-pod",
+                        "namespace": "default",
+                        "uid": "status-conflict-pod-uid"
+                    },
+                    "spec": {
+                        "containers": [{"name": "app", "image": "nginx"}]
+                    },
+                    "status": {"phase": "Pending"}
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.update_status_only(
+            "v1",
+            "Pod",
+            Some("default"),
+            "status-conflict-pod",
+            json!({"phase": "Running"}),
+            Some(created.resource_version),
+        )
+        .await
+        .unwrap();
+
+        let err = apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateStatus {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                namespace: Some("default".into()),
+                name: "status-conflict-pod".into(),
+                status: json!({"phase": "Succeeded"}),
+                expected_rv: Some(created.resource_version),
+                preconditions: ResourcePreconditions::from_resource(&created),
+                observed_status_stamp: None,
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 3,
+                uid: Some(created.uid.clone()),
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .expect_err("status updates must remain strict against status conflicts");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected status conflict, got: {err:#}"
+        );
+
+        let stored = db
+            .get_resource("v1", "Pod", Some("default"), "status-conflict-pod")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .data
+                .pointer("/status/phase")
+                .and_then(|v| v.as_str()),
+            Some("Running")
+        );
+    }
+
+    #[tokio::test]
     async fn replicated_apply_patch_rejects_stale_resource_version() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
@@ -839,6 +1195,7 @@ mod cases {
                 patch_kind: PatchKind::Merge,
                 patch: json!({"data": {"after": "true"}}),
                 preconditions: ResourcePreconditions::resource_version(99),
+                strict_resource_version: false,
             },
             CommandMeta {
                 command_id: CommandId::new(),
@@ -871,6 +1228,276 @@ mod cases {
         assert!(
             stored.data.pointer("/data/after").is_none(),
             "stale patch must not mutate live data"
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_apply_patch_allows_status_only_rv_advance() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "patch-status-overlap-deploy",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "patch-status-overlap-deploy",
+                        "namespace": "default",
+                        "uid": "patch-status-overlap-uid",
+                        "generation": 1
+                    },
+                    "spec": {"replicas": 1},
+                    "status": {"availableReplicas": 0}
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.update_status_only(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "patch-status-overlap-deploy",
+            json!({"availableReplicas": 1}),
+            Some(created.resource_version),
+        )
+        .await
+        .unwrap();
+
+        apply_command_to_backend(
+            &db,
+            StorageCommand::PatchResource {
+                api_version: "apps/v1".into(),
+                kind: "Deployment".into(),
+                namespace: Some("default".into()),
+                name: "patch-status-overlap-deploy".into(),
+                patch_kind: PatchKind::Merge,
+                patch: json!({"spec": {"replicas": 2}, "status": {"availableReplicas": 0}}),
+                preconditions: ResourcePreconditions::from_resource(&created),
+                strict_resource_version: false,
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 3,
+                uid: Some(created.uid.clone()),
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .expect("main patch must tolerate a concurrent status-only RV advance");
+
+        let stored = db
+            .get_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "patch-status-overlap-deploy",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.data.pointer("/spec/replicas"), Some(&json!(2)));
+        assert_eq!(
+            stored.data.pointer("/status/availableReplicas"),
+            Some(&json!(1)),
+            "main patch must preserve live status"
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_apply_patch_rejects_true_spec_conflict() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "patch-spec-conflict-deploy",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "patch-spec-conflict-deploy",
+                        "namespace": "default",
+                        "uid": "patch-spec-conflict-uid",
+                        "generation": 1
+                    },
+                    "spec": {"replicas": 1},
+                    "status": {"availableReplicas": 0}
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut live_update = (*created.data).clone();
+        live_update["metadata"]["generation"] = json!(2);
+        live_update["spec"]["replicas"] = json!(3);
+        db.update_main_resource_with_preconditions(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "patch-spec-conflict-deploy",
+            live_update,
+            ResourcePreconditions::from_resource(&created),
+        )
+        .await
+        .unwrap();
+
+        let err = apply_command_to_backend(
+            &db,
+            StorageCommand::PatchResource {
+                api_version: "apps/v1".into(),
+                kind: "Deployment".into(),
+                namespace: Some("default".into()),
+                name: "patch-spec-conflict-deploy".into(),
+                patch_kind: PatchKind::Merge,
+                patch: json!({"metadata": {"generation": 2}, "spec": {"replicas": 2}}),
+                preconditions: ResourcePreconditions::from_resource(&created),
+                strict_resource_version: false,
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 3,
+                uid: Some(created.uid.clone()),
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .expect_err("stale patch must still reject a real spec conflict");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected spec conflict, got: {err:#}"
+        );
+
+        let stored = db
+            .get_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "patch-spec-conflict-deploy",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.data.pointer("/spec/replicas"), Some(&json!(3)));
+    }
+
+    #[tokio::test]
+    async fn replicated_apply_patch_rejects_same_name_replacement() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "patch-replacement-deploy",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "patch-replacement-deploy",
+                        "namespace": "default",
+                        "uid": "old-patch-deploy-uid",
+                        "generation": 1
+                    },
+                    "spec": {"replicas": 1},
+                    "status": {"availableReplicas": 0}
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.delete_resource_with_preconditions(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "patch-replacement-deploy",
+            ResourcePreconditions::from_resource(&created),
+        )
+        .await
+        .unwrap();
+        let replacement = db
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "patch-replacement-deploy",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "patch-replacement-deploy",
+                        "namespace": "default",
+                        "uid": "new-patch-deploy-uid",
+                        "generation": 1
+                    },
+                    "spec": {"replicas": 1},
+                    "status": {"availableReplicas": 0}
+                }),
+            )
+            .await
+            .unwrap();
+        db.update_status_only(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "patch-replacement-deploy",
+            json!({"availableReplicas": 1}),
+            Some(replacement.resource_version),
+        )
+        .await
+        .unwrap();
+
+        let err = apply_command_to_backend(
+            &db,
+            StorageCommand::PatchResource {
+                api_version: "apps/v1".into(),
+                kind: "Deployment".into(),
+                namespace: Some("default".into()),
+                name: "patch-replacement-deploy".into(),
+                patch_kind: PatchKind::Merge,
+                patch: json!({"spec": {"replicas": 2}}),
+                preconditions: ResourcePreconditions::resource_version(created.resource_version),
+                strict_resource_version: false,
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 5,
+                uid: Some(created.uid.clone()),
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .expect_err("patch rebase must not cross a same-name replacement");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected replacement conflict, got: {err:#}"
+        );
+
+        let stored = db
+            .get_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "patch-replacement-deploy",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.uid, "new-patch-deploy-uid");
+        assert_eq!(stored.data.pointer("/spec/replicas"), Some(&json!(1)));
+        assert_eq!(
+            stored.data.pointer("/status/availableReplicas"),
+            Some(&json!(1))
         );
     }
 
@@ -1811,6 +2438,127 @@ mod cases {
         assert!(
             !err.to_string().contains("Query returned no rows"),
             "stale raft delete precondition must not leak sqlite no-rows as API/internal error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_mode_main_update_allows_status_only_rv_advance() {
+        let (ds, _calls) = make_ds_with_inline_proposer().await;
+
+        let created = ds
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "raft-status-overlap-deploy",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "raft-status-overlap-deploy",
+                        "namespace": "default",
+                        "uid": "raft-status-overlap-uid",
+                        "generation": 1
+                    },
+                    "spec": {"replicas": 1},
+                    "status": {"availableReplicas": 0}
+                }),
+            )
+            .await
+            .unwrap();
+
+        ds.update_status_only(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "raft-status-overlap-deploy",
+            json!({"availableReplicas": 1}),
+            Some(created.resource_version),
+        )
+        .await
+        .unwrap();
+
+        let mut proposed = (*created.data).clone();
+        proposed["spec"]["replicas"] = json!(2);
+        proposed["status"] = json!({"availableReplicas": 0});
+        let updated = ds
+            .update_main_resource_with_preconditions(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "raft-status-overlap-deploy",
+                proposed,
+                ResourcePreconditions::from_resource(&created),
+            )
+            .await
+            .expect("raft-routed main update must tolerate a status-only RV advance");
+
+        assert_eq!(updated.data.pointer("/spec/replicas"), Some(&json!(2)));
+        assert_eq!(
+            updated.data.pointer("/status/availableReplicas"),
+            Some(&json!(1)),
+            "raft-routed main update must preserve live status"
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_mode_patch_allows_status_only_rv_advance() {
+        let (ds, _calls) = make_ds_with_inline_proposer().await;
+
+        let created = ds
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "raft-patch-status-overlap-deploy",
+                json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "raft-patch-status-overlap-deploy",
+                        "namespace": "default",
+                        "uid": "raft-patch-status-overlap-uid",
+                        "generation": 1
+                    },
+                    "spec": {"replicas": 1},
+                    "status": {"availableReplicas": 0}
+                }),
+            )
+            .await
+            .unwrap();
+
+        ds.update_status_only(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "raft-patch-status-overlap-deploy",
+            json!({"availableReplicas": 1}),
+            Some(created.resource_version),
+        )
+        .await
+        .unwrap();
+
+        let updated = ds
+            .patch_resource_latest_with_preconditions(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "raft-patch-status-overlap-deploy",
+                ResourcePatchRequest::new(
+                    PatchKind::Merge,
+                    json!({"spec": {"replicas": 2}, "status": {"availableReplicas": 0}}),
+                    ResourcePreconditions::from_resource(&created),
+                ),
+            )
+            .await
+            .expect("raft-routed patch must tolerate a status-only RV advance")
+            .expect("deployment exists");
+
+        assert_eq!(updated.data.pointer("/spec/replicas"), Some(&json!(2)));
+        assert_eq!(
+            updated.data.pointer("/status/availableReplicas"),
+            Some(&json!(1)),
+            "raft-routed patch must preserve live status"
         );
     }
 

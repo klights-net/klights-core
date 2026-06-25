@@ -247,6 +247,8 @@ pub struct ProtoPatchResource {
     pub patch: Vec<u8>,
     #[prost(message, optional, tag = "7")]
     pub preconditions: Option<ProtoResourcePreconditions>,
+    #[prost(bool, tag = "8")]
+    pub strict_resource_version: bool,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

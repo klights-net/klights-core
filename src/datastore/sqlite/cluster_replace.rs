@@ -575,7 +575,7 @@ fn put_resource_row(
             validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
         }
         merge_status_only_row_with_existing(&mut row, existing.as_ref())?;
-        preserve_same_uid_pod_deletion_metadata_from_existing(&mut row, existing.as_ref())?;
+        preserve_same_uid_server_metadata_from_existing(&mut row, existing.as_ref())?;
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         if existing.as_ref().is_some_and(|(rv, _uid, existing_bytes)| {
@@ -677,7 +677,7 @@ fn put_resource_row(
             validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
         }
         merge_status_only_row_with_existing(&mut row, existing.as_ref())?;
-        preserve_same_uid_pod_deletion_metadata_from_existing(&mut row, existing.as_ref())?;
+        preserve_same_uid_server_metadata_from_existing(&mut row, existing.as_ref())?;
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         if existing.as_ref().is_some_and(|(rv, _uid, existing_bytes)| {
@@ -1117,14 +1117,11 @@ fn merge_status_only_row_with_existing(
     Ok(())
 }
 
-fn preserve_same_uid_pod_deletion_metadata_from_existing(
+fn preserve_same_uid_server_metadata_from_existing(
     row: &mut LogApplyResourceRow,
     existing: Option<&(i64, String, Vec<u8>)>,
 ) -> tokio_rusqlite::Result<()> {
-    if row.api_version != "v1" || row.kind != "Pod" {
-        return Ok(());
-    }
-    let Some((_current_rv, current_uid, existing_bytes)) = existing else {
+    let Some((current_rv, current_uid, existing_bytes)) = existing else {
         return Ok(());
     };
     let fallback_uid = if row.uid.is_empty() {
@@ -1140,42 +1137,58 @@ fn preserve_same_uid_pod_deletion_metadata_from_existing(
 
     let existing_data: serde_json::Value =
         serde_json::from_slice(existing_bytes).map_err(serde_to_sqlite_error)?;
-    let Some(existing_meta) = existing_data
-        .get("metadata")
-        .and_then(|value| value.as_object())
-    else {
-        return Ok(());
-    };
-    let Some(deletion_timestamp) = existing_meta
-        .get("deletionTimestamp")
-        .filter(|value| !value.is_null())
-        .filter(|value| {
-            value
-                .as_str()
-                .is_none_or(|timestamp| !timestamp.trim().is_empty())
-        })
-        .cloned()
-    else {
-        return Ok(());
-    };
-    let Some(row_object) = row.data.as_object_mut() else {
-        return Ok(());
-    };
-    let metadata = row_object
-        .entry("metadata".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let Some(metadata_object) = metadata.as_object_mut() else {
-        return Ok(());
-    };
-    metadata_object.insert("deletionTimestamp".to_string(), deletion_timestamp);
-    if let Some(grace) = existing_meta
-        .get("deletionGracePeriodSeconds")
-        .filter(|value| !value.is_null())
+    crate::datastore::sqlite::resource_shape::preserve_server_metadata_fields_from_existing(
+        &mut row.data,
+        &existing_data,
+    );
+    if row
+        .precondition_resource_version
+        .is_some_and(|expected| expected != *current_rv)
     {
-        metadata_object.insert("deletionGracePeriodSeconds".to_string(), grace.clone());
+        preserve_finalizers_from_existing(&mut row.data, &existing_data);
     }
-    crate::resource_semantics::mark_terminating_pod_unready(&mut row.data);
+    if row.api_version == "v1"
+        && row.kind == "Pod"
+        && existing_data
+            .pointer("/metadata/deletionTimestamp")
+            .filter(|value| !value.is_null())
+            .filter(|value| {
+                value
+                    .as_str()
+                    .is_none_or(|timestamp| !timestamp.trim().is_empty())
+            })
+            .is_some()
+    {
+        crate::resource_semantics::mark_terminating_pod_unready(&mut row.data);
+    }
     Ok(())
+}
+
+fn preserve_finalizers_from_existing(data: &mut serde_json::Value, existing: &serde_json::Value) {
+    let Some(existing_finalizers) = existing
+        .pointer("/metadata/finalizers")
+        .and_then(|value| value.as_array())
+        .filter(|finalizers| !finalizers.is_empty())
+    else {
+        return;
+    };
+    let Some(metadata) = data
+        .get_mut("metadata")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    let mut merged = metadata
+        .get("finalizers")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for finalizer in existing_finalizers {
+        if !merged.iter().any(|value| value == finalizer) {
+            merged.push(finalizer.clone());
+        }
+    }
+    metadata.insert("finalizers".to_string(), serde_json::Value::Array(merged));
 }
 
 fn validate_put_resource_apply_preconditions(
@@ -2726,6 +2739,128 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(false),
             "terminating Pod container readiness must stay false"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_put_preserves_existing_deletion_metadata_for_non_pod_same_uid() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "terminating-deploy",
+            serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "name": "terminating-deploy",
+                    "namespace": "default",
+                    "uid": "deploy-uid",
+                    "generation": 1
+                },
+                "spec": {"replicas": 1},
+                "status": {"availableReplicas": 1}
+            }),
+        )
+        .await
+        .unwrap();
+        let existing = db
+            .get_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "terminating-deploy",
+            )
+            .await
+            .unwrap()
+            .expect("deployment exists before delete mark");
+        let mut deleting = (*existing.data).clone();
+        deleting["metadata"]["deletionTimestamp"] = serde_json::json!("2026-06-25T02:35:00Z");
+        deleting["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(30);
+        deleting["metadata"]["finalizers"] = serde_json::json!(["example.com/protect"]);
+        db.update_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "terminating-deploy",
+            deleting,
+            existing.resource_version,
+        )
+        .await
+        .unwrap();
+
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                61,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "apps/v1".to_string(),
+                    kind: "Deployment".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "terminating-deploy".to_string(),
+                    uid: "deploy-uid".to_string(),
+                    resource_version: 61,
+                    data: serde_json::json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": {
+                            "name": "terminating-deploy",
+                            "namespace": "default",
+                            "uid": "deploy-uid",
+                            "resourceVersion": "61",
+                            "generation": 2
+                        },
+                        "spec": {"replicas": 2},
+                        "status": {"availableReplicas": 1}
+                    }),
+                    require_absent: false,
+                    require_existing: false,
+                    precondition_uid: Some("deploy-uid".to_string()),
+                    precondition_resource_version: Some(existing.resource_version),
+                    status_only: false,
+                })],
+            ))
+            .await
+            .expect("raft put applies");
+        assert!(
+            result.error_message.is_none(),
+            "committed Deployment PUT must succeed: {result:?}"
+        );
+
+        let row = db
+            .get_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "terminating-deploy",
+            )
+            .await
+            .unwrap()
+            .expect("deployment remains after committed put");
+        assert_eq!(
+            row.data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(|v| v.as_str()),
+            Some("2026-06-25T02:35:00Z"),
+            "same-UID non-Pod PUT must not erase a live deletionTimestamp"
+        );
+        assert_eq!(
+            row.data
+                .pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(|v| v.as_i64()),
+            Some(30),
+            "same-UID non-Pod PUT must not erase deletion grace"
+        );
+        assert_eq!(
+            row.data
+                .pointer("/metadata/finalizers/0")
+                .and_then(|v| v.as_str()),
+            Some("example.com/protect"),
+            "stale same-UID non-Pod PUT must not erase live finalizers"
+        );
+        assert_eq!(
+            row.data.pointer("/spec/replicas"),
+            Some(&serde_json::json!(2))
         );
     }
 

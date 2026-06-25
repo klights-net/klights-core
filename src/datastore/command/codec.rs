@@ -289,6 +289,7 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 patch_kind,
                 patch,
                 preconditions,
+                strict_resource_version,
             } => proto_storage_command::Command::PatchResource(ProtoPatchResource {
                 api_version,
                 kind,
@@ -299,6 +300,7 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 },
                 patch: json_to_bytes(&patch),
                 preconditions: Some(preconditions.into()),
+                strict_resource_version,
             }),
             StorageCommand::UpdateStatus {
                 api_version,
@@ -540,6 +542,7 @@ impl TryFrom<ProtoStorageCommand> for StorageCommand {
                 },
                 patch: bytes_to_json(&p.patch),
                 preconditions: decode_preconditions(p.preconditions, "PatchResource")?,
+                strict_resource_version: p.strict_resource_version,
             },
             proto_storage_command::Command::UpdateStatus(p) => StorageCommand::UpdateStatus {
                 api_version: p.api_version,
@@ -945,6 +948,7 @@ mod tests {
                     patch_kind: PatchKind::Merge,
                     patch: json!({"metadata": {"labels": {"app": "test"}}}),
                     preconditions: uid_preconditions("uid-abc-123"),
+                    strict_resource_version: true,
                 },
                 "PatchResource",
             ),
@@ -1835,6 +1839,7 @@ mod tests {
                 patch_kind: PatchKind::Merge,
                 patch: json!({"metadata": {"labels": {"app": "test"}}}),
                 preconditions: uid_preconditions("uid-a"),
+                strict_resource_version: true,
             },
             StorageCommand::DeleteResource {
                 api_version: "v1".into(),

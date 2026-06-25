@@ -582,6 +582,7 @@ impl DatastoreBackend for RedbDatastore {
             patch_kind,
             patch,
             preconditions,
+            strict_resource_version: _,
         } = request;
         if preconditions.uid.is_some() || preconditions.resource_version.is_some() {
             let Some(resource) = self.resources.get_res(a, k, ns, n).await? else {

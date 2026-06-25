@@ -77,13 +77,19 @@ impl DatastoreApplier for Datastore {
                 patch_kind,
                 patch,
                 preconditions,
+                strict_resource_version,
             } => {
                 self.patch_resource_latest_with_preconditions(
                     &api_version,
                     &kind,
                     namespace.as_deref(),
                     &name,
-                    crate::datastore::ResourcePatchRequest::new(patch_kind, patch, preconditions),
+                    crate::datastore::ResourcePatchRequest {
+                        patch_kind,
+                        patch,
+                        preconditions,
+                        strict_resource_version,
+                    },
                 )
                 .await?;
             }

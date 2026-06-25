@@ -341,6 +341,8 @@ pub struct ResourcePatchRequest {
     pub patch_kind: PatchKind,
     pub patch: Value,
     pub preconditions: ResourcePreconditions,
+    #[serde(default)]
+    pub strict_resource_version: bool,
 }
 
 impl ResourcePatchRequest {
@@ -349,11 +351,17 @@ impl ResourcePatchRequest {
             patch_kind,
             patch,
             preconditions,
+            strict_resource_version: false,
         }
     }
 
     pub fn without_preconditions(patch_kind: PatchKind, patch: Value) -> Self {
         Self::new(patch_kind, patch, ResourcePreconditions::default())
+    }
+
+    pub fn with_strict_resource_version(mut self) -> Self {
+        self.strict_resource_version = true;
+        self
     }
 }
 

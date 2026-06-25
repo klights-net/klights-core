@@ -439,6 +439,7 @@ mod tests {
                 uid: Some("u-6".into()),
                 resource_version: None,
             },
+            strict_resource_version: false,
         };
         assert_eq!(
             subject_key_for_command(&cmd),

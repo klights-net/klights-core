@@ -10205,6 +10205,7 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
             patch_kind,
             patch,
             preconditions,
+            strict_resource_version,
         } => {
             assert_eq!(api_version, "v1");
             assert_eq!(kind, "Pod");
@@ -10216,6 +10217,7 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
                 Some("uid-missing-delete-mark")
             );
             assert_eq!(preconditions.resource_version, None);
+            assert!(!strict_resource_version);
             assert_eq!(
                 patch.pointer("/metadata/deletionGracePeriodSeconds"),
                 Some(&json!(7))

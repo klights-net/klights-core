@@ -256,6 +256,39 @@ pub(super) fn preserve_server_metadata_fields_from_existing(data: &mut Value, ex
     }
 }
 
+pub(super) fn resource_client_owned_state_equal(left: &Value, right: &Value) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    strip_status_and_server_metadata(&mut left);
+    strip_status_and_server_metadata(&mut right);
+    left == right
+}
+
+fn strip_status_and_server_metadata(value: &mut Value) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    obj.remove("status");
+
+    let Some(metadata) = obj
+        .get_mut("metadata")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    for key in [
+        "resourceVersion",
+        "uid",
+        "creationTimestamp",
+        "generation",
+        "deletionTimestamp",
+        "deletionGracePeriodSeconds",
+        "managedFields",
+    ] {
+        metadata.remove(key);
+    }
+}
+
 pub(super) fn ensure_pod_status_ip_arrays(data: &mut Value, api_version: &str, kind: &str) {
     if api_version != "v1" || kind != "Pod" {
         return;

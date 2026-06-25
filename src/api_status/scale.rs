@@ -217,7 +217,8 @@ async fn update_apps_v1_scale(
                     uid: Some(resource.uid),
                     resource_version: expected_resource_version,
                 },
-            ),
+            )
+            .with_strict_resource_version(),
         )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind.to_lowercase(), name)))?;
@@ -540,7 +541,8 @@ pub async fn update_replicationcontroller_scale(
                     uid: Some(rc.uid),
                     resource_version: expected_resource_version,
                 },
-            ),
+            )
+            .with_strict_resource_version(),
         )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("replicationcontroller {} not found", name)))?;
