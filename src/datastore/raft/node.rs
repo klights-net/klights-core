@@ -628,20 +628,26 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
                 err.to_string(),
             ));
         }
-        // Outbox writes are durable and retryable. This includes worker status
-        // dispatch and leader-side controller status paths routed through
-        // propose_outbox_on_backend. Under WAN loss they must not sit behind
-        // user-facing API writes in the fair proposal queue until the gRPC
-        // deadline; shed load quickly and let the caller's outbox/reconcile retry.
-        let flow_permit = if outbox_operation_uses_priority_permit(operation) {
-            self.flow_control.try_acquire_priority()
+        // Control-critical outbox writes retain a reserved fast path. Pod
+        // status writes wait asynchronously on the normal gate: at 200 ms RTT,
+        // immediate retry/backoff can hide readiness for seconds while the
+        // runtime has already started the Pod. Waiting here still happens
+        // before build_log_apply_commit_for_outbox reserves an RV, so status
+        // traffic cannot build a committed-RV backlog ahead of raft progress.
+        let _flow_permit = if outbox_operation_uses_priority_permit(operation) {
+            self.flow_control.try_acquire_priority().ok_or_else(|| {
+                crate::kubelet::outbox::OutboxApplyError::Retryable(
+                    "raft proposal flow control saturated; retry outbox later".to_string(),
+                )
+            })?
+        } else if outbox_operation_waits_for_permit(operation) {
+            self.flow_control.acquire().await
         } else {
-            self.flow_control.try_acquire()
-        };
-        let Some(_flow_permit) = flow_permit else {
-            return Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
-                "raft proposal flow control saturated; retry outbox later".to_string(),
-            ));
+            self.flow_control.try_acquire().ok_or_else(|| {
+                crate::kubelet::outbox::OutboxApplyError::Retryable(
+                    "raft proposal flow control saturated; retry outbox later".to_string(),
+                )
+            })?
         };
         let payload_bytes = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
             .encode_protobuf()
@@ -737,6 +743,19 @@ fn outbox_operation_uses_priority_permit(operation: &str) -> bool {
         Ok(OutboxOperation::NodeRegistration)
             | Ok(OutboxOperation::NodeDataplane)
             | Ok(OutboxOperation::NodeStatus)
+    )
+}
+
+fn outbox_operation_waits_for_permit(operation: &str) -> bool {
+    use crate::kubelet::outbox::payload::OutboxOperation;
+    matches!(
+        OutboxOperation::try_from(operation),
+        Ok(OutboxOperation::PodStatus)
+            | Ok(OutboxOperation::RuntimeReconcile)
+            | Ok(OutboxOperation::ProbeReadiness)
+            | Ok(OutboxOperation::DeadlineExceeded)
+            | Ok(OutboxOperation::ContainerStatusSnapshot)
+            | Ok(OutboxOperation::EphemeralContainerStatuses)
     )
 }
 
@@ -2514,13 +2533,13 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// The outbox proposer path preserves a caller-provided idempotency key, but it
-    /// must not queue behind the same fair flow-control gate as API writes. Retryable
-    /// outbox writes include worker status dispatch and leader-side controller status
-    /// paths; under packet loss they should shed load quickly instead of holding a
-    /// gRPC lane until the client deadline and starving user-facing writes.
+    /// Pod status outbox writes are durable but latency-sensitive; when the
+    /// flow-control gate is saturated they should wait on the async permit
+    /// instead of bouncing into node-local retry/backoff. The wait must happen
+    /// before resourceVersion reservation so status traffic still cannot build
+    /// an RV backlog ahead of raft progress.
     #[tokio::test]
-    async fn raft_outbox_proposal_fails_fast_when_flow_control_is_saturated() {
+    async fn raft_pod_status_outbox_waits_for_flow_control_without_reserving_rv() {
         use crate::datastore::replicated::RaftProposer;
 
         let (node, backend) = fresh_node(75).await;
@@ -2539,48 +2558,39 @@ mod tests {
         assert_eq!(node.flow_control.available_permits(), 0);
 
         let rv_before = backend.get_current_resource_version().await.unwrap();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(300),
-            node.propose_outbox_command(
+        {
+            let proposal = node.propose_outbox_command(
                 "outbox-permit-ordering",
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
                 propose_create_command("outbox-permit-ordering"),
                 "worker-1",
-            ),
-        )
-        .await
-        .expect("saturated outbox proposal must fail fast, not wait for the gRPC deadline");
-        let err = result.expect_err("saturated outbox proposal must be retryable");
-        assert!(
-            matches!(
-                err,
-                crate::kubelet::outbox::OutboxApplyError::Retryable(ref message)
-                    if message.contains("raft proposal flow control saturated")
-            ),
-            "unexpected saturated outbox error: {err}"
-        );
+            );
+            tokio::pin!(proposal);
+            tokio::select! {
+                result = &mut proposal => {
+                    panic!("saturated PodStatus outbox proposal must wait for capacity, got {result:?}");
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
 
-        let rv_during = backend.get_current_resource_version().await.unwrap();
-        assert_eq!(
-            rv_during, rv_before,
-            "outbox propose must not reserve an rv when it sheds load under flow-control saturation"
-        );
+            let rv_during = backend.get_current_resource_version().await.unwrap();
+            assert_eq!(
+                rv_during, rv_before,
+                "outbox propose must not reserve an rv while waiting for a flow-control permit"
+            );
 
-        drop(held);
+            drop(held);
 
-        let retry_result = node
-            .propose_outbox_command(
-                "outbox-permit-ordering",
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
-                propose_create_command("outbox-permit-ordering"),
-                "worker-1",
-            )
-            .await
-            .expect("retry after capacity returns must succeed with the same idempotency key");
-        assert!(matches!(
-            retry_result,
-            crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
-        ));
+            let retry_result =
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut proposal)
+                    .await
+                    .expect("PodStatus outbox proposal must complete after capacity returns")
+                    .expect("PodStatus outbox proposal should succeed after capacity returns");
+            assert!(matches!(
+                retry_result,
+                crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
+            ));
+        }
         node.shutdown().await.unwrap();
     }
 
@@ -2644,6 +2654,29 @@ mod tests {
                 outbox_operation_uses_priority_permit(operation.as_str()),
                 expected,
                 "{operation:?} priority classification mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn outbox_waiting_permit_classifier_is_explicit() {
+        use crate::kubelet::outbox::payload::OutboxOperation;
+
+        let cases = [
+            (OutboxOperation::PodStatus, true),
+            (OutboxOperation::RuntimeReconcile, true),
+            (OutboxOperation::ProbeReadiness, true),
+            (OutboxOperation::DeadlineExceeded, true),
+            (OutboxOperation::ContainerStatusSnapshot, true),
+            (OutboxOperation::EphemeralContainerStatuses, true),
+            (OutboxOperation::NodeStatus, false),
+            (OutboxOperation::EventCreate, false),
+        ];
+        for (operation, expected) in cases {
+            assert_eq!(
+                outbox_operation_waits_for_permit(operation.as_str()),
+                expected,
+                "{operation:?} waiting classification mismatch"
             );
         }
     }
