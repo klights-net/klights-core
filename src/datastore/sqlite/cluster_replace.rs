@@ -1161,10 +1161,14 @@ fn preserve_newer_same_uid_row_on_stale_committed_put(
     {
         return Ok(());
     }
-    if crate::datastore::sqlite::resource_shape::resource_client_owned_state_equal(
-        &existing_data,
-        &row.data,
-    ) {
+
+    let Some(existing_generation) = metadata_generation(&existing_data) else {
+        return Ok(());
+    };
+    let Some(incoming_generation) = metadata_generation(&row.data) else {
+        return Ok(());
+    };
+    if incoming_generation >= existing_generation {
         return Ok(());
     }
 
@@ -1184,6 +1188,11 @@ fn preserve_newer_same_uid_row_on_stale_committed_put(
     row.uid = current_uid.clone();
     row.data = existing_data;
     Ok(())
+}
+
+fn metadata_generation(data: &serde_json::Value) -> Option<i64> {
+    data.pointer("/metadata/generation")
+        .and_then(|value| value.as_i64())
 }
 
 fn preserve_same_uid_server_metadata_from_existing(
@@ -2766,6 +2775,104 @@ mod tests {
         assert_eq!(
             row.resource_version, 60,
             "stale committed PUT still advances materialized raft resourceVersion"
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_generation_committed_put_applies_after_status_only_rv_advance() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "web",
+                serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "web",
+                        "namespace": "default",
+                        "uid": "deploy-newer-generation-put-uid",
+                        "generation": 2
+                    },
+                    "spec": {"replicas": 10},
+                    "status": {"replicas": 13, "availableReplicas": 8}
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.update_status_only_with_preconditions(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "web",
+            serde_json::json!({
+                "replicas": 13,
+                "availableReplicas": 8,
+                "observedGeneration": 2
+            }),
+            crate::datastore::ResourcePreconditions::uid(created.uid.clone()),
+        )
+        .await
+        .expect("status update advances RV before stale-precondition scale PUT apply");
+
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                60,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "apps/v1".to_string(),
+                    kind: "Deployment".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "web".to_string(),
+                    uid: "deploy-newer-generation-put-uid".to_string(),
+                    resource_version: 60,
+                    data: serde_json::json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": {
+                            "name": "web",
+                            "namespace": "default",
+                            "uid": "deploy-newer-generation-put-uid",
+                            "resourceVersion": "60",
+                            "generation": 3
+                        },
+                        "spec": {"replicas": 30},
+                        "status": {
+                            "replicas": 13,
+                            "availableReplicas": 8,
+                            "observedGeneration": 2
+                        }
+                    }),
+                    require_absent: false,
+                    require_existing: true,
+                    precondition_uid: Some("deploy-newer-generation-put-uid".to_string()),
+                    precondition_resource_version: Some(created.resource_version),
+                    status_only: false,
+                })],
+            ))
+            .await
+            .expect("newer-generation committed PUT should apply after status RV advance");
+        assert!(
+            result.error_message.is_none(),
+            "newer-generation committed PUT must not fail raft apply: {result:?}"
+        );
+
+        let row = db
+            .get_resource("apps/v1", "Deployment", Some("default"), "web")
+            .await
+            .unwrap()
+            .expect("deployment remains after newer-generation committed put");
+        assert_eq!(
+            row.data.pointer("/spec/replicas"),
+            Some(&serde_json::json!(30)),
+            "newer-generation stale-precondition committed PUT must apply the scale update"
+        );
+        assert_eq!(
+            row.data.pointer("/metadata/generation"),
+            Some(&serde_json::json!(3)),
+            "newer-generation stale-precondition committed PUT must publish the new generation"
         );
     }
 
