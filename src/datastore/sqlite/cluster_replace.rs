@@ -575,6 +575,7 @@ fn put_resource_row(
             validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
         }
         merge_status_only_row_with_existing(&mut row, existing.as_ref())?;
+        preserve_newer_same_uid_row_on_stale_committed_put(&mut row, existing.as_ref())?;
         preserve_same_uid_server_metadata_from_existing(&mut row, existing.as_ref())?;
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -677,6 +678,7 @@ fn put_resource_row(
             validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
         }
         merge_status_only_row_with_existing(&mut row, existing.as_ref())?;
+        preserve_newer_same_uid_row_on_stale_committed_put(&mut row, existing.as_ref())?;
         preserve_same_uid_server_metadata_from_existing(&mut row, existing.as_ref())?;
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -1114,6 +1116,73 @@ fn merge_status_only_row_with_existing(
     );
     row.uid = current_uid.clone();
     row.data = live;
+    Ok(())
+}
+
+fn preserve_newer_same_uid_row_on_stale_committed_put(
+    row: &mut LogApplyResourceRow,
+    existing: Option<&(i64, String, Vec<u8>)>,
+) -> tokio_rusqlite::Result<()> {
+    if row.status_only {
+        return Ok(());
+    }
+    let Some(expected_rv) = row.precondition_resource_version else {
+        return Ok(());
+    };
+    let Some((current_rv, current_uid, existing_bytes)) = existing else {
+        return Ok(());
+    };
+    if expected_rv >= *current_rv {
+        return Ok(());
+    }
+
+    let fallback_uid = if row.uid.is_empty() {
+        None
+    } else {
+        Some(row.uid.as_str())
+    };
+    let incoming_uid =
+        crate::datastore::sqlite::resource_shape::metadata_uid(&row.data).or(fallback_uid);
+    if incoming_uid != Some(current_uid.as_str()) {
+        return Ok(());
+    }
+
+    let mut existing_data: serde_json::Value =
+        serde_json::from_slice(existing_bytes).map_err(serde_to_sqlite_error)?;
+    if existing_data
+        .pointer("/metadata/deletionTimestamp")
+        .filter(|value| !value.is_null())
+        .filter(|value| {
+            value
+                .as_str()
+                .is_none_or(|timestamp| !timestamp.trim().is_empty())
+        })
+        .is_some()
+    {
+        return Ok(());
+    }
+    if crate::datastore::sqlite::resource_shape::resource_client_owned_state_equal(
+        &existing_data,
+        &row.data,
+    ) {
+        return Ok(());
+    }
+
+    existing_data = crate::datastore::sqlite::resource_shape::hydrate_watch_event_data(
+        existing_data,
+        &row.api_version,
+        &row.kind,
+        row.namespace.as_deref(),
+        &row.name,
+        row.resource_version,
+    );
+    crate::datastore::sqlite::resource_shape::ensure_pod_status_ip_arrays(
+        &mut existing_data,
+        &row.api_version,
+        &row.kind,
+    );
+    row.uid = current_uid.clone();
+    row.data = existing_data;
     Ok(())
 }
 
@@ -2601,6 +2670,103 @@ mod tests {
             "row data must reflect the committed value"
         );
         assert_eq!(row.resource_version, 60, "row must carry the committed rv");
+    }
+
+    #[tokio::test]
+    async fn stale_same_uid_committed_put_does_not_revert_newer_client_owned_state() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "apps/v1",
+                "Deployment",
+                Some("default"),
+                "web",
+                serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "web",
+                        "namespace": "default",
+                        "uid": "deploy-stale-put-uid",
+                        "generation": 2
+                    },
+                    "spec": {"replicas": 10},
+                    "status": {"replicas": 13, "availableReplicas": 8}
+                }),
+            )
+            .await
+            .unwrap();
+
+        let mut scaled = (*created.data).clone();
+        scaled["metadata"]["generation"] = serde_json::json!(3);
+        scaled["spec"]["replicas"] = serde_json::json!(30);
+        db.update_resource(
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "web",
+            scaled,
+            created.resource_version,
+        )
+        .await
+        .unwrap();
+
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                60,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "apps/v1".to_string(),
+                    kind: "Deployment".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "web".to_string(),
+                    uid: "deploy-stale-put-uid".to_string(),
+                    resource_version: 60,
+                    data: serde_json::json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": {
+                            "name": "web",
+                            "namespace": "default",
+                            "uid": "deploy-stale-put-uid",
+                            "resourceVersion": "60",
+                            "generation": 2
+                        },
+                        "spec": {"replicas": 10},
+                        "status": {"replicas": 13, "availableReplicas": 8}
+                    }),
+                    require_absent: false,
+                    require_existing: true,
+                    precondition_uid: Some("deploy-stale-put-uid".to_string()),
+                    precondition_resource_version: Some(created.resource_version),
+                    status_only: false,
+                })],
+            ))
+            .await
+            .expect("stale committed PUT should apply without surfacing a state-machine error");
+        assert!(
+            result.error_message.is_none(),
+            "stale committed PUT must not fail the raft apply: {result:?}"
+        );
+
+        let row = db
+            .get_resource("apps/v1", "Deployment", Some("default"), "web")
+            .await
+            .unwrap()
+            .expect("deployment remains after stale committed put");
+        assert_eq!(
+            row.data.pointer("/spec/replicas"),
+            Some(&serde_json::json!(30)),
+            "same-UID stale committed PUT must not roll back a newer Deployment scale update"
+        );
+        assert_eq!(
+            row.data.pointer("/metadata/generation"),
+            Some(&serde_json::json!(3)),
+            "same-UID stale committed PUT must preserve the newer client-owned generation"
+        );
+        assert_eq!(
+            row.resource_version, 60,
+            "stale committed PUT still advances materialized raft resourceVersion"
+        );
     }
 
     #[tokio::test]
