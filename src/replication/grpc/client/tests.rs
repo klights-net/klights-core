@@ -1804,9 +1804,10 @@ mod cases {
     #[test]
     fn is_transport_status_classifies_connection_failures_only() {
         use tonic::Status;
-        let cases: [(Status, bool); 7] = [
+        let cases: [(Status, bool); 8] = [
             (Status::unavailable("error trying to connect"), true),
             (Status::unknown("h2 protocol error: connection reset"), true),
+            (Status::cancelled("stream reset by peer"), true),
             (Status::failed_precondition("not raft leader"), false),
             (Status::not_found("missing"), false),
             (Status::already_exists("dup"), false),

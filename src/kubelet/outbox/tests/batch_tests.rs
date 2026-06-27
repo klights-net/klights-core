@@ -48,6 +48,19 @@ fn pod_status_command(namespace: &str, name: &str, uid: &str) -> StorageCommand 
     }
 }
 
+fn pod_delete_command(namespace: &str, name: &str, uid: &str) -> StorageCommand {
+    StorageCommand::DeleteResource {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some(namespace.to_string()),
+        name: name.to_string(),
+        preconditions: ResourcePreconditions {
+            uid: Some(uid.to_string()),
+            resource_version: None,
+        },
+    }
+}
+
 /// A fake apply client that records calls. Responses must be pre-loaded
 /// via `push_responses`: each call pops the next response from the stack.
 #[derive(Default)]
@@ -358,6 +371,345 @@ async fn batch_claim_blocks_younger_same_subject_while_older_leased() {
             .iter()
             .map(|r| &r.idempotency_key)
             .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn single_claim_allows_actor_finalize_delete_to_leapfrog_backed_off_pod_status() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+    let subject = OutboxSubject::new(
+        "v1/Pod/default/web/uid-web",
+        Some("default".to_string()),
+        "web",
+        Some("uid-web".to_string()),
+    );
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-status-backoff",
+            OutboxOperation::PodStatus,
+            OutboxSubject::new(
+                subject.key.clone(),
+                subject.namespace.clone(),
+                subject.name.clone(),
+                subject.uid.clone(),
+            ),
+            "uid-web",
+            pod_status_command("default", "web", "uid-web"),
+            1_000,
+        ))
+        .await
+        .expect("enqueue status");
+    let status = node_db
+        .claim_next_due_outbox(1_000, 100, "status-lease")
+        .await
+        .expect("claim status")
+        .expect("status row due");
+    assert_eq!(status.idempotency_key, "web-status-backoff");
+    node_db
+        .mark_outbox_attempt_failed(status.id, "status-lease", 30_000, "transport down")
+        .await
+        .expect("back off status");
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-actor-finalize-delete",
+            OutboxOperation::PodMetadata,
+            subject,
+            "uid-web",
+            pod_delete_command("default", "web", "uid-web"),
+            1_001,
+        ))
+        .await
+        .expect("enqueue actor finalize delete");
+
+    let claimed = node_db
+        .claim_next_due_outbox(1_001, 100, "delete-lease")
+        .await
+        .expect("claim delete")
+        .expect("actor-finalize delete must be due despite older status backoff");
+    assert_eq!(claimed.idempotency_key, "web-actor-finalize-delete");
+}
+
+#[tokio::test]
+async fn batch_claim_allows_actor_finalize_delete_to_leapfrog_backed_off_pod_status() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+    let subject = "v1/Pod/default/web/uid-web";
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-status-backoff-batch",
+            OutboxOperation::PodStatus,
+            OutboxSubject::new(
+                subject,
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_status_command("default", "web", "uid-web"),
+            1_000,
+        ))
+        .await
+        .expect("enqueue status");
+    let status = node_db
+        .claim_due_outbox_batch(1_000, 16, 100, "status-batch-lease")
+        .await
+        .expect("claim status batch")
+        .pop()
+        .expect("status row due");
+    assert_eq!(status.idempotency_key, "web-status-backoff-batch");
+    node_db
+        .mark_outbox_attempt_failed(status.id, "status-batch-lease", 30_000, "transport down")
+        .await
+        .expect("back off status");
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-actor-finalize-delete-batch",
+            OutboxOperation::PodMetadata,
+            OutboxSubject::new(
+                subject,
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_delete_command("default", "web", "uid-web"),
+            1_001,
+        ))
+        .await
+        .expect("enqueue actor finalize delete");
+
+    let claimed = node_db
+        .claim_due_outbox_batch(1_001, 16, 100, "delete-batch-lease")
+        .await
+        .expect("claim delete batch");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(
+        claimed[0].idempotency_key,
+        "web-actor-finalize-delete-batch"
+    );
+}
+
+#[tokio::test]
+async fn batch_claim_leases_only_terminal_delete_when_older_status_is_also_due() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+    let subject = "v1/Pod/default/web/uid-web";
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-status-due-with-delete",
+            OutboxOperation::PodStatus,
+            OutboxSubject::new(
+                subject,
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_status_command("default", "web", "uid-web"),
+            1_000,
+        ))
+        .await
+        .expect("enqueue status");
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-actor-finalize-delete-due",
+            OutboxOperation::PodMetadata,
+            OutboxSubject::new(
+                subject,
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_delete_command("default", "web", "uid-web"),
+            1_001,
+        ))
+        .await
+        .expect("enqueue actor finalize delete");
+
+    let claimed = node_db
+        .claim_due_outbox_batch(1_001, 16, 100, "delete-only-batch-lease")
+        .await
+        .expect("claim delete batch");
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|row| row.idempotency_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["web-actor-finalize-delete-due"],
+        "terminal delete must be the only leased row for this subject"
+    );
+}
+
+#[tokio::test]
+async fn terminal_delete_apply_completes_older_superseded_status_rows() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+    let client = Arc::new(StackApplyClient::default());
+    let dispatcher = OutboxDispatcher::batch_mode_for_tests(node_db.clone(), client.clone(), 16);
+    let subject = "v1/Pod/default/web/uid-web";
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-status-superseded",
+            OutboxOperation::PodStatus,
+            OutboxSubject::new(
+                subject,
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_status_command("default", "web", "uid-web"),
+            1_000,
+        ))
+        .await
+        .expect("enqueue status");
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-actor-finalize-delete-cleans-status",
+            OutboxOperation::PodMetadata,
+            OutboxSubject::new(
+                subject,
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_delete_command("default", "web", "uid-web"),
+            1_001,
+        ))
+        .await
+        .expect("enqueue actor finalize delete");
+
+    client
+        .push_response(Ok(OutboxApplyResult::Applied { applied_rv: 10 }))
+        .await;
+    assert_eq!(
+        dispatcher
+            .dispatch_due_once(1_001)
+            .await
+            .expect("dispatch terminal delete"),
+        DispatchOutcome::Dispatched
+    );
+
+    assert!(
+        node_db
+            .claim_next_due_outbox(30_000, 100, "after-delete")
+            .await
+            .expect("claim after terminal delete")
+            .is_none(),
+        "older superseded status rows must be completed after terminal delete applies"
+    );
+}
+
+#[tokio::test]
+async fn nonterminal_status_remains_fifo_blocked_by_older_backed_off_status() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+    let subject = "v1/Pod/default/web/uid-web";
+
+    for (key, at) in [("older-status", 1_000), ("younger-status", 1_001)] {
+        outbox
+            .enqueue_command(OutboxCommand::new(
+                key,
+                OutboxOperation::PodStatus,
+                OutboxSubject::new(
+                    subject,
+                    Some("default".to_string()),
+                    "web",
+                    Some("uid-web".to_string()),
+                ),
+                "uid-web",
+                pod_status_command("default", "web", "uid-web"),
+                at,
+            ))
+            .await
+            .expect("enqueue status");
+    }
+
+    let older = node_db
+        .claim_next_due_outbox(1_000, 100, "older-lease")
+        .await
+        .expect("claim older status")
+        .expect("older status due");
+    node_db
+        .mark_outbox_attempt_failed(older.id, "older-lease", 30_000, "transport down")
+        .await
+        .expect("back off older status");
+
+    assert!(
+        node_db
+            .claim_next_due_outbox(1_001, 100, "younger-lease")
+            .await
+            .expect("claim younger status")
+            .is_none(),
+        "a younger non-terminal status row must remain blocked by the older status backoff"
+    );
+}
+
+#[tokio::test]
+async fn actor_finalize_delete_for_replacement_uid_is_not_blocked_by_old_uid_status() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "old-web-status-backoff",
+            OutboxOperation::PodStatus,
+            OutboxSubject::new(
+                "v1/Pod/default/web/uid-old",
+                Some("default".to_string()),
+                "web",
+                Some("uid-old".to_string()),
+            ),
+            "uid-old",
+            pod_status_command("default", "web", "uid-old"),
+            1_000,
+        ))
+        .await
+        .expect("enqueue old status");
+    let old_status = node_db
+        .claim_next_due_outbox(1_000, 100, "old-status-lease")
+        .await
+        .expect("claim old status")
+        .expect("old status due");
+    node_db
+        .mark_outbox_attempt_failed(old_status.id, "old-status-lease", 30_000, "transport down")
+        .await
+        .expect("back off old status");
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "replacement-web-actor-finalize-delete",
+            OutboxOperation::PodMetadata,
+            OutboxSubject::new(
+                "v1/Pod/default/web/uid-new",
+                Some("default".to_string()),
+                "web",
+                Some("uid-new".to_string()),
+            ),
+            "uid-new",
+            pod_delete_command("default", "web", "uid-new"),
+            1_001,
+        ))
+        .await
+        .expect("enqueue replacement delete");
+
+    let claimed = node_db
+        .claim_next_due_outbox(1_001, 100, "replacement-delete-lease")
+        .await
+        .expect("claim replacement delete")
+        .expect("replacement UID delete must not share FIFO with old UID status");
+    assert_eq!(
+        claimed.idempotency_key,
+        "replacement-web-actor-finalize-delete"
     );
 }
 

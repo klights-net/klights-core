@@ -1,4 +1,4 @@
-use crate::datastore::{DatastoreBackend, ResourcePreconditions};
+use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
@@ -19,6 +19,15 @@ fn status_with_updates<const N: usize>(resource: &Value, updates: [(&str, Value)
         status.insert(key.to_string(), value);
     }
     Value::Object(status)
+}
+
+async fn write_pvc_status(
+    db: &dyn DatastoreBackend,
+    pvc: &Resource,
+    status: Value,
+) -> Result<Value> {
+    let updated = crate::controllers::common::write_status_for_resource(db, pvc, &status).await?;
+    Ok(std::sync::Arc::unwrap_or_clone(updated.data))
 }
 
 /// Provision a PV for a PVC that has a storageClassName matching a known provisioner.
@@ -138,7 +147,7 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
     else {
         return Ok(pvc.clone());
     };
-    let pvc = crate::api::inject_resource_version(live_pvc.data, live_pvc.resource_version);
+    let pvc = crate::api::inject_resource_version(live_pvc.data.clone(), live_pvc.resource_version);
 
     let metadata = pvc
         .get("metadata")
@@ -320,39 +329,16 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         )
         .await?;
 
-        // Update PVC status to Bound
-        let mut updated_pvc = pvc.clone();
-        if let Some(pvc_obj) = updated_pvc.as_object_mut() {
-            let pvc_status = status_with_updates(
-                &pvc,
-                [
-                    ("phase", json!("Bound")),
-                    ("accessModes", json!(access_modes)),
-                    ("capacity", json!({"storage": requested_storage})),
-                    ("volumeName", json!(pv_name)),
-                ],
-            );
-            pvc_obj.insert("status".to_string(), pvc_status);
-        }
-
-        let pvc_metadata = updated_pvc
-            .get("metadata")
-            .ok_or_else(|| anyhow::anyhow!("PVC missing metadata"))?;
-        let pvc_rv = crate::utils::extract_resource_version(pvc_metadata);
-        let pvc_preconditions = ResourcePreconditions::from_metadata(pvc_metadata, pvc_rv)?;
-
-        let result = db
-            .update_resource_with_preconditions(
-                "v1",
-                "PersistentVolumeClaim",
-                Some(namespace),
-                name,
-                updated_pvc,
-                pvc_preconditions,
-            )
-            .await?;
-
-        return Ok(std::sync::Arc::unwrap_or_clone(result.data));
+        let pvc_status = status_with_updates(
+            &pvc,
+            [
+                ("phase", json!("Bound")),
+                ("accessModes", json!(access_modes)),
+                ("capacity", json!({"storage": requested_storage})),
+                ("volumeName", json!(pv_name)),
+            ],
+        );
+        return write_pvc_status(db, &live_pvc, pvc_status).await;
     }
 
     // No matching PV found - try to provision a PV
@@ -415,43 +401,16 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         )
         .await?;
 
-        // Update PVC status to Bound
-        let mut updated_pvc = pvc.clone();
-        if let Some(pvc_obj) = updated_pvc.as_object_mut() {
-            let pvc_status = status_with_updates(
-                &pvc,
-                [
-                    ("phase", json!("Bound")),
-                    ("accessModes", json!(access_modes)),
-                    ("capacity", json!({"storage": requested_storage})),
-                    ("volumeName", json!(provisioned_pv_name)),
-                ],
-            );
-            pvc_obj.insert("status".to_string(), pvc_status);
-        }
-
-        let pvc_metadata = updated_pvc
-            .get("metadata")
-            .ok_or_else(|| anyhow::anyhow!("PVC missing metadata"))?;
-        let pvc_rv = crate::utils::extract_resource_version(pvc_metadata);
-        let pvc_preconditions = ResourcePreconditions::from_metadata(pvc_metadata, pvc_rv)?;
-        let pvc_name = metadata
-            .get("name")
-            .and_then(|n| n.as_str())
-            .ok_or_else(|| anyhow::anyhow!("PVC missing name"))?;
-
-        let result = db
-            .update_resource_with_preconditions(
-                "v1",
-                "PersistentVolumeClaim",
-                Some(namespace),
-                pvc_name,
-                updated_pvc,
-                pvc_preconditions,
-            )
-            .await?;
-
-        return Ok(std::sync::Arc::unwrap_or_clone(result.data));
+        let pvc_status = status_with_updates(
+            &pvc,
+            [
+                ("phase", json!("Bound")),
+                ("accessModes", json!(access_modes)),
+                ("capacity", json!({"storage": requested_storage})),
+                ("volumeName", json!(provisioned_pv_name)),
+            ],
+        );
+        return write_pvc_status(db, &live_pvc, pvc_status).await;
     }
 
     if pvc
@@ -462,31 +421,8 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         return Ok(pvc.clone());
     }
 
-    // No provisioning happened - set status to Pending
-    let mut updated_pvc = pvc.clone();
-    if let Some(pvc_obj) = updated_pvc.as_object_mut() {
-        let pvc_status = status_with_updates(&pvc, [("phase", json!("Pending"))]);
-        pvc_obj.insert("status".to_string(), pvc_status);
-    }
-
-    let pvc_metadata = updated_pvc
-        .get("metadata")
-        .ok_or_else(|| anyhow::anyhow!("PVC missing metadata"))?;
-    let pvc_rv = crate::utils::extract_resource_version(pvc_metadata);
-    let pvc_preconditions = ResourcePreconditions::from_metadata(pvc_metadata, pvc_rv)?;
-
-    let result = db
-        .update_resource_with_preconditions(
-            "v1",
-            "PersistentVolumeClaim",
-            Some(namespace),
-            name,
-            updated_pvc,
-            pvc_preconditions,
-        )
-        .await?;
-
-    Ok(std::sync::Arc::unwrap_or_clone(result.data))
+    let pvc_status = status_with_updates(&pvc, [("phase", json!("Pending"))]);
+    write_pvc_status(db, &live_pvc, pvc_status).await
 }
 
 #[cfg(test)]

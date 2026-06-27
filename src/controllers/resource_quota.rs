@@ -4,7 +4,7 @@
 //! expecting status.used to reflect the current count. This reconciler scans all
 //! ResourceQuotas in a namespace and updates their status.used fields.
 
-use crate::datastore::{DatastoreBackend, ResourcePreconditions};
+use crate::datastore::DatastoreBackend;
 use crate::kubelet::pod_repository::PodReader;
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -484,56 +484,8 @@ pub async fn reconcile_resource_quotas_for_namespace(
         else {
             continue;
         };
-        let mut status = resource_quota_status_value(hard, used_map);
-
-        // Update the ResourceQuota in the DB with conflict retry.
-        // Under concurrent pod creation, multiple side effects may race
-        // on the same ResourceQuota row. Retry up to 5 times with
-        // re-read to get a fresh resourceVersion.
-        let rq_name = rq_resource.name.clone();
-        let mut attempt = 0u8;
-        let mut current_rv = rq_resource.resource_version;
-        let mut current_uid = rq_resource.uid.clone();
-        loop {
-            let preconditions = ResourcePreconditions {
-                resource_version: Some(current_rv),
-                uid: Some(current_uid.clone()),
-            };
-            match db
-                .update_status_only_with_preconditions(
-                    "v1",
-                    "ResourceQuota",
-                    Some(namespace),
-                    &rq_name,
-                    status.clone(),
-                    preconditions,
-                )
-                .await
-            {
-                Ok(_) => break,
-                Err(e) if crate::datastore::errors::is_conflict_error(&e) && attempt < 4 => {
-                    attempt += 1;
-                    // Re-read to get a fresh RV and rebuild the status
-                    let Some(fresh) = db
-                        .get_resource("v1", "ResourceQuota", Some(namespace), &rq_name)
-                        .await?
-                    else {
-                        break;
-                    };
-                    let Some((fresh_hard, fresh_used_map)) =
-                        calculate_resource_quota_status(db, pod_reader, namespace, &fresh.data)
-                            .await
-                    else {
-                        break;
-                    };
-                    current_rv = fresh.resource_version;
-                    current_uid = fresh.uid.clone();
-                    status = resource_quota_status_value(fresh_hard, fresh_used_map);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let status = resource_quota_status_value(hard, used_map);
+        crate::controllers::common::write_status_for_resource(db, &rq_resource, &status).await?;
     }
 
     Ok(())

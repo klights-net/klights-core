@@ -250,6 +250,79 @@ async fn test_pvc_bind_preserves_status_conditions() {
 }
 
 #[tokio::test]
+async fn test_pvc_status_writer_rejects_stale_snapshot_after_status_patch() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    let created = db
+        .create_resource(
+            "v1",
+            "PersistentVolumeClaim",
+            Some("default"),
+            "stale-status-pvc",
+            json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": "stale-status-pvc",
+                    "namespace": "default",
+                    "uid": "stale-status-pvc-uid"
+                },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": {"requests": {"storage": "1Gi"}}
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    db.update_status_only(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "stale-status-pvc",
+        json!({
+            "phase": "Pending",
+            "conditions": [{
+                "type": "StatusPatched",
+                "status": "True",
+                "reason": "E2E patchedStatus",
+                "message": "Set from e2e test"
+            }]
+        }),
+        Some(created.resource_version),
+    )
+    .await
+    .expect("user status patch should win the race first");
+
+    let stale_write = write_pvc_status(
+        &db,
+        &created,
+        json!({
+            "phase": "Bound",
+            "accessModes": ["ReadWriteOnce"],
+            "capacity": {"storage": "1Gi"},
+            "volumeName": "pv-for-stale-status-pvc"
+        }),
+    )
+    .await;
+    let err = stale_write.expect_err("stale PVC controller status write must not rebase");
+    assert!(
+        crate::datastore::errors::is_conflict_error(&err),
+        "expected stale PVC status write conflict, got {err:#}"
+    );
+
+    let pvc = get_pvc(&db, "default", "stale-status-pvc").await;
+    assert_eq!(pvc.pointer("/status/phase"), Some(&json!("Pending")));
+    assert_eq!(
+        pvc.pointer("/status/conditions/0/type"),
+        Some(&json!("StatusPatched")),
+        "stale controller write must not drop user-patched status conditions"
+    );
+}
+
+#[tokio::test]
 async fn test_pv_bind_preserves_status_reason_and_message() {
     let db = crate::datastore::test_support::in_memory().await;
 

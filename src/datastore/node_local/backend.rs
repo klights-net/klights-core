@@ -58,6 +58,11 @@ pub trait NodeLocalBackend: Send + Sync {
         lease_token: &str,
     ) -> Result<Vec<OutboxRow>>;
     async fn complete_outbox_batch(&self, ids: &[i64]) -> Result<()>;
+    async fn complete_superseded_status_outbox_for_terminal_pod_delete(
+        &self,
+        subject_key: &str,
+        terminal_delete_id: i64,
+    ) -> Result<usize>;
 
     async fn move_outbox_to_dead_letter_if_max_attempts(
         &self,
@@ -257,6 +262,19 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
 
     async fn complete_outbox_batch(&self, ids: &[i64]) -> Result<()> {
         SqliteNodeLocalDb::complete_outbox_batch(self, ids).await
+    }
+
+    async fn complete_superseded_status_outbox_for_terminal_pod_delete(
+        &self,
+        subject_key: &str,
+        terminal_delete_id: i64,
+    ) -> Result<usize> {
+        SqliteNodeLocalDb::complete_superseded_status_outbox_for_terminal_pod_delete(
+            self,
+            subject_key,
+            terminal_delete_id,
+        )
+        .await
     }
 
     async fn move_outbox_to_dead_letter_if_max_attempts(

@@ -912,6 +912,119 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
 }
 
 #[tokio::test]
+async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "PersistentVolumeClaim",
+            Some("default"),
+            "status-condition-race",
+            json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": "status-condition-race",
+                    "namespace": "default",
+                    "uid": "status-condition-race-uid"
+                },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "resources": {"requests": {"storage": "1Gi"}}
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let committed_status = crate::log_apply::LogApplyCommit::new(
+        created.resource_version + 2,
+        vec![crate::log_apply::LogApplyMutation::PutResource(
+            crate::log_apply::LogApplyResourceRow {
+                api_version: "v1".to_string(),
+                kind: "PersistentVolumeClaim".to_string(),
+                namespace: Some("default".to_string()),
+                name: "status-condition-race".to_string(),
+                uid: "status-condition-race-uid".to_string(),
+                resource_version: created.resource_version + 2,
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
+                    "metadata": {
+                        "name": "status-condition-race",
+                        "namespace": "default",
+                        "uid": "status-condition-race-uid",
+                        "resourceVersion": (created.resource_version + 2).to_string()
+                    },
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "resources": {"requests": {"storage": "1Gi"}}
+                    },
+                    "status": {
+                        "phase": "Bound",
+                        "accessModes": ["ReadWriteOnce"],
+                        "capacity": {"storage": "1Gi"},
+                        "volumeName": "pv-status-condition-race"
+                    }
+                }),
+                require_absent: false,
+                require_existing: true,
+                precondition_uid: Some("status-condition-race-uid".to_string()),
+                precondition_resource_version: Some(created.resource_version),
+                status_only: true,
+            },
+        )],
+    );
+
+    db.update_status_only(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "status-condition-race",
+        json!({
+            "phase": "Pending",
+            "conditions": [{
+                "type": "StatusPatched",
+                "status": "True",
+                "reason": "E2E patchedStatus",
+                "message": "Set from e2e test"
+            }]
+        }),
+        Some(created.resource_version),
+    )
+    .await
+    .expect("user status patch applies before committed controller status row");
+
+    let result = db
+        .apply_raft_log_apply_commit(committed_status)
+        .await
+        .expect("committed status-only row should merge onto live PVC");
+    assert_eq!(result.applied_rv, Some(created.resource_version + 2));
+
+    let live = db
+        .get_resource(
+            "v1",
+            "PersistentVolumeClaim",
+            Some("default"),
+            "status-condition-race",
+        )
+        .await
+        .unwrap()
+        .expect("PVC remains");
+    assert_eq!(live.data.pointer("/status/phase"), Some(&json!("Bound")));
+    assert_eq!(
+        live.data.pointer("/status/volumeName"),
+        Some(&json!("pv-status-condition-race"))
+    );
+    assert_eq!(
+        live.data.pointer("/status/conditions/0/type"),
+        Some(&json!("StatusPatched")),
+        "committed status-only apply must not drop unrelated live status conditions"
+    );
+}
+
+#[tokio::test]
 async fn raft_status_apply_built_before_preemption_preserves_disruption_target() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db

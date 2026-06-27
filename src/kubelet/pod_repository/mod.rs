@@ -781,20 +781,15 @@ impl PodRepository {
     }
 
     pub async fn schedule_all_unbound_pods(&self) -> Result<()> {
-        let pods = self.store.list(None, None, None, None, None).await?;
-        for pod in pods.items {
-            if pod
-                .data
-                .pointer("/spec/nodeName")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| !s.is_empty())
-            {
-                continue;
-            }
-            let namespace = pod.namespace.as_deref().unwrap_or("default");
-            let _ = self.schedule_pending_pod(namespace, &pod.name).await?;
-        }
-        Ok(())
+        self.api
+            .schedule_all_unbound_pods()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))
+    }
+
+    #[cfg(test)]
+    fn set_scheduler_bind_gate_for_test(&self, gate: Arc<api::SchedulerBindGateForTest>) {
+        self.api.set_scheduler_bind_gate_for_test(gate);
     }
 
     /// Enqueue the owning Job for asynchronous reconciliation after a pod

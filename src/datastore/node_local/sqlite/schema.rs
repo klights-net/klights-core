@@ -34,6 +34,7 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
                 'LeaseRenew',
                 'EventCreate'
             )),
+            is_terminal_pod_delete INTEGER NOT NULL DEFAULT 0 CHECK(is_terminal_pod_delete IN (0, 1)),
             payload_proto       BLOB NOT NULL,
             attempt             INTEGER NOT NULL DEFAULT 0,
             next_due_ms         INTEGER NOT NULL,

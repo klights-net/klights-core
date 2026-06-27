@@ -6217,6 +6217,193 @@ async fn api_create_pod_leader_mode_leaves_pod_unbound_until_scheduler_controlle
 }
 
 #[tokio::test]
+async fn leader_scheduler_orders_unbound_pods_by_priority_creation_and_name() {
+    use super::PodReader;
+
+    let repo =
+        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
+            .await;
+    repo.store
+        .db()
+        .create_resource(
+            "v1",
+            "Node",
+            None,
+            "test-node",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "test-node"},
+                "spec": {"unschedulable": false},
+                "status": {
+                    "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "1"},
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut later = pending_pod("a-later");
+    later["metadata"]["creationTimestamp"] = json!("2026-06-01T00:00:02Z");
+    repo.store
+        .create("default", "a-later", later)
+        .await
+        .unwrap();
+
+    let mut earlier = pending_pod("z-earlier");
+    earlier["metadata"]["creationTimestamp"] = json!("2026-06-01T00:00:01Z");
+    repo.store
+        .create("default", "z-earlier", earlier)
+        .await
+        .unwrap();
+
+    repo.schedule_all_unbound_pods().await.unwrap();
+
+    let earlier = repo.get_pod("default", "z-earlier").await.unwrap().unwrap();
+    let later = repo.get_pod("default", "a-later").await.unwrap().unwrap();
+    assert_eq!(
+        earlier
+            .data
+            .pointer("/spec/nodeName")
+            .and_then(|v| v.as_str()),
+        Some("test-node"),
+        "earlier pod in the same priority band must get the only slot"
+    );
+    assert!(
+        later
+            .data
+            .pointer("/spec/nodeName")
+            .and_then(|v| v.as_str())
+            .is_none(),
+        "later pod must remain unbound when the earlier pod consumed capacity"
+    );
+}
+
+#[tokio::test]
+async fn leader_scheduler_concurrent_wave_reserves_node_capacity_once() {
+    use super::PodReader;
+
+    let repo =
+        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
+            .await;
+    repo.store
+        .db()
+        .create_resource(
+            "v1",
+            "Node",
+            None,
+            "test-node",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "test-node"},
+                "spec": {"unschedulable": false},
+                "status": {
+                    "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "1"},
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    for idx in 0..8 {
+        let name = format!("wave-{idx}");
+        repo.store
+            .create("default", &name, pending_pod(&name))
+            .await
+            .unwrap();
+    }
+
+    repo.schedule_all_unbound_pods().await.unwrap();
+
+    let pods = repo
+        .list_pods(Some("default"), None, None, None, None)
+        .await
+        .unwrap();
+    let bound: Vec<_> = pods
+        .items
+        .iter()
+        .filter(|pod| {
+            pod.data.pointer("/spec/nodeName").and_then(|v| v.as_str()) == Some("test-node")
+        })
+        .collect();
+    assert_eq!(
+        bound.len(),
+        1,
+        "bounded concurrent scheduling must not double-allocate the only node slot"
+    );
+}
+
+#[tokio::test]
+async fn leader_scheduler_starts_bounded_bind_wave_concurrently() {
+    use super::PodReader;
+
+    let repo = Arc::new(
+        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
+            .await,
+    );
+    let gate = Arc::new(super::api::SchedulerBindGateForTest::new());
+    repo.set_scheduler_bind_gate_for_test(gate.clone());
+
+    repo.store
+        .db()
+        .create_resource(
+            "v1",
+            "Node",
+            None,
+            "test-node",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "test-node"},
+                "spec": {"unschedulable": false},
+                "status": {
+                    "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "20"},
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    for idx in 0..super::api::SCHED_BIND_CONCURRENCY {
+        let name = format!("parallel-{idx}");
+        repo.store
+            .create("default", &name, pending_pod(&name))
+            .await
+            .unwrap();
+    }
+
+    let scheduling_repo = repo.clone();
+    let schedule_task =
+        tokio::spawn(async move { scheduling_repo.schedule_all_unbound_pods().await });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        gate.wait_for_entered_at_least(super::api::SCHED_BIND_CONCURRENCY),
+    )
+    .await
+    .expect("the whole first scheduling wave should reach the bind gate concurrently");
+    gate.release_all();
+    schedule_task.await.unwrap().unwrap();
+
+    let pods = repo
+        .list_pods(Some("default"), None, None, None, None)
+        .await
+        .unwrap();
+    let bound = pods
+        .items
+        .iter()
+        .filter(|pod| {
+            pod.data.pointer("/spec/nodeName").and_then(|v| v.as_str()) == Some("test-node")
+        })
+        .count();
+    assert_eq!(bound, super::api::SCHED_BIND_CONCURRENCY);
+}
+
+#[tokio::test]
 async fn leader_scheduler_binds_node_and_podscheduled_condition_in_one_pod_event() {
     use super::{PodApiWriter, PodReader};
     use crate::datastore::WatchTarget;
@@ -7393,6 +7580,7 @@ async fn scheduler_preempts_controller_created_priority_class_pods() {
                 "kind": "Pod",
                 "metadata": {"name": name, "namespace": "default"},
                 "spec": {
+                    "nodeName": "test-node",
                     "priorityClassName": class_name,
                     "containers": [{
                         "name": "c",

@@ -791,7 +791,10 @@ fn patch_resource_latest_row(
             .optional()?;
         let Some((current_rv, current_uid, current_bytes)) = existing else {
             if patch.require_existing {
-                return Err(other_error("Resource not found (404 Not Found)"));
+                return Err(apply_conflict_error(
+                    ApplyConflictCode::NotFound,
+                    "Resource not found (404 Not Found)",
+                ));
             }
             return Ok(None);
         };
@@ -873,7 +876,10 @@ fn patch_resource_latest_row(
             .optional()?;
         let Some((current_rv, current_uid, current_bytes)) = existing else {
             if patch.require_existing {
-                return Err(other_error("Resource not found (404 Not Found)"));
+                return Err(apply_conflict_error(
+                    ApplyConflictCode::NotFound,
+                    "Resource not found (404 Not Found)",
+                ));
             }
             return Ok(None);
         };
@@ -961,7 +967,10 @@ fn apply_latest_patch_to_current_resource(
                 "raft authoritative PATCH: uid precondition bypassed, applying patch to current row"
             );
         } else {
-            return Err(other_error("UID precondition failed (409 Conflict)"));
+            return Err(apply_conflict_error(
+                ApplyConflictCode::UidPrecondition,
+                "UID precondition failed (409 Conflict)",
+            ));
         }
     }
     if let Some(expected_rv) = patch.precondition_resource_version
@@ -976,9 +985,12 @@ fn apply_latest_patch_to_current_resource(
                 "raft authoritative PATCH: rv precondition bypassed, applying patch to current row"
             );
         } else {
-            return Err(other_error(format!(
-                "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-            )));
+            return Err(apply_conflict_error(
+                ApplyConflictCode::ResourceVersionPrecondition,
+                format!(
+                    "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
+                ),
+            ));
         }
     }
     let current: serde_json::Value =
@@ -1071,7 +1083,7 @@ fn merge_status_only_row_with_existing(
     if !row.status_only {
         return Ok(());
     }
-    let Some((_current_rv, current_uid, existing_bytes)) = existing else {
+    let Some((current_rv, current_uid, existing_bytes)) = existing else {
         return Ok(());
     };
     let status = row
@@ -1082,6 +1094,12 @@ fn merge_status_only_row_with_existing(
     let mut status = status;
     let mut live: serde_json::Value =
         serde_json::from_slice(existing_bytes).map_err(serde_to_sqlite_error)?;
+    if row
+        .precondition_resource_version
+        .is_some_and(|expected_rv| expected_rv < *current_rv)
+    {
+        preserve_unmentioned_live_status_fields(&row.api_version, &row.kind, &live, &mut status);
+    }
     if row
         .precondition_uid
         .as_deref()
@@ -1117,6 +1135,28 @@ fn merge_status_only_row_with_existing(
     row.uid = current_uid.clone();
     row.data = live;
     Ok(())
+}
+
+fn preserve_unmentioned_live_status_fields(
+    api_version: &str,
+    kind: &str,
+    live: &serde_json::Value,
+    incoming_status: &mut serde_json::Value,
+) {
+    if api_version == "v1" && kind == "Pod" {
+        return;
+    }
+    let Some(live_status) = live.get("status").and_then(|status| status.as_object()) else {
+        return;
+    };
+    let Some(incoming_status) = incoming_status.as_object_mut() else {
+        return;
+    };
+    for (key, value) in live_status {
+        incoming_status
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
 }
 
 fn preserve_newer_same_uid_row_on_stale_committed_put(
@@ -1162,13 +1202,11 @@ fn preserve_newer_same_uid_row_on_stale_committed_put(
         return Ok(());
     }
 
-    let Some(existing_generation) = metadata_generation(&existing_data) else {
-        return Ok(());
-    };
-    let Some(incoming_generation) = metadata_generation(&row.data) else {
-        return Ok(());
-    };
-    if incoming_generation >= existing_generation {
+    if let (Some(existing_generation), Some(incoming_generation)) = (
+        metadata_generation(&existing_data),
+        metadata_generation(&row.data),
+    ) && incoming_generation >= existing_generation
+    {
         return Ok(());
     }
 
@@ -1274,10 +1312,16 @@ fn validate_put_resource_apply_preconditions(
     existing: Option<&(i64, String, Vec<u8>)>,
 ) -> tokio_rusqlite::Result<()> {
     if row.require_absent && existing.is_some() {
-        return Err(other_error("Resource already exists (409 Conflict)"));
+        return Err(apply_conflict_error(
+            ApplyConflictCode::AlreadyExists,
+            "Resource already exists (409 Conflict)",
+        ));
     }
     if row.require_existing && existing.is_none() {
-        return Err(other_error("Resource not found (404 Not Found)"));
+        return Err(apply_conflict_error(
+            ApplyConflictCode::NotFound,
+            "Resource not found (404 Not Found)",
+        ));
     }
     let Some((current_rv, current_uid, _)) = existing else {
         return Ok(());
@@ -1285,14 +1329,20 @@ fn validate_put_resource_apply_preconditions(
     if let Some(expected_uid) = row.precondition_uid.as_deref()
         && expected_uid != current_uid
     {
-        return Err(other_error("UID precondition failed (409 Conflict)"));
+        return Err(apply_conflict_error(
+            ApplyConflictCode::UidPrecondition,
+            "UID precondition failed (409 Conflict)",
+        ));
     }
     if let Some(expected_rv) = row.precondition_resource_version
         && expected_rv != *current_rv
     {
-        return Err(other_error(format!(
-            "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-        )));
+        return Err(apply_conflict_error(
+            ApplyConflictCode::ResourceVersionPrecondition,
+            format!(
+                "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1305,10 +1355,16 @@ fn validate_put_resource_presence_preconditions(
     existing: Option<&(i64, String, Vec<u8>)>,
 ) -> tokio_rusqlite::Result<()> {
     if row.require_absent && existing.is_some() {
-        return Err(other_error("Resource already exists (409 Conflict)"));
+        return Err(apply_conflict_error(
+            ApplyConflictCode::AlreadyExists,
+            "Resource already exists (409 Conflict)",
+        ));
     }
     if row.require_existing && existing.is_none() {
-        return Err(other_error("Resource not found (404 Not Found)"));
+        return Err(apply_conflict_error(
+            ApplyConflictCode::NotFound,
+            "Resource not found (404 Not Found)",
+        ));
     }
     Ok(())
 }
@@ -1362,9 +1418,12 @@ fn delete_resource_row(
                     "raft authoritative DELETE: rv precondition bypassed, removing stale row"
                 );
             } else {
-                return Err(other_error(format!(
-                    "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-                )));
+                return Err(apply_conflict_error(
+                    ApplyConflictCode::ResourceVersionPrecondition,
+                    format!(
+                        "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
+                    ),
+                ));
             }
         }
         tx.execute(
@@ -1394,7 +1453,8 @@ fn delete_resource_row(
                 &data_bytes,
             ),
         )?;
-        let data = serde_json::from_slice(&data_bytes).unwrap_or(serde_json::Value::Null);
+        let data: serde_json::Value =
+            serde_json::from_slice(&data_bytes).map_err(serde_to_sqlite_error)?;
         Ok(Some(create_pending_watch_event(
             &key.api_version,
             &key.kind,
@@ -1435,9 +1495,12 @@ fn delete_resource_row(
                     "raft authoritative DELETE: rv precondition bypassed, removing stale cluster row"
                 );
             } else {
-                return Err(other_error(format!(
-                    "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-                )));
+                return Err(apply_conflict_error(
+                    ApplyConflictCode::ResourceVersionPrecondition,
+                    format!(
+                        "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
+                    ),
+                ));
             }
         }
         tx.execute(
@@ -1461,7 +1524,8 @@ fn delete_resource_row(
                 &data_bytes,
             ),
         )?;
-        let data = serde_json::from_slice(&data_bytes).unwrap_or(serde_json::Value::Null);
+        let data: serde_json::Value =
+            serde_json::from_slice(&data_bytes).map_err(serde_to_sqlite_error)?;
         Ok(Some(create_pending_watch_event(
             &key.api_version,
             &key.kind,
@@ -1560,7 +1624,8 @@ fn delete_namespace_row(
             &data_bytes,
         ),
     )?;
-    let data = serde_json::from_slice(&data_bytes).unwrap_or(serde_json::Value::Null);
+    let data: serde_json::Value =
+        serde_json::from_slice(&data_bytes).map_err(serde_to_sqlite_error)?;
     Ok(Some(create_pending_watch_event(
         "v1",
         "Namespace",
@@ -1744,9 +1809,43 @@ fn storage_result_from_applied_outbox(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyConflictCode {
+    NotFound,
+    AlreadyExists,
+    UidPrecondition,
+    ResourceVersionPrecondition,
+}
+
+#[derive(Debug)]
+struct ApplyConflictError {
+    code: ApplyConflictCode,
+    message: String,
+}
+
+impl std::fmt::Display for ApplyConflictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ApplyConflictError {}
+
+fn apply_conflict_error(
+    code: ApplyConflictCode,
+    message: impl Into<String>,
+) -> tokio_rusqlite::Error {
+    tokio_rusqlite::Error::Other(Box::new(ApplyConflictError {
+        code,
+        message: message.into(),
+    }))
+}
+
 fn is_terminal_apply_conflict(err: &tokio_rusqlite::Error) -> bool {
-    let msg = err.to_string();
-    msg.contains("409 Conflict") || msg.contains("404 Not Found")
+    match err {
+        tokio_rusqlite::Error::Other(inner) => inner.downcast_ref::<ApplyConflictError>().is_some(),
+        _ => false,
+    }
 }
 
 /// Emit a warning when a committed raft PUT bypasses staleness-related preconditions
@@ -1963,6 +2062,28 @@ mod tests {
                 hostport_range: None,
             })],
         )
+    }
+
+    #[test]
+    fn terminal_apply_conflict_classification_uses_typed_codes_not_message_text() {
+        for code in [
+            ApplyConflictCode::NotFound,
+            ApplyConflictCode::AlreadyExists,
+            ApplyConflictCode::UidPrecondition,
+            ApplyConflictCode::ResourceVersionPrecondition,
+        ] {
+            let err = apply_conflict_error(code, "typed conflict without status text");
+            assert!(
+                is_terminal_apply_conflict(&err),
+                "typed conflict {code:?} must classify as terminal"
+            );
+        }
+
+        let transient = other_error("transient text mentioning 409 Conflict and 404 Not Found");
+        assert!(
+            !is_terminal_apply_conflict(&transient),
+            "untyped internal errors must not classify as terminal by message text"
+        );
     }
 
     fn dataplane_commit(
@@ -2613,6 +2734,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn committed_namespace_delete_errors_on_corrupt_stored_json_instead_of_emitting_null_event()
+     {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_namespace(
+            "corrupt-delete-ns",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "corrupt-delete-ns",
+                    "uid": "corrupt-delete-ns-uid"
+                }
+            }),
+        )
+        .await
+        .expect("seed Namespace");
+
+        db.db_call("test_corrupt_delete_namespace_data", |conn| {
+            conn.execute(
+                "UPDATE namespaces SET data = ?1 WHERE name = 'corrupt-delete-ns'",
+                [b"{not-json".as_slice()],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("corrupt stored JSON");
+
+        let err = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                60,
+                vec![LogApplyMutation::DeleteNamespace {
+                    name: "corrupt-delete-ns".to_string(),
+                }],
+            ))
+            .await
+            .expect_err("corrupt stored JSON must fail committed namespace delete apply");
+        assert!(
+            err.to_string().contains("expected ident")
+                || err.to_string().contains("key must be a string"),
+            "error must come from JSON decoding, got: {err}"
+        );
+    }
+
     /// Committed put must overwrite a stale local row regardless of precondition_resource_version
     /// mismatch (the follower has an older rv than the precondition the leader captured).
     #[tokio::test]
@@ -2775,6 +2940,126 @@ mod tests {
         assert_eq!(
             row.resource_version, 60,
             "stale committed PUT still advances materialized raft resourceVersion"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_same_uid_generationless_committed_put_preserves_newer_configmap_state() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.apply_raft_log_apply_commit(LogApplyCommit::new(
+            10,
+            vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "generationless-cm".to_string(),
+                uid: "generationless-cm-uid".to_string(),
+                resource_version: 10,
+                data: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "generationless-cm",
+                        "namespace": "default",
+                        "uid": "generationless-cm-uid",
+                        "resourceVersion": "10"
+                    },
+                    "data": {"winner": "initial"}
+                }),
+                require_absent: false,
+                require_existing: false,
+                precondition_uid: None,
+                precondition_resource_version: None,
+                status_only: false,
+            })],
+        ))
+        .await
+        .expect("seed generation-less ConfigMap from raft");
+
+        db.apply_raft_log_apply_commit(LogApplyCommit::new(
+            20,
+            vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "generationless-cm".to_string(),
+                uid: "generationless-cm-uid".to_string(),
+                resource_version: 20,
+                data: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "generationless-cm",
+                        "namespace": "default",
+                        "uid": "generationless-cm-uid",
+                        "resourceVersion": "20"
+                    },
+                    "data": {"winner": "newer"}
+                }),
+                require_absent: false,
+                require_existing: true,
+                precondition_uid: Some("generationless-cm-uid".to_string()),
+                precondition_resource_version: Some(10),
+                status_only: false,
+            })],
+        ))
+        .await
+        .expect("newer generation-less ConfigMap update applies");
+
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                30,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "generationless-cm".to_string(),
+                    uid: "generationless-cm-uid".to_string(),
+                    resource_version: 30,
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "generationless-cm",
+                            "namespace": "default",
+                            "uid": "generationless-cm-uid",
+                            "resourceVersion": "30"
+                        },
+                        "data": {"winner": "stale"}
+                    }),
+                    require_absent: false,
+                    require_existing: true,
+                    precondition_uid: Some("generationless-cm-uid".to_string()),
+                    precondition_resource_version: Some(10),
+                    status_only: false,
+                })],
+            ))
+            .await
+            .expect("stale generation-less committed PUT should not fail raft apply");
+        assert!(
+            result.error_message.is_none(),
+            "stale generation-less committed PUT must not fail raft apply: {result:?}"
+        );
+
+        let row = db
+            .get_resource("v1", "ConfigMap", Some("default"), "generationless-cm")
+            .await
+            .unwrap()
+            .expect("ConfigMap remains after stale committed put");
+        assert_eq!(
+            row.data
+                .pointer("/data/winner")
+                .and_then(|value| value.as_str()),
+            Some("newer"),
+            "generation-less stale committed PUT must preserve newer same-UID state"
+        );
+        assert!(
+            row.data.pointer("/metadata/generation").is_none(),
+            "test fixture must remain generation-less"
+        );
+        assert_eq!(
+            row.resource_version, 30,
+            "stale generation-less committed PUT still advances materialized raft resourceVersion"
         );
     }
 

@@ -2892,7 +2892,7 @@ fn is_not_raft_leader_status(status: &tonic::Status) -> bool {
 fn is_transport_status(status: &tonic::Status) -> bool {
     matches!(
         status.code(),
-        tonic::Code::Unavailable | tonic::Code::Unknown
+        tonic::Code::Unavailable | tonic::Code::Unknown | tonic::Code::Cancelled
     )
 }
 

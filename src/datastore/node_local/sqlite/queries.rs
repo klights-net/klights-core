@@ -53,19 +53,40 @@ pub(super) const RUNTIME_OBSERVATION_CHECKPOINT_DELETE_UID: &str =
 
 pub(super) const OUTBOX_INSERT: &str = "INSERT INTO outbox \
      (idempotency_key, enqueued_ms, subject_key, subject_api_version, subject_kind, \
-      subject_namespace, subject_name, subject_uid, pod_uid, operation, payload_proto, next_due_ms) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+      subject_namespace, subject_name, subject_uid, pod_uid, operation, \
+      is_terminal_pod_delete, payload_proto, next_due_ms) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
 pub(super) const OUTBOX_ROW_SELECT: &str = "SELECT id, idempotency_key, enqueued_ms, \
      subject_key, subject_api_version, subject_kind, subject_namespace, subject_name, \
-     subject_uid, pod_uid, operation, payload_proto, attempt, next_due_ms, \
+     subject_uid, pod_uid, operation, is_terminal_pod_delete, payload_proto, attempt, next_due_ms, \
      leased_until_ms, lease_token, last_error FROM outbox WHERE id = ?1";
 pub(super) const OUTBOX_CLAIM_NEXT_DUE: &str = "SELECT id FROM outbox candidate \
      WHERE candidate.next_due_ms <= ?1 \
        AND (candidate.leased_until_ms = 0 OR candidate.leased_until_ms <= ?1) \
+       AND NOT ( \
+           candidate.is_terminal_pod_delete = 0 \
+           AND candidate.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
+               'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+           AND EXISTS ( \
+               SELECT 1 FROM outbox terminal \
+               WHERE terminal.subject_key = candidate.subject_key \
+                 AND terminal.id > candidate.id \
+                 AND terminal.is_terminal_pod_delete = 1 \
+                 AND terminal.next_due_ms <= ?1 \
+                 AND (terminal.leased_until_ms = 0 OR terminal.leased_until_ms <= ?1) \
+           ) \
+       ) \
        AND NOT EXISTS ( \
            SELECT 1 FROM outbox older \
            WHERE older.subject_key = candidate.subject_key \
              AND older.id < candidate.id \
+             AND NOT ( \
+                 candidate.is_terminal_pod_delete = 1 \
+                 AND older.is_terminal_pod_delete = 0 \
+                 AND older.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
+                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+                 AND (older.leased_until_ms = 0 OR older.leased_until_ms <= ?1) \
+             ) \
        ) \
      ORDER BY CASE candidate.operation \
            WHEN 'LeaseRenew' THEN 0 \
@@ -81,6 +102,10 @@ pub(super) const OUTBOX_MARK_FAILED: &str = "UPDATE outbox \
      WHERE id = ?1 AND lease_token = ?2";
 pub(super) const OUTBOX_COMPLETE: &str = "DELETE FROM outbox WHERE id = ?1 AND lease_token = ?2";
 pub(super) const OUTBOX_COMPLETE_BY_ID: &str = "DELETE FROM outbox WHERE id = ?1";
+pub(super) const OUTBOX_COMPLETE_SUPERSEDED_TERMINAL_POD_DELETE_STATUS: &str = "DELETE FROM outbox WHERE subject_key = ?1 AND id < ?2 \
+     AND is_terminal_pod_delete = 0 \
+     AND operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
+         'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses')";
 // Strict per-subject single-in-flight: a candidate is excluded if ANY older
 // same-subject row exists, regardless of whether that older row is currently
 // due or leased. This matches OUTBOX_CLAIM_NEXT_DUE exactly so the batch and
@@ -93,10 +118,30 @@ pub(super) const OUTBOX_COMPLETE_BY_ID: &str = "DELETE FROM outbox WHERE id = ?1
 pub(super) const OUTBOX_CLAIM_DUE_BATCH: &str = "SELECT id FROM outbox candidate \
      WHERE candidate.next_due_ms <= ?1 \
        AND (candidate.leased_until_ms = 0 OR candidate.leased_until_ms <= ?1) \
+       AND NOT ( \
+           candidate.is_terminal_pod_delete = 0 \
+           AND candidate.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
+               'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+           AND EXISTS ( \
+               SELECT 1 FROM outbox terminal \
+               WHERE terminal.subject_key = candidate.subject_key \
+                 AND terminal.id > candidate.id \
+                 AND terminal.is_terminal_pod_delete = 1 \
+                 AND terminal.next_due_ms <= ?1 \
+                 AND (terminal.leased_until_ms = 0 OR terminal.leased_until_ms <= ?1) \
+           ) \
+       ) \
        AND NOT EXISTS ( \
            SELECT 1 FROM outbox older \
            WHERE older.subject_key = candidate.subject_key \
              AND older.id < candidate.id \
+             AND NOT ( \
+                 candidate.is_terminal_pod_delete = 1 \
+                 AND older.is_terminal_pod_delete = 0 \
+                 AND older.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
+                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+                 AND (older.leased_until_ms = 0 OR older.leased_until_ms <= ?1) \
+             ) \
        ) \
      ORDER BY CASE candidate.operation \
            WHEN 'LeaseRenew' THEN 0 \

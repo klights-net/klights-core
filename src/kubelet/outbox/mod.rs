@@ -522,6 +522,20 @@ impl OutboxDispatcher {
         client: Arc<dyn OutboxApplyClient>,
         notify: Arc<Notify>,
     ) -> Self {
+        Self::new_with_rtt_estimator(
+            node_db,
+            client,
+            notify,
+            std::sync::Arc::new(crate::datastore::raft::rtt_estimator::RttEstimator::new()),
+        )
+    }
+
+    pub fn new_with_rtt_estimator(
+        node_db: NodeLocalHandle,
+        client: Arc<dyn OutboxApplyClient>,
+        notify: Arc<Notify>,
+        rtt: std::sync::Arc<crate::datastore::raft::rtt_estimator::RttEstimator>,
+    ) -> Self {
         Self {
             node_db,
             client,
@@ -531,7 +545,7 @@ impl OutboxDispatcher {
             batch_size: 16,
             dispatch_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dispatch_errors_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rtt: std::sync::Arc::new(crate::datastore::raft::rtt_estimator::RttEstimator::new()),
+            rtt,
         }
     }
 
@@ -576,6 +590,15 @@ impl OutboxDispatcher {
     #[cfg(test)]
     pub fn for_tests(node_db: NodeLocalHandle, client: Arc<dyn OutboxApplyClient>) -> Self {
         Self::new(node_db, client, Arc::new(Notify::new()))
+    }
+
+    #[cfg(test)]
+    pub fn for_tests_with_rtt_estimator(
+        node_db: NodeLocalHandle,
+        client: Arc<dyn OutboxApplyClient>,
+        rtt: std::sync::Arc<crate::datastore::raft::rtt_estimator::RttEstimator>,
+    ) -> Self {
+        Self::new_with_rtt_estimator(node_db, client, Arc::new(Notify::new()), rtt)
     }
 
     #[cfg(test)]
@@ -807,6 +830,22 @@ impl OutboxDispatcher {
                 }
                 self.complete_row(row.id, lease_token, &row.idempotency_key)
                     .await;
+                if row.is_terminal_pod_delete
+                    && let Err(err) = self
+                        .node_db
+                        .complete_superseded_status_outbox_for_terminal_pod_delete(
+                            &row.subject_key,
+                            row.id,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        outbox_id = row.id,
+                        pod_uid = %row.pod_uid,
+                        error = %err,
+                        "complete superseded pod status outbox rows failed"
+                    );
+                }
             }
             Err(OutboxApplyError::Retryable(err)) => {
                 self.dispatch_errors_total
@@ -2011,6 +2050,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retryable_backoff_uses_injected_raft_rtt_without_outbox_success_sample() {
+        let node_db = node_db().await;
+        let outbox = Outbox::new(node_db.clone());
+        let client = Arc::new(FakeApplyClient::default());
+        let raft_rtt = Arc::new(crate::datastore::raft::rtt_estimator::RttEstimator::new());
+        raft_rtt.record_sample(std::time::Duration::from_millis(800));
+        let dispatcher = OutboxDispatcher::for_tests_with_rtt_estimator(
+            node_db.clone(),
+            client.clone(),
+            raft_rtt,
+        );
+
+        client
+            .push_response(Err(OutboxApplyError::Retryable("leader down".into())))
+            .await;
+        outbox
+            .enqueue_command(OutboxCommand::new(
+                "key-retry-raft-rtt",
+                OutboxOperation::PodStatus,
+                OutboxSubject::new(
+                    "v1/Pod/default/web/uid-rtt",
+                    Some("default".to_string()),
+                    "web",
+                    Some("uid-rtt".to_string()),
+                ),
+                "uid-rtt",
+                pod_status_command("default", "web", "uid-rtt"),
+                1_000,
+            ))
+            .await
+            .expect("enqueue retry row");
+
+        assert_eq!(
+            dispatcher.dispatch_due_once(1_000).await.expect("dispatch"),
+            DispatchOutcome::Dispatched
+        );
+        let next_retry = match dispatcher.dispatch_due_once(1_100).await.expect("dispatch") {
+            DispatchOutcome::Idle {
+                next_wake_ms: Some(next),
+            } => next,
+            other => panic!("expected idle retry wake, got {other:?}"),
+        };
+        let (backoff_lower, backoff_upper) = super::adaptive_backoff_bounds(0, 800);
+        assert!(
+            (1_000 + backoff_lower..=1_000 + backoff_upper).contains(&next_retry),
+            "retry wake must use injected raft RTT window [{},{}], got {next_retry}",
+            1_000 + backoff_lower,
+            1_000 + backoff_upper
+        );
+    }
+
+    #[tokio::test]
     async fn applied_checkpoint_marker_does_not_drop_unmaterialized_pod_ip_status() {
         let node_db = node_db().await;
         let outbox = Outbox::new(node_db.clone());
@@ -2197,9 +2288,12 @@ mod tests {
             dispatcher.dispatch_due_once(1_001).await.expect("dispatch"),
             DispatchOutcome::Dispatched
         );
-        assert_eq!(
-            dispatcher.dispatch_due_once(1_002).await.expect("dispatch"),
-            DispatchOutcome::Dispatched
+        assert!(
+            matches!(
+                dispatcher.dispatch_due_once(1_002).await.expect("dispatch"),
+                DispatchOutcome::Idle { .. }
+            ),
+            "actor-finalize delete should complete superseded status rows"
         );
         assert!(
             cluster_db

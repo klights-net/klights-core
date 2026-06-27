@@ -971,6 +971,137 @@ async fn test_patch_pvc_status_merge_patch_returns_conditions() {
 }
 
 #[tokio::test]
+async fn test_patch_pvc_status_condition_survives_stale_controller_status_commit() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+
+    let ns_body = r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"pvc-status-race"}}"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(ns_body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let pvc_body = r#"{
+        "apiVersion":"v1",
+        "kind":"PersistentVolumeClaim",
+        "metadata":{"name":"pvc1","namespace":"pvc-status-race","uid":"pvc-status-race-uid"},
+        "spec":{
+            "accessModes":["ReadWriteOnce"],
+            "resources":{"requests":{"storage":"1Gi"}}
+        }
+    }"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/pvc-status-race/persistentvolumeclaims")
+        .header("content-type", "application/json")
+        .body(Body::from(pvc_body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = db
+        .get_resource(
+            "v1",
+            "PersistentVolumeClaim",
+            Some("pvc-status-race"),
+            "pvc1",
+        )
+        .await
+        .unwrap()
+        .expect("PVC should exist after API create");
+
+    let patch = r#"{"status":{"conditions":[{"type":"StatusPatched","status":"True","reason":"E2E patchedStatus","message":"Set from e2e test"}]}}"#;
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/v1/namespaces/pvc-status-race/persistentvolumeclaims/pvc1/status")
+        .header("content-type", "application/merge-patch+json")
+        .body(Body::from(patch))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let patched = db
+        .get_resource(
+            "v1",
+            "PersistentVolumeClaim",
+            Some("pvc-status-race"),
+            "pvc1",
+        )
+        .await
+        .unwrap()
+        .expect("PVC should exist after status patch");
+
+    let committed_status = crate::log_apply::LogApplyCommit::new(
+        patched.resource_version + 1,
+        vec![crate::log_apply::LogApplyMutation::PutResource(
+            crate::log_apply::LogApplyResourceRow {
+                api_version: "v1".to_string(),
+                kind: "PersistentVolumeClaim".to_string(),
+                namespace: Some("pvc-status-race".to_string()),
+                name: "pvc1".to_string(),
+                uid: created.uid.clone(),
+                resource_version: patched.resource_version + 1,
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
+                    "metadata": {
+                        "name": "pvc1",
+                        "namespace": "pvc-status-race",
+                        "uid": created.uid.clone(),
+                        "resourceVersion": (patched.resource_version + 1).to_string()
+                    },
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "resources": {"requests": {"storage": "1Gi"}}
+                    },
+                    "status": {
+                        "phase": "Bound",
+                        "accessModes": ["ReadWriteOnce"],
+                        "capacity": {"storage": "1Gi"},
+                        "volumeName": "pv-pvc-status-race"
+                    }
+                }),
+                require_absent: false,
+                require_existing: true,
+                precondition_uid: Some(created.uid.clone()),
+                precondition_resource_version: Some(created.resource_version),
+                status_only: true,
+            },
+        )],
+    );
+    let result = db
+        .apply_raft_log_apply_commit(committed_status)
+        .await
+        .expect("stale controller status commit should apply through raft");
+    assert_eq!(result.applied_rv, Some(patched.resource_version + 1));
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/namespaces/pvc-status-race/persistentvolumeclaims/pvc1/status")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body.pointer("/status/phase"), Some(&json!("Bound")));
+    assert_eq!(
+        body.pointer("/status/conditions/0/type"),
+        Some(&json!("StatusPatched")),
+        "PVC /status patch condition must survive stale controller status commit"
+    );
+}
+
+#[tokio::test]
 async fn test_pv_status_defaults_phase_available_on_create() {
     use axum::{
         body::Body,

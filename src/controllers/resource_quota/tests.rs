@@ -147,6 +147,74 @@ impl crate::kubelet::pod_repository::PodReader for ResourceQuotaConflictPodReade
     }
 }
 
+struct ResourceQuotaStatusConflictPodReader {
+    inner: Arc<dyn crate::kubelet::pod_repository::PodReader>,
+    db: crate::datastore::sqlite::Datastore,
+    updated: AtomicBool,
+}
+
+#[async_trait]
+impl crate::kubelet::pod_repository::PodReader for ResourceQuotaStatusConflictPodReader {
+    async fn get_pod(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.inner.get_pod(ns, name).await
+    }
+
+    async fn get_pod_for_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
+        self.inner.get_pod_for_uid(ns, name, uid).await
+    }
+
+    async fn list_pods(
+        &self,
+        ns: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        limit: Option<i64>,
+        continue_token: Option<&str>,
+    ) -> anyhow::Result<crate::datastore::ResourceList> {
+        if ns == Some("default") && !self.updated.swap(true, Ordering::SeqCst) {
+            let current = self
+                .db
+                .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
+                .await?
+                .expect("test ResourceQuota should exist");
+            self.db
+                .update_status_only(
+                    "v1",
+                    "ResourceQuota",
+                    Some("default"),
+                    "test-rq",
+                    json!({
+                        "hard": {"pods": "4"},
+                        "used": {"pods": "77"}
+                    }),
+                    Some(current.resource_version),
+                )
+                .await?;
+        }
+
+        self.inner
+            .list_pods(ns, label_selector, field_selector, limit, continue_token)
+            .await
+    }
+
+    async fn list_pods_by_owner_uid(
+        &self,
+        ns: &str,
+        owner_uid: &str,
+    ) -> anyhow::Result<Vec<crate::datastore::Resource>> {
+        self.inner.list_pods_by_owner_uid(ns, owner_uid).await
+    }
+}
+
 #[test]
 fn test_parse_scalar_resource_accepts_decimal_si_suffix() {
     assert_eq!(
@@ -160,7 +228,69 @@ fn test_parse_scalar_resource_accepts_decimal_si_suffix() {
 }
 
 #[tokio::test]
-async fn test_reconcile_resource_quota_conflict_retry_uses_fresh_hard_spec() {
+async fn test_reconcile_resource_quota_rejects_stale_status_overlap() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    db.create_resource(
+        "v1",
+        "ResourceQuota",
+        Some("default"),
+        "test-rq",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ResourceQuota",
+            "metadata": {"name": "test-rq", "namespace": "default"},
+            "spec": {"hard": {"pods": "4"}},
+            "status": {"hard": {"pods": "4"}, "used": {"pods": "0"}}
+        }),
+    )
+    .await
+    .unwrap();
+
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "test-pod",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test-pod", "namespace": "default"},
+            "spec": {"containers": [{"name": "c", "image": "busybox"}]}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let pod_reader = ResourceQuotaStatusConflictPodReader {
+        inner: crate::controllers::test_utils::pod_repository_for_test(&db),
+        db: db.clone(),
+        updated: AtomicBool::new(false),
+    };
+
+    let result = reconcile_resource_quotas_for_namespace(&db, &pod_reader, "default").await;
+    let err = result.expect_err("stale ResourceQuota status overlap must be rejected");
+    assert!(
+        crate::datastore::errors::is_conflict_error(&err),
+        "expected status conflict, got {err:#}"
+    );
+
+    let rq = db
+        .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rq.data
+            .pointer("/status/used/pods")
+            .and_then(|v| v.as_str()),
+        Some("77"),
+        "ResourceQuota reconcile must not overwrite a live status change from a stale snapshot"
+    );
+}
+
+#[tokio::test]
+async fn test_reconcile_resource_quota_rejects_stale_spec_overlap() {
     let db = crate::datastore::test_support::in_memory().await;
 
     db.create_resource(
@@ -200,9 +330,12 @@ async fn test_reconcile_resource_quota_conflict_retry_uses_fresh_hard_spec() {
         updated: AtomicBool::new(false),
     };
 
-    reconcile_resource_quotas_for_namespace(&db, &pod_reader, "default")
-        .await
-        .unwrap();
+    let result = reconcile_resource_quotas_for_namespace(&db, &pod_reader, "default").await;
+    let err = result.expect_err("stale ResourceQuota spec overlap must be rejected");
+    assert!(
+        crate::datastore::errors::is_conflict_error(&err),
+        "expected status conflict, got {err:#}"
+    );
 
     let rq = db
         .get_resource("v1", "ResourceQuota", Some("default"), "test-rq")
@@ -212,17 +345,17 @@ async fn test_reconcile_resource_quota_conflict_retry_uses_fresh_hard_spec() {
 
     assert_eq!(
         rq.data
-            .pointer("/status/hard/secrets")
+            .pointer("/spec/hard/secrets")
             .and_then(|v| v.as_str()),
         Some("5"),
-        "conflict retry must mirror the fresh live spec.hard"
+        "test mutation should leave the live spec.hard changed"
     );
     assert_eq!(
         rq.data
             .pointer("/status/used/secrets")
             .and_then(|v| v.as_str()),
-        Some("0"),
-        "conflict retry must calculate usage for fresh hard keys"
+        None,
+        "ResourceQuota reconcile must not rebase stale status across a live spec change"
     );
 }
 

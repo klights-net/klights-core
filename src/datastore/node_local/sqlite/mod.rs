@@ -6,6 +6,7 @@ use rusqlite::OptionalExtension;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
+use crate::datastore::command::{StorageCommand, decode_command_protobuf};
 use crate::datastore::sqlite::DbExecutor;
 use crate::datastore::{
     PodEndpointEvent, PodEndpointMode, PodEndpointRow, PodNetworkAllocationRequest,
@@ -89,6 +90,7 @@ pub struct OutboxRow {
     pub subject_uid: Option<String>,
     pub pod_uid: String,
     pub operation: String,
+    pub is_terminal_pod_delete: bool,
     pub payload_proto: Vec<u8>,
     pub attempt: i64,
     pub next_due_ms: i64,
@@ -466,6 +468,8 @@ impl SqliteNodeLocalDb {
     }
 
     pub async fn enqueue_outbox(&self, row: OutboxInsert) -> Result<()> {
+        let is_terminal_pod_delete =
+            is_terminal_pod_delete_outbox_row(row.operation.as_str(), row.payload_proto.as_slice());
         self.db_call("node_local:outbox_enqueue", move |conn| {
             conn.execute(
                 queries::OUTBOX_INSERT,
@@ -480,6 +484,7 @@ impl SqliteNodeLocalDb {
                     row.subject_uid,
                     row.pod_uid,
                     row.operation,
+                    if is_terminal_pod_delete { 1_i64 } else { 0_i64 },
                     row.payload_proto,
                     row.next_due_ms
                 ],
@@ -618,7 +623,7 @@ impl SqliteNodeLocalDb {
                 {
                     let mut stmt = tx.prepare("SELECT id, idempotency_key, enqueued_ms, \
                         subject_key, subject_api_version, subject_kind, subject_namespace, subject_name, \
-                        subject_uid, pod_uid, operation, payload_proto, attempt, next_due_ms, \
+                        subject_uid, pod_uid, operation, is_terminal_pod_delete, payload_proto, attempt, next_due_ms, \
                         leased_until_ms, lease_token, last_error FROM outbox WHERE id = ?1")?;
                     for id in leased_ids {
                         if let Some(row) = stmt.query_row([id], row_to_outbox).optional()? {
@@ -651,6 +656,26 @@ impl SqliteNodeLocalDb {
         })
         .await
         .map_err(|e| anyhow!("outbox batch complete failed: {e}"))
+    }
+
+    pub async fn complete_superseded_status_outbox_for_terminal_pod_delete(
+        &self,
+        subject_key: &str,
+        terminal_delete_id: i64,
+    ) -> Result<usize> {
+        let subject_key = subject_key.to_string();
+        self.db_call(
+            "node_local:outbox_complete_superseded_terminal_pod_delete_status",
+            move |conn| {
+                conn.execute(
+                    queries::OUTBOX_COMPLETE_SUPERSEDED_TERMINAL_POD_DELETE_STATUS,
+                    rusqlite::params![subject_key, terminal_delete_id],
+                )
+                .map_err(tokio_rusqlite::Error::from)
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("outbox complete superseded status failed: {e}"))
     }
 
     pub async fn requeue_expired_outbox_leases(&self, now_ms: i64) -> Result<usize> {
@@ -765,15 +790,22 @@ impl SqliteNodeLocalDb {
 
     pub async fn replay_dead_letter(&self, id: i64) -> Result<bool> {
         let now = now_ms();
+        let row = self
+            .db_call("node_local:outbox_dead_letter_replay_get", move |conn| {
+                Ok(conn
+                    .query_row(queries::DEAD_LETTER_GET, [id], row_to_dead_letter)
+                    .optional()?)
+            })
+            .await
+            .map_err(|e| anyhow!("outbox dead letter replay read failed: {e}"))?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let is_terminal_pod_delete =
+            is_terminal_pod_delete_outbox_row(row.operation.as_str(), row.payload_proto.as_slice());
+
         self.db_call("node_local:outbox_dead_letter_replay", move |conn| {
             let tx = conn.transaction()?;
-            let row = tx
-                .query_row(queries::DEAD_LETTER_GET, [id], row_to_dead_letter)
-                .optional()?;
-            let Some(row) = row else {
-                tx.commit()?;
-                return Ok(false);
-            };
             tx.execute(
                 queries::OUTBOX_INSERT,
                 rusqlite::params![
@@ -787,6 +819,7 @@ impl SqliteNodeLocalDb {
                     row.subject_uid,
                     row.pod_uid,
                     row.operation,
+                    if is_terminal_pod_delete { 1_i64 } else { 0_i64 },
                     row.payload_proto,
                     now,
                 ],
@@ -1213,13 +1246,29 @@ fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
         subject_uid: row.get(8)?,
         pod_uid: row.get(9)?,
         operation: row.get(10)?,
-        payload_proto: row.get(11)?,
-        attempt: row.get(12)?,
-        next_due_ms: row.get(13)?,
-        leased_until_ms: row.get(14)?,
-        lease_token: row.get(15)?,
-        last_error: row.get(16)?,
+        is_terminal_pod_delete: row.get::<_, i64>(11)? != 0,
+        payload_proto: row.get(12)?,
+        attempt: row.get(13)?,
+        next_due_ms: row.get(14)?,
+        leased_until_ms: row.get(15)?,
+        lease_token: row.get(16)?,
+        last_error: row.get(17)?,
     })
+}
+
+fn is_terminal_pod_delete_outbox_row(operation: &str, payload_proto: &[u8]) -> bool {
+    if operation != "PodMetadata" {
+        return false;
+    }
+    matches!(
+        decode_command_protobuf(payload_proto),
+        Ok(StorageCommand::DeleteResource {
+            api_version,
+            kind,
+            preconditions,
+            ..
+        }) if api_version == "v1" && kind == "Pod" && preconditions.uid.is_some()
+    )
 }
 
 fn row_to_dead_letter(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRow> {

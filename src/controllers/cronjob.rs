@@ -33,7 +33,7 @@ async fn reconcile_cronjob_inner(
     db: &dyn DatastoreBackend,
     dispatcher: Option<&ControllerDispatcher>,
     cj: &Value,
-    rv: i64,
+    _rv: i64,
 ) -> Result<()> {
     let input_metadata = cj
         .get("metadata")
@@ -52,7 +52,7 @@ async fn reconcile_cronjob_inner(
     else {
         return Ok(());
     };
-    let cj = &live_cj.data;
+    let cj = live_cj.data.as_ref();
     let metadata = cj
         .get("metadata")
         .ok_or_else(|| anyhow::anyhow!("missing metadata"))?;
@@ -100,7 +100,7 @@ async fn reconcile_cronjob_inner(
 
     let Some(scheduled_time) = most_recent_cronjob_schedule_time(cj, now, &schedule, true)? else {
         // Not yet due — just sync active list and clean up old jobs, then return.
-        sync_active_status(db, cj, name, namespace, uid, rv, None).await?;
+        sync_active_status(db, &live_cj, None).await?;
         cleanup_old_jobs_by_history_limit(db, cj, namespace, uid).await?;
         return Ok(());
     };
@@ -116,7 +116,7 @@ async fn reconcile_cronjob_inner(
                 name,
                 active_jobs.len()
             );
-            sync_active_status(db, cj, name, namespace, uid, rv, None).await?;
+            sync_active_status(db, &live_cj, None).await?;
             cleanup_old_jobs_by_history_limit(db, cj, namespace, uid).await?;
             return Ok(());
         }
@@ -144,7 +144,7 @@ async fn reconcile_cronjob_inner(
     if let (Some(dispatcher), Some(job)) = (dispatcher, created_job.as_ref()) {
         dispatcher.enqueue(&job.data).await;
     }
-    sync_active_status(db, cj, name, namespace, uid, rv, Some(scheduled_time)).await?;
+    sync_active_status(db, &live_cj, Some(scheduled_time)).await?;
 
     // Clean up old completed/failed Jobs that exceed history limits
     cleanup_old_jobs_by_history_limit(db, cj, namespace, uid).await?;
@@ -514,13 +514,12 @@ async fn list_active_jobs(
 /// Sync the CronJob's status.lastScheduleTime and status.active list.
 async fn sync_active_status(
     db: &dyn DatastoreBackend,
-    cj: &Value,
-    name: &str,
-    namespace: &str,
-    cj_uid: &str,
-    rv: i64,
+    cj_resource: &Resource,
     new_scheduled: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
+    let cj = cj_resource.data.as_ref();
+    let namespace = cj_resource.namespace.as_deref().unwrap_or("default");
+    let cj_uid = cj_resource.uid.as_str();
     let active_jobs = list_active_jobs(db, namespace, cj_uid).await?;
     let active_refs: Vec<Value> = active_jobs
         .iter()
@@ -570,15 +569,7 @@ async fn sync_active_status(
         return Ok(());
     }
 
-    db.update_status_only_with_preconditions(
-        "batch/v1",
-        "CronJob",
-        Some(namespace),
-        name,
-        status,
-        ResourcePreconditions::uid_and_resource_version(cj_uid.to_string(), rv),
-    )
-    .await?;
+    crate::controllers::common::write_status_for_resource(db, cj_resource, &status).await?;
 
     Ok(())
 }
@@ -1108,10 +1099,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cronjob_reconcile_propagates_status_update_error() {
-        // Status-write failures (e.g., resourceVersion conflict from a concurrent
-        // update) must surface to the caller so the controller's outer loop retries
-        // instead of silently treating the reconcile as successful.
+    async fn test_cronjob_reconcile_uses_live_resource_for_status_after_stale_input_rv() {
+        // The reconciler re-reads the live CronJob before acting. Status writes
+        // must therefore use that live row's resourceVersion, not the older RV
+        // carried by the event/timer that triggered this reconcile.
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
             "v1",
@@ -1146,13 +1137,24 @@ mod tests {
         .await
         .unwrap();
 
-        // Pass a stale resource_version that cannot match the row's current rv;
-        // the eventual status update inside sync_active_status must fail.
+        // Pass a stale resource_version that cannot match the row's current RV.
+        // The live CronJob row read inside reconcile still has the valid guard.
         let stale_rv: i64 = 999_999;
         let result = reconcile_cronjob_inner(&db, None, &cj, stale_rv).await;
         assert!(
-            result.is_err(),
-            "reconcile_cronjob must propagate status-update conflict, got {result:?}"
+            result.is_ok(),
+            "reconcile_cronjob must write status from the live row despite stale input RV, got {result:?}"
+        );
+
+        let live = db
+            .get_resource("batch/v1", "CronJob", Some("default"), "test-cj-prop")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.data.pointer("/status/observedGeneration"),
+            Some(&json!(1)),
+            "successful reconcile should persist status through the live-row status writer"
         );
     }
 
@@ -1656,17 +1658,9 @@ mod tests {
 
         // No active Jobs, no new schedule → sync_active_status computes a status
         // identical to the one already stored. It must NOT issue a status write.
-        super::sync_active_status(
-            &db,
-            &cj,
-            "test-cj-sync",
-            "default",
-            "cj-sync-uid",
-            created.resource_version,
-            None,
-        )
-        .await
-        .unwrap();
+        super::sync_active_status(&db, &created, None)
+            .await
+            .unwrap();
 
         let after = db
             .get_resource("batch/v1", "CronJob", Some("default"), "test-cj-sync")
@@ -1676,6 +1670,83 @@ mod tests {
         assert_eq!(
             after.resource_version, created.resource_version,
             "sync_active_status must not bump resourceVersion when status is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cronjob_sync_active_status_rejects_stale_status_overlap() {
+        let db = make_raft_cronjob_datastore().await;
+        let cj = json!({
+            "apiVersion": "batch/v1",
+            "kind": "CronJob",
+            "metadata": {
+                "name": "test-cj-stale-status",
+                "namespace": "default",
+                "uid": "cj-stale-status-uid",
+                "generation": 1,
+                "creationTimestamp": crate::utils::k8s_time_now(),
+            },
+            "spec": {
+                "schedule": "* * * * *",
+                "concurrencyPolicy": "Allow",
+                "jobTemplate": {"spec": {"template": {"spec": {
+                    "containers": [{"name": "c", "image": "nginx"}],
+                    "restartPolicy": "Never"
+                }}}}
+            },
+            "status": {
+                "active": [],
+                "lastSuccessfulTime": "2026-01-01T00:00:00Z"
+            },
+        });
+        let created = db
+            .create_resource(
+                "batch/v1",
+                "CronJob",
+                Some("default"),
+                "test-cj-stale-status",
+                cj,
+            )
+            .await
+            .unwrap();
+
+        db.update_status_only(
+            "batch/v1",
+            "CronJob",
+            Some("default"),
+            "test-cj-stale-status",
+            json!({
+                "active": [],
+                "lastSuccessfulTime": "2026-01-02T00:00:00Z"
+            }),
+            Some(created.resource_version),
+        )
+        .await
+        .unwrap();
+
+        let result = super::sync_active_status(&db, &created, None).await;
+        let err = result.expect_err("stale CronJob status overlap must be rejected");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected status conflict, got {err:#}"
+        );
+
+        let live = db
+            .get_resource(
+                "batch/v1",
+                "CronJob",
+                Some("default"),
+                "test-cj-stale-status",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.data
+                .pointer("/status/lastSuccessfulTime")
+                .and_then(|value| value.as_str()),
+            Some("2026-01-02T00:00:00Z"),
+            "CronJob status writer must not overwrite a live status change from a stale snapshot"
         );
     }
 }
