@@ -1861,7 +1861,7 @@ fn applied_outbox_record_in_tx(
 }
 
 fn is_uncommitted_outbox_placeholder(row: &AppliedOutboxRecord) -> bool {
-    row.applied_rv.is_none() && row.subject_key.is_empty() && row.result_proto.is_empty()
+    row.applied_rv.is_none() && row.result_proto.is_empty()
 }
 
 fn storage_result_from_applied_outbox(

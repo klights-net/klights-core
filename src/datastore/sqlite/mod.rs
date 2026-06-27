@@ -535,9 +535,7 @@ impl Datastore {
                     })
                     .optional()?;
                 if let Some(ref row) = existing {
-                    let placeholder = row.applied_rv.is_none()
-                        && row.subject_key.is_empty()
-                        && row.result_proto.is_empty();
+                    let placeholder = row.applied_rv.is_none() && row.result_proto.is_empty();
                     if placeholder && row.first_seen_ms < stale_cutoff_ms {
                         tx.execute(queries::APPLIED_OUTBOX_DELETE_BY_KEY, [&claim_key])?;
                     } else if placeholder {
@@ -549,25 +547,19 @@ impl Datastore {
                     }
                 }
 
-                // Claim the placeholder so concurrent proposals dedup.
-                tx.execute(
-                    queries::APPLIED_OUTBOX_INSERT,
-                    rusqlite::params![
-                        &claim_key,
-                        "",
-                        &claim_operation,
-                        now,
-                        Option::<i64>::None,
-                        Vec::<u8>::new(),
-                        Option::<i64>::None
-                    ],
-                )?;
-
                 let (mut commit, rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
                     decoded.command,
                     &claim_operation,
                     &authoring_node_owned,
+                )?;
+
+                // Claim the placeholder in the same transaction that reserves
+                // the RV so list snapshots can avoid anchoring past unapplied
+                // raft entries for this resource collection.
+                tx.execute(
+                    queries::APPLIED_OUTBOX_INSERT_PLACEHOLDER_WITH_RESERVED_RV,
+                    rusqlite::params![&claim_key, &subject_key, &claim_operation, now, rv],
                 )?;
 
                 // Append PutAppliedOutbox so the state-machine apply on
@@ -667,9 +659,7 @@ impl Datastore {
                     .optional()?;
 
                 if let Some(ref row) = existing {
-                    let placeholder = row.applied_rv.is_none()
-                        && row.subject_key.is_empty()
-                        && row.result_proto.is_empty();
+                    let placeholder = row.applied_rv.is_none() && row.result_proto.is_empty();
                     if placeholder && row.first_seen_ms < stale_cutoff_ms {
                         tx.execute(queries::APPLIED_OUTBOX_DELETE_BY_KEY, [&claim_key])?;
                     } else if placeholder {

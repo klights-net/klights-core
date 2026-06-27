@@ -403,6 +403,126 @@ async fn list_resources_response_rv_allows_catch_up_for_post_list_delete() {
 }
 
 #[tokio::test]
+async fn list_resources_response_rv_does_not_skip_reserved_unapplied_delete() {
+    let db = Datastore::new_in_memory().await.unwrap();
+
+    let created = db
+        .create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "cm-reserved-delete",
+            json!({
+                "metadata": {
+                    "name": "cm-reserved-delete",
+                    "namespace": "default"
+                },
+                "data": {"k": "v"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let command = crate::datastore::command::StorageCommand::DeleteResource {
+        api_version: "v1".to_string(),
+        kind: "ConfigMap".to_string(),
+        namespace: Some("default".to_string()),
+        name: "cm-reserved-delete".to_string(),
+        preconditions: crate::datastore::types::ResourcePreconditions::uid(created.uid.clone()),
+    };
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "reserved-delete-list-watch",
+            crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+            payload.as_ref(),
+            "mn-controlplane1",
+        )
+        .await
+        .expect("build unapplied delete commit");
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit,
+        applied_rv: delete_rv,
+    } = outcome
+    else {
+        panic!("expected a fresh delete commit");
+    };
+
+    db.apply_log_apply_commit(crate::log_apply::LogApplyCommit::new(
+        delete_rv + 1,
+        vec![crate::log_apply::LogApplyMutation::PutResource(
+            crate::log_apply::LogApplyResourceRow {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "cm-unrelated".to_string(),
+                uid: "cm-unrelated-uid".to_string(),
+                resource_version: delete_rv + 1,
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "cm-unrelated",
+                        "namespace": "default",
+                        "uid": "cm-unrelated-uid"
+                    },
+                    "data": {"k": "v"}
+                }),
+                require_absent: true,
+                require_existing: false,
+                precondition_uid: None,
+                precondition_resource_version: None,
+                status_only: false,
+            },
+        )],
+    ))
+    .await
+    .unwrap();
+
+    let list = db
+        .list_resources(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            ResourceListQuery::new(
+                None,
+                Some("metadata.name=cm-reserved-delete"),
+                Some(500),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        list.items
+            .iter()
+            .any(|item| item.name == "cm-reserved-delete"),
+        "test setup must list cm-reserved-delete before the pending delete applies"
+    );
+    assert!(
+        list.resource_version < delete_rv,
+        "list contains cm-reserved-delete while delete rv={delete_rv} is reserved but unapplied; \
+         list rv={} would make catch-up skip the delete",
+        list.resource_version
+    );
+
+    db.apply_log_apply_commit(commit).await.unwrap();
+    let catch_up = db
+        .list_resources_modified_since("v1", "ConfigMap", Some("default"), list.resource_version)
+        .await
+        .unwrap();
+    assert!(
+        catch_up.iter().any(|event| {
+            event.resource.name == "cm-reserved-delete" && event.event_type.as_ref() == "DELETED"
+        }),
+        "watch catch-up from list rv={} must include reserved delete rv={delete_rv}",
+        list.resource_version
+    );
+}
+
+#[tokio::test]
 async fn list_resources_response_rv_is_global_snapshot_not_max_item() {
     // A complete (non-paginated) list must report the global snapshot
     // resourceVersion, not max(item RV). Reporting max(item RV) under-anchors a

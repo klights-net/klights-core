@@ -209,13 +209,21 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
             first_seen_ms   INTEGER NOT NULL,
             applied_rv      INTEGER,
             result_proto    BLOB NOT NULL,
-            status_stamp    INTEGER
+            status_stamp    INTEGER,
+            reserved_rv     INTEGER
         )",
         [],
     )?;
+    migrate_applied_outbox_reserved_rv(conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_applied_outbox_subject
          ON applied_outbox(subject_key, first_seen_ms)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_applied_outbox_pending_reserved
+         ON applied_outbox(subject_key, reserved_rv)
+         WHERE reserved_rv IS NOT NULL AND applied_rv IS NULL AND length(result_proto) = 0",
         [],
     )?;
 
@@ -340,6 +348,28 @@ fn migrate_watch_events_allow_same_rv(conn: &mut rusqlite::Connection) -> rusqli
     )?;
     tx.execute("DROP TABLE watch_events_old", [])?;
     tx.commit()
+}
+
+fn migrate_applied_outbox_reserved_rv(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_reserved_rv = {
+        let mut stmt = conn.prepare("PRAGMA table_info(applied_outbox)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for row in rows {
+            if row? == "reserved_rv" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_reserved_rv {
+        conn.execute(
+            "ALTER TABLE applied_outbox ADD COLUMN reserved_rv INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeSubnet> {

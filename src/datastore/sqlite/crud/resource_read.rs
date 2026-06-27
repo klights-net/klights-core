@@ -161,25 +161,48 @@ fn maybe_pause_list_resources_snapshot_after_rows_for_test(
 fn list_response_resource_version(
     _items: &[Resource],
     current_rv: i64,
+    pending_reserved_rv: Option<i64>,
     _request_had_continue: bool,
     _response_has_continue: bool,
 ) -> i64 {
-    // Every list (complete or paginated) reports the in-transaction global
-    // snapshot resourceVersion. This matches real K8s: the collection revision
-    // anchors any follow-up `?watch=true&resourceVersion=<list rv>` to "now",
-    // so the server replays nothing for objects already reflected in the list
-    // (the kubectl `-w` phantom-pod artifact).
+    // Every list (complete or paginated) normally reports the in-transaction
+    // global snapshot resourceVersion. This matches real K8s: the collection
+    // revision anchors any follow-up `?watch=true&resourceVersion=<list rv>`
+    // to "now", so the server replays nothing for objects already reflected
+    // in the list (the kubectl `-w` phantom-pod artifact).
     //
-    // This is safe in the raft-only cluster model: every listed row has
-    // rv <= current_rv (the in-tx snapshot includes any raced-in create), and
-    // every future mutation — including deletes of listed rows — is stamped a
-    // strictly higher rv (`next_resource_version_in_tx`; `advance_metadata_rv_
-    // to_at_least` only moves the counter up) and applied in raft commit order,
-    // so a watch resuming from current_rv catches all of them. A delete stamped
-    // *below* the global counter cannot occur under raft, so anchoring to
-    // max(item rv) to "catch" such a delete is unnecessary (and is what caused
-    // the stale-list-RV replay).
+    // Raft proposals reserve the leader's next RV before state-machine apply
+    // so every member materializes the same object RV. While such a
+    // collection-relevant reservation is in flight, the global metadata RV can
+    // be higher than a mutation that is not yet visible in rows/watch history.
+    // Cap the list RV just before the earliest unapplied reservation so a
+    // follow-up watch cannot skip that eventual ADDED/MODIFIED/DELETED event.
+    if let Some(reserved_rv) = pending_reserved_rv.filter(|rv| *rv > 0) {
+        return current_rv.min(reserved_rv.saturating_sub(1));
+    }
     current_rv
+}
+
+fn list_subject_key_prefix(api_version: &str, kind: &str, namespace: Option<&str>) -> String {
+    match namespace {
+        Some(namespace) => format!("{api_version}/{kind}/{namespace}/"),
+        None => format!("{api_version}/{kind}/"),
+    }
+}
+
+fn pending_reserved_rv_for_collection_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    subject_prefix: &str,
+) -> rusqlite::Result<Option<i64>> {
+    tx.query_row(
+        "SELECT MIN(reserved_rv) FROM applied_outbox
+         WHERE reserved_rv IS NOT NULL
+           AND applied_rv IS NULL
+           AND length(result_proto) = 0
+           AND subject_key LIKE ?1",
+        rusqlite::params![format!("{subject_prefix}%")],
+        |row| row.get(0),
+    )
 }
 
 impl Datastore {
@@ -388,7 +411,7 @@ impl Datastore {
             let token_for_count = token_owned.clone();
             let ns_for_count = ns_owned.clone();
             let event_compat = needs_event_v1_compat(api_version, kind);
-            let (items, total_after_token, current_rv) =
+            let (items, total_after_token, current_rv, pending_reserved_rv) =
                 if use_namespaced_table(api_version, kind, &namespace) {
                     self.db_call("db_query", move |conn| {
                         let tx = conn.transaction()?;
@@ -452,8 +475,12 @@ impl Datastore {
                         let total_after_token: i64 =
                             conn.query_row(&count_query, &count_param_refs[..], |row| row.get(0))?;
                         let current_rv = Self::current_resource_version_in_tx(&tx)?;
+                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
+                            &tx,
+                            &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
+                        )?;
 
-                        Ok((items, total_after_token, current_rv))
+                        Ok((items, total_after_token, current_rv, pending_reserved_rv))
                     })
                     .await?
                 } else {
@@ -495,7 +522,11 @@ impl Datastore {
                         let total_after_token: i64 =
                             conn.query_row(&count_query, &count_param_refs[..], |row| row.get(0))?;
                         let current_rv = Self::current_resource_version_in_tx(&tx)?;
-                        Ok((items, total_after_token, current_rv))
+                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
+                            &tx,
+                            &list_subject_key_prefix(&av, &k, None),
+                        )?;
+                        Ok((items, total_after_token, current_rv, pending_reserved_rv))
                     })
                     .await?
                 };
@@ -509,6 +540,7 @@ impl Datastore {
             let response_rv = list_response_resource_version(
                 &items,
                 current_rv,
+                pending_reserved_rv,
                 request_had_continue,
                 next_token.is_some(),
             );
@@ -547,7 +579,11 @@ impl Datastore {
             // Build the pushdown separately for each branch because the param
             // offset (base query parameter count) differs between namespaced
             // and cluster paths.
-            let (items, current_rv) = if use_namespaced_table(api_version, kind, &namespace) {
+            let (items, current_rv, pending_reserved_rv) = if use_namespaced_table(
+                api_version,
+                kind,
+                &namespace,
+            ) {
                 // Base param count WITHOUT token/cursor: used for residual
                 // cursor batching where the cursor comes after pushdown.
                 // The non-residual path adds token back for its offset.
@@ -717,7 +753,11 @@ impl Datastore {
                             cursor_name = last_candidate_name;
                         }
                         let current_rv = Self::current_resource_version_in_tx(&tx)?;
-                        Ok((page_items, current_rv))
+                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
+                            &tx,
+                            &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
+                        )?;
+                        Ok((page_items, current_rv, pending_reserved_rv))
                     })
                     .await?
                 } else {
@@ -830,7 +870,11 @@ impl Datastore {
                             pause_continue_token.as_deref(),
                         );
                         let current_rv = Self::current_resource_version_in_tx(&tx)?;
-                        Ok((page_items, current_rv))
+                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
+                            &tx,
+                            &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
+                        )?;
+                        Ok((page_items, current_rv, pending_reserved_rv))
                     })
                     .await?
                 }
@@ -962,7 +1006,11 @@ impl Datastore {
                             cursor_name = last_candidate_name;
                         }
                         let current_rv = Self::current_resource_version_in_tx(&tx)?;
-                        Ok((page_items, current_rv))
+                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
+                            &tx,
+                            &list_subject_key_prefix(&av, &k, None),
+                        )?;
+                        Ok((page_items, current_rv, pending_reserved_rv))
                     })
                     .await?
                 } else {
@@ -1032,7 +1080,11 @@ impl Datastore {
                             }
                         }
                         let current_rv = Self::current_resource_version_in_tx(&tx)?;
-                        Ok((page_items, current_rv))
+                        let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
+                            &tx,
+                            &list_subject_key_prefix(&av, &k, None),
+                        )?;
+                        Ok((page_items, current_rv, pending_reserved_rv))
                     })
                     .await?
                 }
@@ -1050,6 +1102,7 @@ impl Datastore {
             let response_rv = list_response_resource_version(
                 &items,
                 current_rv,
+                pending_reserved_rv,
                 request_had_continue,
                 next_token.is_some(),
             );
@@ -1093,7 +1146,11 @@ impl Datastore {
                 Vec::new()
             };
 
-        let (items, current_rv) = if use_namespaced_table(api_version, kind, &namespace) {
+        let (items, current_rv, pending_reserved_rv) = if use_namespaced_table(
+            api_version,
+            kind,
+            &namespace,
+        ) {
             // Namespaced resources
             self.db_call("db_query", move |conn| {
                 let tx = conn.transaction()?;
@@ -1181,7 +1238,11 @@ impl Datastore {
                     items.push(item);
                 }
                 let current_rv = Self::current_resource_version_in_tx(&tx)?;
-                Ok((items, current_rv))
+                let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
+                    &tx,
+                    &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
+                )?;
+                Ok((items, current_rv, pending_reserved_rv))
             })
             .await?
         } else {
@@ -1256,7 +1317,11 @@ impl Datastore {
                     items.push(item);
                 }
                 let current_rv = Self::current_resource_version_in_tx(&tx)?;
-                Ok((items, current_rv))
+                let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
+                    &tx,
+                    &list_subject_key_prefix(&av, &k, None),
+                )?;
+                Ok((items, current_rv, pending_reserved_rv))
             })
             .await?
         };
@@ -1279,6 +1344,7 @@ impl Datastore {
         let response_rv = list_response_resource_version(
             &items,
             current_rv,
+            pending_reserved_rv,
             request_had_continue,
             next_token.is_some(),
         );

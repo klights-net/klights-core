@@ -147,16 +147,21 @@ pub(super) const APPLIED_OUTBOX_INSERT: &str = "INSERT OR IGNORE INTO applied_ou
      (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp) \
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
+pub(super) const APPLIED_OUTBOX_INSERT_PLACEHOLDER_WITH_RESERVED_RV: &str = "INSERT OR IGNORE INTO applied_outbox \
+     (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp, reserved_rv) \
+     VALUES (?1, ?2, ?3, ?4, NULL, X'', NULL, ?5)";
+
 pub(super) const APPLIED_OUTBOX_UPSERT_EXACT: &str = "INSERT INTO applied_outbox \
-     (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+     (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp, reserved_rv) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL) \
      ON CONFLICT(idempotency_key) DO UPDATE SET \
        subject_key = excluded.subject_key, \
        operation = excluded.operation, \
        first_seen_ms = excluded.first_seen_ms, \
        applied_rv = excluded.applied_rv, \
        result_proto = excluded.result_proto, \
-       status_stamp = excluded.status_stamp";
+       status_stamp = excluded.status_stamp, \
+       reserved_rv = NULL";
 
 /// Highest worker-observed status stamp already recorded for a Pod status
 /// subject. The leader compares an incoming status snapshot's stamp against
@@ -581,7 +586,6 @@ pub(super) const APPLIED_OUTBOX_UPDATE_RESULT: &str = "UPDATE applied_outbox \
      WHERE idempotency_key = ?1";
 pub(super) const APPLIED_OUTBOX_DELETE_STALE_PLACEHOLDERS: &str = "DELETE FROM applied_outbox \
      WHERE applied_rv IS NULL
-     AND subject_key = ''
      AND result_proto = X''
      AND first_seen_ms < ?1";
 pub(super) const APPLIED_OUTBOX_DELETE_EXPIRED: &str =
@@ -592,7 +596,6 @@ pub(super) const APPLIED_OUTBOX_DELETE_BY_KEY: &str =
 
 pub(super) const APPLIED_OUTBOX_DELETE_UNCOMMITTED_PLACEHOLDER_BY_KEY: &str = "DELETE FROM applied_outbox \
      WHERE idempotency_key = ?1 \
-       AND subject_key = '' \
        AND applied_rv IS NULL \
        AND length(result_proto) = 0";
 
