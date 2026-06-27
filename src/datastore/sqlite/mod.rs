@@ -6,6 +6,7 @@
 
 mod applier;
 mod cluster_replace;
+mod cluster_state_apply;
 mod crud;
 mod executor;
 mod filters;

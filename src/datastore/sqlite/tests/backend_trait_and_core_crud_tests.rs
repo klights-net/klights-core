@@ -1911,6 +1911,173 @@ async fn raft_zero_grace_pod_delete_mark_patch_replays_identical_watch_payloads(
 }
 
 #[tokio::test]
+async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_payloads() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+    let base_pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "terminating-stale-put",
+            "namespace": "default",
+            "uid": "terminating-stale-put-uid",
+            "creationTimestamp": "2026-06-21T00:00:00Z"
+        },
+        "spec": {
+            "automountServiceAccountToken": false,
+            "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}],
+            "nodeName": "mn-worker"
+        },
+        "status": {
+            "phase": "Running",
+            "conditions": [
+                {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-06-21T00:00:01Z"},
+                {"type": "Initialized", "status": "True", "lastTransitionTime": "2026-06-21T00:00:01Z"},
+                {"type": "ContainersReady", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"},
+                {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"}
+            ],
+            "containerStatuses": [{
+                "name": "app",
+                "ready": true,
+                "started": true,
+                "restartCount": 0
+            }]
+        }
+    });
+
+    let leader_created = leader
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "terminating-stale-put",
+            base_pod.clone(),
+        )
+        .await
+        .unwrap();
+    let follower_created = follower
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "terminating-stale-put",
+            base_pod,
+        )
+        .await
+        .unwrap();
+
+    let mut leader_terminating = (*leader_created.data).clone();
+    leader_terminating["metadata"]["deletionTimestamp"] = json!("2026-06-21T00:00:10Z");
+    leader_terminating["metadata"]["deletionGracePeriodSeconds"] = json!(0);
+    leader
+        .update_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "terminating-stale-put",
+            leader_terminating,
+            leader_created.resource_version,
+        )
+        .await
+        .expect("leader live pod is terminating before stale committed put");
+    let mut follower_terminating = (*follower_created.data).clone();
+    follower_terminating["metadata"]["deletionTimestamp"] = json!("2026-06-21T00:00:10Z");
+    follower_terminating["metadata"]["deletionGracePeriodSeconds"] = json!(0);
+    follower
+        .update_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "terminating-stale-put",
+            follower_terminating,
+            follower_created.resource_version,
+        )
+        .await
+        .expect("follower live pod is terminating before stale committed put");
+
+    let committed_rv = leader_created.resource_version + 10;
+    let mut committed_pod = (*leader_created.data).clone();
+    committed_pod["metadata"]["resourceVersion"] = json!(committed_rv.to_string());
+    committed_pod["status"]["phase"] = json!("Running");
+    committed_pod["status"]["conditions"] = json!([
+        {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-06-21T00:00:01Z"},
+        {"type": "Initialized", "status": "True", "lastTransitionTime": "2026-06-21T00:00:01Z"},
+        {"type": "ContainersReady", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"},
+        {"type": "Ready", "status": "True", "lastTransitionTime": "2026-06-21T00:00:02Z"}
+    ]);
+    let commit = crate::log_apply::LogApplyCommit::new(
+        committed_rv,
+        vec![crate::log_apply::LogApplyMutation::PutResource(
+            crate::log_apply::LogApplyResourceRow {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "terminating-stale-put".to_string(),
+                uid: "terminating-stale-put-uid".to_string(),
+                resource_version: committed_rv,
+                data: committed_pod,
+                require_absent: false,
+                require_existing: true,
+                precondition_uid: Some("terminating-stale-put-uid".to_string()),
+                precondition_resource_version: Some(leader_created.resource_version),
+                status_only: false,
+            },
+        )],
+    );
+
+    leader
+        .apply_raft_log_apply_commit(commit.clone())
+        .await
+        .expect("leader applies stale committed put");
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    follower
+        .apply_raft_log_apply_commit(commit)
+        .await
+        .expect("follower applies same stale committed put");
+
+    let leader_event = leader
+        .list_watch_events_since(
+            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+                "v1", "Pod", "default",
+            )],
+            leader_created.resource_version,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.resource.resource_version == committed_rv)
+        .expect("leader stale put watch event");
+    let follower_event = follower
+        .list_watch_events_since(
+            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+                "v1", "Pod", "default",
+            )],
+            follower_created.resource_version,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| event.resource.resource_version == committed_rv)
+        .expect("follower stale put watch event");
+
+    assert_eq!(leader_event.event_type, "MODIFIED");
+    assert_eq!(follower_event.event_type, "MODIFIED");
+    assert_eq!(
+        leader_event.resource.data, follower_event.resource.data,
+        "the same stale Pod raft PUT over a terminating live row must produce byte-identical watch payloads on every member"
+    );
+    assert_eq!(
+        leader_event
+            .resource
+            .data
+            .pointer("/status/conditions/2/lastTransitionTime")
+            .and_then(|value| value.as_str()),
+        Some("2026-06-21T00:00:10Z"),
+        "legacy stale commits without a committed transition timestamp must use deterministic deletionTimestamp, not member-local wall time"
+    );
+}
+
+#[tokio::test]
 async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
