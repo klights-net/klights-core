@@ -22,9 +22,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::types::Resource;
+use crate::datastore::types::{AppliedOutboxRecord, NodeSubnet, PodCleanupIntent, Resource};
 use crate::log_apply::{
-    LogApplyCommit, LogApplyMutation, LogApplyResourceKey, LogApplyWatchEventRow,
+    ClusterMutation, LogApplyCommit, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
+    LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourceRow, LogApplyWatchEventRow,
+    NamespaceMutation, NetworkMutation, OutboxLedgerMutation, PodCleanupMutation, ResourceMutation,
+    WatchHistoryMutation,
 };
 
 const SNAPSHOT_JSON_COMMIT_BATCH_SIZE: usize = 128;
@@ -268,17 +271,20 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink>(
         }
 
         let resource_version = resource.resource_version;
-        let mut mutations = Vec::new();
+        let mut mutations: Vec<ClusterMutation> = Vec::new();
         if event_type == "DELETED" {
             mutations.push(delete_mutation_from_watch_resource(&resource));
         } else if let Some(current) = live_resources.get(&key)
             && current.resource_version == resource_version
             && emitted_live_keys.insert(key.clone())
         {
-            mutations.extend(live_resource_commit(current).mutations);
+            mutations.push(live_resource_mutation(current));
         }
         mutations.push(watch_event_mutation(resource, event_type));
-        sink.push(LogApplyCommit::new(resource_version, mutations))?;
+        sink.push(LogApplyCommit::from_cluster_mutations(
+            resource_version,
+            mutations,
+        ))?;
     }
 
     let mut remaining_live: Vec<_> = live_resources
@@ -301,24 +307,33 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink>(
         peers.sort_by(|a, b| a.node_name.as_str().cmp(b.node_name.as_str()));
         for peer in peers {
             let node_name = peer.node_name.to_string();
-            sink.push(LogApplyCommit::put_node_subnet(current_rv, &peer))?;
+            sink.push(snapshot_commit_from_family(
+                current_rv,
+                cluster_network_mutation_from_subnet(&peer),
+            ))?;
             if let Some(dataplane) = db.get_node_dataplane(&node_name).await? {
-                sink.push(LogApplyCommit::put_node_dataplane(current_rv, &dataplane))?;
+                sink.push(snapshot_commit_from_family(
+                    current_rv,
+                    cluster_network_mutation_from_dataplane(&dataplane),
+                ))?;
             }
         }
     }
 
     if current_rv > 0 {
         for record in db.list_applied_outbox().await? {
-            sink.push(LogApplyCommit::put_applied_outbox(current_rv, record))?;
+            sink.push(snapshot_commit_from_family(
+                current_rv,
+                cluster_outbox_mutation_from_record(record),
+            ))?;
         }
     }
 
     for node_name in node_names {
         for intent in db.list_pod_cleanup_intents_for_node(&node_name).await? {
-            sink.push(LogApplyCommit::put_pod_cleanup_intent(
+            sink.push(snapshot_commit_from_family(
                 intent.resource_version,
-                intent,
+                cluster_pod_cleanup_mutation_from_intent(intent),
             ))?;
         }
     }
@@ -471,34 +486,60 @@ fn live_resource_order(resource: &Resource) -> u8 {
 }
 
 fn live_resource_commit(resource: &Resource) -> LogApplyCommit {
+    snapshot_commit_from_family(resource.resource_version, live_resource_mutation(resource))
+}
+
+fn snapshot_commit_from_family(resource_version: i64, mutation: ClusterMutation) -> LogApplyCommit {
+    LogApplyCommit::from_cluster_mutations(resource_version, vec![mutation])
+}
+
+fn live_resource_mutation(resource: &Resource) -> ClusterMutation {
     if resource.api_version == "v1" && resource.kind == "Namespace" && resource.namespace.is_none()
     {
-        LogApplyCommit::put_namespace(resource)
+        ClusterMutation::Namespace(NamespaceMutation::PutNamespace(LogApplyNamespaceRow {
+            name: resource.name.clone(),
+            uid: resource.uid.clone(),
+            resource_version: resource.resource_version,
+            data: (*resource.data).clone(),
+        }))
     } else {
-        LogApplyCommit::put_resource(resource)
+        ClusterMutation::Resource(ResourceMutation::PutResource(LogApplyResourceRow {
+            api_version: resource.api_version.clone(),
+            kind: resource.kind.clone(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
+            uid: resource.uid.clone(),
+            resource_version: resource.resource_version,
+            data: (*resource.data).clone(),
+            require_absent: false,
+            require_existing: false,
+            precondition_uid: None,
+            precondition_resource_version: None,
+            status_only: false,
+        }))
     }
 }
 
-fn delete_mutation_from_watch_resource(resource: &Resource) -> LogApplyMutation {
+fn delete_mutation_from_watch_resource(resource: &Resource) -> ClusterMutation {
     if resource.api_version == "v1" && resource.kind == "Namespace" && resource.namespace.is_none()
     {
-        LogApplyMutation::DeleteNamespace {
+        ClusterMutation::Namespace(NamespaceMutation::DeleteNamespace {
             name: resource.name.clone(),
-        }
+        })
     } else {
-        LogApplyMutation::DeleteResource(LogApplyResourceKey {
+        ClusterMutation::Resource(ResourceMutation::DeleteResource(LogApplyResourceKey {
             api_version: resource.api_version.clone(),
             kind: resource.kind.clone(),
             namespace: resource.namespace.clone(),
             name: resource.name.clone(),
             uid: resource.uid.clone(),
             precondition_resource_version: None,
-        })
+        }))
     }
 }
 
-fn watch_event_mutation(resource: Resource, event_type: String) -> LogApplyMutation {
-    LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+fn watch_event_mutation(resource: Resource, event_type: String) -> ClusterMutation {
+    ClusterMutation::WatchHistory(WatchHistoryMutation::PutWatchEvent(LogApplyWatchEventRow {
         api_version: resource.api_version,
         kind: resource.kind,
         namespace: resource.namespace,
@@ -506,7 +547,46 @@ fn watch_event_mutation(resource: Resource, event_type: String) -> LogApplyMutat
         resource_version: resource.resource_version,
         event_type,
         data: std::sync::Arc::unwrap_or_clone(resource.data),
-    })
+    }))
+}
+
+fn cluster_network_mutation_from_subnet(row: &NodeSubnet) -> ClusterMutation {
+    ClusterMutation::Network(NetworkMutation::PutNodeSubnet(LogApplyNodeSubnetRow {
+        node_name: row.node_name.as_str().to_string(),
+        subnet: row.subnet.to_string(),
+        subnet_base_int: row.subnet_base_int,
+        vtep_ip: row.vtep_ip.to_string(),
+        vtep_mac: row.vtep_mac.as_ref().map(|mac| mac.to_string()),
+        node_ip: row.node_ip.to_string(),
+        mode: match row.mode {
+            crate::controllers::annotations::NodePeerMode::Root => "root".to_string(),
+            crate::controllers::annotations::NodePeerMode::Rootless => "rootless".to_string(),
+        },
+        hostport_range: row.hostport_range.as_ref().map(|range| range.to_string()),
+    }))
+}
+
+fn cluster_network_mutation_from_dataplane(
+    row: &crate::networking::wireguard::DataplanePeerMetadata,
+) -> ClusterMutation {
+    ClusterMutation::Network(NetworkMutation::PutNodeDataplane(
+        LogApplyNodeDataplaneRow {
+            node_name: row.node_name.clone(),
+            mode: row.mode.as_str().to_string(),
+            encryption: row.encryption.as_str().to_string(),
+            public_key: row.public_key.as_ref().map(|key| key.to_string()),
+            endpoint: row.endpoint.to_string(),
+            port: row.port,
+        },
+    ))
+}
+
+fn cluster_outbox_mutation_from_record(record: AppliedOutboxRecord) -> ClusterMutation {
+    ClusterMutation::OutboxLedger(OutboxLedgerMutation::PutAppliedOutbox(record.into()))
+}
+
+fn cluster_pod_cleanup_mutation_from_intent(intent: PodCleanupIntent) -> ClusterMutation {
+    ClusterMutation::PodCleanup(PodCleanupMutation::PutPodCleanupIntent(intent.into()))
 }
 
 #[cfg(test)]

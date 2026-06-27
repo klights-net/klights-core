@@ -12,6 +12,8 @@ use crate::datastore::types::{
     AppliedOutboxRecord, NodeSubnet, PatchKind, PodCleanupIntent, Resource,
 };
 use crate::networking::wireguard::DataplanePeerMetadata;
+pub mod mutation;
+pub use mutation::*;
 
 // T3: `KEY_LAST_APPLIED_INDEX`, `KEY_LAST_APPLIED_RV` removed —
 // the `log_apply_entries` table and its checkpoint are gone.
@@ -27,6 +29,16 @@ impl LogApplyCommit {
         Self {
             resource_version,
             mutations,
+        }
+    }
+
+    pub fn from_cluster_mutations(resource_version: i64, mutations: Vec<ClusterMutation>) -> Self {
+        Self {
+            resource_version,
+            mutations: mutations
+                .into_iter()
+                .map(ClusterMutation::into_log_apply_mutation)
+                .collect(),
         }
     }
 
@@ -448,7 +460,22 @@ pub fn encode_commit_json(commit: &LogApplyCommit) -> Result<Vec<u8>> {
 }
 
 pub fn decode_commit_json(bytes: &[u8]) -> Result<LogApplyCommit> {
-    Ok(serde_json::from_slice(bytes)?)
+    if let Ok(commit) = serde_json::from_slice::<LogApplyCommit>(bytes) {
+        return Ok(commit);
+    }
+    let versioned: VersionedLogApplyCommit = serde_json::from_slice(bytes)?;
+    let mutations = versioned
+        .mutations
+        .into_iter()
+        .map(LogApplyMutation::try_from)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(LogApplyCommit::new(versioned.resource_version, mutations))
+}
+
+#[derive(Deserialize)]
+struct VersionedLogApplyCommit {
+    resource_version: i64,
+    mutations: Vec<VersionedClusterMutation>,
 }
 
 pub fn encode_commit_protobuf(commit: &LogApplyCommit) -> Result<Vec<u8>> {
@@ -1592,5 +1619,160 @@ mod parity_tests {
 
         let restored: AppliedOutboxRecord = row.into();
         assert_eq!(restored.status_stamp, Some(99));
+    }
+
+    #[test]
+    fn every_mutation_variant_round_trips_through_cluster_mutation() {
+        for name in all_variant_names() {
+            let (label, mutation) = sample(name);
+            let original = mutation.clone();
+            let cm: ClusterMutation = original.clone().into();
+            let round_tripped: LogApplyMutation = cm.into();
+            assert_eq!(
+                round_tripped, original,
+                "{label}: ClusterMutation round-trip changed the value"
+            );
+        }
+    }
+
+    #[test]
+    fn from_cluster_mutations_matches_log_apply_commit_new_for_samples() {
+        for name in all_variant_names() {
+            let (label, mutation) = sample(name);
+            let rv = commit_for(mutation.clone()).resource_version;
+            let cm: ClusterMutation = mutation.clone().into();
+            let from_cluster = LogApplyCommit::from_cluster_mutations(rv, vec![cm]);
+            let direct = LogApplyCommit::new(rv, vec![mutation]);
+            assert_eq!(
+                from_cluster, direct,
+                "{label}: from_cluster_mutations must match LogApplyCommit::new on the same sample"
+            );
+        }
+    }
+
+    #[test]
+    fn old_protobuf_bytes_decode_through_cluster_mutation_bridge() {
+        // B3: prove old protobuf tags remain decodable while every
+        // mutation survives the LogApplyMutation -> ClusterMutation ->
+        // LogApplyMutation conversion bridge without changing meaning.
+        for name in all_variant_names() {
+            let (label, mutation) = sample(name);
+            let original = commit_for(mutation);
+
+            // 1. Old flat protobuf bytes decode to the expected commit.
+            let old_bytes = encode_commit_protobuf(&original)
+                .unwrap_or_else(|err| panic!("{label}: protobuf encode failed: {err:#}"));
+            let decoded: LogApplyCommit = decode_commit_protobuf(&old_bytes)
+                .unwrap_or_else(|err| panic!("{label}: old protobuf decode failed: {err:#}"));
+            assert_eq!(
+                decoded, original,
+                "{label}: old protobuf bytes decoded to different commit"
+            );
+
+            // 2. ClusterMutation conversion preserves every mutation.
+            for (i, mutation) in decoded.mutations.iter().enumerate() {
+                let cm: ClusterMutation = mutation.clone().into();
+                let back: LogApplyMutation = cm.into();
+                assert_eq!(
+                    &back, mutation,
+                    "{label}[{i}]: ClusterMutation conversion changed value"
+                );
+            }
+
+            // 3. Re-encoded protobuf bytes decode again to the same logical commit.
+            //    Re-encode from the original commit (not the round-tripped clone) so
+            //    byte-level stability is measured against the canonical old encoding.
+            let re_bytes = encode_commit_protobuf(&original)
+                .unwrap_or_else(|err| panic!("{label}: re-encode failed: {err:#}"));
+            let re_decoded: LogApplyCommit = decode_commit_protobuf(&re_bytes)
+                .unwrap_or_else(|err| panic!("{label}: re-decoded protobuf failed: {err:#}"));
+            assert_eq!(
+                re_decoded, original,
+                "{label}: re-encoded protobuf bytes decode to different commit"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_json_commits_still_decode() {
+        for name in all_variant_names() {
+            let (label, mutation) = sample(name);
+            let commit = commit_for(mutation);
+            let bytes = encode_commit_json(&commit).unwrap();
+            let decoded: LogApplyCommit = decode_commit_json(&bytes).unwrap_or_else(|err| {
+                panic!("{label}: flat JSON decode failed: {err:#}");
+            });
+            assert_eq!(decoded, commit, "{label}: flat JSON decode changed value");
+        }
+    }
+
+    #[test]
+    fn versioned_json_decodes_to_same_commit() {
+        for name in all_variant_names() {
+            let (label, mutation) = sample(name);
+            let original = commit_for(mutation);
+            let cm: ClusterMutation = original.mutations[0].clone().into();
+            let versioned = Vec::from([VersionedClusterMutation::new(cm)]);
+
+            // Build the versioned envelope manually
+            let envelope = serde_json::json!({
+                "resource_version": original.resource_version,
+                "mutations": versioned,
+            });
+            let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
+
+            let decoded: LogApplyCommit =
+                decode_commit_json(&envelope_bytes).unwrap_or_else(|err| {
+                    panic!("{label}: versioned JSON decode failed: {err:#}");
+                });
+            assert_eq!(decoded, original, "{label}: versioned decode changed value");
+        }
+    }
+
+    #[test]
+    fn versioned_decode_encode_cycle_is_stable() {
+        for name in all_variant_names() {
+            let (label, mutation) = sample(name);
+            let original = commit_for(mutation);
+            let cm: ClusterMutation = original.mutations[0].clone().into();
+            let versioned = Vec::from([VersionedClusterMutation::new(cm)]);
+            let envelope = serde_json::json!({
+                "resource_version": original.resource_version,
+                "mutations": versioned,
+            });
+            let bytes1 = serde_json::to_vec(&envelope).unwrap();
+            let decoded: LogApplyCommit = decode_commit_json(&bytes1).unwrap_or_else(|err| {
+                panic!("{label}: first versioned decode failed: {err:#}");
+            });
+            let re_encoded = encode_commit_json(&decoded).unwrap();
+            let decoded2: LogApplyCommit = decode_commit_json(&re_encoded).unwrap_or_else(|err| {
+                panic!("{label}: second decode (from re-encoded) failed: {err:#}");
+            });
+            assert_eq!(
+                decoded2, original,
+                "{label}: versioned decode/encode cycle not stable"
+            );
+            assert_eq!(decoded2, decoded, "{label}: re-decode changed value");
+        }
+    }
+
+    #[test]
+    fn versioned_wrong_version_errors() {
+        let mutation = sample(all_variant_names()[0]).1;
+        let cm: ClusterMutation = mutation.into();
+        let bad = serde_json::json!({
+            "version": 999,
+            "mutation": cm,
+        });
+        let envelope = serde_json::json!({
+            "resource_version": 1,
+            "mutations": [bad],
+        });
+        let bytes = serde_json::to_vec(&envelope).unwrap();
+        let result = decode_commit_json(&bytes);
+        assert!(
+            result.is_err(),
+            "unsupported version 999 must produce an error, got: {result:?}"
+        );
     }
 }

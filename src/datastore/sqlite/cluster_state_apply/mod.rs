@@ -7,6 +7,7 @@ mod resource;
 mod watch_history;
 
 use crate::datastore::types::PendingWatchEvent;
+use crate::log_apply::ClusterMutation;
 
 #[derive(Default)]
 pub(super) struct ApplyEffects {
@@ -84,6 +85,155 @@ impl<'tx, 'conn> RaftClusterStateApplier<'tx, 'conn> {
         &mut self,
     ) -> &mut watch_history::WatchHistoryStateApplier<'tx, 'conn> {
         &mut self.watch_history
+    }
+
+    pub(super) fn apply_cluster_mutation(
+        &mut self,
+        commit_resource_version: i64,
+        mutation: ClusterMutation,
+        emit_watch_events: bool,
+        raft_authoritative: bool,
+        effects: &mut ApplyEffects,
+    ) -> tokio_rusqlite::Result<()> {
+        match mutation {
+            ClusterMutation::Resource(mutation) => match mutation {
+                crate::log_apply::ResourceMutation::PutResource(row) => {
+                    if row.resource_version != commit_resource_version {
+                        return Err(super::cluster_replace::other_error(
+                            "resource row RV does not match commit RV",
+                        ));
+                    }
+                    if let Some(event) = self.resource_mut().apply_put_resource(
+                        row,
+                        emit_watch_events,
+                        raft_authoritative,
+                    )? {
+                        effects.push_watch_event(event);
+                    }
+                }
+                crate::log_apply::ResourceMutation::PatchResourceLatest(patch) => {
+                    if patch.resource_version != commit_resource_version {
+                        return Err(super::cluster_replace::other_error(
+                            "resource patch RV does not match commit RV",
+                        ));
+                    }
+                    if let Some(event) = self.resource_mut().apply_patch_resource_latest(
+                        patch,
+                        emit_watch_events,
+                        raft_authoritative,
+                    )? {
+                        effects.push_watch_event(event);
+                    }
+                }
+                crate::log_apply::ResourceMutation::DeleteResource(key) => {
+                    if let Some(event) = self.resource_mut().apply_delete_resource(
+                        commit_resource_version,
+                        key,
+                        emit_watch_events,
+                        raft_authoritative,
+                    )? {
+                        effects.push_watch_event(event);
+                    }
+                }
+            },
+            ClusterMutation::Namespace(mutation) => match mutation {
+                crate::log_apply::NamespaceMutation::PutNamespace(row) => {
+                    if row.resource_version != commit_resource_version {
+                        return Err(super::cluster_replace::other_error(
+                            "namespace row RV does not match commit RV",
+                        ));
+                    }
+                    if let Some(event) =
+                        self.namespace_mut().put_namespace(row, emit_watch_events)?
+                    {
+                        effects.push_watch_event(event);
+                    }
+                }
+                crate::log_apply::NamespaceMutation::DeleteNamespace { name } => {
+                    if let Some(event) = self.namespace_mut().delete_namespace(
+                        commit_resource_version,
+                        &name,
+                        emit_watch_events,
+                    )? {
+                        effects.push_watch_event(event);
+                    }
+                }
+                crate::log_apply::NamespaceMutation::DeleteNamespaceContents { name } => {
+                    self.namespace_mut().delete_namespace_contents(&name)?;
+                }
+            },
+            ClusterMutation::WatchHistory(mutation) => match mutation {
+                crate::log_apply::WatchHistoryMutation::PutWatchEvent(row) => {
+                    effects.push_watch_event(self.watch_history_mut().apply_put_watch_event(row)?);
+                }
+                crate::log_apply::WatchHistoryMutation::GcWatchEvents {
+                    max_rows,
+                    batch_cap,
+                } => {
+                    self.watch_history_mut()
+                        .apply_gc_watch_events(max_rows, batch_cap)?;
+                }
+            },
+            ClusterMutation::Network(mutation) => match mutation {
+                crate::log_apply::NetworkMutation::PutNodeSubnet(row) => {
+                    self.network_mut().put_node_subnet(row)?;
+                }
+                crate::log_apply::NetworkMutation::AllocateNodeSubnet(allocation) => {
+                    self.network_mut().allocate_node_subnet(allocation)?;
+                }
+                crate::log_apply::NetworkMutation::DeleteNodeSubnet { node_name } => {
+                    self.network_mut().delete_node_subnet(node_name)?;
+                }
+                crate::log_apply::NetworkMutation::PutNodeDataplane(row) => {
+                    self.network_mut().put_node_dataplane(row)?;
+                }
+                crate::log_apply::NetworkMutation::DeleteNodeDataplane { node_name } => {
+                    self.network_mut().delete_node_dataplane(node_name)?;
+                }
+            },
+            ClusterMutation::OutboxLedger(mutation) => match mutation {
+                crate::log_apply::OutboxLedgerMutation::PutAppliedOutbox(row) => {
+                    self.outbox_mut().put_applied_outbox(row)?;
+                }
+                crate::log_apply::OutboxLedgerMutation::DeleteAppliedOutbox { idempotency_key } => {
+                    self.outbox_mut().delete_applied_outbox(idempotency_key)?;
+                }
+                crate::log_apply::OutboxLedgerMutation::GcAppliedOutbox {
+                    cutoff_ms,
+                    operations: _,
+                } => {
+                    self.outbox_mut().gc_applied_outbox(cutoff_ms)?;
+                }
+            },
+            ClusterMutation::ClusterMeta(mutation) => match mutation {
+                crate::log_apply::ClusterMetaMutation::AdvanceResourceVersion {
+                    resource_version: _,
+                } => {}
+                crate::log_apply::ClusterMetaMutation::PutKlightsMeta { key, value } => {
+                    self.cluster_meta_mut().put_klights_meta(key, value)?;
+                }
+            },
+            ClusterMutation::PodCleanup(mutation) => match mutation {
+                crate::log_apply::PodCleanupMutation::PutPodCleanupIntent(row) => {
+                    if row.resource_version != commit_resource_version {
+                        return Err(super::cluster_replace::other_error(
+                            "pod cleanup intent RV does not match commit RV",
+                        ));
+                    }
+                    self.pod_cleanup_mut().put_pod_cleanup_intent(row)?;
+                }
+                crate::log_apply::PodCleanupMutation::DeletePodCleanupIntent(key) => {
+                    self.pod_cleanup_mut().delete_pod_cleanup_intent(key)?;
+                }
+                crate::log_apply::PodCleanupMutation::DeletePodCleanupIntentsForNode {
+                    node_name,
+                } => {
+                    self.pod_cleanup_mut()
+                        .delete_pod_cleanup_intents_for_node(node_name)?;
+                }
+            },
+        }
+        Ok(())
     }
 }
 

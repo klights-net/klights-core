@@ -494,7 +494,7 @@ impl Datastore {
         use crate::control_plane::client::apply::subject_key_for_command;
         use crate::kubelet::outbox::OutboxApplyError;
         use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
-        use crate::log_apply::{LogApplyAppliedOutboxRow, LogApplyMutation};
+        use crate::log_apply::{ClusterMutation, LogApplyAppliedOutboxRow, OutboxLedgerMutation};
 
         let decoded = OutboxPayload::decode_protobuf(payload)
             .map_err(|e| OutboxApplyError::Retryable(e.to_string()))?;
@@ -568,20 +568,23 @@ impl Datastore {
                 // the leader this UPSERT overwrites the placeholder we
                 // just claimed; on followers it inserts fresh.
                 use crate::datastore::command::{StorageResponse, encode_response_protobuf};
-                commit.mutations.push(LogApplyMutation::PutAppliedOutbox(
-                    LogApplyAppliedOutboxRow {
-                        idempotency_key: claim_key.clone(),
-                        subject_key,
-                        operation: claim_operation,
-                        first_seen_ms: now,
-                        applied_rv: None,
-                        result_proto: encode_response_protobuf(&StorageResponse::Ack {
-                            resource_version: 0,
-                        })
-                        .unwrap_or_default(),
-                        status_stamp,
-                    },
-                ));
+                commit.mutations.push(
+                    ClusterMutation::OutboxLedger(OutboxLedgerMutation::PutAppliedOutbox(
+                        LogApplyAppliedOutboxRow {
+                            idempotency_key: claim_key.clone(),
+                            subject_key,
+                            operation: claim_operation,
+                            first_seen_ms: now,
+                            applied_rv: None,
+                            result_proto: encode_response_protobuf(&StorageResponse::Ack {
+                                resource_version: 0,
+                            })
+                            .unwrap_or_default(),
+                            status_stamp,
+                        },
+                    ))
+                    .into_log_apply_mutation(),
+                );
 
                 tx.commit()?;
                 Ok(BuildOutboxTxnOutcome::Built { commit, rv })
@@ -816,9 +819,11 @@ impl Datastore {
             ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
         };
         use crate::log_apply::{
-            LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
-            LogApplyNodeSubnetAllocation, LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow,
-            LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow, LogApplyWatchEventRow,
+            ClusterMetaMutation, ClusterMutation, LogApplyCommit, LogApplyNamespaceRow,
+            LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation, LogApplyPodCleanupIntentKey,
+            LogApplyPodCleanupIntentRow, LogApplyResourceKey, LogApplyResourcePatch,
+            LogApplyResourceRow, LogApplyWatchEventRow, NamespaceMutation, NetworkMutation,
+            PodCleanupMutation, ResourceMutation, WatchHistoryMutation,
         };
         use serde_json::Value;
 
@@ -846,22 +851,24 @@ impl Datastore {
                     crate::kubelet::node::set_node_external_ip_from_dataplane_annotation(&mut data);
                 }
                 let uid = ensure_metadata_uid(&mut data);
-                LogApplyCommit::new(
+                LogApplyCommit::from_cluster_mutations(
                     rv,
-                    vec![LogApplyMutation::PutResource(LogApplyResourceRow {
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        uid,
-                        resource_version: rv,
-                        data,
-                        require_absent: true,
-                        require_existing: false,
-                        precondition_uid: None,
-                        precondition_resource_version: None,
-                        status_only: false,
-                    })],
+                    vec![ClusterMutation::Resource(ResourceMutation::PutResource(
+                        LogApplyResourceRow {
+                            api_version,
+                            kind,
+                            namespace,
+                            name,
+                            uid,
+                            resource_version: rv,
+                            data,
+                            require_absent: true,
+                            require_existing: false,
+                            precondition_uid: None,
+                            precondition_resource_version: None,
+                            status_only: false,
+                        },
+                    ))],
                 )
             }
 
@@ -953,22 +960,24 @@ impl Datastore {
                 } else {
                     effective_preconditions.resource_version
                 };
-                LogApplyCommit::new(
+                LogApplyCommit::from_cluster_mutations(
                     rv,
-                    vec![LogApplyMutation::PutResource(LogApplyResourceRow {
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        uid,
-                        resource_version: rv,
-                        data,
-                        require_absent: false,
-                        require_existing: true,
-                        precondition_uid: preconditions.uid,
-                        precondition_resource_version,
-                        status_only: false,
-                    })],
+                    vec![ClusterMutation::Resource(ResourceMutation::PutResource(
+                        LogApplyResourceRow {
+                            api_version,
+                            kind,
+                            namespace,
+                            name,
+                            uid,
+                            resource_version: rv,
+                            data,
+                            require_absent: false,
+                            require_existing: true,
+                            precondition_uid: preconditions.uid,
+                            precondition_resource_version,
+                            status_only: false,
+                        },
+                    ))],
                 )
             }
 
@@ -1071,27 +1080,29 @@ impl Datastore {
                         .resource_version
                         .or_else(|| expected_rv.filter(|rv| *rv > 0))
                 };
-                LogApplyCommit::new(
+                LogApplyCommit::from_cluster_mutations(
                     rv,
-                    vec![LogApplyMutation::PutResource(LogApplyResourceRow {
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        uid,
-                        resource_version: rv,
-                        data: live,
-                        require_absent: false,
-                        require_existing: true,
-                        precondition_uid: preconditions.uid,
-                        precondition_resource_version,
-                        status_only: true,
-                    })],
+                    vec![ClusterMutation::Resource(ResourceMutation::PutResource(
+                        LogApplyResourceRow {
+                            api_version,
+                            kind,
+                            namespace,
+                            name,
+                            uid,
+                            resource_version: rv,
+                            data: live,
+                            require_absent: false,
+                            require_existing: true,
+                            precondition_uid: preconditions.uid,
+                            precondition_resource_version,
+                            status_only: true,
+                        },
+                    ))],
                 )
             }
 
             StorageCommand::ApplyResourceBatch { operations } => {
-                let mut mutations = Vec::with_capacity(operations.len());
+                let mut mutations: Vec<ClusterMutation> = Vec::with_capacity(operations.len());
                 for operation in operations {
                     match operation {
                         ResourceBatchOperation::Put {
@@ -1147,20 +1158,22 @@ impl Datastore {
                             }
                             ensure_pod_status_ip_arrays(&mut data, &api_version, &kind);
                             let uid = ensure_metadata_uid(&mut data);
-                            mutations.push(LogApplyMutation::PutResource(LogApplyResourceRow {
-                                api_version,
-                                kind,
-                                namespace,
-                                name,
-                                uid,
-                                resource_version: rv,
-                                data,
-                                require_absent: mode == ResourceBatchPutMode::Create,
-                                require_existing: mode == ResourceBatchPutMode::Update,
-                                precondition_uid: preconditions.uid,
-                                precondition_resource_version: preconditions.resource_version,
-                                status_only: false,
-                            }));
+                            mutations.push(ClusterMutation::Resource(
+                                ResourceMutation::PutResource(LogApplyResourceRow {
+                                    api_version,
+                                    kind,
+                                    namespace,
+                                    name,
+                                    uid,
+                                    resource_version: rv,
+                                    data,
+                                    require_absent: mode == ResourceBatchPutMode::Create,
+                                    require_existing: mode == ResourceBatchPutMode::Update,
+                                    precondition_uid: preconditions.uid,
+                                    precondition_resource_version: preconditions.resource_version,
+                                    status_only: false,
+                                }),
+                            ));
                         }
                         ResourceBatchOperation::Delete {
                             api_version,
@@ -1182,18 +1195,20 @@ impl Datastore {
                                 live_rv,
                             )
                             .map_err(Self::sqlite_conversion_error)?;
-                            mutations.push(LogApplyMutation::DeleteResource(LogApplyResourceKey {
-                                api_version,
-                                kind,
-                                namespace,
-                                name,
-                                uid: live_uid,
-                                precondition_resource_version: preconditions.resource_version,
-                            }));
+                            mutations.push(ClusterMutation::Resource(
+                                ResourceMutation::DeleteResource(LogApplyResourceKey {
+                                    api_version,
+                                    kind,
+                                    namespace,
+                                    name,
+                                    uid: live_uid,
+                                    precondition_resource_version: preconditions.resource_version,
+                                }),
+                            ));
                         }
                     }
                 }
-                LogApplyCommit::new(rv, mutations)
+                LogApplyCommit::from_cluster_mutations(rv, mutations)
             }
 
             StorageCommand::DeleteResource {
@@ -1212,16 +1227,18 @@ impl Datastore {
                 )?;
                 validate_resource_preconditions(&preconditions, Some(&current_uid), current_rv)
                     .map_err(Self::sqlite_conversion_error)?;
-                LogApplyCommit::new(
+                LogApplyCommit::from_cluster_mutations(
                     rv,
-                    vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        uid: current_uid,
-                        precondition_resource_version: preconditions.resource_version,
-                    })],
+                    vec![ClusterMutation::Resource(ResourceMutation::DeleteResource(
+                        LogApplyResourceKey {
+                            api_version,
+                            kind,
+                            namespace,
+                            name,
+                            uid: current_uid,
+                            precondition_resource_version: preconditions.resource_version,
+                        },
+                    ))],
                 )
             }
 
@@ -1247,52 +1264,69 @@ impl Datastore {
                 .map_err(Self::sqlite_conversion_error)?;
                 let stamped_node =
                     Self::node_routing_metadata_resource_row_in_tx(tx, &node_name, &metadata, rv)?;
-                let mut mutations = vec![LogApplyMutation::PutNodeDataplane(
-                    LogApplyNodeDataplaneRow {
+                let mut mutations = vec![ClusterMutation::Network(
+                    NetworkMutation::PutNodeDataplane(LogApplyNodeDataplaneRow {
                         node_name,
                         mode,
                         encryption,
                         public_key,
                         endpoint,
                         port,
-                    },
+                    }),
                 )];
                 if let Some(row) = stamped_node {
-                    mutations.push(LogApplyMutation::PutResource(row));
+                    mutations.push(ClusterMutation::Resource(ResourceMutation::PutResource(
+                        row,
+                    )));
                 }
-                LogApplyCommit::new(rv, mutations)
+                LogApplyCommit::from_cluster_mutations(rv, mutations)
             }
 
-            StorageCommand::CreateNamespace { name, data } => LogApplyCommit::new(
-                rv,
-                vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
-                    name: name.clone(),
-                    uid: String::new(),
-                    resource_version: rv,
-                    data,
-                })],
-            ),
+            StorageCommand::CreateNamespace { name, data } => {
+                LogApplyCommit::from_cluster_mutations(
+                    rv,
+                    vec![ClusterMutation::Namespace(NamespaceMutation::PutNamespace(
+                        LogApplyNamespaceRow {
+                            name: name.clone(),
+                            uid: String::new(),
+                            resource_version: rv,
+                            data,
+                        },
+                    ))],
+                )
+            }
 
-            StorageCommand::UpdateNamespace { name, data, .. } => LogApplyCommit::new(
-                rv,
-                vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
-                    name: name.clone(),
-                    uid: String::new(),
-                    resource_version: rv,
-                    data,
-                })],
-            ),
+            StorageCommand::UpdateNamespace { name, data, .. } => {
+                LogApplyCommit::from_cluster_mutations(
+                    rv,
+                    vec![ClusterMutation::Namespace(NamespaceMutation::PutNamespace(
+                        LogApplyNamespaceRow {
+                            name: name.clone(),
+                            uid: String::new(),
+                            resource_version: rv,
+                            data,
+                        },
+                    ))],
+                )
+            }
 
-            StorageCommand::DeleteNamespace { name } => LogApplyCommit::new(
+            StorageCommand::DeleteNamespace { name } => LogApplyCommit::from_cluster_mutations(
                 rv,
                 vec![
-                    LogApplyMutation::DeleteNamespaceContents { name: name.clone() },
-                    LogApplyMutation::DeleteNamespace { name },
+                    ClusterMutation::Namespace(NamespaceMutation::DeleteNamespaceContents {
+                        name: name.clone(),
+                    }),
+                    ClusterMutation::Namespace(NamespaceMutation::DeleteNamespace { name }),
                 ],
             ),
 
             StorageCommand::DeleteNamespaceContents { name } => {
-                LogApplyCommit::new(rv, vec![LogApplyMutation::DeleteNamespaceContents { name }])
+                LogApplyCommit::from_cluster_mutations(
+                    rv,
+                    vec![ClusterMutation::Namespace(
+                        NamespaceMutation::DeleteNamespaceContents { name },
+                    )],
+                )
             }
 
             StorageCommand::PatchResource {
@@ -1352,10 +1386,10 @@ impl Datastore {
                         )
                         .then(crate::utils::k8s_timestamp);
                     return Ok((
-                        LogApplyCommit::new(
+                        LogApplyCommit::from_cluster_mutations(
                             rv,
-                            vec![LogApplyMutation::PatchResourceLatest(
-                                LogApplyResourcePatch {
+                            vec![ClusterMutation::Resource(
+                                ResourceMutation::PatchResourceLatest(LogApplyResourcePatch {
                                     api_version,
                                     kind,
                                     namespace,
@@ -1367,7 +1401,7 @@ impl Datastore {
                                     precondition_uid: Some(live_uid),
                                     precondition_resource_version: None,
                                     terminating_pod_unready_timestamp,
-                                },
+                                }),
                             )],
                         ),
                         rv,
@@ -1387,24 +1421,26 @@ impl Datastore {
                 );
                 preserve_server_metadata_fields_from_existing(&mut live, &live_before_patch);
                 let uid = ensure_metadata_uid(&mut live);
-                LogApplyCommit::new(
+                LogApplyCommit::from_cluster_mutations(
                     rv,
-                    vec![LogApplyMutation::PutResource(LogApplyResourceRow {
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        uid,
-                        resource_version: rv,
-                        data: live,
-                        require_absent: false,
-                        require_existing: true,
-                        precondition_uid: effective_preconditions.uid,
-                        precondition_resource_version: effective_preconditions
-                            .resource_version
-                            .or(Some(live_rv)),
-                        status_only: false,
-                    })],
+                    vec![ClusterMutation::Resource(ResourceMutation::PutResource(
+                        LogApplyResourceRow {
+                            api_version,
+                            kind,
+                            namespace,
+                            name,
+                            uid,
+                            resource_version: rv,
+                            data: live,
+                            require_absent: false,
+                            require_existing: true,
+                            precondition_uid: effective_preconditions.uid,
+                            precondition_resource_version: effective_preconditions
+                                .resource_version
+                                .or(Some(live_rv)),
+                            status_only: false,
+                        },
+                    ))],
                 )
             }
 
@@ -1412,19 +1448,24 @@ impl Datastore {
                 node_name,
                 subnet,
                 node_ip,
-            } => LogApplyCommit::new(
+            } => LogApplyCommit::from_cluster_mutations(
                 rv,
-                vec![LogApplyMutation::AllocateNodeSubnet(
-                    LogApplyNodeSubnetAllocation {
+                vec![ClusterMutation::Network(
+                    NetworkMutation::AllocateNodeSubnet(LogApplyNodeSubnetAllocation {
                         node_name,
                         cluster_cidr: subnet,
                         node_ip,
-                    },
+                    }),
                 )],
             ),
 
             StorageCommand::DeleteNodeSubnet { node_name } => {
-                LogApplyCommit::new(rv, vec![LogApplyMutation::DeleteNodeSubnet { node_name }])
+                LogApplyCommit::from_cluster_mutations(
+                    rv,
+                    vec![ClusterMutation::Network(
+                        NetworkMutation::DeleteNodeSubnet { node_name },
+                    )],
+                )
             }
 
             StorageCommand::UpdateNodeVtepMac {
@@ -1482,27 +1523,31 @@ impl Datastore {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as i64;
-                LogApplyCommit::new(
+                LogApplyCommit::from_cluster_mutations(
                     rv,
                     vec![
-                        LogApplyMutation::PutPodCleanupIntent(LogApplyPodCleanupIntentRow {
-                            node_name,
-                            namespace: namespace.clone(),
-                            pod_name: pod_name.clone(),
-                            pod_uid: pod_uid.clone(),
-                            reason,
-                            resource_version: rv,
-                            created_at_ms,
-                            pod_data,
-                        }),
-                        LogApplyMutation::DeleteResource(LogApplyResourceKey {
-                            api_version: "v1".to_string(),
-                            kind: "Pod".to_string(),
-                            namespace: Some(namespace),
-                            name: pod_name,
-                            uid: live_uid,
-                            precondition_resource_version: None,
-                        }),
+                        ClusterMutation::PodCleanup(PodCleanupMutation::PutPodCleanupIntent(
+                            LogApplyPodCleanupIntentRow {
+                                node_name,
+                                namespace: namespace.clone(),
+                                pod_name: pod_name.clone(),
+                                pod_uid: pod_uid.clone(),
+                                reason,
+                                resource_version: rv,
+                                created_at_ms,
+                                pod_data,
+                            },
+                        )),
+                        ClusterMutation::Resource(ResourceMutation::DeleteResource(
+                            LogApplyResourceKey {
+                                api_version: "v1".to_string(),
+                                kind: "Pod".to_string(),
+                                namespace: Some(namespace),
+                                name: pod_name,
+                                uid: live_uid,
+                                precondition_resource_version: None,
+                            },
+                        )),
                     ],
                 )
             }
@@ -1513,23 +1558,27 @@ impl Datastore {
                 pod_name,
                 pod_uid,
                 reason,
-            } => LogApplyCommit::new(
+            } => LogApplyCommit::from_cluster_mutations(
                 rv,
-                vec![LogApplyMutation::DeletePodCleanupIntent(
-                    LogApplyPodCleanupIntentKey {
+                vec![ClusterMutation::PodCleanup(
+                    PodCleanupMutation::DeletePodCleanupIntent(LogApplyPodCleanupIntentKey {
                         node_name,
                         namespace,
                         pod_name,
                         pod_uid,
                         reason,
-                    },
+                    }),
                 )],
             ),
 
-            StorageCommand::DeletePodCleanupIntentsForNode { node_name } => LogApplyCommit::new(
-                rv,
-                vec![LogApplyMutation::DeletePodCleanupIntentsForNode { node_name }],
-            ),
+            StorageCommand::DeletePodCleanupIntentsForNode { node_name } => {
+                LogApplyCommit::from_cluster_mutations(
+                    rv,
+                    vec![ClusterMutation::PodCleanup(
+                        PodCleanupMutation::DeletePodCleanupIntentsForNode { node_name },
+                    )],
+                )
+            }
 
             StorageCommand::WatchEventAppend {
                 event_bytes,
@@ -1545,37 +1594,45 @@ impl Datastore {
                 let name = event["name"].as_str().unwrap_or("").to_string();
                 let event_type = event["type"].as_str().unwrap_or("ADDED").to_string();
                 let data = event["object"].clone();
-                LogApplyCommit::new(
+                LogApplyCommit::from_cluster_mutations(
                     rv,
-                    vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
-                        api_version,
-                        kind,
-                        namespace,
-                        name,
-                        resource_version: watch_rv.max(rv),
-                        event_type,
-                        data,
-                    })],
+                    vec![ClusterMutation::WatchHistory(
+                        WatchHistoryMutation::PutWatchEvent(LogApplyWatchEventRow {
+                            api_version,
+                            kind,
+                            namespace,
+                            name,
+                            resource_version: watch_rv.max(rv),
+                            event_type,
+                            data,
+                        }),
+                    )],
                 )
             }
 
             StorageCommand::GcWatchEvents {
                 max_rows,
                 batch_cap,
-            } => LogApplyCommit::new(
+            } => LogApplyCommit::from_cluster_mutations(
                 rv,
-                vec![LogApplyMutation::GcWatchEvents {
-                    max_rows,
-                    batch_cap,
-                }],
+                vec![ClusterMutation::WatchHistory(
+                    WatchHistoryMutation::GcWatchEvents {
+                        max_rows,
+                        batch_cap,
+                    },
+                )],
             ),
 
-            StorageCommand::AdvanceResourceVersion { min_rv: _, new_rv } => LogApplyCommit::new(
-                rv,
-                vec![LogApplyMutation::AdvanceResourceVersion {
-                    resource_version: new_rv.max(rv),
-                }],
-            ),
+            StorageCommand::AdvanceResourceVersion { min_rv: _, new_rv } => {
+                LogApplyCommit::from_cluster_mutations(
+                    rv,
+                    vec![ClusterMutation::ClusterMeta(
+                        ClusterMetaMutation::AdvanceResourceVersion {
+                            resource_version: new_rv.max(rv),
+                        },
+                    )],
+                )
+            }
             StorageCommand::EnsureClusterMetadata { cluster_id } => {
                 let existing: Option<String> = tx
                     .query_row(
@@ -1585,17 +1642,17 @@ impl Datastore {
                     )
                     .ok();
                 if existing.is_none() {
-                    LogApplyCommit::new(
+                    LogApplyCommit::from_cluster_mutations(
                         rv,
                         vec![
-                            LogApplyMutation::PutKlightsMeta {
+                            ClusterMutation::ClusterMeta(ClusterMetaMutation::PutKlightsMeta {
                                 key: crate::bootstrap::cluster_meta::KEY_CLUSTER_ID.to_string(),
                                 value: cluster_id,
-                            },
-                            LogApplyMutation::PutKlightsMeta {
+                            }),
+                            ClusterMutation::ClusterMeta(ClusterMetaMutation::PutKlightsMeta {
                                 key: crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH.to_string(),
                                 value: "0".to_string(),
-                            },
+                            }),
                         ],
                     )
                 } else {
@@ -1604,7 +1661,12 @@ impl Datastore {
                 }
             }
             StorageCommand::SetKlightsMeta { key, value } => {
-                LogApplyCommit::new(rv, vec![LogApplyMutation::PutKlightsMeta { key, value }])
+                LogApplyCommit::from_cluster_mutations(
+                    rv,
+                    vec![ClusterMutation::ClusterMeta(
+                        ClusterMetaMutation::PutKlightsMeta { key, value },
+                    )],
+                )
             }
         };
 

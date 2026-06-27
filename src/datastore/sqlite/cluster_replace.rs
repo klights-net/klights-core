@@ -4,7 +4,7 @@ use crate::bootstrap::cluster_meta::{
     KEY_CLUSTER_ID, KEY_LEADER_EPOCH, KEY_RAFT_LEADER_HINT, KEY_RAFT_TERM, KEY_RAFT_VOTERS,
 };
 use crate::datastore::types::{AppliedOutboxRecord, PendingWatchEvent, ReplicatedSnapshotMetadata};
-use crate::log_apply::{LogApplyCommit, LogApplyMutation};
+use crate::log_apply::{ClusterMutation, LogApplyCommit, LogApplyMutation};
 #[cfg(test)]
 use crate::log_apply::{LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow, LogApplyWatchEventRow};
 #[cfg(test)]
@@ -337,123 +337,13 @@ fn apply_commit_in_tx_with_watch_events(
     let mut effects = ApplyEffects::new();
     let mut applier = RaftClusterStateApplier::new(tx);
     for mutation in commit.mutations {
-        match mutation {
-            LogApplyMutation::PutResource(row) => {
-                if row.resource_version != commit.resource_version {
-                    return Err(other_error("resource row RV does not match commit RV"));
-                }
-                if let Some(event) = applier.resource_mut().apply_put_resource(
-                    row,
-                    emit_watch_events,
-                    raft_authoritative,
-                )? {
-                    effects.push_watch_event(event);
-                }
-            }
-            LogApplyMutation::PatchResourceLatest(patch) => {
-                if patch.resource_version != commit.resource_version {
-                    return Err(other_error("resource patch RV does not match commit RV"));
-                }
-                if let Some(event) = applier.resource_mut().apply_patch_resource_latest(
-                    patch,
-                    emit_watch_events,
-                    raft_authoritative,
-                )? {
-                    effects.push_watch_event(event);
-                }
-            }
-            LogApplyMutation::DeleteResource(key) => {
-                if let Some(event) = applier.resource_mut().apply_delete_resource(
-                    commit.resource_version,
-                    key,
-                    emit_watch_events,
-                    raft_authoritative,
-                )? {
-                    effects.push_watch_event(event);
-                }
-            }
-            LogApplyMutation::PutNamespace(row) => {
-                if row.resource_version != commit.resource_version {
-                    return Err(other_error("namespace row RV does not match commit RV"));
-                }
-                if let Some(event) = applier
-                    .namespace_mut()
-                    .put_namespace(row, emit_watch_events)?
-                {
-                    effects.push_watch_event(event);
-                }
-            }
-            LogApplyMutation::DeleteNamespace { name } => {
-                if let Some(event) = applier.namespace_mut().delete_namespace(
-                    commit.resource_version,
-                    &name,
-                    emit_watch_events,
-                )? {
-                    effects.push_watch_event(event);
-                }
-            }
-            LogApplyMutation::DeleteNamespaceContents { name } => {
-                applier.namespace_mut().delete_namespace_contents(&name)?;
-            }
-            LogApplyMutation::PutNodeSubnet(row) => applier.network_mut().put_node_subnet(row)?,
-            LogApplyMutation::AllocateNodeSubnet(allocation) => {
-                applier.network_mut().allocate_node_subnet(allocation)?;
-            }
-            LogApplyMutation::DeleteNodeSubnet { node_name } => {
-                applier.network_mut().delete_node_subnet(node_name)?;
-            }
-            LogApplyMutation::PutNodeDataplane(row) => {
-                applier.network_mut().put_node_dataplane(row)?;
-            }
-            LogApplyMutation::DeleteNodeDataplane { node_name } => {
-                applier.network_mut().delete_node_dataplane(node_name)?;
-            }
-            LogApplyMutation::PutAppliedOutbox(row) => {
-                applier.outbox_mut().put_applied_outbox(row)?;
-            }
-            LogApplyMutation::DeleteAppliedOutbox { idempotency_key } => {
-                applier
-                    .outbox_mut()
-                    .delete_applied_outbox(idempotency_key)?;
-            }
-            LogApplyMutation::GcAppliedOutbox {
-                cutoff_ms,
-                operations: _,
-            } => {
-                applier.outbox_mut().gc_applied_outbox(cutoff_ms)?;
-            }
-            LogApplyMutation::GcWatchEvents {
-                max_rows,
-                batch_cap,
-            } => {
-                applier
-                    .watch_history_mut()
-                    .apply_gc_watch_events(max_rows, batch_cap)?;
-            }
-            LogApplyMutation::PutWatchEvent(row) => {
-                effects.push_watch_event(applier.watch_history_mut().apply_put_watch_event(row)?)
-            }
-            LogApplyMutation::AdvanceResourceVersion { .. } => {}
-            LogApplyMutation::PutKlightsMeta { key, value } => {
-                applier.cluster_meta_mut().put_klights_meta(key, value)?;
-            }
-            LogApplyMutation::PutPodCleanupIntent(row) => {
-                if row.resource_version != commit.resource_version {
-                    return Err(other_error(
-                        "pod cleanup intent RV does not match commit RV",
-                    ));
-                }
-                applier.pod_cleanup_mut().put_pod_cleanup_intent(row)?;
-            }
-            LogApplyMutation::DeletePodCleanupIntent(key) => {
-                applier.pod_cleanup_mut().delete_pod_cleanup_intent(key)?;
-            }
-            LogApplyMutation::DeletePodCleanupIntentsForNode { node_name } => {
-                applier
-                    .pod_cleanup_mut()
-                    .delete_pod_cleanup_intents_for_node(node_name)?;
-            }
-        }
+        applier.apply_cluster_mutation(
+            commit.resource_version,
+            ClusterMutation::from(mutation),
+            emit_watch_events,
+            raft_authoritative,
+            &mut effects,
+        )?;
     }
     advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
     Ok((applied_rv, effects.into_pending_watch_events()))
