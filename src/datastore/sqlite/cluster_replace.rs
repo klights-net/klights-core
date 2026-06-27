@@ -1261,6 +1261,7 @@ fn preserve_same_uid_server_metadata_from_existing(
         .precondition_resource_version
         .is_some_and(|expected| expected != *current_rv)
     {
+        preserve_live_owner_refs_for_stale_pod_bind(row, &existing_data);
         preserve_finalizers_from_existing(&mut row.data, &existing_data);
     }
     if row.api_version == "v1"
@@ -1278,6 +1279,56 @@ fn preserve_same_uid_server_metadata_from_existing(
         crate::resource_semantics::mark_terminating_pod_unready(&mut row.data);
     }
     Ok(())
+}
+
+fn preserve_live_owner_refs_for_stale_pod_bind(
+    row: &mut LogApplyResourceRow,
+    existing: &serde_json::Value,
+) {
+    if row.api_version != "v1" || row.kind != "Pod" {
+        return;
+    }
+    let incoming_node = row
+        .data
+        .pointer("/spec/nodeName")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    let Some(incoming_node) = incoming_node else {
+        return;
+    };
+    let existing_node = existing
+        .pointer("/spec/nodeName")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    if existing_node == Some(incoming_node) {
+        return;
+    }
+    let Some(existing_owner_refs) = existing
+        .pointer("/metadata/ownerReferences")
+        .and_then(|value| value.as_array())
+        .filter(|refs| !refs.is_empty())
+        .cloned()
+    else {
+        return;
+    };
+    let incoming_owner_refs = row
+        .data
+        .pointer("/metadata/ownerReferences")
+        .and_then(|value| value.as_array());
+    if incoming_owner_refs.is_some_and(|refs| !refs.is_empty()) {
+        return;
+    }
+    let Some(metadata) = row
+        .data
+        .get_mut("metadata")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    metadata.insert(
+        "ownerReferences".to_string(),
+        serde_json::Value::Array(existing_owner_refs),
+    );
 }
 
 fn preserve_finalizers_from_existing(data: &mut serde_json::Value, existing: &serde_json::Value) {

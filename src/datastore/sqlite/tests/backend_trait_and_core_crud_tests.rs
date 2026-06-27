@@ -912,6 +912,113 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
 }
 
 #[tokio::test]
+async fn stale_committed_pod_bind_preserves_live_owner_references() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "cycle-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "cycle-pod",
+                    "namespace": "default",
+                    "uid": "cycle-pod-uid"
+                },
+                "spec": {
+                    "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut bind_snapshot = (*created.data).clone();
+    bind_snapshot["spec"]["nodeName"] = json!("mn-worker");
+    let bind_command = StorageCommand::UpdateResource {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "cycle-pod".to_string(),
+        data: bind_snapshot,
+        expected_rv: created.resource_version,
+        preconditions: ResourcePreconditions::from_resource(&created),
+    };
+    let bind_payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(bind_command)
+        .encode_protobuf()
+        .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "stale-cycle-pod-bind",
+            "UpdateResource",
+            bind_payload.as_ref(),
+            "leader",
+        )
+        .await
+        .expect("build stale bind commit");
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit: bind_commit,
+        ..
+    } = outcome
+    else {
+        panic!("expected a fresh bind commit");
+    };
+
+    let mut owner_ref_patch = (*created.data).clone();
+    owner_ref_patch["metadata"]["ownerReferences"] = json!([{
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "name": "owner-pod",
+        "uid": "owner-pod-uid",
+        "controller": true,
+        "blockOwnerDeletion": true
+    }]);
+    db.update_resource_with_preconditions(
+        "v1",
+        "Pod",
+        Some("default"),
+        "cycle-pod",
+        owner_ref_patch,
+        ResourcePreconditions::from_resource(&created),
+    )
+    .await
+    .expect("ownerReferences update applies before stale bind commit");
+
+    let apply_result = db
+        .apply_raft_log_apply_commit(bind_commit)
+        .await
+        .expect("stale committed bind applies authoritatively");
+    assert!(
+        apply_result.error_message.is_none(),
+        "stale bind apply must not become a terminal conflict: {apply_result:?}"
+    );
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "cycle-pod")
+        .await
+        .unwrap()
+        .expect("pod remains after bind apply");
+    assert_eq!(
+        live.data
+            .pointer("/spec/nodeName")
+            .and_then(|value| value.as_str()),
+        Some("mn-worker"),
+        "stale committed scheduler bind must still apply nodeName"
+    );
+    assert_eq!(
+        live.data
+            .pointer("/metadata/ownerReferences/0/uid")
+            .and_then(|value| value.as_str()),
+        Some("owner-pod-uid"),
+        "stale committed scheduler bind must not clear live ownerReferences"
+    );
+}
+
+#[tokio::test]
 async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
