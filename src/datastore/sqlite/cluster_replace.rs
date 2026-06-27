@@ -1,17 +1,12 @@
-use super::cluster_state_apply::ClusterStateApplier;
-use super::crud::helpers::{WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error};
-use super::owner_ref_index;
-use super::selector_index;
-use super::{Datastore, create_pending_watch_event, queries};
+use super::cluster_state_apply::{ApplyEffects, RaftClusterStateApplier};
+use super::{Datastore, queries};
 use crate::bootstrap::cluster_meta::{
     KEY_CLUSTER_ID, KEY_LEADER_EPOCH, KEY_RAFT_LEADER_HINT, KEY_RAFT_TERM, KEY_RAFT_VOTERS,
 };
 use crate::datastore::types::{AppliedOutboxRecord, PendingWatchEvent, ReplicatedSnapshotMetadata};
-use crate::log_apply::{
-    LogApplyAppliedOutboxRow, LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow,
-    LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow,
-    LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow, LogApplyWatchEventRow,
-};
+use crate::log_apply::{LogApplyCommit, LogApplyMutation};
+#[cfg(test)]
+use crate::log_apply::{LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow, LogApplyWatchEventRow};
 #[cfg(test)]
 use crate::log_apply::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
 use anyhow::{Result, anyhow};
@@ -281,7 +276,9 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                     },
                 )
                 .unwrap_or_default();
-                put_applied_outbox_row(tx, row)?;
+                RaftClusterStateApplier::new(tx)
+                    .outbox_mut()
+                    .put_applied_outbox(row)?;
             }
             Ok(RaftLogApplyOutcome {
                 result: crate::datastore::raft::types::StorageCommandResult {
@@ -337,106 +334,108 @@ fn apply_commit_in_tx_with_watch_events(
     }
     let commit = stamp_provisional_resource_version_in_tx(tx, commit)?;
     let applied_rv = commit.resource_version;
-    let mut pending = Vec::with_capacity(commit.mutations.len());
-    let resource_applier = ClusterStateApplier::new(tx);
+    let mut effects = ApplyEffects::new();
+    let mut applier = RaftClusterStateApplier::new(tx);
     for mutation in commit.mutations {
         match mutation {
             LogApplyMutation::PutResource(row) => {
                 if row.resource_version != commit.resource_version {
                     return Err(other_error("resource row RV does not match commit RV"));
                 }
-                if let Some(event) = resource_applier.apply_put_resource(
+                if let Some(event) = applier.resource_mut().apply_put_resource(
                     row,
                     emit_watch_events,
                     raft_authoritative,
                 )? {
-                    pending.push(event);
+                    effects.push_watch_event(event);
                 }
             }
             LogApplyMutation::PatchResourceLatest(patch) => {
                 if patch.resource_version != commit.resource_version {
                     return Err(other_error("resource patch RV does not match commit RV"));
                 }
-                if let Some(event) = resource_applier.apply_patch_resource_latest(
+                if let Some(event) = applier.resource_mut().apply_patch_resource_latest(
                     patch,
                     emit_watch_events,
                     raft_authoritative,
                 )? {
-                    pending.push(event);
+                    effects.push_watch_event(event);
                 }
             }
             LogApplyMutation::DeleteResource(key) => {
-                if let Some(event) = resource_applier.apply_delete_resource(
+                if let Some(event) = applier.resource_mut().apply_delete_resource(
                     commit.resource_version,
                     key,
                     emit_watch_events,
                     raft_authoritative,
                 )? {
-                    pending.push(event);
+                    effects.push_watch_event(event);
                 }
             }
             LogApplyMutation::PutNamespace(row) => {
                 if row.resource_version != commit.resource_version {
                     return Err(other_error("namespace row RV does not match commit RV"));
                 }
-                if let Some(event) = put_namespace_row(tx, row, emit_watch_events)? {
-                    pending.push(event);
+                if let Some(event) = applier
+                    .namespace_mut()
+                    .put_namespace(row, emit_watch_events)?
+                {
+                    effects.push_watch_event(event);
                 }
             }
             LogApplyMutation::DeleteNamespace { name } => {
-                if let Some(event) =
-                    delete_namespace_row(tx, commit.resource_version, &name, emit_watch_events)?
-                {
-                    pending.push(event);
+                if let Some(event) = applier.namespace_mut().delete_namespace(
+                    commit.resource_version,
+                    &name,
+                    emit_watch_events,
+                )? {
+                    effects.push_watch_event(event);
                 }
             }
             LogApplyMutation::DeleteNamespaceContents { name } => {
-                delete_namespace_contents_rows(tx, &name)?;
+                applier.namespace_mut().delete_namespace_contents(&name)?;
             }
-            LogApplyMutation::PutNodeSubnet(row) => put_node_subnet_row(tx, row)?,
+            LogApplyMutation::PutNodeSubnet(row) => applier.network_mut().put_node_subnet(row)?,
             LogApplyMutation::AllocateNodeSubnet(allocation) => {
-                let row = allocate_node_subnet_row(tx, allocation)?;
-                put_node_subnet_row(tx, row)?;
+                applier.network_mut().allocate_node_subnet(allocation)?;
             }
             LogApplyMutation::DeleteNodeSubnet { node_name } => {
-                tx.execute(queries::NODE_SUBNET_DELETE, rusqlite::params![node_name])?;
+                applier.network_mut().delete_node_subnet(node_name)?;
             }
-            LogApplyMutation::PutNodeDataplane(row) => put_node_dataplane_row(tx, row)?,
+            LogApplyMutation::PutNodeDataplane(row) => {
+                applier.network_mut().put_node_dataplane(row)?;
+            }
             LogApplyMutation::DeleteNodeDataplane { node_name } => {
-                tx.execute(queries::NODE_DATAPLANE_DELETE, rusqlite::params![node_name])?;
+                applier.network_mut().delete_node_dataplane(node_name)?;
             }
-            LogApplyMutation::PutAppliedOutbox(row) => put_applied_outbox_row(tx, row)?,
+            LogApplyMutation::PutAppliedOutbox(row) => {
+                applier.outbox_mut().put_applied_outbox(row)?;
+            }
             LogApplyMutation::DeleteAppliedOutbox { idempotency_key } => {
-                tx.execute(
-                    queries::APPLIED_OUTBOX_DELETE_BY_KEY,
-                    rusqlite::params![idempotency_key],
-                )?;
+                applier
+                    .outbox_mut()
+                    .delete_applied_outbox(idempotency_key)?;
             }
             LogApplyMutation::GcAppliedOutbox {
                 cutoff_ms,
                 operations: _,
             } => {
-                tx.execute(
-                    queries::APPLIED_OUTBOX_DELETE_EXPIRED,
-                    rusqlite::params![cutoff_ms],
-                )?;
+                applier.outbox_mut().gc_applied_outbox(cutoff_ms)?;
             }
             LogApplyMutation::GcWatchEvents {
                 max_rows,
                 batch_cap,
             } => {
-                let removed = super::gc::gc_watch_events_in_tx(tx, max_rows, batch_cap)?;
-                if removed > 0 {
-                    let _ = tx.execute("PRAGMA incremental_vacuum(1000)", []);
-                }
+                applier
+                    .watch_history_mut()
+                    .apply_gc_watch_events(max_rows, batch_cap)?;
             }
-            LogApplyMutation::PutWatchEvent(row) => pending.push(put_watch_event_row(tx, row)?),
+            LogApplyMutation::PutWatchEvent(row) => {
+                effects.push_watch_event(applier.watch_history_mut().apply_put_watch_event(row)?)
+            }
             LogApplyMutation::AdvanceResourceVersion { .. } => {}
             LogApplyMutation::PutKlightsMeta { key, value } => {
-                tx.execute(
-                    crate::datastore::sqlite::queries::UPSERT_KLIGHTS_META,
-                    rusqlite::params![&key, &value],
-                )?;
+                applier.cluster_meta_mut().put_klights_meta(key, value)?;
             }
             LogApplyMutation::PutPodCleanupIntent(row) => {
                 if row.resource_version != commit.resource_version {
@@ -444,21 +443,20 @@ fn apply_commit_in_tx_with_watch_events(
                         "pod cleanup intent RV does not match commit RV",
                     ));
                 }
-                put_pod_cleanup_intent_row(tx, row)?;
+                applier.pod_cleanup_mut().put_pod_cleanup_intent(row)?;
             }
             LogApplyMutation::DeletePodCleanupIntent(key) => {
-                delete_pod_cleanup_intent_row(tx, key)?;
+                applier.pod_cleanup_mut().delete_pod_cleanup_intent(key)?;
             }
             LogApplyMutation::DeletePodCleanupIntentsForNode { node_name } => {
-                tx.execute(
-                    queries::POD_CLEANUP_INTENTS_DELETE_BY_NODE,
-                    rusqlite::params![node_name],
-                )?;
+                applier
+                    .pod_cleanup_mut()
+                    .delete_pod_cleanup_intents_for_node(node_name)?;
             }
         }
     }
     advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
-    Ok((applied_rv, pending))
+    Ok((applied_rv, effects.into_pending_watch_events()))
 }
 
 fn stamp_provisional_resource_version_in_tx(
@@ -542,234 +540,6 @@ fn stamp_provisional_resource_version_in_tx(
     Ok(commit)
 }
 
-fn put_namespace_row(
-    tx: &rusqlite::Transaction<'_>,
-    row: LogApplyNamespaceRow,
-    emit_watch_events: bool,
-) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
-    let data_bytes = serde_json::to_vec(&row.data)
-        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
-    let existing = tx
-        .query_row(
-            queries::NAMESPACE_GET,
-            rusqlite::params![&row.name],
-            |db_row| Ok((db_row.get::<_, i64>(1)?, db_row.get::<_, Vec<u8>>(3)?)),
-        )
-        .optional()?;
-    if existing.as_ref().is_some_and(|(rv, existing_bytes)| {
-        *rv == row.resource_version && *existing_bytes == data_bytes
-    }) {
-        return Ok(None);
-    }
-    tx.execute(
-        queries::NAMESPACES_UPSERT_EXACT,
-        rusqlite::params![&row.name, &row.uid, row.resource_version, &data_bytes],
-    )?;
-    let event_type = if existing.is_some() {
-        "MODIFIED"
-    } else {
-        "ADDED"
-    };
-    if !emit_watch_events {
-        return Ok(None);
-    }
-    insert_watch_event_in_conn(
-        tx,
-        WatchEventInsert::new(
-            "v1",
-            "Namespace",
-            None,
-            &row.name,
-            row.resource_version,
-            event_type,
-            &data_bytes,
-        ),
-    )?;
-    Ok(Some(create_pending_watch_event(
-        "v1",
-        "Namespace",
-        None,
-        &row.name,
-        row.resource_version,
-        event_type,
-        row.data,
-    )))
-}
-
-fn delete_namespace_row(
-    tx: &rusqlite::Transaction<'_>,
-    resource_version: i64,
-    name: &str,
-    emit_watch_events: bool,
-) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
-    let existing = tx
-        .query_row(
-            queries::NAMESPACE_GET_DATA,
-            rusqlite::params![name],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()?;
-    let Some(data_bytes) = existing else {
-        return Ok(None);
-    };
-    tx.execute(queries::NAMESPACE_DELETE, rusqlite::params![name])?;
-    if !emit_watch_events {
-        return Ok(None);
-    }
-    insert_watch_event_in_conn(
-        tx,
-        WatchEventInsert::new(
-            "v1",
-            "Namespace",
-            None,
-            name,
-            resource_version,
-            "DELETED",
-            &data_bytes,
-        ),
-    )?;
-    let data: serde_json::Value =
-        serde_json::from_slice(&data_bytes).map_err(serde_to_sqlite_error)?;
-    Ok(Some(create_pending_watch_event(
-        "v1",
-        "Namespace",
-        None,
-        name,
-        resource_version,
-        "DELETED",
-        data,
-    )))
-}
-
-fn delete_namespace_contents_rows(
-    tx: &rusqlite::Transaction<'_>,
-    name: &str,
-) -> tokio_rusqlite::Result<()> {
-    let mut stmt = tx.prepare(queries::NAMESPACE_RESOURCES_LIST_EXCLUDING_KIND)?;
-    let rows = stmt
-        .query_map(rusqlite::params![name, "Pod"], |row| {
-            Ok((
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    tx.execute(
-        queries::NAMESPACE_RESOURCES_DELETE_NON_PODS,
-        rusqlite::params![name],
-    )?;
-    for (api_version, kind, namespace, resource_name) in rows {
-        selector_index::delete_index_entries(tx, &api_version, &kind, &namespace, &resource_name)?;
-        owner_ref_index::delete_owner_refs(tx, &api_version, &kind, &namespace, &resource_name)?;
-    }
-    Ok(())
-}
-
-fn put_applied_outbox_row(
-    tx: &rusqlite::Transaction<'_>,
-    row: LogApplyAppliedOutboxRow,
-) -> tokio_rusqlite::Result<()> {
-    tx.execute(
-        queries::APPLIED_OUTBOX_UPSERT_EXACT,
-        rusqlite::params![
-            row.idempotency_key,
-            row.subject_key,
-            row.operation,
-            row.first_seen_ms,
-            row.applied_rv,
-            row.result_proto,
-            row.status_stamp
-        ],
-    )?;
-    Ok(())
-}
-
-fn allocate_node_subnet_row(
-    tx: &rusqlite::Transaction<'_>,
-    allocation: LogApplyNodeSubnetAllocation,
-) -> tokio_rusqlite::Result<LogApplyNodeSubnetRow> {
-    let node_name_typed = crate::networking::NodeName::parse(&allocation.node_name)
-        .map_err(|err| other_error(format!("Invalid node name {}: {err}", allocation.node_name)))?;
-    let node_ip_typed: std::net::Ipv4Addr = allocation
-        .node_ip
-        .parse()
-        .map_err(|err| other_error(format!("Invalid node IP {}: {err}", allocation.node_ip)))?;
-    let cluster =
-        crate::networking::ClusterCidr::parse(&allocation.cluster_cidr).map_err(|err| {
-            other_error(format!(
-                "Invalid cluster CIDR {}: {err}",
-                allocation.cluster_cidr
-            ))
-        })?;
-    if cluster.prefix() > 24 {
-        return Err(other_error(format!(
-            "cluster CIDR prefix must be <= /24 (got /{})",
-            cluster.prefix()
-        )));
-    }
-
-    let existing = tx
-        .query_row(
-            queries::NODE_SUBNET_SELECT_BY_NAME,
-            rusqlite::params![node_name_typed.as_str()],
-            |row| {
-                Ok(LogApplyNodeSubnetRow {
-                    node_name: row.get(0)?,
-                    subnet: row.get(1)?,
-                    subnet_base_int: row.get::<_, i64>(2)? as u32,
-                    vtep_ip: row.get(3)?,
-                    vtep_mac: row.get(4)?,
-                    node_ip: row.get(5)?,
-                    mode: row.get(6)?,
-                    hostport_range: row.get(7)?,
-                })
-            },
-        )
-        .optional()?;
-    if let Some(existing) = existing {
-        return Ok(existing);
-    }
-
-    let mut allocated = std::collections::BTreeSet::new();
-    {
-        let mut stmt = tx.prepare("SELECT subnet_base_int FROM node_subnets")?;
-        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
-        for row in rows {
-            allocated.insert(row? as u32);
-        }
-    }
-
-    let cluster_base = cluster.network();
-    let host_bits = 32u32.saturating_sub(cluster.prefix() as u32);
-    let subnet_count = 1u32.checked_shl(host_bits - 8).unwrap_or(1).max(1);
-    for i in 0..subnet_count {
-        let base = cluster_base + (i << 8);
-        if allocated.contains(&base) {
-            continue;
-        }
-        let subnet_typed =
-            crate::networking::PodSubnet::parse(&format!("{}/24", std::net::Ipv4Addr::from(base)))
-                .expect("constructed /24 must parse");
-        let vtep_ip = std::net::Ipv4Addr::from(base);
-        return Ok(LogApplyNodeSubnetRow {
-            node_name: node_name_typed.as_str().to_string(),
-            subnet: subnet_typed.to_string(),
-            subnet_base_int: base,
-            vtep_ip: vtep_ip.to_string(),
-            vtep_mac: None,
-            node_ip: node_ip_typed.to_string(),
-            mode: "root".to_string(),
-            hostport_range: None,
-        });
-    }
-
-    Err(tokio_rusqlite::Error::Rusqlite(
-        rusqlite::Error::QueryReturnedNoRows,
-    ))
-}
-
 fn applied_outbox_record_in_tx(
     tx: &rusqlite::Transaction<'_>,
     idempotency_key: &str,
@@ -850,113 +620,6 @@ fn is_terminal_apply_conflict(err: &tokio_rusqlite::Error) -> bool {
         tokio_rusqlite::Error::Other(inner) => inner.downcast_ref::<ApplyConflictError>().is_some(),
         _ => false,
     }
-}
-
-fn put_pod_cleanup_intent_row(
-    tx: &rusqlite::Transaction<'_>,
-    row: LogApplyPodCleanupIntentRow,
-) -> tokio_rusqlite::Result<()> {
-    let pod_data = serde_json::to_vec(&row.pod_data)
-        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
-    tx.execute(
-        queries::POD_CLEANUP_INTENT_UPSERT,
-        rusqlite::params![
-            row.node_name,
-            row.namespace,
-            row.pod_name,
-            row.pod_uid,
-            row.reason,
-            row.resource_version,
-            row.created_at_ms,
-            pod_data
-        ],
-    )?;
-    Ok(())
-}
-
-fn delete_pod_cleanup_intent_row(
-    tx: &rusqlite::Transaction<'_>,
-    key: LogApplyPodCleanupIntentKey,
-) -> tokio_rusqlite::Result<()> {
-    tx.execute(
-        queries::POD_CLEANUP_INTENT_DELETE,
-        rusqlite::params![
-            key.node_name,
-            key.namespace,
-            key.pod_name,
-            key.pod_uid,
-            key.reason
-        ],
-    )?;
-    Ok(())
-}
-
-fn put_watch_event_row(
-    tx: &rusqlite::Transaction<'_>,
-    row: LogApplyWatchEventRow,
-) -> tokio_rusqlite::Result<PendingWatchEvent> {
-    let data_bytes = serde_json::to_vec(&row.data)
-        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
-    insert_watch_event_in_conn(
-        tx,
-        WatchEventInsert::new(
-            &row.api_version,
-            &row.kind,
-            row.namespace.as_deref(),
-            &row.name,
-            row.resource_version,
-            &row.event_type,
-            &data_bytes,
-        ),
-    )?;
-    Ok(create_pending_watch_event(
-        &row.api_version,
-        &row.kind,
-        row.namespace.as_deref(),
-        &row.name,
-        row.resource_version,
-        &row.event_type,
-        row.data,
-    ))
-}
-
-fn put_node_subnet_row(
-    tx: &rusqlite::Transaction<'_>,
-    row: LogApplyNodeSubnetRow,
-) -> tokio_rusqlite::Result<()> {
-    tx.execute(
-        queries::NODE_SUBNET_UPSERT_EXACT,
-        rusqlite::params![
-            row.node_name,
-            row.subnet,
-            i64::from(row.subnet_base_int),
-            row.vtep_ip,
-            row.vtep_mac,
-            row.node_ip,
-            row.mode,
-            row.hostport_range
-        ],
-    )?;
-    Ok(())
-}
-
-fn put_node_dataplane_row(
-    tx: &rusqlite::Transaction<'_>,
-    row: LogApplyNodeDataplaneRow,
-) -> tokio_rusqlite::Result<()> {
-    tx.execute(
-        queries::NODE_DATAPLANE_UPSERT,
-        rusqlite::params![
-            row.node_name,
-            row.mode,
-            row.encryption,
-            row.public_key,
-            row.endpoint,
-            row.port.map(i64::from),
-            0i64
-        ],
-    )?;
-    Ok(())
 }
 
 fn advance_metadata_rv_to_at_least_tx(

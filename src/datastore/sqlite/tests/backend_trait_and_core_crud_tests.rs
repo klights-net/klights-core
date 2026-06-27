@@ -2078,6 +2078,69 @@ async fn raft_stale_pod_put_over_terminating_live_row_replays_identical_watch_pa
 }
 
 #[tokio::test]
+async fn raft_resource_put_persists_row_and_watch_from_identical_payload_bytes() {
+    let ds = Datastore::new_in_memory().await.unwrap();
+
+    let row_data = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": "co-derived",
+            "namespace": "default",
+            "uid": "co-derived-uid",
+            "labels": {"app": "co-derived"},
+            "resourceVersion": "41"
+        },
+        "data": {"hello": "derived"},
+    });
+    let commit = crate::log_apply::LogApplyCommit::new(
+        41,
+        vec![crate::log_apply::LogApplyMutation::PutResource(
+            crate::log_apply::LogApplyResourceRow {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "co-derived".to_string(),
+                uid: "co-derived-uid".to_string(),
+                resource_version: 41,
+                data: row_data,
+                require_absent: false,
+                require_existing: false,
+                precondition_uid: None,
+                precondition_resource_version: None,
+                status_only: false,
+            },
+        )],
+    );
+
+    ds.apply_log_apply_commit(commit).await.unwrap();
+
+    let resource_row_bytes: Vec<u8> = ds
+        .db_call("test_resource_put_row_bytes", |conn| {
+            Ok(conn.query_row(
+                "SELECT data FROM namespaced_resources WHERE api_version = ?1 AND kind = ?2 AND namespace = ?3 AND name = ?4",
+                rusqlite::params!["v1", "ConfigMap", "default", "co-derived"],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+
+    let watch_row_bytes: Vec<u8> = ds
+        .db_call("test_resource_watch_row_bytes", |conn| {
+            Ok(conn.query_row(
+                "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
+                rusqlite::params!["v1", "ConfigMap", "default", "co-derived", 41],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(resource_row_bytes, watch_row_bytes);
+}
+
+#[tokio::test]
 async fn raft_patch_apply_built_before_spec_update_does_not_revert_live_spec() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
@@ -2490,6 +2553,199 @@ async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() 
     );
 }
 
+async fn applied_outbox_rows(
+    db: &Datastore,
+) -> Vec<(
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Vec<u8>,
+    Option<i64>,
+)> {
+    type AppliedOutboxRow = (
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+        Vec<u8>,
+        Option<i64>,
+    );
+
+    db.db_call("test_applied_outbox_rows", |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT idempotency_key, subject_key, operation, first_seen_ms, \
+             applied_rv, result_proto, status_stamp \
+             FROM applied_outbox ORDER BY idempotency_key",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<AppliedOutboxRow>>>()?;
+        Ok(rows)
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn raft_applied_outbox_replay_is_deterministic() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+
+    let initial_put = crate::log_apply::LogApplyCommit::new(
+        1,
+        vec![
+            crate::log_apply::LogApplyMutation::PutAppliedOutbox(
+                crate::log_apply::LogApplyAppliedOutboxRow {
+                    idempotency_key: "outbox-old".to_string(),
+                    subject_key: "v1:Pod:default:old-pod:uid-1".to_string(),
+                    operation: "PodMetadata".to_string(),
+                    first_seen_ms: 10_000,
+                    applied_rv: Some(11),
+                    result_proto: vec![0x01, 0x02],
+                    status_stamp: Some(21_000),
+                },
+            ),
+            crate::log_apply::LogApplyMutation::PutAppliedOutbox(
+                crate::log_apply::LogApplyAppliedOutboxRow {
+                    idempotency_key: "outbox-new".to_string(),
+                    subject_key: "v1:Pod:default:new-pod:uid-2".to_string(),
+                    operation: "PodStatus".to_string(),
+                    first_seen_ms: 20_000,
+                    applied_rv: Some(12),
+                    result_proto: vec![0x03, 0x04],
+                    status_stamp: None,
+                },
+            ),
+        ],
+    );
+
+    leader
+        .apply_log_apply_commit(initial_put.clone())
+        .await
+        .unwrap();
+    follower.apply_log_apply_commit(initial_put).await.unwrap();
+
+    let expected_initial = vec![
+        (
+            "outbox-new".to_string(),
+            "v1:Pod:default:new-pod:uid-2".to_string(),
+            "PodStatus".to_string(),
+            20_000,
+            Some(12),
+            vec![0x03, 0x04],
+            None,
+        ),
+        (
+            "outbox-old".to_string(),
+            "v1:Pod:default:old-pod:uid-1".to_string(),
+            "PodMetadata".to_string(),
+            10_000,
+            Some(11),
+            vec![0x01, 0x02],
+            Some(21_000),
+        ),
+    ];
+    let leader_rows = applied_outbox_rows(&leader).await;
+    let follower_rows = applied_outbox_rows(&follower).await;
+    assert_eq!(
+        leader_rows, follower_rows,
+        "leader/follower rows must remain identical"
+    );
+    assert_eq!(
+        leader_rows, expected_initial,
+        "initial put rows must match expected snapshot"
+    );
+
+    let delete = crate::log_apply::LogApplyCommit::new(
+        2,
+        vec![crate::log_apply::LogApplyMutation::DeleteAppliedOutbox {
+            idempotency_key: "outbox-old".to_string(),
+        }],
+    );
+    leader.apply_log_apply_commit(delete.clone()).await.unwrap();
+    follower.apply_log_apply_commit(delete).await.unwrap();
+
+    let after_delete_expected = vec![(
+        "outbox-new".to_string(),
+        "v1:Pod:default:new-pod:uid-2".to_string(),
+        "PodStatus".to_string(),
+        20_000,
+        Some(12),
+        vec![0x03, 0x04],
+        None,
+    )];
+    let leader_rows = applied_outbox_rows(&leader).await;
+    let follower_rows = applied_outbox_rows(&follower).await;
+    assert_eq!(
+        leader_rows, follower_rows,
+        "leader/follower rows must remain identical"
+    );
+    assert_eq!(leader_rows, after_delete_expected);
+
+    let follow_up_put = crate::log_apply::LogApplyCommit::new(
+        3,
+        vec![crate::log_apply::LogApplyMutation::PutAppliedOutbox(
+            crate::log_apply::LogApplyAppliedOutboxRow {
+                idempotency_key: "outbox-older-again".to_string(),
+                subject_key: "v1:Pod:default:older-pod:uid-3".to_string(),
+                operation: "PodMetadata".to_string(),
+                first_seen_ms: 5_000,
+                applied_rv: Some(13),
+                result_proto: vec![0x05],
+                status_stamp: Some(7_000),
+            },
+        )],
+    );
+    leader
+        .apply_log_apply_commit(follow_up_put.clone())
+        .await
+        .unwrap();
+    follower
+        .apply_log_apply_commit(follow_up_put)
+        .await
+        .unwrap();
+
+    let gc = crate::log_apply::LogApplyCommit::new(
+        4,
+        vec![crate::log_apply::LogApplyMutation::GcAppliedOutbox {
+            cutoff_ms: 10_000,
+            operations: vec!["PodMetadata".to_string(), "PodStatus".to_string()],
+        }],
+    );
+    leader.apply_log_apply_commit(gc.clone()).await.unwrap();
+    follower.apply_log_apply_commit(gc).await.unwrap();
+
+    let expected_after_gc = vec![(
+        "outbox-new".to_string(),
+        "v1:Pod:default:new-pod:uid-2".to_string(),
+        "PodStatus".to_string(),
+        20_000,
+        Some(12),
+        vec![0x03, 0x04],
+        None,
+    )];
+    let leader_rows = applied_outbox_rows(&leader).await;
+    let follower_rows = applied_outbox_rows(&follower).await;
+    assert_eq!(
+        leader_rows, follower_rows,
+        "leader/follower rows must remain identical"
+    );
+    assert_eq!(leader_rows, expected_after_gc);
+}
+
 #[tokio::test]
 async fn raft_commit_builder_does_not_treat_api_node_update_as_node_status_refresh() {
     let db = Datastore::new_in_memory().await.unwrap();
@@ -2795,6 +3051,311 @@ async fn log_apply_replays_pod_cleanup_intents() {
             .unwrap()
             .is_empty()
     );
+}
+
+async fn get_klights_meta_rows(
+    db: &Datastore,
+    key_a: &'static str,
+    key_b: &'static str,
+) -> Vec<(String, String)> {
+    db.db_call("test_select_test_klights_meta_rows", {
+        let key_a = key_a.to_string();
+        let key_b = key_b.to_string();
+        move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT key, value FROM _klights_meta WHERE key IN (?1, ?2) ORDER BY key",
+            )?;
+            let rows = stmt
+                .query_map([key_a.as_str(), key_b.as_str()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        }
+    })
+    .await
+    .unwrap()
+}
+
+async fn pod_cleanup_intent_rows(
+    db: &Datastore,
+) -> Vec<(String, String, String, String, String, i64, i64, Vec<u8>)> {
+    db.db_call("test_pod_cleanup_intent_rows", |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT node_name, namespace, pod_name, pod_uid, reason, resource_version, created_at_ms, pod_data \
+             FROM pod_cleanup_intents \
+             ORDER BY node_name, namespace, pod_name, pod_uid, reason",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn raft_pod_cleanup_intent_replay_is_deterministic() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+
+    let pod_a_data = serde_json::to_vec(&json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "lost-pod-a",
+            "namespace": "default",
+            "uid": "lost-pod-a-uid",
+            "labels": {
+                "app": "replay",
+                "node": "worker-a"
+            },
+        },
+        "spec": {"nodeName": "worker-a"},
+        "status": {"phase": "Running"},
+    }))
+    .unwrap();
+    let pod_b_data = serde_json::to_vec(&json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "lost-pod-b",
+            "namespace": "default",
+            "uid": "lost-pod-b-uid",
+            "labels": {
+                "app": "replay",
+                "node": "worker-a"
+            },
+        },
+        "spec": {"nodeName": "worker-a"},
+        "status": {"phase": "Pending"},
+    }))
+    .unwrap();
+    let pod_c_data = serde_json::to_vec(&json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "lost-pod-c",
+            "namespace": "default",
+            "uid": "lost-pod-c-uid",
+            "labels": {
+                "app": "replay",
+                "node": "worker-b"
+            },
+        },
+        "spec": {"nodeName": "worker-b"},
+        "status": {"phase": "Running"},
+    }))
+    .unwrap();
+
+    let initial_put = crate::log_apply::LogApplyCommit::new(
+        11,
+        vec![
+            crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
+                crate::log_apply::LogApplyPodCleanupIntentRow {
+                    node_name: "worker-a".to_string(),
+                    namespace: "default".to_string(),
+                    pod_name: "lost-pod-a".to_string(),
+                    pod_uid: "lost-pod-a-uid".to_string(),
+                    reason: "NodeLost".to_string(),
+                    resource_version: 11,
+                    created_at_ms: 1_700_000_000_100,
+                    pod_data: serde_json::from_slice(&pod_a_data).unwrap(),
+                },
+            ),
+            crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
+                crate::log_apply::LogApplyPodCleanupIntentRow {
+                    node_name: "worker-a".to_string(),
+                    namespace: "default".to_string(),
+                    pod_name: "lost-pod-b".to_string(),
+                    pod_uid: "lost-pod-b-uid".to_string(),
+                    reason: "NodeLost".to_string(),
+                    resource_version: 11,
+                    created_at_ms: 1_700_000_000_200,
+                    pod_data: serde_json::from_slice(&pod_b_data).unwrap(),
+                },
+            ),
+            crate::log_apply::LogApplyMutation::PutPodCleanupIntent(
+                crate::log_apply::LogApplyPodCleanupIntentRow {
+                    node_name: "worker-b".to_string(),
+                    namespace: "default".to_string(),
+                    pod_name: "lost-pod-c".to_string(),
+                    pod_uid: "lost-pod-c-uid".to_string(),
+                    reason: "NodeLost".to_string(),
+                    resource_version: 11,
+                    created_at_ms: 1_700_000_000_300,
+                    pod_data: serde_json::from_slice(&pod_c_data).unwrap(),
+                },
+            ),
+        ],
+    );
+
+    leader
+        .apply_log_apply_commit(initial_put.clone())
+        .await
+        .unwrap();
+    follower.apply_log_apply_commit(initial_put).await.unwrap();
+
+    let expected_after_put = vec![
+        (
+            "worker-a".to_string(),
+            "default".to_string(),
+            "lost-pod-a".to_string(),
+            "lost-pod-a-uid".to_string(),
+            "NodeLost".to_string(),
+            11,
+            1_700_000_000_100,
+            pod_a_data.clone(),
+        ),
+        (
+            "worker-a".to_string(),
+            "default".to_string(),
+            "lost-pod-b".to_string(),
+            "lost-pod-b-uid".to_string(),
+            "NodeLost".to_string(),
+            11,
+            1_700_000_000_200,
+            pod_b_data.clone(),
+        ),
+        (
+            "worker-b".to_string(),
+            "default".to_string(),
+            "lost-pod-c".to_string(),
+            "lost-pod-c-uid".to_string(),
+            "NodeLost".to_string(),
+            11,
+            1_700_000_000_300,
+            pod_c_data.clone(),
+        ),
+    ];
+
+    let leader_rows = pod_cleanup_intent_rows(&leader).await;
+    let follower_rows = pod_cleanup_intent_rows(&follower).await;
+    assert_eq!(leader_rows, follower_rows);
+    assert_eq!(leader_rows, expected_after_put);
+
+    let delete = crate::log_apply::LogApplyCommit::new(
+        12,
+        vec![crate::log_apply::LogApplyMutation::DeletePodCleanupIntent(
+            crate::log_apply::LogApplyPodCleanupIntentKey {
+                node_name: "worker-a".to_string(),
+                namespace: "default".to_string(),
+                pod_name: "lost-pod-a".to_string(),
+                pod_uid: "lost-pod-a-uid".to_string(),
+                reason: "NodeLost".to_string(),
+            },
+        )],
+    );
+
+    leader.apply_log_apply_commit(delete.clone()).await.unwrap();
+    follower.apply_log_apply_commit(delete).await.unwrap();
+
+    let after_delete_expected = vec![
+        (
+            "worker-a".to_string(),
+            "default".to_string(),
+            "lost-pod-b".to_string(),
+            "lost-pod-b-uid".to_string(),
+            "NodeLost".to_string(),
+            11,
+            1_700_000_000_200,
+            pod_b_data.clone(),
+        ),
+        (
+            "worker-b".to_string(),
+            "default".to_string(),
+            "lost-pod-c".to_string(),
+            "lost-pod-c-uid".to_string(),
+            "NodeLost".to_string(),
+            11,
+            1_700_000_000_300,
+            pod_c_data.clone(),
+        ),
+    ];
+    let leader_rows = pod_cleanup_intent_rows(&leader).await;
+    let follower_rows = pod_cleanup_intent_rows(&follower).await;
+    assert_eq!(leader_rows, follower_rows);
+    assert_eq!(leader_rows, after_delete_expected);
+
+    let delete_node = crate::log_apply::LogApplyCommit::new(
+        13,
+        vec![
+            crate::log_apply::LogApplyMutation::DeletePodCleanupIntentsForNode {
+                node_name: "worker-b".to_string(),
+            },
+        ],
+    );
+
+    leader
+        .apply_log_apply_commit(delete_node.clone())
+        .await
+        .unwrap();
+    follower.apply_log_apply_commit(delete_node).await.unwrap();
+
+    let after_node_delete_expected = vec![(
+        "worker-a".to_string(),
+        "default".to_string(),
+        "lost-pod-b".to_string(),
+        "lost-pod-b-uid".to_string(),
+        "NodeLost".to_string(),
+        11,
+        1_700_000_000_200,
+        pod_b_data,
+    )];
+    let leader_rows = pod_cleanup_intent_rows(&leader).await;
+    let follower_rows = pod_cleanup_intent_rows(&follower).await;
+    assert_eq!(leader_rows, follower_rows);
+    assert_eq!(leader_rows, after_node_delete_expected);
+}
+
+#[tokio::test]
+async fn raft_cluster_meta_replay_is_deterministic() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+
+    let commit = crate::log_apply::LogApplyCommit::new(
+        1,
+        vec![
+            crate::log_apply::LogApplyMutation::PutKlightsMeta {
+                key: "raft-test-alpha".to_string(),
+                value: "alpha".to_string(),
+            },
+            crate::log_apply::LogApplyMutation::PutKlightsMeta {
+                key: "raft-test-beta".to_string(),
+                value: "beta".to_string(),
+            },
+        ],
+    );
+
+    let commit_to_apply = commit.clone();
+    leader
+        .apply_log_apply_commit(commit_to_apply)
+        .await
+        .unwrap();
+    follower.apply_log_apply_commit(commit).await.unwrap();
+
+    let expected = vec![
+        ("raft-test-alpha".to_string(), "alpha".to_string()),
+        ("raft-test-beta".to_string(), "beta".to_string()),
+    ];
+    let leader_meta = get_klights_meta_rows(&leader, "raft-test-alpha", "raft-test-beta").await;
+    let follower_meta = get_klights_meta_rows(&follower, "raft-test-alpha", "raft-test-beta").await;
+
+    assert_eq!(leader_meta, expected);
+    assert_eq!(follower_meta, expected);
+    assert_eq!(leader_meta, follower_meta);
 }
 
 #[tokio::test]

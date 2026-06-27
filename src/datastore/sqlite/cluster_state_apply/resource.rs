@@ -5,31 +5,189 @@
 //! normalized payload so raft members cannot diverge by recomputing local state
 //! while applying the same committed entry.
 
-use super::cluster_replace::{
+use super::super::cluster_replace::{
     ApplyConflictCode, apply_conflict_error, other_error, record_raft_authoritative_apply_conflict,
 };
-use super::crud::helpers::{WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error};
-use super::{create_pending_watch_event, owner_ref_index, queries, selector_index};
+use super::super::crud::helpers::{
+    WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
+};
+use super::super::{create_pending_watch_event, owner_ref_index, queries, selector_index};
 use crate::datastore::types::{PatchKind, PendingWatchEvent};
 use crate::log_apply::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
 use rusqlite::OptionalExtension;
 
-pub(super) struct ClusterStateApplier<'tx, 'conn> {
+pub(in crate::datastore::sqlite) struct ClusterStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
 }
 
-impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
-    pub(super) fn new(tx: &'tx rusqlite::Transaction<'conn>) -> Self {
+struct ResourceWriteSink<'tx, 'conn> {
+    tx: &'tx rusqlite::Transaction<'conn>,
+}
+
+impl<'tx, 'conn> ResourceWriteSink<'tx, 'conn> {
+    fn new(tx: &'tx rusqlite::Transaction<'conn>) -> Self {
         Self { tx }
     }
 
-    pub(super) fn apply_put_resource(
+    fn upsert_resource_from_bytes(
+        &self,
+        identity: ResourceIdentity<'_>,
+        uid: &str,
+        resource_version: i64,
+        data_bytes: &[u8],
+    ) -> tokio_rusqlite::Result<()> {
+        match identity.scope {
+            ResourceScope::Namespaced(namespace) => {
+                self.tx.execute(
+                    queries::NAMESPACED_UPSERT_EXACT,
+                    rusqlite::params![
+                        identity.api_version,
+                        identity.kind,
+                        namespace,
+                        identity.name,
+                        uid,
+                        resource_version,
+                        data_bytes
+                    ],
+                )?;
+            }
+            ResourceScope::Cluster => {
+                self.tx.execute(
+                    queries::CLUSTER_UPSERT_EXACT,
+                    rusqlite::params![
+                        identity.api_version,
+                        identity.kind,
+                        identity.name,
+                        uid,
+                        resource_version,
+                        data_bytes
+                    ],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn upsert_indexes_from_bytes(
+        &self,
+        identity: ResourceIdentity<'_>,
+        data_bytes: &[u8],
+    ) -> tokio_rusqlite::Result<()> {
+        selector_index::upsert_index_entries(
+            self.tx,
+            identity.api_version,
+            identity.kind,
+            identity.index_namespace(),
+            identity.name,
+            data_bytes,
+        )?;
+        owner_ref_index::upsert_owner_refs(
+            self.tx,
+            identity.api_version,
+            identity.kind,
+            identity.index_namespace(),
+            identity.name,
+            data_bytes,
+        )?;
+        Ok(())
+    }
+
+    fn delete_resource_from_identity(
+        &self,
+        identity: ResourceIdentity<'_>,
+    ) -> tokio_rusqlite::Result<()> {
+        match identity.scope {
+            ResourceScope::Namespaced(namespace) => {
+                self.tx.execute(
+                    queries::NAMESPACED_DELETE_BY_KEY,
+                    rusqlite::params![
+                        identity.api_version,
+                        identity.kind,
+                        namespace,
+                        identity.name
+                    ],
+                )?;
+            }
+            ResourceScope::Cluster => {
+                self.tx.execute(
+                    queries::CLUSTER_DELETE_BY_KEY,
+                    rusqlite::params![identity.api_version, identity.kind, identity.name],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_indexes_from_identity(
+        &self,
+        identity: ResourceIdentity<'_>,
+    ) -> tokio_rusqlite::Result<()> {
+        selector_index::delete_index_entries(
+            self.tx,
+            identity.api_version,
+            identity.kind,
+            identity.index_namespace(),
+            identity.name,
+        )?;
+        owner_ref_index::delete_owner_refs(
+            self.tx,
+            identity.api_version,
+            identity.kind,
+            identity.index_namespace(),
+            identity.name,
+        )?;
+        Ok(())
+    }
+
+    fn emit_watch_from_bytes(
+        &self,
+        emit_watch_events: bool,
+        identity: ResourceIdentity<'_>,
+        resource_version: i64,
+        event_type: &str,
+        data_bytes: &[u8],
+        data: serde_json::Value,
+    ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
+        if !emit_watch_events {
+            return Ok(None);
+        }
+        insert_watch_event_in_conn(
+            self.tx,
+            WatchEventInsert::new(
+                identity.api_version,
+                identity.kind,
+                identity.namespace(),
+                identity.name,
+                resource_version,
+                event_type,
+                data_bytes,
+            ),
+        )?;
+        Ok(Some(create_pending_watch_event(
+            identity.api_version,
+            identity.kind,
+            identity.namespace(),
+            identity.name,
+            resource_version,
+            event_type,
+            data,
+        )))
+    }
+}
+
+impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
+    pub(in crate::datastore::sqlite) fn new(tx: &'tx rusqlite::Transaction<'conn>) -> Self {
+        Self { tx }
+    }
+
+    pub(in crate::datastore::sqlite) fn apply_put_resource(
         &self,
         mut row: LogApplyResourceRow,
         emit_watch_events: bool,
         raft_authoritative: bool,
     ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
         let mut namespace_owned = String::new();
+        let sink = ResourceWriteSink::new(self.tx);
         let existing = {
             let identity = resource_identity(
                 &row.api_version,
@@ -59,17 +217,17 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         if existing.as_ref().is_some_and(|(rv, _uid, existing_bytes)| {
             *rv == row.resource_version && *existing_bytes == data_bytes
         }) {
-            self.upsert_indexes(identity, &data_bytes)?;
+            sink.upsert_indexes_from_bytes(identity, &data_bytes)?;
             return Ok(None);
         }
-        self.upsert_resource_row(identity, &row.uid, row.resource_version, &data_bytes)?;
-        self.upsert_indexes(identity, &data_bytes)?;
+        sink.upsert_resource_from_bytes(identity, &row.uid, row.resource_version, &data_bytes)?;
+        sink.upsert_indexes_from_bytes(identity, &data_bytes)?;
         let event_type = if existing.is_some() {
             "MODIFIED"
         } else {
             "ADDED"
         };
-        self.maybe_emit_watch_event(
+        sink.emit_watch_from_bytes(
             emit_watch_events,
             identity,
             row.resource_version,
@@ -79,13 +237,14 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         )
     }
 
-    pub(super) fn apply_patch_resource_latest(
+    pub(in crate::datastore::sqlite) fn apply_patch_resource_latest(
         &self,
         patch: LogApplyResourcePatch,
         emit_watch_events: bool,
         raft_authoritative: bool,
     ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
         let mut namespace_owned = String::new();
+        let sink = ResourceWriteSink::new(self.tx);
         let identity = resource_identity(
             &patch.api_version,
             &patch.kind,
@@ -113,9 +272,14 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         )?;
         let data_bytes = serde_json::to_vec(&patched_data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
-        self.upsert_resource_row(identity, &current_uid, patch.resource_version, &data_bytes)?;
-        self.upsert_indexes(identity, &data_bytes)?;
-        self.maybe_emit_watch_event(
+        sink.upsert_resource_from_bytes(
+            identity,
+            &current_uid,
+            patch.resource_version,
+            &data_bytes,
+        )?;
+        sink.upsert_indexes_from_bytes(identity, &data_bytes)?;
+        sink.emit_watch_from_bytes(
             emit_watch_events,
             identity,
             patch.resource_version,
@@ -125,7 +289,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         )
     }
 
-    pub(super) fn apply_delete_resource(
+    pub(in crate::datastore::sqlite) fn apply_delete_resource(
         &self,
         resource_version: i64,
         key: LogApplyResourceKey,
@@ -133,6 +297,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         raft_authoritative: bool,
     ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
         let mut namespace_owned = String::new();
+        let sink = ResourceWriteSink::new(self.tx);
         let identity = resource_identity(
             &key.api_version,
             &key.kind,
@@ -167,11 +332,11 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
                 ));
             }
         }
-        self.delete_resource_row(identity)?;
-        self.delete_indexes(identity)?;
+        sink.delete_resource_from_identity(identity)?;
+        sink.delete_indexes_from_identity(identity)?;
         let data: serde_json::Value =
             serde_json::from_slice(&data_bytes).map_err(serde_to_sqlite_error)?;
-        self.maybe_emit_watch_event(
+        sink.emit_watch_from_bytes(
             emit_watch_events,
             identity,
             resource_version,
@@ -222,145 +387,6 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
                 .optional()
                 .map_err(tokio_rusqlite::Error::from),
         }
-    }
-
-    fn upsert_resource_row(
-        &self,
-        identity: ResourceIdentity<'_>,
-        uid: &str,
-        resource_version: i64,
-        data_bytes: &[u8],
-    ) -> tokio_rusqlite::Result<()> {
-        match identity.scope {
-            ResourceScope::Namespaced(namespace) => {
-                self.tx.execute(
-                    queries::NAMESPACED_UPSERT_EXACT,
-                    rusqlite::params![
-                        identity.api_version,
-                        identity.kind,
-                        namespace,
-                        identity.name,
-                        uid,
-                        resource_version,
-                        data_bytes
-                    ],
-                )?;
-            }
-            ResourceScope::Cluster => {
-                self.tx.execute(
-                    queries::CLUSTER_UPSERT_EXACT,
-                    rusqlite::params![
-                        identity.api_version,
-                        identity.kind,
-                        identity.name,
-                        uid,
-                        resource_version,
-                        data_bytes
-                    ],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn delete_resource_row(&self, identity: ResourceIdentity<'_>) -> tokio_rusqlite::Result<()> {
-        match identity.scope {
-            ResourceScope::Namespaced(namespace) => {
-                self.tx.execute(
-                    queries::NAMESPACED_DELETE_BY_KEY,
-                    rusqlite::params![
-                        identity.api_version,
-                        identity.kind,
-                        namespace,
-                        identity.name
-                    ],
-                )?;
-            }
-            ResourceScope::Cluster => {
-                self.tx.execute(
-                    queries::CLUSTER_DELETE_BY_KEY,
-                    rusqlite::params![identity.api_version, identity.kind, identity.name],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    fn upsert_indexes(
-        &self,
-        identity: ResourceIdentity<'_>,
-        data_bytes: &[u8],
-    ) -> tokio_rusqlite::Result<()> {
-        selector_index::upsert_index_entries(
-            self.tx,
-            identity.api_version,
-            identity.kind,
-            identity.index_namespace(),
-            identity.name,
-            data_bytes,
-        )?;
-        owner_ref_index::upsert_owner_refs(
-            self.tx,
-            identity.api_version,
-            identity.kind,
-            identity.index_namespace(),
-            identity.name,
-            data_bytes,
-        )?;
-        Ok(())
-    }
-
-    fn delete_indexes(&self, identity: ResourceIdentity<'_>) -> tokio_rusqlite::Result<()> {
-        selector_index::delete_index_entries(
-            self.tx,
-            identity.api_version,
-            identity.kind,
-            identity.index_namespace(),
-            identity.name,
-        )?;
-        owner_ref_index::delete_owner_refs(
-            self.tx,
-            identity.api_version,
-            identity.kind,
-            identity.index_namespace(),
-            identity.name,
-        )?;
-        Ok(())
-    }
-
-    fn maybe_emit_watch_event(
-        &self,
-        emit_watch_events: bool,
-        identity: ResourceIdentity<'_>,
-        resource_version: i64,
-        event_type: &str,
-        data_bytes: &[u8],
-        data: serde_json::Value,
-    ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
-        if !emit_watch_events {
-            return Ok(None);
-        }
-        insert_watch_event_in_conn(
-            self.tx,
-            WatchEventInsert::new(
-                identity.api_version,
-                identity.kind,
-                identity.namespace(),
-                identity.name,
-                resource_version,
-                event_type,
-                data_bytes,
-            ),
-        )?;
-        Ok(Some(create_pending_watch_event(
-            identity.api_version,
-            identity.kind,
-            identity.namespace(),
-            identity.name,
-            resource_version,
-            event_type,
-            data,
-        )))
     }
 }
 
@@ -413,7 +439,7 @@ fn resource_identity<'a>(
     name: &'a str,
     namespace_owned: &'a mut String,
 ) -> ResourceIdentity<'a> {
-    if super::use_namespaced_table(api_version, kind, &namespace) {
+    if super::super::use_namespaced_table(api_version, kind, &namespace) {
         *namespace_owned = namespace.unwrap_or("default").to_string();
         ResourceIdentity {
             api_version,

@@ -1031,3 +1031,410 @@ async fn test_cluster_watch_catchup_replays_intermediate_events_before_delete() 
     );
     assert_eq!(replay[1].event_type, "DELETED");
 }
+
+#[tokio::test]
+async fn raft_namespace_put_replays_identical_row_and_watch_payloads() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+
+    let namespace_data = json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": "deterministic-ns",
+            "uid": "deterministic-ns-uid"
+        },
+    });
+
+    let commit = crate::log_apply::LogApplyCommit::new(
+        51,
+        vec![crate::log_apply::LogApplyMutation::PutNamespace(
+            crate::log_apply::LogApplyNamespaceRow {
+                name: "deterministic-ns".to_string(),
+                uid: "deterministic-ns-uid".to_string(),
+                resource_version: 51,
+                data: namespace_data,
+            },
+        )],
+    );
+
+    leader
+        .apply_log_apply_commit(commit.clone())
+        .await
+        .expect("leader namespace PUT must apply");
+    follower
+        .apply_log_apply_commit(commit)
+        .await
+        .expect("follower namespace PUT must apply");
+
+    let leader_row_bytes: Vec<u8> = leader
+        .db_call("raft-namespace-put-row-bytes-leader", |conn| {
+            Ok(conn.query_row(
+                "SELECT data FROM namespaces WHERE name = ?1",
+                rusqlite::params!["deterministic-ns"],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    let follower_row_bytes: Vec<u8> = follower
+        .db_call("raft-namespace-put-row-bytes-follower", |conn| {
+            Ok(conn.query_row(
+                "SELECT data FROM namespaces WHERE name = ?1",
+                rusqlite::params!["deterministic-ns"],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+
+    let leader_watch_bytes: Vec<u8> = leader
+        .db_call("raft-namespace-put-watch-bytes-leader", |conn| {
+            Ok(conn.query_row(
+                "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
+                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 51],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    let follower_watch_bytes: Vec<u8> = follower
+        .db_call("raft-namespace-put-watch-bytes-follower", |conn| {
+            Ok(conn.query_row(
+                "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
+                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 51],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(leader_row_bytes, follower_row_bytes);
+    assert_eq!(leader_watch_bytes, follower_watch_bytes);
+    assert_eq!(leader_row_bytes, leader_watch_bytes);
+}
+
+#[tokio::test]
+async fn raft_namespace_delete_replays_identical_watch_payloads() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+
+    let put_commit = crate::log_apply::LogApplyCommit::new(
+        51,
+        vec![crate::log_apply::LogApplyMutation::PutNamespace(
+            crate::log_apply::LogApplyNamespaceRow {
+                name: "deterministic-ns".to_string(),
+                uid: "deterministic-ns-uid".to_string(),
+                resource_version: 51,
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {
+                        "name": "deterministic-ns",
+                        "uid": "deterministic-ns-uid"
+                    },
+                }),
+            },
+        )],
+    );
+
+    leader
+        .apply_log_apply_commit(put_commit.clone())
+        .await
+        .expect("leader namespace seed PUT must apply");
+    follower
+        .apply_log_apply_commit(put_commit)
+        .await
+        .expect("follower namespace seed PUT must apply");
+
+    let delete_commit = crate::log_apply::LogApplyCommit::new(
+        52,
+        vec![crate::log_apply::LogApplyMutation::DeleteNamespace {
+            name: "deterministic-ns".to_string(),
+        }],
+    );
+
+    leader
+        .apply_log_apply_commit(delete_commit.clone())
+        .await
+        .expect("leader namespace DELETE must apply");
+    follower
+        .apply_log_apply_commit(delete_commit)
+        .await
+        .expect("follower namespace DELETE must apply");
+
+    let leader_watch_bytes: Vec<u8> = leader
+        .db_call("raft-namespace-delete-watch-bytes-leader", |conn| {
+            Ok(conn.query_row(
+                "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
+                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 52],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    let follower_watch_bytes: Vec<u8> = follower
+        .db_call("raft-namespace-delete-watch-bytes-follower", |conn| {
+            Ok(conn.query_row(
+                "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
+                rusqlite::params!["v1", "Namespace", "#cluster", "deterministic-ns", 52],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+
+    let leader_namespace = leader.get_namespace("deterministic-ns").await.unwrap();
+    let follower_namespace = follower.get_namespace("deterministic-ns").await.unwrap();
+
+    assert!(leader_namespace.is_none());
+    assert!(follower_namespace.is_none());
+    assert_eq!(leader_watch_bytes, follower_watch_bytes);
+}
+
+#[tokio::test]
+async fn raft_explicit_watch_event_replay_preserves_committed_payload_bytes() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+
+    let watch_payload = json!({
+        "type": "ADDED",
+        "object": {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "replay-configmap",
+                "namespace": "default",
+                "uid": "replay-configmap-uid"
+            },
+            "data": {
+                "alpha": "bravo",
+            },
+        },
+    });
+    let committed_bytes = serde_json::to_vec(&watch_payload).unwrap();
+
+    let commit = crate::log_apply::LogApplyCommit::new(
+        10_024,
+        vec![crate::log_apply::LogApplyMutation::PutWatchEvent(
+            crate::log_apply::LogApplyWatchEventRow {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "replay-configmap".to_string(),
+                resource_version: 10_024,
+                event_type: "ADDED".to_string(),
+                data: watch_payload,
+            },
+        )],
+    );
+
+    leader
+        .apply_log_apply_commit(commit.clone())
+        .await
+        .expect("leader explicit watch event must apply");
+    follower
+        .apply_log_apply_commit(commit)
+        .await
+        .expect("follower explicit watch event must apply");
+
+    let leader_watch_bytes: Vec<u8> = leader
+        .db_call(
+            "raft-explicit-watch-event-replay-preserve-leader-watch-bytes",
+            |conn| {
+                Ok(conn.query_row(
+                    "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
+                    rusqlite::params!["v1", "ConfigMap", "default", "replay-configmap", 10_024],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?)
+            },
+        )
+        .await
+        .unwrap();
+    let follower_watch_bytes: Vec<u8> = follower
+        .db_call(
+            "raft-explicit-watch-event-replay-preserve-follower-watch-bytes",
+            |conn| {
+                Ok(conn.query_row(
+                    "SELECT data FROM watch_events WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3 AND name = ?4 AND resource_version = ?5",
+                    rusqlite::params!["v1", "ConfigMap", "default", "replay-configmap", 10_024],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )?)
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(leader_watch_bytes, follower_watch_bytes);
+    assert_eq!(leader_watch_bytes, committed_bytes);
+}
+
+#[tokio::test]
+async fn raft_watch_gc_replays_identically() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+
+    let payload_for = |resource_version: i64, name: &str| {
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": name,
+                "namespace": "default",
+                "uid": format!("{name}-uid"),
+            },
+            "data": {
+                "seed": format!("watch-event-{resource_version}"),
+            },
+        })
+    };
+
+    for resource_version in [10_i64, 20, 30] {
+        let name = format!("watch-gc-{resource_version}");
+        let commit = crate::log_apply::LogApplyCommit::new(
+            resource_version,
+            vec![crate::log_apply::LogApplyMutation::PutWatchEvent(
+                crate::log_apply::LogApplyWatchEventRow {
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: name.clone(),
+                    resource_version,
+                    event_type: "ADDED".to_string(),
+                    data: payload_for(resource_version, &name),
+                },
+            )],
+        );
+
+        leader
+            .apply_log_apply_commit(commit.clone())
+            .await
+            .expect("leader watch GC seed must apply");
+        follower
+            .apply_log_apply_commit(commit)
+            .await
+            .expect("follower watch GC seed must apply");
+    }
+
+    let gc_commit = crate::log_apply::LogApplyCommit::new(
+        40,
+        vec![crate::log_apply::LogApplyMutation::GcWatchEvents {
+            max_rows: 1,
+            batch_cap: 10_000,
+        }],
+    );
+    leader
+        .apply_log_apply_commit(gc_commit.clone())
+        .await
+        .expect("leader watch GC commit must apply");
+    follower
+        .apply_log_apply_commit(gc_commit)
+        .await
+        .expect("follower watch GC commit must apply");
+
+    let leader_remaining_rows: Vec<(i64, String, String, String, String, Vec<u8>)> = leader
+        .db_call("raft-watch-gc-leader-rows", |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT resource_version, api_version, kind, COALESCE(namespace, '#cluster') AS namespace, name, data
+                 FROM watch_events
+                 WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3
+                 ORDER BY resource_version",
+            )?;
+            let rows = stmt.query_map(rusqlite::params!["v1", "ConfigMap", "default"], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .unwrap();
+
+    let follower_remaining_rows: Vec<(i64, String, String, String, String, Vec<u8>)> = follower
+        .db_call("raft-watch-gc-follower-rows", |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT resource_version, api_version, kind, COALESCE(namespace, '#cluster') AS namespace, name, data
+                 FROM watch_events
+                 WHERE api_version = ?1 AND kind = ?2 AND COALESCE(namespace, '#cluster') = ?3
+                 ORDER BY resource_version",
+            )?;
+            let rows = stmt.query_map(rusqlite::params!["v1", "ConfigMap", "default"], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .unwrap();
+
+    let leader_replay_floors: Vec<(String, String, String, i64)> = leader
+        .db_call("raft-watch-gc-leader-replay-floors", |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT api_version, kind, namespace_key, floor_rv
+                 FROM watch_replay_floors
+                 ORDER BY api_version, kind, namespace_key",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .unwrap();
+    let follower_replay_floors: Vec<(String, String, String, i64)> = follower
+        .db_call("raft-watch-gc-follower-replay-floors", |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT api_version, kind, namespace_key, floor_rv
+                 FROM watch_replay_floors
+                 ORDER BY api_version, kind, namespace_key",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(leader_remaining_rows.len(), 1);
+    assert_eq!(follower_remaining_rows.len(), 1);
+    assert_eq!(leader_remaining_rows, follower_remaining_rows);
+    assert_eq!(leader_replay_floors, follower_replay_floors);
+    assert_eq!(
+        leader_replay_floors,
+        vec![(
+            "v1".to_string(),
+            "ConfigMap".to_string(),
+            "default".to_string(),
+            20,
+        )]
+    );
+
+    assert_eq!(leader_remaining_rows[0].0, 30);
+    assert_eq!(leader_remaining_rows[0].1, "v1");
+    assert_eq!(leader_remaining_rows[0].2, "ConfigMap");
+    assert_eq!(leader_remaining_rows[0].3, "default");
+    let expected_tail = serde_json::to_vec(&payload_for(30, "watch-gc-30")).unwrap();
+    assert_eq!(leader_remaining_rows[0].5, expected_tail);
+}
