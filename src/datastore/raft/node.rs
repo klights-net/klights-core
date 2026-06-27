@@ -751,6 +751,7 @@ fn outbox_operation_waits_for_permit(operation: &str) -> bool {
     matches!(
         OutboxOperation::try_from(operation),
         Ok(OutboxOperation::PodStatus)
+            | Ok(OutboxOperation::PodMetadata)
             | Ok(OutboxOperation::RuntimeReconcile)
             | Ok(OutboxOperation::ProbeReadiness)
             | Ok(OutboxOperation::DeadlineExceeded)
@@ -2669,6 +2670,13 @@ mod tests {
             (OutboxOperation::DeadlineExceeded, true),
             (OutboxOperation::ContainerStatusSnapshot, true),
             (OutboxOperation::EphemeralContainerStatuses, true),
+            // PodMetadata (controller ownerRef adoption/release, label merges,
+            // deletion finalization) must WAIT for a general permit (FIFO) rather
+            // than best-effort `try_acquire`. Under parallel e2e load, best-effort
+            // rejection + retry backoff starves controller reconciliation past the
+            // suite's adoption/release timeouts. FIFO guarantees progress without a
+            // retry storm and without borrowing the node-liveness reserved permit.
+            (OutboxOperation::PodMetadata, true),
             (OutboxOperation::NodeStatus, false),
             (OutboxOperation::EventCreate, false),
         ];
