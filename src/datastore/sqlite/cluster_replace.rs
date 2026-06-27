@@ -1262,7 +1262,7 @@ fn preserve_same_uid_server_metadata_from_existing(
         .is_some_and(|expected| expected != *current_rv)
     {
         preserve_live_pod_node_for_stale_put(row, &existing_data);
-        preserve_live_owner_refs_for_stale_pod_bind(row, &existing_data);
+        preserve_live_owner_refs_for_stale_pod_put(row, &existing_data);
         preserve_finalizers_from_existing(&mut row.data, &existing_data);
     }
     if row.api_version == "v1"
@@ -1320,26 +1320,11 @@ fn preserve_live_pod_node_for_stale_put(
     );
 }
 
-fn preserve_live_owner_refs_for_stale_pod_bind(
+fn preserve_live_owner_refs_for_stale_pod_put(
     row: &mut LogApplyResourceRow,
     existing: &serde_json::Value,
 ) {
     if row.api_version != "v1" || row.kind != "Pod" {
-        return;
-    }
-    let incoming_node = row
-        .data
-        .pointer("/spec/nodeName")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.is_empty());
-    let Some(incoming_node) = incoming_node else {
-        return;
-    };
-    let existing_node = existing
-        .pointer("/spec/nodeName")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.is_empty());
-    if existing_node == Some(incoming_node) {
         return;
     }
     let Some(existing_owner_refs) = existing
@@ -1354,7 +1339,7 @@ fn preserve_live_owner_refs_for_stale_pod_bind(
         .data
         .pointer("/metadata/ownerReferences")
         .and_then(|value| value.as_array());
-    if incoming_owner_refs.is_some_and(|refs| !refs.is_empty()) {
+    if incoming_owner_refs.is_some() {
         return;
     }
     let Some(metadata) = row

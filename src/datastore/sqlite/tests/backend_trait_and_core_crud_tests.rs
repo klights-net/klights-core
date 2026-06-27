@@ -1019,6 +1019,227 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
 }
 
 #[tokio::test]
+async fn stale_committed_pod_put_same_node_preserves_live_owner_references() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "same-node-owner-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "same-node-owner-pod",
+                    "namespace": "default",
+                    "uid": "same-node-owner-pod-uid"
+                },
+                "spec": {
+                    "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut stale_same_node_snapshot = (*created.data).clone();
+    stale_same_node_snapshot["spec"]["nodeName"] = json!("mn-controlplane3");
+    let stale_same_node_command = StorageCommand::UpdateResource {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "same-node-owner-pod".to_string(),
+        data: stale_same_node_snapshot,
+        expected_rv: created.resource_version,
+        preconditions: ResourcePreconditions::from_resource(&created),
+    };
+    let stale_same_node_payload =
+        crate::kubelet::outbox::payload::OutboxPayload::from_command(stale_same_node_command)
+            .encode_protobuf()
+            .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "stale-same-node-pod-put",
+            "UpdateResource",
+            stale_same_node_payload.as_ref(),
+            "leader",
+        )
+        .await
+        .expect("build stale same-node commit");
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit: stale_same_node_commit,
+        ..
+    } = outcome
+    else {
+        panic!("expected a fresh stale same-node commit");
+    };
+
+    let mut live = (*created.data).clone();
+    live["spec"]["nodeName"] = json!("mn-controlplane3");
+    live["metadata"]["ownerReferences"] = json!([
+        {
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "name": "rc-to-be-deleted",
+            "uid": "rc-to-be-deleted-uid",
+            "controller": true,
+            "blockOwnerDeletion": true
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "ReplicationController",
+            "name": "rc-to-stay",
+            "uid": "rc-to-stay-uid"
+        }
+    ]);
+    db.update_resource_with_preconditions(
+        "v1",
+        "Pod",
+        Some("default"),
+        "same-node-owner-pod",
+        live,
+        ResourcePreconditions::from_resource(&created),
+    )
+    .await
+    .expect("newer live ownerReferences update applies first");
+
+    let apply_result = db
+        .apply_raft_log_apply_commit(stale_same_node_commit)
+        .await
+        .expect("stale same-node commit applies authoritatively");
+    assert!(
+        apply_result.error_message.is_none(),
+        "stale same-node apply must not become a terminal conflict: {apply_result:?}"
+    );
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "same-node-owner-pod")
+        .await
+        .unwrap()
+        .expect("pod remains after stale same-node apply");
+    let owner_refs = live
+        .data
+        .pointer("/metadata/ownerReferences")
+        .and_then(|value| value.as_array())
+        .expect("ownerReferences remain present");
+    assert_eq!(
+        owner_refs.len(),
+        2,
+        "stale same-node full Pod PUT must not clear live ownerReferences"
+    );
+    assert!(
+        owner_refs.iter().any(
+            |owner| owner.get("uid").and_then(|value| value.as_str()) == Some("rc-to-stay-uid")
+        ),
+        "stale same-node full Pod PUT must preserve the second live owner"
+    );
+}
+
+#[tokio::test]
+async fn stale_committed_pod_put_with_explicit_empty_owner_references_clears_live_owners() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "clear-owner-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "clear-owner-pod",
+                    "namespace": "default",
+                    "uid": "clear-owner-pod-uid",
+                    "ownerReferences": [{
+                        "apiVersion": "v1",
+                        "kind": "ReplicationController",
+                        "name": "rc-owner",
+                        "uid": "rc-owner-uid"
+                    }]
+                },
+                "spec": {
+                    "nodeName": "mn-controlplane3",
+                    "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut stale_clear_snapshot = (*created.data).clone();
+    stale_clear_snapshot["metadata"]["ownerReferences"] = json!([]);
+    let stale_clear_command = StorageCommand::UpdateResource {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "clear-owner-pod".to_string(),
+        data: stale_clear_snapshot,
+        expected_rv: created.resource_version,
+        preconditions: ResourcePreconditions::from_resource(&created),
+    };
+    let stale_clear_payload =
+        crate::kubelet::outbox::payload::OutboxPayload::from_command(stale_clear_command)
+            .encode_protobuf()
+            .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "stale-explicit-owner-clear",
+            "UpdateResource",
+            stale_clear_payload.as_ref(),
+            "leader",
+        )
+        .await
+        .expect("build stale explicit owner clear commit");
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit: stale_clear_commit,
+        ..
+    } = outcome
+    else {
+        panic!("expected a fresh stale owner clear commit");
+    };
+
+    let mut newer_live = (*created.data).clone();
+    newer_live["status"]["phase"] = json!("Running");
+    db.update_resource_with_preconditions(
+        "v1",
+        "Pod",
+        Some("default"),
+        "clear-owner-pod",
+        newer_live,
+        ResourcePreconditions::from_resource(&created),
+    )
+    .await
+    .expect("newer live update advances resourceVersion first");
+
+    let apply_result = db
+        .apply_raft_log_apply_commit(stale_clear_commit)
+        .await
+        .expect("stale explicit owner clear applies authoritatively");
+    assert!(
+        apply_result.error_message.is_none(),
+        "stale explicit owner clear must not become a terminal conflict: {apply_result:?}"
+    );
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "clear-owner-pod")
+        .await
+        .unwrap()
+        .expect("pod remains after explicit owner clear");
+    let owner_refs = live
+        .data
+        .pointer("/metadata/ownerReferences")
+        .and_then(|value| value.as_array());
+    assert!(
+        owner_refs.is_none_or(|refs| refs.is_empty()),
+        "explicit empty ownerReferences update must be allowed to clear live owners"
+    );
+}
+
+#[tokio::test]
 async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
