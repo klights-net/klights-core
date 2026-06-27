@@ -1261,6 +1261,7 @@ fn preserve_same_uid_server_metadata_from_existing(
         .precondition_resource_version
         .is_some_and(|expected| expected != *current_rv)
     {
+        preserve_live_pod_node_for_stale_put(row, &existing_data);
         preserve_live_owner_refs_for_stale_pod_bind(row, &existing_data);
         preserve_finalizers_from_existing(&mut row.data, &existing_data);
     }
@@ -1279,6 +1280,44 @@ fn preserve_same_uid_server_metadata_from_existing(
         crate::resource_semantics::mark_terminating_pod_unready(&mut row.data);
     }
     Ok(())
+}
+
+fn preserve_live_pod_node_for_stale_put(
+    row: &mut LogApplyResourceRow,
+    existing: &serde_json::Value,
+) {
+    if row.api_version != "v1" || row.kind != "Pod" {
+        return;
+    }
+    let Some(existing_node) = existing
+        .pointer("/spec/nodeName")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let incoming_node = row
+        .data
+        .pointer("/spec/nodeName")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty());
+    if incoming_node == Some(existing_node.as_str()) {
+        return;
+    }
+    let Some(object) = row.data.as_object_mut() else {
+        return;
+    };
+    let spec = object
+        .entry("spec".to_string())
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    let Some(spec) = spec.as_object_mut() else {
+        return;
+    };
+    spec.insert(
+        "nodeName".to_string(),
+        serde_json::Value::String(existing_node),
+    );
 }
 
 fn preserve_live_owner_refs_for_stale_pod_bind(

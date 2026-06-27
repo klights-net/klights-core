@@ -1019,6 +1019,100 @@ async fn stale_committed_pod_bind_preserves_live_owner_references() {
 }
 
 #[tokio::test]
+async fn stale_committed_pod_bind_does_not_rebind_already_bound_pod() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "rebind-pod",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "rebind-pod",
+                    "namespace": "default",
+                    "uid": "rebind-pod-uid"
+                },
+                "spec": {
+                    "containers": [{"name": "app", "image": "registry.k8s.io/pause:3.10"}]
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut stale_bind_snapshot = (*created.data).clone();
+    stale_bind_snapshot["spec"]["nodeName"] = json!("mn-controlplane3");
+    let stale_bind_command = StorageCommand::UpdateResource {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "rebind-pod".to_string(),
+        data: stale_bind_snapshot,
+        expected_rv: created.resource_version,
+        preconditions: ResourcePreconditions::from_resource(&created),
+    };
+    let stale_bind_payload =
+        crate::kubelet::outbox::payload::OutboxPayload::from_command(stale_bind_command)
+            .encode_protobuf()
+            .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "stale-rebind-pod-bind",
+            "UpdateResource",
+            stale_bind_payload.as_ref(),
+            "leader",
+        )
+        .await
+        .expect("build stale bind commit");
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit: stale_bind_commit,
+        ..
+    } = outcome
+    else {
+        panic!("expected a fresh stale bind commit");
+    };
+
+    let mut live_bind = (*created.data).clone();
+    live_bind["spec"]["nodeName"] = json!("mn-replica");
+    db.update_resource_with_preconditions(
+        "v1",
+        "Pod",
+        Some("default"),
+        "rebind-pod",
+        live_bind,
+        ResourcePreconditions::from_resource(&created),
+    )
+    .await
+    .expect("newer live scheduler bind applies first");
+
+    let apply_result = db
+        .apply_raft_log_apply_commit(stale_bind_commit)
+        .await
+        .expect("stale committed bind applies authoritatively");
+    assert!(
+        apply_result.error_message.is_none(),
+        "stale bind apply must not become a terminal conflict: {apply_result:?}"
+    );
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "rebind-pod")
+        .await
+        .unwrap()
+        .expect("pod remains after stale bind apply");
+    assert_eq!(
+        live.data
+            .pointer("/spec/nodeName")
+            .and_then(|value| value.as_str()),
+        Some("mn-replica"),
+        "stale committed scheduler bind must not move an already-bound Pod"
+    );
+}
+
+#[tokio::test]
 async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
