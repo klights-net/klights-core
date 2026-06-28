@@ -16,6 +16,8 @@ jobs:
     name: Ubuntu 26.04 APT package smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    env:
+      EXPECTED_KLIGHTS_VERSION: 0.9.10
     steps:
       - name: Start Ubuntu 26.04 systemd container
         run: |
@@ -56,16 +58,17 @@ jobs:
       - name: Install klights from APT repository
         run: |
           set -euo pipefail
-          docker exec klights-ubuntu-2604 bash -lc '
+          docker exec -e EXPECTED_KLIGHTS_VERSION klights-ubuntu-2604 bash -lc '
             set -euo pipefail
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y --no-install-recommends ca-certificates curl iproute2 jq procps
+            apt-get install -y --no-install-recommends ca-certificates curl iproute2 jq kmod nftables procps
             echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt resolute main" \
               > /etc/apt/sources.list.d/klights.list
             apt-get update
             apt-cache policy klights
             apt-get install -y klights
+            dpkg-query -W -f="\${Version}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1~resolute"
             install -d -m 0755 /var/lib/klights
             printf "%s\n" \
               "RUST_LOG=info" \
@@ -117,7 +120,7 @@ jobs:
               kubectl get pods -A -o wide || true
               exit 1
             fi
-            kubectl get nodes
+            kubectl get nodes -o wide
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             kubectl rollout status deployment/nginx-smoke --timeout=240s
             kubectl expose deployment nginx-smoke --name=nginx-smoke --port=80 --target-port=80
@@ -144,6 +147,8 @@ jobs:
     name: RHEL 10 RPM package smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    env:
+      EXPECTED_KLIGHTS_VERSION: 0.9.10
     steps:
       - name: Start RHEL 10 compatible systemd container
         run: |
@@ -173,9 +178,9 @@ jobs:
       - name: Install klights from RPM repository
         run: |
           set -euo pipefail
-          docker exec klights-rhel10 bash -lc '
+          docker exec -e EXPECTED_KLIGHTS_VERSION klights-rhel10 bash -lc '
             set -euo pipefail
-            dnf install -y ca-certificates curl dnf-plugins-core iproute jq procps-ng
+            dnf install -y ca-certificates curl dnf-plugins-core iproute jq kmod nftables procps-ng
             dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
             dnf install -y containerd.io --setopt=install_weak_deps=False
             printf "%s\n" \
@@ -187,6 +192,7 @@ jobs:
               > /etc/yum.repos.d/klights.repo
             dnf makecache --disablerepo="*" --enablerepo=klights
             dnf install -y klights
+            rpm -q --qf "%{VERSION}-%{RELEASE}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1.el10"
             install -d -m 0755 /var/lib/klights
             printf "%s\n" \
               "RUST_LOG=info" \
@@ -238,7 +244,7 @@ jobs:
               kubectl get pods -A -o wide || true
               exit 1
             fi
-            kubectl get nodes
+            kubectl get nodes -o wide
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             kubectl rollout status deployment/nginx-smoke --timeout=240s
             kubectl expose deployment nginx-smoke --name=nginx-smoke --port=80 --target-port=80
