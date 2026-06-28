@@ -1,3 +1,6 @@
+#![cfg(test)]
+//! TO-BE-CLEANUP: legacy replicated StorageCommand test support only.
+//!
 //! `DatastoreApplier` implementation for `RedbDatastore`.
 //!
 //! Delegates each `StorageCommand` variant to the appropriate domain store.

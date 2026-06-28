@@ -1,3 +1,6 @@
+#![cfg(test)]
+//! TO-BE-CLEANUP: legacy replicated StorageCommand test support only.
+//!
 //! `DatastoreApplier` implementation for the SQLite backend.
 //!
 //! Maps each `StorageCommand` variant to the corresponding `Datastore`

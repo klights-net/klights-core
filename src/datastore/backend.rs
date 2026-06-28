@@ -13,16 +13,18 @@ use crate::networking::VtepMac;
 use crate::watch::{WatchEvent, WatchReceiver};
 use crate::watch::{WatchSignal, WatchTopic};
 
+#[cfg(test)]
 use super::command::{CommandMeta, StorageCommand};
 #[cfg(test)]
 use super::types::PendingWatchEvent;
+#[cfg(test)]
+use super::types::ReplicatedCreateOptions;
 use super::types::{
     AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PatchKind, PodCleanupIntent,
     PodEndpointEvent, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
-    PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, ReplicatedCreateOptions,
-    ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation, ResourceList, ResourceListQuery,
-    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayRead,
-    WatchTarget,
+    PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, ReplicatedSnapshotMetadata,
+    Resource, ResourceBatchOperation, ResourceList, ResourceListQuery, ResourcePatchRequest,
+    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayRead, WatchTarget,
 };
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
@@ -62,9 +64,12 @@ pub trait DatastoreBackend: Send + Sync {
     #[cfg(test)]
     fn broadcast_watch_event(&self, pending: PendingWatchEvent);
 
+    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+    ///
     /// Apply a replicated command locally without going through role-based
     /// public write admission.  Leaders use this for forwarded writes after
     /// bootstrap-token validation; replicas use it for snapshot and stream apply.
+    #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -135,12 +140,15 @@ pub trait DatastoreBackend: Send + Sync {
         data: Value,
     ) -> Result<Resource>;
 
+    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+    ///
     /// Apply an authoritative leader `CreateResource` entry on a local replica.
     ///
     /// This is not the public Kubernetes create path. Public creates must keep
     /// rejecting existing names. Replicated creates converge a follower cache to
     /// the leader's object identity, including delete/recreate slots where the
     /// same name now has a different UID.
+    #[cfg(test)]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
@@ -1699,6 +1707,8 @@ impl<T: DatastoreBackend + ?Sized> NamespaceContentStore for T {
 /// Replication and snapshot-apply entry points.
 #[async_trait]
 pub trait ReplicationStore: Send + Sync {
+    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+    #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -1719,6 +1729,7 @@ pub trait ReplicationStore: Send + Sync {
 
 #[async_trait]
 impl<T: DatastoreBackend + ?Sized> ReplicationStore for T {
+    #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -1751,6 +1762,7 @@ impl<T: DatastoreBackend + ?Sized> ReplicationStore for T {
 
 #[async_trait]
 impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
+    #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,

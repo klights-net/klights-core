@@ -7,12 +7,16 @@ use std::net::Ipv4Addr;
 use tokio::sync::broadcast;
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::command::{CommandMeta, StorageCommand};
+#[cfg(test)]
+use crate::datastore::command::CommandMeta;
+use crate::datastore::command::StorageCommand;
 use crate::datastore::types::*;
 use crate::networking::VtepMac;
 use crate::watch::{WatchSignal, WatchTopic};
 
-use super::{ReplicatedDatastore, apply_command_to_backend};
+use super::ReplicatedDatastore;
+#[cfg(test)]
+use super::apply_command_to_backend;
 
 #[async_trait]
 impl DatastoreBackend for ReplicatedDatastore {
@@ -1119,6 +1123,8 @@ impl DatastoreBackend for ReplicatedDatastore {
         Ok(removed)
     }
 
+    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+    #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,

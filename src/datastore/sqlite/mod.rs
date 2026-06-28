@@ -4,6 +4,7 @@
 //! types via `use super::*;` — the re-exports below make the `types::`
 //! and `backend::` symbols visible to them.
 
+#[cfg(test)]
 mod applier;
 mod cluster_replace;
 mod cluster_state_apply;
@@ -754,11 +755,10 @@ impl Datastore {
     }
 
     /// Apply a StorageCommand within a transaction by converting it to
-    /// a LogApplyCommit and routing through `apply_commit_in_tx` — the
-    /// same path used by the replica BackupApplier. This ensures:
+    /// a LogApplyCommit and routing through `apply_commit_in_tx`. This ensures:
     ///   - All StorageCommand variants are supported (no "unsupported" gap)
-    ///   - Both raft state-machine apply and replica sync use one code path
-    ///   - Log-apply entries are produced for downstream replicas
+    ///   - Leader-local outbox apply and raft state-machine replay share row semantics
+    ///   - The applied outbox result is derived from the same committed mutation data
     fn apply_outbox_command_in_tx(
         tx: &rusqlite::Transaction<'_>,
         command: crate::datastore::command::StorageCommand,
@@ -2282,6 +2282,8 @@ impl DatastoreBackend for Datastore {
         Datastore::create_resource(self, api_version, kind, namespace, name, data).await
     }
 
+    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+    #[cfg(test)]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,

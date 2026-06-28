@@ -1,9 +1,9 @@
 //! Role-aware ReplicatedDatastore wrapper (DSB-HA-02).
 //!
 //! In production, every `DatastoreHandle` is a `ReplicatedDatastore`.
-//! The concrete SQLite `Datastore` only implements `DatastoreApplier`;
-//! `DatastoreBackend` is the public runtime contract, satisfied solely
-//! by `ReplicatedDatastore`.
+//! `DatastoreBackend` is the public runtime contract, satisfied by
+//! `ReplicatedDatastore`; legacy local `StorageCommand` apply support is
+//! test-only cleanup debt.
 //!
 //! ## Architecture
 //!
@@ -25,7 +25,9 @@ use std::sync::{Arc, OnceLock};
 
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::command::{COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand};
+#[cfg(test)]
 use crate::datastore::types::{ReplicatedCreateOptions, ResourcePatchRequest};
+#[cfg(test)]
 use crate::networking::VtepMac;
 
 mod backend_impl;
@@ -37,9 +39,8 @@ mod backend_impl;
 // StorageCommand through `RaftProposer::propose_command`. The proposer
 // encodes the command as an `OutboxPayload` and submits it to openraft's
 // `client_write`. openraft replicates it to peers and then drives the
-// state machine's apply, which calls back into `apply_outbox_transactionally_direct`
-// on the same wrapper (bypassing the propose route) to actually mutate the
-// inner backend and emit the `log_apply` stream the BackupApplier consumes.
+// state machine's apply, which calls the backend raft log-apply surface to
+// mutate cluster.db through the generic-to-typed helper path.
 //
 // The trait is intentionally narrow: a single method that takes a
 // fully-formed StorageCommand and returns once openraft has committed +
@@ -122,11 +123,13 @@ impl WriteRejection {
 // DatastoreApplier — deterministic local apply trait
 // ---------------------------------------------------------------------------
 
+/// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
 /// Trait for deterministic local apply of storage commands.
 ///
 /// Local storage engines implement this trait.  The replication layer
 /// calls `apply_command` after role-based logic determines the write
 /// should proceed.
+#[cfg(test)]
 #[async_trait]
 pub trait DatastoreApplier: Send + Sync {
     async fn apply_command(&self, cmd: StorageCommand, meta: CommandMeta) -> Result<()>;
@@ -259,6 +262,8 @@ fn current_epoch_millis() -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
+/// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
 pub async fn apply_command_to_backend<B>(
     backend: &B,
     command: StorageCommand,
@@ -604,6 +609,8 @@ where
     Ok(())
 }
 
+#[cfg(test)]
+/// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
 async fn align_resource_version_before_replicated_apply<B>(
     backend: &B,
     target_rv: i64,
@@ -624,6 +631,7 @@ where
     Ok(())
 }
 
+#[cfg(test)]
 #[async_trait]
 impl DatastoreApplier for ReplicatedDatastore {
     async fn apply_command(&self, cmd: StorageCommand, meta: CommandMeta) -> Result<()> {

@@ -1,8 +1,8 @@
 //! `RedbDatastore` — redb backend composed from focused domain stores.
 //!
 //! Production uses `ReplicatedDatastore`; `RedbDatastore` implements
-//! `DatastoreApplier` and `DatastoreBackend` by delegating to composed stores.
-//! Each store can be tested independently.
+//! `DatastoreBackend` by delegating to composed stores. Legacy local
+//! `StorageCommand` apply support is test-only cleanup debt.
 
 use std::sync::Arc;
 
@@ -15,6 +15,7 @@ use crate::watch::WatchBus;
 
 pub mod accessor;
 pub mod advance;
+#[cfg(test)]
 mod applier;
 mod backend_impl;
 mod helpers;
@@ -59,7 +60,7 @@ const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 /// Redb-backed datastore composed from focused domain stores.
 ///
 /// Each store owns its data access logic and can be tested independently.
-/// The `DatastoreBackend` and `DatastoreApplier` impls delegate to these stores.
+/// The `DatastoreBackend` impl delegates to these stores.
 pub struct RedbDatastore {
     pub accessor: Arc<RedbAccessor>,
     watch_bus: Arc<WatchBus>,

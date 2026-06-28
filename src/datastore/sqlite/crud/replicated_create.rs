@@ -1,3 +1,6 @@
+#![cfg(test)]
+//! TO-BE-CLEANUP: legacy replicated StorageCommand test support only.
+//!
 //! Replicated create resource — converges a follower cache to the
 //! leader's object identity, including delete/recreate slots where the
 //! same name now has a different UID.

@@ -1,9 +1,9 @@
 //! Stable `StorageCommand` / `StorageResponse` codec for HA replication.
 //!
-//! Leader/follower and Raft replicate logical mutations as `StorageCommand`
-//! values — never SQLite WAL frames or backend-specific operations.  Every
-//! backend implements `DatastoreApplier` which receives decoded commands and
-//! returns `StorageResponse` values.
+//! Raft proposals carry logical mutations as `StorageCommand` values — never
+//! SQLite WAL frames or backend-specific operations. Production apply converts
+//! them into versioned log-apply commits before the raft state machine mutates
+//! cluster state through the generic-to-typed helper path.
 //!
 //! ## Design invariants
 //!
