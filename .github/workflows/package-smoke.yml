@@ -1,0 +1,225 @@
+name: package-smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-26-04-apt:
+    name: Ubuntu 26.04 APT package smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Start Ubuntu 26.04 systemd container
+        run: |
+          set -euo pipefail
+          cat > Dockerfile.ubuntu-26.04-systemd <<'EOF_DOCKERFILE'
+          FROM ubuntu:26.04
+          ENV DEBIAN_FRONTEND=noninteractive
+          RUN apt-get update \
+            && apt-get install -y --no-install-recommends ca-certificates dbus systemd systemd-sysv \
+            && apt-get clean \
+            && rm -rf /var/lib/apt/lists/*
+          STOPSIGNAL SIGRTMIN+3
+          CMD ["/sbin/init"]
+          EOF_DOCKERFILE
+          docker build -t klights-ubuntu-26.04-systemd -f Dockerfile.ubuntu-26.04-systemd .
+          docker run -d --name klights-ubuntu-2604 \
+            --privileged \
+            --cgroupns=host \
+            --tmpfs /tmp \
+            --tmpfs /run \
+            --tmpfs /run/lock \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            klights-ubuntu-26.04-systemd
+
+          for attempt in {1..60}; do
+            if docker exec klights-ubuntu-2604 systemctl is-system-running >/tmp/systemd-state 2>&1; then
+              break
+            fi
+            state="$(cat /tmp/systemd-state || true)"
+            if [[ "$state" == "degraded" ]]; then
+              break
+            fi
+            sleep 2
+          done
+
+          docker exec klights-ubuntu-2604 systemctl status --no-pager || true
+
+      - name: Install klights from APT repository
+        run: |
+          set -euo pipefail
+          docker exec klights-ubuntu-2604 bash -lc '
+            set -euo pipefail
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends ca-certificates curl iproute2 jq procps
+            echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt resolute main" \
+              > /etc/apt/sources.list.d/klights.list
+            apt-get update
+            apt-cache policy klights
+            apt-get install -y klights
+            install -d -m 0755 /var/lib/klights
+            printf "%s\n" \
+              "RUST_LOG=info" \
+              "KLIGHTS_DATA_ROOT=/var/lib/klights" \
+              "KLIGHTS_ARGS=start" \
+              > /etc/default/klights
+          '
+
+      - name: Start klights service
+        run: |
+          set -euo pipefail
+          docker exec klights-ubuntu-2604 bash -lc '
+            set -euo pipefail
+            systemctl daemon-reload
+            systemctl restart containerd
+            systemctl restart klights
+            for attempt in {1..120}; do
+              if test -f /var/lib/klights/etc/kubeconfig.yaml && systemctl is-active --quiet klights; then
+                exit 0
+              fi
+              systemctl status klights --no-pager || true
+              journalctl -u klights --no-pager -n 80 || true
+              sleep 5
+            done
+            journalctl -u klights --no-pager -n 200 || true
+            exit 1
+          '
+
+      - name: Deploy nginx service and curl it from another pod
+        run: |
+          set -euo pipefail
+          docker exec klights-ubuntu-2604 bash -lc '
+            set -euo pipefail
+            curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
+            chmod 0755 /usr/local/bin/kubectl
+            export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
+            kubectl get nodes
+            kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
+            kubectl rollout status deployment/nginx-smoke --timeout=240s
+            kubectl expose deployment nginx-smoke --name=nginx-smoke --port=80 --target-port=80
+            service_ip="$(kubectl get service nginx-smoke -o jsonpath="{.spec.clusterIP}")"
+            kubectl run curl-smoke \
+              --image=curlimages/curl:8.11.1 \
+              --restart=Never \
+              --rm \
+              --attach \
+              --command -- sh -c "for attempt in \$(seq 1 60); do curl -fsS http://${service_ip}:80/ | grep -qi nginx && exit 0; sleep 2; done; exit 1"
+          '
+
+      - name: Collect Ubuntu diagnostics
+        if: always()
+        run: |
+          docker exec klights-ubuntu-2604 bash -lc '
+            systemctl status klights --no-pager || true
+            journalctl -u klights --no-pager -n 200 || true
+            journalctl -u containerd --no-pager -n 120 || true
+          ' || true
+          docker rm -f klights-ubuntu-2604 || true
+
+  rhel10-rpm:
+    name: RHEL 10 RPM package smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Start RHEL 10 compatible systemd container
+        run: |
+          set -euo pipefail
+          docker run -d --name klights-rhel10 \
+            --privileged \
+            --cgroupns=host \
+            --tmpfs /tmp \
+            --tmpfs /run \
+            --tmpfs /run/lock \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            almalinux:10 /usr/sbin/init
+
+          for attempt in {1..60}; do
+            if docker exec klights-rhel10 systemctl is-system-running >/tmp/systemd-state 2>&1; then
+              break
+            fi
+            state="$(cat /tmp/systemd-state || true)"
+            if [[ "$state" == "degraded" ]]; then
+              break
+            fi
+            sleep 2
+          done
+
+          docker exec klights-rhel10 systemctl status --no-pager || true
+
+      - name: Install klights from RPM repository
+        run: |
+          set -euo pipefail
+          docker exec klights-rhel10 bash -lc '
+            set -euo pipefail
+            dnf install -y ca-certificates curl iproute jq procps-ng
+            printf "%s\n" \
+              "[klights]" \
+              "name=klights" \
+              "baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el10/x86_64" \
+              "enabled=1" \
+              "gpgcheck=0" \
+              > /etc/yum.repos.d/klights.repo
+            dnf makecache --disablerepo="*" --enablerepo=klights
+            dnf install -y klights
+            install -d -m 0755 /var/lib/klights
+            printf "%s\n" \
+              "RUST_LOG=info" \
+              "KLIGHTS_DATA_ROOT=/var/lib/klights" \
+              "KLIGHTS_ARGS=start" \
+              > /etc/sysconfig/klights
+          '
+
+      - name: Start klights service
+        run: |
+          set -euo pipefail
+          docker exec klights-rhel10 bash -lc '
+            set -euo pipefail
+            systemctl daemon-reload
+            systemctl restart containerd
+            systemctl restart klights
+            for attempt in {1..120}; do
+              if test -f /var/lib/klights/etc/kubeconfig.yaml && systemctl is-active --quiet klights; then
+                exit 0
+              fi
+              systemctl status klights --no-pager || true
+              journalctl -u klights --no-pager -n 80 || true
+              sleep 5
+            done
+            journalctl -u klights --no-pager -n 200 || true
+            exit 1
+          '
+
+      - name: Deploy nginx service and curl it from another pod
+        run: |
+          set -euo pipefail
+          docker exec klights-rhel10 bash -lc '
+            set -euo pipefail
+            curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
+            chmod 0755 /usr/local/bin/kubectl
+            export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
+            kubectl get nodes
+            kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
+            kubectl rollout status deployment/nginx-smoke --timeout=240s
+            kubectl expose deployment nginx-smoke --name=nginx-smoke --port=80 --target-port=80
+            service_ip="$(kubectl get service nginx-smoke -o jsonpath="{.spec.clusterIP}")"
+            kubectl run curl-smoke \
+              --image=curlimages/curl:8.11.1 \
+              --restart=Never \
+              --rm \
+              --attach \
+              --command -- sh -c "for attempt in \$(seq 1 60); do curl -fsS http://${service_ip}:80/ | grep -qi nginx && exit 0; sleep 2; done; exit 1"
+          '
+
+      - name: Collect RHEL 10 diagnostics
+        if: always()
+        run: |
+          docker exec klights-rhel10 bash -lc '
+            systemctl status klights --no-pager || true
+            journalctl -u klights --no-pager -n 200 || true
+            journalctl -u containerd --no-pager -n 120 || true
+          ' || true
+          docker rm -f klights-rhel10 || true
