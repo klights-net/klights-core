@@ -203,11 +203,17 @@ jobs:
           PACKAGE_GPG_KEY_ID: ${{ env.PACKAGE_GPG_KEY_ID }}
         run: |
           set +e
-          {
+          (
+            set -euo pipefail
+            mkdir -p dist/packages
             scripts/package/build-deb.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --suite noble --distro ubuntu24.04 --out dist/packages
             scripts/package/build-deb.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --suite resolute --distro ubuntu26.04 --out dist/packages
             scripts/package/build-rpm.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --distro el9 --out dist/packages
             scripts/package/build-rpm.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --distro el10 --out dist/packages
+            test -f "dist/packages/klights_${KLIGHTS_VERSION}-1~noble_amd64.deb"
+            test -f "dist/packages/klights_${KLIGHTS_VERSION}-1~resolute_amd64.deb"
+            test -f "dist/packages/klights-${KLIGHTS_VERSION}-1.el9.x86_64.rpm"
+            test -f "dist/packages/klights-${KLIGHTS_VERSION}-1.el10.x86_64.rpm"
             scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite noble --origin klights --label klights --codename noble
             scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite resolute --origin klights --label klights --codename resolute
             scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el9
@@ -220,7 +226,7 @@ jobs:
               exit 1
             fi
             sha256sum "${files[@]}" > SHA256SUMS
-          } 2>&1 | tee package-build.log
+          ) 2>&1 | tee package-build.log
 
           status=${PIPESTATUS[0]}
           if [[ "$status" -ne 0 ]]; then
@@ -329,10 +335,14 @@ jobs:
           name: klights ${{ github.ref_name }}
           body_path: release-notes.md
           fail_on_unmatched_files: true
+          overwrite_files: true
           files: dist/packages/*
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
+          token: ${{ secrets.PAGES_TOKEN || github.token }}
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
