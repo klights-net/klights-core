@@ -129,28 +129,28 @@ jobs:
 
           if [[ ! -s "$NOTES" ]]; then
             cat > "$NOTES" <<EOF_NOTES
-## klights ${VERSION}
+          ## klights ${VERSION}
 
-Release notes were not found in CHANGELOG.md for ${VERSION}.
-EOF_NOTES
+          Release notes were not found in CHANGELOG.md for ${VERSION}.
+          EOF_NOTES
           fi
 
           cat >> "$NOTES" <<EOF_NOTES
 
-## Binary packages
+          ## Binary packages
 
-This release publishes:
+          This release publishes:
 
-- Ubuntu 24.04 (noble): \`klights_${VERSION}-1~noble_amd64.deb\`
-- Ubuntu 26.04 (resolute): \`klights_${VERSION}-1~resolute_amd64.deb\`
-- RHEL 9: \`klights-${VERSION}-1.el9.x86_64.rpm\`
-- RHEL 10: \`klights-${VERSION}-1.el10.x86_64.rpm\`
+          - Ubuntu 24.04 (noble): \`klights_${VERSION}-1~noble_amd64.deb\`
+          - Ubuntu 26.04 (resolute): \`klights_${VERSION}-1~resolute_amd64.deb\`
+          - RHEL 9: \`klights-${VERSION}-1.el9.x86_64.rpm\`
+          - RHEL 10: \`klights-${VERSION}-1.el10.x86_64.rpm\`
 
-Package repositories are published to GitHub Pages:
+          Package repositories are published to GitHub Pages:
 
-- APT: https://klights-net.github.io/klights-core/apt
-- RPM: https://klights-net.github.io/klights-core/rpm
-EOF_NOTES
+          - APT: https://klights-net.github.io/klights-core/apt
+          - RPM: https://klights-net.github.io/klights-core/rpm
+          EOF_NOTES
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
