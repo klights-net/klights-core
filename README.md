@@ -49,10 +49,52 @@ containerd-free runtime support are not available in this release.
 
 ## Quickstart
 
-Build the release binary:
+Install klights from the public package repository.
+
+Ubuntu 24.04 (`noble`):
 
 ```bash
-cargo build --release
+sudo install -d /etc/apt/keyrings
+echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt noble main" | \
+  sudo tee /etc/apt/sources.list.d/klights.list
+sudo apt-get update
+sudo apt-get install -y klights
+```
+
+Ubuntu 26.04 (`resolute`):
+
+```bash
+sudo install -d /etc/apt/keyrings
+echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt resolute main" | \
+  sudo tee /etc/apt/sources.list.d/klights.list
+sudo apt-get update
+sudo apt-get install -y klights
+```
+
+RHEL 9:
+
+```bash
+sudo tee /etc/yum.repos.d/klights.repo >/dev/null <<'EOF'
+[klights]
+name=klights
+baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el9/x86_64
+enabled=1
+gpgcheck=0
+EOF
+sudo dnf install -y klights
+```
+
+RHEL 10:
+
+```bash
+sudo tee /etc/yum.repos.d/klights.repo >/dev/null <<'EOF'
+[klights]
+name=klights
+baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el10/x86_64
+enabled=1
+gpgcheck=0
+EOF
+sudo dnf install -y klights
 ```
 
 klights has two control-plane startup modes:
@@ -69,7 +111,7 @@ klights has two control-plane startup modes:
 Start the first node with the built-in defaults:
 
 ```bash
-sudo ./target/release/klights start
+sudo klights start
 ```
 
 The defaults cover the API port, node data directory, pod CIDR, service CIDR,
@@ -111,7 +153,7 @@ chmod 600 /tmp/klights-controlplane.token /tmp/klights-worker.token
 For Raft control-plane mode, join the second and third control-plane voters:
 
 ```bash
-sudo ./target/release/klights controlplane \
+sudo klights controlplane \
   --leader https://<leader-ip>:7679 \
   --skip-ca \
   --token-file /tmp/klights-controlplane.token
@@ -120,7 +162,7 @@ sudo ./target/release/klights controlplane \
 For single-leader mode, add an optional replica backup:
 
 ```bash
-sudo ./target/release/klights replica \
+sudo klights replica \
   --leader https://<leader-ip>:7679 \
   --skip-ca \
   --token-file /tmp/klights-controlplane.token
@@ -129,7 +171,7 @@ sudo ./target/release/klights replica \
 Join a worker:
 
 ```bash
-sudo ./target/release/klights worker \
+sudo klights worker \
   --leader https://<leader-ip>:7679 \
   --skip-ca \
   --token-file /tmp/klights-worker.token
