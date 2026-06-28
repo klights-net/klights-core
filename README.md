@@ -190,6 +190,21 @@ endpoints.
 - `kmod`, including `modprobe` for kernel module setup such as `br_netfilter`
 - `kubectl` for interacting with the generated kubeconfig
 
+Install runtime dependencies on Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y containerd kmod nftables
+```
+
+Install runtime dependencies on RHEL:
+
+```bash
+sudo dnf install -y dnf-plugins-core kmod nftables
+sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+sudo dnf install -y containerd.io --setopt=install_weak_deps=False
+```
+
 For source builds, also install:
 
 - Rust toolchain with `cargo` and `rustc`
