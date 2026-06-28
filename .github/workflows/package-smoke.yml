@@ -102,6 +102,21 @@ jobs:
             curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
             chmod 0755 /usr/local/bin/kubectl
             export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
+            node_ready=false
+            for attempt in {1..120}; do
+              if kubectl get nodes && kubectl wait --for=condition=Ready node --all --timeout=5s; then
+                node_ready=true
+                break
+              fi
+              systemctl status klights --no-pager || true
+              journalctl -u klights --no-pager -n 80 || true
+              sleep 5
+            done
+            if [ "${node_ready}" != "true" ]; then
+              kubectl get nodes -o wide || true
+              kubectl get pods -A -o wide || true
+              exit 1
+            fi
             kubectl get nodes
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             kubectl rollout status deployment/nginx-smoke --timeout=240s
@@ -160,7 +175,9 @@ jobs:
           set -euo pipefail
           docker exec klights-rhel10 bash -lc '
             set -euo pipefail
-            dnf install -y ca-certificates curl iproute jq procps-ng
+            dnf install -y ca-certificates curl dnf-plugins-core iproute jq procps-ng
+            dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+            dnf install -y containerd.io --setopt=install_weak_deps=False
             printf "%s\n" \
               "[klights]" \
               "name=klights" \
@@ -206,6 +223,21 @@ jobs:
             curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
             chmod 0755 /usr/local/bin/kubectl
             export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
+            node_ready=false
+            for attempt in {1..120}; do
+              if kubectl get nodes && kubectl wait --for=condition=Ready node --all --timeout=5s; then
+                node_ready=true
+                break
+              fi
+              systemctl status klights --no-pager || true
+              journalctl -u klights --no-pager -n 80 || true
+              sleep 5
+            done
+            if [ "${node_ready}" != "true" ]; then
+              kubectl get nodes -o wide || true
+              kubectl get pods -A -o wide || true
+              exit 1
+            fi
             kubectl get nodes
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             kubectl rollout status deployment/nginx-smoke --timeout=240s
