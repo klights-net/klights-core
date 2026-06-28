@@ -6,9 +6,9 @@ authors = ["klights-core copyright holders <lapcchan@gmail.com>"]
 description = "A resource-efficient, event-driven Kubernetes-compatible cluster runtime."
 readme = "README.md"
 license = "AGPL-3.0-or-later"
-repository = "https://gitlab.com/lapcchan/klights-core"
-homepage = "https://gitlab.com/lapcchan/klights-core"
-documentation = "https://gitlab.com/lapcchan/klights-core/-/blob/main/README.md"
+repository = "https://github.com/klights-net/klights-core"
+homepage = "https://github.com/klights-net/klights-core"
+documentation = "https://github.com/klights-net/klights-core/blob/main/README.md"
 keywords = ["kubernetes", "k8s", "rust", "containerd", "control-plane"]
 categories = ["command-line-utilities", "network-programming"]
 
