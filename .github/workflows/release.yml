@@ -75,7 +75,26 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "KLIGHTS_VERSION=$VERSION" >> "$GITHUB_ENV"
 
+      - name: Restore staged static binary
+        id: staged-binary
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          mkdir -p dist/binary-artifact
+          asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/klights-linux-x86_64-static"
+          if curl -fsSL "$asset_url" -o dist/binary-artifact/klights; then
+            chmod 0755 dist/binary-artifact/klights
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing staged static binary from ${asset_url}"
+          else
+            rm -f dist/binary-artifact/klights
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            echo "No staged static binary found for ${GITHUB_REF_NAME}; building from source."
+          fi
+
       - name: Build static release binary
+        if: steps.staged-binary.outputs.restored != 'true'
         env:
           CARGO_BUILD_JOBS: "2"
           CC: gcc-13
@@ -119,16 +138,28 @@ jobs:
           cat release-build.log
 
       - name: Stage static binary artifact
+        if: steps.staged-binary.outputs.restored != 'true'
         run: |
           mkdir -p dist/binary-artifact
           install -m 0755 target/release/klights dist/binary-artifact/klights
+          install -m 0755 target/release/klights dist/binary-artifact/klights-linux-x86_64-static
           install -m 0644 release-build.log dist/binary-artifact/release-build.log
+
+      - name: Publish staged static binary
+        if: steps.staged-binary.outputs.restored != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: klights ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: dist/binary-artifact/klights-linux-x86_64-static
 
       - name: Upload static binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: klights-static-binary
-          path: dist/binary-artifact/*
+          path: dist/binary-artifact/klights
           retention-days: 14
 
   package:
