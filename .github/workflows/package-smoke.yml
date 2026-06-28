@@ -33,13 +33,23 @@ jobs:
           CMD ["/sbin/init"]
           EOF_DOCKERFILE
           docker build -t klights-ubuntu-26.04-systemd -f Dockerfile.ubuntu-26.04-systemd .
+          sudo modprobe tun || true
+          sudo mkdir -p /dev/net
+          if [ ! -e /dev/net/tun ]; then
+            sudo mknod /dev/net/tun c 10 200
+          fi
+          sudo chmod 0666 /dev/net/tun
           docker run -d --name klights-ubuntu-2604 \
             --privileged \
+            --cap-add=SYS_MODULE \
             --cgroupns=host \
+            --device /dev/net/tun:/dev/net/tun \
+            --security-opt seccomp=unconfined \
             --tmpfs /tmp \
             --tmpfs /run \
             --tmpfs /run/lock \
             --tmpfs /var/lib/klights:exec,mode=0755 \
+            -v /lib/modules:/lib/modules:ro \
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
             klights-ubuntu-26.04-systemd
 
@@ -195,13 +205,23 @@ jobs:
       - name: Start RHEL 10 compatible systemd container
         run: |
           set -euo pipefail
+          sudo modprobe tun || true
+          sudo mkdir -p /dev/net
+          if [ ! -e /dev/net/tun ]; then
+            sudo mknod /dev/net/tun c 10 200
+          fi
+          sudo chmod 0666 /dev/net/tun
           docker run -d --name klights-rhel10 \
             --privileged \
+            --cap-add=SYS_MODULE \
             --cgroupns=host \
+            --device /dev/net/tun:/dev/net/tun \
+            --security-opt seccomp=unconfined \
             --tmpfs /tmp \
             --tmpfs /run \
             --tmpfs /run/lock \
             --tmpfs /var/lib/klights:exec,mode=0755 \
+            -v /lib/modules:/lib/modules:ro \
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
             almalinux:10 /usr/sbin/init
 
