@@ -35,6 +35,7 @@ jobs:
             libsqlite3-dev \
             libssl-dev \
             pkg-config \
+            protobuf-compiler \
             rpm \
             zlib1g-dev
 
@@ -43,6 +44,14 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
           rustup target add x86_64-unknown-linux-gnu
+
+      - name: Print release build diagnostics
+        run: |
+          rustc -Vv
+          cargo -V
+          protoc --version
+          pkg-config --modversion libmnl libnftnl sqlite3 zlib openssl
+          pkg-config --libs --static libmnl libnftnl sqlite3 zlib openssl
 
       - name: Validate tag and derive version
         id: version
