@@ -256,7 +256,9 @@ jobs:
               echo "No packages were produced in dist/packages"
               exit 1
             fi
-            sha256sum "${files[@]}" > SHA256SUMS
+            sha256sum "${files[@]}" \
+              | sed -E 's/(  klights_[0-9.]+-1)~(noble|resolute)(_amd64[.]deb)$/\1.\2\3/' \
+              > SHA256SUMS
           ) 2>&1 | tee package-build.log
 
           status=${PIPESTATUS[0]}
