@@ -11,7 +11,7 @@ permissions:
   id-token: write
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
@@ -20,7 +20,7 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Install packaging tooling
+      - name: Install build tooling
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -28,12 +28,9 @@ jobs:
             binutils \
             build-essential \
             cmake \
-            createrepo-c \
-            dpkg-dev \
             g++-13 \
             gcc-13 \
             gzip \
-            gnupg \
             libmnl-dev \
             libnftnl-dev \
             libsqlite3-dev \
@@ -121,8 +118,63 @@ jobs:
           fi
           cat release-build.log
 
+      - name: Stage static binary artifact
+        run: |
+          mkdir -p dist/binary-artifact
+          install -m 0755 target/release/klights dist/binary-artifact/klights
+          install -m 0644 release-build.log dist/binary-artifact/release-build.log
+
+      - name: Upload static binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: klights-static-binary
+          path: dist/binary-artifact/*
+          retention-days: 14
+
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download static binary
+        uses: actions/download-artifact@v4
+        with:
+          name: klights-static-binary
+          path: dist/binary
+
+      - name: Install package tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            apt-utils \
+            createrepo-c \
+            dpkg-dev \
+            gzip \
+            gnupg \
+            rpm
+
+      - name: Prepare binary artifact
+        run: |
+          chmod +x dist/binary/klights
+
+      - name: Validate tag and derive version
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must use vMAJOR.MINOR.PATCH format; got '$GITHUB_REF_NAME'"
+            exit 1
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "KLIGHTS_VERSION=$VERSION" >> "$GITHUB_ENV"
+
       - name: Import optional package GPG key
-        id: package-gpg
         env:
           PACKAGE_GPG_PRIVATE_KEY: ${{ secrets.PACKAGE_GPG_PRIVATE_KEY }}
           PACKAGE_GPG_PASSPHRASE: ${{ secrets.PACKAGE_GPG_PASSPHRASE }}
@@ -142,37 +194,94 @@ jobs:
             KEY_ID="$(gpg --batch --with-colons --list-secret-keys --keyid-format=long | awk -F: '$1 == "sec" { print $5; exit }')"
             if [[ -n "$KEY_ID" ]]; then
               echo "PACKAGE_GPG_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
-              echo "detected=true" >> "$GITHUB_OUTPUT"
             fi
-          else
-            echo "detected=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build packages
+      - name: Build packages and publish repo metadata
         env:
           PACKAGE_GPG_PASSPHRASE: ${{ secrets.PACKAGE_GPG_PASSPHRASE }}
           PACKAGE_GPG_KEY_ID: ${{ env.PACKAGE_GPG_KEY_ID }}
         run: |
-          mkdir -p dist/packages
+          set +e
+          {
+            scripts/package/build-deb.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --suite noble --distro ubuntu24.04 --out dist/packages
+            scripts/package/build-deb.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --suite resolute --distro ubuntu26.04 --out dist/packages
+            scripts/package/build-rpm.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --distro el9 --out dist/packages
+            scripts/package/build-rpm.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --distro el10 --out dist/packages
+            scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite noble --origin klights --label klights --codename noble
+            scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite resolute --origin klights --label klights --codename resolute
+            scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el9
+            scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el10
+            cd dist/packages
+            shopt -s nullglob
+            files=(*)
+            if [[ ${#files[@]} -eq 0 ]]; then
+              echo "No packages were produced in dist/packages"
+              exit 1
+            fi
+            sha256sum "${files[@]}" > SHA256SUMS
+          } 2>&1 | tee package-build.log
 
-          scripts/package/build-deb.sh --binary target/release/klights --version "$KLIGHTS_VERSION" --suite noble --distro ubuntu24.04 --out dist/packages
-          scripts/package/build-deb.sh --binary target/release/klights --version "$KLIGHTS_VERSION" --suite resolute --distro ubuntu26.04 --out dist/packages
-          scripts/package/build-rpm.sh --binary target/release/klights --version "$KLIGHTS_VERSION" --distro el9 --out dist/packages
-          scripts/package/build-rpm.sh --binary target/release/klights --version "$KLIGHTS_VERSION" --distro el10 --out dist/packages
+          status=${PIPESTATUS[0]}
+          if [[ "$status" -ne 0 ]]; then
+            {
+              echo "### Package build failed"
+              echo
+              echo "#### Package command tail"
+              echo
+              echo '```text'
+              tail -n 160 package-build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            summary="$(tail -n 160 package-build.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')"
+            echo "::error title=Package build failed::$summary"
+            exit "$status"
+          fi
+          cat package-build.log
 
-          scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite noble --origin klights --label klights --codename noble
-          scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite resolute --origin klights --label klights --codename resolute
-          scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el9
-          scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el10
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: klights-packages
+          path: dist/packages/*
+          retention-days: 14
 
-          cd dist/packages
-          shopt -s nullglob
-          files=(*)
-          if [[ ${#files[@]} -eq 0 ]]; then
-            echo "No packages were produced in dist/packages"
+      - name: Upload package repository artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: klights-package-repos
+          path: public
+          retention-days: 14
+
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: klights-packages
+          path: dist/packages
+
+      - name: Download package repositories
+        uses: actions/download-artifact@v4
+        with:
+          name: klights-package-repos
+          path: public
+
+      - name: Validate tag and derive version
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must use vMAJOR.MINOR.PATCH format; got '$GITHUB_REF_NAME'"
             exit 1
           fi
-          sha256sum "${files[@]}" > SHA256SUMS
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "KLIGHTS_VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Build release notes
         run: |
@@ -189,29 +298,29 @@ jobs:
           fi
 
           if [[ ! -s "$NOTES" ]]; then
-            cat > "$NOTES" <<EOF_NOTES
-          ## klights ${VERSION}
-
-          Release notes were not found in CHANGELOG.md for ${VERSION}.
-          EOF_NOTES
+            {
+              echo "## klights ${VERSION}"
+              echo
+              echo "Release notes were not found in CHANGELOG.md for ${VERSION}."
+            } > "$NOTES"
           fi
 
-          cat >> "$NOTES" <<EOF_NOTES
-
-          ## Binary packages
-
-          This release publishes:
-
-          - Ubuntu 24.04 (noble): \`klights_${VERSION}-1~noble_amd64.deb\`
-          - Ubuntu 26.04 (resolute): \`klights_${VERSION}-1~resolute_amd64.deb\`
-          - RHEL 9: \`klights-${VERSION}-1.el9.x86_64.rpm\`
-          - RHEL 10: \`klights-${VERSION}-1.el10.x86_64.rpm\`
-
-          Package repositories are published to GitHub Pages:
-
-          - APT: https://klights-net.github.io/klights-core/apt
-          - RPM: https://klights-net.github.io/klights-core/rpm
-          EOF_NOTES
+          {
+            echo
+            echo "## Binary packages"
+            echo
+            echo "This release publishes:"
+            echo
+            echo "- Ubuntu 24.04 (noble): \`klights_${VERSION}-1~noble_amd64.deb\`"
+            echo "- Ubuntu 26.04 (resolute): \`klights_${VERSION}-1~resolute_amd64.deb\`"
+            echo "- RHEL 9: \`klights-${VERSION}-1.el9.x86_64.rpm\`"
+            echo "- RHEL 10: \`klights-${VERSION}-1.el10.x86_64.rpm\`"
+            echo
+            echo "Package repositories are published to GitHub Pages:"
+            echo
+            echo "- APT: https://klights-net.github.io/klights-core/apt"
+            echo "- RPM: https://klights-net.github.io/klights-core/rpm"
+          } >> "$NOTES"
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
