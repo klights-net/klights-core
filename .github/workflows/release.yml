@@ -27,6 +27,7 @@ jobs:
             apt-utils \
             binutils \
             build-essential \
+            cmake \
             createrepo-c \
             dpkg-dev \
             g++-13 \
@@ -37,6 +38,9 @@ jobs:
             libnftnl-dev \
             libsqlite3-dev \
             libssl-dev \
+            libzstd-dev \
+            mold \
+            ninja-build \
             pkg-config \
             protobuf-compiler \
             rpm \
@@ -64,9 +68,10 @@ jobs:
           g++-13 --version | head -n 1
           ld --version | head -n 1
           cc --version | head -n 1
+          mold --version
           protoc --version
-          pkg-config --modversion libmnl libnftnl sqlite3 zlib openssl
-          pkg-config --libs --static libmnl libnftnl sqlite3 zlib openssl
+          pkg-config --modversion libmnl libnftnl sqlite3 zlib libzstd openssl
+          pkg-config --libs --static libmnl libnftnl sqlite3 zlib libzstd openssl
 
       - name: Validate tag and derive version
         id: version
