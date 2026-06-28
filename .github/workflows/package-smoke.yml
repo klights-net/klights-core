@@ -124,13 +124,36 @@ jobs:
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             kubectl rollout status deployment/nginx-smoke --timeout=240s
             kubectl expose deployment nginx-smoke --name=nginx-smoke --port=80 --target-port=80
-            service_ip="$(kubectl get service nginx-smoke -o jsonpath="{.spec.clusterIP}")"
+            service_ip="$(kubectl get service nginx-smoke -o jsonpath={.spec.clusterIP})"
+            kubectl get deployment nginx-smoke -o wide
+            kubectl get service nginx-smoke -o wide
+            kubectl get pods -o wide
+            kubectl delete pod curl-smoke --ignore-not-found
             kubectl run curl-smoke \
               --image=curlimages/curl:8.11.1 \
               --restart=Never \
-              --rm \
-              --attach \
               --command -- sh -c "for attempt in \$(seq 1 60); do curl -fsS http://${service_ip}:80/ | grep -qi nginx && exit 0; sleep 2; done; exit 1"
+            curl_succeeded=false
+            for attempt in {1..120}; do
+              phase="$(kubectl get pod curl-smoke -o jsonpath={.status.phase} 2>/dev/null || true)"
+              if [ "${phase}" = "Succeeded" ]; then
+                curl_succeeded=true
+                break
+              fi
+              if [ "${phase}" = "Failed" ]; then
+                break
+              fi
+              kubectl get pod curl-smoke -o wide || true
+              sleep 2
+            done
+            kubectl logs pod/curl-smoke || true
+            if [ "${curl_succeeded}" != "true" ]; then
+              kubectl describe deployment nginx-smoke || true
+              kubectl describe service nginx-smoke || true
+              kubectl describe pod curl-smoke || true
+              kubectl get pods -o wide || true
+              exit 1
+            fi
           '
 
       - name: Collect Ubuntu diagnostics
@@ -248,13 +271,36 @@ jobs:
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             kubectl rollout status deployment/nginx-smoke --timeout=240s
             kubectl expose deployment nginx-smoke --name=nginx-smoke --port=80 --target-port=80
-            service_ip="$(kubectl get service nginx-smoke -o jsonpath="{.spec.clusterIP}")"
+            service_ip="$(kubectl get service nginx-smoke -o jsonpath={.spec.clusterIP})"
+            kubectl get deployment nginx-smoke -o wide
+            kubectl get service nginx-smoke -o wide
+            kubectl get pods -o wide
+            kubectl delete pod curl-smoke --ignore-not-found
             kubectl run curl-smoke \
               --image=curlimages/curl:8.11.1 \
               --restart=Never \
-              --rm \
-              --attach \
               --command -- sh -c "for attempt in \$(seq 1 60); do curl -fsS http://${service_ip}:80/ | grep -qi nginx && exit 0; sleep 2; done; exit 1"
+            curl_succeeded=false
+            for attempt in {1..120}; do
+              phase="$(kubectl get pod curl-smoke -o jsonpath={.status.phase} 2>/dev/null || true)"
+              if [ "${phase}" = "Succeeded" ]; then
+                curl_succeeded=true
+                break
+              fi
+              if [ "${phase}" = "Failed" ]; then
+                break
+              fi
+              kubectl get pod curl-smoke -o wide || true
+              sleep 2
+            done
+            kubectl logs pod/curl-smoke || true
+            if [ "${curl_succeeded}" != "true" ]; then
+              kubectl describe deployment nginx-smoke || true
+              kubectl describe service nginx-smoke || true
+              kubectl describe pod curl-smoke || true
+              kubectl get pods -o wide || true
+              exit 1
+            fi
           '
 
       - name: Collect RHEL 10 diagnostics
