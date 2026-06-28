@@ -7,8 +7,6 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 jobs:
   build:
@@ -360,10 +358,10 @@ jobs:
             echo "- RHEL 9: \`klights-${VERSION}-1.el9.x86_64.rpm\`"
             echo "- RHEL 10: \`klights-${VERSION}-1.el10.x86_64.rpm\`"
             echo
-            echo "Package repositories are published to GitHub Pages:"
+            echo "Package repositories are published from the \`package-repo\` branch:"
             echo
-            echo "- APT: https://klights-net.github.io/klights-core/apt"
-            echo "- RPM: https://klights-net.github.io/klights-core/rpm"
+            echo "- APT: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt"
+            echo "- RPM: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm"
           } >> "$NOTES"
 
       - name: Publish GitHub release
@@ -376,59 +374,80 @@ jobs:
           overwrite_files: true
           files: dist/packages/*
 
-      - name: Verify GitHub Pages is configured
+      - name: Publish package repository branch
         env:
-          GH_TOKEN: ${{ secrets.PAGES_TOKEN || github.token }}
-          HAS_PAGES_TOKEN: ${{ secrets.PAGES_TOKEN != '' }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          repo_dir="$(mktemp -d)"
+
+          git init "$repo_dir"
+          cd "$repo_dir"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan package-repo
+
+          cp -a "${GITHUB_WORKSPACE}/public/." .
+          touch .nojekyll
+          cat > README.md <<EOF_REPO
+          # klights package repository
+
+          Generated from ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}.
+
+          APT base URL:
+
+          \`\`\`text
+          https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo/apt
+          \`\`\`
+
+          RPM base URL:
+
+          \`\`\`text
+          https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo/rpm
+          \`\`\`
+          EOF_REPO
+
+          git add .
+          git commit -m "chore: publish package repository for ${GITHUB_REF_NAME}"
+          git push --force "$repo_url" package-repo
+
+      - name: Verify hosted package repository
+        env:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          status="$(
-            curl -sS -o pages.json -w '%{http_code}' \
-              -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer ${GH_TOKEN}" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages"
-          )"
+          set -euo pipefail
+          base_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo"
+          paths=(
+            "apt/dists/noble/Release"
+            "apt/dists/noble/main/binary-amd64/Packages"
+            "apt/dists/noble/main/binary-amd64/Packages.gz"
+            "apt/dists/resolute/Release"
+            "apt/dists/resolute/main/binary-amd64/Packages"
+            "apt/dists/resolute/main/binary-amd64/Packages.gz"
+            "rpm/el9/x86_64/repodata/repomd.xml"
+            "rpm/el10/x86_64/repodata/repomd.xml"
+          )
 
-          if [[ "$status" == "200" ]]; then
-            cat pages.json
-            exit 0
-          fi
+          for path in "${paths[@]}"; do
+            url="${base_url}/${path}"
+            ok=false
+            for attempt in {1..12}; do
+              if curl -fsSL "$url" >/tmp/klights-repo-check; then
+                ok=true
+                break
+              fi
+              sleep 5
+            done
+            if [[ "$ok" != "true" ]]; then
+              echo "::error title=Package repository verification failed::Unable to fetch ${url}"
+              exit 1
+            fi
+          done
 
-          if [[ "$status" == "404" && "$HAS_PAGES_TOKEN" != "true" ]]; then
-            {
-              echo "### GitHub Pages is not enabled"
-              echo
-              echo "The package repositories were built, but they cannot be deployed until GitHub Pages exists for this repository."
-              echo
-              echo "Enable **Settings > Pages > Build and deployment > Source: GitHub Actions**, then rerun this tag workflow."
-              echo
-              echo "Alternative: add a repository secret named \`PAGES_TOKEN\` containing a PAT with repository admin permission so this workflow can create the Pages site."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error title=GitHub Pages is not enabled::Enable Settings > Pages > Source: GitHub Actions, or add a PAGES_TOKEN secret with repository admin permission."
-            exit 1
-          fi
-
-          if [[ "$status" == "404" && "$HAS_PAGES_TOKEN" == "true" ]]; then
-            echo "GitHub Pages is not enabled yet; PAGES_TOKEN is set, so configure-pages will attempt to create the Pages site."
-          fi
-
-          if [[ "$status" != "404" ]]; then
-            cat pages.json
-            echo "::error title=GitHub Pages API check failed::Expected 200 or 404 from the Pages API; got HTTP ${status}."
-            exit 1
-          fi
-
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-        with:
-          enablement: true
-          token: ${{ secrets.PAGES_TOKEN || github.token }}
-
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: public
-
-      - name: Deploy Pages site
-        uses: actions/deploy-pages@v4
+          curl -fsSL "${base_url}/apt/dists/noble/main/binary-amd64/Packages" | grep -q '^Package: klights$'
+          curl -fsSL "${base_url}/apt/dists/resolute/main/binary-amd64/Packages" | grep -q '^Package: klights$'
+          curl -fsSL "${base_url}/rpm/el9/x86_64/repodata/repomd.xml" | grep -q 'primary'
+          curl -fsSL "${base_url}/rpm/el10/x86_64/repodata/repomd.xml" | grep -q 'primary'

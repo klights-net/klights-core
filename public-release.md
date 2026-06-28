@@ -11,11 +11,11 @@ git@github.com:klights-net/klights-core.git
 https://github.com/klights-net/klights-core
 ```
 
-Package repository URLs after GitHub Pages deployment:
+Package repository URLs after release workflow deployment:
 
 ```text
-https://klights-net.github.io/klights-core/apt
-https://klights-net.github.io/klights-core/rpm
+https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt
+https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm
 ```
 
 GitHub Releases URL:
@@ -27,7 +27,6 @@ https://github.com/klights-net/klights-core/releases
 ## GitHub settings required before first tag
 
 - Enable GitHub Actions for the repository.
-- Enable GitHub Pages with source set to GitHub Actions.
 - Confirm workflow permissions allow `Read and write permissions` if organization policy does not honor workflow-level `contents: write`.
 - Confirm public repository visibility before pushing release tags.
 - Confirm branch protection does not block tag-triggered release workflows.
@@ -91,7 +90,7 @@ klights-VERSION-1.el10.x86_64.rpm
 SHA256SUMS
 ```
 
-Verify GitHub Pages contains these repository paths:
+Verify the `package-repo` branch contains these repository paths:
 
 ```text
 apt/dists/noble/main/binary-amd64/Packages
@@ -192,18 +191,18 @@ Verify checksums:
 sha256sum -c SHA256SUMS
 ```
 
-Smoke-test APT metadata after Pages deploy:
+Smoke-test APT metadata after package repository branch deploy:
 
 ```bash
-curl -fsSL https://klights-net.github.io/klights-core/apt/dists/noble/Release
-curl -fsSL https://klights-net.github.io/klights-core/apt/dists/resolute/Release
+curl -fsSL https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/dists/noble/Release
+curl -fsSL https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/dists/resolute/Release
 ```
 
-Smoke-test RPM metadata after Pages deploy:
+Smoke-test RPM metadata after package repository branch deploy:
 
 ```bash
-curl -fsSL https://klights-net.github.io/klights-core/rpm/el9/x86_64/repodata/repomd.xml
-curl -fsSL https://klights-net.github.io/klights-core/rpm/el10/x86_64/repodata/repomd.xml
+curl -fsSL https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el9/x86_64/repodata/repomd.xml
+curl -fsSL https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el10/x86_64/repodata/repomd.xml
 ```
 
 ## Public release sequence
@@ -214,5 +213,5 @@ curl -fsSL https://klights-net.github.io/klights-core/rpm/el10/x86_64/repodata/r
 4. Push the `vMAJOR.MINOR.PATCH` tag.
 5. Watch the GitHub Actions `release` workflow.
 6. Verify GitHub Release assets.
-7. Verify GitHub Pages APT/RPM metadata URLs.
+7. Verify `package-repo` branch APT/RPM metadata URLs.
 8. Install-test the packages on Ubuntu 24.04, Ubuntu 26.04, RHEL 9, and RHEL 10 test hosts before announcing public availability.
