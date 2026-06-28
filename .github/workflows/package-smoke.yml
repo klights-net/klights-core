@@ -2,6 +2,11 @@ name: package-smoke
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/package-smoke.yml'
 
 permissions:
   contents: read
