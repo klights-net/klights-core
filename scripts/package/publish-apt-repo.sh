@@ -88,8 +88,13 @@ if ! command -v dpkg-scanpackages >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! command -v apt-ftparchive >/dev/null 2>&1; then
+  echo "apt-ftparchive not found. Install apt-utils on this host." >&2
+  exit 1
+fi
+
 mkdir -p "$REPO_DIR"
-POOL_DIR="$REPO_DIR/pool/main/k/klights"
+POOL_DIR="$REPO_DIR/pool/$SUITE/main/k/klights"
 DIST_ROOT="$REPO_DIR/dists/$SUITE"
 BINARY_DIR="$DIST_ROOT/main/binary-amd64"
 mkdir -p "$POOL_DIR" "$BINARY_DIR"
@@ -97,7 +102,7 @@ mkdir -p "$POOL_DIR" "$BINARY_DIR"
 PATTERN="klights_*~${SUITE}_amd64.deb"
 shopt -s nullglob
 package_count=0
-for package_file in "$PACKAGES_DIR/$PATTERN"; do
+for package_file in "$PACKAGES_DIR"/$PATTERN; do
   install -m 0644 "$package_file" "$POOL_DIR/"
   package_count=$((package_count + 1))
 done
@@ -108,35 +113,18 @@ if [[ "$package_count" -eq 0 ]]; then
   exit 1
 fi
 
-( cd "$REPO_DIR" && dpkg-scanpackages --arch amd64 pool/main/k/klights ) > "$BINARY_DIR/Packages"
+( cd "$REPO_DIR" && dpkg-scanpackages --arch amd64 "pool/$SUITE/main/k/klights" ) > "$BINARY_DIR/Packages"
 gzip -9c "$BINARY_DIR/Packages" > "$BINARY_DIR/Packages.gz"
 
 RELEASE_FILE="$DIST_ROOT/Release"
-APT_FTP_AVAILABLE=0
-if command -v apt-ftparchive >/dev/null 2>&1; then
-  if apt-ftparchive \
-    -o "APT::FTPArchive::Release::Origin=$ORIGIN" \
-    -o "APT::FTPArchive::Release::Label=$LABEL" \
-    -o "APT::FTPArchive::Release::Suite=$SUITE" \
-    -o "APT::FTPArchive::Release::Codename=$CODENAME" \
-    -o "APT::FTPArchive::Release::Architectures=amd64" \
-    -o "APT::FTPArchive::Release::Components=main" \
-    release "$DIST_ROOT" > "$RELEASE_FILE"; then
-    APT_FTP_AVAILABLE=1
-  fi
-fi
-
-if [[ "$APT_FTP_AVAILABLE" -eq 0 ]]; then
-  cat > "$RELEASE_FILE" <<EOF_RELEASE
-Date: $(date -u '+%a, %d %b %Y %H:%M:%S %z')
-Origin: $ORIGIN
-Label: $LABEL
-Suite: $SUITE
-Codename: $CODENAME
-Architectures: amd64
-Components: main
-EOF_RELEASE
-fi
+apt-ftparchive \
+  -o "APT::FTPArchive::Release::Origin=$ORIGIN" \
+  -o "APT::FTPArchive::Release::Label=$LABEL" \
+  -o "APT::FTPArchive::Release::Suite=$SUITE" \
+  -o "APT::FTPArchive::Release::Codename=$CODENAME" \
+  -o "APT::FTPArchive::Release::Architectures=amd64" \
+  -o "APT::FTPArchive::Release::Components=main" \
+  release "$DIST_ROOT" > "$RELEASE_FILE"
 
 if [[ -n "${PACKAGE_GPG_KEY_ID:-}" ]]; then
   if ! command -v gpg >/dev/null 2>&1; then
