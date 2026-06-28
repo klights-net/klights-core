@@ -26,8 +26,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             apt-utils \
             binutils \
+            build-essential \
             createrepo-c \
             dpkg-dev \
+            g++-13 \
+            gcc-13 \
             gzip \
             gnupg \
             libmnl-dev \
@@ -45,10 +48,22 @@ jobs:
           rustup default 1.95.0
           rustup target add x86_64-unknown-linux-gnu
 
+      - name: Add linker swap space
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       - name: Print release build diagnostics
         run: |
           rustc -Vv
           cargo -V
+          gcc-13 --version | head -n 1
+          g++-13 --version | head -n 1
+          ld --version | head -n 1
+          cc --version | head -n 1
           protoc --version
           pkg-config --modversion libmnl libnftnl sqlite3 zlib openssl
           pkg-config --libs --static libmnl libnftnl sqlite3 zlib openssl
@@ -69,6 +84,9 @@ jobs:
       - name: Build static release binary
         env:
           CARGO_BUILD_JOBS: "2"
+          CC: gcc-13
+          CXX: g++-13
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc-13
         run: |
           set +e
           ./release.sh --static > release-build.log 2>&1
@@ -76,14 +94,31 @@ jobs:
           if [[ "$status" -ne 0 ]]; then
             echo "Release build failed with exit code $status"
             tail -n 300 release-build.log
+            grep -Ei '(/usr/bin/ld|collect2|undefined reference|cannot find|killed|signal|fatal error|error: linking|ld returned)' release-build.log > release-linker-errors.log || true
             {
               echo "### Release build failed"
               echo
+              echo "#### Linker diagnostics"
+              echo
               echo '```text'
-              tail -n 120 release-build.log
+              if [[ -s release-linker-errors.log ]]; then
+                tail -n 160 release-linker-errors.log
+              else
+                echo "No linker-specific diagnostics matched; showing release log tail."
+              fi
+              echo '```'
+              echo
+              echo "#### Release log tail"
+              echo
+              echo '```text'
+              tail -n 80 release-build.log
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            summary="$(tail -n 40 release-build.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')"
+            if [[ -s release-linker-errors.log ]]; then
+              summary="$(tail -n 20 release-linker-errors.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')"
+            else
+              summary="$(tail -n 40 release-build.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')"
+            fi
             echo "::error title=Release build failed::$summary"
             exit "$status"
           fi
