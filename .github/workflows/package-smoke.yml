@@ -39,6 +39,7 @@ jobs:
             --tmpfs /tmp \
             --tmpfs /run \
             --tmpfs /run/lock \
+            --tmpfs /var/lib/klights:exec,mode=0755 \
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
             klights-ubuntu-26.04-systemd
 
@@ -200,6 +201,7 @@ jobs:
             --tmpfs /tmp \
             --tmpfs /run \
             --tmpfs /run/lock \
+            --tmpfs /var/lib/klights:exec,mode=0755 \
             -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
             almalinux:10 /usr/sbin/init
 
