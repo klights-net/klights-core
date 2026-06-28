@@ -71,7 +71,7 @@ RPM_REPO="$REPO_DIR/$DISTRO/x86_64"
 PATTERN="klights-*-1.${DISTRO}.x86_64.rpm"
 shopt -s nullglob
 package_count=0
-for package_file in "$PACKAGES_DIR/$PATTERN"; do
+for package_file in "$PACKAGES_DIR"/$PATTERN; do
   install -m 0644 "$package_file" "$RPM_REPO/"
   package_count=$((package_count + 1))
 done

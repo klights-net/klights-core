@@ -115,6 +115,7 @@ fi
 if [[ -f "$DEFAULT_SRC" ]]; then
   mkdir -p "$STAGING/etc/default"
   install -m 0644 "$DEFAULT_SRC" "$STAGING/etc/default/klights"
+  printf '/etc/default/klights\n' > "$STAGING/DEBIAN/conffiles"
 fi
 
 cat > "$STAGING/DEBIAN/control" <<EOF_CTRL
@@ -143,7 +144,8 @@ EOF_POST
 cat > "$STAGING/DEBIAN/prerm" <<'EOF_PRERM'
 #!/bin/sh
 set -e
-if command -v systemctl >/dev/null 2>&1; then
+if [ "$1" = "remove" ] && command -v systemctl >/dev/null 2>&1; then
+  systemctl stop klights.service || true
   systemctl disable klights.service || true
   systemctl daemon-reload || true
 fi

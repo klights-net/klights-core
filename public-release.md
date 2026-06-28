@@ -57,7 +57,18 @@ Expected tag format:
 vMAJOR.MINOR.PATCH
 ```
 
-The workflow strips the leading `v` and rejects versions containing `-`.
+The workflow strips the leading `v` and rejects tags that are not strict
+`vMAJOR.MINOR.PATCH` versions.
+
+Before tagging, add or update the matching section in `CHANGELOG.md`:
+
+```text
+## [MAJOR.MINOR.PATCH] - YYYY-MM-DD
+```
+
+GitHub Releases are the canonical public release notes. The workflow extracts
+the matching changelog section into the GitHub Release body and attaches the
+binary package assets.
 
 Example:
 
