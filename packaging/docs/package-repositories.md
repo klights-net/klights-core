@@ -1,8 +1,8 @@
 # Klights package repositories
 
-GitHub Pages hosts the static package indexes:
-- Apt: `https://klights-net.github.io/klights-core/apt`
-- RPM: `https://klights-net.github.io/klights-core/rpm`
+The `package-repo` branch hosts the static package indexes:
+- Apt: `https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt`
+- RPM: `https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm`
 
 Binary package assets are published on GitHub Releases.
 
@@ -10,10 +10,10 @@ Ubuntu 24.04 (`noble`) and Ubuntu 26.04 (`resolute`) examples:
 ```bash
 sudo install -d /etc/apt/keyrings
 # Unsigned fallback (no GPG key configured):
-echo "deb [trusted=yes] https://klights-net.github.io/klights-core/apt noble main" | \
+echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt noble main" | \
   sudo tee /etc/apt/sources.list.d/klights.list
 # Signed repo (configure your keyring):
-# echo "deb [signed-by=/etc/apt/keyrings/klights-archive-keyring.gpg] https://klights-net.github.io/klights-core/apt noble main" | \
+# echo "deb [signed-by=/etc/apt/keyrings/klights-archive-keyring.gpg] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt noble main" | \
 #   sudo tee /etc/apt/sources.list.d/klights.list
 sudo apt-get update && sudo apt-get install -y klights
 ```
@@ -24,7 +24,7 @@ RHEL 9 (`el9`) and RHEL 10 (`el10`) examples:
 cat >/etc/yum.repos.d/klights.repo <<'EOF'
 [klights]
 name=Klights
-baseurl=https://klights-net.github.io/klights-core/rpm/el9
+baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el9/x86_64
 gpgcheck=0
 # Signed repo (set your keyring path):
 # gpgcheck=1
