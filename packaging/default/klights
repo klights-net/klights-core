@@ -1,0 +1,14 @@
+# Environment file for klights service on Debian and RPM hosts.
+
+# Runtime log level (service default is set to info).
+# Set this variable to override it for this node.
+# RUST_LOG=info
+
+# Pass command arguments to /usr/bin/klights.
+# KLIGHTS_ARGS=""
+
+# Root mode example:
+# KLIGHTS_ARGS="--data-dir /var/lib/klights"
+
+# Rootless mode example:
+# KLIGHTS_ARGS="--rootless --data-dir /var/lib/klights"

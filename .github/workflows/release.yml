@@ -1,0 +1,121 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install packaging tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            apt-utils \
+            createrepo-c \
+            dpkg-dev \
+            gzip \
+            gnupg \
+            libmnl-dev \
+            libnftnl-dev \
+            libsqlite3-dev \
+            libssl-dev \
+            pkg-config \
+            rpm \
+            zlib1g-dev
+
+      - name: Validate tag and derive version
+        id: version
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ -z "$VERSION" || "$VERSION" == *-* ]]; then
+            echo "::error::Invalid release version '$VERSION' from tag '$GITHUB_REF_NAME'"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "KLIGHTS_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build static release binary
+        run: ./release.sh --static
+
+      - name: Import optional package GPG key
+        id: package-gpg
+        env:
+          PACKAGE_GPG_PRIVATE_KEY: ${{ secrets.PACKAGE_GPG_PRIVATE_KEY }}
+          PACKAGE_GPG_PASSPHRASE: ${{ secrets.PACKAGE_GPG_PASSPHRASE }}
+        run: |
+          if [[ -n "$PACKAGE_GPG_PRIVATE_KEY" ]]; then
+            KEY_FILE="$RUNNER_TEMP/package-signing-key.asc"
+            printf '%s\n' "$PACKAGE_GPG_PRIVATE_KEY" > "$KEY_FILE"
+
+            if [[ -n "$PACKAGE_GPG_PASSPHRASE" ]] && ! gpg --batch --yes --pinentry-mode loopback --passphrase "$PACKAGE_GPG_PASSPHRASE" --import "$KEY_FILE"; then
+              gpg --batch --yes --import "$KEY_FILE"
+            elif [[ -z "$PACKAGE_GPG_PASSPHRASE" ]]; then
+              gpg --batch --yes --import "$KEY_FILE"
+            fi
+
+            rm -f "$KEY_FILE"
+
+            KEY_ID="$(gpg --batch --with-colons --list-secret-keys --keyid-format=long | awk -F: '$1 == "sec" { print $5; exit }')"
+            if [[ -n "$KEY_ID" ]]; then
+              echo "PACKAGE_GPG_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
+              echo "detected=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "detected=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build packages
+        env:
+          PACKAGE_GPG_PASSPHRASE: ${{ secrets.PACKAGE_GPG_PASSPHRASE }}
+          PACKAGE_GPG_KEY_ID: ${{ env.PACKAGE_GPG_KEY_ID }}
+        run: |
+          mkdir -p dist/packages
+
+          scripts/package/build-deb.sh --binary target/release/klights --version "$KLIGHTS_VERSION" --suite noble --distro ubuntu24.04 --out dist/packages
+          scripts/package/build-deb.sh --binary target/release/klights --version "$KLIGHTS_VERSION" --suite resolute --distro ubuntu26.04 --out dist/packages
+          scripts/package/build-rpm.sh --binary target/release/klights --version "$KLIGHTS_VERSION" --distro el9 --out dist/packages
+          scripts/package/build-rpm.sh --binary target/release/klights --version "$KLIGHTS_VERSION" --distro el10 --out dist/packages
+
+          scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite noble --origin klights --label klights --codename noble
+          scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite resolute --origin klights --label klights --codename resolute
+          scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el9
+          scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el10
+
+          cd dist/packages
+          shopt -s nullglob
+          files=(*)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No packages were produced in dist/packages"
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: dist/packages/*
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy Pages site
+        uses: actions/deploy-pages@v4

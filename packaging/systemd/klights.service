@@ -1,0 +1,16 @@
+[Unit]
+Description=K8s Runtime Services (klights)
+After=network-online.target containerd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="RUST_LOG=info"
+EnvironmentFile=-/etc/default/klights
+EnvironmentFile=-/etc/sysconfig/klights
+ExecStart=/usr/bin/klights $KLIGHTS_ARGS
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target
