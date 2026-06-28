@@ -78,17 +78,22 @@ jobs:
       - name: Restore staged static binary
         id: staged-binary
         env:
+          GH_TOKEN: ${{ github.token }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           mkdir -p dist/binary-artifact
-          asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/klights-linux-x86_64-static"
-          if curl -fsSL "$asset_url" -o dist/binary-artifact/klights; then
+          if gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern klights-linux-x86_64-static \
+            --dir dist/binary-artifact; then
+            test -f dist/binary-artifact/klights-linux-x86_64-static
+            mv dist/binary-artifact/klights-linux-x86_64-static dist/binary-artifact/klights
             chmod 0755 dist/binary-artifact/klights
             echo "restored=true" >> "$GITHUB_OUTPUT"
-            echo "Reusing staged static binary from ${asset_url}"
+            echo "Reusing staged static binary from GitHub Release ${GITHUB_REF_NAME}"
           else
-            rm -f dist/binary-artifact/klights
+            rm -f dist/binary-artifact/klights dist/binary-artifact/klights-linux-x86_64-static
             echo "restored=false" >> "$GITHUB_OUTPUT"
             echo "No staged static binary found for ${GITHUB_REF_NAME}; building from source."
           fi
@@ -102,8 +107,8 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc-13
         run: |
           set +e
-          ./release.sh --static > release-build.log 2>&1
-          status=$?
+          ./release.sh --static 2>&1 | tee release-build.log
+          status=${PIPESTATUS[0]}
           if [[ "$status" -ne 0 ]]; then
             echo "Release build failed with exit code $status"
             tail -n 300 release-build.log
@@ -370,6 +375,49 @@ jobs:
           fail_on_unmatched_files: true
           overwrite_files: true
           files: dist/packages/*
+
+      - name: Verify GitHub Pages is configured
+        env:
+          GH_TOKEN: ${{ secrets.PAGES_TOKEN || github.token }}
+          HAS_PAGES_TOKEN: ${{ secrets.PAGES_TOKEN != '' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          status="$(
+            curl -sS -o pages.json -w '%{http_code}' \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages"
+          )"
+
+          if [[ "$status" == "200" ]]; then
+            cat pages.json
+            exit 0
+          fi
+
+          if [[ "$status" == "404" && "$HAS_PAGES_TOKEN" != "true" ]]; then
+            {
+              echo "### GitHub Pages is not enabled"
+              echo
+              echo "The package repositories were built, but they cannot be deployed until GitHub Pages exists for this repository."
+              echo
+              echo "Enable **Settings > Pages > Build and deployment > Source: GitHub Actions**, then rerun this tag workflow."
+              echo
+              echo "Alternative: add a repository secret named \`PAGES_TOKEN\` containing a PAT with repository admin permission so this workflow can create the Pages site."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=GitHub Pages is not enabled::Enable Settings > Pages > Source: GitHub Actions, or add a PAGES_TOKEN secret with repository admin permission."
+            exit 1
+          fi
+
+          if [[ "$status" == "404" && "$HAS_PAGES_TOKEN" == "true" ]]; then
+            echo "GitHub Pages is not enabled yet; PAGES_TOKEN is set, so configure-pages will attempt to create the Pages site."
+          fi
+
+          if [[ "$status" != "404" ]]; then
+            cat pages.json
+            echo "::error title=GitHub Pages API check failed::Expected 200 or 404 from the Pages API; got HTTP ${status}."
+            exit 1
+          fi
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
