@@ -122,7 +122,25 @@ jobs:
             fi
             kubectl get nodes -o wide
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
-            kubectl rollout status deployment/nginx-smoke --timeout=240s
+            nginx_ready=false
+            for attempt in {1..90}; do
+              kubectl get deployment nginx-smoke -o wide || true
+              kubectl get pods -o wide || true
+              if kubectl wait --for=condition=Available deployment/nginx-smoke --timeout=5s; then
+                nginx_ready=true
+                break
+              fi
+              sleep 2
+            done
+            if [ "${nginx_ready}" != "true" ]; then
+              kubectl describe deployment nginx-smoke || true
+              kubectl get pods -o wide || true
+              for pod in $(kubectl get pods -l app=nginx-smoke -o name 2>/dev/null); do
+                kubectl describe "${pod}" || true
+                kubectl logs "${pod}" --all-containers=true || true
+              done
+              exit 1
+            fi
             kubectl expose deployment nginx-smoke --name=nginx-smoke --port=80 --target-port=80
             service_ip="$(kubectl get service nginx-smoke -o jsonpath={.spec.clusterIP})"
             kubectl get deployment nginx-smoke -o wide
@@ -269,7 +287,25 @@ jobs:
             fi
             kubectl get nodes -o wide
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
-            kubectl rollout status deployment/nginx-smoke --timeout=240s
+            nginx_ready=false
+            for attempt in {1..90}; do
+              kubectl get deployment nginx-smoke -o wide || true
+              kubectl get pods -o wide || true
+              if kubectl wait --for=condition=Available deployment/nginx-smoke --timeout=5s; then
+                nginx_ready=true
+                break
+              fi
+              sleep 2
+            done
+            if [ "${nginx_ready}" != "true" ]; then
+              kubectl describe deployment nginx-smoke || true
+              kubectl get pods -o wide || true
+              for pod in $(kubectl get pods -l app=nginx-smoke -o name 2>/dev/null); do
+                kubectl describe "${pod}" || true
+                kubectl logs "${pod}" --all-containers=true || true
+              done
+              exit 1
+            fi
             kubectl expose deployment nginx-smoke --name=nginx-smoke --port=80 --target-port=80
             service_ip="$(kubectl get service nginx-smoke -o jsonpath={.spec.clusterIP})"
             kubectl get deployment nginx-smoke -o wide
