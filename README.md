@@ -185,9 +185,14 @@ endpoints.
 ## Prerequisites
 
 - Linux host with root access for runtime work
-- Rust toolchain with `cargo` and `rustc`
 - `containerd`
+- `nftables`, including the `nft` command used for rootful service routing
+- `kmod`, including `modprobe` for kernel module setup such as `br_netfilter`
 - `kubectl` for interacting with the generated kubeconfig
+
+For source builds, also install:
+
+- Rust toolchain with `cargo` and `rustc`
 - Native networking build dependencies such as `pkg-config`, `libnftnl`, and
   `libmnl`
 
