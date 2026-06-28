@@ -374,6 +374,17 @@ jobs:
           overwrite_files: true
           files: dist/packages/*
 
+      - name: Update GitHub release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "klights ${GITHUB_REF_NAME}" \
+            --notes-file release-notes.md
+
       - name: Publish package repository branch
         env:
           GITHUB_REF_NAME: ${{ github.ref_name }}
