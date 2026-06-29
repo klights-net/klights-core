@@ -131,8 +131,11 @@ License:        AGPL-3.0-or-later
 BuildArch:      x86_64
 Source0:        klights-%{version}.tar.gz
 Requires:       containerd
+Requires:       iproute
+Requires:       kmod
 Requires:       libmnl
 Requires:       libnftnl
+Requires:       nftables
 
 %description
 Klights is a compact Rust implementation of core Kubernetes control-plane and

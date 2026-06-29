@@ -207,24 +207,15 @@ endpoints.
 
 - Linux host with root access for runtime work
 - `containerd`
+- `iproute2` on Ubuntu or `iproute` on RHEL, including the `ip` command used
+  by CNI setup and cleanup paths
 - `nftables`, including the `nft` command used for rootful service routing
 - `kmod`, including `modprobe` for kernel module setup such as `br_netfilter`
 - `kubectl` for interacting with the generated kubeconfig
 
-Install runtime dependencies on Ubuntu:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y containerd kmod nftables
-```
-
-Install runtime dependencies on RHEL:
-
-```bash
-sudo dnf install -y dnf-plugins-core kmod nftables
-sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-sudo dnf install -y containerd.io --setopt=install_weak_deps=False
-```
+When installing from the public APT or RPM repositories, the package metadata
+declares the runtime dependencies so the package manager installs them with
+`klights`.
 
 For source builds, also install:
 
