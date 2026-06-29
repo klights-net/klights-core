@@ -166,6 +166,7 @@ node runtime services for local clusters.
 %install
 mkdir -p %{buildroot}/usr/bin
 install -m 0755 usr/bin/klights %{buildroot}%{_bindir}/klights
+mkdir -p %{buildroot}/var/lib/klights
 %if %{has_systemd}
 mkdir -p %{buildroot}/usr/lib/systemd/system
 install -m 0644 usr/lib/systemd/system/klights.service \
