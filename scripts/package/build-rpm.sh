@@ -110,7 +110,7 @@ trap cleanup EXIT
 TOPDIR="$TMPROOT/topdir"
 SOURCE_ROOT="$TMPROOT/klights-${VERSION}"
 mkdir -p "$TOPDIR/SPECS" "$TOPDIR/SOURCES" "$TOPDIR/BUILD" "$TOPDIR/RPMS" "$TOPDIR/SRPMS"
-mkdir -p "$SOURCE_ROOT/usr/bin" "$SOURCE_ROOT/usr/lib/systemd/system" "$SOURCE_ROOT/etc/sysconfig"
+mkdir -p "$SOURCE_ROOT/usr/bin" "$SOURCE_ROOT/usr/lib/systemd/system" "$SOURCE_ROOT/etc/sysconfig" "$SOURCE_ROOT/var/lib/klights"
 
 install -m 0755 "$BINARY" "$SOURCE_ROOT/usr/bin/klights"
 
@@ -179,6 +179,7 @@ install -m 0644 etc/sysconfig/klights %{buildroot}/etc/sysconfig/klights
 %files
 %defattr(-,root,root,-)
 %attr(0755,root,root) %{_bindir}/klights
+%dir %attr(0755,root,root) /var/lib/klights
 %if %{has_systemd}
 /usr/lib/systemd/system/klights.service
 %endif

@@ -75,7 +75,9 @@ jobs:
             apt-get install -y klights
             dpkg-query -W -f="\${Version}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1~resolute"
             test -f /etc/default/klights
+            grep -Fx "KLIGHTS_DATA_ROOT=/var/lib/klights" /etc/default/klights
             grep -Fx "KLIGHTS_ARGS=start" /etc/default/klights
+            test -d /var/lib/klights
             systemctl cat klights | grep -F "RUST_LOG=info"
           '
 
@@ -248,7 +250,9 @@ jobs:
             dnf install -y klights
             rpm -q --qf "%{VERSION}-%{RELEASE}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1.el10"
             test -f /etc/sysconfig/klights
+            grep -Fx "KLIGHTS_DATA_ROOT=/var/lib/klights" /etc/sysconfig/klights
             grep -Fx "KLIGHTS_ARGS=start" /etc/sysconfig/klights
+            test -d /var/lib/klights
             systemctl cat klights | grep -F "RUST_LOG=info"
           '
 
@@ -429,7 +433,9 @@ jobs:
             apt-get install -y klights
             dpkg-query -W -f="\${Version}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1~resolute"
             test -f /etc/default/klights
+            grep -Fx "KLIGHTS_DATA_ROOT=/var/lib/klights" /etc/default/klights
             grep -Fx "KLIGHTS_ARGS=start" /etc/default/klights
+            test -d /var/lib/klights
             systemctl cat klights | grep -F "RUST_LOG=info"
           '
 
@@ -602,7 +608,9 @@ jobs:
             dnf install -y klights
             rpm -q --qf "%{VERSION}-%{RELEASE}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1.el10"
             test -f /etc/sysconfig/klights
+            grep -Fx "KLIGHTS_DATA_ROOT=/var/lib/klights" /etc/sysconfig/klights
             grep -Fx "KLIGHTS_ARGS=start" /etc/sysconfig/klights
+            test -d /var/lib/klights
             systemctl cat klights | grep -F "RUST_LOG=info"
           '
 

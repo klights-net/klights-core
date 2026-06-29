@@ -4,6 +4,9 @@
 # Set this variable to override it for this node.
 # RUST_LOG=info
 
+# Data root used by the packaged service.
+KLIGHTS_DATA_ROOT=/var/lib/klights
+
 # Pass command arguments to /usr/bin/klights.
 KLIGHTS_ARGS=start
 

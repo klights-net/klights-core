@@ -118,7 +118,7 @@ cleanup() {
 trap cleanup EXIT
 
 STAGING="$TMPDIR/pkg"
-mkdir -p "$STAGING/DEBIAN" "$STAGING/usr/bin"
+mkdir -p "$STAGING/DEBIAN" "$STAGING/usr/bin" "$STAGING/var/lib/klights"
 
 install -m 0755 "$BINARY" "$STAGING/usr/bin/klights"
 
