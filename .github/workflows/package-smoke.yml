@@ -136,9 +136,11 @@ jobs:
       - name: Install kubectl and verify node readiness
         run: |
           set -euo pipefail
+          kubectl_bin="kubectl-${{ matrix.container_name }}"
+          curl -fsSLo "$kubectl_bin" "https://dl.k8s.io/release/v1.34.1/bin/linux/${{ matrix.kubectl_arch }}/kubectl"
+          docker cp "$kubectl_bin" "${{ matrix.container_name }}:/usr/local/bin/kubectl"
           docker exec -e EXPECTED_KLIGHTS_VERSION "${{ matrix.container_name }}" bash -lc '
             set -euo pipefail
-            curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.34.1/bin/linux/${{ matrix.kubectl_arch }}/kubectl"
             chmod +x /usr/local/bin/kubectl
             export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
             kubectl get nodes
@@ -301,9 +303,11 @@ jobs:
       - name: Install kubectl and verify node readiness
         run: |
           set -euo pipefail
+          kubectl_bin="kubectl-${{ matrix.container_name }}"
+          curl -fsSLo "$kubectl_bin" "https://dl.k8s.io/release/v1.34.1/bin/linux/${{ matrix.kubectl_arch }}/kubectl"
+          docker cp "$kubectl_bin" "${{ matrix.container_name }}:/usr/local/bin/kubectl"
           docker exec -e EXPECTED_KLIGHTS_VERSION "${{ matrix.container_name }}" bash -lc '
             set -euo pipefail
-            curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.34.1/bin/linux/${{ matrix.kubectl_arch }}/kubectl"
             chmod +x /usr/local/bin/kubectl
             export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
             kubectl get nodes
