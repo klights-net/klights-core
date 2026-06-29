@@ -5,7 +5,7 @@
 # RUST_LOG=info
 
 # Pass command arguments to /usr/bin/klights.
-# KLIGHTS_ARGS=""
+KLIGHTS_ARGS=start
 
 # Root mode example:
 # KLIGHTS_ARGS="--data-dir /var/lib/klights"
