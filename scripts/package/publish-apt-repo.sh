@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat >&2 <<EOF_USAGE
 Usage: $(basename "$0") \
-  --packages DIR --repo DIR --suite SUITE --origin ORIGIN --label LABEL --codename CODENAME
+  --packages DIR --repo DIR --suite SUITE --arch ARCH --origin ORIGIN --label LABEL --codename CODENAME
 
 Build a static APT repository for klights Debian packages.
 EOF_USAGE
@@ -14,6 +14,7 @@ EOF_USAGE
 PACKAGES_DIR=""
 REPO_DIR=""
 SUITE=""
+ARCH=""
 ORIGIN=""
 LABEL=""
 CODENAME=""
@@ -42,6 +43,14 @@ while [[ "$#" -gt 0 ]]; do
         usage
       fi
       SUITE=$2
+      shift 2
+      ;;
+    --arch)
+      if [[ "$#" -lt 2 ]]; then
+        echo "--arch requires amd64|arm64" >&2
+        usage
+      fi
+      ARCH=$2
       shift 2
       ;;
     --origin)
@@ -78,9 +87,14 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$PACKAGES_DIR" || -z "$REPO_DIR" || -z "$SUITE" || -z "$ORIGIN" || -z "$LABEL" || -z "$CODENAME" ]]; then
+if [[ -z "$PACKAGES_DIR" || -z "$REPO_DIR" || -z "$SUITE" || -z "$ARCH" || -z "$ORIGIN" || -z "$LABEL" || -z "$CODENAME" ]]; then
   echo "Missing required arguments." >&2
   usage
+fi
+
+if [[ "$ARCH" != "amd64" && "$ARCH" != "arm64" ]]; then
+  echo "--arch must be amd64 or arm64" >&2
+  exit 1
 fi
 
 if ! command -v dpkg-scanpackages >/dev/null 2>&1; then
@@ -96,10 +110,10 @@ fi
 mkdir -p "$REPO_DIR"
 POOL_DIR="$REPO_DIR/pool/$SUITE/main/k/klights"
 DIST_ROOT="$REPO_DIR/dists/$SUITE"
-BINARY_DIR="$DIST_ROOT/main/binary-amd64"
+BINARY_DIR="$DIST_ROOT/main/binary-$ARCH"
 mkdir -p "$POOL_DIR" "$BINARY_DIR"
 
-PATTERN="klights_*~${SUITE}_amd64.deb"
+PATTERN="klights_*~${SUITE}_${ARCH}.deb"
 shopt -s nullglob
 package_count=0
 for package_file in "$PACKAGES_DIR"/$PATTERN; do
@@ -113,16 +127,17 @@ if [[ "$package_count" -eq 0 ]]; then
   exit 1
 fi
 
-( cd "$REPO_DIR" && dpkg-scanpackages --arch amd64 "pool/$SUITE/main/k/klights" ) > "$BINARY_DIR/Packages"
+( cd "$REPO_DIR" && dpkg-scanpackages --arch "$ARCH" "pool/$SUITE/main/k/klights" ) > "$BINARY_DIR/Packages"
 gzip -9c "$BINARY_DIR/Packages" > "$BINARY_DIR/Packages.gz"
 
 RELEASE_FILE="$DIST_ROOT/Release"
+ARCHITECTURES="$(find "$DIST_ROOT/main" -maxdepth 1 -type d -name 'binary-*' -printf '%f\n' | sed 's/^binary-//' | sort | tr '\n' ' ' | sed 's/ $//')"
 apt-ftparchive \
   -o "APT::FTPArchive::Release::Origin=$ORIGIN" \
   -o "APT::FTPArchive::Release::Label=$LABEL" \
   -o "APT::FTPArchive::Release::Suite=$SUITE" \
   -o "APT::FTPArchive::Release::Codename=$CODENAME" \
-  -o "APT::FTPArchive::Release::Architectures=amd64" \
+  -o "APT::FTPArchive::Release::Architectures=$ARCHITECTURES" \
   -o "APT::FTPArchive::Release::Components=main" \
   release "$DIST_ROOT" > "$RELEASE_FILE"
 

@@ -10,7 +10,17 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_name: x86_64
+            runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+          - arch_name: arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -45,7 +55,7 @@ jobs:
         run: |
           rustup toolchain install 1.95.0 --profile minimal
           rustup default 1.95.0
-          rustup target add x86_64-unknown-linux-gnu
+          rustup target add "${{ matrix.rust_target }}"
 
       - name: Print release build diagnostics
         run: |
@@ -83,15 +93,15 @@ jobs:
           mkdir -p dist/binary-artifact
           if gh release download "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern klights-linux-x86_64-static \
+            --pattern "klights-linux-${{ matrix.arch_name }}-static" \
             --dir dist/binary-artifact; then
-            test -f dist/binary-artifact/klights-linux-x86_64-static
-            mv dist/binary-artifact/klights-linux-x86_64-static dist/binary-artifact/klights
+            test -f "dist/binary-artifact/klights-linux-${{ matrix.arch_name }}-static"
+            mv "dist/binary-artifact/klights-linux-${{ matrix.arch_name }}-static" dist/binary-artifact/klights
             chmod 0755 dist/binary-artifact/klights
             echo "restored=true" >> "$GITHUB_OUTPUT"
             echo "Reusing staged static binary from GitHub Release ${GITHUB_REF_NAME}"
           else
-            rm -f dist/binary-artifact/klights dist/binary-artifact/klights-linux-x86_64-static
+            rm -f dist/binary-artifact/klights "dist/binary-artifact/klights-linux-${{ matrix.arch_name }}-static"
             echo "restored=false" >> "$GITHUB_OUTPUT"
             echo "No staged static binary found for ${GITHUB_REF_NAME}; building from source."
           fi
@@ -103,6 +113,8 @@ jobs:
           CC: gcc-13
           CXX: g++-13
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: gcc-13
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: gcc-13
+          KLIGHTS_STATIC_TARGET: ${{ matrix.rust_target }}
         run: |
           set +e
           ./release.sh --static 2>&1 | tee release-build.log
@@ -145,7 +157,7 @@ jobs:
         run: |
           mkdir -p dist/binary-artifact
           install -m 0755 target/release/klights dist/binary-artifact/klights
-          install -m 0755 target/release/klights dist/binary-artifact/klights-linux-x86_64-static
+          install -m 0755 target/release/klights "dist/binary-artifact/klights-linux-${{ matrix.arch_name }}-static"
           install -m 0644 release-build.log dist/binary-artifact/release-build.log
 
       - name: Publish staged static binary
@@ -156,12 +168,12 @@ jobs:
           name: klights ${{ github.ref_name }}
           fail_on_unmatched_files: true
           overwrite_files: true
-          files: dist/binary-artifact/klights-linux-x86_64-static
+          files: dist/binary-artifact/klights-linux-${{ matrix.arch_name }}-static
 
       - name: Upload static binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: klights-static-binary
+          name: klights-static-binary-${{ matrix.arch_name }}
           path: dist/binary-artifact/klights
           retention-days: 14
 
@@ -175,11 +187,17 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      - name: Download static binary
+      - name: Download x86_64 static binary
         uses: actions/download-artifact@v4
         with:
-          name: klights-static-binary
-          path: dist/binary
+          name: klights-static-binary-x86_64
+          path: dist/binary/x86_64
+
+      - name: Download arm64 static binary
+        uses: actions/download-artifact@v4
+        with:
+          name: klights-static-binary-arm64
+          path: dist/binary/arm64
 
       - name: Install package tooling
         run: |
@@ -195,7 +213,7 @@ jobs:
 
       - name: Prepare binary artifact
         run: |
-          chmod +x dist/binary/klights
+          chmod +x dist/binary/x86_64/klights dist/binary/arm64/klights
 
       - name: Validate tag and derive version
         env:
@@ -245,39 +263,59 @@ jobs:
             mkdir -p dist/packages
             mkdir -p dist/runtime
             containerd_base="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}"
-            containerd_asset="containerd-static-${CONTAINERD_VERSION}-linux-amd64.tar.gz"
-            curl -fsSLo "dist/runtime/${containerd_asset}" "${containerd_base}/${containerd_asset}"
-            curl -fsSLo "dist/runtime/${containerd_asset}.sha256sum" "${containerd_base}/${containerd_asset}.sha256sum"
-            (cd dist/runtime && sha256sum -c "${containerd_asset}.sha256sum")
-            mkdir -p dist/runtime/containerd
-            tar -C dist/runtime/containerd -xzf "dist/runtime/${containerd_asset}"
             curl -fsSLo dist/runtime/containerd-LICENSE "https://raw.githubusercontent.com/containerd/containerd/v${CONTAINERD_VERSION}/LICENSE"
             curl -fsSLo dist/runtime/containerd-NOTICE "https://raw.githubusercontent.com/containerd/containerd/v${CONTAINERD_VERSION}/NOTICE"
             runc_base="https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}"
-            curl -fsSLo dist/runtime/runc.amd64 "${runc_base}/runc.amd64"
             curl -fsSLo dist/runtime/runc.sha256sum "${runc_base}/runc.sha256sum"
-            grep ' runc.amd64$' dist/runtime/runc.sha256sum | (cd dist/runtime && sha256sum -c -)
-            chmod 0755 dist/runtime/runc.amd64
             curl -fsSLo dist/runtime/runc-LICENSE "https://raw.githubusercontent.com/opencontainers/runc/v${RUNC_VERSION}/LICENSE"
             curl -fsSLo dist/runtime/runc-NOTICE "https://raw.githubusercontent.com/opencontainers/runc/v${RUNC_VERSION}/NOTICE"
-            scripts/package/build-deb.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --suite noble --distro ubuntu24.04 --out dist/packages
-            scripts/package/build-deb.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --suite resolute --distro ubuntu26.04 --out dist/packages
-            scripts/package/build-rhel-runtime-rpms.sh --containerd-dir dist/runtime/containerd --runc-bin dist/runtime/runc.amd64 --containerd-version "$CONTAINERD_VERSION" --runc-version "$RUNC_VERSION" --containerd-license dist/runtime/containerd-LICENSE --containerd-notice dist/runtime/containerd-NOTICE --runc-license dist/runtime/runc-LICENSE --runc-notice dist/runtime/runc-NOTICE --distro el9 --out dist/packages
-            scripts/package/build-rhel-runtime-rpms.sh --containerd-dir dist/runtime/containerd --runc-bin dist/runtime/runc.amd64 --containerd-version "$CONTAINERD_VERSION" --runc-version "$RUNC_VERSION" --containerd-license dist/runtime/containerd-LICENSE --containerd-notice dist/runtime/containerd-NOTICE --runc-license dist/runtime/runc-LICENSE --runc-notice dist/runtime/runc-NOTICE --distro el10 --out dist/packages
-            scripts/package/build-rpm.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --distro el9 --out dist/packages
-            scripts/package/build-rpm.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --distro el10 --out dist/packages
+            for runtime_arch in amd64 arm64; do
+              containerd_asset="containerd-static-${CONTAINERD_VERSION}-linux-${runtime_arch}.tar.gz"
+              curl -fsSLo "dist/runtime/${containerd_asset}" "${containerd_base}/${containerd_asset}"
+              curl -fsSLo "dist/runtime/${containerd_asset}.sha256sum" "${containerd_base}/${containerd_asset}.sha256sum"
+              (cd dist/runtime && sha256sum -c "${containerd_asset}.sha256sum")
+              mkdir -p "dist/runtime/containerd-${runtime_arch}"
+              tar -C "dist/runtime/containerd-${runtime_arch}" -xzf "dist/runtime/${containerd_asset}"
+              curl -fsSLo "dist/runtime/runc.${runtime_arch}" "${runc_base}/runc.${runtime_arch}"
+              grep " runc.${runtime_arch}$" dist/runtime/runc.sha256sum | (cd dist/runtime && sha256sum -c -)
+              chmod 0755 "dist/runtime/runc.${runtime_arch}"
+            done
+            scripts/package/build-deb.sh --binary dist/binary/x86_64/klights --version "$KLIGHTS_VERSION" --suite noble --distro ubuntu24.04 --arch amd64 --out dist/packages
+            scripts/package/build-deb.sh --binary dist/binary/x86_64/klights --version "$KLIGHTS_VERSION" --suite resolute --distro ubuntu26.04 --arch amd64 --out dist/packages
+            scripts/package/build-deb.sh --binary dist/binary/arm64/klights --version "$KLIGHTS_VERSION" --suite noble --distro ubuntu24.04 --arch arm64 --out dist/packages
+            scripts/package/build-deb.sh --binary dist/binary/arm64/klights --version "$KLIGHTS_VERSION" --suite resolute --distro ubuntu26.04 --arch arm64 --out dist/packages
+            scripts/package/build-rhel-runtime-rpms.sh --containerd-dir dist/runtime/containerd-amd64 --runc-bin dist/runtime/runc.amd64 --containerd-version "$CONTAINERD_VERSION" --runc-version "$RUNC_VERSION" --containerd-license dist/runtime/containerd-LICENSE --containerd-notice dist/runtime/containerd-NOTICE --runc-license dist/runtime/runc-LICENSE --runc-notice dist/runtime/runc-NOTICE --distro el9 --arch x86_64 --out dist/packages
+            scripts/package/build-rhel-runtime-rpms.sh --containerd-dir dist/runtime/containerd-amd64 --runc-bin dist/runtime/runc.amd64 --containerd-version "$CONTAINERD_VERSION" --runc-version "$RUNC_VERSION" --containerd-license dist/runtime/containerd-LICENSE --containerd-notice dist/runtime/containerd-NOTICE --runc-license dist/runtime/runc-LICENSE --runc-notice dist/runtime/runc-NOTICE --distro el10 --arch x86_64 --out dist/packages
+            scripts/package/build-rhel-runtime-rpms.sh --containerd-dir dist/runtime/containerd-arm64 --runc-bin dist/runtime/runc.arm64 --containerd-version "$CONTAINERD_VERSION" --runc-version "$RUNC_VERSION" --containerd-license dist/runtime/containerd-LICENSE --containerd-notice dist/runtime/containerd-NOTICE --runc-license dist/runtime/runc-LICENSE --runc-notice dist/runtime/runc-NOTICE --distro el9 --arch aarch64 --out dist/packages
+            scripts/package/build-rhel-runtime-rpms.sh --containerd-dir dist/runtime/containerd-arm64 --runc-bin dist/runtime/runc.arm64 --containerd-version "$CONTAINERD_VERSION" --runc-version "$RUNC_VERSION" --containerd-license dist/runtime/containerd-LICENSE --containerd-notice dist/runtime/containerd-NOTICE --runc-license dist/runtime/runc-LICENSE --runc-notice dist/runtime/runc-NOTICE --distro el10 --arch aarch64 --out dist/packages
+            scripts/package/build-rpm.sh --binary dist/binary/x86_64/klights --version "$KLIGHTS_VERSION" --distro el9 --arch x86_64 --out dist/packages
+            scripts/package/build-rpm.sh --binary dist/binary/x86_64/klights --version "$KLIGHTS_VERSION" --distro el10 --arch x86_64 --out dist/packages
+            scripts/package/build-rpm.sh --binary dist/binary/arm64/klights --version "$KLIGHTS_VERSION" --distro el9 --arch aarch64 --out dist/packages
+            scripts/package/build-rpm.sh --binary dist/binary/arm64/klights --version "$KLIGHTS_VERSION" --distro el10 --arch aarch64 --out dist/packages
             test -f "dist/packages/klights_${KLIGHTS_VERSION}-1~noble_amd64.deb"
             test -f "dist/packages/klights_${KLIGHTS_VERSION}-1~resolute_amd64.deb"
+            test -f "dist/packages/klights_${KLIGHTS_VERSION}-1~noble_arm64.deb"
+            test -f "dist/packages/klights_${KLIGHTS_VERSION}-1~resolute_arm64.deb"
             test -f "dist/packages/containerd-${CONTAINERD_VERSION}-1.el9.x86_64.rpm"
             test -f "dist/packages/containerd-${CONTAINERD_VERSION}-1.el10.x86_64.rpm"
+            test -f "dist/packages/containerd-${CONTAINERD_VERSION}-1.el9.aarch64.rpm"
+            test -f "dist/packages/containerd-${CONTAINERD_VERSION}-1.el10.aarch64.rpm"
             test -f "dist/packages/runc-${RUNC_VERSION}-1.el9.x86_64.rpm"
             test -f "dist/packages/runc-${RUNC_VERSION}-1.el10.x86_64.rpm"
+            test -f "dist/packages/runc-${RUNC_VERSION}-1.el9.aarch64.rpm"
+            test -f "dist/packages/runc-${RUNC_VERSION}-1.el10.aarch64.rpm"
             test -f "dist/packages/klights-${KLIGHTS_VERSION}-1.el9.x86_64.rpm"
             test -f "dist/packages/klights-${KLIGHTS_VERSION}-1.el10.x86_64.rpm"
-            scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite noble --origin klights --label klights --codename noble
-            scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite resolute --origin klights --label klights --codename resolute
-            scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el9
-            scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el10
+            test -f "dist/packages/klights-${KLIGHTS_VERSION}-1.el9.aarch64.rpm"
+            test -f "dist/packages/klights-${KLIGHTS_VERSION}-1.el10.aarch64.rpm"
+            scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite noble --arch amd64 --origin klights --label klights --codename noble
+            scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite noble --arch arm64 --origin klights --label klights --codename noble
+            scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite resolute --arch amd64 --origin klights --label klights --codename resolute
+            scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite resolute --arch arm64 --origin klights --label klights --codename resolute
+            scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el9 --arch x86_64
+            scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el9 --arch aarch64
+            scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el10 --arch x86_64
+            scripts/package/publish-rpm-repo.sh --packages dist/packages --repo public/rpm --distro el10 --arch aarch64
             cd dist/packages
             shopt -s nullglob
             files=(*)
@@ -286,7 +324,7 @@ jobs:
               exit 1
             fi
             sha256sum "${files[@]}" \
-              | sed -E 's/(  klights_[0-9.]+-1)~(noble|resolute)(_amd64[.]deb)$/\1.\2\3/' \
+              | sed -E 's/(  klights_[0-9.]+-1)~(noble|resolute)(_(amd64|arm64)[.]deb)$/\1.\2\3/' \
               > SHA256SUMS
           ) 2>&1 | tee package-build.log
 
@@ -381,11 +419,11 @@ jobs:
             echo
             echo "This release publishes:"
             echo
-            echo "- Ubuntu 24.04 (noble): \`klights_${VERSION}-1~noble_amd64.deb\`"
-            echo "- Ubuntu 26.04 (resolute): \`klights_${VERSION}-1~resolute_amd64.deb\`"
-            echo "- RHEL 9: \`klights-${VERSION}-1.el9.x86_64.rpm\`"
-            echo "- RHEL 10: \`klights-${VERSION}-1.el10.x86_64.rpm\`"
-            echo "- RHEL runtime dependencies: \`containerd-${CONTAINERD_VERSION}-1.el9.x86_64.rpm\`, \`containerd-${CONTAINERD_VERSION}-1.el10.x86_64.rpm\`, \`runc-${RUNC_VERSION}-1.el9.x86_64.rpm\`, \`runc-${RUNC_VERSION}-1.el10.x86_64.rpm\`"
+            echo "- Ubuntu 24.04 (noble): \`klights_${VERSION}-1~noble_amd64.deb\`, \`klights_${VERSION}-1~noble_arm64.deb\`"
+            echo "- Ubuntu 26.04 (resolute): \`klights_${VERSION}-1~resolute_amd64.deb\`, \`klights_${VERSION}-1~resolute_arm64.deb\`"
+            echo "- RHEL 9: \`klights-${VERSION}-1.el9.x86_64.rpm\`, \`klights-${VERSION}-1.el9.aarch64.rpm\`"
+            echo "- RHEL 10: \`klights-${VERSION}-1.el10.x86_64.rpm\`, \`klights-${VERSION}-1.el10.aarch64.rpm\`"
+            echo "- RHEL runtime dependencies: \`containerd-${CONTAINERD_VERSION}-1.el9.x86_64.rpm\`, \`containerd-${CONTAINERD_VERSION}-1.el9.aarch64.rpm\`, \`containerd-${CONTAINERD_VERSION}-1.el10.x86_64.rpm\`, \`containerd-${CONTAINERD_VERSION}-1.el10.aarch64.rpm\`, \`runc-${RUNC_VERSION}-1.el9.x86_64.rpm\`, \`runc-${RUNC_VERSION}-1.el9.aarch64.rpm\`, \`runc-${RUNC_VERSION}-1.el10.x86_64.rpm\`, \`runc-${RUNC_VERSION}-1.el10.aarch64.rpm\`"
             echo
             echo "Package repositories are published from the \`package-repo\` branch:"
             echo
@@ -464,11 +502,17 @@ jobs:
             "apt/dists/noble/Release"
             "apt/dists/noble/main/binary-amd64/Packages"
             "apt/dists/noble/main/binary-amd64/Packages.gz"
+            "apt/dists/noble/main/binary-arm64/Packages"
+            "apt/dists/noble/main/binary-arm64/Packages.gz"
             "apt/dists/resolute/Release"
             "apt/dists/resolute/main/binary-amd64/Packages"
             "apt/dists/resolute/main/binary-amd64/Packages.gz"
+            "apt/dists/resolute/main/binary-arm64/Packages"
+            "apt/dists/resolute/main/binary-arm64/Packages.gz"
             "rpm/el9/x86_64/repodata/repomd.xml"
+            "rpm/el9/aarch64/repodata/repomd.xml"
             "rpm/el10/x86_64/repodata/repomd.xml"
+            "rpm/el10/aarch64/repodata/repomd.xml"
           )
 
           for path in "${paths[@]}"; do
@@ -488,6 +532,10 @@ jobs:
           done
 
           curl -fsSL "${base_url}/apt/dists/noble/main/binary-amd64/Packages" | grep -q '^Package: klights$'
+          curl -fsSL "${base_url}/apt/dists/noble/main/binary-arm64/Packages" | grep -q '^Package: klights$'
           curl -fsSL "${base_url}/apt/dists/resolute/main/binary-amd64/Packages" | grep -q '^Package: klights$'
+          curl -fsSL "${base_url}/apt/dists/resolute/main/binary-arm64/Packages" | grep -q '^Package: klights$'
           curl -fsSL "${base_url}/rpm/el9/x86_64/repodata/repomd.xml" | grep -q 'primary'
+          curl -fsSL "${base_url}/rpm/el9/aarch64/repodata/repomd.xml" | grep -q 'primary'
           curl -fsSL "${base_url}/rpm/el10/x86_64/repodata/repomd.xml" | grep -q 'primary'
+          curl -fsSL "${base_url}/rpm/el10/aarch64/repodata/repomd.xml" | grep -q 'primary'

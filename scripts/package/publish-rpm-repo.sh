@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<EOF_USAGE
-Usage: $(basename "$0") --packages DIR --repo DIR --distro el9|el10
+Usage: $(basename "$0") --packages DIR --repo DIR --distro el9|el10 --arch x86_64|aarch64
 
 Build an RPM repository for klights.
 EOF_USAGE
@@ -13,6 +13,7 @@ EOF_USAGE
 PACKAGES_DIR=""
 REPO_DIR=""
 DISTRO=""
+ARCH=""
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -40,6 +41,14 @@ while [[ "$#" -gt 0 ]]; do
       DISTRO=$2
       shift 2
       ;;
+    --arch)
+      if [[ "$#" -lt 2 ]]; then
+        echo "--arch requires x86_64|aarch64" >&2
+        usage
+      fi
+      ARCH=$2
+      shift 2
+      ;;
     --help|-h)
       usage
       ;;
@@ -50,7 +59,7 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$PACKAGES_DIR" || -z "$REPO_DIR" || -z "$DISTRO" ]]; then
+if [[ -z "$PACKAGES_DIR" || -z "$REPO_DIR" || -z "$DISTRO" || -z "$ARCH" ]]; then
   echo "Missing required argument." >&2
   usage
 fi
@@ -60,20 +69,32 @@ if [[ "$DISTRO" != "el9" && "$DISTRO" != "el10" ]]; then
   exit 1
 fi
 
+if [[ "$ARCH" != "x86_64" && "$ARCH" != "aarch64" ]]; then
+  echo "--arch must be x86_64 or aarch64" >&2
+  exit 1
+fi
+
 if ! command -v createrepo_c >/dev/null 2>&1; then
   echo "createrepo_c not found. Install createrepo_c package." >&2
   exit 1
 fi
 
-mkdir -p "$REPO_DIR/$DISTRO/x86_64"
-RPM_REPO="$REPO_DIR/$DISTRO/x86_64"
+mkdir -p "$REPO_DIR/$DISTRO/$ARCH"
+RPM_REPO="$REPO_DIR/$DISTRO/$ARCH"
 
 shopt -s nullglob
 package_count=0
 for package_file in \
   "$PACKAGES_DIR"/klights-*-1.${DISTRO}.x86_64.rpm \
   "$PACKAGES_DIR"/containerd-*-1.${DISTRO}.x86_64.rpm \
-  "$PACKAGES_DIR"/runc-*-1.${DISTRO}.x86_64.rpm; do
+  "$PACKAGES_DIR"/runc-*-1.${DISTRO}.x86_64.rpm \
+  "$PACKAGES_DIR"/klights-*-1.${DISTRO}.aarch64.rpm \
+  "$PACKAGES_DIR"/containerd-*-1.${DISTRO}.aarch64.rpm \
+  "$PACKAGES_DIR"/runc-*-1.${DISTRO}.aarch64.rpm; do
+  case "$(basename "$package_file")" in
+    *".${ARCH}.rpm") ;;
+    *) continue ;;
+  esac
   install -m 0644 "$package_file" "$RPM_REPO/"
   package_count=$((package_count + 1))
 done
