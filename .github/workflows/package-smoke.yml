@@ -239,13 +239,6 @@ jobs:
           docker exec -e EXPECTED_KLIGHTS_VERSION klights-rhel10 bash -lc '
             set -euo pipefail
             printf "%s\n" \
-              "[docker-ce-stable]" \
-              "name=Docker CE Stable - \$basearch" \
-              "baseurl=https://download.docker.com/linux/centos/\$releasever/\$basearch/stable" \
-              "enabled=1" \
-              "gpgcheck=0" \
-              > /etc/yum.repos.d/docker-ce.repo
-            printf "%s\n" \
               "[klights]" \
               "name=klights" \
               "baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el10/x86_64" \

@@ -130,12 +130,13 @@ Summary:        Lightweight Kubernetes runtime
 License:        AGPL-3.0-or-later
 BuildArch:      x86_64
 Source0:        klights-%{version}.tar.gz
-Requires:       containerd
+Requires:       containerd >= 2.3.2
 Requires:       iproute
 Requires:       kmod
 Requires:       libmnl
 Requires:       libnftnl
 Requires:       nftables
+Requires:       runc >= 1.5.0
 
 %description
 Klights is a compact Rust implementation of core Kubernetes control-plane and

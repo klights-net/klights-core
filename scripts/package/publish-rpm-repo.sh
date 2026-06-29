@@ -68,10 +68,12 @@ fi
 mkdir -p "$REPO_DIR/$DISTRO/x86_64"
 RPM_REPO="$REPO_DIR/$DISTRO/x86_64"
 
-PATTERN="klights-*-1.${DISTRO}.x86_64.rpm"
 shopt -s nullglob
 package_count=0
-for package_file in "$PACKAGES_DIR"/$PATTERN; do
+for package_file in \
+  "$PACKAGES_DIR"/klights-*-1.${DISTRO}.x86_64.rpm \
+  "$PACKAGES_DIR"/containerd-*-1.${DISTRO}.x86_64.rpm \
+  "$PACKAGES_DIR"/runc-*-1.${DISTRO}.x86_64.rpm; do
   install -m 0644 "$package_file" "$RPM_REPO/"
   package_count=$((package_count + 1))
 done
