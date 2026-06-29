@@ -127,6 +127,8 @@ jobs:
               exit 1
             fi
             kubectl get nodes -o wide
+            kubectl version -o yaml
+            kubectl version -o json | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v1\.34\.6'
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             nginx_ready=false
             for attempt in {1..90}; do
@@ -301,6 +303,8 @@ jobs:
               exit 1
             fi
             kubectl get nodes -o wide
+            kubectl version -o yaml
+            kubectl version -o json | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v1\.34\.6'
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             nginx_ready=false
             for attempt in {1..90}; do
@@ -483,6 +487,8 @@ jobs:
               exit 1
             fi
             kubectl get nodes -o wide
+            kubectl version -o yaml
+            kubectl version -o json | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v1\.34\.6'
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             nginx_ready=false
             for attempt in {1..90}; do
@@ -657,6 +663,8 @@ jobs:
               exit 1
             fi
             kubectl get nodes -o wide
+            kubectl version -o yaml
+            kubectl version -o json | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v1\.34\.6'
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             nginx_ready=false
             for attempt in {1..90}; do
@@ -719,14 +727,3 @@ jobs:
             journalctl -u containerd --no-pager -n 120 || true
           ' || true
           docker rm -f klights-rhel10-arm64 || true
-
-jobs:
-  ubuntu-26-04-apt-arm64:
-    name: Ubuntu 26.04 APT package smoke (arm64)
-    runs-on: ubuntu-24.04-arm-arm
-    timeout-minutes: 35
-    env:
-      EXPECTED_KLIGHTS_VERSION: 0.9.10
-    steps:
-      - name: Start Ubuntu 26.04 systemd container
-        run: |
