@@ -125,7 +125,7 @@ Section: admin
 Priority: optional
 Architecture: amd64
 Maintainer: klights maintainers <maintainers@klights.net>
-Depends: containerd, libmnl0, libnftnl11
+Depends: containerd, iproute2, kmod, libmnl0, libnftnl11, nftables
 Description: Lightweight Kubernetes runtime
  Klights packages an async, minimal Kubernetes-compatible control plane and
  node runtime stack for local clusters.
