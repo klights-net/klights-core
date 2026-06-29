@@ -7,10 +7,12 @@ mod cases {
     #![allow(clippy::await_holding_lock)]
     use super::super::*;
     use crate::datastore::backend::DatastoreBackend;
+    use crate::datastore::command::{COMMAND_CODEC_VERSION, CommandId};
     use crate::datastore::errors::OpenError;
     use crate::datastore::types::*;
     use async_trait::async_trait;
     use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// T7.2: Create a ReplicatedDatastore in Raft mode with an inline
     /// proposer that applies commands directly to the inner backend.
@@ -423,6 +425,107 @@ mod cases {
             retained.len() <= 5,
             "raft-applied GC must prune the watch table to the retained window; got {} events",
             retained.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_op_applied_outbox_gc_does_not_allocate_local_raft_rv() {
+        let inner: crate::datastore::backend::DatastoreHandle =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        let ds = ReplicatedDatastore::new(
+            inner.clone(),
+            ReplicationMode::Raft {
+                node_name: "leader".into(),
+            },
+        );
+        let before = inner.get_current_resource_version().await.unwrap();
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let removed = ds
+            .gc_applied_outbox(now_ms, 60_000)
+            .await
+            .expect("empty outbox should not require proposer");
+
+        assert_eq!(removed, 0, "empty applied_outbox should make GC a no-op");
+        assert_eq!(
+            inner.get_current_resource_version().await.unwrap(),
+            before,
+            "no-op applied_outbox GC must not create leader-local raft metadata RV drift"
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_mode_applied_outbox_gc_routes_through_proposer_and_prunes_via_apply() {
+        let (ds, calls) = make_ds_with_inline_proposer().await;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        ds.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+            idempotency_key: "old-legacy-row".into(),
+            subject_key: "v1:Pod:default:old".into(),
+            operation: "PodStatus".into(),
+            first_seen_ms: now_ms - 86_400_000,
+            applied_rv: Some(12),
+            result_proto: vec![0x01, 0x02, 0x03],
+            status_stamp: None,
+        })
+        .await
+        .expect("seed legacy outbox row");
+        ds.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+            idempotency_key: "recent-legacy-row".into(),
+            subject_key: "v1:Pod:default:recent".into(),
+            operation: "PodStatus".into(),
+            first_seen_ms: now_ms - 1_000,
+            applied_rv: Some(13),
+            result_proto: vec![0x04],
+            status_stamp: None,
+        })
+        .await
+        .expect("seed recent outbox row");
+        calls.lock().unwrap().clear();
+
+        let removed = ds
+            .gc_applied_outbox(now_ms, 60_000)
+            .await
+            .expect("applied_outbox GC must commit through raft");
+
+        assert_eq!(
+            removed, 1,
+            "only the stale row should be reported as prunable"
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["GcAppliedOutbox"],
+            "applied_outbox GC must route through the raft proposer instead of writing locally"
+        );
+
+        let mut remaining = ds
+            .list_applied_outbox()
+            .await
+            .expect("query remaining applied_outbox rows");
+        remaining.sort_by(|a, b| a.idempotency_key.cmp(&b.idempotency_key));
+        let remaining_keys: Vec<_> = remaining
+            .iter()
+            .map(|row| row.idempotency_key.as_str())
+            .collect();
+        assert!(
+            remaining_keys.iter().any(|key| *key == "recent-legacy-row"),
+            "recent legacy row should survive GC"
+        );
+        assert!(
+            !remaining_keys.iter().any(|key| *key == "old-legacy-row"),
+            "stale legacy row should be removed by raft-applied GC"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|row| row.subject_key == "GcAppliedOutbox"),
+            "GC command should leave an outbox ledger row for this operation"
         );
     }
 

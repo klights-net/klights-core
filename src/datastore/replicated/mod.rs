@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use std::sync::{Arc, OnceLock};
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::command::{COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand};
+use crate::datastore::command::{CommandMeta, StorageCommand};
 #[cfg(test)]
 use crate::datastore::types::{ReplicatedCreateOptions, ResourcePatchRequest};
 #[cfg(test)]
@@ -154,13 +154,6 @@ impl ReplicationObserver {
     pub async fn set(&self, observer: ReplicationObserverFn) {
         *self.inner.write().await = Some(observer);
     }
-
-    async fn notify(&self, command: StorageCommand, meta: CommandMeta) {
-        let observer = self.inner.read().await.clone();
-        if let Some(observer) = observer {
-            observer(command, meta);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,8 +162,6 @@ impl ReplicationObserver {
 
 pub struct ReplicatedDatastore {
     inner: Arc<dyn DatastoreBackend>,
-    mode: ReplicationMode,
-    observer: Option<ReplicationObserver>,
     raft_proposer: OnceLock<Arc<dyn RaftProposer>>,
 }
 
@@ -193,13 +184,11 @@ impl ReplicatedDatastore {
 
     pub fn with_observer(
         inner: Arc<dyn DatastoreBackend>,
-        mode: ReplicationMode,
-        observer: Option<ReplicationObserver>,
+        _mode: ReplicationMode,
+        _observer: Option<ReplicationObserver>,
     ) -> Self {
         Self {
             inner,
-            mode,
-            observer,
             raft_proposer: OnceLock::new(),
         }
     }
@@ -233,33 +222,6 @@ impl ReplicatedDatastore {
     ) -> Result<()> {
         proposer.propose_command(command).await
     }
-
-    fn authoring_node(&self) -> String {
-        self.mode.node_name().to_string()
-    }
-
-    fn meta_for_rv(&self, resource_version: i64, uid: Option<String>) -> CommandMeta {
-        CommandMeta {
-            command_id: CommandId::new(),
-            codec_version: COMMAND_CODEC_VERSION,
-            resource_version,
-            uid,
-            timestamp_ms: current_epoch_millis(),
-            authoring_node: self.authoring_node(),
-        }
-    }
-
-    // T3: `watch_event_mutations_for_rv`, `resource_commit_from_watch_history`,
-    // and `log_apply_commit_for_applied_command` removed. These built
-    // `LogApplyCommit` payloads for the dead `log_apply_entries` table.
-    // Raft `AppendEntries` through `apply_log_apply_commit` (T1.3) is
-    // the sole replication path.
-}
-fn current_epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -575,6 +537,9 @@ where
             batch_cap,
         } => {
             backend.gc_watch_events(max_rows, batch_cap).await?;
+        }
+        StorageCommand::GcAppliedOutbox { cutoff_ms } => {
+            backend.gc_applied_outbox(cutoff_ms, 0).await?;
         }
         StorageCommand::AdvanceResourceVersion { min_rv, .. } => {
             backend.advance_resource_version_after(min_rv).await?;

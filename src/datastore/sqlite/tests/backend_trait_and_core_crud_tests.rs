@@ -2481,6 +2481,44 @@ async fn raft_apply_same_idempotency_key_returns_same_rv_without_reapply() {
 }
 
 #[tokio::test]
+async fn build_log_apply_commit_from_gc_applied_outbox_command_maps_to_outbox_ledger_mutation() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let command = StorageCommand::GcAppliedOutbox { cutoff_ms: 42_000 };
+
+    let commit = db
+        .db_call("test_build_gc_applied_outbox_commit", move |conn| {
+            let tx = conn.transaction()?;
+            let (commit, _rv) = Datastore::build_log_apply_commit_in_tx_from_command(
+                &tx,
+                command,
+                "ServiceTest",
+                "test-node",
+            )?;
+            tx.commit()?;
+            Ok(commit)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        commit.mutations.len(),
+        1,
+        "GC command should map to one outbox mutation"
+    );
+    let mutation = &commit.mutations[0];
+    match mutation {
+        crate::log_apply::LogApplyMutation::GcAppliedOutbox {
+            cutoff_ms,
+            operations,
+        } => {
+            assert_eq!(*cutoff_ms, 42_000);
+            assert!(operations.is_empty());
+        }
+        other => panic!("unexpected mutation: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn raft_outbox_build_treats_fresh_placeholder_as_retryable_inflight() {
     let db = Datastore::new_in_memory().await.unwrap();
     db.create_resource(

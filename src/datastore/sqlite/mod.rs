@@ -823,7 +823,7 @@ impl Datastore {
             LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation, LogApplyPodCleanupIntentKey,
             LogApplyPodCleanupIntentRow, LogApplyResourceKey, LogApplyResourcePatch,
             LogApplyResourceRow, LogApplyWatchEventRow, NamespaceMutation, NetworkMutation,
-            PodCleanupMutation, ResourceMutation, WatchHistoryMutation,
+            OutboxLedgerMutation, PodCleanupMutation, ResourceMutation, WatchHistoryMutation,
         };
         use serde_json::Value;
 
@@ -1622,6 +1622,17 @@ impl Datastore {
                     },
                 )],
             ),
+            StorageCommand::GcAppliedOutbox { cutoff_ms } => {
+                LogApplyCommit::from_cluster_mutations(
+                    rv,
+                    vec![ClusterMutation::OutboxLedger(
+                        OutboxLedgerMutation::GcAppliedOutbox {
+                            cutoff_ms,
+                            operations: Vec::new(),
+                        },
+                    )],
+                )
+            }
 
             StorageCommand::AdvanceResourceVersion { min_rv: _, new_rv } => {
                 LogApplyCommit::from_cluster_mutations(
@@ -2981,6 +2992,10 @@ impl DatastoreBackend for Datastore {
 
     async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
         Datastore::watch_events_gc_prunable_count(self, max_rows, batch_cap).await
+    }
+
+    async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
+        Datastore::applied_outbox_gc_prunable_count(self, cutoff_ms).await
     }
 
     async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {

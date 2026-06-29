@@ -1101,26 +1101,19 @@ impl DatastoreBackend for ReplicatedDatastore {
     }
 
     async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
-        let removed = self.inner.gc_applied_outbox(now_ms, ttl_ms).await?;
-        if removed > 0 {
-            // T3: `append_log_apply_entry` removed. The outbox GC
-            // commit was only needed for BackupApplier replay; raft
-            // AppendEntries handles it. The observer still fires so
-            // workers see the outbox cleanup via the Connect stream.
-            if let Some(observer) = &self.observer {
-                let current_rv = self.inner.get_current_resource_version().await.unwrap_or(0);
-                observer
-                    .notify(
-                        StorageCommand::AdvanceResourceVersion {
-                            min_rv: current_rv,
-                            new_rv: current_rv,
-                        },
-                        self.meta_for_rv(current_rv, None),
-                    )
-                    .await;
-            }
+        let cutoff_ms = now_ms.saturating_sub(ttl_ms);
+        let prunable = self
+            .inner
+            .applied_outbox_gc_prunable_count(cutoff_ms)
+            .await?;
+        if prunable == 0 {
+            return Ok(0);
         }
-        Ok(removed)
+
+        let proposer = self.require_raft_proposer()?;
+        self.propose_command_via_raft(&proposer, StorageCommand::GcAppliedOutbox { cutoff_ms })
+            .await?;
+        Ok(prunable)
     }
 
     /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.

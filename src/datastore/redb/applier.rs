@@ -246,6 +246,7 @@ impl DatastoreApplier for RedbDatastore {
             StorageCommand::WatchEventAppend { .. }
             | StorageCommand::ApplyResourceBatch { .. }
             | StorageCommand::GcWatchEvents { .. }
+            | StorageCommand::GcAppliedOutbox { .. }
             | StorageCommand::EnsureClusterMetadata { .. }
             | StorageCommand::SetKlightsMeta { .. }
             | StorageCommand::MovePodToCleanupIntent { .. }

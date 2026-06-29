@@ -779,6 +779,17 @@ pub trait DatastoreBackend: Send + Sync {
     /// proposing no-op GC entries on idle clusters.
     async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize>;
 
+    /// Count how many applied_outbox rows would be removed by
+    /// `gc_applied_outbox` when using `cutoff_ms` as the retention cutoff.
+    /// Defaults to unsupported for backends that cannot classify applied_outbox
+    /// retention in O(1) or at least an indexed O(n) way.
+    async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
+        let _ = cutoff_ms;
+        Err(anyhow::anyhow!(
+            "backend does not support applied_outbox prunable-count query"
+        ))
+    }
+
     /// Look up the pod_endpoints row for `pod_ip`. Returns `None` when no
     /// pod currently advertises that address. Phase 1 has no production
     /// consumer beyond the SqlitePodEndpointResolver; Phase 2 hybrid

@@ -304,6 +304,11 @@ pub enum StorageCommand {
     /// watch history converges on the same retention window.
     GcWatchEvents { max_rows: i64, batch_cap: i64 },
 
+    /// GC oldest applied_outbox rows for replicas and followers. The payload
+    /// carries an absolute cutoff timestamp so the leader computes it once and
+    /// all followers remove the same set of rows.
+    GcAppliedOutbox { cutoff_ms: i64 },
+
     // -- Resource version counter (ConfigReplicated) --
     /// Advance the cluster-wide resource version counter.  Maps to
     /// `DatastoreBackend::advance_resource_version_after`.
@@ -353,6 +358,7 @@ impl StorageCommand {
             }
             StorageCommand::WatchEventAppend { .. } => "WatchEventAppend",
             StorageCommand::GcWatchEvents { .. } => "GcWatchEvents",
+            StorageCommand::GcAppliedOutbox { .. } => "GcAppliedOutbox",
             StorageCommand::AdvanceResourceVersion { .. } => "AdvanceResourceVersion",
             StorageCommand::EnsureClusterMetadata { .. } => "EnsureClusterMetadata",
             StorageCommand::SetKlightsMeta { .. } => "SetKlightsMeta",

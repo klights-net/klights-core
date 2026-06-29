@@ -783,6 +783,13 @@ static METHOD_DOMAINS: LazyLock<BTreeMap<&'static str, MethodMeta>> = LazyLock::
             cross_domain: false,
         },
     );
+    m.insert(
+        "applied_outbox_gc_prunable_count",
+        MethodMeta {
+            domain: D::ClusterReplicated,
+            cross_domain: false,
+        },
+    );
 
     m
 });
@@ -943,6 +950,7 @@ mod tests {
             "delete_pod_cleanup_intents_for_node",
             // GC
             "gc_watch_events",
+            "applied_outbox_gc_prunable_count",
             // Pod endpoints
             "pod_endpoint_get_by_pod_ip",
             "pod_endpoint_list_all",

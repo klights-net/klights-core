@@ -1364,6 +1364,10 @@ impl DatastoreBackend for WorkerStoreAdapter {
         Ok(0)
     }
 
+    async fn applied_outbox_gc_prunable_count(&self, _cutoff_ms: i64) -> Result<usize> {
+        Ok(0)
+    }
+
     /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
     #[cfg(test)]
     async fn apply_replicated_command(
