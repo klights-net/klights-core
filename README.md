@@ -49,7 +49,8 @@ containerd-free runtime support are not available in this release.
 
 ## Quickstart
 
-Install klights from the public package repository.
+Install klights from the public package repository, configure the packaged
+systemd service for single-node leader mode, then start the service.
 
 Ubuntu 24.04 (`noble`):
 
@@ -69,6 +70,21 @@ echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-co
   sudo tee /etc/apt/sources.list.d/klights.list
 sudo apt-get update
 sudo apt-get install -y klights
+```
+
+Configure and start the packaged service on Ubuntu:
+
+```bash
+sudo install -d -m 0755 /var/lib/klights
+sudo tee /etc/default/klights >/dev/null <<'EOF'
+RUST_LOG=info
+KLIGHTS_DATA_ROOT=/var/lib/klights
+KLIGHTS_ARGS=start
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now containerd
+sudo systemctl enable --now klights
+sudo systemctl status --no-pager klights
 ```
 
 RHEL 9:
@@ -97,7 +113,29 @@ EOF
 sudo dnf install -y klights
 ```
 
-klights has two control-plane startup modes:
+Configure and start the packaged service on RHEL:
+
+```bash
+sudo install -d -m 0755 /var/lib/klights
+sudo tee /etc/sysconfig/klights >/dev/null <<'EOF'
+RUST_LOG=info
+KLIGHTS_DATA_ROOT=/var/lib/klights
+KLIGHTS_ARGS=start
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable --now containerd
+sudo systemctl enable --now klights
+sudo systemctl status --no-pager klights
+```
+
+Verify the node through the generated kubeconfig:
+
+```bash
+sudo kubectl --kubeconfig /var/lib/klights/etc/kubeconfig.yaml get nodes -o wide
+```
+
+The package Quickstart starts a single-node leader. klights also supports two
+control-plane startup modes:
 
 - **Single-leader mode:** start one leader with `klights start`. This is the
   simplest mode for local development. You can optionally add one or more
@@ -107,23 +145,6 @@ klights has two control-plane startup modes:
   recovery.
 - **Raft control-plane mode:** run exactly three `controlplane` voters. Use
   this mode when you want the control plane itself to run as a Raft cluster.
-
-Start the first node with the built-in defaults:
-
-```bash
-sudo klights start
-```
-
-The defaults cover the API port, node data directory, pod CIDR, service CIDR,
-and local runtime paths. With `sudo`, the default kubeconfig is usually written
-under `/root/klights`:
-
-`KLIGHTS_DATA_ROOT` defaults to `~/klights`; under `sudo`, that usually resolves
-to `/root/klights`.
-
-```bash
-sudo kubectl --kubeconfig /root/klights/etc/kubeconfig.yaml get nodes
-```
 
 To join more nodes, read the bootstrap token Secrets from the first node and
 write them to local token files. The `controlplane-bootstrap-token` Secret is
