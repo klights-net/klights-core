@@ -258,7 +258,8 @@ use crate::kubelet::pod_runtime::repository::{LivePodUidCheck, PodRuntimeReposit
 use crate::kubelet::pod_runtime::status_emitter::PodStatusEmitter;
 use crate::kubelet::pod_runtime::status_helpers::{
     replace_container_status, restart_last_state_from_reconciled_status,
-    restarted_running_container_status, runtime_status_container_id,
+    restart_last_state_from_runtime_status, restarted_running_container_status,
+    runtime_status_container_id,
 };
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
@@ -3312,6 +3313,18 @@ impl PodRuntimeService for RealPodRuntimeService {
                     return Ok(());
                 };
 
+                let observed_container_status = pod
+                    .pointer("/status/containerStatuses")
+                    .and_then(|value| value.as_array())
+                    .and_then(|statuses| {
+                        statuses
+                            .iter()
+                            .find(|status| {
+                                status.get("name").and_then(|value| value.as_str())
+                                    == Some(container_name.as_str())
+                            })
+                            .cloned()
+                    });
                 let mut old_container_id = pod_status_container_id_by_name(&pod, container_name);
                 if old_container_id.is_none() {
                     let containers = self
@@ -3352,6 +3365,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                     .await
                     .ok()
                     .and_then(|response| response.status);
+                let last_state = restart_last_state_from_runtime_status(stopped_status.as_ref());
                 let _ = self
                     .repository
                     .note_container_restart_for_uid(
@@ -3359,9 +3373,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                         pod_name,
                         pod_uid,
                         container_name,
-                        crate::kubelet::pod_runtime::status_helpers::restart_last_state_from_runtime_status(
-                            stopped_status.as_ref(),
-                        ),
+                        last_state.clone(),
                         None,
                     )
                     .await;
@@ -3415,11 +3427,43 @@ impl PodRuntimeService for RealPodRuntimeService {
                     pod_spec,
                 );
 
-                let new_id = self
+                let new_container_id = self
                     .cri
                     .create_container(container_config, &sandbox_id, sandbox_config)
                     .await?;
-                self.cri.start_container(&new_id).await?;
+                self.cri.start_container(&new_container_id).await?;
+                if let Some(observed_status) = observed_container_status.as_ref() {
+                    let mut container_statuses = pod
+                        .pointer("/status/containerStatuses")
+                        .and_then(|value| value.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(replacement) = restarted_running_container_status(
+                        &pod,
+                        container_name,
+                        &new_container_id,
+                        observed_status,
+                        &last_state,
+                    ) {
+                        replace_container_status(
+                            &mut container_statuses,
+                            container_name,
+                            replacement,
+                        );
+                        let mut status = serde_json::json!({
+                            "phase": "Running",
+                            "containerStatuses": container_statuses,
+                        });
+                        crate::pod_status_merge::merge_pod_status_for_update(
+                            "v1",
+                            "Pod",
+                            &pod,
+                            &mut status,
+                            crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
+                        );
+                        self.write_pod_status(&key, status).await?;
+                    }
+                }
             }
             LifecycleCommand::StartupPassed {
                 pod_uid,
