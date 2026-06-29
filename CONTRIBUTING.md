@@ -15,6 +15,9 @@ dual-license model as the project:
 
 If you cannot agree to these terms, do not submit the contribution.
 
+See [CLA.md](CLA.md) for the contributor license agreement that applies to
+submitted contributions.
+
 ## Developer Certificate Of Origin
 
 Each commit should include a `Signed-off-by` line, using your real name or the

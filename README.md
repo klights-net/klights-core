@@ -615,9 +615,10 @@ sudo journalctl -u klights -f
 
 klights-core is dual-licensed under AGPL-3.0-or-later and separate commercial
 license terms. See [LICENSE](LICENSE), [NOTICE](NOTICE), and
-[LICENSE-AGPL-3.0](LICENSE-AGPL-3.0).
+[LICENSE-AGPL-3.0](LICENSE-AGPL-3.0). Commercial-license availability is
+described in [LICENSE_COMMERCIAL](LICENSE_COMMERCIAL).
 
 For commercial licensing inquiries, contact: lapcchan@gmail.com.
 
 Contributions must preserve the dual-license model. See
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md).
