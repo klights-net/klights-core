@@ -68,7 +68,6 @@ jobs:
             set -euo pipefail
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            apt-get install -y --no-install-recommends ca-certificates curl iproute2 jq kmod nftables procps
             echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt resolute main" \
               > /etc/apt/sources.list.d/klights.list
             apt-get update
@@ -106,10 +105,11 @@ jobs:
       - name: Deploy nginx service and curl it from another pod
         run: |
           set -euo pipefail
+          curl -fsSLo kubectl https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
+          chmod 0755 kubectl
+          docker cp kubectl klights-ubuntu-2604:/usr/local/bin/kubectl
           docker exec klights-ubuntu-2604 bash -lc '
             set -euo pipefail
-            curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
-            chmod 0755 /usr/local/bin/kubectl
             export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
             node_ready=false
             for attempt in {1..120}; do
@@ -238,9 +238,13 @@ jobs:
           set -euo pipefail
           docker exec -e EXPECTED_KLIGHTS_VERSION klights-rhel10 bash -lc '
             set -euo pipefail
-            dnf install -y ca-certificates curl dnf-plugins-core iproute jq kmod nftables procps-ng
-            dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-            dnf install -y containerd.io --setopt=install_weak_deps=False
+            printf "%s\n" \
+              "[docker-ce-stable]" \
+              "name=Docker CE Stable - \$basearch" \
+              "baseurl=https://download.docker.com/linux/centos/\$releasever/\$basearch/stable" \
+              "enabled=1" \
+              "gpgcheck=0" \
+              > /etc/yum.repos.d/docker-ce.repo
             printf "%s\n" \
               "[klights]" \
               "name=klights" \
@@ -248,7 +252,7 @@ jobs:
               "enabled=1" \
               "gpgcheck=0" \
               > /etc/yum.repos.d/klights.repo
-            dnf makecache --disablerepo="*" --enablerepo=klights
+            dnf makecache
             dnf install -y klights
             rpm -q --qf "%{VERSION}-%{RELEASE}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1.el10"
             install -d -m 0755 /var/lib/klights
@@ -282,10 +286,11 @@ jobs:
       - name: Deploy nginx service and curl it from another pod
         run: |
           set -euo pipefail
+          curl -fsSLo kubectl https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
+          chmod 0755 kubectl
+          docker cp kubectl klights-rhel10:/usr/local/bin/kubectl
           docker exec klights-rhel10 bash -lc '
             set -euo pipefail
-            curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
-            chmod 0755 /usr/local/bin/kubectl
             export KUBECONFIG=/var/lib/klights/etc/kubeconfig.yaml
             node_ready=false
             for attempt in {1..120}; do
