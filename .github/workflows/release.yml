@@ -186,6 +186,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             apt-utils \
+            curl \
             createrepo-c \
             dpkg-dev \
             gzip \
@@ -207,6 +208,8 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "KLIGHTS_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "CONTAINERD_VERSION=2.3.2" >> "$GITHUB_ENV"
+          echo "RUNC_VERSION=1.5.0" >> "$GITHUB_ENV"
 
       - name: Import optional package GPG key
         env:
@@ -240,12 +243,35 @@ jobs:
           (
             set -euo pipefail
             mkdir -p dist/packages
+            mkdir -p dist/runtime
+            containerd_base="https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}"
+            containerd_asset="containerd-static-${CONTAINERD_VERSION}-linux-amd64.tar.gz"
+            curl -fsSLo "dist/runtime/${containerd_asset}" "${containerd_base}/${containerd_asset}"
+            curl -fsSLo "dist/runtime/${containerd_asset}.sha256sum" "${containerd_base}/${containerd_asset}.sha256sum"
+            (cd dist/runtime && sha256sum -c "${containerd_asset}.sha256sum")
+            mkdir -p dist/runtime/containerd
+            tar -C dist/runtime/containerd -xzf "dist/runtime/${containerd_asset}"
+            curl -fsSLo dist/runtime/containerd-LICENSE "https://raw.githubusercontent.com/containerd/containerd/v${CONTAINERD_VERSION}/LICENSE"
+            curl -fsSLo dist/runtime/containerd-NOTICE "https://raw.githubusercontent.com/containerd/containerd/v${CONTAINERD_VERSION}/NOTICE"
+            runc_base="https://github.com/opencontainers/runc/releases/download/v${RUNC_VERSION}"
+            curl -fsSLo dist/runtime/runc.amd64 "${runc_base}/runc.amd64"
+            curl -fsSLo dist/runtime/runc.sha256sum "${runc_base}/runc.sha256sum"
+            grep ' runc.amd64$' dist/runtime/runc.sha256sum | (cd dist/runtime && sha256sum -c -)
+            chmod 0755 dist/runtime/runc.amd64
+            curl -fsSLo dist/runtime/runc-LICENSE "https://raw.githubusercontent.com/opencontainers/runc/v${RUNC_VERSION}/LICENSE"
+            curl -fsSLo dist/runtime/runc-NOTICE "https://raw.githubusercontent.com/opencontainers/runc/v${RUNC_VERSION}/NOTICE"
             scripts/package/build-deb.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --suite noble --distro ubuntu24.04 --out dist/packages
             scripts/package/build-deb.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --suite resolute --distro ubuntu26.04 --out dist/packages
+            scripts/package/build-rhel-runtime-rpms.sh --containerd-dir dist/runtime/containerd --runc-bin dist/runtime/runc.amd64 --containerd-version "$CONTAINERD_VERSION" --runc-version "$RUNC_VERSION" --containerd-license dist/runtime/containerd-LICENSE --containerd-notice dist/runtime/containerd-NOTICE --runc-license dist/runtime/runc-LICENSE --runc-notice dist/runtime/runc-NOTICE --distro el9 --out dist/packages
+            scripts/package/build-rhel-runtime-rpms.sh --containerd-dir dist/runtime/containerd --runc-bin dist/runtime/runc.amd64 --containerd-version "$CONTAINERD_VERSION" --runc-version "$RUNC_VERSION" --containerd-license dist/runtime/containerd-LICENSE --containerd-notice dist/runtime/containerd-NOTICE --runc-license dist/runtime/runc-LICENSE --runc-notice dist/runtime/runc-NOTICE --distro el10 --out dist/packages
             scripts/package/build-rpm.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --distro el9 --out dist/packages
             scripts/package/build-rpm.sh --binary dist/binary/klights --version "$KLIGHTS_VERSION" --distro el10 --out dist/packages
             test -f "dist/packages/klights_${KLIGHTS_VERSION}-1~noble_amd64.deb"
             test -f "dist/packages/klights_${KLIGHTS_VERSION}-1~resolute_amd64.deb"
+            test -f "dist/packages/containerd-${CONTAINERD_VERSION}-1.el9.x86_64.rpm"
+            test -f "dist/packages/containerd-${CONTAINERD_VERSION}-1.el10.x86_64.rpm"
+            test -f "dist/packages/runc-${RUNC_VERSION}-1.el9.x86_64.rpm"
+            test -f "dist/packages/runc-${RUNC_VERSION}-1.el10.x86_64.rpm"
             test -f "dist/packages/klights-${KLIGHTS_VERSION}-1.el9.x86_64.rpm"
             test -f "dist/packages/klights-${KLIGHTS_VERSION}-1.el10.x86_64.rpm"
             scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite noble --origin klights --label klights --codename noble
@@ -324,6 +350,8 @@ jobs:
           fi
           VERSION="${GITHUB_REF_NAME#v}"
           echo "KLIGHTS_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "CONTAINERD_VERSION=2.3.2" >> "$GITHUB_ENV"
+          echo "RUNC_VERSION=1.5.0" >> "$GITHUB_ENV"
 
       - name: Build release notes
         run: |
@@ -357,6 +385,7 @@ jobs:
             echo "- Ubuntu 26.04 (resolute): \`klights_${VERSION}-1~resolute_amd64.deb\`"
             echo "- RHEL 9: \`klights-${VERSION}-1.el9.x86_64.rpm\`"
             echo "- RHEL 10: \`klights-${VERSION}-1.el10.x86_64.rpm\`"
+            echo "- RHEL runtime dependencies: \`containerd-${CONTAINERD_VERSION}-1.el9.x86_64.rpm\`, \`containerd-${CONTAINERD_VERSION}-1.el10.x86_64.rpm\`, \`runc-${RUNC_VERSION}-1.el9.x86_64.rpm\`, \`runc-${RUNC_VERSION}-1.el10.x86_64.rpm\`"
             echo
             echo "Package repositories are published from the \`package-repo\` branch:"
             echo

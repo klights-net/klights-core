@@ -90,13 +90,6 @@ sudo systemctl status --no-pager klights
 RHEL 9:
 
 ```bash
-sudo tee /etc/yum.repos.d/docker-ce.repo >/dev/null <<'EOF'
-[docker-ce-stable]
-name=Docker CE Stable - $basearch
-baseurl=https://download.docker.com/linux/centos/$releasever/$basearch/stable
-enabled=1
-gpgcheck=0
-EOF
 sudo tee /etc/yum.repos.d/klights.repo >/dev/null <<'EOF'
 [klights]
 name=klights
@@ -110,13 +103,6 @@ sudo dnf install -y klights
 RHEL 10:
 
 ```bash
-sudo tee /etc/yum.repos.d/docker-ce.repo >/dev/null <<'EOF'
-[docker-ce-stable]
-name=Docker CE Stable - $basearch
-baseurl=https://download.docker.com/linux/centos/$releasever/$basearch/stable
-enabled=1
-gpgcheck=0
-EOF
 sudo tee /etc/yum.repos.d/klights.repo >/dev/null <<'EOF'
 [klights]
 name=klights
