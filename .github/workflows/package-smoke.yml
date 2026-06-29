@@ -74,12 +74,9 @@ jobs:
             apt-cache policy klights
             apt-get install -y klights
             dpkg-query -W -f="\${Version}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1~resolute"
-            install -d -m 0755 /var/lib/klights
-            printf "%s\n" \
-              "RUST_LOG=info" \
-              "KLIGHTS_DATA_ROOT=/var/lib/klights" \
-              "KLIGHTS_ARGS=start" \
-              > /etc/default/klights
+            test -f /etc/default/klights
+            grep -Fx "KLIGHTS_ARGS=start" /etc/default/klights
+            systemctl cat klights | grep -F "Environment=RUST_LOG=info"
           '
 
       - name: Start klights service
@@ -250,12 +247,9 @@ jobs:
             dnf makecache
             dnf install -y klights
             rpm -q --qf "%{VERSION}-%{RELEASE}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1.el10"
-            install -d -m 0755 /var/lib/klights
-            printf "%s\n" \
-              "RUST_LOG=info" \
-              "KLIGHTS_DATA_ROOT=/var/lib/klights" \
-              "KLIGHTS_ARGS=start" \
-              > /etc/sysconfig/klights
+            test -f /etc/sysconfig/klights
+            grep -Fx "KLIGHTS_ARGS=start" /etc/sysconfig/klights
+            systemctl cat klights | grep -F "Environment=RUST_LOG=info"
           '
 
       - name: Start klights service
@@ -434,12 +428,9 @@ jobs:
             apt-cache policy klights
             apt-get install -y klights
             dpkg-query -W -f="\${Version}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1~resolute"
-            install -d -m 0755 /var/lib/klights
-            printf "%s\n" \
-              "RUST_LOG=info" \
-              "KLIGHTS_DATA_ROOT=/var/lib/klights" \
-              "KLIGHTS_ARGS=start" \
-              > /etc/default/klights
+            test -f /etc/default/klights
+            grep -Fx "KLIGHTS_ARGS=start" /etc/default/klights
+            systemctl cat klights | grep -F "Environment=RUST_LOG=info"
           '
 
       - name: Start klights service
@@ -610,12 +601,9 @@ jobs:
             dnf makecache
             dnf install -y klights
             rpm -q --qf "%{VERSION}-%{RELEASE}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1.el10"
-            install -d -m 0755 /var/lib/klights
-            printf "%s\n" \
-              "RUST_LOG=info" \
-              "KLIGHTS_DATA_ROOT=/var/lib/klights" \
-              "KLIGHTS_ARGS=start" \
-              > /etc/sysconfig/klights
+            test -f /etc/sysconfig/klights
+            grep -Fx "KLIGHTS_ARGS=start" /etc/sysconfig/klights
+            systemctl cat klights | grep -F "Environment=RUST_LOG=info"
           '
 
       - name: Start klights service
