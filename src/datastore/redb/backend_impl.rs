@@ -653,6 +653,32 @@ impl DatastoreBackend for RedbDatastore {
     async fn gc_watch_events(&self, m: i64, b: i64) -> Result<usize> {
         self.watch_store.gc_watch(m, b).await
     }
+    async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
+        use crate::datastore::redb::tables::APPLIED_OUTBOX;
+        self.accessor
+            .call("redb_applied_outbox_prunable_count", move |db| {
+                let read_txn = db
+                    .begin_read()
+                    .map_err(|e| anyhow::anyhow!("redb read: {}", e))?;
+                let table = read_txn
+                    .open_table(APPLIED_OUTBOX)
+                    .map_err(|e| anyhow::anyhow!("redb open applied_outbox table: {}", e))?;
+                let mut count = 0usize;
+                for row in table
+                    .iter()
+                    .map_err(|e| anyhow::anyhow!("redb applied_outbox iter: {}", e))?
+                {
+                    let (_, value) =
+                        row.map_err(|e| anyhow::anyhow!("redb applied_outbox row: {}", e))?;
+                    let record: AppliedOutboxRecord = serde_json::from_slice(value.value())?;
+                    if record.first_seen_ms < cutoff_ms {
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            })
+            .await
+    }
     async fn pod_endpoint_get_by_pod_ip(&self, ip: Ipv4Addr) -> Result<Option<PodEndpointRow>> {
         self.network.pod_endpoint_get_by_pod_ip(ip).await
     }

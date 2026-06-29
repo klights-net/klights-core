@@ -5,6 +5,85 @@ use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
 use crate::log_apply::LogApplyMutation;
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use serde_json::json;
+use std::net::Ipv4Addr;
+
+use crate::log_apply::{
+    LogApplyCommit, LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow,
+};
+
+type NodeSubnetReplayRow = (
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    String,
+    String,
+    Option<String>,
+    i64,
+);
+
+type NodeDataplaneReplayRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<i64>,
+    i64,
+);
+
+async fn select_node_subnet_rows(db: &Datastore) -> Vec<NodeSubnetReplayRow> {
+    db.db_call("test_select_node_subnet_rows", |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT node_name, subnet, subnet_base_int, vtep_ip, vtep_mac, node_ip, mode, \
+             hostport_range, created_at FROM node_subnets ORDER BY node_name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .await
+    .unwrap()
+}
+
+async fn select_node_dataplane_rows(db: &Datastore) -> Vec<NodeDataplaneReplayRow> {
+    db.db_call("test_select_node_dataplane_rows", |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT node_name, mode, encryption, public_key, endpoint, port, updated_at \
+         FROM node_dataplane ORDER BY node_name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    })
+    .await
+    .unwrap()
+}
 
 #[tokio::test]
 async fn test_node_dataplane_metadata_round_trips_enabled_and_disabled() {
@@ -255,6 +334,207 @@ async fn node_registration_outbox_uses_dataplane_annotation_for_external_ip() {
                 && address.get("address").and_then(|value| value.as_str()) == Some("10.99.0.11")
         }),
         "NodeRegistration should publish dataplane endpoint as ExternalIP without using InternalIP: {addresses:?}",
+    );
+}
+
+#[tokio::test]
+async fn raft_node_subnet_replay_is_deterministic() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+
+    let put = LogApplyNodeSubnetRow {
+        node_name: "node-alpha".to_string(),
+        subnet: "10.60.0.0/24".to_string(),
+        subnet_base_int: u32::from(Ipv4Addr::new(10, 60, 0, 0)),
+        vtep_ip: "10.60.0.1".to_string(),
+        vtep_mac: Some("AA:BB:CC:DD:EE:01".to_string()),
+        node_ip: "192.0.2.10".to_string(),
+        mode: "root".to_string(),
+        hostport_range: Some("30000-30100".to_string()),
+    };
+    let put_commit = LogApplyCommit::new(1, vec![LogApplyMutation::PutNodeSubnet(put.clone())]);
+    leader
+        .apply_log_apply_commit(put_commit.clone())
+        .await
+        .unwrap();
+    follower.apply_log_apply_commit(put_commit).await.unwrap();
+    assert_eq!(
+        select_node_subnet_rows(&leader).await,
+        vec![(
+            "node-alpha".to_string(),
+            "10.60.0.0/24".to_string(),
+            i64::from(u32::from(Ipv4Addr::new(10, 60, 0, 0))),
+            "10.60.0.1".to_string(),
+            Some("AA:BB:CC:DD:EE:01".to_string()),
+            "192.0.2.10".to_string(),
+            "root".to_string(),
+            Some("30000-30100".to_string()),
+            0,
+        )],
+        "leader/follower must store deterministic node_subnet state after put replay",
+    );
+    assert_eq!(
+        select_node_subnet_rows(&leader).await,
+        select_node_subnet_rows(&follower).await,
+        "node subnet rows must be deterministic between leader and follower after put replay",
+    );
+
+    let allocate_commit = LogApplyCommit::new(
+        2,
+        vec![LogApplyMutation::AllocateNodeSubnet(
+            LogApplyNodeSubnetAllocation {
+                node_name: "node-beta".to_string(),
+                cluster_cidr: "10.80.0.0/16".to_string(),
+                node_ip: "192.0.2.11".to_string(),
+            },
+        )],
+    );
+    leader
+        .apply_log_apply_commit(allocate_commit.clone())
+        .await
+        .unwrap();
+    follower
+        .apply_log_apply_commit(allocate_commit)
+        .await
+        .unwrap();
+    assert_eq!(
+        select_node_subnet_rows(&leader).await,
+        vec![
+            (
+                "node-alpha".to_string(),
+                "10.60.0.0/24".to_string(),
+                i64::from(u32::from(Ipv4Addr::new(10, 60, 0, 0))),
+                "10.60.0.1".to_string(),
+                Some("AA:BB:CC:DD:EE:01".to_string()),
+                "192.0.2.10".to_string(),
+                "root".to_string(),
+                Some("30000-30100".to_string()),
+                0,
+            ),
+            (
+                "node-beta".to_string(),
+                "10.80.0.0/24".to_string(),
+                i64::from(u32::from(Ipv4Addr::new(10, 80, 0, 0))),
+                "10.80.0.0".to_string(),
+                None,
+                "192.0.2.11".to_string(),
+                "root".to_string(),
+                None,
+                0,
+            ),
+        ],
+        "allocated and existing subnet rows must be deterministic",
+    );
+    assert_eq!(
+        select_node_subnet_rows(&leader).await,
+        select_node_subnet_rows(&follower).await,
+        "node subnet rows must match between leader and follower after allocation replay",
+    );
+
+    let delete_commit = LogApplyCommit::new(
+        3,
+        vec![LogApplyMutation::DeleteNodeSubnet {
+            node_name: "node-alpha".to_string(),
+        }],
+    );
+    leader
+        .apply_log_apply_commit(delete_commit.clone())
+        .await
+        .unwrap();
+    follower
+        .apply_log_apply_commit(delete_commit)
+        .await
+        .unwrap();
+    assert_eq!(
+        select_node_subnet_rows(&leader).await,
+        vec![(
+            "node-beta".to_string(),
+            "10.80.0.0/24".to_string(),
+            i64::from(u32::from(Ipv4Addr::new(10, 80, 0, 0))),
+            "10.80.0.0".to_string(),
+            None,
+            "192.0.2.11".to_string(),
+            "root".to_string(),
+            None,
+            0,
+        )],
+        "deleted node must be absent after deterministic delete replay",
+    );
+    assert!(
+        !select_node_subnet_rows(&leader)
+            .await
+            .iter()
+            .any(|row| row.0 == "node-alpha"),
+        "deleted node must be absent in deterministic replay",
+    );
+    assert_eq!(
+        select_node_subnet_rows(&leader).await,
+        select_node_subnet_rows(&follower).await,
+        "node subnet replay must stay identical after delete",
+    );
+}
+
+#[tokio::test]
+async fn raft_node_dataplane_replay_is_deterministic() {
+    let leader = Datastore::new_in_memory().await.unwrap();
+    let follower = Datastore::new_in_memory().await.unwrap();
+
+    let put = LogApplyNodeDataplaneRow {
+        node_name: "node-gamma".to_string(),
+        mode: "root".to_string(),
+        encryption: "enabled".to_string(),
+        public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
+        endpoint: "10.99.0.10".to_string(),
+        port: Some(51820),
+    };
+    let put_commit = LogApplyCommit::new(1, vec![LogApplyMutation::PutNodeDataplane(put)]);
+    leader
+        .apply_log_apply_commit(put_commit.clone())
+        .await
+        .unwrap();
+    follower.apply_log_apply_commit(put_commit).await.unwrap();
+    assert_eq!(
+        select_node_dataplane_rows(&leader).await,
+        vec![(
+            "node-gamma".to_string(),
+            "root".to_string(),
+            "enabled".to_string(),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
+            "10.99.0.10".to_string(),
+            Some(51820),
+            0
+        )],
+        "leader node_dataplane rows must be deterministic after put replay",
+    );
+    assert_eq!(
+        select_node_dataplane_rows(&leader).await,
+        select_node_dataplane_rows(&follower).await,
+        "node_dataplane replay must be byte-identical between leader and follower",
+    );
+
+    let delete_commit = LogApplyCommit::new(
+        2,
+        vec![LogApplyMutation::DeleteNodeDataplane {
+            node_name: "node-gamma".to_string(),
+        }],
+    );
+    leader
+        .apply_log_apply_commit(delete_commit.clone())
+        .await
+        .unwrap();
+    follower
+        .apply_log_apply_commit(delete_commit)
+        .await
+        .unwrap();
+    assert_eq!(
+        select_node_dataplane_rows(&leader).await,
+        Vec::<NodeDataplaneReplayRow>::new(),
+        "deleted node_dataplane row must be absent after delete replay",
+    );
+    assert_eq!(
+        select_node_dataplane_rows(&leader).await,
+        select_node_dataplane_rows(&follower).await,
+        "node_dataplane rows must be deterministic between leader and follower after delete replay",
     );
 }
 

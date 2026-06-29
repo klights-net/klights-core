@@ -484,6 +484,9 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 max_rows,
                 batch_cap,
             }),
+            StorageCommand::GcAppliedOutbox { cutoff_ms } => {
+                proto_storage_command::Command::GcAppliedOutbox(ProtoGcAppliedOutbox { cutoff_ms })
+            }
             StorageCommand::EnsureClusterMetadata { cluster_id } => {
                 proto_storage_command::Command::EnsureClusterMetadata(ProtoEnsureClusterMetadata {
                     cluster_id,
@@ -678,6 +681,9 @@ impl TryFrom<ProtoStorageCommand> for StorageCommand {
             proto_storage_command::Command::GcWatchEvents(p) => StorageCommand::GcWatchEvents {
                 max_rows: p.max_rows,
                 batch_cap: p.batch_cap,
+            },
+            proto_storage_command::Command::GcAppliedOutbox(p) => StorageCommand::GcAppliedOutbox {
+                cutoff_ms: p.cutoff_ms,
             },
             proto_storage_command::Command::EnsureClusterMetadata(p) => {
                 StorageCommand::EnsureClusterMetadata {
@@ -1138,6 +1144,12 @@ mod tests {
                 "GcWatchEvents",
             ),
             (
+                StorageCommand::GcAppliedOutbox {
+                    cutoff_ms: 1_234_567_890,
+                },
+                "GcAppliedOutbox",
+            ),
+            (
                 StorageCommand::SetKlightsMeta {
                     key: "voters".into(),
                     value: r#"["mn-leader"]"#.into(),
@@ -1215,6 +1227,7 @@ mod tests {
             "AdvanceResourceVersion",
             "WatchEventAppend",
             "GcWatchEvents",
+            "GcAppliedOutbox",
             "SetKlightsMeta",
         ]
         .into_iter()
@@ -1572,6 +1585,28 @@ mod tests {
                 assert_eq!(batch_cap, 1_024);
             }
             other => panic!("expected GcWatchEvents, got {:?}", other.variant_name()),
+        }
+    }
+
+    /// Decodes a hand-crafted JSON fixture for a `GcAppliedOutbox` command —
+    /// raft-applied outbox pruning must use a cutoff timestamp so every node
+    /// removes the same set of rows.
+    #[test]
+    fn decode_v1_json_gc_applied_outbox_fixture() {
+        let fixture = r#"{
+            "GcAppliedOutbox": {
+                "cutoff_ms": 1700000000000
+            }
+        }"#;
+
+        let cmd =
+            decode_command_json(fixture.as_bytes()).expect("v1 fixture should decode cleanly");
+
+        match cmd {
+            StorageCommand::GcAppliedOutbox { cutoff_ms } => {
+                assert_eq!(cutoff_ms, 1_700_000_000_000);
+            }
+            other => panic!("expected GcAppliedOutbox, got {:?}", other.variant_name()),
         }
     }
 

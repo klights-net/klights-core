@@ -1,3 +1,6 @@
+#![cfg(test)]
+//! TO-BE-CLEANUP: legacy replicated StorageCommand test support only.
+//!
 //! `DatastoreApplier` implementation for the SQLite backend.
 //!
 //! Maps each `StorageCommand` variant to the corresponding `Datastore`
@@ -289,6 +292,9 @@ impl DatastoreApplier for Datastore {
                 batch_cap,
             } => {
                 self.gc_watch_events(max_rows, batch_cap).await?;
+            }
+            StorageCommand::GcAppliedOutbox { cutoff_ms } => {
+                self.gc_applied_outbox(cutoff_ms, 0).await?;
             }
             StorageCommand::AdvanceResourceVersion { min_rv, new_rv: _ } => {
                 // advance_resource_version_after bumps the RV if it's below min_rv.

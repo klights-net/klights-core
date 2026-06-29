@@ -113,6 +113,22 @@ impl Datastore {
         Ok(count)
     }
 
+    /// Count how many applied_outbox rows are eligible for GC at the provided
+    /// cutoff without mutating storage.
+    pub async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
+        let count = self
+            .db_call("applied_outbox_gc_prunable_count", move |conn| {
+                Ok(conn.query_row::<i64, _, _>(
+                    queries::APPLIED_OUTBOX_GC_PRUNABLE_COUNT,
+                    rusqlite::params![cutoff_ms],
+                    |row| row.get(0),
+                )? as usize)
+            })
+            .await
+            .map_err(|e| anyhow!("Failed to count prunable applied_outbox rows: {}", e))?;
+        Ok(count)
+    }
+
     pub async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
         let deleted = self
             .db_call("gc_watch_events", move |conn| {

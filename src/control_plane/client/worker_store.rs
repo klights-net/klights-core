@@ -9,6 +9,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::control_plane::client::{LeaderApiClient, ListRequest, ResourceKey, WatchRequest};
+#[cfg(test)]
 use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::node_local::NodeLocalHandle;
 use crate::datastore::{
@@ -1363,6 +1364,12 @@ impl DatastoreBackend for WorkerStoreAdapter {
         Ok(0)
     }
 
+    async fn applied_outbox_gc_prunable_count(&self, _cutoff_ms: i64) -> Result<usize> {
+        Ok(0)
+    }
+
+    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+    #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         _command: StorageCommand,

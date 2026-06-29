@@ -1,3 +1,6 @@
+#![cfg(test)]
+//! TO-BE-CLEANUP: legacy replicated StorageCommand test support only.
+//!
 //! `DatastoreApplier` implementation for `RedbDatastore`.
 //!
 //! Delegates each `StorageCommand` variant to the appropriate domain store.
@@ -243,6 +246,7 @@ impl DatastoreApplier for RedbDatastore {
             StorageCommand::WatchEventAppend { .. }
             | StorageCommand::ApplyResourceBatch { .. }
             | StorageCommand::GcWatchEvents { .. }
+            | StorageCommand::GcAppliedOutbox { .. }
             | StorageCommand::EnsureClusterMetadata { .. }
             | StorageCommand::SetKlightsMeta { .. }
             | StorageCommand::MovePodToCleanupIntent { .. }

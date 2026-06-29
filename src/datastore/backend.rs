@@ -13,16 +13,18 @@ use crate::networking::VtepMac;
 use crate::watch::{WatchEvent, WatchReceiver};
 use crate::watch::{WatchSignal, WatchTopic};
 
+#[cfg(test)]
 use super::command::{CommandMeta, StorageCommand};
 #[cfg(test)]
 use super::types::PendingWatchEvent;
+#[cfg(test)]
+use super::types::ReplicatedCreateOptions;
 use super::types::{
     AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PatchKind, PodCleanupIntent,
     PodEndpointEvent, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
-    PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, ReplicatedCreateOptions,
-    ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation, ResourceList, ResourceListQuery,
-    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayRead,
-    WatchTarget,
+    PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, ReplicatedSnapshotMetadata,
+    Resource, ResourceBatchOperation, ResourceList, ResourceListQuery, ResourcePatchRequest,
+    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayRead, WatchTarget,
 };
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
@@ -62,9 +64,12 @@ pub trait DatastoreBackend: Send + Sync {
     #[cfg(test)]
     fn broadcast_watch_event(&self, pending: PendingWatchEvent);
 
+    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+    ///
     /// Apply a replicated command locally without going through role-based
     /// public write admission.  Leaders use this for forwarded writes after
     /// bootstrap-token validation; replicas use it for snapshot and stream apply.
+    #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -135,12 +140,15 @@ pub trait DatastoreBackend: Send + Sync {
         data: Value,
     ) -> Result<Resource>;
 
+    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+    ///
     /// Apply an authoritative leader `CreateResource` entry on a local replica.
     ///
     /// This is not the public Kubernetes create path. Public creates must keep
     /// rejecting existing names. Replicated creates converge a follower cache to
     /// the leader's object identity, including delete/recreate slots where the
     /// same name now has a different UID.
+    #[cfg(test)]
     async fn apply_replicated_create_resource(
         &self,
         api_version: &str,
@@ -770,6 +778,17 @@ pub trait DatastoreBackend: Send + Sync {
     /// without mutating storage. Used by raft-mode maintenance to avoid
     /// proposing no-op GC entries on idle clusters.
     async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize>;
+
+    /// Count how many applied_outbox rows would be removed by
+    /// `gc_applied_outbox` when using `cutoff_ms` as the retention cutoff.
+    /// Defaults to unsupported for backends that cannot classify applied_outbox
+    /// retention in O(1) or at least an indexed O(n) way.
+    async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
+        let _ = cutoff_ms;
+        Err(anyhow::anyhow!(
+            "backend does not support applied_outbox prunable-count query"
+        ))
+    }
 
     /// Look up the pod_endpoints row for `pod_ip`. Returns `None` when no
     /// pod currently advertises that address. Phase 1 has no production
@@ -1699,6 +1718,8 @@ impl<T: DatastoreBackend + ?Sized> NamespaceContentStore for T {
 /// Replication and snapshot-apply entry points.
 #[async_trait]
 pub trait ReplicationStore: Send + Sync {
+    /// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+    #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -1719,6 +1740,7 @@ pub trait ReplicationStore: Send + Sync {
 
 #[async_trait]
 impl<T: DatastoreBackend + ?Sized> ReplicationStore for T {
+    #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,
@@ -1751,6 +1773,7 @@ impl<T: DatastoreBackend + ?Sized> ReplicationStore for T {
 
 #[async_trait]
 impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
+    #[cfg(test)]
     async fn apply_replicated_command(
         &self,
         command: StorageCommand,

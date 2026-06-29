@@ -1,9 +1,9 @@
 //! Stable `StorageCommand` / `StorageResponse` codec for HA replication.
 //!
-//! Leader/follower and Raft replicate logical mutations as `StorageCommand`
-//! values — never SQLite WAL frames or backend-specific operations.  Every
-//! backend implements `DatastoreApplier` which receives decoded commands and
-//! returns `StorageResponse` values.
+//! Raft proposals carry logical mutations as `StorageCommand` values — never
+//! SQLite WAL frames or backend-specific operations. Production apply converts
+//! them into versioned log-apply commits before the raft state machine mutates
+//! cluster state through the generic-to-typed helper path.
 //!
 //! ## Design invariants
 //!
@@ -304,6 +304,11 @@ pub enum StorageCommand {
     /// watch history converges on the same retention window.
     GcWatchEvents { max_rows: i64, batch_cap: i64 },
 
+    /// GC oldest applied_outbox rows for replicas and followers. The payload
+    /// carries an absolute cutoff timestamp so the leader computes it once and
+    /// all followers remove the same set of rows.
+    GcAppliedOutbox { cutoff_ms: i64 },
+
     // -- Resource version counter (ConfigReplicated) --
     /// Advance the cluster-wide resource version counter.  Maps to
     /// `DatastoreBackend::advance_resource_version_after`.
@@ -353,6 +358,7 @@ impl StorageCommand {
             }
             StorageCommand::WatchEventAppend { .. } => "WatchEventAppend",
             StorageCommand::GcWatchEvents { .. } => "GcWatchEvents",
+            StorageCommand::GcAppliedOutbox { .. } => "GcAppliedOutbox",
             StorageCommand::AdvanceResourceVersion { .. } => "AdvanceResourceVersion",
             StorageCommand::EnsureClusterMetadata { .. } => "EnsureClusterMetadata",
             StorageCommand::SetKlightsMeta { .. } => "SetKlightsMeta",

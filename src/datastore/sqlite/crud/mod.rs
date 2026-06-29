@@ -8,6 +8,8 @@ mod ownership;
 mod pod_endpoints;
 mod pod_slot_admission;
 mod pod_workqueue;
+// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+#[cfg(test)]
 pub(in crate::datastore::sqlite) mod replicated_create;
 pub(in crate::datastore::sqlite) mod resource_create;
 pub(in crate::datastore::sqlite) mod resource_delete;

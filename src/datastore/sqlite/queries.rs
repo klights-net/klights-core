@@ -590,6 +590,8 @@ pub(super) const APPLIED_OUTBOX_DELETE_STALE_PLACEHOLDERS: &str = "DELETE FROM a
      AND first_seen_ms < ?1";
 pub(super) const APPLIED_OUTBOX_DELETE_EXPIRED: &str =
     "DELETE FROM applied_outbox WHERE first_seen_ms < ?1";
+pub(super) const APPLIED_OUTBOX_GC_PRUNABLE_COUNT: &str =
+    "SELECT COUNT(*) FROM applied_outbox WHERE first_seen_ms < ?1";
 
 pub(super) const APPLIED_OUTBOX_DELETE_BY_KEY: &str =
     "DELETE FROM applied_outbox WHERE idempotency_key = ?1";

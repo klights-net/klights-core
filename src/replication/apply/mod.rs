@@ -739,6 +739,16 @@ pub async fn apply_forwarded_command(
                 authoring_node,
             ))
         }
+        StorageCommand::GcAppliedOutbox { cutoff_ms } => {
+            let before_rv = db.get_current_resource_version().await.unwrap_or(0);
+            db.gc_applied_outbox(cutoff_ms, 0).await?;
+            let rv = resource_version_after_mutation(db, before_rv).await?;
+            Ok(ack_apply(
+                StorageCommand::GcAppliedOutbox { cutoff_ms },
+                rv,
+                authoring_node,
+            ))
+        }
         StorageCommand::ApplyResourceBatch { operations } => {
             let before_rv = db.get_current_resource_version().await.unwrap_or(0);
             db.apply_resource_batch(operations.clone()).await?;

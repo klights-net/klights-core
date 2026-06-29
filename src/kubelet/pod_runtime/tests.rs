@@ -5136,6 +5136,132 @@ async fn liveness_restart_uses_runtime_container_id_with_parity() {
     );
 }
 
+#[tokio::test]
+async fn liveness_restart_publishes_replacement_container_status_immediately() {
+    use crate::kubelet::lifecycle::{LifecycleCommand, RestartReason};
+    use crate::kubelet::pod_repository::{PodStatusUpdate, PodStatusWriter};
+    use crate::kubelet::pod_runtime::cri::ContainerRuntimeState;
+
+    let harness = PodRuntimeHarness::new().await;
+    let pod = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "namespace": "container-probe",
+            "name": "liveness-status-pod",
+            "uid": "uid-liveness-status",
+            "resourceVersion": "1"
+        },
+        "spec": {
+            "nodeName": "test-node",
+            "restartPolicy": "Always",
+            "containers": [{
+                "name": "agnhost",
+                "image": "registry.k8s.io/e2e-test-images/agnhost:2.56",
+                "imagePullPolicy": "Never",
+                "livenessProbe": {
+                    "grpc": {"port": 8080},
+                    "periodSeconds": 1,
+                    "failureThreshold": 1
+                }
+            }]
+        },
+        "status": {
+            "phase": "Running",
+            "podIP": "10.50.1.5",
+            "hostIP": "10.99.0.11",
+            "conditions": [
+                {"type": "ContainersReady", "status": "True"},
+                {"type": "Ready", "status": "True"}
+            ],
+            "containerStatuses": [{
+                "name": "agnhost",
+                "containerID": "containerd://old-liveness-container",
+                "image": "registry.k8s.io/e2e-test-images/agnhost:2.56",
+                "imageID": "registry.k8s.io/e2e-test-images/agnhost@sha256:test",
+                "ready": true,
+                "started": true,
+                "restartCount": 0,
+                "state": {"running": {"startedAt": "2026-05-19T22:49:26Z"}}
+            }]
+        }
+    });
+    let key = PodRuntimeKey::new(
+        "container-probe",
+        "liveness-status-pod",
+        "uid-liveness-status",
+    );
+
+    harness.create_runtime_pod(pod.clone()).await;
+    harness
+        .repo
+        .set_pod_status_for_uid(
+            "container-probe",
+            "liveness-status-pod",
+            "uid-liveness-status",
+            PodStatusUpdate {
+                phase: "Running".to_string(),
+                pod_ip: "10.50.1.5".to_string(),
+                host_ip: "10.99.0.11".to_string(),
+                container_statuses: pod
+                    .pointer("/status/containerStatuses")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap(),
+                init_container_statuses: None,
+                qos_class: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    harness
+        .store
+        .record_sandbox(&key, "sandbox-liveness-status")
+        .await
+        .unwrap();
+    harness.container_control.set_container_states(vec![(
+        "old-liveness-container".to_string(),
+        ContainerRuntimeState::Running,
+    )]);
+    harness.cri.set_container_exit_code(137);
+
+    harness
+        .runtime
+        .handle_lifecycle_command(LifecycleCommand::RestartRequested {
+            pod_uid: "uid-liveness-status".into(),
+            namespace: "container-probe".into(),
+            pod_name: "liveness-status-pod".into(),
+            container_name: "agnhost".into(),
+            reason: RestartReason::LivenessProbe,
+        })
+        .await
+        .unwrap();
+
+    let stored = harness.stored_pod(&key).await;
+    let status = stored
+        .pointer("/status/containerStatuses/0")
+        .expect("container status must be stored after liveness restart");
+    assert_eq!(
+        status.get("containerID").and_then(|value| value.as_str()),
+        Some("containerd://container-sandbox-liveness-status"),
+        "probe-triggered restart must publish the replacement container id immediately"
+    );
+    assert_eq!(
+        status.get("restartCount").and_then(|value| value.as_i64()),
+        Some(1),
+        "probe-triggered restart must increment restartCount with the replacement status"
+    );
+    assert!(
+        status.pointer("/lastState/terminated").is_some(),
+        "probe-triggered restart must preserve the terminated lastState"
+    );
+    assert!(
+        status.pointer("/state/running/startedAt").is_some(),
+        "probe-triggered restart must publish the replacement as running"
+    );
+}
+
 // ── Task 21.3: reconcile_ephemeral ──
 
 #[tokio::test]

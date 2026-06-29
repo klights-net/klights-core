@@ -120,7 +120,7 @@ pub struct ProtoErrorResp {
 pub struct ProtoStorageCommand {
     #[prost(
         oneof = "proto_storage_command::Command",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
     )]
     pub command: Option<proto_storage_command::Command>,
 }
@@ -180,6 +180,8 @@ pub mod proto_storage_command {
         DeletePodCleanupIntentsForNode(super::ProtoDeletePodCleanupIntentsForNode),
         #[prost(message, tag = "26")]
         ApplyResourceBatch(super::ProtoApplyResourceBatch),
+        #[prost(message, tag = "27")]
+        GcAppliedOutbox(super::ProtoGcAppliedOutbox),
     }
 }
 
@@ -488,6 +490,12 @@ pub struct ProtoGcWatchEvents {
     pub max_rows: i64,
     #[prost(int64, tag = "2")]
     pub batch_cap: i64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoGcAppliedOutbox {
+    #[prost(int64, tag = "1")]
+    pub cutoff_ms: i64,
 }
 
 /// Protobuf enum for `PatchKind`.

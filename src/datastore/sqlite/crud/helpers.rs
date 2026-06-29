@@ -155,6 +155,8 @@ pub fn serde_to_sqlite_error(error: serde_json::Error) -> tokio_rusqlite::Error 
     tokio_rusqlite::Error::Rusqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
+// TO-BE-CLEANUP: legacy replicated StorageCommand apply test support.
+#[cfg(test)]
 pub fn advance_metadata_rv_to_at_least(
     conn: &rusqlite::Connection,
     resource_version: i64,
