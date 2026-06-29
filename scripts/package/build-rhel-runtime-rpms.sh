@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<EOF_USAGE
-Usage: $(basename "$0") --containerd-dir DIR --runc-bin PATH --containerd-version VERSION --runc-version VERSION --containerd-license PATH --containerd-notice PATH --runc-license PATH --runc-notice PATH --distro el9|el10 --out DIR
+Usage: $(basename "$0") --containerd-dir DIR --runc-bin PATH --containerd-version VERSION --runc-version VERSION --containerd-license PATH --containerd-notice PATH --runc-license PATH --runc-notice PATH --distro el9|el10 --arch ARCH --out DIR
 
 Create RHEL-compatible RPMs for the open-source container runtime dependencies
 published by the klights package repository.
@@ -20,6 +20,7 @@ CONTAINERD_NOTICE=""
 RUNC_LICENSE=""
 RUNC_NOTICE=""
 DISTRO=""
+ARCH=""
 OUT_DIR=""
 
 while [[ "$#" -gt 0 ]]; do
@@ -60,6 +61,10 @@ while [[ "$#" -gt 0 ]]; do
       DISTRO=${2:-}
       shift 2
       ;;
+    --arch)
+      ARCH=${2:-}
+      shift 2
+      ;;
     --out)
       OUT_DIR=${2:-}
       shift 2
@@ -74,13 +79,18 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$CONTAINERD_DIR" || -z "$RUNC_BIN" || -z "$CONTAINERD_VERSION" || -z "$RUNC_VERSION" || -z "$CONTAINERD_LICENSE" || -z "$CONTAINERD_NOTICE" || -z "$RUNC_LICENSE" || -z "$RUNC_NOTICE" || -z "$DISTRO" || -z "$OUT_DIR" ]]; then
+if [[ -z "$CONTAINERD_DIR" || -z "$RUNC_BIN" || -z "$CONTAINERD_VERSION" || -z "$RUNC_VERSION" || -z "$CONTAINERD_LICENSE" || -z "$CONTAINERD_NOTICE" || -z "$RUNC_LICENSE" || -z "$RUNC_NOTICE" || -z "$DISTRO" || -z "$ARCH" || -z "$OUT_DIR" ]]; then
   echo "Missing required argument." >&2
   usage
 fi
 
 if [[ "$DISTRO" != "el9" && "$DISTRO" != "el10" ]]; then
   echo "--distro must be el9 or el10" >&2
+  exit 1
+fi
+
+if [[ "$ARCH" != "x86_64" && "$ARCH" != "aarch64" ]]; then
+  echo "--arch must be x86_64 or aarch64" >&2
   exit 1
 fi
 
@@ -163,7 +173,7 @@ Version:        ${CONTAINERD_VERSION}
 Release:        1.${DISTRO}
 Summary:        Open container runtime
 License:        Apache-2.0
-BuildArch:      x86_64
+BuildArch:      ${ARCH}
 Source0:        containerd-%{version}.tar.gz
 URL:            https://containerd.io/
 Requires:       runc
@@ -231,7 +241,7 @@ Version:        ${RUNC_VERSION}
 Release:        1.${DISTRO}
 Summary:        Open Container Initiative runtime
 License:        Apache-2.0
-BuildArch:      x86_64
+BuildArch:      ${ARCH}
 Source0:        runc-%{version}.tar.gz
 URL:            https://github.com/opencontainers/runc
 Provides:       runc = %{version}-%{release}
@@ -262,12 +272,12 @@ install -m 0644 usr/share/licenses/runc/NOTICE \
 %license /usr/share/licenses/runc/NOTICE
 EOF_SPEC
 
-rpmbuild -bb --define "_topdir $TOPDIR" "$TOPDIR/SPECS/runc.spec"
-rpmbuild -bb --define "_topdir $TOPDIR" "$TOPDIR/SPECS/containerd.spec"
+rpmbuild -bb --target "$ARCH" --define "_topdir $TOPDIR" "$TOPDIR/SPECS/runc.spec"
+rpmbuild -bb --target "$ARCH" --define "_topdir $TOPDIR" "$TOPDIR/SPECS/containerd.spec"
 
 for package in \
-  "$TOPDIR/RPMS/x86_64/runc-${RUNC_VERSION}-1.${DISTRO}.x86_64.rpm" \
-  "$TOPDIR/RPMS/x86_64/containerd-${CONTAINERD_VERSION}-1.${DISTRO}.x86_64.rpm"; do
+  "$TOPDIR/RPMS/$ARCH/runc-${RUNC_VERSION}-1.${DISTRO}.${ARCH}.rpm" \
+  "$TOPDIR/RPMS/$ARCH/containerd-${CONTAINERD_VERSION}-1.${DISTRO}.${ARCH}.rpm"; do
   if [[ ! -f "$package" ]]; then
     echo "Failed to build expected package: $package" >&2
     find "$TOPDIR/RPMS" -maxdepth 3 -type f >&2

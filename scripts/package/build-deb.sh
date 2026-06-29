@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<EOF_USAGE
-Usage: $(basename "$0") --binary PATH --version VERSION --suite SUITE --distro DISTRO --out DIR
+Usage: $(basename "$0") --binary PATH --version VERSION --suite SUITE --distro DISTRO --arch ARCH --out DIR
 
 Create a Debian package for klights.
 
@@ -12,6 +12,7 @@ Options:
   --version VERSION version string for package metadata
   --suite SUITE     target Debian suite (e.g. stable)
   --distro DISTRO   Debian-like distro label used in release suffix
+  --arch ARCH       Debian architecture (amd64 or arm64)
   --out DIR         output directory for generated .deb
 EOF_USAGE
   exit 1
@@ -21,6 +22,7 @@ BINARY=""
 VERSION=""
 SUITE=""
 DISTRO=""
+ARCH=""
 OUT_DIR=""
 
 while [[ "$#" -gt 0 ]]; do
@@ -57,6 +59,14 @@ while [[ "$#" -gt 0 ]]; do
       DISTRO=$2
       shift 2
       ;;
+    --arch)
+      if [[ "$#" -lt 2 ]]; then
+        echo "--arch requires ARCH" >&2
+        usage
+      fi
+      ARCH=$2
+      shift 2
+      ;;
     --out)
       if [[ "$#" -lt 2 ]]; then
         echo "--out requires DIR" >&2
@@ -75,9 +85,14 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$BINARY" || -z "$VERSION" || -z "$SUITE" || -z "$DISTRO" || -z "$OUT_DIR" ]]; then
+if [[ -z "$BINARY" || -z "$VERSION" || -z "$SUITE" || -z "$DISTRO" || -z "$ARCH" || -z "$OUT_DIR" ]]; then
   echo "Missing required argument." >&2
   usage
+fi
+
+if [[ "$ARCH" != "amd64" && "$ARCH" != "arm64" ]]; then
+  echo "--arch must be amd64 or arm64" >&2
+  exit 1
 fi
 
 if ! command -v dpkg-deb >/dev/null 2>&1; then
@@ -123,7 +138,7 @@ Package: klights
 Version: ${VERSION}-1~${SUITE}
 Section: admin
 Priority: optional
-Architecture: amd64
+Architecture: ${ARCH}
 Maintainer: klights maintainers <maintainers@klights.net>
 Depends: containerd, iproute2, kmod, libmnl0, libnftnl11, nftables
 Description: Lightweight Kubernetes runtime
@@ -154,7 +169,7 @@ EOF_PRERM
 
 chmod 0755 "$STAGING/DEBIAN/postinst" "$STAGING/DEBIAN/prerm"
 
-OUTPUT="$OUT_DIR/klights_${VERSION}-1~${SUITE}_amd64.deb"
+OUTPUT="$OUT_DIR/klights_${VERSION}-1~${SUITE}_${ARCH}.deb"
 dpkg-deb --build "$STAGING" "$OUTPUT"
 
 echo "$OUTPUT"

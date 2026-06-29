@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<EOF_USAGE
-Usage: $(basename "$0") --binary PATH --version VERSION --distro el9|el10 --out DIR
+Usage: $(basename "$0") --binary PATH --version VERSION --distro el9|el10 --arch ARCH --out DIR
 
 Create an RPM for klights.
 
@@ -11,6 +11,7 @@ Options:
   --binary PATH     path to klights binary to install
   --version VERSION version string for package metadata
   --distro el9|el10 target EL release label (also used as rpm Release suffix)
+  --arch ARCH       RPM architecture (x86_64 or aarch64)
   --out DIR         output directory for generated .rpm
 EOF_USAGE
   exit 1
@@ -19,6 +20,7 @@ EOF_USAGE
 BINARY=""
 VERSION=""
 DISTRO=""
+ARCH=""
 OUT_DIR=""
 
 while [[ "$#" -gt 0 ]]; do
@@ -47,6 +49,14 @@ while [[ "$#" -gt 0 ]]; do
       DISTRO=$2
       shift 2
       ;;
+    --arch)
+      if [[ "$#" -lt 2 ]]; then
+        echo "--arch requires x86_64|aarch64" >&2
+        usage
+      fi
+      ARCH=$2
+      shift 2
+      ;;
     --out)
       if [[ "$#" -lt 2 ]]; then
         echo "--out requires DIR" >&2
@@ -65,13 +75,18 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ -z "$BINARY" || -z "$VERSION" || -z "$DISTRO" || -z "$OUT_DIR" ]]; then
+if [[ -z "$BINARY" || -z "$VERSION" || -z "$DISTRO" || -z "$ARCH" || -z "$OUT_DIR" ]]; then
   echo "Missing required argument." >&2
   usage
 fi
 
 if [[ "$DISTRO" != "el9" && "$DISTRO" != "el10" ]]; then
   echo "--distro must be el9 or el10" >&2
+  exit 1
+fi
+
+if [[ "$ARCH" != "x86_64" && "$ARCH" != "aarch64" ]]; then
+  echo "--arch must be x86_64 or aarch64" >&2
   exit 1
 fi
 
@@ -128,7 +143,7 @@ Version:        ${VERSION}
 Release:        1.${DISTRO}
 Summary:        Lightweight Kubernetes runtime
 License:        AGPL-3.0-or-later
-BuildArch:      x86_64
+BuildArch:      ${ARCH}
 Source0:        klights-%{version}.tar.gz
 Requires:       containerd >= 2.3.2
 Requires:       iproute
@@ -191,10 +206,10 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 EOF_SPEC
 
-rpmbuild -bb --define "_topdir $TOPDIR" "$TOPDIR/SPECS/klights.spec"
+rpmbuild -bb --target "$ARCH" --define "_topdir $TOPDIR" "$TOPDIR/SPECS/klights.spec"
 
-PACKAGE_NAME="klights-${VERSION}-1.${DISTRO}.x86_64.rpm"
-BUILT_PACKAGE="$(find "$TOPDIR/RPMS/x86_64" -maxdepth 1 -type f -name "$PACKAGE_NAME" -print | head -n 1)"
+PACKAGE_NAME="klights-${VERSION}-1.${DISTRO}.${ARCH}.rpm"
+BUILT_PACKAGE="$(find "$TOPDIR/RPMS/$ARCH" -maxdepth 1 -type f -name "$PACKAGE_NAME" -print | head -n 1)"
 if [[ -z "$BUILT_PACKAGE" ]]; then
   echo "Failed to build package: $PACKAGE_NAME" >&2
   find "$TOPDIR/RPMS" -maxdepth 3 -type f >&2
