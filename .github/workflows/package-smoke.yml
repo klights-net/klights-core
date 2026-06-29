@@ -127,8 +127,8 @@ jobs:
               exit 1
             fi
             kubectl get nodes -o wide
-            kubectl version -o yaml
-            kubectl version -o json | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v1\.34\.6'
+            kubectl version -o yaml | tee /tmp/klights-version.yaml
+            grep -F "gitVersion: v1.34.6" /tmp/klights-version.yaml
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             nginx_ready=false
             for attempt in {1..90}; do
@@ -303,8 +303,8 @@ jobs:
               exit 1
             fi
             kubectl get nodes -o wide
-            kubectl version -o yaml
-            kubectl version -o json | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v1\.34\.6'
+            kubectl version -o yaml | tee /tmp/klights-version.yaml
+            grep -F "gitVersion: v1.34.6" /tmp/klights-version.yaml
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             nginx_ready=false
             for attempt in {1..90}; do
@@ -487,8 +487,8 @@ jobs:
               exit 1
             fi
             kubectl get nodes -o wide
-            kubectl version -o yaml
-            kubectl version -o json | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v1\.34\.6'
+            kubectl version -o yaml | tee /tmp/klights-version.yaml
+            grep -F "gitVersion: v1.34.6" /tmp/klights-version.yaml
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             nginx_ready=false
             for attempt in {1..90}; do
@@ -663,8 +663,8 @@ jobs:
               exit 1
             fi
             kubectl get nodes -o wide
-            kubectl version -o yaml
-            kubectl version -o json | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v1\.34\.6'
+            kubectl version -o yaml | tee /tmp/klights-version.yaml
+            grep -F "gitVersion: v1.34.6" /tmp/klights-version.yaml
             kubectl create deployment nginx-smoke --image=nginx:alpine --port=80
             nginx_ready=false
             for attempt in {1..90}; do
