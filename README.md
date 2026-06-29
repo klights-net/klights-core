@@ -49,83 +49,66 @@ containerd-free runtime support are not available in this release.
 
 ## Quickstart
 
-Install klights from the public package repository, configure the packaged
-systemd service for single-node leader mode, then start the service.
+Install klights from the public package repository, then start the packaged
+systemd services. The packages include the klights service unit, default
+`RUST_LOG=info`, default `KLIGHTS_ARGS=start`, and package-manager dependency
+metadata for the runtime packages.
 
-Ubuntu 24.04 (`noble`):
+Packages are published for:
+
+- Ubuntu 24.04 (`noble`) on `amd64` and `arm64`
+- Ubuntu 26.04 (`resolute`) on `amd64` and `arm64`
+- RHEL-compatible 9 on `x86_64` and `aarch64`
+- RHEL-compatible 10 on `x86_64` and `aarch64`
+
+Ubuntu 24.04:
 
 ```bash
-sudo install -d /etc/apt/keyrings
-echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt noble main" | \
-  sudo tee /etc/apt/sources.list.d/klights.list
+echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt noble main" |   sudo tee /etc/apt/sources.list.d/klights.list
 sudo apt-get update
 sudo apt-get install -y klights
-```
-
-Ubuntu 26.04 (`resolute`):
-
-```bash
-sudo install -d /etc/apt/keyrings
-echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt resolute main" | \
-  sudo tee /etc/apt/sources.list.d/klights.list
-sudo apt-get update
-sudo apt-get install -y klights
-```
-
-Configure and start the packaged service on Ubuntu:
-
-```bash
-sudo install -d -m 0755 /var/lib/klights
-sudo tee /etc/default/klights >/dev/null <<'EOF'
-RUST_LOG=info
-KLIGHTS_DATA_ROOT=/var/lib/klights
-KLIGHTS_ARGS=start
-EOF
-sudo systemctl daemon-reload
 sudo systemctl enable --now containerd
 sudo systemctl enable --now klights
-sudo systemctl status --no-pager klights
 ```
 
-RHEL 9:
+Ubuntu 26.04:
+
+```bash
+echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt resolute main" |   sudo tee /etc/apt/sources.list.d/klights.list
+sudo apt-get update
+sudo apt-get install -y klights
+sudo systemctl enable --now containerd
+sudo systemctl enable --now klights
+```
+
+RHEL-compatible 9:
 
 ```bash
 sudo tee /etc/yum.repos.d/klights.repo >/dev/null <<'EOF'
 [klights]
 name=klights
-baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el9/x86_64
+baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el9/$basearch
 enabled=1
 gpgcheck=0
 EOF
 sudo dnf install -y klights
+sudo systemctl enable --now containerd
+sudo systemctl enable --now klights
 ```
 
-RHEL 10:
+RHEL-compatible 10:
 
 ```bash
 sudo tee /etc/yum.repos.d/klights.repo >/dev/null <<'EOF'
 [klights]
 name=klights
-baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el10/x86_64
+baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el10/$basearch
 enabled=1
 gpgcheck=0
 EOF
 sudo dnf install -y klights
-```
-
-Configure and start the packaged service on RHEL:
-
-```bash
-sudo install -d -m 0755 /var/lib/klights
-sudo tee /etc/sysconfig/klights >/dev/null <<'EOF'
-RUST_LOG=info
-KLIGHTS_DATA_ROOT=/var/lib/klights
-KLIGHTS_ARGS=start
-EOF
-sudo systemctl daemon-reload
 sudo systemctl enable --now containerd
 sudo systemctl enable --now klights
-sudo systemctl status --no-pager klights
 ```
 
 Verify the node through the generated kubeconfig:
@@ -134,74 +117,9 @@ Verify the node through the generated kubeconfig:
 sudo kubectl --kubeconfig /var/lib/klights/etc/kubeconfig.yaml get nodes -o wide
 ```
 
-The package Quickstart starts a single-node leader. klights also supports two
-control-plane startup modes:
-
-- **Single-leader mode:** start one leader with `klights start`. This is the
-  simplest mode for local development. You can optionally add one or more
-  `replica` nodes. A replica is a backup copy of the control plane; it follows
-  the leader as a Raft learner but does not vote or take over automatically. If
-  the leader is lost, you can manually restart a replica as the leader for
-  recovery.
-- **Raft control-plane mode:** run exactly three `controlplane` voters. Use
-  this mode when you want the control plane itself to run as a Raft cluster.
-
-To join more nodes, read the bootstrap token Secrets from the first node and
-write them to local token files. The `controlplane-bootstrap-token` Secret is
-used by `controlplane` and `replica` joins. The `worker-bootstrap-token` Secret
-is used by `worker` joins.
-
-```bash
-sudo kubectl --kubeconfig /root/klights/etc/kubeconfig.yaml \
-  -n kube-system get secret controlplane-bootstrap-token -o json \
-  | jq -r '
-      [.data["token-id"], .data["token-secret"]]
-      | map(@base64d)
-      | "\(.[0]).\(.[1])"
-    ' > /tmp/klights-controlplane.token
-
-sudo kubectl --kubeconfig /root/klights/etc/kubeconfig.yaml \
-  -n kube-system get secret worker-bootstrap-token -o json \
-  | jq -r '
-      [.data["token-id"], .data["token-secret"]]
-      | map(@base64d)
-      | "\(.[0]).\(.[1])"
-    ' > /tmp/klights-worker.token
-
-chmod 600 /tmp/klights-controlplane.token /tmp/klights-worker.token
-```
-
-For Raft control-plane mode, join the second and third control-plane voters:
-
-```bash
-sudo klights controlplane \
-  --leader https://<leader-ip>:7679 \
-  --skip-ca \
-  --token-file /tmp/klights-controlplane.token
-```
-
-For single-leader mode, add an optional replica backup:
-
-```bash
-sudo klights replica \
-  --leader https://<leader-ip>:7679 \
-  --skip-ca \
-  --token-file /tmp/klights-controlplane.token
-```
-
-Join a worker:
-
-```bash
-sudo klights worker \
-  --leader https://<leader-ip>:7679 \
-  --skip-ca \
-  --token-file /tmp/klights-worker.token
-```
-
-`--skip-ca` is only for first bootstrap when the joiner does not already have
-the leader CA certificate. Use the detailed examples below when you need fixed
-node names, fixed data roots, custom pod ranges, or explicit external
-endpoints.
+The package Quickstart starts a single-node leader. For Raft control-plane,
+replica, worker-node, fixed address, or custom data-root examples, see
+[ARCH.md](ARCH.md) and [public-release.md](public-release.md).
 
 ## Prerequisites
 
