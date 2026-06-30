@@ -1,15 +1,17 @@
 # klights
 
 klights is a resource-efficient, event-driven Kubernetes-compatible cluster
-runtime. `klights` is pronounced **K-light-s**.
-
-The goal is to build a resource-efficient Kubernetes API-compatible
-implementation that can run real development workloads with near-zero idle CPU,
-a small memory footprint.
+runtime. pronounced **K-light-s**.
 
 
-Baseline Memory usage
----------------------
+### Sonobuoy Conformance tests
+Klights passed Sonobuoy Conformance tests with 3 raft controlplanes, one replicas and 2 workers nodes.
+Sonobuoy Version: v0.57.3
+Ran 424 of 7144 Specs in 2260.475 seconds
+SUCCESS! -- 424 Passed | 0 Failed | 0 Pending | 6720 Skipped
+
+
+### Baseline Memory usage
 startup, with klights running and only CoreDNS deployed:
 
 - klights process RSS:      approximately 76.1 MiB
@@ -31,7 +33,6 @@ The idle baseline was therefore roughly:
 The cgroup number includes embedded runtime overhead, not just the klights process.
 
 
-
 ### This beta currently offers:
 
 - Near-zero CPU use during idle through async, event-driven runtime paths.
@@ -46,6 +47,7 @@ The cgroup number includes embedded runtime overhead, not just the klights proce
 - Worker-node and control-plane node joins with separate bootstrap tokens.
 - Rootful container runtime integration through containerd and klights-managed
   CNI configuration.
+
 
 ### Upcoming work includes but is not limited to:
 
