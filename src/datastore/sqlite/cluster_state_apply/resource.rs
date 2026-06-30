@@ -199,13 +199,19 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
             );
             self.get_existing_resource(identity)?
         };
+        let normalized_before_validation = row.status_only;
+        if normalized_before_validation {
+            normalize_committed_resource_for_apply(&mut row, existing.as_ref())?;
+        }
         if raft_authoritative {
             validate_put_resource_presence_preconditions(&row, existing.as_ref())?;
             log_raft_put_conflict_if_any(&row, existing.as_ref());
         } else {
             validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
         }
-        normalize_committed_resource_for_apply(&mut row, existing.as_ref())?;
+        if !normalized_before_validation {
+            normalize_committed_resource_for_apply(&mut row, existing.as_ref())?;
+        }
         let identity = resource_identity(
             &row.api_version,
             &row.kind,
@@ -613,26 +619,21 @@ fn merge_status_only_row_with_existing(
     let mut status = status;
     let mut live: serde_json::Value =
         serde_json::from_slice(existing_bytes).map_err(serde_to_sqlite_error)?;
-    if row
+    let freshness = if row
         .precondition_resource_version
         .is_some_and(|expected_rv| expected_rv < *current_rv)
     {
-        preserve_unmentioned_live_status_fields(&row.api_version, &row.kind, &live, &mut status);
-        preserve_live_status_conditions_by_type(&live, &mut status);
-    }
-    if row
-        .precondition_uid
-        .as_deref()
-        .is_some_and(|uid| !uid.is_empty())
-    {
-        crate::pod_status_merge::merge_pod_status_for_update(
-            &row.api_version,
-            &row.kind,
-            &live,
-            &mut status,
-            crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
-        );
-    }
+        crate::datastore::status_merge_policy::StatusApplyFreshness::Stale
+    } else {
+        crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh
+    };
+    crate::datastore::status_merge_policy::merge_status_for_apply(
+        &row.api_version,
+        &row.kind,
+        &live,
+        &mut status,
+        freshness,
+    );
     let Some(live_obj) = live.as_object_mut() else {
         return Err(other_error(
             "status-only log_apply target is not a JSON object",
@@ -652,86 +653,14 @@ fn merge_status_only_row_with_existing(
         &row.api_version,
         &row.kind,
     );
+    if freshness == crate::datastore::status_merge_policy::StatusApplyFreshness::Stale
+        && row.precondition_uid.as_deref() == Some(current_uid.as_str())
+    {
+        row.precondition_resource_version = None;
+    }
     row.uid = current_uid.clone();
     row.data = live;
     Ok(())
-}
-
-fn preserve_unmentioned_live_status_fields(
-    api_version: &str,
-    kind: &str,
-    live: &serde_json::Value,
-    incoming_status: &mut serde_json::Value,
-) {
-    if api_version == "v1" && kind == "Pod" {
-        return;
-    }
-    let Some(live_status) = live.get("status").and_then(|status| status.as_object()) else {
-        return;
-    };
-    let Some(incoming_status) = incoming_status.as_object_mut() else {
-        return;
-    };
-    for (key, value) in live_status {
-        incoming_status
-            .entry(key.clone())
-            .or_insert_with(|| value.clone());
-    }
-}
-
-fn preserve_live_status_conditions_by_type(
-    live: &serde_json::Value,
-    incoming_status: &mut serde_json::Value,
-) {
-    let Some(live_conditions) = live
-        .pointer("/status/conditions")
-        .and_then(|conditions| conditions.as_array())
-    else {
-        return;
-    };
-    if live_conditions.is_empty() {
-        return;
-    }
-    let Some(status_obj) = incoming_status.as_object_mut() else {
-        return;
-    };
-    let incoming_conditions = status_obj
-        .entry("conditions".to_string())
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-    let Some(incoming_conditions) = incoming_conditions.as_array_mut() else {
-        return;
-    };
-
-    let mut seen_types = HashSet::new();
-    for incoming in incoming_conditions.iter_mut() {
-        let Some(condition_type) = incoming
-            .get("type")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        if let Some(live_condition) = live_conditions.iter().find(|condition| {
-            condition.get("type").and_then(|value| value.as_str()) == Some(condition_type.as_str())
-        }) {
-            *incoming = live_condition.clone();
-        }
-        seen_types.insert(condition_type);
-    }
-
-    for live_condition in live_conditions {
-        let Some(condition_type) = live_condition
-            .get("type")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        if seen_types.insert(condition_type.to_string()) {
-            incoming_conditions.push(live_condition.clone());
-        }
-    }
 }
 
 fn preserve_newer_same_uid_row_on_stale_committed_put(

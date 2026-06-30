@@ -3312,4 +3312,97 @@ mod cases {
             stored.data.pointer("/status/conditions")
         );
     }
+
+    #[tokio::test]
+    async fn replicated_stale_status_preserves_live_job_status_scalars() {
+        use crate::datastore::replicated::apply_command_to_backend;
+
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "batch/v1",
+                "Job",
+                Some("default"),
+                "replicated-stale-job",
+                json!({
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "metadata": {"name": "replicated-stale-job", "namespace": "default", "uid": "replicated-job-uid"},
+                    "spec": {},
+                    "status": {
+                        "active": 1,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "conditions": [{"type": "Complete", "status": "False"}]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.update_status_only(
+            "batch/v1",
+            "Job",
+            Some("default"),
+            "replicated-stale-job",
+            json!({
+                "active": 0,
+                "succeeded": 1,
+                "failed": 0,
+                "completionTime": "2026-06-30T12:00:00Z",
+                "conditions": [{"type": "Complete", "status": "True", "reason": "CompletionsReached"}]
+            }),
+            Some(created.resource_version),
+        )
+        .await
+        .expect("live completion status applies first");
+
+        apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateStatus {
+                api_version: "batch/v1".into(),
+                kind: "Job".into(),
+                namespace: Some("default".into()),
+                name: "replicated-stale-job".into(),
+                status: json!({
+                    "active": 1,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "conditions": [{"type": "Complete", "status": "False"}]
+                }),
+                expected_rv: Some(created.resource_version),
+                preconditions: ResourcePreconditions {
+                    uid: Some("replicated-job-uid".into()),
+                    resource_version: Some(created.resource_version),
+                },
+                observed_status_stamp: None,
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: created.resource_version,
+                uid: Some("replicated-job-uid".into()),
+                timestamp_ms: 0,
+                authoring_node: "worker-a".into(),
+            },
+        )
+        .await
+        .expect("stale replicated status must apply by rebasing");
+
+        let live = db
+            .get_resource("batch/v1", "Job", Some("default"), "replicated-stale-job")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.data.pointer("/status/active"), Some(&json!(0)));
+        assert_eq!(live.data.pointer("/status/succeeded"), Some(&json!(1)));
+        assert_eq!(
+            live.data.pointer("/status/completionTime"),
+            Some(&json!("2026-06-30T12:00:00Z"))
+        );
+        assert_eq!(
+            live.data.pointer("/status/conditions/0/status"),
+            Some(&json!("True"))
+        );
+    }
 }

@@ -912,6 +912,108 @@ async fn raft_status_apply_built_before_metadata_update_preserves_live_metadata(
 }
 
 #[tokio::test]
+async fn stale_status_only_apply_preserves_live_job_status_scalars() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "batch/v1",
+            "Job",
+            Some("default"),
+            "stale-job-status",
+            json!({
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": {"name": "stale-job-status", "namespace": "default", "uid": "job-uid"},
+                "spec": {},
+                "status": {
+                    "active": 1,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "conditions": [{"type": "Started", "status": "True"}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+        StorageCommand::UpdateStatus {
+            api_version: "batch/v1".into(),
+            kind: "Job".into(),
+            namespace: Some("default".into()),
+            name: "stale-job-status".into(),
+            status: json!({
+                "active": 1,
+                "succeeded": 0,
+                "failed": 0,
+                "conditions": [{"type": "Complete", "status": "False"}]
+            }),
+            expected_rv: Some(created.resource_version),
+            preconditions: ResourcePreconditions {
+                uid: Some("job-uid".into()),
+                resource_version: Some(created.resource_version),
+            },
+            observed_status_stamp: None,
+        },
+    )
+    .encode_protobuf()
+    .unwrap();
+
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "stale-job-status-commit",
+            "JobStatus",
+            payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .expect("build stale status commit");
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+        panic!("expected status commit");
+    };
+
+    let mut live_update = (*created.data).clone();
+    live_update["status"] = json!({
+        "active": 0,
+        "succeeded": 1,
+        "failed": 0,
+        "completionTime": "2026-06-30T12:00:00Z",
+        "conditions": [{"type": "Complete", "status": "True", "reason": "CompletionsReached"}]
+    });
+    db.update_status_only(
+        "batch/v1",
+        "Job",
+        Some("default"),
+        "stale-job-status",
+        live_update["status"].clone(),
+        Some(created.resource_version),
+    )
+    .await
+    .expect("live job completion status applies first");
+
+    db.apply_log_apply_commit(commit)
+        .await
+        .expect("stale commit must apply by rebasing");
+
+    let live = db
+        .get_resource("batch/v1", "Job", Some("default"), "stale-job-status")
+        .await
+        .unwrap()
+        .expect("live job remains");
+    assert_eq!(live.data.pointer("/status/active"), Some(&json!(0)));
+    assert_eq!(live.data.pointer("/status/succeeded"), Some(&json!(1)));
+    assert_eq!(
+        live.data.pointer("/status/completionTime"),
+        Some(&json!("2026-06-30T12:00:00Z"))
+    );
+    assert_eq!(
+        live.data.pointer("/status/conditions/0/status"),
+        Some(&json!("True")),
+        "stale status-only apply must not roll back same-type live condition"
+    );
+}
+
+#[tokio::test]
 async fn stale_committed_pod_bind_preserves_live_owner_references() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db

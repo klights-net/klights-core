@@ -338,7 +338,7 @@ where
             name,
             status,
             expected_rv: _,
-            preconditions,
+            mut preconditions,
             observed_status_stamp,
         } => {
             let current = backend
@@ -376,6 +376,21 @@ where
                 && let Some(current) = current.as_ref()
             {
                 crate::kubelet::node::merge_node_status_for_update(&mut status, &current.data);
+            }
+            if let (Some(expected_rv), Some(current)) =
+                (preconditions.resource_version, current.as_ref())
+                && expected_rv < current.resource_version
+                && preconditions.uid.as_deref() == Some(current.uid.as_str())
+                && !(api_version == "v1" && kind == "Pod")
+            {
+                crate::datastore::status_merge_policy::merge_status_for_apply(
+                    &api_version,
+                    &kind,
+                    current.data.as_ref(),
+                    &mut status,
+                    crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
+                );
+                preconditions.resource_version = None;
             }
             backend
                 .update_status_only_with_preconditions(

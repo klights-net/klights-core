@@ -21,6 +21,7 @@ pub mod replicated;
 pub mod selector;
 pub mod snapshot;
 pub mod sqlite;
+pub mod status_merge_policy;
 pub mod types;
 
 pub use backend::*;

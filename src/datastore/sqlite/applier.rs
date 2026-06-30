@@ -125,6 +125,23 @@ impl DatastoreApplier for Datastore {
                 if preconditions.resource_version.is_none() {
                     preconditions.resource_version = expected_rv;
                 }
+                if let Some(expected_rv) = preconditions.resource_version
+                    && let Some(current) = self
+                        .get_resource(&api_version, &kind, namespace.as_deref(), &name)
+                        .await?
+                    && expected_rv < current.resource_version
+                    && preconditions.uid.as_deref() == Some(current.uid.as_str())
+                    && !(api_version == "v1" && kind == "Pod")
+                {
+                    crate::datastore::status_merge_policy::merge_status_for_apply(
+                        &api_version,
+                        &kind,
+                        current.data.as_ref(),
+                        &mut status,
+                        crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
+                    );
+                    preconditions.resource_version = None;
+                }
                 self.update_status_only_with_preconditions(
                     &api_version,
                     &kind,
