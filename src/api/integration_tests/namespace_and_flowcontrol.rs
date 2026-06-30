@@ -3081,6 +3081,298 @@ async fn test_apf_rejects_matching_request_when_limited_priority_level_is_full()
     );
 }
 
+#[tokio::test]
+async fn test_apf_queue_mode_rejects_when_queue_length_limit_is_full() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tokio::time::{Duration, timeout};
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let apf = state.api_priority_fairness.clone();
+
+    db.create_resource(
+        "flowcontrol.apiserver.k8s.io/v1",
+        "PriorityLevelConfiguration",
+        None,
+        "apf-queue-one-seat",
+        json!({
+            "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+            "kind": "PriorityLevelConfiguration",
+            "metadata": {"name": "apf-queue-one-seat"},
+            "spec": {
+                "type": "Limited",
+                "limited": {
+                    "nominalConcurrencyShares": 1,
+                    "limitResponse": {
+                        "type": "Queue",
+                        "queuing": {
+                            "queues": 1,
+                            "handSize": 1,
+                            "queueLengthLimit": 1
+                        }
+                    }
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "flowcontrol.apiserver.k8s.io/v1",
+        "FlowSchema",
+        None,
+        "apf-bob-list-namespaces",
+        json!({
+            "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+            "kind": "FlowSchema",
+            "metadata": {"name": "apf-bob-list-namespaces"},
+            "spec": {
+                "matchingPrecedence": 10,
+                "priorityLevelConfiguration": {"name": "apf-queue-one-seat"},
+                "distinguisherMethod": {"type": "ByUser"},
+                "rules": [{
+                    "subjects": [{"kind": "User", "user": {"name": "bob"}}],
+                    "resourceRules": [{
+                        "verbs": ["list"],
+                        "apiGroups": [""],
+                        "resources": ["namespaces"],
+                        "clusterScope": true
+                    }]
+                }]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let _held_seat = state
+        .api_priority_fairness
+        .occupy_limited_priority_level_for_test("apf-queue-one-seat", 1)
+        .expect("test should occupy APF seat");
+    let app = crate::api::build_router(state);
+    let app_for_first = app.clone();
+    let app_for_second = app.clone();
+
+    let mut first = Request::builder()
+        .method("GET")
+        .uri("/api/v1/namespaces")
+        .body(Body::empty())
+        .unwrap();
+    first
+        .extensions_mut()
+        .insert(crate::auth::AuthenticatedIdentity::client_cert(
+            "bob".to_string(),
+            vec![],
+        ));
+
+    let mut second = Request::builder()
+        .method("GET")
+        .uri("/api/v1/namespaces")
+        .body(Body::empty())
+        .unwrap();
+    second
+        .extensions_mut()
+        .insert(crate::auth::AuthenticatedIdentity::client_cert(
+            "bob".to_string(),
+            vec![],
+        ));
+
+    let mut first_handle = tokio::spawn(async move { app_for_first.oneshot(first).await.unwrap() });
+
+    let first_queue_ready = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if apf.queued_count_for_test("apf-queue-one-seat") == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        first_queue_ready,
+        "first request should remain queued before requesting overflow"
+    );
+
+    let second_resp = timeout(Duration::from_secs(2), app_for_second.oneshot(second))
+        .await
+        .expect("the second request should return when the queue is full")
+        .unwrap();
+
+    assert_eq!(second_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let second_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(second_resp.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(second_body["reason"], "TooManyRequests");
+    assert!(
+        second_body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("queue-full")),
+        "APF queue overflow should report queue-full: {second_body}"
+    );
+
+    assert_eq!(apf.queued_count_for_test("apf-queue-one-seat"), 1);
+    let first_timed_out = tokio::select! {
+        _ = &mut first_handle => false,
+        _ = tokio::time::sleep(Duration::from_millis(200)) => true,
+    };
+    assert!(
+        first_timed_out,
+        "first queued request should remain pending while queueing"
+    );
+
+    drop(_held_seat);
+    let first_resp = timeout(Duration::from_secs(1), &mut first_handle)
+        .await
+        .expect("first request should eventually complete after releasing seat")
+        .expect("first request task should complete");
+    assert_eq!(
+        first_resp.status(),
+        StatusCode::OK,
+        "queued request should complete after seat is released"
+    );
+}
+
+#[tokio::test]
+async fn test_apf_queue_mode_separates_unrelated_flows() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tokio::time::{Duration, timeout};
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let apf = state.api_priority_fairness.clone();
+
+    db.create_resource(
+        "flowcontrol.apiserver.k8s.io/v1",
+        "PriorityLevelConfiguration",
+        None,
+        "apf-queue-two",
+        json!({
+            "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+            "kind": "PriorityLevelConfiguration",
+            "metadata": {"name": "apf-queue-two"},
+            "spec": {
+                "type": "Limited",
+                "limited": {
+                    "nominalConcurrencyShares": 1,
+                    "limitResponse": {
+                        "type": "Queue",
+                        "queuing": {
+                            "queues": 2,
+                            "handSize": 1,
+                            "queueLengthLimit": 1
+                        }
+                    }
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "flowcontrol.apiserver.k8s.io/v1",
+        "FlowSchema",
+        None,
+        "apf-apf-by-user",
+        json!({
+            "apiVersion": "flowcontrol.apiserver.k8s.io/v1",
+            "kind": "FlowSchema",
+            "metadata": {"name": "apf-apf-by-user"},
+            "spec": {
+                "matchingPrecedence": 10,
+                "priorityLevelConfiguration": {"name": "apf-queue-two"},
+                "distinguisherMethod": {"type": "ByUser"},
+                "rules": [{
+                    "subjects": [{"kind": "User", "user": {"name": "*"}}],
+                    "resourceRules": [{
+                        "verbs": ["list"],
+                        "apiGroups": [""],
+                        "resources": ["namespaces"],
+                        "clusterScope": true
+                    }]
+                }]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let _held_seat = state
+        .api_priority_fairness
+        .occupy_limited_priority_level_for_test("apf-queue-two", 1)
+        .expect("test should occupy APF seat");
+    let app = crate::api::build_router(state);
+
+    let mut alice_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/namespaces")
+        .body(Body::empty())
+        .unwrap();
+    alice_req
+        .extensions_mut()
+        .insert(crate::auth::AuthenticatedIdentity::client_cert(
+            "alice".to_string(),
+            vec![],
+        ));
+
+    let mut bob_req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/namespaces")
+        .body(Body::empty())
+        .unwrap();
+    bob_req
+        .extensions_mut()
+        .insert(crate::auth::AuthenticatedIdentity::client_cert(
+            "bob".to_string(),
+            vec![],
+        ));
+
+    let mut alice_handle = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(alice_req).await.unwrap() }
+    });
+    let mut bob_handle = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(bob_req).await.unwrap() }
+    });
+
+    let bob_timed_out = tokio::select! {
+        res = &mut bob_handle => {
+            panic!(
+                "unrelated flow unexpectedly completed before queueing check: {:?}",
+                res
+            );
+        }
+        _ = tokio::time::sleep(Duration::from_millis(200)) => true,
+    };
+    assert!(
+        bob_timed_out,
+        "second unrelated flow should be queued instead of rejected by a full queue"
+    );
+    assert_eq!(apf.queued_count_for_test("apf-queue-two"), 2);
+    assert_eq!(apf.executing_count_for_test("apf-queue-two"), 1);
+
+    drop(_held_seat);
+
+    let alice_resp = timeout(Duration::from_secs(1), &mut alice_handle)
+        .await
+        .expect("alice request should eventually complete")
+        .expect("request task should complete");
+    let bob_resp = timeout(Duration::from_secs(1), &mut bob_handle)
+        .await
+        .expect("bob request should eventually complete after seat release")
+        .expect("request task should complete");
+    assert_eq!(alice_resp.status(), StatusCode::OK);
+    assert_eq!(bob_resp.status(), StatusCode::OK);
+}
+
 /// Regression for garbage_collector.go:436
 /// Orphan-deleting an RC must NOT delete the pods it created.
 /// After orphan delete: all pods must still exist in the API (any phase).
