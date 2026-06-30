@@ -3,12 +3,18 @@
 klights is a resource-efficient, event-driven Kubernetes-compatible cluster
 runtime. pronounced **K-light-s**.
 
+Packaged with both ARM and x86 build on Ubuntu 24.04/26.04 and RHEL 9/10. 
+
+Start with [QUICKSTART.md](QUICKSTART.md). 
+
+Build, run, configuration, and operations documentation [doc/README.md](doc/README.md).
 
 ### Sonobuoy Conformance tests
-Klights passed Sonobuoy Conformance tests with 3 raft controlplanes, one replicas and 2 workers nodes.
-Sonobuoy Version: v0.57.3
-Ran 424 of 7144 Specs in 2260.475 seconds
-SUCCESS! -- 424 Passed | 0 Failed | 0 Pending | 6720 Skipped
+Klights completed Sonobuoy Conformance tests with 3 raft controlplanes, one replicas and 2 workers nodes.
+
+- Sonobuoy Version: v0.57.3
+- Ran 424 of 7144 Specs in 2260.475 seconds
+- SUCCESS! -- 424 Passed | 0 Failed | 0 Pending | 6720 Skipped
 
 
 ### Baseline Memory usage
@@ -67,5 +73,3 @@ Current release support is limited to rootful local development mode. Rootless
 operation, hybrid rootless/root clusters, expanded CNI plugin support, and
 containerd-free runtime support are not available in this release.
 
-Start with [QUICKSTART.md](QUICKSTART.md). Build, run, configuration, and
-operations documentation lives in [doc/README.md](doc/README.md).
