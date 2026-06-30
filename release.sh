@@ -22,6 +22,25 @@ libnftnl, libmnl, zlib, OpenSSL, and SQLite.
 EOF_USAGE
 }
 
+openssl_static_link_args() {
+  if ! command -v pkg-config >/dev/null 2>&1; then
+    return 0
+  fi
+
+  pkg-config --libs --static openssl 2>/dev/null | tr ' ' '\n' | while IFS= read -r arg; do
+    case "$arg" in
+      ""|-lssl|-lcrypto)
+        ;;
+      -l:libjitterentropy.a)
+        printf ' -C link-arg=-l:libjitterentropy.a'
+        ;;
+      -l*|-L*|-Wl,*|-pthread)
+        printf ' -C link-arg=%s' "$arg"
+        ;;
+    esac
+  done
+}
+
 LINK_MODE="${KLIGHTS_RELEASE_LINK_MODE:-static}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -66,7 +85,8 @@ case "$LINK_MODE" in
     export OPENSSL_STATIC=1
     export LIBSQLITE3_SYS_STATIC=1
     export LIBZ_SYS_STATIC=1
-    export "$RUSTFLAGS_ENV=${EXISTING_RUSTFLAGS:+$EXISTING_RUSTFLAGS }-C target-feature=+crt-static"
+    OPENSSL_EXTRA_LINK_ARGS="$(openssl_static_link_args)"
+    export "$RUSTFLAGS_ENV=${EXISTING_RUSTFLAGS:+$EXISTING_RUSTFLAGS }-C target-feature=+crt-static${OPENSSL_EXTRA_LINK_ARGS}"
 
     echo "[release] building statically linked release binary for $STATIC_TARGET"
     cargo build --release --target "$STATIC_TARGET"
