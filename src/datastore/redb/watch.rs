@@ -11,6 +11,23 @@ use crate::datastore::redb::tables;
 use crate::datastore::types::*;
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
+const DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE: i64 = 1_024;
+
+fn watch_events_min_scope_rows(max_rows: i64) -> usize {
+    max_rows.clamp(1, DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE) as usize
+}
+
+fn watch_events_max_rows(max_rows: i64) -> usize {
+    if max_rows <= 0 { 0 } else { max_rows as usize }
+}
+
+fn watch_events_batch_cap(batch_cap: i64) -> usize {
+    if batch_cap < 0 {
+        usize::MAX
+    } else {
+        batch_cap as usize
+    }
+}
 
 pub struct RedbWatchStore {
     pub accessor: Arc<RedbAccessor>,
@@ -244,37 +261,36 @@ impl RedbWatchStore {
     pub async fn gc_watch(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
         self.db_call("gc_watch", move |db| {
             let w = db.begin_write()?;
-            let count: usize = {
+            let entries: Vec<(u64, Option<Vec<u8>>)> = {
                 let tbl = w.open_table(tables::WATCH_EVENTS)?;
-                tbl.iter()?.count()
+                let mut entries = Vec::new();
+                for entry in tbl.iter()? {
+                    let (key, event_ref) = entry?;
+                    let rv = key.value();
+                    let body = event_ref.value().to_vec();
+                    let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    entries.push((rv, floor_key_for_event(&event)));
+                }
+                entries
             };
-            if count <= max_rows as usize {
+            let candidates = watch_gc_candidates(&entries, max_rows, batch_cap);
+            if candidates.is_empty() {
                 w.commit()?;
                 return Ok(0);
             }
-            let to_remove = (count - max_rows as usize).min(batch_cap as usize);
-            let (keys_to_remove, floor_updates): (Vec<u64>, BTreeMap<Vec<u8>, u64>) = {
-                let tbl = w.open_table(tables::WATCH_EVENTS)?;
-                let mut keys = Vec::new();
-                let mut floor_updates: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-                for e in tbl.iter()? {
-                    let (k, event_ref) = e?;
-                    let rv = k.value();
-                    let body = event_ref.value().to_vec();
-                    let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                    if let Some(key) = floor_key_for_event(&event) {
-                        floor_updates
-                            .entry(key)
-                            .and_modify(|floor| *floor = (*floor).max(rv))
-                            .or_insert(rv);
-                    }
-                    keys.push(rv);
-                    if keys.len() >= to_remove {
-                        break;
-                    }
+
+            let mut keys_to_remove = Vec::with_capacity(candidates.len());
+            let mut floor_updates: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+            for (rv, floor_key) in candidates {
+                if let Some(key) = floor_key {
+                    floor_updates
+                        .entry(key)
+                        .and_modify(|floor| *floor = (*floor).max(rv))
+                        .or_insert(rv);
                 }
-                (keys, floor_updates)
-            };
+                keys_to_remove.push(rv);
+            }
+
             {
                 let mut floors = w.open_table(tables::WATCH_REPLAY_FLOORS)?;
                 for (key, floor_rv) in floor_updates {
@@ -302,14 +318,59 @@ impl RedbWatchStore {
         self.db_call("gc_watch_prunable_count", move |db| {
             let r = db.begin_read()?;
             let tbl = r.open_table(tables::WATCH_EVENTS)?;
-            let count = tbl.iter()?.count();
-            if count <= max_rows as usize {
-                return Ok(0);
+            let mut entries = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, event_ref) = entry?;
+                let rv = key.value();
+                let body = event_ref.value().to_vec();
+                let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                entries.push((rv, floor_key_for_event(&event)));
             }
-            Ok((count - max_rows as usize).min(batch_cap as usize))
+            Ok(watch_gc_candidates(&entries, max_rows, batch_cap).len())
         })
         .await
     }
+}
+
+fn watch_gc_candidates(
+    entries: &[(u64, Option<Vec<u8>>)],
+    max_rows: i64,
+    batch_cap: i64,
+) -> Vec<(u64, Option<Vec<u8>>)> {
+    let max_rows = watch_events_max_rows(max_rows);
+    if entries.len() <= max_rows {
+        return Vec::new();
+    }
+
+    let global_prunable = entries.len() - max_rows;
+    let min_scope_rows = watch_events_min_scope_rows(max_rows as i64);
+    let batch_cap = watch_events_batch_cap(batch_cap);
+    let mut scope_totals: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    for (_, floor_key) in entries {
+        if let Some(key) = floor_key {
+            *scope_totals.entry(key.clone()).or_default() += 1;
+        }
+    }
+
+    let mut seen_by_scope: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    let mut candidates = Vec::new();
+    for (idx, (rv, floor_key)) in entries.iter().enumerate() {
+        if idx >= global_prunable || candidates.len() >= batch_cap {
+            break;
+        }
+
+        if let Some(key) = floor_key {
+            let seen = seen_by_scope.entry(key.clone()).or_default();
+            let scope_rank = scope_totals.get(key).copied().unwrap_or(0) - *seen;
+            *seen += 1;
+            if scope_rank <= min_scope_rows {
+                continue;
+            }
+        }
+
+        candidates.push((*rv, floor_key.clone()));
+    }
+    candidates
 }
 
 fn watch_event_matches_target(
