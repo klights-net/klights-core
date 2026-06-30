@@ -61,17 +61,27 @@ pub async fn apiservice_reconcile_keys_for_resource(
         )]);
     }
 
-    if !matches!((api_version, kind), ("v1", "Service") | ("v1", "Endpoints")) {
+    if !matches!(
+        (api_version, kind),
+        ("v1", "Service") | ("v1", "Endpoints") | ("discovery.k8s.io/v1", "EndpointSlice")
+    ) {
         return Ok(Vec::new());
     }
     let namespace = resource
         .pointer("/metadata/namespace")
         .and_then(|v| v.as_str())
         .unwrap_or("default");
-    let name = resource
-        .pointer("/metadata/name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let name = if (api_version, kind) == ("discovery.k8s.io/v1", "EndpointSlice") {
+        resource
+            .pointer("/metadata/labels/kubernetes.io~1service-name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    } else {
+        resource
+            .pointer("/metadata/name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    };
     if name.is_empty() {
         return Ok(Vec::new());
     }
@@ -155,6 +165,71 @@ mod tests {
                 "apiVersion": "v1",
                 "kind": "Service",
                 "metadata": {"namespace": "default", "name": "ready-service"}
+            }),
+            &db,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            keys,
+            vec![ReconcileKey::cluster(
+                "apiregistration.k8s.io/v1",
+                "APIService",
+                "v1alpha1.ready.example.com"
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn endpointslice_mutation_enqueues_matching_apiservice_only() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "apiregistration.k8s.io/v1",
+            "APIService",
+            None,
+            "v1alpha1.ready.example.com",
+            json!({
+                "apiVersion": "apiregistration.k8s.io/v1",
+                "kind": "APIService",
+                "metadata": {"name": "v1alpha1.ready.example.com"},
+                "spec": {
+                    "group": "ready.example.com",
+                    "version": "v1alpha1",
+                    "service": {"namespace": "default", "name": "ready-service"}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        db.create_resource(
+            "apiregistration.k8s.io/v1",
+            "APIService",
+            None,
+            "v1alpha1.other.example.com",
+            json!({
+                "apiVersion": "apiregistration.k8s.io/v1",
+                "kind": "APIService",
+                "metadata": {"name": "v1alpha1.other.example.com"},
+                "spec": {
+                    "group": "other.example.com",
+                    "version": "v1alpha1",
+                    "service": {"namespace": "default", "name": "other-service"}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let keys = apiservice_reconcile_keys_for_resource(
+            &json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {
+                    "name": "ready-service-abc",
+                    "namespace": "default",
+                    "labels": {"kubernetes.io/service-name": "ready-service"}
+                }
             }),
             &db,
         )

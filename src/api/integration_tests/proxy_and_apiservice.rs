@@ -10,6 +10,18 @@ fn apiservice_service_dns_names(service: &str, namespace: &str) -> Vec<String> {
     ]
 }
 
+fn apiservice_available_condition(body: &serde_json::Value) -> Option<&serde_json::Value> {
+    body.pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|condition| {
+            condition
+                .pointer("/type")
+                .and_then(serde_json::Value::as_str)
+                == Some("Available")
+        })
+}
+
 fn generate_apiservice_self_signed_identity(service: &str, namespace: &str) -> (String, String) {
     use rcgen::CertificateParams;
     let cert_params =
@@ -549,6 +561,218 @@ async fn test_apiservice_status_reconciles_after_backend_service_and_endpoints_c
         })
         .expect("APIService status must contain Available condition");
     assert_eq!(available["reason"], "Passed");
+
+    cancel.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_apiservice_status_recovers_from_endpointslice_update() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tokio::time::{Duration, timeout};
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let dispatcher = state.controller_dispatcher.clone();
+    let db = state.db.clone();
+    let node_name = state.config.node_name.clone();
+    let cancel = CancellationToken::new();
+    let worker = tokio::spawn(dispatcher.run_worker(db.clone(), node_name, cancel.clone()));
+    let app = crate::api::build_router(state);
+
+    let apiservice = json!({
+        "apiVersion": "apiregistration.k8s.io/v1",
+        "kind": "APIService",
+        "metadata": {"name": "v1alpha1.ready.example.com"},
+        "spec": {
+            "group": "ready.example.com",
+            "version": "v1alpha1",
+            "groupPriorityMinimum": 1000,
+            "versionPriority": 10,
+            "insecureSkipTLSVerify": true,
+            "service": {"name": "ready-service", "namespace": "default", "port": 9443}
+        }
+    });
+
+    let create_apiservice = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/apiregistration.k8s.io/v1/apiservices")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&apiservice).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_apiservice.status(), StatusCode::CREATED);
+
+    let service = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": "ready-service", "namespace": "default"},
+        "spec": {"ports": [{"port": 9443}]}
+    });
+    let create_service = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/default/services")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&service).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_service.status(), StatusCode::CREATED);
+
+    let endpointslice = json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": "ready-service-abc",
+            "namespace": "default",
+            "labels": {"kubernetes.io/service-name": "ready-service"}
+        },
+        "addressType": "IPv4",
+        "ports": [{"name": "https", "port": 9443, "protocol": "TCP"}],
+        "endpoints": [{"addresses": ["10.42.0.25"], "conditions": {"ready": false}}]
+    });
+
+    let create_endpointslice = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/discovery.k8s.io/v1/namespaces/default/endpointslices")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&endpointslice).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_endpointslice.status(), StatusCode::CREATED);
+    let created_endpointslice: serde_json::Value = serde_json::from_slice(
+        &to_bytes(create_endpointslice.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+
+    let _ = timeout(Duration::from_secs(2), async {
+        loop {
+            let status = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(
+                            "/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.ready.example.com/status",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(status.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            let available = apiservice_available_condition(&body)
+                .expect("APIService status must contain Available condition");
+            if available["status"].as_str() == Some("False")
+                && available["reason"].as_str() == Some("MissingEndpoints")
+            {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("APIService status should remain unavailable with non-ready EndpointSlice");
+
+    let ready_resource_version = created_endpointslice["metadata"]
+        .pointer("/resourceVersion")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("1");
+    let ready_endpointslice = json!({
+        "apiVersion": "discovery.k8s.io/v1",
+        "kind": "EndpointSlice",
+        "metadata": {
+            "name": "ready-service-abc",
+            "namespace": "default",
+            "resourceVersion": ready_resource_version,
+            "labels": created_endpointslice["metadata"]["labels"],
+            "uid": created_endpointslice["metadata"]["uid"],
+        },
+        "addressType": "IPv4",
+        "ports": [{"name": "https", "port": 9443, "protocol": "TCP"}],
+        "endpoints": [{"addresses": ["10.42.0.25"], "conditions": {"ready": true}}]
+    });
+
+    let update_endpointslice = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(
+                    "/apis/discovery.k8s.io/v1/namespaces/default/endpointslices/ready-service-abc",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&ready_endpointslice).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update_endpointslice.status(), StatusCode::OK);
+
+    let final_status = timeout(Duration::from_secs(2), async {
+        loop {
+            let status = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(
+                            "/apis/apiregistration.k8s.io/v1/apiservices/v1alpha1.ready.example.com/status",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(status.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            let available = apiservice_available_condition(&body)
+                .expect("APIService status must contain Available condition");
+            if available["status"] == "True" {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("APIService status should become Available=True after EndpointSlice ready update");
+    let final_available = apiservice_available_condition(&final_status)
+        .expect("APIService status must contain Available condition");
+    assert_eq!(final_available["status"], "True");
+    assert_eq!(final_available["reason"], "Passed");
+
+    assert!(
+        db.get_resource("v1", "Endpoints", Some("default"), "ready-service")
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     cancel.cancel();
     worker.await.unwrap();

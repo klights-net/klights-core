@@ -279,7 +279,18 @@ pub fn default_registry(
         apiservice_effect.clone(),
         ErrorPolicy::Warn,
     );
-    registry.register("v1", "Endpoints", apiservice_effect, ErrorPolicy::Warn);
+    registry.register(
+        "v1",
+        "Endpoints",
+        apiservice_effect.clone(),
+        ErrorPolicy::Warn,
+    );
+    registry.register(
+        "discovery.k8s.io/v1",
+        "EndpointSlice",
+        apiservice_effect,
+        ErrorPolicy::Warn,
+    );
     registry.register(
         "v1",
         "Node",

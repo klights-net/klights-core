@@ -4,7 +4,7 @@
 //! Endpoints objects so the apiregistration API behaves like a small
 //! kube-aggregator control plane instead of a passive proxy registry.
 
-use crate::datastore::{DatastoreBackend, ResourcePreconditions};
+use crate::datastore::{DatastoreBackend, ResourceListQuery, ResourcePreconditions};
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
@@ -94,6 +94,38 @@ async fn evaluate_apiservice_status(
         ));
     }
 
+    let endpoint_slice_selector = format!("kubernetes.io/service-name={name}");
+    let endpoint_slices = db
+        .list_resources(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some(namespace),
+            ResourceListQuery::new(Some(&endpoint_slice_selector), None, None, None),
+        )
+        .await?;
+    if !endpoint_slices.items.is_empty() {
+        let slice_refs: Vec<&Value> = endpoint_slices
+            .items
+            .iter()
+            .map(|slice| slice.data.as_ref())
+            .collect();
+        if endpointslices_have_ready_address(&slice_refs) {
+            return Ok(status_with_available(
+                apiservice,
+                "True",
+                "Passed",
+                "all checks passed",
+            ));
+        }
+
+        return Ok(status_with_available(
+            apiservice,
+            "False",
+            "MissingEndpoints",
+            format!("APIService backend EndpointSlice {namespace}/{name} has no ready addresses"),
+        ));
+    }
+
     let Some(endpoints) = db
         .get_resource("v1", "Endpoints", Some(namespace), name)
         .await?
@@ -121,6 +153,31 @@ async fn evaluate_apiservice_status(
         "Passed",
         "all checks passed",
     ))
+}
+
+fn endpointslices_have_ready_address(slices: &[&Value]) -> bool {
+    slices.iter().any(|slice| {
+        slice
+            .get("endpoints")
+            .and_then(|v| v.as_array())
+            .is_some_and(|endpoints| {
+                endpoints.iter().any(|endpoint| {
+                    let ready = endpoint
+                        .pointer("/conditions/ready")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
+                    ready
+                        && endpoint
+                            .get("addresses")
+                            .and_then(Value::as_array)
+                            .is_some_and(|addresses| {
+                                addresses.iter().any(|address| {
+                                    address.as_str().is_some_and(|value| !value.is_empty())
+                                })
+                            })
+                })
+            })
+    })
 }
 
 fn endpoints_have_ready_address(endpoints: &Value) -> bool {
@@ -176,4 +233,137 @@ fn existing_available_transition_time(apiservice: &Value, status: &str) -> Optio
         .and_then(|condition| condition.get("lastTransitionTime"))
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn apiservice_available_when_ready_endpointslice_exists_without_legacy_endpoints() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Service",
+            Some("default"),
+            "wardle-service",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": "wardle-service", "namespace": "default"},
+                "spec": {"ports": [{"name": "https", "port": 443, "targetPort": 8443, "protocol": "TCP"}]}
+            }),
+        )
+        .await
+        .unwrap();
+        db.create_resource(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            "wardle-service-abc",
+            json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {
+                    "name": "wardle-service-abc",
+                    "namespace": "default",
+                    "labels": {"kubernetes.io/service-name": "wardle-service"}
+                },
+                "addressType": "IPv4",
+                "ports": [{"name": "https", "port": 8443, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.42.0.25"], "conditions": {"ready": true}}]
+            }),
+        )
+        .await
+        .unwrap();
+
+        let apiservice = json!({
+            "apiVersion": "apiregistration.k8s.io/v1",
+            "kind": "APIService",
+            "metadata": {"name": "v1alpha1.wardle.example.com"},
+            "spec": {
+                "group": "wardle.example.com",
+                "version": "v1alpha1",
+                "service": {"namespace": "default", "name": "wardle-service"}
+            }
+        });
+
+        let status = evaluate_apiservice_status(&db, &apiservice).await.unwrap();
+        assert_eq!(available_condition_status(&status), Some("True"));
+    }
+
+    #[tokio::test]
+    async fn apiservice_unavailable_when_endpointslice_has_no_ready_addresses() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Service",
+            Some("default"),
+            "wardle-service",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": "wardle-service", "namespace": "default"},
+                "spec": {"ports": [{"name": "https", "port": 443, "targetPort": 8443, "protocol": "TCP"}]}
+            }),
+        )
+        .await
+        .unwrap();
+        db.create_resource(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            "wardle-service-empty",
+            json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {
+                    "name": "wardle-service-empty",
+                    "namespace": "default",
+                    "labels": {"kubernetes.io/service-name": "wardle-service"}
+                },
+                "addressType": "IPv4",
+                "ports": [{"name": "https", "port": 8443, "protocol": "TCP"}],
+                "endpoints": [{"addresses": ["10.42.0.25"], "conditions": {"ready": false}}]
+            }),
+        )
+        .await
+        .unwrap();
+
+        let apiservice = json!({
+            "apiVersion": "apiregistration.k8s.io/v1",
+            "kind": "APIService",
+            "metadata": {"name": "v1alpha1.wardle.example.com"},
+            "spec": {"service": {"namespace": "default", "name": "wardle-service"}}
+        });
+
+        let status = evaluate_apiservice_status(&db, &apiservice).await.unwrap();
+        assert_eq!(available_condition_status(&status), Some("False"));
+        assert_eq!(
+            available_condition_reason(&status),
+            Some("MissingEndpoints")
+        );
+    }
+
+    fn available_condition_status(status: &Value) -> Option<&str> {
+        status
+            .pointer("/conditions")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|condition| {
+                condition.pointer("/type").and_then(Value::as_str) == Some("Available")
+            })
+            .and_then(|condition| condition.pointer("/status").and_then(Value::as_str))
+    }
+
+    fn available_condition_reason(status: &Value) -> Option<&str> {
+        status
+            .pointer("/conditions")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|condition| {
+                condition.pointer("/type").and_then(Value::as_str) == Some("Available")
+            })
+            .and_then(|condition| condition.pointer("/reason").and_then(Value::as_str))
+    }
 }
