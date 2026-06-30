@@ -46,11 +46,14 @@ pub(super) fn indexed_field_paths(api_version: &str, kind: &str) -> &'static [&'
             "reason",
             "type",
             "source",
+            "reportingController",
+            "reportingInstance",
             "involvedObject.kind",
             "involvedObject.uid",
             "involvedObject.name",
             "involvedObject.namespace",
         ],
+        ("certificates.k8s.io/v1", "CertificateSigningRequest") => &["spec.signerName"],
         _ => &[],
     }
 }

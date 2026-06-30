@@ -390,6 +390,7 @@ fn is_windows_pod(pod: &Value) -> bool {
 
 fn seccomp_type(value: &Value) -> Option<&str> {
     string_at(value, "/securityContext/seccompProfile/type")
+        .or_else(|| string_at(value, "/spec/securityContext/seccompProfile/type"))
 }
 
 fn bool_at(value: &Value, pointer: &str) -> Option<bool> {
@@ -410,4 +411,69 @@ fn string_array_at<'a>(value: &'a Value, pointer: &str) -> Vec<&'a str> {
         .and_then(|v| v.as_array())
         .map(|values| values.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn restricted_accepts_pod_level_seccomp_profile() {
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "restricted-pod"},
+            "spec": {
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "runAsUser": 1000,
+                    "seccompProfile": {"type": "RuntimeDefault"}
+                },
+                "containers": [{
+                    "name": "pause",
+                    "image": "registry.k8s.io/pause:3.10",
+                    "securityContext": {
+                        "allowPrivilegeEscalation": false,
+                        "capabilities": {"drop": ["ALL"]}
+                    }
+                }]
+            }
+        });
+
+        let violations = validate_pod_security(PodSecurityLevel::Restricted, &pod);
+        assert!(
+            violations.is_empty(),
+            "pod-level seccompProfile must satisfy restricted PodSecurity: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn restricted_still_rejects_missing_seccomp_profile() {
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "restricted-pod"},
+            "spec": {
+                "securityContext": {
+                    "runAsNonRoot": true,
+                    "runAsUser": 1000
+                },
+                "containers": [{
+                    "name": "pause",
+                    "image": "registry.k8s.io/pause:3.10",
+                    "securityContext": {
+                        "allowPrivilegeEscalation": false,
+                        "capabilities": {"drop": ["ALL"]}
+                    }
+                }]
+            }
+        });
+
+        let violations = validate_pod_security(PodSecurityLevel::Restricted, &pod);
+        assert!(
+            violations.iter().any(|v| v.contains("seccompProfile")),
+            "restricted PodSecurity must still require seccompProfile: {violations:?}"
+        );
+    }
 }

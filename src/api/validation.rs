@@ -136,11 +136,14 @@ fn builtin_selectable_fields(api_version: &str, kind: &str) -> &'static [&'stati
             "reason",
             "type",
             "source",
+            "reportingController",
+            "reportingInstance",
             "involvedObject.kind",
             "involvedObject.uid",
             "involvedObject.name",
             "involvedObject.namespace",
         ],
+        ("certificates.k8s.io/v1", "CertificateSigningRequest") => &["spec.signerName"],
         _ => &[],
     }
 }

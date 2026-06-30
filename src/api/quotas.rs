@@ -26,9 +26,17 @@ fn kind_to_quota_info(kind: &str) -> Option<(&'static str, &'static str, &'stati
 
 fn pod_quota_bucket_and_resource(quota_key: &str) -> Option<(&'static str, &str)> {
     if let Some(suffix) = quota_key.strip_prefix("requests.") {
-        Some(("requests", suffix))
+        if suffix == "storage" {
+            None
+        } else {
+            Some(("requests", suffix))
+        }
     } else if let Some(suffix) = quota_key.strip_prefix("limits.") {
-        Some(("limits", suffix))
+        if suffix == "storage" {
+            None
+        } else {
+            Some(("limits", suffix))
+        }
     } else if quota_key == "cpu" {
         Some(("requests", "cpu"))
     } else if quota_key == "memory" {
@@ -670,6 +678,11 @@ mod tests {
     #[test]
     fn test_pod_quota_bucket_and_resource_returns_none_for_unknown_keys() {
         assert_eq!(pod_quota_bucket_and_resource("pods"), None);
+        assert_eq!(
+            pod_quota_bucket_and_resource("requests.storage"),
+            None,
+            "requests.storage is PVC storage quota, not a per-container Pod request"
+        );
         assert_eq!(pod_quota_bucket_and_resource(""), None);
         assert_eq!(
             pod_quota_bucket_and_resource("requests."),

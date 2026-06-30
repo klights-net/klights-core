@@ -367,6 +367,70 @@ async fn test_resourcequota_pod_create_requires_configured_request_resource() {
 }
 
 #[tokio::test]
+async fn test_resourcequota_requests_storage_does_not_require_pod_container_storage_request() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let ns_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"rq-storage"}}"#,
+        ))
+        .unwrap();
+    let ns_resp = app.clone().oneshot(ns_req).await.unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+
+    let rq_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/rq-storage/resourcequotas")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+                "apiVersion":"v1",
+                "kind":"ResourceQuota",
+                "metadata":{"name":"rq-storage","namespace":"rq-storage"},
+                "spec":{"hard":{"requests.storage":"1Gi","pods":"4"}}
+            }"#,
+        ))
+        .unwrap();
+    let rq_resp = app.clone().oneshot(rq_req).await.unwrap();
+    assert_eq!(rq_resp.status(), StatusCode::CREATED);
+
+    let pod_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/rq-storage/pods")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{
+                "apiVersion":"v1",
+                "kind":"Pod",
+                "metadata":{"name":"pod-without-storage-request","namespace":"rq-storage"},
+                "spec":{
+                    "containers":[{
+                        "name":"c",
+                        "image":"busybox",
+                        "resources":{"requests":{"cpu":"100m","memory":"64Mi"}}
+                    }]
+                }
+            }"#,
+        ))
+        .unwrap();
+    let pod_resp = app.clone().oneshot(pod_req).await.unwrap();
+    assert_eq!(
+        pod_resp.status(),
+        StatusCode::CREATED,
+        "requests.storage quota applies to PVCs, not Pod container resources"
+    );
+}
+
+#[tokio::test]
 async fn test_resourcequota_scope_selector_priorityclass_filters_pod_quota() {
     use axum::{
         body::Body,
@@ -1907,6 +1971,75 @@ async fn test_events_v1_create_is_listed_via_core_events_source_selector() {
         .and_then(|v| v.as_str())
         .or_else(|| items[0].get("reportingController").and_then(|v| v.as_str()));
     assert_eq!(component, Some("test-controller"));
+}
+
+#[tokio::test]
+async fn test_events_v1_list_supports_reporting_controller_field_selector() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let ns = format!("events-reporting-{}", uuid::Uuid::new_v4().simple());
+
+    let ns_body = json!({
+        "apiVersion":"v1",
+        "kind":"Namespace",
+        "metadata":{"name": ns}
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&ns_body).unwrap()))
+        .unwrap();
+    let _ = app.clone().oneshot(req).await.unwrap();
+
+    for (name, controller) in [
+        ("selected-event", "test-controller"),
+        ("other-event", "other"),
+    ] {
+        let event = json!({
+            "apiVersion": "events.k8s.io/v1",
+            "kind": "Event",
+            "metadata": {"name": name, "namespace": ns},
+            "eventTime": "2026-04-26T00:00:00Z",
+            "reportingController": controller,
+            "reportingInstance": "node-1",
+            "action": "Testing",
+            "reason": "Started",
+            "regarding": {"apiVersion": "v1", "kind": "Pod", "name": "pod-1", "namespace": ns},
+            "note": "reporting selector event",
+            "type": "Normal"
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/apis/events.k8s.io/v1/namespaces/{}/events", ns))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&event).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/apis/events.k8s.io/v1/namespaces/{}/events?fieldSelector=reportingController%3Dtest-controller",
+            ns
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let items = body["items"].as_array().expect("items must be array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["metadata"]["name"], "selected-event");
 }
 
 #[tokio::test]
@@ -3904,6 +4037,67 @@ async fn test_csr_status_subresource_get_put() {
         updated.data["spec"]["signerName"],
         "kubernetes.io/kube-apiserver-client"
     );
+}
+
+#[tokio::test]
+async fn test_csr_list_supports_signer_name_field_selector() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    for (name, signer) in [
+        ("selected-csr", "example.com/selected"),
+        ("other-csr", "example.com/other"),
+    ] {
+        let csr = json!({
+            "apiVersion": "certificates.k8s.io/v1",
+            "kind": "CertificateSigningRequest",
+            "metadata": {"name": name},
+            "spec": {
+                "request": "LS0t...",
+                "signerName": signer,
+                "usages": ["client auth"]
+            }
+        });
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/certificates.k8s.io/v1/certificatesigningrequests")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&csr).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+    }
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/apis/certificates.k8s.io/v1/certificatesigningrequests?fieldSelector=spec.signerName%3Dexample.com/selected",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+
+    let bytes = to_bytes(list.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let items = body["items"].as_array().expect("items must be array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["metadata"]["name"], "selected-csr");
 }
 
 #[tokio::test]
