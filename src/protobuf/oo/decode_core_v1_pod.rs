@@ -179,6 +179,9 @@ pub fn pb_pod_spec_to_json(spec: &k8s_pb::api::core::v1::PodSpec) -> Value {
                     .collect::<Vec<_>>()
             );
         }
+        if let Some(seccomp_profile) = &sc.seccomp_profile {
+            sc_obj["seccompProfile"] = pb_seccomp_profile_to_json(seccomp_profile);
+        }
         obj["securityContext"] = sc_obj;
     }
     if !spec.host_aliases.is_empty() {

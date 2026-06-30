@@ -466,6 +466,9 @@ pub fn pb_container_to_json(c: &k8s_pb::api::core::v1::Container) -> Value {
         if let Some(proc_mount) = &sc.proc_mount {
             sc_obj["procMount"] = json!(proc_mount);
         }
+        if let Some(seccomp_profile) = &sc.seccomp_profile {
+            sc_obj["seccompProfile"] = pb_seccomp_profile_to_json(seccomp_profile);
+        }
         obj["securityContext"] = sc_obj;
     }
 
@@ -562,6 +565,19 @@ pub fn pb_container_to_json(c: &k8s_pb::api::core::v1::Container) -> Value {
         obj["envFrom"] = json!(env_from_arr);
     }
 
+    obj
+}
+
+pub fn pb_seccomp_profile_to_json(profile: &k8s_pb::api::core::v1::SeccompProfile) -> Value {
+    use serde_json::json;
+
+    let mut obj = json!({});
+    if let Some(profile_type) = &profile.r#type {
+        obj["type"] = json!(profile_type);
+    }
+    if let Some(localhost_profile) = &profile.localhost_profile {
+        obj["localhostProfile"] = json!(localhost_profile);
+    }
     obj
 }
 

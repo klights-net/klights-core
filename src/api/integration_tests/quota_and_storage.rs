@@ -1636,6 +1636,72 @@ async fn test_runtimeclass_admission_rejects_protobuf_pod_with_missing_runtimecl
 }
 
 #[tokio::test]
+async fn test_pod_security_admission_accepts_restricted_protobuf_pod_with_pod_seccomp() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let ns_body = serde_json::to_vec(&json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+            "name": "restricted-protobuf",
+            "labels": {
+                "pod-security.kubernetes.io/enforce": "restricted"
+            }
+        }
+    }))
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(ns_body))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let pod_json = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "restricted-pod", "namespace": "restricted-protobuf"},
+        "spec": {
+            "securityContext": {
+                "runAsNonRoot": true,
+                "seccompProfile": {"type": "RuntimeDefault"}
+            },
+            "containers": [{
+                "name": "main",
+                "image": "registry.k8s.io/pause:3.10.1",
+                "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "capabilities": {"drop": ["ALL"]}
+                }
+            }]
+        }
+    });
+    let pod_pb = crate::protobuf::encode_protobuf(&pod_json).unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/restricted-protobuf/pods")
+        .header("content-type", "application/vnd.kubernetes.protobuf")
+        .body(Body::from(pod_pb))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "restricted protobuf Pod with pod-level seccompProfile must be admitted"
+    );
+}
+
+#[tokio::test]
 async fn test_protobuf_pod_create_respects_non_matching_node_selector() {
     use axum::{
         body::{Body, to_bytes},

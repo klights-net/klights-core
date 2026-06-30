@@ -130,6 +130,58 @@ pub fn test_pod_protobuf_roundtrip_preserves_node_selector() {
 }
 
 #[test]
+pub fn test_pod_protobuf_roundtrip_preserves_seccomp_profiles() {
+    use serde_json::json;
+
+    let pod_json = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "restricted-pod",
+            "namespace": "default"
+        },
+        "spec": {
+            "securityContext": {
+                "runAsNonRoot": true,
+                "runAsUser": 1000,
+                "seccompProfile": {"type": "RuntimeDefault"}
+            },
+            "containers": [{
+                "name": "restricted-pod",
+                "image": "registry.k8s.io/pause:3.10.1",
+                "securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "capabilities": {"drop": ["ALL"]},
+                    "seccompProfile": {
+                        "type": "Localhost",
+                        "localhostProfile": "profiles/restricted.json"
+                    }
+                }
+            }]
+        }
+    });
+
+    let protobuf_bytes = encode_protobuf(&pod_json).unwrap();
+    let decoded = decode_protobuf(&protobuf_bytes[4..]).unwrap();
+
+    assert_eq!(
+        decoded.pointer("/spec/securityContext/seccompProfile/type"),
+        Some(&json!("RuntimeDefault")),
+        "protobuf Pod roundtrip must preserve pod-level seccompProfile"
+    );
+    assert_eq!(
+        decoded.pointer("/spec/containers/0/securityContext/seccompProfile/type"),
+        Some(&json!("Localhost")),
+        "protobuf Pod roundtrip must preserve container-level seccompProfile type"
+    );
+    assert_eq!(
+        decoded.pointer("/spec/containers/0/securityContext/seccompProfile/localhostProfile"),
+        Some(&json!("profiles/restricted.json")),
+        "protobuf Pod roundtrip must preserve seccomp localhostProfile"
+    );
+}
+
+#[test]
 pub fn test_pod_protobuf_roundtrip_preserves_env_value_from_sources() {
     use serde_json::json;
 

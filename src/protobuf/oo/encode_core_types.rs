@@ -111,6 +111,7 @@ pub fn json_pod_spec_to_pb(
                             .collect()
                     })
                     .unwrap_or_default(),
+                seccomp_profile: sc.seccomp_profile.as_ref().map(json_seccomp_profile_to_pb),
                 ..Default::default()
             }
         }),
@@ -588,6 +589,7 @@ pub fn json_container_to_pb(
                     }
                 }),
                 proc_mount: sc.proc_mount.clone(),
+                seccomp_profile: sc.seccomp_profile.as_ref().map(json_seccomp_profile_to_pb),
                 ..Default::default()
             }
         }),
@@ -600,6 +602,15 @@ pub fn json_container_to_pb(
                 stop_signal: None,
             }),
         ..Default::default()
+    }
+}
+
+fn json_seccomp_profile_to_pb(
+    profile: &k8s_openapi::api::core::v1::SeccompProfile,
+) -> k8s_pb::api::core::v1::SeccompProfile {
+    k8s_pb::api::core::v1::SeccompProfile {
+        r#type: Some(profile.type_.clone()),
+        localhost_profile: profile.localhost_profile.clone(),
     }
 }
 
