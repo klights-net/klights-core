@@ -136,6 +136,88 @@ async fn test_cronjob_status_patch_metadata_annotation_preserved() {
     );
 }
 
+#[tokio::test]
+async fn test_job_status_put_protobuf_updates_existing_custom_condition_timestamp() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    db.create_resource(
+        "batch/v1",
+        "Job",
+        Some("job-status-protobuf"),
+        "job1",
+        json!({
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "metadata": {"name": "job1", "namespace": "job-status-protobuf"},
+            "spec": {
+                "parallelism": 1,
+                "completions": 1,
+                "template": {
+                    "spec": {
+                        "restartPolicy": "Never",
+                        "containers": [{"name": "main", "image": "busybox"}]
+                    }
+                }
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let patched_time = "2026-06-30T18:14:03Z";
+    let patch = json!({
+        "metadata": {"annotations": {"patchedstatus": "true"}},
+        "status": {
+            "conditions": [{
+                "type": "CustomConditionType",
+                "status": "True",
+                "reason": "E2E",
+                "message": "Set from patch",
+                "lastTransitionTime": patched_time
+            }]
+        }
+    });
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/apis/batch/v1/namespaces/job-status-protobuf/jobs/job1/status")
+        .header("content-type", "application/merge-patch+json")
+        .body(Body::from(serde_json::to_vec(&patch).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let mut update_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        update_body["status"]["conditions"][0]["lastTransitionTime"],
+        patched_time
+    );
+
+    let updated_time = "2026-06-30T18:14:07Z";
+    update_body["status"]["conditions"][0]["lastTransitionTime"] = json!(updated_time);
+    let protobuf_body =
+        crate::protobuf::encode_protobuf(&update_body).expect("Job status update encodes");
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/apis/batch/v1/namespaces/job-status-protobuf/jobs/job1/status")
+        .header("content-type", "application/vnd.kubernetes.protobuf")
+        .body(Body::from(protobuf_body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        updated["status"]["conditions"][0]["lastTransitionTime"], updated_time,
+        "protobuf PUT /status must persist the caller-updated Job condition transition time"
+    );
+}
+
 /// Verifies that each item in a list response includes metadata.resourceVersion.
 /// K8s spec requires all objects returned by the API (including in list items)
 /// to have resourceVersion set. Server-side apply and informers rely on this.

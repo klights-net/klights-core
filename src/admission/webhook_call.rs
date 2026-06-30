@@ -1,6 +1,7 @@
 use crate::admission::http_client::webhook_http_client_for;
 use crate::admission::request_context::AdmissionRequestContext;
-use crate::datastore::DatastoreBackend;
+use crate::datastore::{DatastoreBackend, ResourceListQuery};
+use crate::networking::service_routing::{Protocol, ServiceSpec};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::net::{IpAddr, SocketAddr};
@@ -37,46 +38,37 @@ pub(super) async fn resolve_webhook_target(
             .and_then(|ns| ns.as_str())
             .ok_or_else(|| anyhow::anyhow!("Service reference missing namespace"))?;
 
-        let service = db
-            .get_resource("v1", "Service", Some(namespace), name)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Service not found: {}/{}", namespace, name))?;
-
-        let cluster_ip = service
-            .data
-            .get("spec")
-            .and_then(|spec| spec.get("clusterIP"))
-            .and_then(|ip| ip.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Service missing spec.clusterIP"))?
-            .parse::<IpAddr>()
-            .context("Service has invalid spec.clusterIP")?;
-
-        let service_ports = service
-            .data
-            .get("spec")
-            .and_then(|spec| spec.get("ports"))
-            .and_then(|ports| ports.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Service has no ports"))?;
         let requested_port = service_ref
             .get("port")
             .and_then(|p| p.as_u64())
             .map(|p| u16::try_from(p).context("Service reference port out of range"))
-            .transpose()?;
-        let selected_service_port = if let Some(p) = requested_port {
-            service_ports
-                .iter()
-                .find(|item| item.get("port").and_then(|v| v.as_u64()) == Some(p as u64))
-                .ok_or_else(|| anyhow::anyhow!("Service does not expose requested port {}", p))?
-        } else {
-            service_ports
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("Service has no ports"))?
-        };
-        let service_port = selected_service_port
-            .get("port")
-            .and_then(|p| p.as_u64())
-            .and_then(|p| u16::try_from(p).ok())
-            .ok_or_else(|| anyhow::anyhow!("Service port out of range"))?;
+            .transpose()?
+            .unwrap_or(443);
+        let service_spec = resolve_webhook_service_spec(db, namespace, name).await?;
+        let selected_service_port = service_spec
+            .ports
+            .iter()
+            .find(|port| {
+                port.protocol == Protocol::Tcp
+                    && port.service_port == requested_port
+                    && !port.endpoints.is_empty()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Service {}/{} has no ready TCP endpoint for port {}",
+                    namespace,
+                    name,
+                    requested_port
+                )
+            })?;
+        let endpoint_ip = selected_service_port
+            .endpoints
+            .first()
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!("Service {}/{} has no ready endpoints", namespace, name)
+            })?;
+        let endpoint_port = selected_service_port.target_port;
         let path = service_ref
             .get("path")
             .and_then(|p| p.as_str())
@@ -84,12 +76,58 @@ pub(super) async fn resolve_webhook_target(
         let host = format!("{}.{}.svc", name, namespace);
 
         return Ok(ResolvedWebhookTarget {
-            base_url: format!("https://{}:{}{}", host, service_port, path),
-            dns_override: Some((host, SocketAddr::new(cluster_ip, service_port))),
+            base_url: format!("https://{}:{}{}", host, endpoint_port, path),
+            dns_override: Some((
+                host,
+                SocketAddr::new(IpAddr::V4(endpoint_ip), endpoint_port),
+            )),
         });
     }
 
     anyhow::bail!("clientConfig must have either url or service field")
+}
+
+async fn resolve_webhook_service_spec(
+    db: &dyn DatastoreBackend,
+    namespace: &str,
+    name: &str,
+) -> Result<ServiceSpec> {
+    let service = db
+        .get_resource("v1", "Service", Some(namespace), name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Service not found: {}/{}", namespace, name))?;
+
+    let label_selector = format!("kubernetes.io/service-name={name}");
+    let endpoint_slices = db
+        .list_resources(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some(namespace),
+            ResourceListQuery::new(Some(&label_selector), None, None, None),
+        )
+        .await?;
+    let slice_refs: Vec<&Value> = endpoint_slices
+        .items
+        .iter()
+        .map(|slice| slice.data.as_ref())
+        .collect();
+    if !slice_refs.is_empty()
+        && let Some(spec) = ServiceSpec::from_service_and_endpointslices(&service.data, &slice_refs)
+    {
+        return Ok(spec);
+    }
+
+    let endpoints = db
+        .get_resource("v1", "Endpoints", Some(namespace), name)
+        .await?;
+    if let Some(endpoints) = endpoints
+        && let Some(spec) =
+            ServiceSpec::from_service_and_endpoints(service.data.as_ref(), Some(&endpoints.data))
+    {
+        return Ok(spec);
+    }
+
+    anyhow::bail!("Service {}/{} has no ready endpoints", namespace, name)
 }
 
 pub(super) async fn call_webhook(

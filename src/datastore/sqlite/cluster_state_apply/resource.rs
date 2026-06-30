@@ -618,6 +618,7 @@ fn merge_status_only_row_with_existing(
         .is_some_and(|expected_rv| expected_rv < *current_rv)
     {
         preserve_unmentioned_live_status_fields(&row.api_version, &row.kind, &live, &mut status);
+        preserve_live_status_conditions_by_type(&live, &mut status);
     }
     if row
         .precondition_uid
@@ -675,6 +676,61 @@ fn preserve_unmentioned_live_status_fields(
         incoming_status
             .entry(key.clone())
             .or_insert_with(|| value.clone());
+    }
+}
+
+fn preserve_live_status_conditions_by_type(
+    live: &serde_json::Value,
+    incoming_status: &mut serde_json::Value,
+) {
+    let Some(live_conditions) = live
+        .pointer("/status/conditions")
+        .and_then(|conditions| conditions.as_array())
+    else {
+        return;
+    };
+    if live_conditions.is_empty() {
+        return;
+    }
+    let Some(status_obj) = incoming_status.as_object_mut() else {
+        return;
+    };
+    let incoming_conditions = status_obj
+        .entry("conditions".to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let Some(incoming_conditions) = incoming_conditions.as_array_mut() else {
+        return;
+    };
+
+    let mut seen_types = HashSet::new();
+    for incoming in incoming_conditions.iter_mut() {
+        let Some(condition_type) = incoming
+            .get("type")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(live_condition) = live_conditions.iter().find(|condition| {
+            condition.get("type").and_then(|value| value.as_str()) == Some(condition_type.as_str())
+        }) {
+            *incoming = live_condition.clone();
+        }
+        seen_types.insert(condition_type);
+    }
+
+    for live_condition in live_conditions {
+        let Some(condition_type) = live_condition
+            .get("type")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if seen_types.insert(condition_type.to_string()) {
+            incoming_conditions.push(live_condition.clone());
+        }
     }
 }
 

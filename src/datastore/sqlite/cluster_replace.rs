@@ -2215,6 +2215,141 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn stale_raft_status_only_apply_preserves_newer_job_custom_condition_timestamp() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "batch/v1",
+                "Job",
+                Some("default"),
+                "condition-job",
+                serde_json::json!({
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "metadata": {
+                        "name": "condition-job",
+                        "namespace": "default",
+                        "uid": "job-condition-uid"
+                    },
+                    "spec": {
+                        "parallelism": 2,
+                        "completions": 4,
+                        "template": {
+                            "spec": {
+                                "restartPolicy": "Never",
+                                "containers": [{"name": "main", "image": "busybox"}]
+                            }
+                        }
+                    },
+                    "status": {
+                        "active": 2,
+                        "ready": 2,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "conditions": [{
+                            "type": "CustomConditionType",
+                            "status": "True",
+                            "lastTransitionTime": "2026-06-30T18:14:03Z"
+                        }],
+                        "startTime": "2026-06-30T18:14:00Z",
+                        "terminating": 0
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.update_status_only_with_preconditions(
+            "batch/v1",
+            "Job",
+            Some("default"),
+            "condition-job",
+            serde_json::json!({
+                "active": 2,
+                "ready": 2,
+                "succeeded": 0,
+                "failed": 0,
+                "conditions": [{
+                    "type": "CustomConditionType",
+                    "status": "True",
+                    "lastTransitionTime": "2026-06-30T18:14:07Z"
+                }],
+                "startTime": "2026-06-30T18:14:00Z",
+                "terminating": 0
+            }),
+            crate::datastore::ResourcePreconditions::from_resource(&created),
+        )
+        .await
+        .unwrap();
+
+        db.apply_raft_log_apply_commit(LogApplyCommit::new(
+            30,
+            vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                api_version: "batch/v1".to_string(),
+                kind: "Job".to_string(),
+                namespace: Some("default".to_string()),
+                name: "condition-job".to_string(),
+                uid: "job-condition-uid".to_string(),
+                resource_version: 30,
+                data: serde_json::json!({
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "metadata": {
+                        "name": "condition-job",
+                        "namespace": "default",
+                        "uid": "job-condition-uid",
+                        "resourceVersion": "30"
+                    },
+                    "spec": {
+                        "parallelism": 2,
+                        "completions": 4,
+                        "template": {
+                            "spec": {
+                                "restartPolicy": "Never",
+                                "containers": [{"name": "main", "image": "busybox"}]
+                            }
+                        }
+                    },
+                    "status": {
+                        "active": 2,
+                        "ready": 2,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "conditions": [{
+                            "type": "CustomConditionType",
+                            "status": "True",
+                            "lastTransitionTime": "2026-06-30T18:14:03Z"
+                        }],
+                        "startTime": "2026-06-30T18:14:00Z",
+                        "terminating": 0
+                    }
+                }),
+                require_absent: false,
+                require_existing: true,
+                precondition_uid: Some("job-condition-uid".to_string()),
+                precondition_resource_version: Some(created.resource_version),
+                status_only: true,
+            })],
+        ))
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_resource("batch/v1", "Job", Some("default"), "condition-job")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .data
+                .pointer("/status/conditions/0/lastTransitionTime")
+                .and_then(|value| value.as_str()),
+            Some("2026-06-30T18:14:07Z"),
+            "stale raft status-only apply must not roll back a newer user-updated Job condition"
+        );
+    }
+
     /// A follower that holds a stale row (the leader already deleted it via a committed log entry)
     /// must converge to the leader fingerprint (row absent) without requiring a snapshot install.
     #[tokio::test]

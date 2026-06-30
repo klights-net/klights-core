@@ -837,6 +837,26 @@ async fn test_resolve_webhook_target_from_service_reference() {
     )
     .await
     .unwrap();
+    db.create_resource(
+        "v1",
+        "Endpoints",
+        Some("cert-manager"),
+        "webhook-service",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": {
+                "name": "webhook-service",
+                "namespace": "cert-manager"
+            },
+            "subsets": [{
+                "addresses": [{"ip": "10.42.1.10"}],
+                "ports": [{"port": 443}]
+            }]
+        }),
+    )
+    .await
+    .unwrap();
 
     let client_config = json!({
         "service": {
@@ -855,7 +875,7 @@ async fn test_resolve_webhook_target_from_service_reference() {
         target.dns_override,
         Some((
             "webhook-service.cert-manager.svc".to_string(),
-            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 200, 50), 443)),
+            SocketAddr::from((std::net::Ipv4Addr::new(10, 42, 1, 10), 443)),
         ))
     );
 }
@@ -879,6 +899,26 @@ async fn test_resolve_webhook_target_service_with_port_specified() {
     db.create_resource("v1", "Service", Some("default"), "webhook-service", service)
         .await
         .unwrap();
+    db.create_resource(
+        "v1",
+        "Endpoints",
+        Some("default"),
+        "webhook-service",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Endpoints",
+            "metadata": {
+                "name": "webhook-service",
+                "namespace": "default"
+            },
+            "subsets": [{
+                "addresses": [{"ip": "10.42.1.20"}],
+                "ports": [{"port": 9443}]
+            }]
+        }),
+    )
+    .await
+    .unwrap();
 
     let client_config = json!({
         "service": {
@@ -894,13 +934,13 @@ async fn test_resolve_webhook_target_service_with_port_specified() {
         target.dns_override,
         Some((
             "webhook-service.default.svc".to_string(),
-            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 128, 100), 9443)),
+            SocketAddr::from((std::net::Ipv4Addr::new(10, 42, 1, 20), 9443)),
         ))
     );
 }
 
 #[tokio::test]
-async fn test_resolve_webhook_target_uses_cluster_ip_even_when_endpoints_exist() {
+async fn test_resolve_webhook_target_uses_endpoint_target_port_when_endpoints_exist() {
     let db = crate::datastore::test_support::in_memory().await;
 
     let service = json!({
@@ -949,12 +989,12 @@ async fn test_resolve_webhook_target_uses_cluster_ip_even_when_endpoints_exist()
     });
 
     let target = resolve_webhook_target(&db, &client_config).await.unwrap();
-    assert_eq!(target.base_url, "https://webhook-service.default.svc:443");
+    assert_eq!(target.base_url, "https://webhook-service.default.svc:9443");
     assert_eq!(
         target.dns_override,
         Some((
             "webhook-service.default.svc".to_string(),
-            SocketAddr::from((std::net::Ipv4Addr::new(10, 43, 128, 100), 443)),
+            SocketAddr::from((std::net::Ipv4Addr::new(10, 42, 0, 55), 9443)),
         ))
     );
 }
