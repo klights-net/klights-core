@@ -120,7 +120,10 @@ use query::{CreateUpdateQuery, DeleteCollectionQuery, ListQuery, process_continu
 // `query::resolve_list_page`, which calls this internally.
 #[cfg(test)]
 use query::resolve_list_response_resource_version;
-pub use quotas::{check_resource_quota_for_creation, check_resource_quota_for_pod_update};
+pub use quotas::{
+    check_resource_quota_for_creation, check_resource_quota_for_pod_update,
+    check_resource_quota_for_pvc_update,
+};
 pub use response::K8sResponse;
 #[cfg(test)]
 pub use response::prefers_protobuf;

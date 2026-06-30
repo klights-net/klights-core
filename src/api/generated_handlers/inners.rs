@@ -877,6 +877,12 @@ pub async fn update_inner(
         check_resource_quota_for_pod_update(state.db.as_ref(), namespace, &current.data, &body)
             .await?;
     }
+    if kind == "PersistentVolumeClaim"
+        && let Some(namespace) = ns
+    {
+        check_resource_quota_for_pvc_update(state.db.as_ref(), namespace, &current.data, &body)
+            .await?;
+    }
 
     if kind == "PriorityClass" {
         validate_priorityclass_update_immutable(&current.data, &body)?;
@@ -1580,6 +1586,17 @@ pub async fn patch_inner(
         {
             validate_pod_resource_requirements_immutable(&current.data, &patched)?;
             check_resource_quota_for_pod_update(
+                state.db.as_ref(),
+                namespace,
+                &current.data,
+                &patched,
+            )
+            .await?;
+        }
+        if kind == "PersistentVolumeClaim"
+            && let Some(namespace) = ns
+        {
+            check_resource_quota_for_pvc_update(
                 state.db.as_ref(),
                 namespace,
                 &current.data,

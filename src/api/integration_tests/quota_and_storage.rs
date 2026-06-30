@@ -431,6 +431,210 @@ async fn test_resourcequota_requests_storage_does_not_require_pod_container_stor
 }
 
 #[tokio::test]
+async fn test_resourcequota_requests_storage_counts_pvc_requests() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+
+    db.create_namespace(
+        "rq-pvc-storage",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "rq-pvc-storage"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let quota = json!({
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {"name": "storage-quota", "namespace": "rq-pvc-storage"},
+        "spec": {"hard": {"requests.storage": "3Gi"}}
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/rq-pvc-storage/resourcequotas")
+                .header("content-type", "application/json")
+                .body(Body::from(quota.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    for (name, storage) in [("data-a", "1Gi"), ("data-b", "1536Mi")] {
+        let pvc = json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": name, "namespace": "rq-pvc-storage"},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": {"requests": {"storage": storage}}
+            }
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/rq-pvc-storage/persistentvolumeclaims")
+                    .header("content-type", "application/json")
+                    .body(Body::from(pvc.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    let quota = db
+        .get_resource(
+            "v1",
+            "ResourceQuota",
+            Some("rq-pvc-storage"),
+            "storage-quota",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        quota.data.pointer("/status/used/requests.storage"),
+        Some(&json!("2560Mi")),
+        "ResourceQuota status.used requests.storage must sum PVC requested storage"
+    );
+}
+
+#[tokio::test]
+async fn test_resourcequota_requests_storage_denies_pvc_create_and_expand_over_hard() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+    db.create_namespace(
+        "rq-pvc-deny",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "rq-pvc-deny"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let quota = json!({
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {"name": "storage-quota", "namespace": "rq-pvc-deny"},
+        "spec": {"hard": {"requests.storage": "2Gi"}}
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/rq-pvc-deny/resourcequotas")
+                .header("content-type", "application/json")
+                .body(Body::from(quota.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "data", "namespace": "rq-pvc-deny"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "2Gi"}}
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/rq-pvc-deny/persistentvolumeclaims")
+                .header("content-type", "application/json")
+                .body(Body::from(pvc.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let second = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "data-2", "namespace": "rq-pvc-deny"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Mi"}}
+        }
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces/rq-pvc-deny/persistentvolumeclaims")
+                .header("content-type", "application/json")
+                .body(Body::from(second.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("requests.storage")),
+        "quota denial must name requests.storage: {body}"
+    );
+
+    let expanded = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "data", "namespace": "rq-pvc-deny"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "3Gi"}}
+        }
+    });
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/namespaces/rq-pvc-deny/persistentvolumeclaims/data")
+                .header("content-type", "application/json")
+                .body(Body::from(expanded.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn test_resourcequota_scope_selector_priorityclass_filters_pod_quota() {
     use axum::{
         body::Body,

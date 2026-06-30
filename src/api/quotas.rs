@@ -90,6 +90,88 @@ fn ensure_pod_specifies_quota_resource(
     Ok(())
 }
 
+fn pvc_requested_storage(pvc: &Value) -> Option<i64> {
+    pvc.pointer("/spec/resources/requests/storage")
+        .and_then(Value::as_str)
+        .and_then(|raw| crate::controllers::resource_quota::parse_resource_quantity("storage", raw))
+}
+
+async fn check_pvc_storage_delta(
+    db: &dyn crate::datastore::DatastoreBackend,
+    namespace: &str,
+    delta: i64,
+) -> Result<(), AppError> {
+    if delta <= 0 {
+        return Ok(());
+    }
+
+    let rq_list = match db
+        .list_resources(
+            "v1",
+            "ResourceQuota",
+            Some(namespace),
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await
+    {
+        Ok(list) => list,
+        Err(_) => return Ok(()),
+    };
+
+    for rq_resource in rq_list.items {
+        if crate::controllers::resource_quota::resource_quota_has_pod_scope_constraints(
+            rq_resource.data.as_ref(),
+        ) {
+            continue;
+        }
+        let Some(limit_raw) = rq_resource
+            .data
+            .pointer("/spec/hard/requests.storage")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(limit) =
+            crate::controllers::resource_quota::parse_resource_quantity("storage", limit_raw)
+        else {
+            continue;
+        };
+
+        let used_raw = rq_resource
+            .data
+            .pointer("/status/used/requests.storage")
+            .and_then(Value::as_str)
+            .unwrap_or("0");
+        let used = crate::controllers::resource_quota::parse_resource_quantity("storage", used_raw)
+            .unwrap_or(0);
+        if used + delta > limit {
+            let requested_fmt =
+                crate::controllers::resource_quota::format_resource_quantity("storage", delta);
+            let used_fmt =
+                crate::controllers::resource_quota::format_resource_quantity("storage", used);
+            let limit_fmt =
+                crate::controllers::resource_quota::format_resource_quantity("storage", limit);
+            return Err(AppError::Forbidden(format!(
+                "exceeded quota: requests.storage, requested: {}, used: {}, limited: {}",
+                requested_fmt, used_fmt, limit_fmt
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn check_resource_quota_for_pvc_update(
+    db: &dyn crate::datastore::DatastoreBackend,
+    namespace: &str,
+    old_pvc: &Value,
+    new_pvc: &Value,
+) -> Result<(), AppError> {
+    let old = pvc_requested_storage(old_pvc).unwrap_or(0);
+    let new = pvc_requested_storage(new_pvc).unwrap_or(0);
+    check_pvc_storage_delta(db, namespace, new.saturating_sub(old)).await
+}
+
 pub async fn check_resource_quota_for_pod_update(
     db: &dyn crate::datastore::DatastoreBackend,
     namespace: &str,
@@ -299,6 +381,11 @@ pub async fn check_resource_quota_for_creation(
         Ok(list) => list,
         Err(_) => return Ok(()),
     };
+
+    if kind == "PersistentVolumeClaim" {
+        let requested = pvc_requested_storage(body).unwrap_or(0);
+        check_pvc_storage_delta(db, namespace, requested).await?;
+    }
 
     for rq_resource in rq_list.items {
         let hard = match rq_resource

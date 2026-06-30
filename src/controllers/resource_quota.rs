@@ -26,6 +26,66 @@ fn quota_resource_to_kind(resource_name: &str) -> Option<(&'static str, &'static
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QuotaUsageKind<'a> {
+    PodResource {
+        bucket: &'static str,
+        resource_key: &'a str,
+    },
+    PvcRequestedStorage,
+    CountResource {
+        api_version: &'static str,
+        kind: &'static str,
+    },
+    CountKey {
+        api_version: String,
+        kind: String,
+    },
+    ServiceNodePorts,
+    ServiceLoadBalancers,
+    Pods,
+}
+
+fn quota_usage_kind(resource_name: &str) -> Option<QuotaUsageKind<'_>> {
+    if resource_name == "requests.storage" {
+        return Some(QuotaUsageKind::PvcRequestedStorage);
+    }
+    if let Some(suffix) = resource_name.strip_prefix("requests.") {
+        return Some(QuotaUsageKind::PodResource {
+            bucket: "requests",
+            resource_key: suffix,
+        });
+    }
+    if let Some(suffix) = resource_name.strip_prefix("limits.") {
+        if suffix == "storage" {
+            return None;
+        }
+        return Some(QuotaUsageKind::PodResource {
+            bucket: "limits",
+            resource_key: suffix,
+        });
+    }
+    match resource_name {
+        "cpu" => Some(QuotaUsageKind::PodResource {
+            bucket: "requests",
+            resource_key: "cpu",
+        }),
+        "memory" => Some(QuotaUsageKind::PodResource {
+            bucket: "requests",
+            resource_key: "memory",
+        }),
+        "ephemeral-storage" => Some(QuotaUsageKind::PodResource {
+            bucket: "requests",
+            resource_key: "ephemeral-storage",
+        }),
+        "services.nodeports" => Some(QuotaUsageKind::ServiceNodePorts),
+        "services.loadbalancers" => Some(QuotaUsageKind::ServiceLoadBalancers),
+        "pods" => Some(QuotaUsageKind::Pods),
+        _ => quota_resource_to_kind(resource_name)
+            .map(|(api_version, kind)| QuotaUsageKind::CountResource { api_version, kind }),
+    }
+}
+
 /// Map from plural resource name to kind, for `count/` prefix quota key parsing.
 fn plural_to_kind(plural: &str) -> Option<&'static str> {
     match plural {
@@ -482,26 +542,13 @@ pub fn calculate_pod_effective_resource_for_key(
     regular_sum.max(init_max)
 }
 
-async fn sum_pod_resource_quota_key(
+async fn sum_pod_resource_quota_resource(
     pod_reader: &dyn PodReader,
     namespace: &str,
     resource_quota: &Value,
-    quota_key: &str,
+    bucket: &'static str,
+    resource_key: &str,
 ) -> Option<String> {
-    let (bucket, resource_key) = if let Some(suffix) = quota_key.strip_prefix("requests.") {
-        ("requests", suffix)
-    } else if let Some(suffix) = quota_key.strip_prefix("limits.") {
-        ("limits", suffix)
-    } else if quota_key == "cpu" {
-        ("requests", "cpu")
-    } else if quota_key == "memory" {
-        ("requests", "memory")
-    } else if quota_key == "ephemeral-storage" {
-        ("requests", "ephemeral-storage")
-    } else {
-        return None;
-    };
-
     let pods = pod_reader
         .list_pods(Some(namespace), None, None, None, None)
         .await
@@ -522,6 +569,36 @@ async fn sum_pod_resource_quota_key(
     }
 
     Some(format_resource_quantity(resource_key, total))
+}
+
+async fn sum_pvc_requested_storage(db: &dyn DatastoreBackend, namespace: &str) -> Option<String> {
+    let pvcs = db
+        .list_resources(
+            "v1",
+            "PersistentVolumeClaim",
+            Some(namespace),
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await
+        .ok()?
+        .items;
+
+    let mut total = 0_i64;
+    for pvc in pvcs {
+        if pvc.data.pointer("/metadata/deletionTimestamp").is_some() {
+            continue;
+        }
+        let Some(raw) = pvc
+            .data
+            .pointer("/spec/resources/requests/storage")
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        total += parse_resource_quantity("storage", raw).unwrap_or(0);
+    }
+
+    Some(format_resource_quantity("storage", total))
 }
 
 /// Count pods that match the given scope selector, or all pods if scopes is empty.
@@ -557,46 +634,60 @@ async fn calculate_resource_quota_status(
 
     let mut used = serde_json::Map::new();
     for resource_name in hard.keys() {
-        if let Some(pod_used) =
-            sum_pod_resource_quota_key(pod_reader, namespace, rq, resource_name).await
-        {
-            used.insert(resource_name.clone(), json!(pod_used));
-            continue;
-        }
+        let usage_kind = quota_usage_kind(resource_name).or_else(|| {
+            parse_count_quota_key(resource_name)
+                .map(|(api_version, kind)| QuotaUsageKind::CountKey { api_version, kind })
+        });
 
-        let count = if resource_name == "services.nodeports" {
-            // Count NodePort and LoadBalancer services (both allocate NodePorts)
-            let np = count_services_by_type(db, namespace, "NodePort").await;
-            let lb = count_services_by_type(db, namespace, "LoadBalancer").await;
-            np + lb
-        } else if resource_name == "services.loadbalancers" {
-            count_services_by_type(db, namespace, "LoadBalancer").await
-        } else if resource_name == "pods" {
-            // Pod counting must exclude terminating pods
-            count_pods_with_scope(pod_reader, namespace, rq).await
-        } else if let Some((api_version, kind)) = quota_resource_to_kind(resource_name) {
-            count_resources(db, api_version, kind, namespace).await
-        } else if resource_name.starts_with("count/") {
-            // Handle count/<plural>.<group> style quota keys
-            if let Some((api_version, kind)) = parse_count_quota_key(resource_name) {
-                count_resources(db, &api_version, &kind, namespace).await
-            } else {
-                // Unknown count/ resource, preserve existing or 0
-                rq.pointer(&format!("/status/used/{}", resource_name))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(0)
-            }
-        } else {
-            // For resource types we don't know how to count (cpu, memory, storage, etc.),
-            // preserve existing value or 0
-            rq.pointer(&format!("/status/used/{}", resource_name))
+        let Some(usage_kind) = usage_kind else {
+            let count = rq
+                .pointer(&format!("/status/used/{}", resource_name))
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0)
+                .unwrap_or(0);
+            used.insert(resource_name.clone(), json!(count.to_string()));
+            continue;
         };
-        let value = count.to_string();
-        used.insert(resource_name.clone(), json!(value));
+
+        match usage_kind {
+            QuotaUsageKind::PodResource {
+                bucket,
+                resource_key,
+            } => {
+                if let Some(pod_used) =
+                    sum_pod_resource_quota_resource(pod_reader, namespace, rq, bucket, resource_key)
+                        .await
+                {
+                    used.insert(resource_name.clone(), json!(pod_used));
+                }
+            }
+            QuotaUsageKind::PvcRequestedStorage => {
+                if let Some(storage_used) = sum_pvc_requested_storage(db, namespace).await {
+                    used.insert(resource_name.clone(), json!(storage_used));
+                }
+            }
+            QuotaUsageKind::ServiceNodePorts => {
+                let np = count_services_by_type(db, namespace, "NodePort").await;
+                let lb = count_services_by_type(db, namespace, "LoadBalancer").await;
+                used.insert(resource_name.clone(), json!((np + lb).to_string()));
+            }
+            QuotaUsageKind::ServiceLoadBalancers => {
+                let count = count_services_by_type(db, namespace, "LoadBalancer").await;
+                used.insert(resource_name.clone(), json!(count.to_string()));
+            }
+            QuotaUsageKind::Pods => {
+                let count = count_pods_with_scope(pod_reader, namespace, rq).await;
+                used.insert(resource_name.clone(), json!(count.to_string()));
+            }
+            QuotaUsageKind::CountResource { api_version, kind } => {
+                let count = count_resources(db, api_version, kind, namespace).await;
+                used.insert(resource_name.clone(), json!(count.to_string()));
+            }
+            QuotaUsageKind::CountKey { api_version, kind } => {
+                let count = count_resources(db, &api_version, &kind, namespace).await;
+                used.insert(resource_name.clone(), json!(count.to_string()));
+            }
+        };
     }
 
     Some((hard, Value::Object(used)))
