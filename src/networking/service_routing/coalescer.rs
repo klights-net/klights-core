@@ -716,27 +716,40 @@ fn apply_service_routing_watch_event_to_inventory(
         EventType::Added | EventType::Modified | EventType::Deleted => {}
     }
 
-    let deleted = event.event.event_type == EventType::Deleted;
     let object = event.event.object.as_ref();
-    let (namespace, name, resource_version) = watch_event_object_identity(object)?;
-    let data = (!deleted).then(|| (*object).clone());
 
     match (target.api_version, target.kind) {
-        ("v1", "Service") => Ok(table.apply_service_event_to_inventory(
-            namespace,
-            name,
-            resource_version,
-            deleted,
-            data,
-        )),
-        ("v1", "Endpoints") => Ok(table.apply_endpoints_event_to_inventory(
-            namespace,
-            name,
-            resource_version,
-            deleted,
-            data,
-        )),
+        ("networking.k8s.io/v1", "NetworkPolicy") | ("v1", "Pod") | ("v1", "Namespace") => {
+            Ok(Some(super::inventory::InventoryApply::Applied))
+        }
+        ("v1", "Service") => {
+            let deleted = event.event.event_type == EventType::Deleted;
+            let (namespace, name, resource_version) = watch_event_object_identity(object)?;
+            let data = (!deleted).then(|| (*object).clone());
+            Ok(table.apply_service_event_to_inventory(
+                namespace,
+                name,
+                resource_version,
+                deleted,
+                data,
+            ))
+        }
+        ("v1", "Endpoints") => {
+            let deleted = event.event.event_type == EventType::Deleted;
+            let (namespace, name, resource_version) = watch_event_object_identity(object)?;
+            let data = (!deleted).then(|| (*object).clone());
+            Ok(table.apply_endpoints_event_to_inventory(
+                namespace,
+                name,
+                resource_version,
+                deleted,
+                data,
+            ))
+        }
         ("discovery.k8s.io/v1", "EndpointSlice") => {
+            let deleted = event.event.event_type == EventType::Deleted;
+            let (namespace, name, resource_version) = watch_event_object_identity(object)?;
+            let data = (!deleted).then(|| (*object).clone());
             let Some(service_name) = object
                 .pointer("/metadata/labels/kubernetes.io~1service-name")
                 .and_then(|value| value.as_str())
@@ -1102,6 +1115,78 @@ mod tests {
             .iter()
             .map(|target| (target.api_version.to_string(), target.kind.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn policy_only_watch_targets_trigger_sync_without_service_inventory_identity() {
+        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let table = test_service_table(supervisor);
+        let cases = [
+            (
+                ServiceRoutingWatchTarget {
+                    api_version: "networking.k8s.io/v1",
+                    kind: "NetworkPolicy",
+                },
+                serde_json::json!({
+                    "apiVersion": "networking.k8s.io/v1",
+                    "kind": "NetworkPolicy",
+                    "metadata": {
+                        "namespace": "policy-ns",
+                        "name": "allow-backend",
+                        "resourceVersion": "7"
+                    }
+                }),
+            ),
+            (
+                ServiceRoutingWatchTarget {
+                    api_version: "v1",
+                    kind: "Pod",
+                },
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "policy-ns",
+                        "name": "backend",
+                        "resourceVersion": "8"
+                    }
+                }),
+            ),
+            (
+                ServiceRoutingWatchTarget {
+                    api_version: "v1",
+                    kind: "Namespace",
+                },
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {
+                        "name": "policy-ns",
+                        "resourceVersion": "9"
+                    }
+                }),
+            ),
+        ];
+
+        for (target, object) in cases {
+            let result = apply_service_routing_watch_event_to_inventory(
+                table.as_ref(),
+                target,
+                ResourceEvent {
+                    event: crate::watch::WatchEvent::modified(object),
+                },
+            )
+            .expect("policy-only watch target must not poison service inventory sync");
+            assert_eq!(
+                result,
+                Some(crate::networking::service_routing::inventory::InventoryApply::Applied),
+                "{}/{} event should wake network-policy reconcile without requiring a Service inventory key",
+                target.api_version,
+                target.kind
+            );
+        }
     }
 
     #[async_trait]
