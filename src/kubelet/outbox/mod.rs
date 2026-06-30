@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::Resource;
 use crate::datastore::command::StorageCommand;
-use crate::datastore::node_local::sqlite::RuntimeObservationCheckpoint;
+use crate::datastore::node_local::sqlite::{PodStatusCheckpoint, RuntimeObservationCheckpoint};
 use crate::datastore::node_local::{NodeLocalHandle, OutboxInsert, OutboxRow};
 use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
@@ -360,6 +360,8 @@ impl Outbox {
         updated_ms: i64,
     ) -> Result<()> {
         let namespace = pod.namespace.as_deref().unwrap_or("default");
+        let previous = self.node_db.get_pod_status_checkpoint(&pod.uid).await?;
+        let status = merge_checkpoint_status_for_record(pod, status, previous.as_ref());
         self.node_db
             .upsert_pod_status_checkpoint(
                 &pod.uid,
@@ -477,6 +479,159 @@ impl Outbox {
             .delete_runtime_observation_checkpoint(pod_uid)
             .await
     }
+}
+
+fn merge_checkpoint_status_for_record(
+    pod: &Resource,
+    mut incoming: Value,
+    previous: Option<&PodStatusCheckpoint>,
+) -> Value {
+    let namespace = pod.namespace.as_deref().unwrap_or("default");
+    let Some(previous) = previous else {
+        normalize_bound_pod_scheduled_condition(pod, &mut incoming, None);
+        return incoming;
+    };
+    if previous.namespace != namespace || previous.pod_name != pod.name {
+        normalize_bound_pod_scheduled_condition(pod, &mut incoming, None);
+        return incoming;
+    }
+
+    if let (Some(incoming_obj), Some(previous_obj)) =
+        (incoming.as_object_mut(), previous.status.as_object())
+    {
+        preserve_previous_checkpoint_field(incoming_obj, previous_obj, "podIP");
+        preserve_previous_checkpoint_field(incoming_obj, previous_obj, "podIPs");
+        preserve_previous_checkpoint_field(incoming_obj, previous_obj, "hostIP");
+        preserve_previous_checkpoint_field(incoming_obj, previous_obj, "hostIPs");
+        preserve_previous_checkpoint_field(incoming_obj, previous_obj, "qosClass");
+        merge_checkpoint_conditions(incoming_obj, previous_obj);
+    }
+
+    normalize_bound_pod_scheduled_condition(pod, &mut incoming, Some(&previous.status));
+    incoming
+}
+
+fn preserve_previous_checkpoint_field(
+    incoming: &mut serde_json::Map<String, Value>,
+    previous: &serde_json::Map<String, Value>,
+    field: &str,
+) {
+    if !incoming
+        .get(field)
+        .is_none_or(status_checkpoint_value_is_empty)
+    {
+        return;
+    }
+    let Some(previous_value) = previous.get(field) else {
+        return;
+    };
+    if status_checkpoint_value_is_empty(previous_value) {
+        return;
+    }
+    incoming.insert(field.to_string(), previous_value.clone());
+}
+
+fn status_checkpoint_value_is_empty(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(value) => value.trim().is_empty(),
+        Value::Array(values) => values.is_empty(),
+        Value::Object(values) => values.is_empty(),
+        _ => false,
+    }
+}
+
+fn merge_checkpoint_conditions(
+    incoming: &mut serde_json::Map<String, Value>,
+    previous: &serde_json::Map<String, Value>,
+) {
+    let Some(previous_conditions) = previous
+        .get("conditions")
+        .and_then(|value| value.as_array())
+    else {
+        return;
+    };
+    let conditions = incoming
+        .entry("conditions".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !conditions.is_array() {
+        *conditions = Value::Array(Vec::new());
+    }
+    let Some(incoming_conditions) = conditions.as_array_mut() else {
+        return;
+    };
+    for condition in previous_conditions {
+        let Some(condition_type) = condition.get("type").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if incoming_conditions.iter().any(|candidate| {
+            candidate.get("type").and_then(|value| value.as_str()) == Some(condition_type)
+        }) {
+            continue;
+        }
+        incoming_conditions.push(condition.clone());
+    }
+}
+
+fn normalize_bound_pod_scheduled_condition(
+    pod: &Resource,
+    status: &mut Value,
+    previous_status: Option<&Value>,
+) {
+    let bound = pod
+        .data
+        .pointer("/spec/nodeName")
+        .and_then(|value| value.as_str())
+        .is_some_and(|node| !node.is_empty());
+    if !bound {
+        return;
+    }
+
+    let true_condition = pod_scheduled_true_condition(status)
+        .or_else(|| previous_status.and_then(pod_scheduled_true_condition))
+        .or_else(|| {
+            pod_scheduled_true_condition(pod.data.pointer("/status").unwrap_or(&Value::Null))
+        })
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "type": "PodScheduled",
+                "status": "True",
+                "lastTransitionTime": crate::utils::k8s_timestamp(),
+            })
+        });
+
+    let Some(status_obj) = status.as_object_mut() else {
+        return;
+    };
+    let conditions = status_obj
+        .entry("conditions".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !conditions.is_array() {
+        *conditions = Value::Array(Vec::new());
+    }
+    let Some(conditions) = conditions.as_array_mut() else {
+        return;
+    };
+    if let Some(existing) = conditions.iter_mut().find(|condition| {
+        condition.get("type").and_then(|value| value.as_str()) == Some("PodScheduled")
+    }) {
+        *existing = true_condition;
+    } else {
+        conditions.push(true_condition);
+    }
+}
+
+fn pod_scheduled_true_condition(status: &Value) -> Option<Value> {
+    status
+        .get("conditions")
+        .and_then(|conditions| conditions.as_array())
+        .and_then(|conditions| {
+            conditions.iter().find(|condition| {
+                condition.get("type").and_then(|value| value.as_str()) == Some("PodScheduled")
+                    && condition.get("status").and_then(|value| value.as_str()) == Some("True")
+            })
+        })
+        .cloned()
 }
 
 fn pod_status_contains_checkpoint(pod: &Value, checkpoint_status: &Value) -> bool {
@@ -2171,6 +2326,120 @@ mod tests {
                 .expect("read checkpoint")
                 .is_some(),
             "unmaterialized checkpoint should remain for later local reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_runtime_checkpoint_without_ip_preserves_prior_pod_ip_and_scheduled_condition() {
+        let node_db = node_db().await;
+        let outbox = Outbox::new(node_db.clone());
+        let live = crate::datastore::Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "checkpoint-runtime-race".to_string(),
+            uid: "uid-checkpoint-runtime-race".to_string(),
+            resource_version: 20,
+            data: Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "checkpoint-runtime-race",
+                    "uid": "uid-checkpoint-runtime-race",
+                    "resourceVersion": "20"
+                },
+                "spec": {
+                    "nodeName": "mn-replica",
+                    "containers": [{"name": "main", "image": "busybox"}]
+                },
+                "status": {
+                    "phase": "Pending",
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-06-30T05:07:27Z"},
+                        {"type": "Initialized", "status": "True", "lastTransitionTime": "2026-06-30T05:07:26Z"}
+                    ]
+                }
+            })),
+        };
+
+        outbox
+            .record_pod_status_checkpoint(
+                &live,
+                serde_json::json!({
+                    "phase": "Pending",
+                    "podIP": "10.50.3.2",
+                    "podIPs": [{"ip": "10.50.3.2"}],
+                    "hostIP": "10.99.0.13",
+                    "hostIPs": [{"ip": "10.99.0.13"}],
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-06-30T05:07:27Z"},
+                        {"type": "Initialized", "status": "True", "lastTransitionTime": "2026-06-30T05:07:26Z"}
+                    ],
+                    "containerStatuses": []
+                }),
+                100,
+            )
+            .await
+            .expect("record podIP checkpoint");
+
+        outbox
+            .record_pod_status_checkpoint(
+                &live,
+                serde_json::json!({
+                    "phase": "Pending",
+                    "conditions": [
+                        {
+                            "type": "PodScheduled",
+                            "status": "False",
+                            "lastTransitionTime": "2026-06-30T05:07:26Z",
+                            "reason": "SchedulingPending"
+                        },
+                        {"type": "Initialized", "status": "True", "lastTransitionTime": "2026-06-30T05:07:26Z"},
+                        {"type": "ContainersReady", "status": "False", "lastTransitionTime": "2026-06-30T05:07:29Z"},
+                        {"type": "Ready", "status": "False", "lastTransitionTime": "2026-06-30T05:07:29Z"}
+                    ],
+                    "containerStatuses": [{
+                        "name": "main",
+                        "ready": true,
+                        "started": true,
+                        "restartCount": 0,
+                        "state": {"running": {"startedAt": "2026-06-30T05:07:29Z"}}
+                    }]
+                }),
+                200,
+            )
+            .await
+            .expect("record runtime checkpoint");
+
+        let merged = outbox
+            .merge_pod_status_checkpoint(live)
+            .await
+            .expect("merge checkpoint");
+
+        assert_eq!(
+            merged
+                .data
+                .pointer("/status/podIP")
+                .and_then(|value| value.as_str()),
+            Some("10.50.3.2"),
+            "runtime checkpoint without network fields must not erase the prior CNI podIP checkpoint"
+        );
+        let scheduled = merged
+            .data
+            .pointer("/status/conditions")
+            .and_then(|conditions| conditions.as_array())
+            .and_then(|conditions| {
+                conditions.iter().find(|condition| {
+                    condition.get("type").and_then(|value| value.as_str()) == Some("PodScheduled")
+                })
+            })
+            .expect("PodScheduled condition present");
+        assert_eq!(
+            scheduled.get("status").and_then(|value| value.as_str()),
+            Some("True"),
+            "a runtime checkpoint must not downgrade a bound Pod back to SchedulingPending"
         );
     }
 
