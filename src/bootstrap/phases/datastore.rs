@@ -117,8 +117,9 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     );
     // T6 step 4: every leader-class boot's `cluster_api` is the
     // switching proxy from step 3 — never a bare LocalApiClient. The
-    // proxy dispatches reads to local, writes to local when this node
-    // is the elected leader, writes to remote otherwise.
+    // proxy dispatches application reads/watches to the elected leader
+    // target, and writes to local only when this node is the elected
+    // leader.
     //
     // T6 step 4b: control-plane members build a real gRPC forwarder
     // using `RemoteApiClient` so follower writes reach the elected

@@ -10,7 +10,7 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::HeaderValue;
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 use std::{fs as blocking_fs, path::Path};
 
@@ -61,9 +61,9 @@ impl RaftLeaderProxy {
             // traffic (mirrors the CRD conversion webhook client).
             .no_proxy()
             // Bound connection establishment so an unreachable leader still
-            // fails fast into the local-read fallback, but do NOT bound the
-            // total request: streamed responses (pod log `follow`, chunked
-            // GETs) must be relayed for as long as the client stays connected.
+            // fails fast into retryable 503, but do NOT bound the total
+            // request: streamed responses (pod log `follow`, chunked GETs)
+            // must be relayed for as long as the client stays connected.
             .connect_timeout(std::time::Duration::from_secs(10));
 
         // Verify the leader's server certificate against the cluster CA.
@@ -171,26 +171,15 @@ pub async fn leader_proxy_middleware(
         return next.run(request).await;
     }
 
-    // Follower: proxy to leader, fallback to local reads if leader gone
-    follower_handle(request, &proxy, next).await
+    // Follower: proxy to leader or fail closed if no safe leader path exists.
+    follower_handle(request, &proxy).await
 }
 
-/// Follower request handler: proxy to leader when available, fall back to
-/// local read-only datastore when the leader is unreachable and the request is
-/// a datastore-backed read. Leader-owned subresources such as pods/log must not
-/// fall back to the follower's local handler.
-async fn follower_handle(request: Request, proxy: &RaftLeaderProxy, next: Next) -> Response {
-    let allow_local_read_fallback = allows_local_read_fallback(request.method(), request.uri());
-
-    // Watch requests are long-lived streaming GETs that cannot be proxied
-    // through a buffered 30s request. Serve them locally — the local state
-    // machine apply path feeds the watch broadcast channel on every follower.
-    if allow_local_read_fallback && is_watch_request(request.uri().query()) {
-        return next.run(request).await;
-    }
-
+/// Follower request handler: proxy to leader when available. If no current
+/// leader endpoint is known or the leader cannot be reached, fail closed with a
+/// retryable Kubernetes 503 rather than serving stale local cluster.db state.
+async fn follower_handle(request: Request, proxy: &RaftLeaderProxy) -> Response {
     if let Some(leader_addr) = proxy.leader_addr() {
-        // Clone the request so we can retry locally on connection failure
         let (parts, body) = request.into_parts();
         let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
             Ok(bytes) => bytes,
@@ -200,53 +189,15 @@ async fn follower_handle(request: Request, proxy: &RaftLeaderProxy, next: Next) 
             }
         };
 
-        // Try proxying to leader
-        let proxy_resp = proxy_raw(&parts, &body_bytes, &leader_addr, &proxy.http_client()).await;
-        if proxy_resp.status() != axum::http::StatusCode::SERVICE_UNAVAILABLE {
-            return proxy_resp;
-        }
-
-        // Leader unreachable: serve datastore-backed reads locally, reject
-        // writes and leader-owned subresources such as pods/log.
-        if allow_local_read_fallback {
-            tracing::debug!("leader unreachable; serving GET from local datastore (read-only)");
-            let rebuilt = Request::from_parts(parts, Body::from(body_bytes));
-            return next.run(rebuilt).await;
-        }
-        return proxy_resp;
+        return proxy_raw(&parts, &body_bytes, &leader_addr, &proxy.http_client()).await;
     }
 
-    // No leader address at all: serve datastore-backed reads locally.
-    if allow_local_read_fallback {
-        tracing::debug!("no raft leader; serving GET from local datastore (read-only)");
-        return next.run(request).await;
-    }
-    service_unavailable("no raft leader elected (read-only mode during election)")
-}
-
-/// Whether the query string contains `watch=true` (K8s watch request).
-fn is_watch_request(query: Option<&str>) -> bool {
-    query.is_some_and(|q| q.contains("watch=true"))
-}
-
-fn allows_local_read_fallback(method: &axum::http::Method, uri: &axum::http::Uri) -> bool {
-    if method != axum::http::Method::GET {
-        return false;
-    }
-
-    let crate::auth::request_info::ResolvedAuthz::Authorize(request) =
-        crate::auth::request_info::resolve_request_info(method, uri.path(), uri.query());
-    if !request.resource_request {
-        return true;
-    }
-    match request.subresource.as_deref() {
-        None | Some("status" | "scale") => true,
-        Some(_) => false,
-    }
+    service_unavailable("no raft leader elected; retry when a leader is available")
 }
 
 /// Send a pre-buffered request to the leader and return the response.
-/// Returns 503 on connection failure (caller decides fallback).
+/// Returns 503 on connection failure; followers must fail closed rather than
+/// retrying the request against local cluster.db state.
 async fn proxy_raw(
     parts: &axum::http::request::Parts,
     body_bytes: &[u8],
@@ -393,10 +344,11 @@ fn stamp_forwarded_client_cert(
 }
 
 fn service_unavailable(msg: &str) -> Response {
-    let mut resp = axum::http::Response::new(Body::from(format!("service unavailable: {msg}\n")));
-    *resp.status_mut() = axum::http::StatusCode::SERVICE_UNAVAILABLE;
+    let mut resp = crate::api::AppError::ServiceUnavailable(msg.to_string()).into_response();
     resp.headers_mut()
         .insert("connection", HeaderValue::from_static("close"));
+    resp.headers_mut()
+        .insert("retry-after", HeaderValue::from_static("1"));
     resp
 }
 
@@ -460,43 +412,34 @@ mod tests {
         assert_eq!(proxy.leader_addr(), None);
     }
 
-    #[test]
-    fn local_read_fallback_policy_is_datastore_read_only() {
-        let get = axum::http::Method::GET;
-        let post = axum::http::Method::POST;
+    #[tokio::test]
+    async fn service_unavailable_is_kubernetes_status_response() {
+        let response = service_unavailable("no raft leader elected");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
 
-        assert!(allows_local_read_fallback(
-            &get,
-            &"/api/v1/namespaces/default/pods".parse().unwrap()
-        ));
-        assert!(allows_local_read_fallback(
-            &get,
-            &"/api/v1/namespaces/default/pods/p/status".parse().unwrap()
-        ));
-        assert!(allows_local_read_fallback(
-            &get,
-            &"/api/v1/namespaces/default/pods?watch=true"
-                .parse()
-                .unwrap()
-        ));
-        assert!(!allows_local_read_fallback(
-            &get,
-            &"/api/v1/namespaces/default/pods/p/log".parse().unwrap()
-        ));
-        assert!(!allows_local_read_fallback(
-            &get,
-            &"/api/v1/namespaces/default/pods/p/log?watch=true"
-                .parse()
-                .unwrap()
-        ));
-        assert!(!allows_local_read_fallback(
-            &get,
-            &"/api/v1/namespaces/default/pods/p/proxy".parse().unwrap()
-        ));
-        assert!(!allows_local_read_fallback(
-            &post,
-            &"/api/v1/namespaces/default/pods".parse().unwrap()
-        ));
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("application/json"),
+            "503 must be a Kubernetes Status JSON response, got content-type {content_type:?}"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes)
+            .expect("503 response body must be valid Kubernetes Status JSON");
+        assert_eq!(body["apiVersion"], "v1");
+        assert_eq!(body["kind"], "Status");
+        assert_eq!(body["status"], "Failure");
+        assert_eq!(body["reason"], "ServiceUnavailable");
+        assert_eq!(body["code"], 503);
     }
 
     /// A long-lived streaming GET (e.g. `kubectl logs -f`, which is a chunked

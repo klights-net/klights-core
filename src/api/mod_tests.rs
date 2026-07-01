@@ -5601,19 +5601,22 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
         ))
     }
 
-    async fn get_node_body(state: crate::api::AppState, path: &str) -> Value {
+    async fn get_response(state: crate::api::AppState, path: &str) -> axum::response::Response {
         let app = crate::api::build_router(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(path)
-                    .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        app.oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(path)
+                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn get_node_body(state: crate::api::AppState, path: &str) -> Value {
+        let response = get_response(state, path).await;
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -5719,13 +5722,21 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
         )
         .await
         .unwrap();
-    let follower_get = get_node_body(follower_state, "/api/v1/nodes/worker-a").await;
-    assert!(
-        follower_get["status"]["conditions"][0]
-            .get("lastHeartbeatTime")
-            .is_none(),
-        "followers serving local read fallback must not inject leader-local heartbeat state"
+    let follower_response = get_response(follower_state, "/api/v1/nodes/worker-a").await;
+    assert_eq!(
+        follower_response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "followers must fail closed instead of serving local cluster.db reads"
     );
+    let follower_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(follower_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(follower_body["kind"], "Status");
+    assert_eq!(follower_body["reason"], "ServiceUnavailable");
+    assert_eq!(follower_body["code"], 503);
 }
 
 #[tokio::test]

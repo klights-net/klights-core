@@ -1121,8 +1121,9 @@ mod tests {
             }
             other => panic!("expected Retryable, got {other:?}"),
         }
-        // Reads are open (return empty); they are served by the proxy's
-        // local arm in production. The stub is only on the write path.
+        // The test stub's read methods return empty. Production leader-class
+        // controlplanes use a real RemoteApiClient for follower reads; the
+        // stub is only reachable for non-HA seed/worker construction.
         assert!(
             stub.get_resource(ResourceKey {
                 api_version: "v1".into(),
