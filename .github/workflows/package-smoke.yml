@@ -42,6 +42,9 @@ jobs:
     env:
       EXPECTED_KLIGHTS_VERSION: 0.9.10
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Start Ubuntu ${{ matrix.ubuntu_version }} systemd container
         run: |
           set -euo pipefail
@@ -96,25 +99,18 @@ jobs:
       - name: Install klights from APT repository
         run: |
           set -euo pipefail
+          quickstart_script="$(
+            awk -v heading="## Ubuntu ${{ matrix.ubuntu_version }}" '\''
+              $0 == heading { in_section=1; next }
+              in_section && /^## / { exit }
+              in_section && /^```bash$/ { in_code=1; next }
+              in_code && /^```$/ { exit }
+              in_code { print }
+            '\'' QUICKSTART.md | sed -E "s/^sudo //"
+          )"
+          printf "%s\n" "$quickstart_script" | docker exec -i "${{ matrix.container_name }}" bash -se
           docker exec -e EXPECTED_KLIGHTS_VERSION "${{ matrix.container_name }}" bash -lc '
             set -euo pipefail
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            install -d -m 0755 /etc/apt/keyrings
-            curl -fsSL \
-              https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc \
-              -o /etc/apt/keyrings/klights-archive-keyring.asc
-            chmod 0644 /etc/apt/keyrings/klights-archive-keyring.asc
-            printf "%s\n" \
-              "Types: deb" \
-              "URIs: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/" \
-              "Suites: ${{ matrix.suite }}" \
-              "Components: main" \
-              "Signed-By: /etc/apt/keyrings/klights-archive-keyring.asc" \
-              > /etc/apt/sources.list.d/klights.sources
-            apt-get update
-            apt-cache policy klights
-            apt-get install -y klights
             dpkg-query -W -f="\${Version}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1~${{ matrix.suite }}"
             test -f /etc/default/klights
             grep -Fx "KLIGHTS_DATA_ROOT=/var/lib/klights" /etc/default/klights
@@ -229,6 +225,9 @@ jobs:
     env:
       EXPECTED_KLIGHTS_VERSION: 0.9.10
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Start RHEL-compatible ${{ matrix.rhel_major }} systemd container
         run: |
           set -euo pipefail
@@ -269,24 +268,18 @@ jobs:
       - name: Install klights from RPM repository
         run: |
           set -euo pipefail
+          quickstart_script="$(
+            awk -v heading="## RHEL-Compatible ${{ matrix.rhel_major }}" '\''
+              $0 == heading { in_section=1; next }
+              in_section && /^## / { exit }
+              in_section && /^```bash$/ { in_code=1; next }
+              in_code && /^```$/ { exit }
+              in_code { print }
+            '\'' QUICKSTART.md | sed -E "s/^sudo //"
+          )"
+          printf "%s\n" "$quickstart_script" | docker exec -i "${{ matrix.container_name }}" bash -se
           docker exec -e EXPECTED_KLIGHTS_VERSION "${{ matrix.container_name }}" bash -lc '
             set -euo pipefail
-            install -d -m 0755 /etc/pki/rpm-gpg
-            curl -fsSLo /etc/pki/rpm-gpg/klights-archive-keyring.asc \
-              https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc
-            grep -q "BEGIN PGP PUBLIC KEY BLOCK" /etc/pki/rpm-gpg/klights-archive-keyring.asc
-            rpm --import /etc/pki/rpm-gpg/klights-archive-keyring.asc
-            cat >/etc/yum.repos.d/klights.repo <<EOF_REPO
-          [klights]
-          name=klights
-          baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/${{ matrix.el }}/${{ matrix.rpm_arch }}
-          enabled=1
-          repo_gpgcheck=1
-          gpgcheck=1
-          gpgkey=file:///etc/pki/rpm-gpg/klights-archive-keyring.asc
-          EOF_REPO
-            dnf -y --disablerepo="*" --enablerepo=klights makecache --refresh
-            dnf -y install klights
             rpm -q --qf "%{VERSION}-%{RELEASE}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1.${{ matrix.el }}"
             test -f /etc/sysconfig/klights
             grep -Fx "KLIGHTS_DATA_ROOT=/var/lib/klights" /etc/sysconfig/klights
