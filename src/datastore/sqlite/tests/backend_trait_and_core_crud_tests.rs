@@ -1014,6 +1014,143 @@ async fn stale_status_only_apply_preserves_live_job_status_scalars() {
 }
 
 #[tokio::test]
+async fn stale_status_only_apply_uses_incoming_nonterminal_job_condition_values() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "batch/v1",
+            "Job",
+            Some("default"),
+            "stale-job-status-update",
+            json!({
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": {
+                    "name": "stale-job-status-update",
+                    "namespace": "default",
+                    "uid": "stale-job-status-update-uid"
+                },
+                "spec": {},
+                "status": {
+                    "active": 2,
+                    "conditions": [{
+                        "type": "Suspended",
+                        "status": "False",
+                        "lastTransitionTime": "2026-07-01T04:05:01Z"
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let committed_status = crate::log_apply::LogApplyCommit::new(
+        created.resource_version + 2,
+        vec![crate::log_apply::LogApplyMutation::PutResource(
+            crate::log_apply::LogApplyResourceRow {
+                api_version: "batch/v1".to_string(),
+                kind: "Job".to_string(),
+                namespace: Some("default".to_string()),
+                name: "stale-job-status-update".to_string(),
+                uid: "stale-job-status-update-uid".to_string(),
+                resource_version: created.resource_version + 2,
+                data: json!({
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "metadata": {
+                        "name": "stale-job-status-update",
+                        "namespace": "default",
+                        "uid": "stale-job-status-update-uid",
+                        "resourceVersion": (created.resource_version + 2).to_string()
+                    },
+                    "spec": {},
+                    "status": {
+                        "active": 2,
+                        "conditions": [{
+                            "type": "Suspended",
+                            "status": "True",
+                            "lastTransitionTime": "2026-07-01T04:05:03Z",
+                            "reason": "E2E updateStatus"
+                        }]
+                    }
+                }),
+                require_absent: false,
+                require_existing: true,
+                precondition_uid: Some("stale-job-status-update-uid".to_string()),
+                precondition_resource_version: Some(created.resource_version),
+                status_only: true,
+            },
+        )],
+    );
+
+    db.update_status_only(
+        "batch/v1",
+        "Job",
+        Some("default"),
+        "stale-job-status-update",
+        json!({
+            "active": 2,
+            "conditions": [
+                {
+                    "type": "Suspended",
+                    "status": "True",
+                    "lastTransitionTime": "2026-07-01T04:05:02Z",
+                    "reason": "E2E patchStatus"
+                },
+                {
+                    "type": "LiveOnly",
+                    "status": "True",
+                    "reason": "PreserveUnmentioned"
+                }
+            ]
+        }),
+        Some(created.resource_version),
+    )
+    .await
+    .expect("user status patch applies before committed status update");
+
+    db.apply_raft_log_apply_commit(committed_status)
+        .await
+        .expect("stale committed nonterminal Job status should merge onto live resource");
+
+    let live = db
+        .get_resource(
+            "batch/v1",
+            "Job",
+            Some("default"),
+            "stale-job-status-update",
+        )
+        .await
+        .unwrap()
+        .expect("job remains");
+    let conditions = live
+        .data
+        .pointer("/status/conditions")
+        .and_then(|value| value.as_array())
+        .expect("job status conditions must remain an array");
+    assert!(
+        conditions.iter().any(|condition| {
+            condition.get("type").and_then(|value| value.as_str()) == Some("Suspended")
+                && condition
+                    .get("lastTransitionTime")
+                    .and_then(|value| value.as_str())
+                    == Some("2026-07-01T04:05:03Z")
+                && condition.get("reason").and_then(|value| value.as_str())
+                    == Some("E2E updateStatus")
+        }),
+        "incoming nonterminal Job condition must replace the live patched value: {conditions:?}"
+    );
+    assert!(
+        conditions.iter().any(|condition| {
+            condition.get("type").and_then(|value| value.as_str()) == Some("LiveOnly")
+                && condition.get("reason").and_then(|value| value.as_str())
+                    == Some("PreserveUnmentioned")
+        }),
+        "stale Job status apply must preserve live conditions omitted by incoming status: {conditions:?}"
+    );
+}
+
+#[tokio::test]
 async fn stale_committed_pod_bind_preserves_live_owner_references() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
