@@ -186,7 +186,8 @@ pub async fn create_namespace(
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(mut body): LenientJson<Value>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
         state.db.as_ref(),
         build_admission_context(AdmissionContextRequest {
@@ -339,7 +340,8 @@ pub async fn update_namespace(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Namespace {} not found", name)))?;
 
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
         state.db.as_ref(),
         build_admission_context(AdmissionContextRequest {
@@ -381,7 +383,8 @@ pub async fn finalize_namespace(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Namespace {} not found", name)))?;
 
-    if query.dry_run == Some("All".to_string()) {
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    if dry_run.is_all() {
         return Ok(Json(body));
     }
 
@@ -469,6 +472,8 @@ pub async fn patch_namespace(
         .get_namespace(&name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Namespace {} not found", name)))?;
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let is_dry_run = dry_run.is_all();
 
     let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
 
@@ -486,14 +491,14 @@ pub async fn patch_namespace(
             name: Some(name.clone()),
             object: patched,
             old_object: Some((*current.data).clone()),
-            dry_run: query.dry_run == Some("All".to_string()),
+            dry_run: is_dry_run,
             subresource: None,
             options: None,
         }),
     )
     .await?;
 
-    if query.dry_run == Some("All".to_string()) {
+    if is_dry_run {
         return Ok(Json(patched));
     }
 

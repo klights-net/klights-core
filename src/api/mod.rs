@@ -19,6 +19,7 @@ pub mod helpers;
 mod integration_tests;
 #[cfg(test)]
 mod mod_tests;
+pub mod mutation;
 mod namespace;
 mod patch;
 #[cfg(test)]

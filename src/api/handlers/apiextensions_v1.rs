@@ -112,7 +112,8 @@ pub async fn delete_crd_with_deregistration(
         .await?
         .ok_or_else(|| AppError::NotFound("CustomResourceDefinition not found".to_string()))?;
 
-    if query.dry_run == Some("All".to_string()) {
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    if dry_run.is_all() {
         return Ok(Json(std::sync::Arc::unwrap_or_clone(resource.data)));
     }
 
@@ -386,7 +387,8 @@ async fn create_crd_with_registration(
         None,
     )?;
 
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let is_dry_run = dry_run.is_all();
     let admitted = run_admission_for_request(
         state.db.as_ref(),
         build_admission_context(AdmissionContextRequest {
@@ -500,7 +502,8 @@ async fn update_crd_with_registration(
     )?;
 
     check_field_validation_strict(&query, &body)?;
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let is_dry_run = dry_run.is_all();
     body = run_admission_for_request(
         state.db.as_ref(),
         build_admission_context(AdmissionContextRequest {
@@ -601,6 +604,8 @@ async fn patch_crd_with_registration(
     body: Bytes,
 ) -> Result<Json<Value>, AppError> {
     let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let is_dry_run = dry_run.is_all();
 
     let patch: Value = if body.len() >= 4 && &body[..4] == b"k8s\x00" {
         crate::protobuf::decode_protobuf(&body[4..])
@@ -637,7 +642,6 @@ async fn patch_crd_with_registration(
                 create_body["metadata"]["name"] = serde_json::json!(name.clone());
             }
 
-            let is_dry_run = query.dry_run == Some("All".to_string());
             let admitted = run_admission_for_request(
                 state.db.as_ref(),
                 build_admission_context(AdmissionContextRequest {
@@ -731,14 +735,14 @@ async fn patch_crd_with_registration(
                 name: Some(name.clone()),
                 object: patched,
                 old_object: Some((*current.data).clone()),
-                dry_run: query.dry_run == Some("All".to_string()),
+                dry_run: is_dry_run,
                 subresource: None,
                 options: None,
             }),
         )
         .await?;
 
-        if query.dry_run == Some("All".to_string()) {
+        if is_dry_run {
             return Ok(Json(patched));
         }
 

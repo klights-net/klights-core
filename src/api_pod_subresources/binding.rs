@@ -7,13 +7,20 @@ pub struct BindingQuery {
     pub dry_run: Option<String>,
 }
 
+impl BindingQuery {
+    fn dry_run_mode(&self) -> Result<crate::api::mutation::DryRunMode, AppError> {
+        crate::api::mutation::DryRunMode::from_query(self.dry_run.as_deref())
+    }
+}
+
 pub async fn pod_binding(
     State(state): State<Arc<AppState>>,
     Path((namespace, name)): Path<(String, String)>,
     Query(query): Query<BindingQuery>,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = query.dry_run_mode()?;
+    let dry_run = dry_run.is_all();
     let binding: Value = if body.len() >= 4 && &body[..4] == b"k8s\x00" {
         crate::protobuf::decode_protobuf(&body[4..])
             .map_err(|e| AppError::BadRequest(format!("failed to decode binding protobuf: {e}")))?

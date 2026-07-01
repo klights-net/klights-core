@@ -1596,7 +1596,8 @@ async fn delete_collection_cr_inner(
         names.extend(list.items.into_iter().map(|resource| resource.name));
     }
 
-    if query.dry_run.as_deref() == Some("All") {
+    let dry_run = crate::api::mutation::DryRunMode::from_delete_collection_query(query)?;
+    if dry_run.is_all() {
         return Ok(Json(serde_json::json!({
             "apiVersion": "v1",
             "kind": "Status",
@@ -1726,7 +1727,8 @@ async fn create_cr_inner(
         plural,
     } = resource_type;
     let api_version = resource_type.api_version();
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(query)?;
+    let is_dry_run = dry_run.is_all();
     let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
     let storage_api_version = storage_api_version_for_request(group, version, conversion.as_ref());
 
@@ -1881,28 +1883,16 @@ async fn delete_cr_inner(
     }
 
     let requested_api_version = resource_type.api_version();
-    let mut delete_options = parse_delete_options_body(&body);
-    if delete_options._grace_period_seconds.is_none() {
-        delete_options._grace_period_seconds = query.grace_period_seconds;
-    }
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let delete_intent = crate::api::mutation::DeleteIntent::from_query_and_body(query, &body)?;
+    let is_dry_run = delete_intent.dry_run.is_all();
     let mut options_value =
-        serde_json::to_value(&delete_options).unwrap_or_else(|_| serde_json::json!({}));
+        serde_json::to_value(&delete_intent.options).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = options_value.as_object_mut() {
         obj.entry("apiVersion".to_string())
             .or_insert_with(|| serde_json::json!("v1"));
         obj.entry("kind".to_string())
             .or_insert_with(|| serde_json::json!("DeleteOptions"));
     }
-
-    let propagation_policy = delete_options
-        .propagation_policy
-        .as_deref()
-        .or(query.propagation_policy.as_deref())
-        .unwrap_or("Background");
-    let orphan = propagation_policy == "Orphan"
-        || delete_options.orphan_dependents == Some(true)
-        || query.orphan_dependents == Some(true);
 
     let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
     let (resource, stored_api_version) = get_existing_custom_resource_for_write(
@@ -1954,8 +1944,11 @@ async fn delete_cr_inner(
         .and_then(|u| u.as_str())
         .unwrap_or("");
 
-    match (orphan, propagation_policy) {
-        (false, "Foreground") => {
+    match (
+        delete_intent.orphan_children,
+        delete_intent.propagation_policy,
+    ) {
+        (false, crate::api::mutation::PropagationPolicy::Foreground) => {
             let updated = crate::api::finalizer_delete::mark_foreground_deletion_with_retry(
                 state.db.as_ref(),
                 &stored_api_version,
@@ -1999,7 +1992,7 @@ async fn delete_cr_inner(
             }
         }
         (_, _) => {
-            let grace_seconds = delete_options._grace_period_seconds.unwrap_or(0);
+            let grace_seconds = delete_intent.options._grace_period_seconds.unwrap_or(0);
             let outcome =
                 crate::api::finalizer_delete::complete_non_foreground_delete_with_live_recheck(
                     state.db.as_ref(),
@@ -2014,7 +2007,7 @@ async fn delete_cr_inner(
                         delete_preconditions: crate::datastore::ResourcePreconditions::uid(
                             owner_uid.to_string(),
                         ),
-                        orphan_children_before_completion: orphan,
+                        orphan_children_before_completion: delete_intent.orphan_children,
                         uid_mismatch_is_conflict: false,
                         grace_seconds,
                     },
@@ -2036,7 +2029,7 @@ async fn delete_cr_inner(
                 }
                 crate::api::finalizer_delete::DeleteCompletion::GoneOrUidChanged => {}
                 crate::api::finalizer_delete::DeleteCompletion::HardDeleted(deleted) => {
-                    if !orphan
+                    if !delete_intent.orphan_children
                         && let Err(e) = controllers::gc::cascade_delete_with_uid(
                             state.db.as_ref(),
                             &deleted.uid,
@@ -2289,7 +2282,8 @@ async fn patch_cr_inner(
     let api_version = resource_type.api_version();
     let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
     let is_apply_yaml = content_type == Some("application/apply-patch+yaml");
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(query)?;
+    let is_dry_run = dry_run.is_all();
     let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
     let storage_api_version = storage_api_version_for_request(group, version, conversion.as_ref());
 

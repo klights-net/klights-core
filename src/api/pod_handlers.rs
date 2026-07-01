@@ -224,7 +224,8 @@ pub async fn create_pod(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     reject_if_namespace_missing_or_terminating(state.db.as_ref(), &namespace).await?;
 
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let is_dry_run = dry_run.is_all();
 
     // Strict field validation (deep: catches nested unknown fields like spec.bogus)
     check_field_validation_strict_typed("v1", "Pod", &query, &body)?;
@@ -275,7 +276,8 @@ pub async fn update_pod(
     .await?
     .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?;
 
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let is_dry_run = dry_run.is_all();
 
     // Strict field validation (deep: catches nested unknown fields like spec.bogus)
     check_field_validation_strict_typed("v1", "Pod", &query, &body)?;
@@ -320,24 +322,19 @@ pub async fn delete_pod(
     Query(query): Query<CreateUpdateQuery>,
     body: Bytes,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    // Parse DeleteOptions from request body (JSON or protobuf)
-    let mut body_options = parse_delete_options_body(&body);
-    if body_options._grace_period_seconds.is_none() {
-        body_options._grace_period_seconds = query.grace_period_seconds;
-    }
+    let delete_intent = crate::api::mutation::DeleteIntent::from_query_and_body(&query, &body)?;
     // Note: propagation policy / orphanDependents are read at the macro-level
     // for non-Pod kinds. Pod delete defers cascade through PodWorkqueue, so
     // the option is captured into PodApiService once Pod delete gains an
     // explicit propagation-policy field. For now, behavior remains
     // always-cascade by not threading the policy here.
-
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let is_dry_run = delete_intent.dry_run.is_all();
 
     let outcome = crate::kubelet::pod_repository::PodApiWriter::api_delete_pod(
         state.pod_repository.as_ref(),
         &namespace,
         &name,
-        body_options,
+        delete_intent.options,
         is_dry_run,
     )
     .await?;
@@ -408,7 +405,8 @@ pub async fn patch_pod(
     }
 
     let patch_type = content_type_to_patch_type(content_type);
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
+    let is_dry_run = dry_run.is_all();
 
     let outcome = crate::kubelet::pod_repository::PodApiWriter::api_patch_pod(
         state.pod_repository.as_ref(),
@@ -455,7 +453,8 @@ pub async fn delete_collection_pods(
     Path(namespace): Path<String>,
     Query(query): Query<DeleteCollectionQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let is_dry_run = query.dry_run == Some("All".to_string());
+    let dry_run = crate::api::mutation::DryRunMode::from_delete_collection_query(&query)?;
+    let is_dry_run = dry_run.is_all();
     crate::kubelet::pod_repository::PodApiWriter::api_delete_collection_pods(
         state.pod_repository.as_ref(),
         &namespace,
