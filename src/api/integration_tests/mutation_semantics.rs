@@ -157,6 +157,18 @@ fn assert_no_deletion_timestamp(value: &serde_json::Value) {
     );
 }
 
+fn assert_finalizers_include(value: &serde_json::Value, expected: &str) {
+    assert!(
+        value
+            .pointer("/metadata/finalizers")
+            .and_then(|finalizers| finalizers.as_array())
+            .is_some_and(|finalizers| finalizers
+                .iter()
+                .any(|finalizer| finalizer.as_str() == Some(expected))),
+        "object finalizers must include {expected}: {value:?}"
+    );
+}
+
 fn item_names(list: &serde_json::Value) -> Vec<String> {
     let mut names: Vec<String> = list["items"]
         .as_array()
@@ -539,4 +551,240 @@ async fn mutation_deletecollection_dry_run_returns_status_without_deleting_any_m
         .expect("dry-run deletecollection must leave matching Pod live");
         assert_no_deletion_timestamp(&pod.data);
     }
+}
+
+#[tokio::test]
+async fn mutation_delete_uid_precondition_conflict_is_consistent_across_paths() {
+    let state = build_test_app_state().await;
+    let pod_repository = state.pod_repository.clone();
+    let app = crate::api::build_router(state);
+    create_widget_crd(&app).await;
+
+    create_secret(
+        &app,
+        "uid-secret",
+        json!({"name": "uid-secret", "namespace": "default", "uid": "uid-secret-live"}),
+    )
+    .await;
+    create_widget(
+        &app,
+        "uid-widget",
+        json!({"name": "uid-widget", "namespace": "default", "uid": "uid-widget-live"}),
+    )
+    .await;
+    create_pod(
+        &app,
+        "uid-pod",
+        json!({"name": "uid-pod", "namespace": "default", "uid": "uid-pod-live"}),
+    )
+    .await;
+
+    let wrong_uid_options = json!({
+        "apiVersion": "v1",
+        "kind": "DeleteOptions",
+        "preconditions": {"uid": "wrong-uid"}
+    });
+
+    let generated = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/secrets/uid-secret",
+        Some(wrong_uid_options.clone()),
+    )
+    .await;
+    assert_eq!(generated.status(), StatusCode::CONFLICT);
+    let (status, live_secret) =
+        get_json(&app, "/api/v1/namespaces/default/secrets/uid-secret").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_deletion_timestamp(&live_secret);
+
+    let crd = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets/uid-widget",
+        Some(wrong_uid_options.clone()),
+    )
+    .await;
+    assert_eq!(crd.status(), StatusCode::CONFLICT);
+    let (status, live_widget) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/uid-widget",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_no_deletion_timestamp(&live_widget);
+
+    let pod = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/pods/uid-pod",
+        Some(wrong_uid_options),
+    )
+    .await;
+    assert_eq!(pod.status(), StatusCode::CONFLICT);
+    let live_pod = crate::kubelet::pod_repository::PodReader::get_pod(
+        pod_repository.as_ref(),
+        "default",
+        "uid-pod",
+    )
+    .await
+    .unwrap()
+    .expect("UID precondition conflict must leave Pod live");
+    assert_no_deletion_timestamp(&live_pod.data);
+}
+
+#[tokio::test]
+async fn mutation_delete_foreground_adds_finalizer_without_hard_deleting_non_pod_resources() {
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let pod_repository = state.pod_repository.clone();
+    let app = crate::api::build_router(state);
+    create_widget_crd(&app).await;
+
+    create_configmap(
+        &app,
+        "fg-cm",
+        json!({
+            "name": "fg-cm",
+            "namespace": "default",
+            "uid": "fg-cm-live",
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    create_widget(
+        &app,
+        "fg-widget",
+        json!({
+            "name": "fg-widget",
+            "namespace": "default",
+            "uid": "fg-widget-live",
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    create_pod(
+        &app,
+        "fg-pod",
+        json!({"name": "fg-pod", "namespace": "default", "uid": "fg-pod-live"}),
+    )
+    .await;
+    create_secret(
+        &app,
+        "fg-cm-child",
+        json!({
+            "name": "fg-cm-child",
+            "namespace": "default",
+            "finalizers": ["example.com/child-hold"],
+            "ownerReferences": [{
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "name": "fg-cm",
+                "uid": "fg-cm-live",
+                "blockOwnerDeletion": true
+            }]
+        }),
+    )
+    .await;
+    create_configmap(
+        &app,
+        "fg-widget-child",
+        json!({
+            "name": "fg-widget-child",
+            "namespace": "default",
+            "finalizers": ["example.com/child-hold"],
+            "ownerReferences": [{
+                "apiVersion": "example.com/v1",
+                "kind": "Widget",
+                "name": "fg-widget",
+                "uid": "fg-widget-live",
+                "blockOwnerDeletion": true
+            }]
+        }),
+    )
+    .await;
+
+    let generated = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/configmaps/fg-cm",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "propagationPolicy": "Foreground",
+            "preconditions": {"uid": "fg-cm-live"}
+        })),
+    )
+    .await;
+    assert_eq!(generated.status(), StatusCode::ACCEPTED);
+    let generated_body = response_json(generated).await;
+    assert_finalizers_include(&generated_body, "foregroundDeletion");
+    let persisted_cm = db
+        .get_resource("v1", "ConfigMap", Some("default"), "fg-cm")
+        .await
+        .unwrap()
+        .expect("foreground ConfigMap delete must retain the row");
+    assert!(
+        persisted_cm
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+    assert_finalizers_include(&persisted_cm.data, "foregroundDeletion");
+
+    let crd = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets/fg-widget",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "propagationPolicy": "Foreground",
+            "preconditions": {"uid": "fg-widget-live"}
+        })),
+    )
+    .await;
+    assert_eq!(crd.status(), StatusCode::ACCEPTED);
+    let crd_body = response_json(crd).await;
+    assert_finalizers_include(&crd_body, "foregroundDeletion");
+    let persisted_widget = db
+        .get_resource("example.com/v1", "Widget", Some("default"), "fg-widget")
+        .await
+        .unwrap()
+        .expect("foreground custom resource delete must retain the row");
+    assert!(
+        persisted_widget
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
+    assert_finalizers_include(&persisted_widget.data, "foregroundDeletion");
+
+    let pod = request(
+        &app,
+        "DELETE",
+        "/api/v1/namespaces/default/pods/fg-pod",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "propagationPolicy": "Foreground",
+            "preconditions": {"uid": "fg-pod-live"}
+        })),
+    )
+    .await;
+    assert_eq!(pod.status(), StatusCode::ACCEPTED);
+    let live_pod = crate::kubelet::pod_repository::PodReader::get_pod(
+        pod_repository.as_ref(),
+        "default",
+        "fg-pod",
+    )
+    .await
+    .unwrap()
+    .expect("foreground Pod delete must leave actor-owned row");
+    assert!(
+        live_pod
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_some()
+    );
 }

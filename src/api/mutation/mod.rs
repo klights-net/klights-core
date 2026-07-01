@@ -1,3 +1,4 @@
+pub mod delete;
 pub mod identity;
 pub mod options;
 pub mod response;
