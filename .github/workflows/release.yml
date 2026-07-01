@@ -25,8 +25,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.ref }}
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Verify tagged commit checkout
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-list -n 1 "${GITHUB_REF_NAME}^{commit}")"
+          current_commit="$(git rev-parse HEAD)"
+          if [[ "$current_commit" != "$tag_commit" ]]; then
+            echo "::error::Checkout HEAD ${current_commit} does not match ${GITHUB_REF_NAME} target ${tag_commit}"
+            exit 1
+          fi
 
       - name: Install build tooling
         run: |
@@ -197,8 +210,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.ref }}
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Verify tagged commit checkout
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-list -n 1 "${GITHUB_REF_NAME}^{commit}")"
+          current_commit="$(git rev-parse HEAD)"
+          if [[ "$current_commit" != "$tag_commit" ]]; then
+            echo "::error::Checkout HEAD ${current_commit} does not match ${GITHUB_REF_NAME} target ${tag_commit}"
+            exit 1
+          fi
 
       - name: Download static binary
         uses: actions/download-artifact@v4
@@ -306,6 +332,22 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify tagged commit checkout
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-list -n 1 "${GITHUB_REF_NAME}^{commit}")"
+          current_commit="$(git rev-parse HEAD)"
+          if [[ "$current_commit" != "$tag_commit" ]]; then
+            echo "::error::Checkout HEAD ${current_commit} does not match ${GITHUB_REF_NAME} target ${tag_commit}"
+            exit 1
+          fi
 
       - name: Download x86_64 packages
         uses: actions/download-artifact@v4
@@ -349,35 +391,55 @@ jobs:
           echo "CONTAINERD_VERSION=2.3.2" >> "$GITHUB_ENV"
           echo "RUNC_VERSION=1.5.0" >> "$GITHUB_ENV"
 
-      - name: Import optional package GPG key
+      - name: Import package GPG key
         env:
           PACKAGE_GPG_PRIVATE_KEY: ${{ secrets.PACKAGE_GPG_PRIVATE_KEY }}
           PACKAGE_GPG_PASSPHRASE: ${{ secrets.PACKAGE_GPG_PASSPHRASE }}
         run: |
-          if [[ -n "$PACKAGE_GPG_PRIVATE_KEY" ]]; then
-            KEY_FILE="$RUNNER_TEMP/package-signing-key.asc"
-            printf '%s\n' "$PACKAGE_GPG_PRIVATE_KEY" > "$KEY_FILE"
-
-            if [[ -n "$PACKAGE_GPG_PASSPHRASE" ]] && ! gpg --batch --yes --pinentry-mode loopback --passphrase "$PACKAGE_GPG_PASSPHRASE" --import "$KEY_FILE"; then
-              gpg --batch --yes --import "$KEY_FILE"
-            elif [[ -z "$PACKAGE_GPG_PASSPHRASE" ]]; then
-              gpg --batch --yes --import "$KEY_FILE"
-            fi
-
-            rm -f "$KEY_FILE"
-
-            KEY_ID="$(gpg --batch --with-colons --list-secret-keys --keyid-format=long | awk -F: '$1 == "sec" { print $5; exit }')"
-            if [[ -n "$KEY_ID" ]]; then
-              echo "PACKAGE_GPG_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
-            fi
+          if [[ -z "$PACKAGE_GPG_PRIVATE_KEY" ]]; then
+            echo "::error::PACKAGE_GPG_PRIVATE_KEY is required for signed public package repositories"
+            exit 1
           fi
+
+          KEY_FILE="$RUNNER_TEMP/package-signing-key.asc"
+          printf '%s\n' "$PACKAGE_GPG_PRIVATE_KEY" > "$KEY_FILE"
+
+          if [[ -n "$PACKAGE_GPG_PASSPHRASE" ]] && ! gpg --batch --yes --pinentry-mode loopback --passphrase "$PACKAGE_GPG_PASSPHRASE" --import "$KEY_FILE"; then
+            gpg --batch --yes --import "$KEY_FILE"
+          elif [[ -z "$PACKAGE_GPG_PASSPHRASE" ]]; then
+            gpg --batch --yes --import "$KEY_FILE"
+          fi
+
+          rm -f "$KEY_FILE"
+
+          KEY_ID="$(gpg --batch --with-colons --list-secret-keys --keyid-format=long | awk -F: '$1 == "sec" { print $5; exit }')"
+          if [[ -z "$KEY_ID" ]]; then
+            echo "::error::PACKAGE_GPG_PRIVATE_KEY did not import a usable secret key"
+            exit 1
+          fi
+          echo "PACKAGE_GPG_KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
+
+      - name: Export package public key
+        run: |
+          set -euo pipefail
+          if [[ -z "${PACKAGE_GPG_KEY_ID:-}" ]]; then
+            echo "::error::PACKAGE_GPG_KEY_ID was not set by the GPG import step"
+            exit 1
+          fi
+          mkdir -p public/apt
+          gpg --batch --yes --armor --export "$PACKAGE_GPG_KEY_ID" > public/apt/klights-archive-keyring.asc
+          test -s public/apt/klights-archive-keyring.asc
+          grep -q "BEGIN PGP PUBLIC KEY BLOCK" public/apt/klights-archive-keyring.asc
 
       - name: Build package repository metadata
         env:
           PACKAGE_GPG_PASSPHRASE: ${{ secrets.PACKAGE_GPG_PASSPHRASE }}
-          PACKAGE_GPG_KEY_ID: ${{ env.PACKAGE_GPG_KEY_ID }}
         run: |
           set -euo pipefail
+          if [[ -z "${PACKAGE_GPG_KEY_ID:-}" ]]; then
+            echo "::error::PACKAGE_GPG_KEY_ID was not set by the GPG import step"
+            exit 1
+          fi
           mkdir -p public
           scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite noble --arch amd64 --origin klights --label klights --codename noble
           scripts/package/publish-apt-repo.sh --packages dist/packages --repo public/apt --suite noble --arch arm64 --origin klights --label klights --codename noble
@@ -438,6 +500,7 @@ jobs:
             echo "Package repositories are published from the \`package-repo\` branch:"
             echo
             echo "- APT: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt"
+            echo "- APT signing key: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/klights-archive-keyring.asc"
             echo "- RPM: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm"
           } >> "$NOTES"
 
@@ -491,6 +554,12 @@ jobs:
           https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo/apt
           \`\`\`
 
+          APT signing key:
+
+          \`\`\`text
+          https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo/apt/klights-archive-keyring.asc
+          \`\`\`
+
           RPM base URL:
 
           \`\`\`text
@@ -509,12 +578,17 @@ jobs:
           set -euo pipefail
           base_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo"
           paths=(
+            "apt/klights-archive-keyring.asc"
+            "apt/dists/noble/InRelease"
             "apt/dists/noble/Release"
+            "apt/dists/noble/Release.gpg"
             "apt/dists/noble/main/binary-amd64/Packages"
             "apt/dists/noble/main/binary-amd64/Packages.gz"
             "apt/dists/noble/main/binary-arm64/Packages"
             "apt/dists/noble/main/binary-arm64/Packages.gz"
+            "apt/dists/resolute/InRelease"
             "apt/dists/resolute/Release"
+            "apt/dists/resolute/Release.gpg"
             "apt/dists/resolute/main/binary-amd64/Packages"
             "apt/dists/resolute/main/binary-amd64/Packages.gz"
             "apt/dists/resolute/main/binary-arm64/Packages"
@@ -541,6 +615,9 @@ jobs:
             fi
           done
 
+          curl -fsSL "${base_url}/apt/klights-archive-keyring.asc" | grep -q "BEGIN PGP PUBLIC KEY BLOCK"
+          curl -fsSL "${base_url}/apt/dists/noble/InRelease" | grep -q "BEGIN PGP SIGNED MESSAGE"
+          curl -fsSL "${base_url}/apt/dists/resolute/InRelease" | grep -q "BEGIN PGP SIGNED MESSAGE"
           curl -fsSL "${base_url}/apt/dists/noble/main/binary-amd64/Packages" | grep -q '^Package: klights$'
           curl -fsSL "${base_url}/apt/dists/noble/main/binary-arm64/Packages" | grep -q '^Package: klights$'
           curl -fsSL "${base_url}/apt/dists/resolute/main/binary-amd64/Packages" | grep -q '^Package: klights$'

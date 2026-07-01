@@ -100,8 +100,18 @@ jobs:
             set -euo pipefail
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
-            echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt ${{ matrix.suite }} main" \
-              > /etc/apt/sources.list.d/klights.list
+            install -d -m 0755 /etc/apt/keyrings
+            curl -fsSL \
+              https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/klights-archive-keyring.asc \
+              -o /etc/apt/keyrings/klights-archive-keyring.asc
+            chmod 0644 /etc/apt/keyrings/klights-archive-keyring.asc
+            printf "%s\n" \
+              "Types: deb" \
+              "URIs: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/" \
+              "Suites: ${{ matrix.suite }}" \
+              "Components: main" \
+              "Signed-By: /etc/apt/keyrings/klights-archive-keyring.asc" \
+              > /etc/apt/sources.list.d/klights.sources
             apt-get update
             apt-cache policy klights
             apt-get install -y klights
