@@ -26,6 +26,40 @@ async fn request(
         .unwrap()
 }
 
+async fn request_json_with_content_type(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    content_type: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    request_raw(
+        app,
+        method,
+        uri,
+        Some(content_type),
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .await
+}
+
+async fn request_raw(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    content_type: Option<&str>,
+    body: Vec<u8>,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap()
+}
+
 async fn response_json(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
 }
@@ -134,6 +168,34 @@ async fn create_widget(app: &axum::Router, name: &str, metadata: serde_json::Val
     assert_eq!(response.status(), StatusCode::CREATED);
 }
 
+async fn create_deployment(app: &axum::Router, name: &str, metadata: serde_json::Value) {
+    let response = request(
+        app,
+        "POST",
+        "/apis/apps/v1/namespaces/default/deployments",
+        Some(json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": metadata,
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"app": name}},
+                "template": {
+                    "metadata": {"labels": {"app": name}},
+                    "spec": {
+                        "containers": [{
+                            "name": "main",
+                            "image": "registry.k8s.io/pause:3.10"
+                        }]
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
 async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
     let response = request(app, "GET", uri, None).await;
     let status = response.status();
@@ -167,6 +229,16 @@ fn assert_finalizers_include(value: &serde_json::Value, expected: &str) {
                 .any(|finalizer| finalizer.as_str() == Some(expected))),
         "object finalizers must include {expected}: {value:?}"
     );
+}
+
+fn assert_pod_create_defaults(value: &serde_json::Value) {
+    assert_eq!(value["spec"]["serviceAccountName"], "default");
+    assert_eq!(value["spec"]["serviceAccount"], "default");
+    assert_eq!(value["spec"]["dnsPolicy"], "ClusterFirst");
+    assert_eq!(value["spec"]["schedulerName"], "default-scheduler");
+    assert_eq!(value["spec"]["terminationGracePeriodSeconds"], 30);
+    assert_eq!(value["metadata"]["generation"], 1);
+    assert_eq!(value["status"]["phase"], "Pending");
 }
 
 fn item_names(list: &serde_json::Value) -> Vec<String> {
@@ -786,5 +858,264 @@ async fn mutation_delete_foreground_adds_finalizer_without_hard_deleting_non_pod
             .data
             .pointer("/metadata/deletionTimestamp")
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn mutation_create_defaults_are_persisted_for_json_and_protobuf_pod_paths() {
+    let state = build_test_app_state().await;
+    let pod_repository = state.pod_repository.clone();
+    let app = crate::api::build_router(state);
+
+    let json_response = request(
+        &app,
+        "POST",
+        "/api/v1/namespaces/default/pods",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "defaults-json-pod", "namespace": "default"},
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "image": "registry.k8s.io/pause:3.10"
+                }]
+            }
+        })),
+    )
+    .await;
+    assert_eq!(json_response.status(), StatusCode::CREATED);
+    let json_body = response_json(json_response).await;
+    assert_pod_create_defaults(&json_body);
+
+    let persisted_json = crate::kubelet::pod_repository::PodReader::get_pod(
+        pod_repository.as_ref(),
+        "default",
+        "defaults-json-pod",
+    )
+    .await
+    .unwrap()
+    .expect("JSON-created Pod must persist");
+    assert_pod_create_defaults(&persisted_json.data);
+
+    let protobuf_pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {"name": "defaults-protobuf-pod", "namespace": "default"},
+        "spec": {
+            "containers": [{
+                "name": "main",
+                "image": "registry.k8s.io/pause:3.10"
+            }]
+        }
+    });
+    let protobuf_body = crate::protobuf::encode_protobuf(&protobuf_pod).unwrap();
+    let protobuf_response = request_raw(
+        &app,
+        "POST",
+        "/api/v1/namespaces/default/pods",
+        Some("application/vnd.kubernetes.protobuf"),
+        protobuf_body,
+    )
+    .await;
+    assert_eq!(protobuf_response.status(), StatusCode::CREATED);
+    let protobuf_created = response_json(protobuf_response).await;
+    assert_pod_create_defaults(&protobuf_created);
+
+    let persisted_protobuf = crate::kubelet::pod_repository::PodReader::get_pod(
+        pod_repository.as_ref(),
+        "default",
+        "defaults-protobuf-pod",
+    )
+    .await
+    .unwrap()
+    .expect("protobuf-created Pod must persist");
+    assert_pod_create_defaults(&persisted_protobuf.data);
+}
+
+#[tokio::test]
+async fn mutation_update_bumps_generation_only_when_spec_changes_for_generated_and_crd_paths() {
+    let state = build_test_app_state().await;
+    let app = crate::api::build_router(state);
+    create_widget_crd(&app).await;
+
+    create_configmap(
+        &app,
+        "gen-cm",
+        json!({"name": "gen-cm", "namespace": "default"}),
+    )
+    .await;
+    let (status, mut cm) = get_json(&app, "/api/v1/namespaces/default/configmaps/gen-cm").await;
+    assert_eq!(status, StatusCode::OK);
+    let cm_generation = cm["metadata"]["generation"].clone();
+    cm["data"] = json!({"key": "changed"});
+    let cm_update = request(
+        &app,
+        "PUT",
+        "/api/v1/namespaces/default/configmaps/gen-cm",
+        Some(cm),
+    )
+    .await;
+    assert_eq!(cm_update.status(), StatusCode::OK);
+    let cm_body = response_json(cm_update).await;
+    assert_eq!(
+        cm_body["metadata"]["generation"], cm_generation,
+        "ConfigMap data updates must not bump generation"
+    );
+
+    create_deployment(
+        &app,
+        "gen-deploy",
+        json!({"name": "gen-deploy", "namespace": "default"}),
+    )
+    .await;
+    let (status, mut deployment) = get_json(
+        &app,
+        "/apis/apps/v1/namespaces/default/deployments/gen-deploy",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let deployment_generation = deployment["metadata"]["generation"].as_i64().unwrap();
+    deployment["spec"]["replicas"] = json!(2);
+    let deployment_update = request(
+        &app,
+        "PUT",
+        "/apis/apps/v1/namespaces/default/deployments/gen-deploy",
+        Some(deployment),
+    )
+    .await;
+    assert_eq!(deployment_update.status(), StatusCode::OK);
+    let deployment_body = response_json(deployment_update).await;
+    assert_eq!(
+        deployment_body["metadata"]["generation"].as_i64(),
+        Some(deployment_generation + 1),
+        "Deployment spec updates must bump generation once"
+    );
+
+    create_widget(
+        &app,
+        "gen-widget",
+        json!({"name": "gen-widget", "namespace": "default"}),
+    )
+    .await;
+    let (status, mut widget) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/gen-widget",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let widget_generation = widget
+        .pointer("/metadata/generation")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1);
+    widget["spec"] = json!({"value": "changed"});
+    let widget_update = request(
+        &app,
+        "PUT",
+        "/apis/example.com/v1/namespaces/default/widgets/gen-widget",
+        Some(widget),
+    )
+    .await;
+    assert_eq!(widget_update.status(), StatusCode::OK);
+    let widget_body = response_json(widget_update).await;
+    assert_eq!(
+        widget_body["metadata"]["generation"].as_i64(),
+        Some(widget_generation + 1),
+        "custom resource spec updates must bump generation once"
+    );
+}
+
+#[tokio::test]
+async fn mutation_patch_preserves_deletion_timestamp_and_generation_rules() {
+    let state = build_test_app_state().await;
+    let app = crate::api::build_router(state);
+    create_widget_crd(&app).await;
+
+    create_deployment(
+        &app,
+        "patch-deploy",
+        json!({
+            "name": "patch-deploy",
+            "namespace": "default",
+            "uid": "patch-deploy-uid",
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    let delete_deployment = request(
+        &app,
+        "DELETE",
+        "/apis/apps/v1/namespaces/default/deployments/patch-deploy",
+        None,
+    )
+    .await;
+    assert_eq!(delete_deployment.status(), StatusCode::ACCEPTED);
+    let delete_deployment_body = response_json(delete_deployment).await;
+    let deployment_deletion_timestamp =
+        delete_deployment_body["metadata"]["deletionTimestamp"].clone();
+    let deployment_generation = delete_deployment_body["metadata"]["generation"]
+        .as_i64()
+        .unwrap();
+    let deployment_patch = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/apis/apps/v1/namespaces/default/deployments/patch-deploy",
+        "application/merge-patch+json",
+        json!({"spec": {"replicas": 3}}),
+    )
+    .await;
+    assert_eq!(deployment_patch.status(), StatusCode::OK);
+    let deployment_body = response_json(deployment_patch).await;
+    assert_eq!(
+        deployment_body["metadata"]["deletionTimestamp"],
+        deployment_deletion_timestamp
+    );
+    assert_eq!(
+        deployment_body["metadata"]["generation"].as_i64(),
+        Some(deployment_generation + 1)
+    );
+
+    create_widget(
+        &app,
+        "patch-widget",
+        json!({
+            "name": "patch-widget",
+            "namespace": "default",
+            "uid": "patch-widget-uid",
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    let delete_widget = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets/patch-widget",
+        None,
+    )
+    .await;
+    assert_eq!(delete_widget.status(), StatusCode::ACCEPTED);
+    let delete_widget_body = response_json(delete_widget).await;
+    let widget_deletion_timestamp = delete_widget_body["metadata"]["deletionTimestamp"].clone();
+    let widget_generation = delete_widget_body
+        .pointer("/metadata/generation")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(1);
+    let widget_patch = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/apis/example.com/v1/namespaces/default/widgets/patch-widget",
+        "application/merge-patch+json",
+        json!({"spec": {"value": "patched"}}),
+    )
+    .await;
+    assert_eq!(widget_patch.status(), StatusCode::OK);
+    let widget_body = response_json(widget_patch).await;
+    assert_eq!(
+        widget_body["metadata"]["deletionTimestamp"],
+        widget_deletion_timestamp
+    );
+    assert_eq!(
+        widget_body["metadata"]["generation"].as_i64(),
+        Some(widget_generation + 1)
     );
 }

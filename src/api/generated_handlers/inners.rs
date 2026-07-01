@@ -675,7 +675,7 @@ pub async fn create_inner(
         )));
     }
 
-    inject_create_metadata(ns, &mut body, &resource_name);
+    crate::api::mutation::write::prepare_create_metadata(ns, &mut body, &resource_name);
 
     match kind {
         "Pod" => apply_pod_create_defaults(&mut body),
@@ -905,7 +905,11 @@ pub async fn update_inner(
     }
 
     let requested_rv = metadata_resource_version(&body);
-    increment_generation_if_spec_changed(kind, &current.data, &mut body);
+    crate::api::mutation::write::prepare_builtin_generation_for_update(
+        kind,
+        &current.data,
+        &mut body,
+    );
 
     preserve_status_subresource_on_main_update(api_version, kind, &current.data, &mut body);
     crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(&current.data, &mut body);
@@ -1606,7 +1610,11 @@ pub async fn patch_inner(
             process_secret_stringdata(&mut patched);
         }
 
-        increment_generation_if_spec_changed(kind, &current.data, &mut patched);
+        crate::api::mutation::write::prepare_builtin_generation_for_update(
+            kind,
+            &current.data,
+            &mut patched,
+        );
 
         preserve_status_subresource_on_main_update(api_version, kind, &current.data, &mut patched);
         crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(
