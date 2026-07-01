@@ -6,12 +6,12 @@ use super::*;
 // the JSON-walking logic from the rule-building logic so the rule builder
 // is unit-testable without needing real K8s objects.
 
-/// L4 protocol klights routes. K8s spec also allows SCTP but it's vanishingly
-/// rare and not exercised by chainsaw — defer until a real ask appears.
+/// L4 protocol klights routes.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Protocol {
     Tcp,
     Udp,
+    Sctp,
 }
 
 impl Protocol {
@@ -20,6 +20,7 @@ impl Protocol {
         match self {
             Protocol::Tcp => libc::IPPROTO_TCP as u8,
             Protocol::Udp => libc::IPPROTO_UDP as u8,
+            Protocol::Sctp => libc::IPPROTO_SCTP as u8,
         }
     }
 
@@ -28,6 +29,10 @@ impl Protocol {
         match self {
             Protocol::Tcp => TransportHeaderField::Tcp(TcpHeaderField::Dport),
             Protocol::Udp => TransportHeaderField::Udp(UdpHeaderField::Dport),
+            Protocol::Sctp => TransportHeaderField::Raw {
+                offset_bits: 16,
+                length_bits: 16,
+            },
         }
     }
 
@@ -38,6 +43,7 @@ impl Protocol {
         match protocol.to_ascii_uppercase().as_str() {
             "TCP" => Some(Protocol::Tcp),
             "UDP" => Some(Protocol::Udp),
+            "SCTP" => Some(Protocol::Sctp),
             _ => None,
         }
     }
@@ -93,6 +99,7 @@ pub fn remote_pod_endpoint_specs_from_rows(
             match spec.protocol {
                 Protocol::Tcp => 0u8,
                 Protocol::Udp => 1u8,
+                Protocol::Sctp => 2u8,
             },
             spec.host_port,
         )

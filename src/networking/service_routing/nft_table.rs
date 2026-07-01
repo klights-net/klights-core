@@ -564,6 +564,7 @@ impl KlightsTable {
                 match spec.protocol {
                     Protocol::Tcp => 0u8,
                     Protocol::Udp => 1u8,
+                    Protocol::Sctp => 2u8,
                 },
                 spec.host_port,
             )

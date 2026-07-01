@@ -98,6 +98,7 @@ fn hostport_protocol_name(protocol: crate::networking::service_routing::Protocol
     match protocol {
         crate::networking::service_routing::Protocol::Tcp => "TCP",
         crate::networking::service_routing::Protocol::Udp => "UDP",
+        crate::networking::service_routing::Protocol::Sctp => "SCTP",
     }
 }
 

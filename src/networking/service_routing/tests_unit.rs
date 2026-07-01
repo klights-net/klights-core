@@ -659,6 +659,38 @@ struct FreshServiceInventoryClient {
     filtered_endpointslice_list_calls: std::sync::atomic::AtomicUsize,
     legacy_endpoints_empty: bool,
     legacy_endpoints_partial: bool,
+    service_ports: Option<Vec<serde_json::Value>>,
+    endpoints_ports: Option<Vec<serde_json::Value>>,
+    endpointslice_ports: Option<Vec<serde_json::Value>>,
+}
+
+impl FreshServiceInventoryClient {
+    fn service_ports(&self) -> Vec<serde_json::Value> {
+        self.service_ports.clone().unwrap_or_else(|| {
+            vec![
+                json!({"name": "dns", "port": 53, "protocol": "UDP"}),
+                json!({"name": "dns-tcp", "port": 53, "protocol": "TCP"}),
+            ]
+        })
+    }
+
+    fn endpoints_ports(&self) -> Vec<serde_json::Value> {
+        self.endpoints_ports.clone().unwrap_or_else(|| {
+            vec![
+                json!({"name": "dns", "port": 53, "protocol": "UDP"}),
+                json!({"name": "dns-tcp", "port": 53, "protocol": "TCP"}),
+            ]
+        })
+    }
+
+    fn endpointslice_ports(&self) -> Vec<serde_json::Value> {
+        self.endpointslice_ports.clone().unwrap_or_else(|| {
+            vec![
+                json!({"name": "dns", "port": 53, "protocol": "UDP"}),
+                json!({"name": "dns-tcp", "port": 53, "protocol": "TCP"}),
+            ]
+        })
+    }
 }
 
 fn inventory_resource(
@@ -717,6 +749,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                 self.filtered_endpointslice_list_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
+            let ports = self.endpointslice_ports();
             return Ok(crate::datastore::ResourceList {
                 items: if self.legacy_endpoints_empty || self.legacy_endpoints_partial {
                     vec![inventory_resource(
@@ -736,10 +769,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                                 }
                             },
                             "addressType": "IPv4",
-                            "ports": [
-                                {"name": "dns", "port": 53, "protocol": "UDP"},
-                                {"name": "dns-tcp", "port": 53, "protocol": "TCP"}
-                            ],
+                            "ports": ports,
                             "endpoints": [{
                                 "addresses": ["10.50.0.20"],
                                 "conditions": {"ready": true}
@@ -777,19 +807,14 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                             json!([])
                         } else if self.legacy_endpoints_partial {
                             json!([{
-                            "addresses": [{"ip": "10.50.0.2"}],
-                            "ports": [
-                                {"name": "dns", "port": 53, "protocol": "UDP"}
-                            ]
-                        }])
+                                "addresses": [{"ip": "10.50.0.2"}],
+                                "ports": self.endpoints_ports()
+                            }])
                         } else {
                             json!([{
-                            "addresses": [{"ip": "10.50.0.2"}],
-                            "ports": [
-                                {"name": "dns", "port": 53, "protocol": "UDP"},
-                                {"name": "dns-tcp", "port": 53, "protocol": "TCP"}
-                            ]
-                        }])
+                                "addresses": [{"ip": "10.50.0.2"}],
+                                "ports": self.endpoints_ports()
+                            }])
                         }
                     }),
                 )],
@@ -803,6 +828,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
         assert_eq!(req.kind, "Service");
         self.service_list_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let service_ports = self.service_ports();
         Ok(crate::datastore::ResourceList {
             items: vec![inventory_resource(
                 "v1",
@@ -820,10 +846,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                     },
                     "spec": {
                         "clusterIP": "10.51.0.10",
-                        "ports": [
-                            {"name": "dns", "port": 53, "protocol": "UDP"},
-                            {"name": "dns-tcp", "port": 53, "protocol": "TCP"}
-                        ]
+                        "ports": service_ports
                     }
                 }),
             )],
@@ -858,23 +881,18 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                         "name": "kube-dns",
                         "uid": "kube-dns-endpoints-uid",
                     },
-                    "subsets": if self.legacy_endpoints_empty {
+                "subsets": if self.legacy_endpoints_empty {
                         json!([])
                     } else if self.legacy_endpoints_partial {
                         json!([{
-                        "addresses": [{"ip": "10.50.0.2"}],
-                        "ports": [
-                            {"name": "dns", "port": 53, "protocol": "UDP"}
-                        ]
-                    }])
+                            "addresses": [{"ip": "10.50.0.2"}],
+                            "ports": self.endpoints_ports()
+                        }])
                     } else {
                         json!([{
-                        "addresses": [{"ip": "10.50.0.2"}],
-                        "ports": [
-                            {"name": "dns", "port": 53, "protocol": "UDP"},
-                            {"name": "dns-tcp", "port": 53, "protocol": "TCP"}
-                        ]
-                    }])
+                            "addresses": [{"ip": "10.50.0.2"}],
+                            "ports": self.endpoints_ports()
+                        }])
                     }
                 }),
             )));
@@ -1167,6 +1185,36 @@ async fn service_specs_from_api_prefers_complete_endpointslices_over_partial_leg
             (Protocol::Udp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 20)]),
         ],
         "complete EndpointSlices must not be shadowed by a partial legacy Endpoints object"
+    );
+}
+
+#[tokio::test]
+async fn service_specs_from_api_preserves_sctp_endpointslice_ports() {
+    let api = FreshServiceInventoryClient {
+        legacy_endpoints_empty: true,
+        service_ports: Some(vec![
+            json!({"name": "sctp", "port": 5000, "protocol": "SCTP"}),
+        ]),
+        endpointslice_ports: Some(vec![
+            json!({"name": "sctp", "port": 5000, "protocol": "SCTP"}),
+        ]),
+        ..Default::default()
+    };
+
+    let specs = service_specs_from_api(&api)
+        .await
+        .expect("service specs should build from EndpointSlice SCTP ports");
+
+    assert_eq!(specs.len(), 1);
+    let tuples: Vec<_> = specs[0]
+        .ports
+        .iter()
+        .map(|port| (port.protocol, port.service_port, port.target_port))
+        .collect();
+    assert_eq!(
+        tuples,
+        vec![(Protocol::Sctp, 5000, 5000)],
+        "EndpointSlice and Service with protocol SCTP should preserve Protocol::Sctp"
     );
 }
 

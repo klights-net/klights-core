@@ -616,6 +616,87 @@ mod tests {
     }
 
     #[test]
+    fn ingress_sctp_port_rule_is_preserved() {
+        let policies = vec![json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"namespace": "default", "name": "allow-sctp"},
+            "spec": {
+                "podSelector": {"matchLabels": {"app": "web"}},
+                "policyTypes": ["Ingress"],
+                "ingress": [{
+                    "from": [{"ipBlock": {"cidr": "10.42.0.0/16"}}],
+                    "ports": [{"protocol": "SCTP", "port": 5000, "endPort": 5002}]
+                }]
+            }
+        })];
+        let pods = vec![pod("default", "web", "10.42.0.10", json!({"app": "web"}))];
+        let plan = NetworkPolicyPlan::from_resources(&policies, &pods, &[]).unwrap();
+
+        assert_eq!(
+            plan.allowed_flows,
+            BTreeSet::from([NetworkPolicyFlow {
+                direction: NetworkPolicyDirection::Ingress,
+                pod_ip: "10.42.0.10".parse().unwrap(),
+                peer: NetworkPolicyPeerMatch::IpBlock {
+                    cidr: Ipv4CidrMatch {
+                        network: "10.42.0.0".parse().unwrap(),
+                        mask: "255.255.0.0".parse().unwrap(),
+                    },
+                    except: Vec::new(),
+                },
+                port: Some(NetworkPolicyPortMatch {
+                    protocol: Protocol::Sctp,
+                    port: 5000,
+                    end_port: 5002,
+                }),
+            }])
+        );
+    }
+
+    #[test]
+    fn ingress_named_sctp_port_resolves_against_selected_pod_container_port() {
+        let policies = vec![json!({
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "NetworkPolicy",
+            "metadata": {"namespace": "default", "name": "allow-sctp-named"},
+            "spec": {
+                "podSelector": {"matchLabels": {"app": "web"}},
+                "policyTypes": ["Ingress"],
+                "ingress": [{
+                    "from": [{"podSelector": {"matchLabels": {"role": "client"}}}],
+                    "ports": [{"protocol": "SCTP", "port": "sig"}]
+                }]
+            }
+        })];
+        let pods = vec![
+            pod_with_ports(
+                "default",
+                "web",
+                "10.42.0.10",
+                json!({"app": "web"}),
+                json!([{"name": "sig", "containerPort": 5000, "protocol": "SCTP"}]),
+            ),
+            pod("default", "client", "10.42.0.11", json!({"role": "client"})),
+        ];
+        let plan = NetworkPolicyPlan::from_resources(&policies, &pods, &[]).unwrap();
+
+        assert!(plan.allowed_flows.contains(&NetworkPolicyFlow {
+            direction: NetworkPolicyDirection::Ingress,
+            pod_ip: "10.42.0.10".parse().unwrap(),
+            peer: NetworkPolicyPeerMatch::IpBlock {
+                cidr: Ipv4CidrMatch::host("10.42.0.11".parse().unwrap()),
+                except: Vec::new(),
+            },
+            port: Some(NetworkPolicyPortMatch {
+                protocol: Protocol::Sctp,
+                port: 5000,
+                end_port: 5000,
+            }),
+        }));
+    }
+
+    #[test]
     fn numeric_end_port_preserves_range_match() {
         let policies = vec![json!({
             "apiVersion": "networking.k8s.io/v1",
