@@ -473,21 +473,16 @@ fn fail_index_policy_matches(
     failed_indexes
 }
 
-fn existing_condition_transition_time(
+fn preserve_job_condition_timestamps(
+    condition: &mut Value,
     existing_conditions: &[Value],
     condition_type: &str,
-    status: &str,
-) -> Option<Value> {
-    existing_conditions.iter().find_map(|condition| {
-        let same_type =
-            condition.get("type").and_then(|value| value.as_str()) == Some(condition_type);
-        let same_status = condition.get("status").and_then(|value| value.as_str()) == Some(status);
-        if same_type && same_status {
-            condition.get("lastTransitionTime").cloned()
-        } else {
-            None
-        }
-    })
+    now: &str,
+) {
+    let previous =
+        crate::controllers::common::condition_by_type(existing_conditions, condition_type);
+    crate::controllers::common::preserve_condition_transition_time(condition, previous, now);
+    crate::controllers::common::preserve_condition_update_time_if_present(condition, previous, now);
 }
 
 /// Derive the Job `.status` subtree from the current Job object and its owned
@@ -703,6 +698,7 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
+    let condition_now = crate::utils::k8s_timestamp();
     let mut conditions = Vec::new();
 
     let success_policy_ready_for_complete =
@@ -720,9 +716,12 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
         };
         let mut condition = common.build_condition("Complete", "True", reason, message);
         condition["lastProbeTime"] = Value::Null;
-        condition["lastTransitionTime"] =
-            existing_condition_transition_time(&existing_conditions, "Complete", "True")
-                .unwrap_or_else(|| json!(crate::utils::k8s_timestamp()));
+        preserve_job_condition_timestamps(
+            &mut condition,
+            &existing_conditions,
+            "Complete",
+            &condition_now,
+        );
         conditions.push(condition);
     }
 
@@ -730,9 +729,12 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
         let mut condition =
             common.build_condition("Failed", "True", &failure_condition_reason, &failure_reason);
         condition["lastProbeTime"] = Value::Null;
-        condition["lastTransitionTime"] =
-            existing_condition_transition_time(&existing_conditions, "Failed", "True")
-                .unwrap_or_else(|| json!(crate::utils::k8s_timestamp()));
+        preserve_job_condition_timestamps(
+            &mut condition,
+            &existing_conditions,
+            "Failed",
+            &condition_now,
+        );
         conditions.push(condition);
     }
 
@@ -744,9 +746,12 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
             "Matched success policy rule",
         );
         condition["lastProbeTime"] = Value::Null;
-        condition["lastTransitionTime"] =
-            existing_condition_transition_time(&existing_conditions, "SuccessCriteriaMet", "True")
-                .unwrap_or_else(|| json!(crate::utils::k8s_timestamp()));
+        preserve_job_condition_timestamps(
+            &mut condition,
+            &existing_conditions,
+            "SuccessCriteriaMet",
+            &condition_now,
+        );
         conditions.push(condition);
     }
 
@@ -754,9 +759,12 @@ pub fn derive_job_status_from_owned_pods(job: &Value, owned_pods: &[Resource]) -
         let mut condition =
             common.build_condition("Suspended", "True", "JobSuspended", "Job is suspended");
         condition["lastProbeTime"] = Value::Null;
-        condition["lastTransitionTime"] =
-            existing_condition_transition_time(&existing_conditions, "Suspended", "True")
-                .unwrap_or_else(|| json!(crate::utils::k8s_timestamp()));
+        preserve_job_condition_timestamps(
+            &mut condition,
+            &existing_conditions,
+            "Suspended",
+            &condition_now,
+        );
         conditions.push(condition);
     }
 

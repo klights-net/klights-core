@@ -222,6 +222,60 @@ mod cases {
     }
 
     #[test]
+    fn condition_timestamp_helpers_preserve_transition_and_update_times() {
+        let previous = json!({
+            "type": "Ready",
+            "status": "True",
+            "reason": "Reconciled",
+            "message": "ok",
+            "lastTransitionTime": "2026-06-01T00:00:00Z",
+            "lastUpdateTime": "2026-06-01T00:00:01Z"
+        });
+        let mut unchanged = json!({
+            "type": "Ready",
+            "status": "True",
+            "reason": "Reconciled",
+            "message": "ok"
+        });
+
+        preserve_condition_transition_time(&mut unchanged, Some(&previous), "2026-06-01T00:00:10Z");
+        preserve_condition_update_time(&mut unchanged, Some(&previous), "2026-06-01T00:00:10Z");
+
+        assert_eq!(
+            unchanged["lastTransitionTime"],
+            previous["lastTransitionTime"]
+        );
+        assert_eq!(unchanged["lastUpdateTime"], previous["lastUpdateTime"]);
+
+        let mut changed_message = json!({
+            "type": "Ready",
+            "status": "True",
+            "reason": "Reconciled",
+            "message": "changed"
+        });
+        preserve_condition_transition_time(
+            &mut changed_message,
+            Some(&previous),
+            "2026-06-01T00:00:10Z",
+        );
+        preserve_condition_update_time(
+            &mut changed_message,
+            Some(&previous),
+            "2026-06-01T00:00:10Z",
+        );
+
+        assert_eq!(
+            changed_message["lastTransitionTime"], previous["lastTransitionTime"],
+            "same status must preserve transition time"
+        );
+        assert_eq!(
+            changed_message["lastUpdateTime"],
+            json!("2026-06-01T00:00:10Z"),
+            "changed condition state must refresh update time"
+        );
+    }
+
+    #[test]
     fn test_owner_ref_manager_trait_checks_ownership() {
         let common = DefaultControllerCommon;
         let owned = json!({

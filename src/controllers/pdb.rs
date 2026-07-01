@@ -154,11 +154,7 @@ fn build_pdb_status(
     // SufficientPods condition: True when currentHealthy >= desiredHealthy.
     let sufficient = current_healthy >= desired_healthy;
     let condition_status = if sufficient { "True" } else { "False" };
-    let last_transition_time =
-        existing_pdb_condition_transition_time(current_pdb, "SufficientPods", condition_status)
-            .unwrap_or_else(crate::utils::k8s_timestamp);
-
-    let conditions = json!([{
+    let mut condition = json!({
         "type": "SufficientPods",
         "status": condition_status,
         "reason": if sufficient { "SufficientPods" } else { "InsufficientPods" },
@@ -166,16 +162,23 @@ fn build_pdb_status(
             format!("{} pods are available, {} required", current_healthy, desired_healthy)
         } else {
             format!("Have {} healthy pods, need {}", current_healthy, desired_healthy)
-        },
-        "lastTransitionTime": last_transition_time
-    }]);
+        }
+    });
+    let previous = current_pdb
+        .pointer("/status/conditions")
+        .and_then(|conditions| conditions.as_array())
+        .and_then(|conditions| {
+            crate::controllers::common::condition_by_type(conditions, "SufficientPods")
+        });
+    let now = crate::utils::k8s_timestamp();
+    crate::controllers::common::preserve_condition_transition_time(&mut condition, previous, &now);
 
     let mut status = json!({
         "expectedPods": expected_pods,
         "currentHealthy": current_healthy,
         "desiredHealthy": desired_healthy,
         "disruptionsAllowed": disruptions_allowed,
-        "conditions": conditions,
+        "conditions": [condition],
         "observedGeneration": metadata.get("generation").and_then(|g| g.as_i64()).unwrap_or(1)
     });
     if !disrupted_pods.is_empty() {
@@ -200,30 +203,6 @@ fn disrupted_pods_for_live_matching_pods(
         .filter(|(pod_name, _)| live_matching_pod_names.contains(*pod_name))
         .map(|(pod_name, disrupted_at)| (pod_name.clone(), disrupted_at.clone()))
         .collect()
-}
-
-fn existing_pdb_condition_transition_time(
-    pdb: &Value,
-    condition_type: &str,
-    status: &str,
-) -> Option<String> {
-    pdb.pointer("/status/conditions")
-        .and_then(|conditions| conditions.as_array())
-        .and_then(|conditions| {
-            conditions.iter().find_map(|condition| {
-                let same_type =
-                    condition.get("type").and_then(|v| v.as_str()) == Some(condition_type);
-                let same_status = condition.get("status").and_then(|v| v.as_str()) == Some(status);
-                if same_type && same_status {
-                    condition
-                        .get("lastTransitionTime")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string)
-                } else {
-                    None
-                }
-            })
-        })
 }
 
 /// Trigger PDB status reconcile for all PodDisruptionBudgets in a namespace.
@@ -600,6 +579,74 @@ mod tests {
             status["disruptionsAllowed"],
             json!(0),
             "in-flight disrupted pods must consume otherwise allowed disruptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pdb_reconcile_preserves_condition_transition_time_when_status_unchanged() {
+        let db = crate::datastore::test_support::in_memory().await;
+
+        let pdb = create_pdb(
+            &db,
+            "stable-condition-pdb",
+            "default",
+            json!({
+                "minAvailable": 1,
+                "selector": {"matchLabels": {"app": "stable-pdb"}}
+            }),
+        )
+        .await;
+        create_pod(
+            &db,
+            "pod-0",
+            "default",
+            json!({"app": "stable-pdb"}),
+            "Running",
+            true,
+        )
+        .await;
+
+        db.update_status_only(
+            "policy/v1",
+            "PodDisruptionBudget",
+            Some("default"),
+            "stable-condition-pdb",
+            json!({
+                "expectedPods": 1,
+                "currentHealthy": 1,
+                "desiredHealthy": 1,
+                "disruptionsAllowed": 0,
+                "conditions": [{
+                    "type": "SufficientPods",
+                    "status": "True",
+                    "reason": "SufficientPods",
+                    "message": "1 pods are available, 1 required",
+                    "lastTransitionTime": "2026-06-01T00:00:00Z"
+                }],
+                "observedGeneration": 1
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        reconcile_pdb(
+            &db,
+            crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+            &pdb,
+        )
+        .await
+        .unwrap();
+
+        let status = get_pdb_status(&db, "default", "stable-condition-pdb").await;
+        assert_eq!(
+            status.pointer("/conditions/0/lastTransitionTime"),
+            Some(&json!("2026-06-01T00:00:00Z")),
+            "PDB condition transition time must remain stable while status stays True"
+        );
+        assert!(
+            status.pointer("/conditions/0/lastUpdateTime").is_none(),
+            "PDB metav1.Condition output must not gain deployment-style lastUpdateTime"
         );
     }
 

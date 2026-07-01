@@ -1716,17 +1716,7 @@ impl KlightsTable {
         rule.add_expr(&Cmp::new(CmpOp::Eq, spec.host_port.to_be()));
 
         // (4) DNAT to pod_ip:container_port.
-        rule.add_expr(&Immediate::new(pod_ip.octets(), Register::Reg1));
-        rule.add_expr(&Immediate::new(
-            spec.container_port.to_be_bytes(),
-            Register::Reg2,
-        ));
-        rule.add_expr(&Nat {
-            nat_type: NatType::DNat,
-            family: ProtoFamily::Ipv4,
-            ip_register: Register::Reg1,
-            port_register: Some(Register::Reg2),
-        });
+        Self::append_dnat_tail(&mut rule, pod_ip, spec.container_port);
 
         rule
     }
@@ -1831,17 +1821,7 @@ impl KlightsTable {
         )));
         rule.add_expr(&Cmp::new(CmpOp::Eq, spec.protocol.ip_proto()));
 
-        rule.add_expr(&Immediate::new(spec.node_ip.octets(), Register::Reg1));
-        rule.add_expr(&Immediate::new(
-            spec.host_port.to_be_bytes(),
-            Register::Reg2,
-        ));
-        rule.add_expr(&Nat {
-            nat_type: NatType::DNat,
-            family: ProtoFamily::Ipv4,
-            ip_register: Register::Reg1,
-            port_register: Some(Register::Reg2),
-        });
+        Self::append_dnat_tail(&mut rule, spec.node_ip, spec.host_port);
 
         rule
     }
@@ -1973,17 +1953,7 @@ impl KlightsTable {
                 rule.add_expr(&Cmp::new(CmpOp::Eq, i as u32));
 
                 // DNAT to this endpoint
-                rule.add_expr(&Immediate::new(ep.octets(), Register::Reg1));
-                rule.add_expr(&Immediate::new(
-                    port.target_port.to_be_bytes(),
-                    Register::Reg2,
-                ));
-                rule.add_expr(&Nat {
-                    nat_type: NatType::DNat,
-                    family: ProtoFamily::Ipv4,
-                    ip_register: Register::Reg1,
-                    port_register: Some(Register::Reg2),
-                });
+                Self::append_dnat_tail(&mut rule, *ep, port.target_port);
 
                 out.push(rule);
 
@@ -2008,17 +1978,7 @@ impl KlightsTable {
                         offset: 0,
                     });
                     np_rule.add_expr(&Cmp::new(CmpOp::Eq, i as u32));
-                    np_rule.add_expr(&Immediate::new(ep.octets(), Register::Reg1));
-                    np_rule.add_expr(&Immediate::new(
-                        port.target_port.to_be_bytes(),
-                        Register::Reg2,
-                    ));
-                    np_rule.add_expr(&Nat {
-                        nat_type: NatType::DNat,
-                        family: ProtoFamily::Ipv4,
-                        ip_register: Register::Reg1,
-                        port_register: Some(Register::Reg2),
-                    });
+                    Self::append_dnat_tail(&mut np_rule, *ep, port.target_port);
                     out.push(np_rule);
                 }
             }
@@ -2070,23 +2030,21 @@ impl KlightsTable {
             rule.add_expr(&Cmp::new(CmpOp::Lt, threshold));
         }
 
-        // (5) Load endpoint IP into Reg1 (4 bytes, network byte order
-        //     from .octets()).
-        rule.add_expr(&Immediate::new(spec.endpoint.ip.octets(), Register::Reg1));
-        // (6) Load endpoint port into Reg2 (2 bytes, network byte order).
-        rule.add_expr(&Immediate::new(
-            spec.endpoint.port.to_be_bytes(),
-            Register::Reg2,
-        ));
-        // (7) DNAT verdict, reading addr from Reg1 and port from Reg2.
+        // (5) DNAT verdict tail, reading addr from Reg1 and port from Reg2.
+        Self::append_dnat_tail(&mut rule, spec.endpoint.ip, spec.endpoint.port);
+
+        rule
+    }
+
+    fn append_dnat_tail(rule: &mut Rule<'_>, target_ip: Ipv4Addr, target_port: u16) {
+        rule.add_expr(&Immediate::new(target_ip.octets(), Register::Reg1));
+        rule.add_expr(&Immediate::new(target_port.to_be_bytes(), Register::Reg2));
         rule.add_expr(&Nat {
             nat_type: NatType::DNat,
             family: ProtoFamily::Ipv4,
             ip_register: Register::Reg1,
             port_register: Some(Register::Reg2),
         });
-
-        rule
     }
 }
 

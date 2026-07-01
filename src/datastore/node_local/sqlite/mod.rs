@@ -640,24 +640,6 @@ impl SqliteNodeLocalDb {
         Ok(rows)
     }
 
-    /// Complete multiple outbox rows in a single transaction.
-    pub async fn complete_outbox_batch(&self, ids: &[i64]) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let ids = ids.to_vec();
-        self.db_call("node_local:outbox_complete_batch", move |conn| {
-            let tx = conn.transaction()?;
-            for id in &ids {
-                tx.execute(queries::OUTBOX_COMPLETE_BY_ID, [*id])?;
-            }
-            tx.commit()?;
-            Ok(())
-        })
-        .await
-        .map_err(|e| anyhow!("outbox batch complete failed: {e}"))
-    }
-
     pub async fn complete_superseded_status_outbox_for_terminal_pod_delete(
         &self,
         subject_key: &str,
