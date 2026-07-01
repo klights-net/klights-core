@@ -542,12 +542,7 @@ pub async fn delete_namespace(
         state.db.delete_namespace(&name).await?;
         return Ok((
             StatusCode::OK,
-            Json(serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "Status",
-                "status": "Success",
-                "code": 200,
-            })),
+            Json(crate::api::mutation::response::delete_collection_success_status()),
         ));
     }
 
@@ -601,12 +596,7 @@ pub async fn delete_namespace(
     }
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Status",
-            "status": "Success",
-            "code": 202,
-        })),
+        Json(crate::api::mutation::response::accepted_delete_status()),
     ))
 }
 

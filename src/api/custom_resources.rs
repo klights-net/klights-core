@@ -1730,9 +1730,9 @@ async fn create_cr_inner(
             .await?;
     }
 
-    body = run_admission_for_request(
+    body = crate::api::mutation::write::run_admission(
         state.db.as_ref(),
-        build_admission_context(AdmissionContextRequest {
+        AdmissionContextRequest {
             api_version: &api_version,
             kind: &info.kind,
             operation: "CREATE",
@@ -1747,7 +1747,7 @@ async fn create_cr_inner(
             dry_run: is_dry_run,
             subresource: None,
             options: None,
-        }),
+        },
     )
     .await?;
     apply_crd_pruning(state.db.as_ref(), group, version, &info.kind, &mut body).await;
@@ -1901,9 +1901,9 @@ async fn delete_cr_inner(
         &resource,
         &delete_intent.preconditions,
     )?;
-    let _ = run_admission_for_request(
+    let _ = crate::api::mutation::write::run_admission(
         state.db.as_ref(),
-        build_admission_context(AdmissionContextRequest {
+        AdmissionContextRequest {
             api_version: &requested_api_version,
             kind: &info.kind,
             operation: "DELETE",
@@ -1914,7 +1914,7 @@ async fn delete_cr_inner(
             dry_run: is_dry_run,
             subresource: None,
             options: Some(options_value),
-        }),
+        },
     )
     .await?;
 
@@ -2119,9 +2119,9 @@ async fn update_cr_inner(
     )
     .await?;
 
-    body = run_admission_for_request(
+    body = crate::api::mutation::write::run_admission(
         state.db.as_ref(),
-        build_admission_context(AdmissionContextRequest {
+        AdmissionContextRequest {
             api_version: &api_version,
             kind: &info.kind,
             operation: "UPDATE",
@@ -2132,7 +2132,7 @@ async fn update_cr_inner(
             dry_run: false,
             subresource: None,
             options: None,
-        }),
+        },
     )
     .await?;
     apply_crd_pruning(state.db.as_ref(), group, version, &info.kind, &mut body).await;
@@ -2302,9 +2302,9 @@ async fn patch_cr_inner(
                 &mut created_resource,
             )
             .await;
-            created_resource = run_admission_for_request(
+            created_resource = crate::api::mutation::write::run_admission(
                 state.db.as_ref(),
-                build_admission_context(AdmissionContextRequest {
+                AdmissionContextRequest {
                     api_version: &api_version,
                     kind: &info.kind,
                     operation: "CREATE",
@@ -2315,7 +2315,7 @@ async fn patch_cr_inner(
                     dry_run: is_dry_run,
                     subresource: None,
                     options: None,
-                }),
+                },
             )
             .await?;
             apply_crd_pruning(
@@ -2367,9 +2367,9 @@ async fn patch_cr_inner(
     };
 
     let mut patched_resource = apply_patch(&current.data, &patch, content_type)?;
-    patched_resource = run_admission_for_request(
+    patched_resource = crate::api::mutation::write::run_admission(
         state.db.as_ref(),
-        build_admission_context(AdmissionContextRequest {
+        AdmissionContextRequest {
             api_version: &api_version,
             kind: &info.kind,
             operation: "UPDATE",
@@ -2380,7 +2380,7 @@ async fn patch_cr_inner(
             dry_run: is_dry_run,
             subresource: None,
             options: None,
-        }),
+        },
     )
     .await?;
     apply_crd_pruning(

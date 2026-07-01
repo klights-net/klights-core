@@ -116,7 +116,7 @@ async fn delete_collection_mutatingwebhookconfigurations(
             .await;
     }
     Ok(Json(
-        serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200}),
+        crate::api::mutation::response::delete_collection_success_status(),
     ))
 }
 
@@ -150,7 +150,7 @@ async fn delete_collection_validatingwebhookconfigurations(
             .await;
     }
     Ok(Json(
-        serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200}),
+        crate::api::mutation::response::delete_collection_success_status(),
     ))
 }
 
@@ -184,7 +184,7 @@ async fn delete_collection_validatingadmissionpolicies(
             .await;
     }
     Ok(Json(
-        serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200}),
+        crate::api::mutation::response::delete_collection_success_status(),
     ))
 }
 
@@ -218,6 +218,6 @@ async fn delete_collection_validatingadmissionpolicybindings(
             .await;
     }
     Ok(Json(
-        serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200}),
+        crate::api::mutation::response::delete_collection_success_status(),
     ))
 }

@@ -33,6 +33,16 @@ pub fn delete_collection_success_status() -> Value {
     })
 }
 
+pub fn accepted_delete_status() -> Value {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Status",
+        "metadata": {},
+        "status": "Success",
+        "code": 202,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,6 +55,16 @@ mod tests {
         assert_eq!(status["status"], "Success");
         assert_eq!(status["details"]["kind"], "ConfigMap");
         assert_eq!(status["details"]["name"], "cm1");
+    }
+
+    #[test]
+    fn accepted_delete_status_has_kubernetes_shape() {
+        let status = accepted_delete_status();
+        assert_eq!(status["apiVersion"], "v1");
+        assert_eq!(status["kind"], "Status");
+        assert_eq!(status["metadata"], serde_json::json!({}));
+        assert_eq!(status["status"], "Success");
+        assert_eq!(status["code"], 202);
     }
 
     #[test]
