@@ -626,6 +626,65 @@ async fn mutation_deletecollection_dry_run_returns_status_without_deleting_any_m
 }
 
 #[tokio::test]
+async fn mutation_dry_run_does_not_enqueue_service_or_controller_side_effects() {
+    let state = build_test_app_state().await;
+    state
+        .db
+        .create_resource(
+            "v1",
+            "Service",
+            Some("default"),
+            "dry-run-svc",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"name": "dry-run-svc", "namespace": "default"},
+                "spec": {
+                    "selector": {"app": "dry-run-web"},
+                    "ports": [{"port": 80, "targetPort": 8080}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let dispatcher = state.controller_dispatcher.clone();
+    let app = crate::api::build_router(state);
+
+    let response = request(
+        &app,
+        "POST",
+        "/api/v1/namespaces/default/pods?dryRun=All",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "dry-run-pod-side-effects",
+                "namespace": "default",
+                "labels": {"app": "dry-run-web"}
+            },
+            "spec": {
+                "containers": [{
+                    "name": "main",
+                    "image": "registry.k8s.io/pause:3.10"
+                }]
+            },
+            "status": {"podIP": "10.42.0.77"}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response_json(response).await;
+    assert_eq!(body["kind"], "Pod");
+    assert_eq!(body["metadata"]["name"], "dry-run-pod-side-effects");
+
+    let queued = dispatcher.queued_reconcile_keys_for_test().await;
+    assert!(
+        queued.is_empty(),
+        "dry-run mutation must not enqueue side-effect reconcile keys: {queued:?}"
+    );
+}
+
+#[tokio::test]
 async fn mutation_delete_uid_precondition_conflict_is_consistent_across_paths() {
     let state = build_test_app_state().await;
     let pod_repository = state.pod_repository.clone();
