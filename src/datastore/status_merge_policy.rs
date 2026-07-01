@@ -6,6 +6,45 @@ pub enum StatusApplyFreshness {
     Stale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusMergeProfileKind {
+    PodTyped,
+    JobConditionsByTransitionTime,
+    PreserveUnmentionedFieldsAndConditions,
+    PreserveLiveStatusAuthoritatively,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusMergeProfile {
+    pub kind: StatusMergeProfileKind,
+}
+
+impl StatusMergeProfile {
+    pub const fn new(kind: StatusMergeProfileKind) -> Self {
+        Self { kind }
+    }
+}
+
+#[derive(Default)]
+pub struct StatusMergeRegistry {
+    _private: (),
+}
+
+impl StatusMergeRegistry {
+    pub fn profile(&self, api_version: &str, kind: &str) -> StatusMergeProfile {
+        match (api_version, kind) {
+            ("v1", "Pod") => StatusMergeProfile::new(StatusMergeProfileKind::PodTyped),
+            ("batch/v1", "Job") => {
+                StatusMergeProfile::new(StatusMergeProfileKind::JobConditionsByTransitionTime)
+            }
+            ("v1", "PersistentVolume" | "PersistentVolumeClaim") => StatusMergeProfile::new(
+                StatusMergeProfileKind::PreserveUnmentionedFieldsAndConditions,
+            ),
+            _ => StatusMergeProfile::new(StatusMergeProfileKind::PreserveLiveStatusAuthoritatively),
+        }
+    }
+}
+
 pub fn merge_status_for_apply(
     api_version: &str,
     kind: &str,
@@ -13,22 +52,25 @@ pub fn merge_status_for_apply(
     incoming_status: &mut Value,
     freshness: StatusApplyFreshness,
 ) {
-    if api_version == "v1" && kind == "Pod" {
-        merge_pod_status(live_resource, incoming_status);
+    let profile = StatusMergeRegistry::default().profile(api_version, kind);
+
+    if freshness == StatusApplyFreshness::Fresh && profile.kind != StatusMergeProfileKind::PodTyped
+    {
         return;
     }
 
-    if freshness == StatusApplyFreshness::Fresh {
-        return;
-    }
-
-    match (api_version, kind) {
-        ("batch/v1", "Job") => merge_stale_job_status(live_resource, incoming_status),
-        ("v1", "PersistentVolumeClaim" | "PersistentVolume") => {
+    match profile.kind {
+        StatusMergeProfileKind::PodTyped => merge_pod_status(live_resource, incoming_status),
+        StatusMergeProfileKind::JobConditionsByTransitionTime => {
+            merge_stale_job_status(live_resource, incoming_status)
+        }
+        StatusMergeProfileKind::PreserveUnmentionedFieldsAndConditions => {
             preserve_unmentioned_live_status_conditions_by_type(live_resource, incoming_status);
             preserve_unmentioned_live_status_fields(live_resource, incoming_status);
         }
-        _ => preserve_live_status_authoritatively(live_resource, incoming_status),
+        StatusMergeProfileKind::PreserveLiveStatusAuthoritatively => {
+            preserve_live_status_authoritatively(live_resource, incoming_status)
+        }
     }
 }
 
@@ -210,4 +252,50 @@ fn merge_pod_status(live_resource: &Value, incoming_status: &mut Value) {
         incoming_status,
         crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn status_merge_registry_has_profiles_for_current_special_cases() {
+        assert_eq!(
+            StatusMergeRegistry::default().profile("v1", "Pod").kind,
+            StatusMergeProfileKind::PodTyped
+        );
+        assert_eq!(
+            StatusMergeRegistry::default()
+                .profile("batch/v1", "Job")
+                .kind,
+            StatusMergeProfileKind::JobConditionsByTransitionTime
+        );
+        assert_eq!(
+            StatusMergeRegistry::default()
+                .profile("v1", "PersistentVolume")
+                .kind,
+            StatusMergeProfileKind::PreserveUnmentionedFieldsAndConditions
+        );
+        assert_eq!(
+            StatusMergeRegistry::default()
+                .profile("v1", "PersistentVolumeClaim")
+                .kind,
+            StatusMergeProfileKind::PreserveUnmentionedFieldsAndConditions
+        );
+    }
+
+    #[test]
+    fn stale_unknown_status_preserves_live_status_authoritatively() {
+        let live = json!({"status": {"observedGeneration": 9}});
+        let mut incoming = json!({"observedGeneration": 1});
+        merge_status_for_apply(
+            "apps/v1",
+            "Deployment",
+            &live,
+            &mut incoming,
+            StatusApplyFreshness::Stale,
+        );
+        assert_eq!(incoming, json!({"observedGeneration": 9}));
+    }
 }
