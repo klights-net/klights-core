@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing vMAJOR.MINOR.PATCH tag to package'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -25,19 +31,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Verify tagged commit checkout
         env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          tag_commit="$(git rev-list -n 1 "${GITHUB_REF_NAME}^{commit}")"
+          tag_commit="$(git rev-list -n 1 "${RELEASE_REF_NAME}^{commit}")"
           current_commit="$(git rev-parse HEAD)"
           if [[ "$current_commit" != "$tag_commit" ]]; then
-            echo "::error::Checkout HEAD ${current_commit} does not match ${GITHUB_REF_NAME} target ${tag_commit}"
+            echo "::error::Checkout HEAD ${current_commit} does not match ${RELEASE_REF_NAME} target ${tag_commit}"
             exit 1
           fi
 
@@ -86,13 +92,13 @@ jobs:
       - name: Validate tag and derive version
         id: version
         env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release tags must use vMAJOR.MINOR.PATCH format; got '$GITHUB_REF_NAME'"
+          if [[ ! "$RELEASE_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must use vMAJOR.MINOR.PATCH format; got '$RELEASE_REF_NAME'"
             exit 1
           fi
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_REF_NAME#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "KLIGHTS_VERSION=$VERSION" >> "$GITHUB_ENV"
 
@@ -100,11 +106,11 @@ jobs:
         id: staged-binary
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           mkdir -p dist/binary-artifact
-          if gh release download "$GITHUB_REF_NAME" \
+          if gh release download "$RELEASE_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --pattern "klights-linux-${{ matrix.arch_name }}-static" \
             --dir dist/binary-artifact; then
@@ -112,11 +118,11 @@ jobs:
             mv "dist/binary-artifact/klights-linux-${{ matrix.arch_name }}-static" dist/binary-artifact/klights
             chmod 0755 dist/binary-artifact/klights
             echo "restored=true" >> "$GITHUB_OUTPUT"
-            echo "Reusing staged static binary from GitHub Release ${GITHUB_REF_NAME}"
+            echo "Reusing staged static binary from GitHub Release ${RELEASE_REF_NAME}"
           else
             rm -f dist/binary-artifact/klights "dist/binary-artifact/klights-linux-${{ matrix.arch_name }}-static"
             echo "restored=false" >> "$GITHUB_OUTPUT"
-            echo "No staged static binary found for ${GITHUB_REF_NAME}; building from source."
+            echo "No staged static binary found for ${RELEASE_REF_NAME}; building from source."
           fi
 
       - name: Build static release binary
@@ -177,8 +183,8 @@ jobs:
         if: steps.staged-binary.outputs.restored != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: klights ${{ github.ref_name }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          name: klights ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           fail_on_unmatched_files: true
           overwrite_files: true
           files: dist/binary-artifact/klights-linux-${{ matrix.arch_name }}-static
@@ -210,19 +216,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Verify tagged commit checkout
         env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          tag_commit="$(git rev-list -n 1 "${GITHUB_REF_NAME}^{commit}")"
+          tag_commit="$(git rev-list -n 1 "${RELEASE_REF_NAME}^{commit}")"
           current_commit="$(git rev-parse HEAD)"
           if [[ "$current_commit" != "$tag_commit" ]]; then
-            echo "::error::Checkout HEAD ${current_commit} does not match ${GITHUB_REF_NAME} target ${tag_commit}"
+            echo "::error::Checkout HEAD ${current_commit} does not match ${RELEASE_REF_NAME} target ${tag_commit}"
             exit 1
           fi
 
@@ -248,13 +254,13 @@ jobs:
 
       - name: Validate tag and derive version
         env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release tags must use vMAJOR.MINOR.PATCH format; got '$GITHUB_REF_NAME'"
+          if [[ ! "$RELEASE_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must use vMAJOR.MINOR.PATCH format; got '$RELEASE_REF_NAME'"
             exit 1
           fi
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_REF_NAME#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "KLIGHTS_VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "CONTAINERD_VERSION=2.3.2" >> "$GITHUB_ENV"
@@ -333,19 +339,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
           fetch-depth: 0
           fetch-tags: true
 
       - name: Verify tagged commit checkout
         env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          tag_commit="$(git rev-list -n 1 "${GITHUB_REF_NAME}^{commit}")"
+          tag_commit="$(git rev-list -n 1 "${RELEASE_REF_NAME}^{commit}")"
           current_commit="$(git rev-parse HEAD)"
           if [[ "$current_commit" != "$tag_commit" ]]; then
-            echo "::error::Checkout HEAD ${current_commit} does not match ${GITHUB_REF_NAME} target ${tag_commit}"
+            echo "::error::Checkout HEAD ${current_commit} does not match ${RELEASE_REF_NAME} target ${tag_commit}"
             exit 1
           fi
 
@@ -380,13 +386,13 @@ jobs:
 
       - name: Validate tag and derive version
         env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Release tags must use vMAJOR.MINOR.PATCH format; got '$GITHUB_REF_NAME'"
+          if [[ ! "$RELEASE_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must use vMAJOR.MINOR.PATCH format; got '$RELEASE_REF_NAME'"
             exit 1
           fi
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_REF_NAME#v}"
           echo "KLIGHTS_VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "CONTAINERD_VERSION=2.3.2" >> "$GITHUB_ENV"
           echo "RUNC_VERSION=1.5.0" >> "$GITHUB_ENV"
@@ -507,8 +513,8 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: klights ${{ github.ref_name }}
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          name: klights ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           body_path: release-notes.md
           fail_on_unmatched_files: true
           overwrite_files: true
@@ -517,17 +523,17 @@ jobs:
       - name: Update GitHub release notes
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          gh release edit "$GITHUB_REF_NAME" \
+          gh release edit "$RELEASE_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "klights ${GITHUB_REF_NAME}" \
+            --title "klights ${RELEASE_REF_NAME}" \
             --notes-file release-notes.md
 
       - name: Publish package repository branch
         env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+          RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -546,7 +552,7 @@ jobs:
           cat > README.md <<EOF_REPO
           # klights package repository
 
-          Generated from ${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}.
+          Generated from ${GITHUB_REPOSITORY}@${RELEASE_REF_NAME}.
 
           APT base URL:
 
@@ -568,7 +574,7 @@ jobs:
           EOF_REPO
 
           git add .
-          git commit -m "chore: publish package repository for ${GITHUB_REF_NAME}"
+          git commit -m "chore: publish package repository for ${RELEASE_REF_NAME}"
           git push --force "$repo_url" package-repo
 
       - name: Verify hosted package repository
