@@ -382,7 +382,8 @@ jobs:
             createrepo-c \
             dpkg-dev \
             gzip \
-            gnupg
+            gnupg \
+            rpm
 
       - name: Validate tag and derive version
         env:
@@ -432,10 +433,21 @@ jobs:
             echo "::error::PACKAGE_GPG_KEY_ID was not set by the GPG import step"
             exit 1
           fi
-          mkdir -p public/apt
-          gpg --batch --yes --armor --export "$PACKAGE_GPG_KEY_ID" > public/apt/klights-archive-keyring.asc
-          test -s public/apt/klights-archive-keyring.asc
-          grep -q "BEGIN PGP PUBLIC KEY BLOCK" public/apt/klights-archive-keyring.asc
+          mkdir -p public
+          gpg --batch --yes --armor --export "$PACKAGE_GPG_KEY_ID" > public/klights-archive-keyring.asc
+          test -s public/klights-archive-keyring.asc
+          grep -q "BEGIN PGP PUBLIC KEY BLOCK" public/klights-archive-keyring.asc
+
+      - name: Sign RPM packages
+        env:
+          PACKAGE_GPG_PASSPHRASE: ${{ secrets.PACKAGE_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${PACKAGE_GPG_KEY_ID:-}" ]]; then
+            echo "::error::PACKAGE_GPG_KEY_ID was not set by the GPG import step"
+            exit 1
+          fi
+          scripts/package/sign-rpms.sh --packages dist/packages
 
       - name: Build package repository metadata
         env:
@@ -481,6 +493,7 @@ jobs:
               <p>Static APT and RPM package indexes for klights releases.</p>
               <ul>
                 <li><a href="https://github.com/klights-net/klights-core">GitHub repository</a></li>
+                <li><a href="./klights-archive-keyring.asc">Public key</a></li>
                 <li><a href="./apt/">APT repository</a></li>
                 <li><a href="./rpm/">RPM repository</a></li>
               </ul>
@@ -502,7 +515,7 @@ jobs:
               <p>This directory contains the signed APT repository metadata for klights.</p>
               <ul>
                 <li><a href="https://github.com/klights-net/klights-core">GitHub repository</a></li>
-                <li><a href="./klights-archive-keyring.asc">APT signing key</a></li>
+                <li><a href="../klights-archive-keyring.asc">Public key</a></li>
                 <li><a href="./dists/noble/InRelease">Ubuntu 24.04 noble InRelease</a></li>
                 <li><a href="./dists/resolute/InRelease">Ubuntu 26.04 resolute InRelease</a></li>
               </ul>
@@ -549,8 +562,8 @@ jobs:
             echo "Package repositories are published from the \`package-repo\` branch:"
             echo
             echo "- APT: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt"
-            echo "- APT signing key: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/klights-archive-keyring.asc"
             echo "- RPM: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm"
+            echo "- Public key: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc"
           } >> "$NOTES"
 
       - name: Publish GitHub release
@@ -603,10 +616,10 @@ jobs:
           https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo/apt
           \`\`\`
 
-          APT signing key:
+          Public key:
 
           \`\`\`text
-          https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo/apt/klights-archive-keyring.asc
+          https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo/klights-archive-keyring.asc
           \`\`\`
 
           RPM base URL:
@@ -614,6 +627,7 @@ jobs:
           \`\`\`text
           https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo/rpm
           \`\`\`
+
           EOF_REPO
 
           git add .
@@ -629,7 +643,7 @@ jobs:
           paths=(
             "index.html"
             "apt/index.html"
-            "apt/klights-archive-keyring.asc"
+            "klights-archive-keyring.asc"
             "apt/dists/noble/InRelease"
             "apt/dists/noble/Release"
             "apt/dists/noble/Release.gpg"
@@ -645,9 +659,13 @@ jobs:
             "apt/dists/resolute/main/binary-arm64/Packages"
             "apt/dists/resolute/main/binary-arm64/Packages.gz"
             "rpm/el9/x86_64/repodata/repomd.xml"
+            "rpm/el9/x86_64/repodata/repomd.xml.asc"
             "rpm/el9/aarch64/repodata/repomd.xml"
+            "rpm/el9/aarch64/repodata/repomd.xml.asc"
             "rpm/el10/x86_64/repodata/repomd.xml"
+            "rpm/el10/x86_64/repodata/repomd.xml.asc"
             "rpm/el10/aarch64/repodata/repomd.xml"
+            "rpm/el10/aarch64/repodata/repomd.xml.asc"
           )
 
           for path in "${paths[@]}"; do
@@ -668,7 +686,7 @@ jobs:
 
           curl -fsSL "${base_url}/index.html" | grep -q "https://github.com/klights-net/klights-core"
           curl -fsSL "${base_url}/apt/index.html" | grep -q "https://github.com/klights-net/klights-core"
-          curl -fsSL "${base_url}/apt/klights-archive-keyring.asc" | grep -q "BEGIN PGP PUBLIC KEY BLOCK"
+          curl -fsSL "${base_url}/klights-archive-keyring.asc" | grep -q "BEGIN PGP PUBLIC KEY BLOCK"
           curl -fsSL "${base_url}/apt/dists/noble/InRelease" | grep -q "BEGIN PGP SIGNED MESSAGE"
           curl -fsSL "${base_url}/apt/dists/resolute/InRelease" | grep -q "BEGIN PGP SIGNED MESSAGE"
           curl -fsSL "${base_url}/apt/dists/noble/main/binary-amd64/Packages" | grep -q '^Package: klights$'

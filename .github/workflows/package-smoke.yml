@@ -102,7 +102,7 @@ jobs:
             apt-get update
             install -d -m 0755 /etc/apt/keyrings
             curl -fsSL \
-              https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/klights-archive-keyring.asc \
+              https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc \
               -o /etc/apt/keyrings/klights-archive-keyring.asc
             chmod 0644 /etc/apt/keyrings/klights-archive-keyring.asc
             printf "%s\n" \
@@ -271,14 +271,21 @@ jobs:
           set -euo pipefail
           docker exec -e EXPECTED_KLIGHTS_VERSION "${{ matrix.container_name }}" bash -lc '
             set -euo pipefail
+            install -d -m 0755 /etc/pki/rpm-gpg
+            curl -fsSLo /etc/pki/rpm-gpg/klights-archive-keyring.asc \
+              https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc
+            grep -q "BEGIN PGP PUBLIC KEY BLOCK" /etc/pki/rpm-gpg/klights-archive-keyring.asc
+            rpm --import /etc/pki/rpm-gpg/klights-archive-keyring.asc
             cat >/etc/yum.repos.d/klights.repo <<EOF_REPO
           [klights]
           name=klights
           baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/${{ matrix.el }}/${{ matrix.rpm_arch }}
           enabled=1
-          gpgcheck=0
+          repo_gpgcheck=1
+          gpgcheck=1
+          gpgkey=file:///etc/pki/rpm-gpg/klights-archive-keyring.asc
           EOF_REPO
-            dnf -y makecache
+            dnf -y --disablerepo="*" --enablerepo=klights makecache --refresh
             dnf -y install klights
             rpm -q --qf "%{VERSION}-%{RELEASE}\n" klights | grep -Fx "${EXPECTED_KLIGHTS_VERSION}-1.${{ matrix.el }}"
             test -f /etc/sysconfig/klights
