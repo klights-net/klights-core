@@ -63,7 +63,7 @@ pub struct RemotePodEndpointSpec {
 }
 
 /// Build the remote-pod DNAT inventory for this node from `pod_endpoints`.
-/// Local rows and direct VXLAN rows are ignored; only remote hostport rows
+/// Local rows and direct encrypted rows are ignored; only remote hostport rows
 /// belong in the root-side hybrid chain.
 pub fn remote_pod_endpoint_specs_from_rows(
     local_node_name: &str,

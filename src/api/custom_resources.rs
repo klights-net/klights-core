@@ -1596,6 +1596,16 @@ async fn delete_collection_cr_inner(
         names.extend(list.items.into_iter().map(|resource| resource.name));
     }
 
+    if query.dry_run.as_deref() == Some("All") {
+        return Ok(Json(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Success",
+            "code": 200
+        }))
+        .into_response());
+    }
+
     let mut unique_names = std::collections::HashSet::new();
     for name in names {
         if !unique_names.insert(name.clone()) {

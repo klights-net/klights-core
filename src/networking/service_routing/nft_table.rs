@@ -101,9 +101,9 @@ pub struct KlightsTable {
     cluster_cidr_mask: Ipv4Addr,
     service_cidr_ip: Ipv4Addr,
     service_cidr_mask: Ipv4Addr,
-    /// F2-03: mode + configured VXLAN device flow in from the network boot
-    /// boundary. Decides whether the forward chain accepts on the VXLAN
-    /// overlay device and which interface name the rule matches against.
+    /// F2-03: mode + selected route device flow in from the network boot
+    /// boundary. Decides whether the forward chain needs an explicit
+    /// cross-node route-device accept rule and which interface it matches.
     mode: ServiceRoutingMode,
     /// Per-table hostport mappings — one entry per pod that has at least
     /// one hostPort declared. Re-emitting the entire `hostports` chain

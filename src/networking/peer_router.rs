@@ -1,6 +1,6 @@
 //! `PeerRouter` — the narrow trait for cross-node peer endpoint state.
-//! Today this means VXLAN FDB programming; Phase 2 hybrid clusters add
-//! the rootless variant, mediated by `NodeEndpoint`.
+//! Today this means WireGuard and direct-route peer programming, with
+//! rootless reachability mediated by `NodeEndpoint`.
 //!
 //! The `node_subnet` controller takes `&dyn PeerRouter` so it cannot
 //! reach datapath methods like `cni_add` it has no business calling.

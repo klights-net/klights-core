@@ -5340,6 +5340,137 @@ async fn test_validating_webhook_configuration_status_routes_are_supported() {
 }
 
 #[tokio::test]
+async fn test_crd_delete_collection_dry_run_does_not_delete_resources() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let create_ns = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"default"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_ns.status(), StatusCode::CREATED);
+
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "bars.example.com"},
+        "spec": {
+            "group": "example.com",
+            "scope": "Namespaced",
+            "names": {"plural": "bars", "singular": "bar", "kind": "Bar"},
+            "versions": [{
+                "name": "v1",
+                "served": true,
+                "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object"}}
+            }]
+        }
+    });
+    let create_crd = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/apis/apiextensions.k8s.io/v1/customresourcedefinitions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&crd).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_crd.status(), StatusCode::CREATED);
+
+    for (name, label) in [("b1", "dryrun"), ("b2", "keep")] {
+        let create_cr = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/apis/example.com/v1/namespaces/default/bars")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "apiVersion": "example.com/v1",
+                            "kind": "Bar",
+                            "metadata": {
+                                "name": name,
+                                "namespace": "default",
+                                "labels": {"delete": label}
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_cr.status(), StatusCode::CREATED);
+    }
+
+    let delete_collection = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/apis/example.com/v1/namespaces/default/bars?labelSelector=delete%3Ddryrun&dryRun=All")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_collection.status(), StatusCode::OK);
+
+    let list_after_dry_run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/example.com/v1/namespaces/default/bars")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_after_dry_run.status(), StatusCode::OK);
+    let list_body = axum::body::to_bytes(list_after_dry_run.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_value: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    let mut remaining_names: Vec<_> = list_value["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            item.pointer("/metadata/name")
+                .and_then(|name| name.as_str())
+                .map(ToString::to_string)
+        })
+        .collect();
+    remaining_names.sort();
+    assert_eq!(
+        remaining_names,
+        vec!["b1".to_string(), "b2".to_string()],
+        "dry-run delete collection must not remove selected CRD rows, response: {}",
+        list_value
+    );
+}
+
+#[tokio::test]
 async fn test_custom_resource_delete_runs_delete_admission() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -6160,6 +6291,52 @@ async fn test_crd_non_storage_field_selector_filters_on_converted_objects() {
     assert_eq!(event["object"]["metadata"]["name"], "w1");
     assert_eq!(event["object"]["apiVersion"], "example.com/v1");
     assert_eq!(event["object"]["hostPort"], "host1:80");
+
+    let dry_run_delete_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/apis/example.com/v2/namespaces/default/widgets?fieldSelector=host%3Dhost1%2Cport%3D80&dryRun=All")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        dry_run_delete_resp.status(),
+        StatusCode::OK,
+        "dry-run delete collection must be supported for converted custom resources",
+    );
+
+    let list_after_dry_run = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/apis/example.com/v2/namespaces/default/widgets?fieldSelector=host%3Dhost1%2Cport%3D80")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_after_dry_run.status(), StatusCode::OK);
+    let list_after_dry_run_body = axum::body::to_bytes(list_after_dry_run.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list_after_dry_run_value: serde_json::Value =
+        serde_json::from_slice(&list_after_dry_run_body).unwrap();
+    let dry_run_remaining = list_after_dry_run_value["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        dry_run_remaining.len(),
+        1,
+        "dry-run delete collection with converted fieldSelector must not remove matching CRs, response: {}",
+        list_after_dry_run_value
+    );
+    assert_eq!(dry_run_remaining[0]["metadata"]["name"], "w1");
 
     let delete_resp = app
         .clone()

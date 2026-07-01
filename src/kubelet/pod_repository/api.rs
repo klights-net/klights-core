@@ -603,9 +603,29 @@ impl PodApiService {
             .list(None, None, None, None, None)
             .await
             .map_err(|e| -> AppError { e.into() })?;
+        let namespaces = self
+            .db
+            .list_resources(
+                "v1",
+                "Namespace",
+                None,
+                crate::datastore::ResourceListQuery::all(),
+            )
+            .await?;
+        let pdbs = self
+            .db
+            .list_resources(
+                "policy/v1",
+                "PodDisruptionBudget",
+                None,
+                crate::datastore::ResourceListQuery::all(),
+            )
+            .await?;
         Ok(SchedulerSnapshot {
             nodes: nodes.items,
             pods: pods.items,
+            namespaces: namespaces.items,
+            pdbs: pdbs.items,
         })
     }
 
@@ -1498,6 +1518,8 @@ fn reserved_pod_body(pod: &Resource, node_name: &str) -> Value {
 struct SchedulerSnapshot {
     nodes: Vec<Resource>,
     pods: Vec<Resource>,
+    namespaces: Vec<Resource>,
+    pdbs: Vec<Resource>,
 }
 
 async fn schedule_pod_from_snapshot(
@@ -1525,6 +1547,12 @@ async fn schedule_pod_from_snapshot(
     node_names.sort();
 
     let node_values: Vec<&Value> = snapshot.nodes.iter().map(|n| n.data.as_ref()).collect();
+    let namespace_values: Vec<&Value> = snapshot
+        .namespaces
+        .iter()
+        .map(|namespace| namespace.data.as_ref())
+        .collect();
+    let pdb_values: Vec<&Value> = snapshot.pdbs.iter().map(|pdb| pdb.data.as_ref()).collect();
     let existing_per_node: Vec<(&str, Vec<&Value>)> = node_names
         .iter()
         .map(|name| {
@@ -1543,13 +1571,15 @@ async fn schedule_pod_from_snapshot(
         })
         .collect();
 
-    let decision = crate::scheduler::engine::schedule_from_json(
+    let decision = crate::scheduler::engine::schedule_from_json_with_policy(
         &node_values,
         pod,
         &existing_per_node
             .iter()
             .map(|(name, pods)| (*name, pods.as_slice()))
             .collect::<Vec<_>>(),
+        &namespace_values,
+        &pdb_values,
     );
 
     let mut api_decision = scheduling_decision_to_api(decision);

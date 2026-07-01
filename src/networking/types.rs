@@ -165,7 +165,7 @@ impl FromSql for PodSubnet {
 
 /// The cluster-wide CIDR (e.g., "10.244.0.0/16").
 ///
-/// Used for VXLAN configuration, per-node subnet allocation, and routing.
+/// Used for per-node subnet allocation and routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ClusterCidr {
     base: u32,

@@ -1167,7 +1167,7 @@ mod tests {
                 .attributes
                 .iter()
                 .any(|attr| matches!(attr, RouteAttribute::Oif(_))),
-            "explicit plaintext route must not masquerade as a WireGuard or VXLAN device route"
+            "explicit plaintext route must not masquerade as an overlay device route"
         );
     }
 }

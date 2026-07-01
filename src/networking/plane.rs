@@ -98,8 +98,7 @@ impl NetworkPlane {
     /// Boot the shared networking plane. Opens one rtnetlink connection,
     /// prepares the local bridge/CNI datapath, and initializes the selected
     /// cross-node dataplane. WireGuard is the default encrypted dataplane;
-    /// VXLAN is not created unless an explicit VXLAN route mode is added and
-    /// selected.
+    /// explicit direct-route mode installs only kernel routes.
     pub async fn boot(
         cfg: &crate::KlightsConfig,
         cluster_api: Arc<dyn LeaderApiClient>,
@@ -710,7 +709,7 @@ impl crate::networking::peer_router::PeerRouter for NetworkPlane {
     }
 }
 
-// Hybrid peer boot invariants (boot ordering, VXLAN avoidance,
+// Hybrid peer boot invariants (boot ordering, overlay avoidance,
 // peer-endpoint arms) are enforced by `scripts/check_networking_invariants.sh`,
 // run as part of `./build.sh`.
 

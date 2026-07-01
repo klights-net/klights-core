@@ -19,7 +19,7 @@ use std::path::PathBuf;
 pub enum NodeMode {
     /// Process runs as root with the default encrypted WireGuard pod-CIDR
     /// dataplane in the host network namespace (explicit direct-route mode
-    /// installs only kernel routes; VXLAN is dormant legacy, not used).
+    /// installs only kernel routes).
     Root,
     /// Process runs unprivileged inside a rootlesskit user namespace.
     /// `rootlesskit_pid` is the parent rootlesskit PID; `user_netns` is

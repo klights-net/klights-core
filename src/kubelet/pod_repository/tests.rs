@@ -6398,6 +6398,121 @@ async fn leader_scheduler_orders_unbound_pods_by_priority_creation_and_name() {
 }
 
 #[tokio::test]
+async fn leader_scheduler_snapshot_uses_namespace_labels_for_pod_affinity() {
+    use super::PodReader;
+
+    let repo =
+        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
+            .await;
+
+    repo.store
+        .db()
+        .create_resource(
+            "v1",
+            "Namespace",
+            None,
+            "peer-ns",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {
+                    "name": "peer-ns",
+                    "labels": {"team": "storage"}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    for (node, zone) in [("node-a", "zone-a"), ("node-b", "zone-b")] {
+        repo.store
+            .db()
+            .create_resource(
+                "v1",
+                "Node",
+                None,
+                node,
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {
+                        "name": node,
+                        "labels": {"topology.kubernetes.io/zone": zone}
+                    },
+                    "spec": {"unschedulable": false},
+                    "status": {
+                        "allocatable": {"cpu": "8", "memory": "32Gi", "pods": "110"},
+                        "conditions": [{"type": "Ready", "status": "True"}]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    repo.store
+        .create(
+            "peer-ns",
+            "peer",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "peer-ns",
+                    "name": "peer",
+                    "labels": {"app": "database"}
+                },
+                "spec": {
+                    "nodeName": "node-b",
+                    "containers": [{"name": "main", "image": "pause"}]
+                },
+                "status": {"phase": "Running"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    repo.store
+        .create(
+            "default",
+            "client",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"namespace": "default", "name": "client"},
+                "spec": {
+                    "containers": [{"name": "main", "image": "pause"}],
+                    "affinity": {
+                        "podAffinity": {
+                            "requiredDuringSchedulingIgnoredDuringExecution": [{
+                                "labelSelector": {"matchLabels": {"app": "database"}},
+                                "namespaceSelector": {"matchLabels": {"team": "storage"}},
+                                "topologyKey": "topology.kubernetes.io/zone"
+                            }]
+                        }
+                    }
+                },
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    repo.schedule_all_unbound_pods().await.unwrap();
+
+    let scheduled = repo.get_pod("default", "client").await.unwrap().unwrap();
+    assert_eq!(
+        scheduled
+            .data
+            .pointer("/spec/nodeName")
+            .and_then(|v| v.as_str()),
+        Some("node-b"),
+        "snapshot scheduling must include Namespace labels for namespaceSelector affinity: {:?}",
+        scheduled.data
+    );
+}
+
+#[tokio::test]
 async fn leader_scheduler_concurrent_wave_reserves_node_capacity_once() {
     use super::PodReader;
 

@@ -1,13 +1,12 @@
 //! Rootless network boot path (F2-01).
 //!
-//! `NetworkPlane` (root mode) is too heavy for rootless: it ensures a host
-//! bridge, VXLAN device, and writes a VTEP MAC against the kernel via
-//! rtnetlink. None of those operations are valid (or even possible) in a user
-//! namespace where klights does not own the host interfaces.
+//! `NetworkPlane` (root mode) is too heavy for rootless: it owns host-network
+//! bridge and route-device state via rtnetlink. Those operations are not valid
+//! in a user namespace where klights does not own the host interfaces.
 //!
 //! `RootlessNetworkPlane` keeps the slice of boot-time state every mode needs
 //! (the local pod subnet and bridge/veth CNI in the rootless network namespace)
-//! and drops the root-only VXLAN steps. Remaining rootless lifecycle work
+//! and drops root-only host-network setup. Remaining rootless lifecycle work
 //! (pasta process management, bypass4netns socket grafting, hostport
 //! publication) attaches to this struct rather than growing rootless-only
 //! branches inside the root-mode plane.
@@ -47,8 +46,8 @@ pub struct RootlessNetworkPlane {
 
 impl RootlessNetworkPlane {
     /// Boot the rootless network plane. Allocates the node-local pod subnet
-    /// through the shared IPAM and returns; intentionally skips VXLAN setup
-    /// and boot-time bridge mutation. The bridge is created
+    /// through the shared IPAM and returns; intentionally skips boot-time
+    /// host-network mutation. The bridge is created
     /// lazily on the first non-hostNetwork CNI ADD so unit tests and idle
     /// rootless starts do not require netlink mutations until pods need them.
     pub async fn boot(

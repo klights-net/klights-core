@@ -714,7 +714,45 @@ async fn actor_finalize_delete_for_replacement_uid_is_not_blocked_by_old_uid_sta
 }
 
 #[tokio::test]
-async fn actor_owned_delete_terminal_error_is_not_silently_dropped() {
+async fn actor_owned_delete_uid_mismatch_is_not_silently_dropped() {
+    actor_owned_delete_terminal_case_is_handled(
+        "delete-uid-mismatch",
+        Err(OutboxApplyError::UidMismatch {
+            expected: "uid-old".to_string(),
+            actual: "uid-new".to_string(),
+        }),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn actor_owned_delete_conflict_terminal_is_not_silently_dropped() {
+    actor_owned_delete_terminal_case_is_handled(
+        "delete-conflict-terminal",
+        Err(OutboxApplyError::ConflictTerminal(
+            "resourceVersion precondition failed".to_string(),
+        )),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn actor_owned_delete_not_found_completes_without_dead_letter() {
+    actor_owned_delete_terminal_case_is_handled(
+        "delete-not-found",
+        Err(OutboxApplyError::NotFound("pod already gone".to_string())),
+        false,
+    )
+    .await;
+}
+
+async fn actor_owned_delete_terminal_case_is_handled(
+    key: &str,
+    response: Result<OutboxApplyResult, OutboxApplyError>,
+    should_dead_letter: bool,
+) {
     let node_db = node_db().await;
     let outbox = Outbox::new(node_db.clone());
     let client = Arc::new(StackApplyClient::default());
@@ -723,7 +761,7 @@ async fn actor_owned_delete_terminal_error_is_not_silently_dropped() {
     let now = 7_000i64;
     outbox
         .enqueue_command(OutboxCommand::new(
-            "delete-uid-mismatch",
+            key,
             OutboxOperation::RuntimeReconcile,
             OutboxSubject::new(
                 "v1/Pod/default/web/uid-old",
@@ -738,12 +776,7 @@ async fn actor_owned_delete_terminal_error_is_not_silently_dropped() {
         .await
         .expect("enqueue");
 
-    client
-        .push_response(Err(OutboxApplyError::UidMismatch {
-            expected: "uid-old".to_string(),
-            actual: "uid-new".to_string(),
-        }))
-        .await;
+    client.push_response(response).await;
 
     assert_eq!(
         dispatcher.dispatch_due_once(now).await.expect("dispatch"),
@@ -751,15 +784,22 @@ async fn actor_owned_delete_terminal_error_is_not_silently_dropped() {
     );
 
     let dead = node_db.list_dead_letter().await.expect("list dead letter");
-    assert_eq!(dead.len(), 1);
-    assert_eq!(dead[0].idempotency_key, "delete-uid-mismatch");
+    if should_dead_letter {
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].idempotency_key, key);
+    } else {
+        assert!(
+            dead.is_empty(),
+            "not-found actor-owned Pod delete is success and must not require operator replay"
+        );
+    }
     assert!(
         node_db
             .claim_next_due_outbox(now + 100, 1_000, "check-empty")
             .await
             .expect("claim")
             .is_none(),
-        "terminal actor-owned delete should leave visibility in dead-letter, not pending retry"
+        "terminal actor-owned delete should not remain pending for retry"
     );
 }
 
