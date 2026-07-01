@@ -35,7 +35,18 @@ For source builds, also install:
 ## Ubuntu 24.04
 
 ```bash
-echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt noble main" |   sudo tee /etc/apt/sources.list.d/klights.list
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL \
+  https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/klights-archive-keyring.asc \
+  -o /etc/apt/keyrings/klights-archive-keyring.asc
+sudo chmod 0644 /etc/apt/keyrings/klights-archive-keyring.asc
+sudo tee /etc/apt/sources.list.d/klights.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/
+Suites: noble
+Components: main
+Signed-By: /etc/apt/keyrings/klights-archive-keyring.asc
+EOF
 sudo apt-get update
 sudo apt-get install -y klights
 sudo systemctl enable --now containerd
@@ -45,7 +56,18 @@ sudo systemctl enable --now klights
 ## Ubuntu 26.04
 
 ```bash
-echo "deb [trusted=yes] https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt resolute main" |   sudo tee /etc/apt/sources.list.d/klights.list
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL \
+  https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/klights-archive-keyring.asc \
+  -o /etc/apt/keyrings/klights-archive-keyring.asc
+sudo chmod 0644 /etc/apt/keyrings/klights-archive-keyring.asc
+sudo tee /etc/apt/sources.list.d/klights.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/
+Suites: resolute
+Components: main
+Signed-By: /etc/apt/keyrings/klights-archive-keyring.asc
+EOF
 sudo apt-get update
 sudo apt-get install -y klights
 sudo systemctl enable --now containerd
