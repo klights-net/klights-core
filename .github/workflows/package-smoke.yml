@@ -100,13 +100,13 @@ jobs:
         run: |
           set -euo pipefail
           quickstart_script="$(
-            awk -v heading="## Ubuntu ${{ matrix.ubuntu_version }}" '\''
+            awk -v heading="## Ubuntu ${{ matrix.ubuntu_version }}" '
               $0 == heading { in_section=1; next }
               in_section && /^## / { exit }
               in_section && /^```bash$/ { in_code=1; next }
               in_code && /^```$/ { exit }
               in_code { print }
-            '\'' QUICKSTART.md | sed -E "s/^sudo //"
+            ' QUICKSTART.md | sed -E "s/^sudo //"
           )"
           printf "%s\n" "$quickstart_script" | docker exec -i "${{ matrix.container_name }}" bash -se
           docker exec -e EXPECTED_KLIGHTS_VERSION "${{ matrix.container_name }}" bash -lc '
@@ -269,13 +269,13 @@ jobs:
         run: |
           set -euo pipefail
           quickstart_script="$(
-            awk -v heading="## RHEL-Compatible ${{ matrix.rhel_major }}" '\''
+            awk -v heading="## RHEL-Compatible ${{ matrix.rhel_major }}" '
               $0 == heading { in_section=1; next }
               in_section && /^## / { exit }
               in_section && /^```bash$/ { in_code=1; next }
               in_code && /^```$/ { exit }
               in_code { print }
-            '\'' QUICKSTART.md | sed -E "s/^sudo //"
+            ' QUICKSTART.md | sed -E "s/^sudo //"
           )"
           printf "%s\n" "$quickstart_script" | docker exec -i "${{ matrix.container_name }}" bash -se
           docker exec -e EXPECTED_KLIGHTS_VERSION "${{ matrix.container_name }}" bash -lc '
