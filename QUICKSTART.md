@@ -37,7 +37,7 @@ For source builds, also install:
 ```bash
 sudo install -d -m 0755 /etc/apt/keyrings
 sudo curl -fsSL \
-  https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/klights-archive-keyring.asc \
+  https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc \
   -o /etc/apt/keyrings/klights-archive-keyring.asc
 sudo chmod 0644 /etc/apt/keyrings/klights-archive-keyring.asc
 sudo tee /etc/apt/sources.list.d/klights.sources >/dev/null <<'EOF'
@@ -58,7 +58,7 @@ sudo systemctl enable --now klights
 ```bash
 sudo install -d -m 0755 /etc/apt/keyrings
 sudo curl -fsSL \
-  https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/klights-archive-keyring.asc \
+  https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc \
   -o /etc/apt/keyrings/klights-archive-keyring.asc
 sudo chmod 0644 /etc/apt/keyrings/klights-archive-keyring.asc
 sudo tee /etc/apt/sources.list.d/klights.sources >/dev/null <<'EOF'
@@ -77,12 +77,20 @@ sudo systemctl enable --now klights
 ## RHEL-Compatible 9
 
 ```bash
+sudo install -d -m 0755 /etc/pki/rpm-gpg
+sudo curl -fsSL \
+  https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc \
+  -o /etc/pki/rpm-gpg/klights-archive-keyring.asc
+grep -q "BEGIN PGP PUBLIC KEY BLOCK" /etc/pki/rpm-gpg/klights-archive-keyring.asc
+sudo rpm --import /etc/pki/rpm-gpg/klights-archive-keyring.asc
 sudo tee /etc/yum.repos.d/klights.repo >/dev/null <<'EOF'
 [klights]
 name=klights
 baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el9/$basearch
 enabled=1
-gpgcheck=0
+repo_gpgcheck=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/klights-archive-keyring.asc
 EOF
 sudo dnf install -y klights
 sudo systemctl enable --now containerd
@@ -92,12 +100,20 @@ sudo systemctl enable --now klights
 ## RHEL-Compatible 10
 
 ```bash
+sudo install -d -m 0755 /etc/pki/rpm-gpg
+sudo curl -fsSL \
+  https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc \
+  -o /etc/pki/rpm-gpg/klights-archive-keyring.asc
+grep -q "BEGIN PGP PUBLIC KEY BLOCK" /etc/pki/rpm-gpg/klights-archive-keyring.asc
+sudo rpm --import /etc/pki/rpm-gpg/klights-archive-keyring.asc
 sudo tee /etc/yum.repos.d/klights.repo >/dev/null <<'EOF'
 [klights]
 name=klights
 baseurl=https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm/el10/$basearch
 enabled=1
-gpgcheck=0
+repo_gpgcheck=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/klights-archive-keyring.asc
 EOF
 sudo dnf install -y klights
 sudo systemctl enable --now containerd
