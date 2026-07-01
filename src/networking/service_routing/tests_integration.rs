@@ -712,6 +712,70 @@ mod integration_tests {
 
     #[tokio::test]
     #[ignore]
+    async fn test_dnat_hostport_and_clusterip_endpoint_share_tail_shape() {
+        let name = unique_name("klights_sr_dnat_tail");
+        let _guard = TableGuard { name: name.clone() };
+        let table = build(&name);
+        table.init().await.expect("init");
+
+        table
+            .add_hostports_for_pod(
+                Ipv4Addr::new(10, 99, 0, 42),
+                vec![hp(Some([192, 168, 1, 5]), 31080, 8080)],
+            )
+            .await
+            .expect("add hostport");
+        table
+            .replace_services(&[spec(
+                [10, 43, 128, 5],
+                vec![port(80, 8080, None, Protocol::Tcp, vec![[10, 99, 0, 42]])],
+            )])
+            .await
+            .expect("replace service");
+
+        let hostports = nft_chain(&name, "hostports");
+        let services = nft_chain(&name, "services");
+        let hostport_line = hostports
+            .lines()
+            .find(|line| line.contains("dnat ip to 10.99.0.42:8080"))
+            .expect("hostport DNAT rule");
+        let service_line = services
+            .lines()
+            .find(|line| line.contains("dnat ip to 10.99.0.42:8080"))
+            .expect("service DNAT rule");
+        let hostport_tail = hostport_line
+            .split_once("dnat ip to ")
+            .expect("hostport DNAT tail")
+            .1;
+        let service_tail = service_line
+            .split_once("dnat ip to ")
+            .expect("service DNAT tail")
+            .1;
+
+        assert_eq!(
+            hostport_tail, service_tail,
+            "hostPort and ClusterIP rules that target the same endpoint must render an identical DNAT tail:\nhostport={hostport_line}\nservice={service_line}"
+        );
+        assert!(
+            hostport_line.contains("dport 31080"),
+            "hostPort prefix must match the host port:\n{hostport_line}"
+        );
+        assert!(
+            service_line.contains("dport 80"),
+            "service prefix must match the service port:\n{service_line}"
+        );
+        assert!(
+            hostport_line.contains("0xc0a80105"),
+            "hostPort prefix must include the specific hostIP daddr match:\n{hostport_line}"
+        );
+        assert!(
+            service_line.contains("0xa2b8005"),
+            "service prefix must include the ClusterIP daddr match:\n{service_line}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
     async fn test_init_creates_hostports_chain_empty() {
         let name = unique_name("klights_sr_hp_init");
         let _guard = TableGuard { name: name.clone() };

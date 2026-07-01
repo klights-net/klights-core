@@ -1,13 +1,13 @@
-//! Differential nft route plan.
+//! Deterministic nft route inventory diff.
 //!
 //! Diffs the previously-applied set of [`ServiceSpec`]s against the current
-//! inventory snapshot. The plan lists per-service add / update / remove
-//! operations so the coalescer can apply only what changed instead of
-//! rebuilding the entire `services` chain on every watch event.
+//! inventory snapshot. The plan lists per-service add / update / remove sets
+//! so callers can cheaply detect no-op watch events and log/classify changed
+//! services deterministically.
 //!
-//! A full chain rebuild is still the recovery path for watch compaction or
-//! inventory corruption — the planner just keeps the steady-state cost
-//! proportional to actual changes.
+//! Changed inventories still render and replace the full `services` chain.
+//! Differential nft patching would need separate measurement and kernel-facing
+//! tests before this planner should be treated as an incremental apply engine.
 
 use std::collections::HashMap;
 

@@ -728,21 +728,27 @@ fn mark_node_ready_unknown(node: &mut Value, now: DateTime<Utc>) -> bool {
         {
             return false;
         }
+        let previous = condition.clone();
         condition["status"] = json!("Unknown");
         condition["reason"] = json!(NODE_STATUS_UNKNOWN_REASON);
         condition["message"] = json!(NODE_STATUS_UNKNOWN_MESSAGE);
         remove_condition_field(condition, "lastHeartbeatTime");
-        condition["lastTransitionTime"] = json!(now);
+        crate::controllers::common::preserve_condition_transition_time(
+            condition,
+            Some(&previous),
+            &now,
+        );
         return true;
     }
 
-    conditions.push(json!({
+    let mut condition = json!({
         "type": "Ready",
         "status": "Unknown",
         "reason": NODE_STATUS_UNKNOWN_REASON,
-        "message": NODE_STATUS_UNKNOWN_MESSAGE,
-        "lastTransitionTime": now
-    }));
+        "message": NODE_STATUS_UNKNOWN_MESSAGE
+    });
+    crate::controllers::common::preserve_condition_transition_time(&mut condition, None, &now);
+    conditions.push(condition);
     true
 }
 
@@ -809,20 +815,26 @@ fn mark_pod_condition_unknown(
         {
             return false;
         }
+        let previous = condition.clone();
         condition["status"] = json!("Unknown");
         condition["reason"] = json!(NODE_STATUS_UNKNOWN_REASON);
         condition["message"] = json!(NODE_STATUS_UNKNOWN_MESSAGE);
-        condition["lastTransitionTime"] = json!(now);
+        crate::controllers::common::preserve_condition_transition_time(
+            condition,
+            Some(&previous),
+            now,
+        );
         return true;
     }
 
-    conditions.push(json!({
+    let mut condition = json!({
         "type": condition_type,
         "status": "Unknown",
         "reason": NODE_STATUS_UNKNOWN_REASON,
-        "message": NODE_STATUS_UNKNOWN_MESSAGE,
-        "lastTransitionTime": now
-    }));
+        "message": NODE_STATUS_UNKNOWN_MESSAGE
+    });
+    crate::controllers::common::preserve_condition_transition_time(&mut condition, None, now);
+    conditions.push(condition);
     true
 }
 
@@ -1093,20 +1105,13 @@ fn upsert_reconciled_pod_condition(
     let Some(conditions) = conditions.as_array_mut() else {
         return changed;
     };
-    let transition_time = crate::kubelet::pod_status_logic::get_condition_last_transition_time(
-        existing_conditions,
-        condition_type,
-        condition_status,
-        now,
-    );
+    let previous =
+        crate::controllers::common::condition_by_type(existing_conditions, condition_type);
     if let Some(condition) = conditions
         .iter_mut()
         .find(|condition| condition.get("type").and_then(|v| v.as_str()) == Some(condition_type))
     {
         if set_condition_string_field(condition, "status", condition_status) {
-            changed = true;
-        }
-        if set_condition_string_field(condition, "lastTransitionTime", &transition_time) {
             changed = true;
         }
         if remove_condition_field(condition, "reason") {
@@ -1115,14 +1120,20 @@ fn upsert_reconciled_pod_condition(
         if remove_condition_field(condition, "message") {
             changed = true;
         }
+        let previous_transition = condition.get("lastTransitionTime").cloned();
+        crate::controllers::common::preserve_condition_transition_time(condition, previous, now);
+        if condition.get("lastTransitionTime") != previous_transition.as_ref() {
+            changed = true;
+        }
         return changed;
     }
 
-    conditions.push(json!({
+    let mut condition = json!({
         "type": condition_type,
-        "status": condition_status,
-        "lastTransitionTime": transition_time
-    }));
+        "status": condition_status
+    });
+    crate::controllers::common::preserve_condition_transition_time(&mut condition, previous, now);
+    conditions.push(condition);
     true
 }
 
@@ -1166,21 +1177,31 @@ fn mark_node_ready_from_fresh_observation(
         {
             return false;
         }
+        let previous = condition.clone();
         condition["status"] = json!("True");
         condition["reason"] = json!(NODE_READY_REASON);
         condition["message"] = json!(NODE_READY_MESSAGE);
         remove_condition_field(condition, "lastHeartbeatTime");
-        condition["lastTransitionTime"] = json!(transition_time);
+        crate::controllers::common::preserve_condition_transition_time(
+            condition,
+            Some(&previous),
+            &transition_time,
+        );
         return true;
     }
 
-    conditions.push(json!({
+    let mut condition = json!({
         "type": "Ready",
         "status": "True",
         "reason": NODE_READY_REASON,
-        "message": NODE_READY_MESSAGE,
-        "lastTransitionTime": transition_time
-    }));
+        "message": NODE_READY_MESSAGE
+    });
+    crate::controllers::common::preserve_condition_transition_time(
+        &mut condition,
+        None,
+        &transition_time,
+    );
+    conditions.push(condition);
     true
 }
 

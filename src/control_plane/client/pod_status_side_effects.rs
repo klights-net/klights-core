@@ -14,9 +14,9 @@
 //!  * `replication::grpc::server::Replication::apply_outbox` — remote worker
 //!    writes forwarded over gRPC.
 //!
-//! Both paths converge on the same backend write (`apply_forwarded_command`),
-//! so the side-effect dispatch logic is the same; sharing it here keeps the
-//! two paths from drifting.
+//! Both paths converge on the same leader-side apply result, so the
+//! side-effect dispatch logic is the same; sharing it here keeps the two paths
+//! from drifting.
 
 use std::sync::Arc;
 

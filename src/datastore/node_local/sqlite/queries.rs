@@ -101,7 +101,6 @@ pub(super) const OUTBOX_MARK_FAILED: &str = "UPDATE outbox \
      SET attempt = attempt + 1, next_due_ms = ?3, leased_until_ms = 0, lease_token = NULL, last_error = ?4 \
      WHERE id = ?1 AND lease_token = ?2";
 pub(super) const OUTBOX_COMPLETE: &str = "DELETE FROM outbox WHERE id = ?1 AND lease_token = ?2";
-pub(super) const OUTBOX_COMPLETE_BY_ID: &str = "DELETE FROM outbox WHERE id = ?1";
 pub(super) const OUTBOX_COMPLETE_SUPERSEDED_TERMINAL_POD_DELETE_STATUS: &str = "DELETE FROM outbox WHERE subject_key = ?1 AND id < ?2 \
      AND is_terminal_pod_delete = 0 \
      AND operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \

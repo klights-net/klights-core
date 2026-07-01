@@ -26,7 +26,7 @@ use openraft::raft::{
 use crate::datastore::raft::types::{NodeId, TypeConfig};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PeerRaftRpcMetricsSnapshot {
+struct PeerRaftRpcMetricsSnapshot {
     pub append_entries_calls_total: u64,
     pub append_entries_failures_total: u64,
     pub vote_calls_total: u64,
@@ -40,7 +40,8 @@ pub struct PeerRaftRpcMetricsSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct GrpcRaftNetworkMetricsSnapshot {
+#[cfg(any(test, doctest))]
+struct GrpcRaftNetworkMetricsSnapshot {
     pub append_entries_calls_total: u64,
     pub append_entries_bytes_total: u64,
     pub append_entries_failures_total: u64,
@@ -157,6 +158,7 @@ impl GrpcRaftNetworkMetrics {
             .client_invalidations_total += 1;
     }
 
+    #[cfg(any(test, doctest))]
     fn snapshot(&self) -> GrpcRaftNetworkMetricsSnapshot {
         GrpcRaftNetworkMetricsSnapshot {
             append_entries_calls_total: self.append_entries_calls_total.load(Ordering::Relaxed),
@@ -284,14 +286,9 @@ impl GrpcRaftNetwork {
         }
     }
 
-    pub fn metrics_snapshot(&self) -> GrpcRaftNetworkMetricsSnapshot {
+    #[cfg(any(test, doctest))]
+    fn metrics_snapshot(&self) -> GrpcRaftNetworkMetricsSnapshot {
         self.metrics.snapshot()
-    }
-
-    /// T4: the current RTT estimate (ms) derived from AppendEntries
-    /// round-trips, or the default before any traffic has flowed.
-    pub fn estimated_rtt_ms(&self) -> i64 {
-        self.rtt.estimate_ms()
     }
 
     /// Return the cached client for the bound peer, rebuilding it from the

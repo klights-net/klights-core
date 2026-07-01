@@ -1,3 +1,4 @@
+use crate::controllers::common::{condition_from_status, preserve_condition_timestamps};
 use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -38,7 +39,7 @@ pub fn build_conditions_and_revision(
     });
     preserve_condition_timestamps(
         &mut available_condition,
-        previous_condition(existing_status, "Available"),
+        condition_from_status(existing_status, "Available"),
         &now,
     );
     conditions.push(available_condition);
@@ -86,60 +87,12 @@ pub fn build_conditions_and_revision(
     });
     preserve_condition_timestamps(
         &mut progressing_condition,
-        previous_condition(existing_status, "Progressing"),
+        condition_from_status(existing_status, "Progressing"),
         &now,
     );
     conditions.push(progressing_condition);
 
     (conditions, current_revision)
-}
-
-fn previous_condition<'a>(status: Option<&'a Value>, condition_type: &str) -> Option<&'a Value> {
-    status
-        .and_then(|status| status.get("conditions"))
-        .and_then(|conditions| conditions.as_array())
-        .and_then(|conditions| {
-            conditions.iter().find(|condition| {
-                condition.get("type").and_then(|value| value.as_str()) == Some(condition_type)
-            })
-        })
-}
-
-fn condition_string_field<'a>(condition: &'a Value, field: &str) -> Option<&'a str> {
-    condition.get(field).and_then(|value| value.as_str())
-}
-
-fn same_condition_state(next: &Value, previous: &Value) -> bool {
-    ["status", "reason", "message"]
-        .iter()
-        .all(|field| condition_string_field(next, field) == condition_string_field(previous, field))
-}
-
-fn preserve_condition_timestamps(condition: &mut Value, previous: Option<&Value>, now: &str) {
-    let previous_transition = previous
-        .and_then(|old| old.get("lastTransitionTime"))
-        .cloned();
-    let previous_update = previous.and_then(|old| old.get("lastUpdateTime")).cloned();
-    let previous_status = previous.and_then(|old| condition_string_field(old, "status"));
-    let next_status = condition_string_field(condition, "status");
-    let same_status = previous_status.is_some() && previous_status == next_status;
-    let same_state = previous.is_some_and(|old| same_condition_state(condition, old));
-
-    let Some(condition_obj) = condition.as_object_mut() else {
-        return;
-    };
-    let transition_time = if same_status {
-        previous_transition.unwrap_or_else(|| json!(now))
-    } else {
-        json!(now)
-    };
-    let update_time = if same_state {
-        previous_update.unwrap_or_else(|| json!(now))
-    } else {
-        json!(now)
-    };
-    condition_obj.insert("lastTransitionTime".to_string(), transition_time);
-    condition_obj.insert("lastUpdateTime".to_string(), update_time);
 }
 
 pub(super) async fn apply_revision_and_gc(

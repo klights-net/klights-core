@@ -9,6 +9,7 @@
 //! - Service is idle-silent when no replicas connect.
 //! - Request/response types support JSON and protobuf codecs.
 
+#[cfg(test)]
 pub mod apply;
 pub mod grpc;
 pub mod protocol;

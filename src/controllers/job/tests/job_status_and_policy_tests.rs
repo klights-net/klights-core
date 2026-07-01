@@ -171,6 +171,83 @@ fn test_finished_job_status_preserves_terminal_transition_time() {
     );
 }
 
+#[test]
+fn test_finished_job_status_preserves_terminal_update_time_when_state_unchanged() {
+    let finished_at = "2026-05-21T00:00:00Z";
+    let updated_at = "2026-05-21T00:00:01Z";
+    let job = json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": "stable-update-time",
+            "namespace": "default",
+            "uid": "uid-stable-update-time"
+        },
+        "spec": {
+            "completions": 1,
+            "parallelism": 1,
+            "template": {
+                "spec": {
+                    "containers": [{"name": "worker", "image": "busybox"}],
+                    "restartPolicy": "Never"
+                }
+            }
+        },
+        "status": {
+            "conditions": [{
+                "type": "Complete",
+                "status": "True",
+                "reason": "CompletionsReached",
+                "message": "Reached expected number of succeeded pods",
+                "lastProbeTime": null,
+                "lastTransitionTime": finished_at,
+                "lastUpdateTime": updated_at
+            }],
+            "completionTime": finished_at,
+            "succeeded": 1
+        }
+    });
+    let pod = crate::datastore::Resource {
+        id: 1,
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "stable-update-time-pod".to_string(),
+        uid: "uid-stable-update-time-pod".to_string(),
+        resource_version: 1,
+        data: std::sync::Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "stable-update-time-pod",
+                "namespace": "default",
+                "ownerReferences": [{
+                    "apiVersion": "batch/v1",
+                    "kind": "Job",
+                    "name": "stable-update-time",
+                    "uid": "uid-stable-update-time",
+                    "controller": true
+                }]
+            },
+            "spec": {"restartPolicy": "Never"},
+            "status": {"phase": "Succeeded"}
+        })),
+    };
+
+    let status = derive_job_status_from_owned_pods(&job, &[pod]);
+    let complete = status["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|condition| condition["type"] == "Complete")
+        .expect("completed Job should retain Complete condition");
+
+    assert_eq!(
+        complete["lastUpdateTime"], updated_at,
+        "unchanged Job terminal condition state must preserve lastUpdateTime"
+    );
+}
+
 #[tokio::test]
 async fn test_job_success_policy_not_met_no_condition() {
     // Job with successPolicy but threshold not yet reached

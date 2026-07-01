@@ -29,7 +29,7 @@ use core::{
     storage_response_for_apply, subject_key_for_command,
 };
 
-pub async fn apply_forwarded_command_with_meta(
+pub(crate) async fn apply_forwarded_command_with_meta(
     db: &dyn DatastoreBackend,
     command: StorageCommand,
     meta: CommandMeta,
@@ -66,7 +66,7 @@ pub async fn apply_forwarded_command_with_meta(
     }
 }
 
-pub async fn apply_forwarded_command(
+pub(crate) async fn apply_forwarded_command(
     db: &dyn DatastoreBackend,
     command: StorageCommand,
     authoring_node: String,

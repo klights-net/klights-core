@@ -167,6 +167,107 @@ pub fn build_condition(type_: &str, status: &str, reason: &str, message: &str) -
     })
 }
 
+pub fn condition_by_type<'a>(conditions: &'a [Value], condition_type: &str) -> Option<&'a Value> {
+    conditions.iter().find(|condition| {
+        condition.get("type").and_then(|value| value.as_str()) == Some(condition_type)
+    })
+}
+
+pub fn condition_from_status<'a>(
+    status: Option<&'a Value>,
+    condition_type: &str,
+) -> Option<&'a Value> {
+    status
+        .and_then(|status| status.get("conditions"))
+        .and_then(|conditions| conditions.as_array())
+        .and_then(|conditions| condition_by_type(conditions, condition_type))
+}
+
+pub fn preserve_condition_transition_time(
+    condition: &mut Value,
+    previous: Option<&Value>,
+    now: &str,
+) {
+    let previous_transition = previous
+        .and_then(|old| old.get("lastTransitionTime"))
+        .cloned();
+    let previous_status = previous.and_then(|old| condition_string_field(old, "status"));
+    let next_status = condition_string_field(condition, "status");
+    let same_status = previous_status.is_some() && previous_status == next_status;
+    let transition_time = if same_status {
+        previous_transition.unwrap_or_else(|| json!(now))
+    } else {
+        json!(now)
+    };
+
+    if let Some(condition_obj) = condition.as_object_mut() {
+        condition_obj.insert("lastTransitionTime".to_string(), transition_time);
+    }
+}
+
+pub fn preserve_condition_update_time(condition: &mut Value, previous: Option<&Value>, now: &str) {
+    let previous_update = previous.and_then(|old| old.get("lastUpdateTime")).cloned();
+    let same_state =
+        previous.is_some_and(|old| same_condition_state_without_timestamps(condition, old));
+    let update_time = if same_state {
+        previous_update.unwrap_or_else(|| json!(now))
+    } else {
+        json!(now)
+    };
+
+    if let Some(condition_obj) = condition.as_object_mut() {
+        condition_obj.insert("lastUpdateTime".to_string(), update_time);
+    }
+}
+
+pub fn preserve_condition_update_time_if_present(
+    condition: &mut Value,
+    previous: Option<&Value>,
+    now: &str,
+) {
+    let has_update_time = condition.get("lastUpdateTime").is_some()
+        || previous.is_some_and(|old| old.get("lastUpdateTime").is_some());
+    if has_update_time {
+        preserve_condition_update_time(condition, previous, now);
+    }
+}
+
+pub fn preserve_condition_timestamps(condition: &mut Value, previous: Option<&Value>, now: &str) {
+    preserve_condition_transition_time(condition, previous, now);
+    preserve_condition_update_time(condition, previous, now);
+}
+
+fn condition_string_field<'a>(condition: &'a Value, field: &str) -> Option<&'a str> {
+    condition.get(field).and_then(|value| value.as_str())
+}
+
+fn same_condition_state_without_timestamps(next: &Value, previous: &Value) -> bool {
+    let (Some(next_obj), Some(previous_obj)) = (next.as_object(), previous.as_object()) else {
+        return next == previous;
+    };
+
+    let next_count = next_obj
+        .keys()
+        .filter(|field| !is_condition_timestamp_field(field))
+        .count();
+    let previous_count = previous_obj
+        .keys()
+        .filter(|field| !is_condition_timestamp_field(field))
+        .count();
+    if next_count != previous_count {
+        return false;
+    }
+
+    next_obj
+        .iter()
+        .filter(|(field, _)| !is_condition_timestamp_field(field))
+        .all(|(field, value)| previous_obj.get(field) == Some(value))
+}
+
+fn is_condition_timestamp_field(field: &str) -> bool {
+    matches!(field, "lastTransitionTime" | "lastUpdateTime")
+}
+
 /// Count pods with a Ready=True condition.
 ///
 /// The `pods` slice may be any collection of `Resource` values. Pods without
