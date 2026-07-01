@@ -24,8 +24,8 @@ pub fn merge_status_for_apply(
 
     match (api_version, kind) {
         ("batch/v1", "Job") => preserve_live_status_authoritatively(live_resource, incoming_status),
-        ("v1", "PersistentVolumeClaim") => {
-            preserve_live_status_conditions_by_type(live_resource, incoming_status);
+        ("v1", "PersistentVolumeClaim" | "PersistentVolume") => {
+            preserve_unmentioned_live_status_conditions_by_type(live_resource, incoming_status);
             preserve_unmentioned_live_status_fields(live_resource, incoming_status);
         }
         _ => preserve_live_status_authoritatively(live_resource, incoming_status),
@@ -53,7 +53,10 @@ fn preserve_unmentioned_live_status_fields(live_resource: &Value, incoming_statu
     }
 }
 
-fn preserve_live_status_conditions_by_type(live_resource: &Value, incoming_status: &mut Value) {
+fn preserve_unmentioned_live_status_conditions_by_type(
+    live_resource: &Value,
+    incoming_status: &mut Value,
+) {
     let Some(live_conditions) = live_resource
         .pointer("/status/conditions")
         .and_then(Value::as_array)
@@ -74,7 +77,7 @@ fn preserve_live_status_conditions_by_type(live_resource: &Value, incoming_statu
     };
 
     let mut seen_types = std::collections::HashSet::new();
-    for incoming in incoming_conditions.iter_mut() {
+    for incoming in incoming_conditions.iter() {
         let Some(condition_type) = incoming
             .get("type")
             .and_then(Value::as_str)
@@ -83,11 +86,6 @@ fn preserve_live_status_conditions_by_type(live_resource: &Value, incoming_statu
         else {
             continue;
         };
-        if let Some(live_condition) = live_conditions.iter().find(|condition| {
-            condition.get("type").and_then(Value::as_str) == Some(condition_type.as_str())
-        }) {
-            *incoming = live_condition.clone();
-        }
         seen_types.insert(condition_type);
     }
 

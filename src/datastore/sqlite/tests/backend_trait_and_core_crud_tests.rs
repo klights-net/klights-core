@@ -1697,6 +1697,155 @@ async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
 }
 
 #[tokio::test]
+async fn stale_status_only_apply_uses_incoming_pv_and_pvc_condition_values() {
+    for (kind, namespace) in [
+        ("PersistentVolumeClaim", Some("default")),
+        ("PersistentVolume", None),
+    ] {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let name = format!("stale-status-overwrite-{kind}");
+        let uid = format!("{name}-uid");
+        let created = db
+            .create_resource(
+                "v1",
+                kind,
+                namespace,
+                &name,
+                json!({
+                    "apiVersion": "v1",
+                    "kind": kind,
+                    "metadata": {
+                        "name": name,
+                        "namespace": namespace,
+                        "uid": uid
+                    },
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "resources": {"requests": {"storage": "1Gi"}},
+                        "capacity": {"storage": "1Gi"},
+                        "persistentVolumeReclaimPolicy": "Retain"
+                    },
+                    "status": {"phase": "Pending"}
+                }),
+            )
+            .await
+            .unwrap();
+
+        let committed_status = crate::log_apply::LogApplyCommit::new(
+            created.resource_version + 2,
+            vec![crate::log_apply::LogApplyMutation::PutResource(
+                crate::log_apply::LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: kind.to_string(),
+                    namespace: namespace.map(str::to_string),
+                    name: name.clone(),
+                    uid: uid.clone(),
+                    resource_version: created.resource_version + 2,
+                    data: json!({
+                        "apiVersion": "v1",
+                        "kind": kind,
+                        "metadata": {
+                            "name": name,
+                            "namespace": namespace,
+                            "uid": uid,
+                            "resourceVersion": (created.resource_version + 2).to_string()
+                        },
+                        "spec": {},
+                        "status": {
+                            "phase": "Bound",
+                            "reason": "E2E updateStatus",
+                            "message": "E2E updateStatus",
+                            "conditions": [{
+                                "type": "StatusPatched",
+                                "status": "True",
+                                "reason": "E2E updateStatus",
+                                "message": "E2E updateStatus"
+                            }]
+                        }
+                    }),
+                    require_absent: false,
+                    require_existing: true,
+                    precondition_uid: Some(uid.clone()),
+                    precondition_resource_version: Some(created.resource_version),
+                    status_only: true,
+                },
+            )],
+        );
+
+        db.update_status_only(
+            "v1",
+            kind,
+            namespace,
+            &name,
+            json!({
+                "phase": "Pending",
+                "reason": "E2E patchStatus",
+                "message": "E2E patchStatus",
+                "conditions": [
+                    {
+                        "type": "StatusPatched",
+                        "status": "True",
+                        "reason": "E2E patchStatus",
+                        "message": "E2E patchStatus"
+                    },
+                    {
+                        "type": "LiveOnly",
+                        "status": "True",
+                        "reason": "PreserveUnmentioned"
+                    }
+                ]
+            }),
+            Some(created.resource_version),
+        )
+        .await
+        .expect("user status patch applies before committed status update");
+
+        db.apply_raft_log_apply_commit(committed_status)
+            .await
+            .expect("stale committed status update should merge onto live resource");
+
+        let live = db
+            .get_resource("v1", kind, namespace, &name)
+            .await
+            .unwrap()
+            .expect("resource remains");
+        assert_eq!(
+            live.data.pointer("/status/reason"),
+            Some(&json!("E2E updateStatus")),
+            "{kind} stale status apply must publish incoming reason"
+        );
+        assert_eq!(
+            live.data.pointer("/status/message"),
+            Some(&json!("E2E updateStatus")),
+            "{kind} stale status apply must publish incoming message"
+        );
+        let conditions = live
+            .data
+            .pointer("/status/conditions")
+            .and_then(|value| value.as_array())
+            .expect("status conditions must remain an array");
+        assert!(
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(|value| value.as_str()) == Some("StatusPatched")
+                    && condition.get("reason").and_then(|value| value.as_str())
+                        == Some("E2E updateStatus")
+                    && condition.get("message").and_then(|value| value.as_str())
+                        == Some("E2E updateStatus")
+            }),
+            "{kind} incoming same-type condition must replace the live patched value: {conditions:?}"
+        );
+        assert!(
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(|value| value.as_str()) == Some("LiveOnly")
+                    && condition.get("reason").and_then(|value| value.as_str())
+                        == Some("PreserveUnmentioned")
+            }),
+            "{kind} stale status apply must preserve live conditions omitted by incoming status: {conditions:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn raft_status_apply_built_before_preemption_preserves_disruption_target() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db
