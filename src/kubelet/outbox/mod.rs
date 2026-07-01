@@ -1175,7 +1175,7 @@ const BACKOFF_EXPONENT_CAP: u32 = 6;
 /// next attempt, starving status propagation. The window is RTT-aware and
 /// bounded: `rtt = clamp(rtt_est, 200, 3000)`; `base = clamp(2*rtt, 500, 3000)`;
 /// `upper = min(MAX_BACKOFF_MS, base * 2^min(attempt, 6))`;
-/// `lower = min(upper, max(250, base/2))`. See latency-fix.md Task 3 / Phase D.
+/// `lower = min(upper, max(250, base/2))`.
 fn adaptive_backoff_bounds(attempt: i64, rtt_est_ms: i64) -> (i64, i64) {
     let rtt = rtt_est_ms.clamp(BACKOFF_RTT_MIN_MS, BACKOFF_RTT_MAX_MS);
     let base = (2 * rtt).clamp(BACKOFF_BASE_MIN_MS, BACKOFF_BASE_MAX_MS);
@@ -2160,7 +2160,7 @@ mod tests {
         // RTT 200 ms (the default estimate), first retry (attempt 0) must land
         // well below the old 5 s linear floor so a transient apply error under
         // a ~200 ms RTT lossy link does not starve status propagation for a
-        // full 5 s (latency-fix.md Task 3 / Phase D).
+        // full 5 s.
         for key in ["pod-status-a", "pod-status-b", "pod-status-c"] {
             let sleep = super::adaptive_jittered_backoff_ms(0, key, 200);
             assert!(

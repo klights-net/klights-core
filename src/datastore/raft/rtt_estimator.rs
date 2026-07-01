@@ -1,9 +1,8 @@
-//! T4 (latency-todo): passive RTT estimator fed by raft heartbeat /
-//! AppendEntries round-trips. No extra RPCs — it consumes timing from RPCs
-//! the raft transport already makes, so it is idle-silent when no traffic
-//! flows (HR: zero idle CPU). The EWMA is stored in an atomic so a single
-//! shared estimator can be read by deadline sizing and written by the raft
-//! network without a lock on the hot path.
+//! Passive RTT estimator fed by raft heartbeat / AppendEntries round-trips. No
+//! extra RPCs — it consumes timing from RPCs the raft transport already makes,
+//! so it is idle-silent when no traffic flows (HR: zero idle CPU). The EWMA is
+//! stored in an atomic so a single shared estimator can be read by deadline
+//! sizing and written by the raft network without a lock on the hot path.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;

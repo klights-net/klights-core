@@ -2187,9 +2187,9 @@ mod cases {
     #[tokio::test]
     async fn try_set_tcp_congestion_bbr_is_infallible_on_a_real_socket() {
         // The BBR tuning helper must never propagate an error regardless of
-        // whether the host kernel exposes BBR (latency-fix.md Task 2): on a
-        // BBR-less kernel it logs at debug and returns; on a BBR kernel it
-        // sets the algorithm. Either way the caller is unaffected.
+        // whether the host kernel exposes BBR: on a BBR-less kernel it logs at
+        // debug and returns; on a BBR kernel it sets the algorithm. Either way
+        // the caller is unaffected.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();

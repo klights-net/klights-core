@@ -839,12 +839,12 @@ impl Service<Uri> for ObservedPeerTcpConnector {
 ///
 /// BBR tolerates the lossy multinode harness (and real WANs) far better than
 /// the default CUBIC, whose congestion window collapses under the ~0.5% loss
-/// profile and widens the raft-commit window that the OCC refactor narrowed
-/// (latency-fix.md Task 2 / Phase A). This must never fail the connection: if
-/// the kernel lacks BBR (older kernels, a restricted netns, or a container
-/// without the module) `setsockopt` returns `ENOENT`/`ENOPROTOOPT`, swallowed
-/// at debug level — startup must not depend on host sysctl state. This mirrors
-/// `set_nodelay`-style socket tuning and performs no blocking I/O.
+/// profile and widens the raft-commit window that the OCC refactor narrowed.
+/// This must never fail the connection: if the kernel lacks BBR (older kernels,
+/// a restricted netns, or a container without the module) `setsockopt` returns
+/// `ENOENT`/`ENOPROTOOPT`, swallowed at debug level — startup must not depend on
+/// host sysctl state. This mirrors `set_nodelay`-style socket tuning and
+/// performs no blocking I/O.
 #[cfg(target_os = "linux")]
 fn try_set_tcp_congestion_bbr(stream: &tokio::net::TcpStream) {
     use std::os::unix::io::AsRawFd;

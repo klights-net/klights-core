@@ -1,7 +1,7 @@
-//! T2 (latency-todo): zstd compression at the raft snapshot codec boundary.
-//! Snapshot payloads are JSON `RaftSnapshotData` (resource-dense) and are
-//! chunked over the wire via InstallSnapshot; fewer bytes ⇒ fewer HTTP/2
-//! frames ⇒ proportionally less loss amplification on a lossy link.
+//! zstd compression at the raft snapshot codec boundary. Snapshot payloads are
+//! JSON `RaftSnapshotData` (resource-dense) and are chunked over the wire via
+//! InstallSnapshot; fewer bytes ⇒ fewer HTTP/2 frames ⇒ proportionally less loss
+//! amplification on a lossy link.
 //!
 //! Framing is a 1-byte version tag so a future change stays decodable and an
 //! uncompressed payload (tag `RAW`) round-trips too — this also lets the

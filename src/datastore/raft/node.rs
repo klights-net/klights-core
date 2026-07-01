@@ -33,12 +33,13 @@ pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 3;
 
 /// Leader proposal flow-control cap: the maximum number of unacknowledged
 /// proposals that may be in flight simultaneously. This is DECOUPLED from
-/// `RAFT_MAX_PAYLOAD_ENTRIES` (latency-todo T1): payload entries bounds AppendEntries
+/// `RAFT_MAX_PAYLOAD_ENTRIES`: payload entries bounds AppendEntries
 /// **retransmit cost**, while this permit count bounds **RV backlog ahead of
 /// acknowledged raft progress** at the leader. OpenRaft already pipelines
 /// AppendEntries, so a small payload does NOT require a small permit count.
 /// Coupling both to 3 capped leader commit concurrency at 3 — at ~200 ms quorum
-/// RTT a hard ~15 commits/sec ceiling. Default 16 (sweep range 8..=32, see T1).
+/// RTT a hard ~15 commits/sec ceiling. Default 16 keeps the cap in the measured
+/// safe range 8..=32.
 pub(crate) const RAFT_MAX_INFLIGHT_PROPOSALS: usize = 16;
 
 pub struct RaftNode {
@@ -2882,7 +2883,7 @@ mod tests {
             RAFT_MAX_PAYLOAD_ENTRIES <= 16,
             "RAFT_MAX_PAYLOAD_ENTRIES must stay small for lossy retransmit"
         );
-        // in-flight is independently bounded (latency-todo T1: start 16, sweep 8..=32).
+        // in-flight is independently bounded in the measured safe range.
         assert!(
             (8..=32).contains(&RAFT_MAX_INFLIGHT_PROPOSALS),
             "RAFT_MAX_INFLIGHT_PROPOSALS must be a swept value in 8..=32"
