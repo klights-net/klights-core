@@ -467,6 +467,49 @@ jobs:
               | sed -E 's/(  klights_[0-9.]+-1)~(noble|resolute)(_(amd64|arm64)[.]deb)$/\1.\2\3/' \
               > SHA256SUMS
           )
+          cat > public/index.html <<'EOF_HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>klights package repository</title>
+          </head>
+          <body>
+            <main>
+              <h1>klights package repository</h1>
+              <p>Static APT and RPM package indexes for klights releases.</p>
+              <ul>
+                <li><a href="https://github.com/klights-net/klights-core">GitHub repository</a></li>
+                <li><a href="./apt/">APT repository</a></li>
+                <li><a href="./rpm/">RPM repository</a></li>
+              </ul>
+            </main>
+          </body>
+          </html>
+          EOF_HTML
+          cat > public/apt/index.html <<'EOF_HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>klights APT repository</title>
+          </head>
+          <body>
+            <main>
+              <h1>klights APT repository</h1>
+              <p>This directory contains the signed APT repository metadata for klights.</p>
+              <ul>
+                <li><a href="https://github.com/klights-net/klights-core">GitHub repository</a></li>
+                <li><a href="./klights-archive-keyring.asc">APT signing key</a></li>
+                <li><a href="./dists/noble/InRelease">Ubuntu 24.04 noble InRelease</a></li>
+                <li><a href="./dists/resolute/InRelease">Ubuntu 26.04 resolute InRelease</a></li>
+              </ul>
+            </main>
+          </body>
+          </html>
+          EOF_HTML
 
       - name: Build release notes
         run: |
@@ -584,6 +627,8 @@ jobs:
           set -euo pipefail
           base_url="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/package-repo"
           paths=(
+            "index.html"
+            "apt/index.html"
             "apt/klights-archive-keyring.asc"
             "apt/dists/noble/InRelease"
             "apt/dists/noble/Release"
@@ -621,6 +666,8 @@ jobs:
             fi
           done
 
+          curl -fsSL "${base_url}/index.html" | grep -q "https://github.com/klights-net/klights-core"
+          curl -fsSL "${base_url}/apt/index.html" | grep -q "https://github.com/klights-net/klights-core"
           curl -fsSL "${base_url}/apt/klights-archive-keyring.asc" | grep -q "BEGIN PGP PUBLIC KEY BLOCK"
           curl -fsSL "${base_url}/apt/dists/noble/InRelease" | grep -q "BEGIN PGP SIGNED MESSAGE"
           curl -fsSL "${base_url}/apt/dists/resolute/InRelease" | grep -q "BEGIN PGP SIGNED MESSAGE"
