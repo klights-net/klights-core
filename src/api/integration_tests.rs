@@ -1841,3 +1841,5 @@ mod proxy_and_apiservice;
 mod watch_and_list;
 
 mod finalizer_delete;
+
+mod mutation_semantics;
