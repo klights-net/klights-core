@@ -1100,22 +1100,10 @@ pub async fn delete_inner(
         .get_resource(api_version, kind, ns, name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("{} not found", kind)))?;
-    if let Some(expected_uid) = delete_intent.preconditions.uid.as_deref() {
-        let actual_uid = resource
-            .data
-            .pointer("/metadata/uid")
-            .and_then(|v| v.as_str());
-        if actual_uid != Some(expected_uid) {
-            return Err(AppError::Conflict("UID precondition failed".to_string()));
-        }
-    }
-    if let Some(expected_rv) = delete_intent.preconditions.resource_version
-        && resource.resource_version != expected_rv
-    {
-        return Err(AppError::Conflict(
-            "resourceVersion precondition failed".to_string(),
-        ));
-    }
+    crate::api::mutation::delete::ensure_delete_preconditions_match(
+        &resource,
+        &delete_intent.preconditions,
+    )?;
 
     let delete_options_value =
         serde_json::to_value(&delete_intent.options).unwrap_or_else(|_| serde_json::json!({}));

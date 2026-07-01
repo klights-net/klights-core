@@ -1897,7 +1897,10 @@ async fn delete_cr_inner(
     )
     .await?;
 
-    let data_with_uid = inject_resource_version(resource.data.clone(), resource.resource_version);
+    crate::api::mutation::delete::ensure_delete_preconditions_match(
+        &resource,
+        &delete_intent.preconditions,
+    )?;
     let _ = run_admission_for_request(
         state.db.as_ref(),
         build_admission_context(AdmissionContextRequest {
@@ -1922,12 +1925,6 @@ async fn delete_cr_inner(
         .into_response());
     }
 
-    let owner_uid = data_with_uid
-        .get("metadata")
-        .and_then(|m| m.get("uid"))
-        .and_then(|u| u.as_str())
-        .unwrap_or("");
-
     match (
         delete_intent.orphan_children,
         delete_intent.propagation_policy,
@@ -1940,7 +1937,7 @@ async fn delete_cr_inner(
                 ns,
                 name,
                 resource,
-                crate::datastore::ResourcePreconditions::uid(owner_uid.to_string()),
+                delete_intent.preconditions.clone(),
             )
             .await?;
 
@@ -1991,11 +1988,9 @@ async fn delete_cr_inner(
                             name,
                         },
                         initial_resource: resource,
-                        delete_preconditions: crate::datastore::ResourcePreconditions::uid(
-                            owner_uid.to_string(),
-                        ),
+                        delete_preconditions: delete_intent.preconditions.clone(),
                         orphan_children_before_completion: delete_intent.orphan_children,
-                        uid_mismatch_is_conflict: false,
+                        uid_mismatch_is_conflict: delete_intent.preconditions.uid.is_some(),
                         grace_seconds,
                     },
                 )

@@ -86,23 +86,7 @@ fn ensure_resource_preconditions_match(
     resource: &Resource,
     preconditions: &ResourcePreconditions,
 ) -> Result<(), AppError> {
-    if let Some(expected_uid) = preconditions.uid.as_deref() {
-        let actual_uid = resource
-            .data
-            .pointer("/metadata/uid")
-            .and_then(|v| v.as_str());
-        if actual_uid != Some(expected_uid) {
-            return Err(AppError::Conflict("UID precondition failed".to_string()));
-        }
-    }
-    if let Some(expected_rv) = preconditions.resource_version
-        && resource.resource_version != expected_rv
-    {
-        return Err(AppError::Conflict(
-            "resourceVersion precondition failed".to_string(),
-        ));
-    }
-    Ok(())
+    crate::api::mutation::delete::ensure_delete_preconditions_match(resource, preconditions)
 }
 
 async fn apply_pod_service_account_admission(
