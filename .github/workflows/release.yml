@@ -447,7 +447,57 @@ jobs:
             echo "::error::PACKAGE_GPG_KEY_ID was not set by the GPG import step"
             exit 1
           fi
-          scripts/package/sign-rpms.sh --packages dist/packages
+
+          mapfile -t rpm_files < <(find dist/packages -maxdepth 1 -type f -name '*.rpm' | sort)
+          if [[ "${#rpm_files[@]}" -eq 0 ]]; then
+            echo "::error::No RPM packages found in dist/packages"
+            exit 1
+          fi
+
+          tmp_sign_dir="$(mktemp -d)"
+          cleanup_sign_dir() {
+            rm -rf "$tmp_sign_dir"
+          }
+          trap cleanup_sign_dir EXIT
+
+          gpg --batch --yes --armor --export "$PACKAGE_GPG_KEY_ID" > "$tmp_sign_dir/package-public-key.asc"
+          test -s "$tmp_sign_dir/package-public-key.asc"
+          grep -q "BEGIN PGP PUBLIC KEY BLOCK" "$tmp_sign_dir/package-public-key.asc"
+
+          mkdir -p "$tmp_sign_dir/rpmdb"
+          rpm --define "_dbpath $tmp_sign_dir/rpmdb" --import "$tmp_sign_dir/package-public-key.asc"
+
+          sign_defines=(
+            --define "_signature gpg"
+            --define "_gpg_name $PACKAGE_GPG_KEY_ID"
+            --define "__gpg /usr/bin/gpg"
+            --define "_gpg_digest_algo sha256"
+          )
+
+          if [[ -n "${PACKAGE_GPG_PASSPHRASE:-}" ]]; then
+            install -d -m 0700 "$HOME/.gnupg"
+            grep -qxF "allow-loopback-pinentry" "$HOME/.gnupg/gpg-agent.conf" 2>/dev/null \
+              || echo "allow-loopback-pinentry" >> "$HOME/.gnupg/gpg-agent.conf"
+            gpg-connect-agent reloadagent /bye >/dev/null 2>&1 || true
+
+            passphrase_file="$tmp_sign_dir/passphrase"
+            printf '%s' "$PACKAGE_GPG_PASSPHRASE" > "$passphrase_file"
+            chmod 0600 "$passphrase_file"
+            sign_defines+=(
+              --define "_gpg_sign_cmd_extra_args --batch --yes --pinentry-mode loopback --passphrase-file $passphrase_file"
+            )
+          fi
+
+          rpmsign --addsign "${sign_defines[@]}" "${rpm_files[@]}"
+
+          for rpm_file in "${rpm_files[@]}"; do
+            check_output="$(rpm --define "_dbpath $tmp_sign_dir/rpmdb" --checksig --verbose "$rpm_file")"
+            printf '%s\n' "$check_output"
+            if ! grep -Eq 'Header .*Signature.*, key ID .*, OK|digests signatures OK' <<<"$check_output"; then
+              echo "::error::RPM signature verification failed for $rpm_file"
+              exit 1
+            fi
+          done
 
       - name: Build package repository metadata
         env:
