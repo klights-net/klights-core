@@ -96,6 +96,77 @@ pub async fn run_hooks_logged(
     }
 }
 
+/// Run all registered delete hooks for `resource`, logging and counting any
+/// failure without propagating it back to the already-successful mutation.
+pub async fn run_delete_hooks_logged(
+    registry: &SideEffectRegistry,
+    resource: &serde_json::Value,
+    db: &dyn crate::datastore::DatastoreBackend,
+    metrics: &SideEffectMetrics,
+    context: &'static str,
+) {
+    let api_version = resource
+        .get("apiVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let kind = resource
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let namespace = resource
+        .pointer("/metadata/namespace")
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string());
+    let name = resource
+        .pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let (failures, failed) = registry
+        .run_delete_hooks_collect_failures(resource, db)
+        .await;
+
+    for failure in &failures {
+        metrics.record_recent_failure(crate::side_effects::metrics::SideEffectFailureEntry {
+            api_version: api_version.clone(),
+            kind: kind.clone(),
+            namespace: namespace.clone(),
+            name: name.clone(),
+            hook: failure.hook.to_string(),
+            context: context.to_string(),
+            error: failure.error.clone(),
+        });
+    }
+
+    if failed {
+        metrics
+            .side_effect_failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(error) = failures.first() {
+            tracing::error!(
+                context,
+                hook = %error.hook,
+                error = %error.error,
+                "delete side-effect hooks failed"
+            );
+        } else {
+            tracing::error!(context, "delete side-effect hooks failed");
+        }
+        return;
+    }
+
+    if !failures.is_empty() {
+        tracing::warn!(
+            context,
+            side_effect_failures = failures.len(),
+            "delete side-effect hooks failed with non-fatal policy"
+        );
+    }
+}
+
 /// Run one registered hook by name for `resource`, logging and counting any
 /// failure with the same policy as `run_hooks_logged`.
 pub async fn run_named_hook_logged(

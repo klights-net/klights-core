@@ -8,6 +8,28 @@
 
 use crate::api::*;
 
+async fn dispatch_pod_handler_mutation_event(
+    state: &Arc<AppState>,
+    operation: crate::api::mutation::MutationOperation,
+    resource: &Value,
+    context: &'static str,
+) {
+    crate::api::mutation::dispatch_mutation_event(
+        &state.side_effects,
+        state.db.as_ref(),
+        &state.metrics,
+        crate::api::mutation::MutationEvent {
+            operation,
+            resource,
+            old_resource: None,
+            persisted: true,
+            dry_run: crate::api::mutation::DryRunMode::Live,
+            context,
+        },
+    )
+    .await;
+}
+
 pub async fn list_pods(
     State(state): State<Arc<AppState>>,
     Path(namespace): Path<String>,
@@ -243,10 +265,13 @@ pub async fn create_pod(
     .await?;
 
     if let Some(resource) = result.resource {
-        let _ = state
-            .side_effects
-            .run_hooks(&resource.data, state.db.as_ref())
-            .await;
+        dispatch_pod_handler_mutation_event(
+            &state,
+            crate::api::mutation::MutationOperation::Create,
+            &resource.data,
+            "pod_create",
+        )
+        .await;
         let data = inject_resource_version(resource.data, resource.resource_version);
         return Ok((StatusCode::CREATED, Json(data)));
     }
@@ -306,11 +331,13 @@ pub async fn update_pod(
 
     reconcile_owner_refs_after_mutation(&state, &resource, "namespaced_update").await;
 
-    // P3d-1: post-update side effects dispatched centrally.
-    let _ = state
-        .side_effects
-        .run_hooks(&resource.data, state.db.as_ref())
-        .await;
+    dispatch_pod_handler_mutation_event(
+        &state,
+        crate::api::mutation::MutationOperation::Update,
+        &resource.data,
+        "pod_update",
+    )
+    .await;
 
     let data = inject_resource_version(resource.data, resource.resource_version);
     Ok(Json(data))
@@ -344,13 +371,13 @@ pub async fn delete_pod(
             Ok((StatusCode::OK, Json(v)))
         }
         crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(r) => {
-            // Fire side effects (ResourceQuota recount, etc.) after
-            // pod deletionTimestamp is set. The pod still exists in the
-            // datastore but the RQ reconciler excludes terminating pods.
-            let _ = state
-                .side_effects
-                .run_hooks(&r.data, state.db.as_ref())
-                .await;
+            dispatch_pod_handler_mutation_event(
+                &state,
+                crate::api::mutation::MutationOperation::DeleteMark,
+                &r.data,
+                "pod_delete_mark",
+            )
+            .await;
             let result =
                 crate::api::mutation::response::accepted_object(r.data, r.resource_version);
             Ok((StatusCode::ACCEPTED, Json(result)))
@@ -426,11 +453,13 @@ pub async fn patch_pod(
 
     reconcile_owner_refs_after_mutation(&state, &resource, "namespaced_patch").await;
 
-    // P3d-1: post-patch side effects dispatched centrally.
-    let _ = state
-        .side_effects
-        .run_hooks(&resource.data, state.db.as_ref())
-        .await;
+    dispatch_pod_handler_mutation_event(
+        &state,
+        crate::api::mutation::MutationOperation::Patch,
+        &resource.data,
+        "pod_patch",
+    )
+    .await;
 
     let data = inject_resource_version(resource.data, resource.resource_version);
     Ok(Json(data))
@@ -473,7 +502,13 @@ pub async fn delete_collection_pods(
             "kind": "Pod",
             "metadata": {"namespace": namespace.clone()},
         });
-        let _ = state.side_effects.run_hooks(&stub, state.db.as_ref()).await;
+        dispatch_pod_handler_mutation_event(
+            &state,
+            crate::api::mutation::MutationOperation::DeleteMark,
+            &stub,
+            "pod_delete_collection",
+        )
+        .await;
     }
 
     Ok(Json(

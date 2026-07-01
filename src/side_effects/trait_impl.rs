@@ -254,17 +254,19 @@ impl SideEffectRegistry {
     }
 
     /// Run all registered delete hooks for a resource type.
-    pub async fn run_delete_hooks(
+    pub async fn run_delete_hooks_collect_failures(
         &self,
         resource: &Value,
         db: &dyn DatastoreBackend,
-    ) -> Result<()> {
+    ) -> (Vec<SideEffectFailure>, bool) {
         let api_version = resource
             .get("apiVersion")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let kind = resource.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let key = (api_version, kind);
+        let mut failures = Vec::new();
+        let mut fatal = false;
         if let Some(hooks) = self.hooks.get(&key) {
             for hook in hooks {
                 match hook.side_effect.apply_delete(resource, db).await {
@@ -276,6 +278,10 @@ impl SideEffectRegistry {
                     }
                     Err(error) => match hook.policy {
                         ErrorPolicy::Ignore => {
+                            failures.push(SideEffectFailure {
+                                hook: hook.side_effect.name(),
+                                error: error.to_string(),
+                            });
                             tracing::debug!(
                                 side_effect = %hook.side_effect.name(),
                                 error = %error,
@@ -283,15 +289,43 @@ impl SideEffectRegistry {
                             );
                         }
                         ErrorPolicy::Warn => {
+                            failures.push(SideEffectFailure {
+                                hook: hook.side_effect.name(),
+                                error: error.to_string(),
+                            });
                             tracing::warn!(
                                 side_effect = %hook.side_effect.name(),
                                 error = %error,
                                 "delete side-effect failed"
                             );
                         }
-                        ErrorPolicy::Fail => return Err(error),
+                        ErrorPolicy::Fail => {
+                            failures.push(SideEffectFailure {
+                                hook: hook.side_effect.name(),
+                                error: error.to_string(),
+                            });
+                            fatal = true;
+                            break;
+                        }
                     },
                 }
+            }
+        }
+        (failures, fatal)
+    }
+
+    /// Run all registered delete hooks for a resource type.
+    pub async fn run_delete_hooks(
+        &self,
+        resource: &Value,
+        db: &dyn DatastoreBackend,
+    ) -> Result<()> {
+        let (failures, fatal) = self.run_delete_hooks_collect_failures(resource, db).await;
+        if fatal {
+            if let Some(error) = failures.into_iter().next() {
+                anyhow::bail!(error.error)
+            } else {
+                anyhow::bail!("delete side-effect hook failed")
             }
         }
         Ok(())

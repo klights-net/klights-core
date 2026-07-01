@@ -99,6 +99,28 @@ async fn maybe_reconcile_cluster_role_aggregation(
     }
 }
 
+async fn dispatch_generated_mutation_event(
+    state: &Arc<AppState>,
+    operation: crate::api::mutation::MutationOperation,
+    resource: &Value,
+    context: &'static str,
+) {
+    crate::api::mutation::dispatch_mutation_event(
+        &state.side_effects,
+        state.db.as_ref(),
+        &state.metrics,
+        crate::api::mutation::MutationEvent {
+            operation,
+            resource,
+            old_resource: None,
+            persisted: true,
+            dry_run: crate::api::mutation::DryRunMode::Live,
+            context,
+        },
+    )
+    .await;
+}
+
 pub async fn mark_foreground_deletion_with_retry(
     db: &dyn DatastoreBackend,
     api_version: &str,
@@ -208,10 +230,13 @@ async fn run_post_hard_delete_effects(
         );
     }
 
-    let _ = state
-        .side_effects
-        .run_delete_hooks(&resource.data, state.db.as_ref())
-        .await;
+    dispatch_generated_mutation_event(
+        state,
+        crate::api::mutation::MutationOperation::HardDelete,
+        &resource.data,
+        "generated_hard_delete",
+    )
+    .await;
 
     if !cascade {
         return;
@@ -570,10 +595,13 @@ pub async fn create_inner(
             .await?;
 
         if let Some(resource) = result.resource {
-            let _ = state
-                .side_effects
-                .run_hooks(&resource.data, state.db.as_ref())
-                .await;
+            dispatch_generated_mutation_event(
+                &state,
+                crate::api::mutation::MutationOperation::Create,
+                &resource.data,
+                "pod_create",
+            )
+            .await;
             let data = inject_resource_version(resource.data, resource.resource_version);
             return Ok((StatusCode::CREATED, Json(data)));
         }
@@ -783,10 +811,18 @@ pub async fn create_inner(
         }
     }
 
-    let _ = state
-        .side_effects
-        .run_hooks(&resource.data, state.db.as_ref())
-        .await;
+    let context = if ns.is_some() {
+        "namespaced_create"
+    } else {
+        "cluster_create"
+    };
+    dispatch_generated_mutation_event(
+        &state,
+        crate::api::mutation::MutationOperation::Create,
+        &resource.data,
+        context,
+    )
+    .await;
 
     let data = inject_resource_version(resource.data, resource.resource_version);
     enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
@@ -966,10 +1002,13 @@ pub async fn update_inner(
     )
     .await;
 
-    let _ = state
-        .side_effects
-        .run_hooks(&resource.data, state.db.as_ref())
-        .await;
+    dispatch_generated_mutation_event(
+        &state,
+        crate::api::mutation::MutationOperation::Update,
+        &resource.data,
+        context,
+    )
+    .await;
 
     // Reconcile kube-root-ca.crt if the ca.crt data was cleared or modified.
     // The K8s conformance test clears the data and expects the control
@@ -1153,10 +1192,13 @@ pub async fn delete_inner(
                     namespace = %r.data.pointer("/metadata/namespace").and_then(|v| v.as_str()).unwrap_or("?"),
                     "pod delete GracefulSet: firing side effects"
                 );
-                let _ = state
-                    .side_effects
-                    .run_hooks(&r.data, state.db.as_ref())
-                    .await;
+                dispatch_generated_mutation_event(
+                    &state,
+                    crate::api::mutation::MutationOperation::DeleteMark,
+                    &r.data,
+                    "pod_delete_mark",
+                )
+                .await;
                 Ok((
                     StatusCode::ACCEPTED,
                     Json(crate::api::mutation::response::accepted_object(
@@ -1351,10 +1393,13 @@ pub async fn delete_inner(
     // Endpoints' normal hook is mirror-upsert; after hard delete the
     // endpoint-mirror delete hook above is authoritative.
     if kind != "ResourceQuota" && kind != "Endpoints" {
-        let _ = state
-            .side_effects
-            .run_hooks(&resource.data, state.db.as_ref())
-            .await;
+        dispatch_generated_mutation_event(
+            &state,
+            crate::api::mutation::MutationOperation::DeleteMark,
+            &resource.data,
+            "generated_delete_reconcile",
+        )
+        .await;
     }
 
     let data =
@@ -1488,10 +1533,13 @@ pub async fn patch_inner(
                 kind,
             )
             .await;
-            let _ = state
-                .side_effects
-                .run_hooks(&resource.data, state.db.as_ref())
-                .await;
+            dispatch_generated_mutation_event(
+                &state,
+                crate::api::mutation::MutationOperation::Create,
+                &resource.data,
+                context,
+            )
+            .await;
             let data = inject_resource_version(resource.data, resource.resource_version);
             maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
             return Ok(Json(data));
@@ -1677,10 +1725,13 @@ pub async fn patch_inner(
                 )
                 .await;
 
-                let _ = state
-                    .side_effects
-                    .run_hooks(&resource.data, state.db.as_ref())
-                    .await;
+                dispatch_generated_mutation_event(
+                    &state,
+                    crate::api::mutation::MutationOperation::Patch,
+                    &resource.data,
+                    context,
+                )
+                .await;
 
                 let data = inject_resource_version(resource.data, resource.resource_version);
                 if !(api_version == "v1" && kind == "Service") {
@@ -1817,7 +1868,13 @@ pub async fn delete_collection_shared_inner(
             "kind": kind,
             "metadata": metadata,
         });
-        let _ = state.side_effects.run_hooks(&stub, state.db.as_ref()).await;
+        dispatch_generated_mutation_event(
+            &state,
+            crate::api::mutation::MutationOperation::DeleteMark,
+            &stub,
+            "generated_delete_collection",
+        )
+        .await;
     }
 
     maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;

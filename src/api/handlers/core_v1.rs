@@ -585,12 +585,18 @@ async fn delete_service(
 
     state.network.services.request_services_sync();
 
-    crate::side_effects::run_hooks_logged(
+    crate::api::mutation::dispatch_mutation_event(
         &state.side_effects,
-        &resource.data,
         state.db.as_ref(),
         &state.metrics,
-        "service_delete",
+        crate::api::mutation::MutationEvent {
+            operation: crate::api::mutation::MutationOperation::DeleteMark,
+            resource: &resource.data,
+            old_resource: None,
+            persisted: true,
+            dry_run: crate::api::mutation::DryRunMode::Live,
+            context: "service_delete",
+        },
     )
     .await;
 
