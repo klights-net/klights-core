@@ -5740,6 +5740,155 @@ async fn node_get_and_list_inject_last_heartbeat_time_only_on_raft_leader() {
 }
 
 #[tokio::test]
+async fn raft_follower_without_leader_returns_503_for_get_list_watch_and_write() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn raft_proxy_without_leader() -> std::sync::Arc<crate::api::raft_proxy::RaftLeaderProxy> {
+        let (_, is_leader_rx) = tokio::sync::watch::channel(false);
+        let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
+        std::sync::Arc::new(crate::api::raft_proxy::RaftLeaderProxy::new(
+            is_leader_rx,
+            leader_addr_rx,
+            None,
+        ))
+    }
+
+    async fn follower_response(
+        state: crate::api::AppState,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> axum::response::Response {
+        let app = crate::api::build_router(state);
+        let mut builder = Request::builder().method(method).uri(uri);
+        let body = if let Some(value) = body {
+            builder = builder.header("content-type", "application/json");
+            Body::from(serde_json::to_vec(&value).unwrap())
+        } else {
+            Body::empty()
+        };
+        app.oneshot(
+            builder
+                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn assert_retryable_503(response: axum::response::Response) {
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["apiVersion"], "v1");
+        assert_eq!(body["kind"], "Status");
+        assert_eq!(body["status"], "Failure");
+        assert_eq!(body["reason"], "ServiceUnavailable");
+        assert_eq!(body["code"], 503);
+    }
+
+    let mut follower_state = crate::api::test_support::build_test_app_state().await;
+    follower_state.is_raft_leader_rx = Some(raft_proxy_without_leader());
+
+    for (method, uri, body) in [
+        ("GET", "/api/v1/nodes/worker-a", None),
+        ("GET", "/api/v1/nodes", None),
+        ("GET", "/api/v1/nodes?watch=true", None),
+        (
+            "POST",
+            "/api/v1/namespaces/default/configmaps",
+            Some(json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "follower-write"},
+                "data": {"key": "value"}
+            })),
+        ),
+    ] {
+        let response = follower_response(follower_state.clone(), method, uri, body).await;
+        assert_retryable_503(response).await;
+    }
+}
+
+#[tokio::test]
+async fn raft_follower_with_unreachable_leader_returns_503_without_local_handler_side_effects() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let mut follower_state = crate::api::test_support::build_test_app_state().await;
+    let (_, is_leader_rx) = tokio::sync::watch::channel(false);
+    let (_, leader_addr_rx) = tokio::sync::watch::channel(Some(format!("http://{addr}")));
+    follower_state.is_raft_leader_rx = Some(std::sync::Arc::new(
+        crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
+    ));
+    follower_state
+        .db
+        .create_resource(
+            "v1",
+            "Node",
+            None,
+            "worker-a",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "worker-a"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let app = crate::api::build_router(follower_state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/nodes/worker-a")
+                .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["kind"], "Status");
+    assert_eq!(body["reason"], "ServiceUnavailable");
+    assert_eq!(body["code"], 503);
+}
+
+#[tokio::test]
 async fn test_task_supervisor_db_query_logging_toggle() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
