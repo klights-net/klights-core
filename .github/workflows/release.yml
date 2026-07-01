@@ -493,7 +493,7 @@ jobs:
           for rpm_file in "${rpm_files[@]}"; do
             check_output="$(rpm --define "_dbpath $tmp_sign_dir/rpmdb" --checksig --verbose "$rpm_file")"
             printf '%s\n' "$check_output"
-            if ! grep -Eq 'Header .*Signature.*, key ID .*, OK|digests signatures OK' <<<"$check_output"; then
+            if ! grep -Eq 'Header .*Signature.*, key ID .*: OK|digests signatures OK' <<<"$check_output"; then
               echo "::error::RPM signature verification failed for $rpm_file"
               exit 1
             fi
