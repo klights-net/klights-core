@@ -228,12 +228,9 @@ pub async fn delete_collection_customresourcedefinitions(
             )
             .await;
     }
-    Ok(Json(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Status",
-        "status": "Success",
-        "code": 200,
-    })))
+    Ok(Json(
+        crate::api::mutation::response::delete_collection_success_status(),
+    ))
 }
 
 /// Merge existing storedVersions with the current storage version.

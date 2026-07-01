@@ -119,6 +119,6 @@ async fn delete_collection_ingressclasses(
             .await;
     }
     Ok(Json(
-        serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200}),
+        crate::api::mutation::response::delete_collection_success_status(),
     ))
 }

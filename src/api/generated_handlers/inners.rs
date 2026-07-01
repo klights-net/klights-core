@@ -640,9 +640,9 @@ pub async fn create_inner(
     )
     .await?;
 
-    body = run_admission_for_request(
+    body = crate::api::mutation::write::run_admission(
         state.db.as_ref(),
-        build_admission_context(AdmissionContextRequest {
+        AdmissionContextRequest {
             api_version,
             kind,
             operation: "CREATE",
@@ -657,7 +657,7 @@ pub async fn create_inner(
             dry_run: is_dry_run,
             subresource: None,
             options: None,
-        }),
+        },
     )
     .await?;
 
@@ -891,9 +891,9 @@ pub async fn update_inner(
     )
     .await?;
 
-    body = run_admission_for_request(
+    body = crate::api::mutation::write::run_admission(
         state.db.as_ref(),
-        build_admission_context(AdmissionContextRequest {
+        AdmissionContextRequest {
             api_version,
             kind,
             operation: "UPDATE",
@@ -904,7 +904,7 @@ pub async fn update_inner(
             dry_run: is_dry_run,
             subresource: None,
             options: None,
-        }),
+        },
     )
     .await?;
 
@@ -1150,9 +1150,9 @@ pub async fn delete_inner(
 
     let delete_options_value =
         serde_json::to_value(&delete_intent.options).unwrap_or_else(|_| serde_json::json!({}));
-    let _ = run_admission_for_request(
+    let _ = crate::api::mutation::write::run_admission(
         state.db.as_ref(),
-        build_admission_context(AdmissionContextRequest {
+        AdmissionContextRequest {
             api_version,
             kind,
             operation: "DELETE",
@@ -1163,7 +1163,7 @@ pub async fn delete_inner(
             dry_run: is_dry_run,
             subresource: None,
             options: Some(delete_options_value),
-        }),
+        },
     )
     .await?;
 
@@ -1495,9 +1495,9 @@ pub async fn patch_inner(
                 apply_force,
             )
             .map_err(|conflicts| AppError::Conflict(conflicts.message()))?;
-            let admitted = run_admission_for_request(
+            let admitted = crate::api::mutation::write::run_admission(
                 state.db.as_ref(),
-                build_admission_context(AdmissionContextRequest {
+                AdmissionContextRequest {
                     api_version,
                     kind,
                     operation: "CREATE",
@@ -1508,7 +1508,7 @@ pub async fn patch_inner(
                     dry_run: is_dry_run,
                     subresource: None,
                     options: None,
-                }),
+                },
             )
             .await?;
             if let Some(namespace) = ns {
@@ -1593,9 +1593,9 @@ pub async fn patch_inner(
         )
         .await?;
 
-        patched = run_admission_for_request(
+        patched = crate::api::mutation::write::run_admission(
             state.db.as_ref(),
-            build_admission_context(AdmissionContextRequest {
+            AdmissionContextRequest {
                 api_version,
                 kind,
                 operation: "UPDATE",
@@ -1606,7 +1606,7 @@ pub async fn patch_inner(
                 dry_run: is_dry_run,
                 subresource: None,
                 options: None,
-            }),
+            },
         )
         .await?;
 

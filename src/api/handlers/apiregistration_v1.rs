@@ -52,12 +52,9 @@ pub async fn delete_collection_apiservices(
             .await;
     }
     state.apiservice_proxy_cache.clear().await;
-    Ok(Json(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Status",
-        "status": "Success",
-        "code": 200,
-    })))
+    Ok(Json(
+        crate::api::mutation::response::delete_collection_success_status(),
+    ))
 }
 
 pub async fn delete_apiservice_with_cache_invalidation(

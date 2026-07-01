@@ -1,5 +1,8 @@
 use serde_json::Value;
 
+use crate::api::{AdmissionContextRequest, AppError};
+use crate::datastore::DatastoreBackend;
+
 pub fn prepare_create_metadata(ns: Option<&str>, body: &mut Value, resource_name: &str) {
     crate::api::inject_create_metadata(ns, body, resource_name);
 }
@@ -10,6 +13,13 @@ pub fn prepare_builtin_generation_for_update(kind: &str, current: &Value, body: 
 
 pub fn prepare_custom_generation_for_update(current: &Value, body: &mut Value) {
     crate::api::increment_generation_for_spec_change(current, body);
+}
+
+pub async fn run_admission(
+    db: &dyn DatastoreBackend,
+    request: AdmissionContextRequest<'_>,
+) -> Result<Value, AppError> {
+    crate::api::run_admission_for_request(db, crate::api::build_admission_context(request)).await
 }
 
 #[cfg(test)]
