@@ -9,6 +9,30 @@ Start with [QUICKSTART.md](QUICKSTART.md).
 
 Build, run, configuration, and operations documentation [doc/README.md](doc/README.md).
 
+## Install from APT
+
+Ubuntu 24.04 (`noble`) and Ubuntu 26.04 (`resolute`) packages are published in
+the signed public APT repository.
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL \
+  https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/klights-archive-keyring.asc \
+  -o /etc/apt/keyrings/klights-archive-keyring.asc
+sudo chmod 0644 /etc/apt/keyrings/klights-archive-keyring.asc
+sudo tee /etc/apt/sources.list.d/klights.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt/
+Suites: noble
+Components: main
+Signed-By: /etc/apt/keyrings/klights-archive-keyring.asc
+EOF
+sudo apt-get update
+sudo apt-get install -y klights
+```
+
+For Ubuntu 26.04, use `Suites: resolute` instead of `Suites: noble`.
+
 ### Sonobuoy Conformance tests
 Klights completed Sonobuoy Conformance tests with 3 raft controlplanes, one replicas and 2 workers nodes.
 
@@ -72,4 +96,3 @@ The cgroup number includes embedded runtime overhead, not just the klights proce
 Current release support is limited to rootful local development mode. Rootless
 operation, hybrid rootless/root clusters, expanded CNI plugin support, and
 containerd-free runtime support are not available in this release.
-
