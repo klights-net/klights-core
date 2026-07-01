@@ -1598,13 +1598,10 @@ async fn delete_collection_cr_inner(
 
     let dry_run = crate::api::mutation::DryRunMode::from_delete_collection_query(query)?;
     if dry_run.is_all() {
-        return Ok(Json(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Status",
-            "status": "Success",
-            "code": 200
-        }))
-        .into_response());
+        return Ok(
+            Json(crate::api::mutation::response::delete_collection_success_status())
+                .into_response(),
+        );
     }
 
     let mut unique_names = std::collections::HashSet::new();
@@ -1658,13 +1655,7 @@ async fn delete_collection_cr_inner(
         }
     }
 
-    Ok(Json(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Status",
-        "status": "Success",
-        "code": 200
-    }))
-    .into_response())
+    Ok(Json(crate::api::mutation::response::delete_collection_success_status()).into_response())
 }
 
 pub async fn delete_collection_custom_resources(
@@ -1925,16 +1916,9 @@ async fn delete_cr_inner(
     .await?;
 
     if is_dry_run {
-        return Ok(Json(serde_json::json!({
-            "kind": "Status",
-            "apiVersion": "v1",
-            "metadata": {},
-            "status": "Success",
-            "details": {
-                "name": name,
-                "kind": info.kind,
-            }
-        }))
+        return Ok(Json(crate::api::mutation::response::delete_success_status(
+            &info.kind, name,
+        ))
         .into_response());
     }
 
@@ -1985,7 +1969,10 @@ async fn delete_cr_inner(
                     group,
                     plural,
                     &requested_api_version,
-                    inject_resource_version(latest.data, latest.resource_version),
+                    crate::api::mutation::response::accepted_object(
+                        latest.data,
+                        latest.resource_version,
+                    ),
                 )
                 .await?;
                 return Ok((StatusCode::ACCEPTED, Json(normalized)).into_response());
@@ -2022,7 +2009,10 @@ async fn delete_cr_inner(
                         group,
                         plural,
                         &requested_api_version,
-                        inject_resource_version(updated.data, updated.resource_version),
+                        crate::api::mutation::response::accepted_object(
+                            updated.data,
+                            updated.resource_version,
+                        ),
                     )
                     .await?;
                     return Ok((StatusCode::ACCEPTED, Json(normalized)).into_response());
@@ -2053,16 +2043,9 @@ async fn delete_cr_inner(
         }
     }
 
-    Ok(Json(serde_json::json!({
-        "kind": "Status",
-        "apiVersion": "v1",
-        "metadata": {},
-        "status": "Success",
-        "details": {
-            "name": name,
-            "kind": info.kind,
-        }
-    }))
+    Ok(Json(crate::api::mutation::response::delete_success_status(
+        &info.kind, name,
+    ))
     .into_response())
 }
 

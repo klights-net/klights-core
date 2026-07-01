@@ -1167,7 +1167,10 @@ pub async fn delete_inner(
                     .await;
                 Ok((
                     StatusCode::ACCEPTED,
-                    Json(inject_resource_version(r.data, r.resource_version)),
+                    Json(crate::api::mutation::response::accepted_object(
+                        r.data,
+                        r.resource_version,
+                    )),
                 ))
             }
         };
@@ -1176,7 +1179,8 @@ pub async fn delete_inner(
     if is_dry_run {
         let mut del_data: Value = (*resource.data).clone();
         set_deletion_timestamp(&mut del_data);
-        let result = inject_resource_version(del_data, resource.resource_version);
+        let result =
+            crate::api::mutation::response::persisted_object(del_data, resource.resource_version);
         return Ok((StatusCode::OK, Json(result)));
     }
 
@@ -1214,7 +1218,8 @@ pub async fn delete_inner(
         )
         .await;
         maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
-        let data = inject_resource_version(updated.data, updated.resource_version);
+        let data =
+            crate::api::mutation::response::accepted_object(updated.data, updated.resource_version);
         return Ok((StatusCode::ACCEPTED, Json(data)));
     }
 
@@ -1244,7 +1249,10 @@ pub async fn delete_inner(
                 kind,
             )
             .await;
-            let data = inject_resource_version(updated.data, updated.resource_version);
+            let data = crate::api::mutation::response::accepted_object(
+                updated.data,
+                updated.resource_version,
+            );
             return Ok((StatusCode::ACCEPTED, Json(data)));
         }
         crate::api::finalizer_delete::DeleteCompletion::GoneOrUidChanged => {
@@ -1357,7 +1365,8 @@ pub async fn delete_inner(
             .await;
     }
 
-    let data = inject_resource_version(resource.data, resource.resource_version);
+    let data =
+        crate::api::mutation::response::persisted_object(resource.data, resource.resource_version);
     maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
     Ok((StatusCode::OK, Json(data)))
 }
@@ -1749,12 +1758,9 @@ pub async fn delete_collection_shared_inner(
         .await?;
 
     if is_dry_run {
-        return Ok(Json(serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Status",
-            "status": "Success",
-            "code": 200,
-        })));
+        return Ok(Json(
+            crate::api::mutation::response::delete_collection_success_status(),
+        ));
     }
 
     for resource in list.items {
@@ -1820,12 +1826,9 @@ pub async fn delete_collection_shared_inner(
 
     maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
 
-    Ok(Json(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Status",
-        "status": "Success",
-        "code": 200,
-    })))
+    Ok(Json(
+        crate::api::mutation::response::delete_collection_success_status(),
+    ))
 }
 
 #[cfg(test)]

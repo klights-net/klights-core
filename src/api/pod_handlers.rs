@@ -351,7 +351,8 @@ pub async fn delete_pod(
                 .side_effects
                 .run_hooks(&r.data, state.db.as_ref())
                 .await;
-            let result = inject_resource_version(r.data, r.resource_version);
+            let result =
+                crate::api::mutation::response::accepted_object(r.data, r.resource_version);
             Ok((StatusCode::ACCEPTED, Json(result)))
         }
     }
@@ -475,13 +476,9 @@ pub async fn delete_collection_pods(
         let _ = state.side_effects.run_hooks(&stub, state.db.as_ref()).await;
     }
 
-    // Return K8s Status object
-    Ok(Json(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Status",
-        "status": "Success",
-        "code": 200,
-    })))
+    Ok(Json(
+        crate::api::mutation::response::delete_collection_success_status(),
+    ))
 }
 
 pub async fn list_all_pods(
