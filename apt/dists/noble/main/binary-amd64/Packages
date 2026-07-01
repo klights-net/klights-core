@@ -1,0 +1,16 @@
+Package: klights
+Version: 0.9.10-1~noble
+Architecture: amd64
+Maintainer: klights maintainers <maintainers@klights.net>
+Depends: containerd, iproute2, kmod, libmnl0, libnftnl11, nftables
+Filename: pool/noble/main/k/klights/klights_0.9.10-1~noble_amd64.deb
+Size: 23074592
+MD5sum: f031919b9f71db47fd11141892c02116
+SHA1: 36a32cf0bc7e3247c92a69f667641a1b4e90d263
+SHA256: a008b44f074fcd7b9421859d15708d0d3e5661539bf7cd358a07428ba0335dfa
+Section: admin
+Priority: optional
+Description: Lightweight Kubernetes runtime
+ Klights packages an async, minimal Kubernetes-compatible control plane and
+ node runtime stack for local clusters.
+

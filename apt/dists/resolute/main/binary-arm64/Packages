@@ -1,0 +1,16 @@
+Package: klights
+Version: 0.9.10-1~resolute
+Architecture: arm64
+Maintainer: klights maintainers <maintainers@klights.net>
+Depends: containerd, iproute2, kmod, libmnl0, libnftnl11, nftables
+Filename: pool/resolute/main/k/klights/klights_0.9.10-1~resolute_arm64.deb
+Size: 21921854
+MD5sum: 8c0f8b5e74811c897f931f5e7dcb6fe7
+SHA1: 41a04ac48d20a334077701987cff34eb3c31c677
+SHA256: ba79443c2d9d530f268460693bd01d698730e13c27388836c4cbfb033ee7f86e
+Section: admin
+Priority: optional
+Description: Lightweight Kubernetes runtime
+ Klights packages an async, minimal Kubernetes-compatible control plane and
+ node runtime stack for local clusters.
+

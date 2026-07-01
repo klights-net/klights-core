@@ -1,0 +1,31 @@
+Architectures: amd64 arm64
+Codename: resolute
+Components: main
+Date: Wed, 01 Jul 2026 15:13:34 +0000
+Label: klights
+Origin: klights
+Suite: resolute
+MD5Sum:
+ dd14f419077b66364461a1f0e0dcdbcc              148 Release
+ 2f84b8d21dccb185cc996b1f9e5b6d26              635 main/binary-amd64/Packages
+ 5f0b8b95044646d2061fff4c03fceb4a              441 main/binary-amd64/Packages.gz
+ 795092c4bd4d45be7b5dc7d2eb65f007              635 main/binary-arm64/Packages
+ 656617aa3192854f83d6ff58301d6e58              440 main/binary-arm64/Packages.gz
+SHA1:
+ d333c3a3a4277672ec6e8f20bf8c2677df0fd41d              148 Release
+ 2cdcb3f3385fe5ee8c9f360b5fd3a771aadfc74a              635 main/binary-amd64/Packages
+ bf4b4c590f91dbbf6a66ad9f1b035db50add9137              441 main/binary-amd64/Packages.gz
+ 1849d94b8cfbc890a51cd410fc4de06d1ecc98ec              635 main/binary-arm64/Packages
+ 886650be4ea6790054e64dbbe76ecef4366e5056              440 main/binary-arm64/Packages.gz
+SHA256:
+ 392417b3d2de3929b0ebab0c670d753bbf7d76a822229b25acbc7607dee01e5a              148 Release
+ 5957ec95899ee464ae0d4c6f62409b2086d22693592d839a497902f257ba82d7              635 main/binary-amd64/Packages
+ 505145ebd4f7f11e48085c8f42d6bdeb2fbf77c2e41b2889fc69681026646c15              441 main/binary-amd64/Packages.gz
+ 24c1130bb181df7b89d2e16551534f6c53d5be22ff642a9311888a3fdd33a11d              635 main/binary-arm64/Packages
+ ef9ec57f79b81db43b1c59eee74a2e4150e1247f81016aba6acd43d8b48ec7ab              440 main/binary-arm64/Packages.gz
+SHA512:
+ 3f318907f74addedc3915c0667ee9618f351a0f198844a3ac26462da82511f25be466d750a55fc255b2d7604aac8921184aa2ef4504a9f16223e25e8b01847f9              148 Release
+ 9684caf9580477152202828b0bfb98d736fd80593ddbfadabb543d4124cb355bb7afd36d92fc1b4d05791aec2fda8736e0881d62745bd2c27c59a488445c8009              635 main/binary-amd64/Packages
+ 0267374bea954842be03d7537b053325aefdb6227d1dc7dde7432f8ca27c166a6e671aab75e86cdc6cd4e83e926d3a6c379e945390342a90012c1d43fd60eab3              441 main/binary-amd64/Packages.gz
+ df13e9eaa623cc6654d747f2eeae7422179f487702be0b17a05b49827b841ceb8324972a3d912961006d8e1ca3379f3a5f43881c51cbe583738d50934efc3f20              635 main/binary-arm64/Packages
+ 7e2bc8e074a64188f1e43b67b87c5c0c3f44267017a4404d4ca3298258db5ffa0042dda8cfb8d8bbe498c9ac981c32deba4fad1369ee1b33f86535c41c484ad5              440 main/binary-arm64/Packages.gz
