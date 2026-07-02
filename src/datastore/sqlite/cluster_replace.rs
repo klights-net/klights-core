@@ -1822,6 +1822,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn committed_pod_put_clears_finalizers_when_stale_rv_put_drain_was_committed() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("nsdeletetest"),
+            "test-pod",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "test-pod",
+                    "namespace": "nsdeletetest",
+                    "uid": "pod-uid",
+                    "finalizers": ["e2e.example.com/finalizer"]
+                },
+                "spec": {
+                    "nodeName": "mn-replica",
+                    "containers": [{"name": "nginx", "image": "registry.k8s.io/pause:3.10.1"}]
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True"},
+                        {"type": "Ready", "status": "True"},
+                        {"type": "ContainersReady", "status": "True"}
+                    ],
+                    "containerStatuses": [{"name": "nginx", "ready": true}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let observed_before_delete = db
+            .get_resource("v1", "Pod", Some("nsdeletetest"), "test-pod")
+            .await
+            .unwrap()
+            .expect("pod exists before namespace deletion mark");
+        let mut deleting = (*observed_before_delete.data).clone();
+        deleting["metadata"]["deletionTimestamp"] = serde_json::json!("2026-07-02T08:15:35Z");
+        deleting["metadata"]["deletionGracePeriodSeconds"] = serde_json::json!(0);
+        db.update_resource(
+            "v1",
+            "Pod",
+            Some("nsdeletetest"),
+            "test-pod",
+            deleting,
+            observed_before_delete.resource_version,
+        )
+        .await
+        .unwrap();
+
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                72,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("nsdeletetest".to_string()),
+                    name: "test-pod".to_string(),
+                    uid: "pod-uid".to_string(),
+                    resource_version: 72,
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "test-pod",
+                            "namespace": "nsdeletetest",
+                            "uid": "pod-uid",
+                            "resourceVersion": "72",
+                            "deletionTimestamp": "2026-07-02T08:15:35Z",
+                            "deletionGracePeriodSeconds": 0
+                        },
+                        "spec": {
+                            "nodeName": "mn-replica",
+                            "containers": [{"name": "nginx", "image": "registry.k8s.io/pause:3.10.1"}]
+                        },
+                        "status": {
+                            "phase": "Running",
+                            "conditions": [
+                                {"type": "PodScheduled", "status": "True"},
+                                {"type": "Ready", "status": "False", "reason": "PodTerminating"},
+                                {"type": "ContainersReady", "status": "False", "reason": "PodTerminating"}
+                            ],
+                            "containerStatuses": [{"name": "nginx", "ready": false}]
+                        }
+                    }),
+                    require_absent: false,
+                    require_existing: false,
+                    precondition_uid: Some("pod-uid".to_string()),
+                    precondition_resource_version: Some(observed_before_delete.resource_version),
+                    status_only: false,
+                })],
+            ))
+            .await
+            .expect("raft put applies");
+        assert!(
+            result.error_message.is_none(),
+            "committed Pod PUT must succeed: {result:?}"
+        );
+
+        let row = db
+            .get_resource("v1", "Pod", Some("nsdeletetest"), "test-pod")
+            .await
+            .unwrap()
+            .expect("pod remains until actor-owned finalization removes it");
+        assert!(
+            row.data
+                .pointer("/metadata/finalizers")
+                .and_then(|value| value.as_array())
+                .is_none_or(|finalizers| finalizers.is_empty()),
+            "committed stale Pod PUT that drains finalizers must not merge old finalizers back: {:?}",
+            row.data.pointer("/metadata/finalizers")
+        );
+        assert_eq!(
+            row.data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(|v| v.as_str()),
+            Some("2026-07-02T08:15:35Z"),
+            "same-UID Pod PUT must still preserve deletionTimestamp"
+        );
+        assert_eq!(
+            row.data
+                .pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(|v| v.as_i64()),
+            Some(0),
+            "same-UID Pod PUT must still preserve deletion grace"
+        );
+    }
+
+    #[tokio::test]
     async fn committed_put_preserves_existing_deletion_metadata_for_non_pod_same_uid() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(

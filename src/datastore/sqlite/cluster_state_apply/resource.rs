@@ -767,7 +767,11 @@ fn preserve_same_uid_server_metadata_from_existing(
     {
         preserve_live_pod_node_for_stale_put(row, &existing_data);
         preserve_live_owner_refs_for_stale_pod_put(row, &existing_data);
-        preserve_finalizers_from_existing(&mut row.data, &existing_data);
+        // Pod finalizer drain is the handoff back to actor-owned UID cleanup;
+        // a committed full PUT that omits finalizers must be honored.
+        if row.api_version != "v1" || row.kind != "Pod" {
+            preserve_finalizers_from_existing(&mut row.data, &existing_data);
+        }
     }
     if row.api_version == "v1"
         && row.kind == "Pod"
