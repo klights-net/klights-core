@@ -40,6 +40,14 @@ pub async fn patch_node_status(
     if let Some(new_status) = patched.get("status") {
         let mut new_status = new_status.clone();
         preserve_node_extended_resources(resource.data.get("status"), &mut new_status);
+        crate::datastore::status_merge_policy::merge_status_for_apply(
+            "v1",
+            "Node",
+            resource.data.as_ref(),
+            &mut new_status,
+            crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
+            crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+        );
         // Atomic status write — leaves `.spec.taints` and other Node fields
         // untouched against any concurrent kubelet update.
         state

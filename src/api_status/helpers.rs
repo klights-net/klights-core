@@ -112,7 +112,15 @@ pub async fn update_status_subresource(
 
     // 1. Apply status atomically via json_set — preserves `.spec` against any
     //    concurrent user write.
-    let body_status = body.get("status").cloned().unwrap_or(Value::Null);
+    let mut body_status = body.get("status").cloned().unwrap_or(Value::Null);
+    crate::datastore::status_merge_policy::merge_status_for_apply(
+        &api_version,
+        &kind,
+        existing_resource.data.as_ref(),
+        &mut body_status,
+        crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
+        crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+    );
     state
         .db
         .update_status_only_with_preconditions(
@@ -233,6 +241,15 @@ pub async fn patch_status_subresource(
 
     // 1. Status write — atomic, preserves spec.
     if let Some(new_status) = patched.get("status") {
+        let mut new_status = new_status.clone();
+        crate::datastore::status_merge_policy::merge_status_for_apply(
+            &api_version,
+            &kind,
+            resource.data.as_ref(),
+            &mut new_status,
+            crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
+            crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+        );
         state
             .db
             .update_status_only_with_preconditions(
@@ -240,7 +257,7 @@ pub async fn patch_status_subresource(
                 &kind,
                 Some(&namespace),
                 &name,
-                new_status.clone(),
+                new_status,
                 ResourcePreconditions {
                     uid: Some(resource.uid.clone()),
                     resource_version: expected_rv,
@@ -400,6 +417,14 @@ pub async fn update_cluster_status_subresource(
     if api_version == "v1" && kind == "Node" {
         preserve_node_extended_resources(existing_resource.data.get("status"), &mut body_status);
     }
+    crate::datastore::status_merge_policy::merge_status_for_apply(
+        &api_version,
+        &kind,
+        existing_resource.data.as_ref(),
+        &mut body_status,
+        crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
+        crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+    );
     state
         .db
         .update_status_only_with_preconditions(
@@ -597,6 +622,15 @@ pub async fn patch_cluster_status_subresource(
         .and_then(|value| value.parse::<i64>().ok());
 
     if let Some(new_status) = patched.get("status") {
+        let mut new_status = new_status.clone();
+        crate::datastore::status_merge_policy::merge_status_for_apply(
+            &api_version,
+            &kind,
+            resource.data.as_ref(),
+            &mut new_status,
+            crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
+            crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+        );
         state
             .db
             .update_status_only_with_preconditions(
@@ -604,7 +638,7 @@ pub async fn patch_cluster_status_subresource(
                 &kind,
                 None,
                 &name,
-                new_status.clone(),
+                new_status,
                 ResourcePreconditions {
                     uid: Some(resource.uid.clone()),
                     resource_version: expected_rv,

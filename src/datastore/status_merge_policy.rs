@@ -466,4 +466,118 @@ mod tests {
             "API /status clients must remain authoritative for non-scheduler Pod conditions"
         );
     }
+
+    #[test]
+    fn status_merge_matrix_protects_every_generic_registry_kind() {
+        struct Case {
+            api_version: &'static str,
+            kind: &'static str,
+            terminal_type: Option<&'static str>,
+            live_preserved_field: (&'static str, serde_json::Value),
+        }
+        let cases = [
+            Case {
+                api_version: "batch/v1",
+                kind: "Job",
+                terminal_type: Some("Complete"),
+                live_preserved_field: ("startTime", json!("2026-07-01T00:00:00Z")),
+            },
+            Case {
+                api_version: "v1",
+                kind: "PersistentVolume",
+                terminal_type: None,
+                live_preserved_field: ("phase", json!("Bound")),
+            },
+            Case {
+                api_version: "v1",
+                kind: "PersistentVolumeClaim",
+                terminal_type: None,
+                live_preserved_field: ("phase", json!("Bound")),
+            },
+        ];
+
+        for case in cases {
+            if let Some(term) = case.terminal_type {
+                let mut live_status = serde_json::Map::new();
+                live_status.insert(
+                    "conditions".to_string(),
+                    json!([
+                        {"type": term, "status": "True", "lastTransitionTime": "2026-07-01T00:00:00Z"}
+                    ]),
+                );
+                live_status.insert(
+                    case.live_preserved_field.0.to_string(),
+                    case.live_preserved_field.1.clone(),
+                );
+                let live = json!({"status": live_status});
+                let mut incoming = json!({
+                    "conditions": [
+                        {"type": term, "status": "False", "lastTransitionTime": "2026-06-30T00:00:00Z"}
+                    ]
+                });
+                merge_status_for_apply(
+                    case.api_version,
+                    case.kind,
+                    &live,
+                    &mut incoming,
+                    StatusApplyFreshness::Stale,
+                    StatusApplyOrigin::ReplicatedApply,
+                );
+                assert_eq!(
+                    incoming.pointer("/conditions/0/status"),
+                    Some(&json!("True")),
+                    "{} {} stale apply dropped live terminal condition",
+                    case.api_version,
+                    case.kind
+                );
+            }
+
+            let mut live_status = serde_json::Map::new();
+            live_status.insert(
+                case.live_preserved_field.0.to_string(),
+                case.live_preserved_field.1.clone(),
+            );
+            live_status.insert("conditions".to_string(), json!([]));
+            let live = json!({"status": live_status});
+            let mut incoming = json!({"conditions": []});
+            merge_status_for_apply(
+                case.api_version,
+                case.kind,
+                &live,
+                &mut incoming,
+                StatusApplyFreshness::Stale,
+                StatusApplyOrigin::ReplicatedApply,
+            );
+            assert_eq!(
+                incoming.get(case.live_preserved_field.0),
+                Some(&case.live_preserved_field.1),
+                "{} {} stale apply dropped live field",
+                case.api_version,
+                case.kind
+            );
+
+            let mut fresh = json!({"replaced": true});
+            merge_status_for_apply(
+                case.api_version,
+                case.kind,
+                &live,
+                &mut fresh,
+                StatusApplyFreshness::Fresh,
+                StatusApplyOrigin::ApiSubresource,
+            );
+            assert_eq!(fresh, json!({"replaced": true}));
+        }
+
+        let live = json!({"status": {"observedGeneration": 9}});
+        let mut incoming = json!({"observedGeneration": 1});
+        merge_status_for_apply(
+            "apps/v1",
+            "Deployment",
+            &live,
+            &mut incoming,
+            StatusApplyFreshness::Stale,
+            StatusApplyOrigin::ReplicatedApply,
+        );
+        assert_eq!(incoming, json!({"observedGeneration": 9}));
+    }
 }

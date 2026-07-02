@@ -83,6 +83,15 @@ impl PodSubresourceService {
                 "Resource not found or version conflict (409 Conflict)"
             ));
         }
+        let mut status = status;
+        crate::datastore::status_merge_policy::merge_status_for_apply(
+            "v1",
+            "Pod",
+            current.data.as_ref(),
+            &mut status,
+            crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
+            crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+        );
         let previous = std::sync::Arc::unwrap_or_clone(current.data);
         let updated = self
             .status_only
@@ -132,7 +141,15 @@ impl PodSubresourceService {
             Some(patch_type_to_content_type(patch_type)),
         )
         .map_err(|e| anyhow!("apply_patch failed: {e:?}"))?;
-        let next_status = patched.get("status").cloned().unwrap_or(Value::Null);
+        let mut next_status = patched.get("status").cloned().unwrap_or(Value::Null);
+        crate::datastore::status_merge_policy::merge_status_for_apply(
+            "v1",
+            "Pod",
+            current.data.as_ref(),
+            &mut next_status,
+            crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
+            crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+        );
         let previous = std::sync::Arc::unwrap_or_clone(current.data);
         let updated = self
             .status_only
