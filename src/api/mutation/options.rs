@@ -217,10 +217,12 @@ mod tests {
             dry_run: None,
         };
         let body = bytes::Bytes::from_static(
-            br#"{"kind":"DeleteOptions","apiVersion":"v1","preconditions":{"uid":"expected-uid","resourceVersion":"7"}}"#,
+            br#"{"kind":"DeleteOptions","apiVersion":"v1","propagationPolicy":"Orphan","preconditions":{"uid":"expected-uid","resourceVersion":"7"}}"#,
         );
         let intent = DeleteIntent::from_delete_collection_query_and_body(&query, &body).unwrap();
         assert_eq!(intent.preconditions.uid.as_deref(), Some("expected-uid"));
         assert_eq!(intent.preconditions.resource_version, Some(7));
+        assert_eq!(intent.propagation_policy, PropagationPolicy::Orphan);
+        assert!(intent.orphan_children);
     }
 }

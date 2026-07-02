@@ -530,6 +530,34 @@ mod tests {
                     case.api_version,
                     case.kind
                 );
+
+                let live = json!({
+                    "status": {
+                        "conditions": [
+                            {"type": term, "status": "False", "lastTransitionTime": "2026-07-01T00:00:00Z"}
+                        ]
+                    }
+                });
+                let mut incoming = json!({
+                    "conditions": [
+                        {"type": term, "status": "True", "lastTransitionTime": "2026-07-02T00:00:00Z"}
+                    ]
+                });
+                merge_status_for_apply(
+                    case.api_version,
+                    case.kind,
+                    &live,
+                    &mut incoming,
+                    StatusApplyFreshness::Stale,
+                    StatusApplyOrigin::ReplicatedApply,
+                );
+                assert_eq!(
+                    incoming.pointer("/conditions/0/status"),
+                    Some(&json!("True")),
+                    "{} {} stale apply must keep newer incoming condition",
+                    case.api_version,
+                    case.kind
+                );
             }
 
             let mut live_status = serde_json::Map::new();
@@ -555,6 +583,44 @@ mod tests {
                 case.api_version,
                 case.kind
             );
+
+            if case.terminal_type.is_none() {
+                let live = json!({
+                    "status": {
+                        "conditions": [
+                            {"type": "Bound", "status": "True"}
+                        ]
+                    }
+                });
+                let mut incoming = json!({
+                    "conditions": [
+                        {"type": "Resizing", "status": "False"}
+                    ]
+                });
+                merge_status_for_apply(
+                    case.api_version,
+                    case.kind,
+                    &live,
+                    &mut incoming,
+                    StatusApplyFreshness::Stale,
+                    StatusApplyOrigin::ReplicatedApply,
+                );
+                let condition_types: std::collections::HashSet<_> = incoming
+                    .get("conditions")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|condition| {
+                        condition.get("type").and_then(serde_json::Value::as_str)
+                    })
+                    .collect();
+                assert!(
+                    condition_types.contains("Bound") && condition_types.contains("Resizing"),
+                    "{} {} stale apply must preserve unmentioned live conditions by type: {incoming:?}",
+                    case.api_version,
+                    case.kind
+                );
+            }
 
             let mut fresh = json!({"replaced": true});
             merge_status_for_apply(

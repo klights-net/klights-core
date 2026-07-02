@@ -660,7 +660,11 @@ async fn mutation_crd_deletecollection_with_finalizers_marks_instead_of_hard_del
         &app,
         "DELETE",
         "/apis/example.com/v1/namespaces/default/widgets?labelSelector=mutation%3Dheld-crd-collection",
-        None,
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "propagationPolicy": "Background"
+        })),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -690,17 +694,22 @@ async fn mutation_crd_deletecollection_precondition_conflict_leaves_items_live()
     let app = crate::api::build_router(state);
     create_widget_crd(&app).await;
 
-    create_widget(
-        &app,
-        "precondition-widget",
-        json!({
-            "name": "precondition-widget",
-            "namespace": "default",
-            "uid": "live-widget-uid",
-            "labels": {"mutation": "precondition-crd-collection"}
-        }),
-    )
-    .await;
+    for (name, uid) in [
+        ("precondition-widget-a", "live-widget-uid-a"),
+        ("precondition-widget-b", "live-widget-uid-b"),
+    ] {
+        create_widget(
+            &app,
+            name,
+            json!({
+                "name": name,
+                "namespace": "default",
+                "uid": uid,
+                "labels": {"mutation": "precondition-crd-collection"}
+            }),
+        )
+        .await;
+    }
 
     let response = request(
         &app,
@@ -715,66 +724,114 @@ async fn mutation_crd_deletecollection_precondition_conflict_leaves_items_live()
     .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
 
-    let live = db
-        .get_resource(
-            "example.com/v1",
-            "Widget",
-            Some("default"),
-            "precondition-widget",
-        )
-        .await
-        .unwrap()
-        .expect("precondition conflict must leave CRD item live");
-    assert!(live.data.pointer("/metadata/deletionTimestamp").is_none());
+    for name in ["precondition-widget-a", "precondition-widget-b"] {
+        let live = db
+            .get_resource("example.com/v1", "Widget", Some("default"), name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("precondition conflict must leave {name} live"));
+        assert!(
+            live.data.pointer("/metadata/deletionTimestamp").is_none(),
+            "precondition conflict must not mark {name} terminating"
+        );
+    }
 }
 
-struct CountingWidgetSideEffect {
-    apply_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    delete_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WidgetHookRecord {
+    hook: &'static str,
+    name: String,
+    live_exists_at_hook: bool,
+    live_marked_terminating_at_hook: bool,
+}
+
+struct RecordingWidgetSideEffect {
+    records: std::sync::Arc<std::sync::Mutex<Vec<WidgetHookRecord>>>,
 }
 
 #[async_trait::async_trait]
-impl crate::side_effects::SideEffect for CountingWidgetSideEffect {
+impl crate::side_effects::SideEffect for RecordingWidgetSideEffect {
     fn name(&self) -> &'static str {
-        "counting-widget"
+        "recording-widget"
     }
 
     async fn apply(
         &self,
-        _resource: &serde_json::Value,
-        _db: &dyn crate::datastore::DatastoreBackend,
+        resource: &serde_json::Value,
+        db: &dyn crate::datastore::DatastoreBackend,
     ) -> anyhow::Result<()> {
-        self.apply_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.record("apply", resource, db).await?;
         Ok(())
     }
 
     async fn apply_delete(
         &self,
-        _resource: &serde_json::Value,
-        _db: &dyn crate::datastore::DatastoreBackend,
+        resource: &serde_json::Value,
+        db: &dyn crate::datastore::DatastoreBackend,
     ) -> anyhow::Result<()> {
-        self.delete_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.record("delete", resource, db).await?;
         Ok(())
     }
+}
+
+impl RecordingWidgetSideEffect {
+    async fn record(
+        &self,
+        hook: &'static str,
+        resource: &serde_json::Value,
+        db: &dyn crate::datastore::DatastoreBackend,
+    ) -> anyhow::Result<()> {
+        let api_version = resource
+            .get("apiVersion")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let kind = resource
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let namespace = resource
+            .pointer("/metadata/namespace")
+            .and_then(|value| value.as_str());
+        let name = resource
+            .pointer("/metadata/name")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let live = db.get_resource(api_version, kind, namespace, &name).await?;
+        self.records.lock().unwrap().push(WidgetHookRecord {
+            hook,
+            name,
+            live_exists_at_hook: live.is_some(),
+            live_marked_terminating_at_hook: live.as_ref().is_some_and(|resource| {
+                resource
+                    .data
+                    .pointer("/metadata/deletionTimestamp")
+                    .is_some()
+            }),
+        });
+        Ok(())
+    }
+}
+
+fn widget_hook_records(
+    records: &std::sync::Arc<std::sync::Mutex<Vec<WidgetHookRecord>>>,
+) -> Vec<WidgetHookRecord> {
+    records.lock().unwrap().clone()
 }
 
 #[tokio::test]
 async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_run() {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     let mut state = build_test_app_state().await;
-    let apply_count = Arc::new(AtomicUsize::new(0));
-    let delete_count = Arc::new(AtomicUsize::new(0));
+    let records = Arc::new(Mutex::new(Vec::new()));
     let mut registry = crate::side_effects::SideEffectRegistry::new();
     registry.register(
         "example.com/v1",
         "Widget",
-        Arc::new(CountingWidgetSideEffect {
-            apply_count: apply_count.clone(),
-            delete_count: delete_count.clone(),
+        Arc::new(RecordingWidgetSideEffect {
+            records: records.clone(),
         }),
         crate::side_effects::ErrorPolicy::Warn,
     );
@@ -795,8 +852,7 @@ async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_r
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    assert_eq!(apply_count.load(Ordering::Relaxed), 0);
-    assert_eq!(delete_count.load(Ordering::Relaxed), 0);
+    assert!(widget_hook_records(&records).is_empty());
 
     create_widget(
         &app,
@@ -804,7 +860,34 @@ async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_r
         json!({"name": "event-widget", "namespace": "default"}),
     )
     .await;
-    assert_eq!(apply_count.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        widget_hook_records(&records),
+        vec![WidgetHookRecord {
+            hook: "apply",
+            name: "event-widget".to_string(),
+            live_exists_at_hook: true,
+            live_marked_terminating_at_hook: false,
+        }]
+    );
+
+    let response = request(
+        &app,
+        "PUT",
+        "/apis/example.com/v1/namespaces/default/widgets/event-widget",
+        Some(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": "event-widget", "namespace": "default"},
+            "spec": {"value": "updated"}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let after_update = widget_hook_records(&records);
+    assert_eq!(after_update.len(), 2);
+    assert_eq!(after_update[1].hook, "apply");
+    assert_eq!(after_update[1].name.as_str(), "event-widget");
+    assert!(after_update[1].live_exists_at_hook);
 
     let response = request(
         &app,
@@ -814,7 +897,64 @@ async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_r
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(apply_count.load(Ordering::Relaxed), 2);
+    let after_patch = widget_hook_records(&records);
+    assert_eq!(after_patch.len(), 3);
+    assert_eq!(after_patch[2].hook, "apply");
+    assert_eq!(after_patch[2].name.as_str(), "event-widget");
+    assert!(after_patch[2].live_exists_at_hook);
+
+    create_widget(
+        &app,
+        "event-held-widget",
+        json!({
+            "name": "event-held-widget",
+            "namespace": "default",
+            "labels": {"mutation": "event-collection"},
+            "finalizers": ["example.com/hold"]
+        }),
+    )
+    .await;
+    create_widget(
+        &app,
+        "event-free-widget",
+        json!({
+            "name": "event-free-widget",
+            "namespace": "default",
+            "labels": {"mutation": "event-collection"}
+        }),
+    )
+    .await;
+    assert_eq!(widget_hook_records(&records).len(), 5);
+
+    let response = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets?labelSelector=mutation%3Devent-collection",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let collection_records = widget_hook_records(&records);
+    assert!(
+        collection_records.iter().any(|record| record
+            == &WidgetHookRecord {
+                hook: "apply",
+                name: "event-held-widget".to_string(),
+                live_exists_at_hook: true,
+                live_marked_terminating_at_hook: true,
+            }),
+        "deletecollection mark event must run after deletionTimestamp is persisted: {collection_records:?}"
+    );
+    assert!(
+        collection_records.iter().any(|record| record
+            == &WidgetHookRecord {
+                hook: "delete",
+                name: "event-free-widget".to_string(),
+                live_exists_at_hook: false,
+                live_marked_terminating_at_hook: false,
+            }),
+        "deletecollection hard-delete event must run after the row is gone: {collection_records:?}"
+    );
 
     let response = request(
         &app,
@@ -824,7 +964,13 @@ async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_r
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(delete_count.load(Ordering::Relaxed), 1);
+    assert!(widget_hook_records(&records).iter().any(|record| record
+        == &WidgetHookRecord {
+            hook: "delete",
+            name: "event-widget".to_string(),
+            live_exists_at_hook: false,
+            live_marked_terminating_at_hook: false,
+        }));
 }
 
 #[tokio::test]
