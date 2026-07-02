@@ -98,6 +98,43 @@ pub fn test_encode_protobuf_pod_roundtrip() {
 }
 
 #[test]
+pub fn test_encode_protobuf_pdb_disrupted_pods_roundtrip() {
+    use serde_json::json;
+
+    let pdb_json = json!({
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": {
+            "name": "test-pdb",
+            "namespace": "default"
+        },
+        "spec": {
+            "minAvailable": 1,
+            "selector": {"matchLabels": {"foo": "bar"}}
+        },
+        "status": {
+            "observedGeneration": 1,
+            "disruptionsAllowed": 0,
+            "currentHealthy": 1,
+            "desiredHealthy": 1,
+            "expectedPods": 1,
+            "disruptedPods": {
+                "pod-0": "2026-05-05T20:00:00Z"
+            }
+        }
+    });
+
+    let protobuf_bytes = encode_protobuf(&pdb_json).unwrap();
+    let decoded = decode_protobuf(&protobuf_bytes[4..]).unwrap();
+
+    assert_eq!(
+        decoded.pointer("/status/disruptedPods/pod-0"),
+        Some(&json!("2026-05-05T20:00:00Z")),
+        "PodDisruptionBudget protobuf responses must preserve status.disruptedPods"
+    );
+}
+
+#[test]
 pub fn test_pod_protobuf_roundtrip_preserves_node_selector() {
     use serde_json::json;
 

@@ -62,28 +62,14 @@ pub async fn reconcile_pdb(
             .list_pods(Some(namespace), None, None, None, None)
             .await?;
 
-        // Filter pods matching the selector (non-terminating)
-        let matching_pods: Vec<&crate::datastore::Resource> = pod_list
+        // Preserve disruptedPods for selected pods that still exist, including
+        // the normal eviction window where the pod is terminating.
+        let selector_matching_pods: Vec<&crate::datastore::Resource> = pod_list
             .items
             .iter()
-            .filter(|pod| {
-                // Exclude terminating pods
-                if pod.data.pointer("/metadata/deletionTimestamp").is_some() {
-                    return false;
-                }
-                parsed_selector.matches_resource(&pod.data)
-            })
+            .filter(|pod| parsed_selector.matches_resource(&pod.data))
             .collect();
-
-        let expected_pods = matching_pods.len() as i64;
-
-        // Count healthy pods: Running phase with Ready condition True, or Succeeded
-        let current_healthy = matching_pods
-            .iter()
-            .filter(|pod| is_pod_healthy(&pod.data))
-            .count() as i64;
-
-        let live_matching_pod_names = matching_pods
+        let live_matching_pod_names = selector_matching_pods
             .iter()
             .filter_map(|pod| {
                 pod.data
@@ -94,6 +80,26 @@ pub async fn reconcile_pdb(
             .collect::<HashSet<_>>();
         let disrupted_pods =
             disrupted_pods_for_live_matching_pods(&current.data, &live_matching_pod_names);
+
+        // Filter pods matching the selector (non-terminating)
+        let matching_pods: Vec<&crate::datastore::Resource> = selector_matching_pods
+            .into_iter()
+            .filter(|pod| {
+                // Exclude terminating pods
+                if pod.data.pointer("/metadata/deletionTimestamp").is_some() {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        let expected_pods = matching_pods.len() as i64;
+
+        // Count healthy pods: Running phase with Ready condition True, or Succeeded
+        let current_healthy = matching_pods
+            .iter()
+            .filter(|pod| is_pod_healthy(&pod.data))
+            .count() as i64;
 
         // Compute desiredHealthy from minAvailable or maxUnavailable
         let desired_healthy = compute_desired_healthy(spec, expected_pods);
@@ -381,6 +387,26 @@ mod tests {
         .unwrap();
     }
 
+    async fn set_pod_terminating(db: &dyn DatastoreBackend, namespace: &str, name: &str) {
+        let current = db
+            .get_resource("v1", "Pod", Some(namespace), name)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut pod: serde_json::Value = (*current.data).clone();
+        pod["metadata"]["deletionTimestamp"] = json!("2026-05-05T20:00:10Z");
+        db.update_resource(
+            "v1",
+            "Pod",
+            Some(namespace),
+            name,
+            pod,
+            current.resource_version,
+        )
+        .await
+        .unwrap();
+    }
+
     async fn get_pdb_status(db: &dyn DatastoreBackend, namespace: &str, name: &str) -> Value {
         let r = db
             .get_resource("policy/v1", "PodDisruptionBudget", Some(namespace), name)
@@ -579,6 +605,67 @@ mod tests {
             status["disruptionsAllowed"],
             json!(0),
             "in-flight disrupted pods must consume otherwise allowed disruptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pdb_reconcile_preserves_disrupted_pods_for_terminating_pods() {
+        let db = crate::datastore::test_support::in_memory().await;
+
+        let pdb = create_pdb(
+            &db,
+            "terminating-disrupted-pdb",
+            "default",
+            json!({
+                "minAvailable": 0,
+                "selector": {"matchLabels": {"app": "terminating-disrupted"}}
+            }),
+        )
+        .await;
+        create_pod(
+            &db,
+            "pod-0",
+            "default",
+            json!({"app": "terminating-disrupted"}),
+            "Running",
+            true,
+        )
+        .await;
+        set_pod_terminating(&db, "default", "pod-0").await;
+
+        db.update_status_only(
+            "policy/v1",
+            "PodDisruptionBudget",
+            Some("default"),
+            "terminating-disrupted-pdb",
+            json!({
+                "disruptedPods": {
+                    "pod-0": "2026-05-05T20:00:00Z"
+                }
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        reconcile_pdb(
+            &db,
+            crate::controllers::test_utils::pod_repository_for_test(&db).as_ref(),
+            &pdb,
+        )
+        .await
+        .unwrap();
+
+        let status = get_pdb_status(&db, "default", "terminating-disrupted-pdb").await;
+        assert_eq!(
+            status.pointer("/disruptedPods/pod-0"),
+            Some(&json!("2026-05-05T20:00:00Z")),
+            "PDB reconcile must preserve disruptedPods entries while the named pod is terminating"
+        );
+        assert_eq!(
+            status["disruptionsAllowed"],
+            json!(0),
+            "terminating disrupted pods must still consume otherwise allowed disruptions"
         );
     }
 

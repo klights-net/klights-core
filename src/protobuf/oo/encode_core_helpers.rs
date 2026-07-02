@@ -20,7 +20,18 @@ pub fn json_pdb_to_pb(
                 current_healthy: Some(status.current_healthy),
                 desired_healthy: Some(status.desired_healthy),
                 expected_pods: Some(status.expected_pods),
-                disrupted_pods: std::collections::BTreeMap::new(),
+                disrupted_pods: status
+                    .disrupted_pods
+                    .as_ref()
+                    .map(|disrupted_pods| {
+                        disrupted_pods
+                            .iter()
+                            .map(|(pod_name, disrupted_at)| {
+                                (pod_name.clone(), json_time_to_pb(disrupted_at))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 conditions: vec![],
             }
         }),
