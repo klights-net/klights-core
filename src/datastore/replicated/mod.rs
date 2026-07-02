@@ -345,51 +345,35 @@ where
                 .get_resource(&api_version, &kind, namespace.as_deref(), &name)
                 .await?;
             let mut status = status;
-            // Scheduler-owned Pod conditions (e.g. DisruptionTarget set by
-            // preemption) are never rebuilt by any status writer, so they must
-            // be preserved on every v1/Pod UpdateStatus apply — including the
-            // leader-direct path that carries no outbox stamp. Without this, a
-            // kubelet runtime-reconcile snapshot computed before a preemption
-            // write (and proposed as UpdateStatus with stamp=None) verbatim-
-            // replaces the live status and permanently drops DisruptionTarget,
-            // which is the live SchedulerPreemption conformance failure.
-            if api_version == "v1"
-                && kind == "Pod"
-                && let Some(current) = current.as_ref()
+            // Route typed status merges (Pod, Node) and stale-RV precondition
+            // merges through the single merge_status_for_apply boundary so the
+            // per-kind stale-status policy owns preservation behavior.
+            let needs_typed_apply_merge = (api_version == "v1" && kind == "Pod")
+                || (api_version == "v1" && kind == "Node" && namespace.is_none());
+            let has_stale_matching_precondition = current.as_ref().is_some_and(|current| {
+                preconditions.resource_version.is_some_and(|expected_rv| {
+                    expected_rv < current.resource_version
+                        && preconditions.uid.as_deref() == Some(current.uid.as_str())
+                })
+            });
+            if let Some(current) = current.as_ref()
+                && (needs_typed_apply_merge || has_stale_matching_precondition)
             {
-                let owner = if observed_status_stamp.is_some() {
-                    crate::pod_status_merge::PodStatusOwner::KubeletRuntime
+                let origin = if observed_status_stamp.is_some() {
+                    crate::datastore::status_merge_policy::StatusApplyOrigin::KubeletOutbox
                 } else {
-                    crate::pod_status_merge::PodStatusOwner::ReplicatedApply
+                    crate::datastore::status_merge_policy::StatusApplyOrigin::ReplicatedApply
                 };
-                crate::pod_status_merge::merge_pod_status_for_update(
-                    &api_version,
-                    &kind,
-                    current.data.as_ref(),
-                    &mut status,
-                    owner,
-                );
-            }
-            if api_version == "v1"
-                && kind == "Node"
-                && namespace.is_none()
-                && let Some(current) = current.as_ref()
-            {
-                crate::kubelet::node::merge_node_status_for_update(&mut status, &current.data);
-            }
-            if let (Some(expected_rv), Some(current)) =
-                (preconditions.resource_version, current.as_ref())
-                && expected_rv < current.resource_version
-                && preconditions.uid.as_deref() == Some(current.uid.as_str())
-                && !(api_version == "v1" && kind == "Pod")
-            {
                 crate::datastore::status_merge_policy::merge_status_for_apply(
                     &api_version,
                     &kind,
                     current.data.as_ref(),
                     &mut status,
                     crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
+                    origin,
                 );
+            }
+            if has_stale_matching_precondition && !(api_version == "v1" && kind == "Pod") {
                 preconditions.resource_version = None;
             }
             backend

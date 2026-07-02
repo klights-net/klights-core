@@ -6,12 +6,70 @@ pub enum StatusApplyFreshness {
     Stale,
 }
 
+/// Originator of a status apply. Selects the typed merge owner for kinds whose
+/// status is co-owned by multiple writers (currently Pod; Node routes through
+/// its own typed delegate regardless of origin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusApplyOrigin {
+    /// Raft replication / leader-direct apply without an outbox stamp.
+    ReplicatedApply,
+    /// Kubelet outbox status snapshot (carries a monotonic stamp; the kubelet
+    /// terminal-state preservation guarantee applies).
+    KubeletOutbox,
+    /// A client write through an API `/status` subresource.
+    ApiSubresource,
+}
+
+/// How stale condition arrays are merged against the live status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionMergeMode {
+    /// Drop live conditions entirely; keep only the incoming ones.
+    ReplaceAll,
+    /// Keep incoming conditions, back-filling live condition types the writer
+    /// omitted, keyed by `type` (never overwrite an incoming condition).
+    PreserveUnmentionedByType,
+    /// Merge by `type`, preferring whichever of the live/incoming condition has
+    /// the newer `lastTransitionTime` (live wins ties / when incoming lacks it).
+    MergeByNewestTransitionTime,
+}
+
+/// How stale non-condition status fields are merged against the live status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldMergeMode {
+    /// Drop live fields; keep only incoming.
+    ReplaceAll,
+    /// Keep incoming fields, back-filling live fields the writer omitted.
+    PreserveUnmentioned,
+}
+
+/// Parameterized stale-status behavior for a generic (non-typed) kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenericStaleStatusMode {
+    /// Authoritatively replace incoming stale status with the live status.
+    UseLiveStatus,
+    /// Merge incoming with live per the contained condition/field policies.
+    Merge {
+        condition_merge: ConditionMergeMode,
+        field_merge: FieldMergeMode,
+    },
+}
+
+/// Parameterized merge policy for a generic kind. Table data, not enum variants:
+/// new generic kinds are expressed by adding a registry entry, not a new
+/// `StatusMergeProfileKind` variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenericStatusMergePolicy {
+    /// Condition `type`s whose presence (status `True`) marks the resource
+    /// terminal; a terminal live status is preserved authoritatively.
+    pub terminal_condition_types: &'static [&'static str],
+    pub stale_mode: GenericStaleStatusMode,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusMergeProfileKind {
     PodTyped,
-    JobConditionsByTransitionTime,
-    PreserveUnmentionedFieldsAndConditions,
-    PreserveLiveStatusAuthoritatively,
+    NodeTyped,
+    Generic(GenericStatusMergePolicy),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,13 +92,31 @@ impl StatusMergeRegistry {
     pub fn profile(&self, api_version: &str, kind: &str) -> StatusMergeProfile {
         match (api_version, kind) {
             ("v1", "Pod") => StatusMergeProfile::new(StatusMergeProfileKind::PodTyped),
+            ("v1", "Node") => StatusMergeProfile::new(StatusMergeProfileKind::NodeTyped),
             ("batch/v1", "Job") => {
-                StatusMergeProfile::new(StatusMergeProfileKind::JobConditionsByTransitionTime)
+                StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
+                    terminal_condition_types: &["Complete", "Failed"],
+                    stale_mode: GenericStaleStatusMode::Merge {
+                        condition_merge: ConditionMergeMode::MergeByNewestTransitionTime,
+                        field_merge: FieldMergeMode::PreserveUnmentioned,
+                    },
+                }))
             }
-            ("v1", "PersistentVolume" | "PersistentVolumeClaim") => StatusMergeProfile::new(
-                StatusMergeProfileKind::PreserveUnmentionedFieldsAndConditions,
-            ),
-            _ => StatusMergeProfile::new(StatusMergeProfileKind::PreserveLiveStatusAuthoritatively),
+            ("v1", "PersistentVolume") | ("v1", "PersistentVolumeClaim") => {
+                StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
+                    terminal_condition_types: &[],
+                    stale_mode: GenericStaleStatusMode::Merge {
+                        condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
+                        field_merge: FieldMergeMode::PreserveUnmentioned,
+                    },
+                }))
+            }
+            _ => {
+                StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
+                    terminal_condition_types: &[],
+                    stale_mode: GenericStaleStatusMode::UseLiveStatus,
+                }))
+            }
         }
     }
 }
@@ -51,6 +127,7 @@ pub fn merge_status_for_apply(
     live_resource: &Value,
     incoming_status: &mut Value,
     freshness: StatusApplyFreshness,
+    origin: StatusApplyOrigin,
 ) {
     let profile = StatusMergeRegistry::default().profile(api_version, kind);
 
@@ -60,47 +137,73 @@ pub fn merge_status_for_apply(
     }
 
     match profile.kind {
-        StatusMergeProfileKind::PodTyped => merge_pod_status(live_resource, incoming_status),
-        StatusMergeProfileKind::JobConditionsByTransitionTime => {
-            merge_stale_job_status(live_resource, incoming_status)
+        StatusMergeProfileKind::PodTyped => {
+            merge_pod_status(live_resource, incoming_status, origin)
         }
-        StatusMergeProfileKind::PreserveUnmentionedFieldsAndConditions => {
-            preserve_unmentioned_live_status_conditions_by_type(live_resource, incoming_status);
-            preserve_unmentioned_live_status_fields(live_resource, incoming_status);
+        StatusMergeProfileKind::NodeTyped => {
+            crate::kubelet::node::merge_node_status_for_update(incoming_status, live_resource);
         }
-        StatusMergeProfileKind::PreserveLiveStatusAuthoritatively => {
-            preserve_live_status_authoritatively(live_resource, incoming_status)
+        StatusMergeProfileKind::Generic(policy) => {
+            merge_generic_status(policy, live_resource, incoming_status)
         }
     }
 }
 
-fn merge_stale_job_status(live_resource: &Value, incoming_status: &mut Value) {
-    if live_job_status_is_terminal(live_resource) {
+fn merge_generic_status(
+    policy: GenericStatusMergePolicy,
+    live_resource: &Value,
+    incoming_status: &mut Value,
+) {
+    if live_has_terminal_condition(live_resource, policy.terminal_condition_types) {
         preserve_live_status_authoritatively(live_resource, incoming_status);
         return;
     }
-    preserve_newer_live_job_status_conditions_by_type(live_resource, incoming_status);
-    preserve_unmentioned_live_status_fields(live_resource, incoming_status);
+    match policy.stale_mode {
+        GenericStaleStatusMode::UseLiveStatus => {
+            preserve_live_status_authoritatively(live_resource, incoming_status);
+        }
+        GenericStaleStatusMode::Merge {
+            condition_merge,
+            field_merge,
+        } => {
+            match condition_merge {
+                ConditionMergeMode::ReplaceAll => {}
+                ConditionMergeMode::PreserveUnmentionedByType => {
+                    preserve_unmentioned_live_status_conditions_by_type(
+                        live_resource,
+                        incoming_status,
+                    );
+                }
+                ConditionMergeMode::MergeByNewestTransitionTime => {
+                    merge_conditions_by_newest_transition_time(live_resource, incoming_status);
+                }
+            }
+            match field_merge {
+                FieldMergeMode::ReplaceAll => {}
+                FieldMergeMode::PreserveUnmentioned => {
+                    preserve_unmentioned_live_status_fields(live_resource, incoming_status);
+                }
+            }
+        }
+    }
 }
 
-fn live_job_status_is_terminal(live_resource: &Value) -> bool {
+fn live_has_terminal_condition(live_resource: &Value, terminal_types: &[&str]) -> bool {
     live_resource
         .pointer("/status/conditions")
         .and_then(Value::as_array)
         .is_some_and(|conditions| {
             conditions.iter().any(|condition| {
-                matches!(
-                    condition.get("type").and_then(Value::as_str),
-                    Some("Complete" | "Failed")
-                ) && condition.get("status").and_then(Value::as_str) == Some("True")
+                condition
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|condition_type| terminal_types.contains(&condition_type))
+                    && condition.get("status").and_then(Value::as_str) == Some("True")
             })
         })
 }
 
-fn preserve_newer_live_job_status_conditions_by_type(
-    live_resource: &Value,
-    incoming_status: &mut Value,
-) {
+fn merge_conditions_by_newest_transition_time(live_resource: &Value, incoming_status: &mut Value) {
     let Some(live_conditions) = live_resource
         .pointer("/status/conditions")
         .and_then(Value::as_array)
@@ -132,7 +235,7 @@ fn preserve_newer_live_job_status_conditions_by_type(
         };
         if let Some(live_condition) = live_conditions.iter().find(|condition| {
             condition.get("type").and_then(Value::as_str) == Some(condition_type.as_str())
-        }) && live_job_condition_is_newer(live_condition, incoming)
+        }) && live_condition_is_newer(live_condition, incoming)
         {
             *incoming = live_condition.clone();
         }
@@ -153,7 +256,7 @@ fn preserve_newer_live_job_status_conditions_by_type(
     }
 }
 
-fn live_job_condition_is_newer(live_condition: &Value, incoming_condition: &Value) -> bool {
+fn live_condition_is_newer(live_condition: &Value, incoming_condition: &Value) -> bool {
     match (
         condition_last_transition_time(live_condition),
         condition_last_transition_time(incoming_condition),
@@ -244,13 +347,22 @@ fn preserve_unmentioned_live_status_conditions_by_type(
     }
 }
 
-fn merge_pod_status(live_resource: &Value, incoming_status: &mut Value) {
+fn merge_pod_status(live_resource: &Value, incoming_status: &mut Value, origin: StatusApplyOrigin) {
+    let owner = match origin {
+        StatusApplyOrigin::KubeletOutbox => crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
+        StatusApplyOrigin::ApiSubresource => {
+            crate::pod_status_merge::PodStatusOwner::ApiStatusSubresource
+        }
+        StatusApplyOrigin::ReplicatedApply => {
+            crate::pod_status_merge::PodStatusOwner::ReplicatedApply
+        }
+    };
     crate::pod_status_merge::merge_pod_status_for_update(
         "v1",
         "Pod",
         live_resource,
         incoming_status,
-        crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
+        owner,
     );
 }
 
@@ -266,23 +378,45 @@ mod tests {
             StatusMergeProfileKind::PodTyped
         );
         assert_eq!(
-            StatusMergeRegistry::default()
-                .profile("batch/v1", "Job")
-                .kind,
-            StatusMergeProfileKind::JobConditionsByTransitionTime
+            StatusMergeRegistry::default().profile("v1", "Node").kind,
+            StatusMergeProfileKind::NodeTyped
         );
+
+        let job = StatusMergeRegistry::default().profile("batch/v1", "Job");
+        let StatusMergeProfileKind::Generic(policy) = job.kind else {
+            panic!("Job must use a Generic policy");
+        };
+        assert_eq!(policy.terminal_condition_types.len(), 2);
+        assert!(policy.terminal_condition_types.contains(&"Complete"));
+        assert!(policy.terminal_condition_types.contains(&"Failed"));
         assert_eq!(
-            StatusMergeRegistry::default()
-                .profile("v1", "PersistentVolume")
-                .kind,
-            StatusMergeProfileKind::PreserveUnmentionedFieldsAndConditions
+            policy.stale_mode,
+            GenericStaleStatusMode::Merge {
+                condition_merge: ConditionMergeMode::MergeByNewestTransitionTime,
+                field_merge: FieldMergeMode::PreserveUnmentioned,
+            }
         );
-        assert_eq!(
-            StatusMergeRegistry::default()
-                .profile("v1", "PersistentVolumeClaim")
-                .kind,
-            StatusMergeProfileKind::PreserveUnmentionedFieldsAndConditions
-        );
+
+        for kind in ["PersistentVolume", "PersistentVolumeClaim"] {
+            let pv = StatusMergeRegistry::default().profile("v1", kind);
+            let StatusMergeProfileKind::Generic(policy) = pv.kind else {
+                panic!("{kind} must use a Generic policy");
+            };
+            assert!(policy.terminal_condition_types.is_empty());
+            assert_eq!(
+                policy.stale_mode,
+                GenericStaleStatusMode::Merge {
+                    condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
+                    field_merge: FieldMergeMode::PreserveUnmentioned,
+                }
+            );
+        }
+
+        let default_kind = StatusMergeRegistry::default().profile("apps/v1", "Deployment");
+        let StatusMergeProfileKind::Generic(policy) = default_kind.kind else {
+            panic!("unknown kind must use a Generic policy");
+        };
+        assert_eq!(policy.stale_mode, GenericStaleStatusMode::UseLiveStatus);
     }
 
     #[test]
@@ -295,7 +429,41 @@ mod tests {
             &live,
             &mut incoming,
             StatusApplyFreshness::Stale,
+            StatusApplyOrigin::ReplicatedApply,
         );
         assert_eq!(incoming, json!({"observedGeneration": 9}));
+    }
+
+    #[test]
+    fn api_subresource_origin_allows_pod_status_client_conditions() {
+        let live = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "status": {
+                "conditions": [
+                    {"type": "Ready", "status": "False"}
+                ]
+            }
+        });
+        let mut incoming = json!({
+            "conditions": [
+                {"type": "Ready", "status": "True"}
+            ]
+        });
+
+        merge_status_for_apply(
+            "v1",
+            "Pod",
+            &live,
+            &mut incoming,
+            StatusApplyFreshness::Fresh,
+            StatusApplyOrigin::ApiSubresource,
+        );
+
+        assert_eq!(
+            incoming.pointer("/conditions/0/status"),
+            Some(&json!("True")),
+            "API /status clients must remain authoritative for non-scheduler Pod conditions"
+        );
     }
 }

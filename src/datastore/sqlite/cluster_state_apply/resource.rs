@@ -633,6 +633,7 @@ fn merge_status_only_row_with_existing(
         &live,
         &mut status,
         freshness,
+        crate::datastore::status_merge_policy::StatusApplyOrigin::ReplicatedApply,
     );
     let Some(live_obj) = live.as_object_mut() else {
         return Err(other_error(

@@ -113,12 +113,13 @@ impl DatastoreApplier for RedbDatastore {
                         .get_resource(&api_version, &kind, namespace.as_deref(), &name)
                         .await?
                 {
-                    crate::pod_status_merge::merge_pod_status_for_update(
+                    crate::datastore::status_merge_policy::merge_status_for_apply(
                         &api_version,
                         &kind,
                         current.data.as_ref(),
                         &mut status,
-                        crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
+                        crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
+                        crate::datastore::status_merge_policy::StatusApplyOrigin::KubeletOutbox,
                     );
                 }
                 let mut preconditions = preconditions;

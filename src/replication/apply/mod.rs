@@ -218,44 +218,31 @@ pub(crate) async fn apply_forwarded_command(
             observed_status_stamp,
         } => {
             let mut status = status;
-            // Scheduler-owned Pod conditions (e.g. DisruptionTarget set by
-            // preemption) are never rebuilt by any status writer, so they must
-            // be preserved on every v1/Pod UpdateStatus apply — including the
-            // leader-direct path that carries no outbox stamp. Without this, a
-            // kubelet runtime-reconcile snapshot computed before a preemption
-            // write (and forwarded as UpdateStatus with stamp=None) verbatim-
-            // replaces the live status and permanently drops DisruptionTarget,
-            // which is the live SchedulerPreemption conformance failure.
-            if api_version == "v1"
-                && kind == "Pod"
+            // Route typed status merges (Pod, Node) through the single
+            // merge_status_for_apply boundary so the per-kind stale-status
+            // policy owns preservation behavior (e.g. scheduler-owned Pod
+            // conditions like DisruptionTarget survive a forwarded kubelet
+            // snapshot; Node status is merged against the live object).
+            let needs_typed_apply_merge = (api_version == "v1" && kind == "Pod")
+                || (api_version == "v1" && kind == "Node" && namespace.is_none());
+            if needs_typed_apply_merge
                 && let Some(current) = db
                     .get_resource(&api_version, &kind, namespace.as_deref(), &name)
                     .await?
             {
-                // Stamped applies carry a kubelet outbox snapshot (terminal-state
-                // preservation applies); leader-direct applies carry no stamp
-                // and use ReplicatedApply (condition preservation only).
-                let owner = if observed_status_stamp.is_some() {
-                    crate::pod_status_merge::PodStatusOwner::KubeletRuntime
+                let origin = if observed_status_stamp.is_some() {
+                    crate::datastore::status_merge_policy::StatusApplyOrigin::KubeletOutbox
                 } else {
-                    crate::pod_status_merge::PodStatusOwner::ReplicatedApply
+                    crate::datastore::status_merge_policy::StatusApplyOrigin::ReplicatedApply
                 };
-                crate::pod_status_merge::merge_pod_status_for_update(
+                crate::datastore::status_merge_policy::merge_status_for_apply(
                     &api_version,
                     &kind,
                     current.data.as_ref(),
                     &mut status,
-                    owner,
+                    crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
+                    origin,
                 );
-            }
-            if api_version == "v1"
-                && kind == "Node"
-                && namespace.is_none()
-                && let Some(current) = db
-                    .get_resource(&api_version, &kind, namespace.as_deref(), &name)
-                    .await?
-            {
-                crate::kubelet::node::merge_node_status_for_update(&mut status, &current.data);
             }
             let mut preconditions = preconditions;
             if preconditions.resource_version.is_none() {

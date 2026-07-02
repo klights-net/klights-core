@@ -1058,17 +1058,22 @@ impl Datastore {
                 let mut live: Value =
                     serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
                 let mut next_status = status;
-                if apply_against_latest {
-                    crate::pod_status_merge::merge_pod_status_for_update(
+                let needs_typed_apply_merge = apply_against_latest
+                    || (api_version == "v1" && kind == "Node" && namespace.is_none());
+                if needs_typed_apply_merge {
+                    let origin = if observed_status_stamp.is_some() {
+                        crate::datastore::status_merge_policy::StatusApplyOrigin::KubeletOutbox
+                    } else {
+                        crate::datastore::status_merge_policy::StatusApplyOrigin::ReplicatedApply
+                    };
+                    crate::datastore::status_merge_policy::merge_status_for_apply(
                         &api_version,
                         &kind,
                         &live,
                         &mut next_status,
-                        crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
+                        crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
+                        origin,
                     );
-                }
-                if api_version == "v1" && kind == "Node" && namespace.is_none() {
-                    crate::kubelet::node::merge_node_status_for_update(&mut next_status, &live);
                 }
                 live["status"] = next_status;
                 ensure_resource_type_meta(&mut live, &api_version, &kind);
