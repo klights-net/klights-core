@@ -728,6 +728,105 @@ async fn mutation_crd_deletecollection_precondition_conflict_leaves_items_live()
     assert!(live.data.pointer("/metadata/deletionTimestamp").is_none());
 }
 
+struct CountingWidgetSideEffect {
+    apply_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    delete_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crate::side_effects::SideEffect for CountingWidgetSideEffect {
+    fn name(&self) -> &'static str {
+        "counting-widget"
+    }
+
+    async fn apply(
+        &self,
+        _resource: &serde_json::Value,
+        _db: &dyn crate::datastore::DatastoreBackend,
+    ) -> anyhow::Result<()> {
+        self.apply_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn apply_delete(
+        &self,
+        _resource: &serde_json::Value,
+        _db: &dyn crate::datastore::DatastoreBackend,
+    ) -> anyhow::Result<()> {
+        self.delete_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn mutation_crd_events_fire_once_after_persisted_writes_and_never_on_dry_run() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut state = build_test_app_state().await;
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let delete_count = Arc::new(AtomicUsize::new(0));
+    let mut registry = crate::side_effects::SideEffectRegistry::new();
+    registry.register(
+        "example.com/v1",
+        "Widget",
+        Arc::new(CountingWidgetSideEffect {
+            apply_count: apply_count.clone(),
+            delete_count: delete_count.clone(),
+        }),
+        crate::side_effects::ErrorPolicy::Warn,
+    );
+    state.side_effects = Arc::new(registry);
+    let app = crate::api::build_router(state);
+    create_widget_crd(&app).await;
+
+    let response = request(
+        &app,
+        "POST",
+        "/apis/example.com/v1/namespaces/default/widgets?dryRun=All",
+        Some(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {"name": "dry-widget", "namespace": "default"},
+            "spec": {"value": "dry"}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(apply_count.load(Ordering::Relaxed), 0);
+    assert_eq!(delete_count.load(Ordering::Relaxed), 0);
+
+    create_widget(
+        &app,
+        "event-widget",
+        json!({"name": "event-widget", "namespace": "default"}),
+    )
+    .await;
+    assert_eq!(apply_count.load(Ordering::Relaxed), 1);
+
+    let response = request(
+        &app,
+        "PATCH",
+        "/apis/example.com/v1/namespaces/default/widgets/event-widget",
+        Some(json!({"spec": {"value": "patched"}})),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(apply_count.load(Ordering::Relaxed), 2);
+
+    let response = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets/event-widget",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(delete_count.load(Ordering::Relaxed), 1);
+}
+
 #[tokio::test]
 async fn mutation_dry_run_does_not_enqueue_service_or_controller_side_effects() {
     let state = build_test_app_state().await;

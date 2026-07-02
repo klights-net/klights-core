@@ -1647,24 +1647,45 @@ async fn delete_collection_cr_inner(
         crate::api::mutation::delete::delete_collection_items(&strategy, items, &delete_intent)
             .await?;
     for result in results {
-        if let crate::api::mutation::delete::DeleteResult::HardDeleted(deleted) = result
-            && !delete_intent.orphan_children
-            && let Err(e) = controllers::gc::cascade_delete_with_uid(
-                state.db.as_ref(),
-                &deleted.uid,
-                &deleted.api_version,
-                &deleted.name,
-                &deleted.kind,
-                deleted.namespace.clone(),
-                state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
-            )
-            .await
-        {
-            state
-                .metrics
-                .cascade_delete_failures_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::error!(name = %deleted.name, kind = %deleted.kind, error = %e, "{log_context}: cascade delete failed");
+        match result {
+            crate::api::mutation::delete::DeleteResult::HardDeleted(deleted) => {
+                dispatch_custom_resource_mutation_event(
+                    state,
+                    crate::api::mutation::MutationOperation::HardDelete,
+                    &deleted.data,
+                    "custom_delete_collection_hard_delete",
+                )
+                .await;
+                if !delete_intent.orphan_children
+                    && let Err(e) = controllers::gc::cascade_delete_with_uid(
+                        state.db.as_ref(),
+                        &deleted.uid,
+                        &deleted.api_version,
+                        &deleted.name,
+                        &deleted.kind,
+                        deleted.namespace.clone(),
+                        state.pod_repository.as_ref()
+                            as &dyn crate::controllers::gc::GcPodDeleteSink,
+                    )
+                    .await
+                {
+                    state
+                        .metrics
+                        .cascade_delete_failures_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(name = %deleted.name, kind = %deleted.kind, error = %e, "{log_context}: cascade delete failed");
+                }
+            }
+            crate::api::mutation::delete::DeleteResult::MarkedTerminating(marked) => {
+                dispatch_custom_resource_mutation_event(
+                    state,
+                    crate::api::mutation::MutationOperation::DeleteMark,
+                    &marked.data,
+                    "custom_delete_collection_mark",
+                )
+                .await;
+            }
+            crate::api::mutation::delete::DeleteResult::GoneOrUidChanged => {}
         }
     }
 
@@ -1708,6 +1729,28 @@ pub async fn delete_collection_custom_resources(
         },
     )
     .await
+}
+
+async fn dispatch_custom_resource_mutation_event(
+    state: &Arc<AppState>,
+    operation: crate::api::mutation::MutationOperation,
+    resource: &serde_json::Value,
+    context: &'static str,
+) {
+    crate::api::mutation::dispatch_mutation_event(
+        &state.side_effects,
+        state.db.as_ref(),
+        &state.metrics,
+        crate::api::mutation::MutationEvent {
+            operation,
+            resource,
+            old_resource: None,
+            persisted: true,
+            dry_run: crate::api::mutation::DryRunMode::Live,
+            context,
+        },
+    )
+    .await;
 }
 
 async fn create_cr_inner(
@@ -1806,6 +1849,14 @@ async fn create_cr_inner(
         .await?;
 
     reconcile_custom_resource_owner_refs(state, &resource, log_context).await;
+
+    dispatch_custom_resource_mutation_event(
+        state,
+        crate::api::mutation::MutationOperation::Create,
+        &resource.data,
+        "custom_create",
+    )
+    .await;
 
     let data = normalize_custom_resource_response_data(
         state.db.as_ref(),
@@ -1957,6 +2008,13 @@ async fn delete_cr_inner(
     .await?
     {
         crate::api::mutation::delete::DeleteResult::MarkedTerminating(updated) => {
+            dispatch_custom_resource_mutation_event(
+                state,
+                crate::api::mutation::MutationOperation::DeleteMark,
+                &updated.data,
+                "custom_delete_mark",
+            )
+            .await;
             if let Err(e) = controllers::gc::finalize_foreground_owner_if_ready(
                 state.db.as_ref(),
                 &updated,
@@ -1993,6 +2051,13 @@ async fn delete_cr_inner(
         }
         crate::api::mutation::delete::DeleteResult::GoneOrUidChanged => {}
         crate::api::mutation::delete::DeleteResult::HardDeleted(deleted) => {
+            dispatch_custom_resource_mutation_event(
+                state,
+                crate::api::mutation::MutationOperation::HardDelete,
+                &deleted.data,
+                "custom_delete_hard_delete",
+            )
+            .await;
             if !delete_intent.orphan_children
                 && let Err(e) = controllers::gc::cascade_delete_with_uid(
                     state.db.as_ref(),
@@ -2138,6 +2203,13 @@ async fn update_cr_inner(
         .await?;
 
     reconcile_custom_resource_owner_refs(state, &resource, log_context).await;
+    dispatch_custom_resource_mutation_event(
+        state,
+        crate::api::mutation::MutationOperation::Update,
+        &resource.data,
+        "custom_update",
+    )
+    .await;
     crate::api::finalizer_delete::finalize_after_update_if_ready(
         state,
         &stored_api_version,
@@ -2328,6 +2400,13 @@ async fn patch_cr_inner(
                 )
                 .await?;
             reconcile_custom_resource_owner_refs(state, &resource, apply_create_ctx).await;
+            dispatch_custom_resource_mutation_event(
+                state,
+                crate::api::mutation::MutationOperation::Create,
+                &resource.data,
+                "custom_apply_create",
+            )
+            .await;
             let data = normalize_custom_resource_response_data(
                 state.db.as_ref(),
                 conversion.as_ref(),
@@ -2403,6 +2482,13 @@ async fn patch_cr_inner(
         .await?;
 
     reconcile_custom_resource_owner_refs(state, &resource, patch_ctx).await;
+    dispatch_custom_resource_mutation_event(
+        state,
+        crate::api::mutation::MutationOperation::Patch,
+        &resource.data,
+        "custom_patch",
+    )
+    .await;
     crate::api::finalizer_delete::finalize_after_update_if_ready(
         state,
         &stored_api_version,
