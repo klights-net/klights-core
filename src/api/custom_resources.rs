@@ -111,6 +111,7 @@ struct CustomResourceListRequest<'a> {
 struct CustomResourceCollectionDeleteRequest<'a> {
     scope: CustomResourceScope<'a>,
     query: &'a DeleteCollectionQuery,
+    body: Bytes,
     log_context: &'static str,
 }
 
@@ -1517,6 +1518,7 @@ async fn delete_collection_cr_inner(
     let CustomResourceCollectionDeleteRequest {
         scope,
         query,
+        body,
         log_context,
     } = request;
     let CustomResourceScope {
@@ -1596,7 +1598,9 @@ async fn delete_collection_cr_inner(
         names.extend(list.items.into_iter().map(|resource| resource.name));
     }
 
-    let dry_run = crate::api::mutation::DryRunMode::from_delete_collection_query(query)?;
+    let delete_intent =
+        crate::api::mutation::DeleteIntent::from_delete_collection_query_and_body(query, &body)?;
+    let dry_run = delete_intent.dry_run;
     if dry_run.is_all() {
         return Ok(
             Json(crate::api::mutation::response::delete_collection_success_status())
@@ -1605,6 +1609,7 @@ async fn delete_collection_cr_inner(
     }
 
     let mut unique_names = std::collections::HashSet::new();
+    let mut items = Vec::new();
     for name in names {
         if !unique_names.insert(name.clone()) {
             continue;
@@ -1624,34 +1629,42 @@ async fn delete_collection_cr_inner(
             Err(AppError::NotFound(_)) => continue,
             Err(err) => return Err(err),
         };
+        items.push((
+            crate::api::mutation::ResourceIdentity::new(
+                stored_api_version,
+                info.kind.clone(),
+                ns.map(str::to_string),
+                name,
+            ),
+            current,
+        ));
+    }
 
-        let owner_uid = current
-            .data
-            .pointer("/metadata/uid")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        state
-            .db
-            .delete_resource(&stored_api_version, &info.kind, ns, &name)
+    let strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
+        db: state.db.as_ref(),
+    };
+    let results =
+        crate::api::mutation::delete::delete_collection_items(&strategy, items, &delete_intent)
             .await?;
-
-        if let Err(e) = controllers::gc::cascade_delete_with_uid(
-            state.db.as_ref(),
-            &owner_uid,
-            &stored_api_version,
-            &name,
-            &info.kind,
-            ns.map(str::to_string),
-            state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
-        )
-        .await
+    for result in results {
+        if let crate::api::mutation::delete::DeleteResult::HardDeleted(deleted) = result
+            && !delete_intent.orphan_children
+            && let Err(e) = controllers::gc::cascade_delete_with_uid(
+                state.db.as_ref(),
+                &deleted.uid,
+                &deleted.api_version,
+                &deleted.name,
+                &deleted.kind,
+                deleted.namespace.clone(),
+                state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+            )
+            .await
         {
             state
                 .metrics
                 .cascade_delete_failures_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::error!(name = %name, kind = %info.kind, error = %e, "{log_context}: cascade delete failed");
+            tracing::error!(name = %deleted.name, kind = %deleted.kind, error = %e, "{log_context}: cascade delete failed");
         }
     }
 
@@ -1690,6 +1703,7 @@ pub async fn delete_collection_custom_resources(
         CustomResourceCollectionDeleteRequest {
             scope: resource_type.scoped(ns, false),
             query: &query,
+            body,
             log_context: "delete collection (CRD)",
         },
     )
@@ -1925,22 +1939,24 @@ async fn delete_cr_inner(
         .into_response());
     }
 
-    match (
-        delete_intent.orphan_children,
-        delete_intent.propagation_policy,
-    ) {
-        (false, crate::api::mutation::PropagationPolicy::Foreground) => {
-            let updated = crate::api::finalizer_delete::mark_foreground_deletion_with_retry(
-                state.db.as_ref(),
-                &stored_api_version,
-                &info.kind,
-                ns,
-                name,
-                resource,
-                delete_intent.preconditions.clone(),
-            )
-            .await?;
-
+    let target_identity = crate::api::mutation::ResourceIdentity::new(
+        stored_api_version.clone(),
+        info.kind.clone(),
+        ns.map(str::to_string),
+        name.to_string(),
+    );
+    let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
+        db: state.db.as_ref(),
+    };
+    match crate::api::mutation::delete::delete_loaded_with_strategy(
+        &delete_strategy,
+        target_identity,
+        resource,
+        &delete_intent,
+    )
+    .await?
+    {
+        crate::api::mutation::delete::DeleteResult::MarkedTerminating(updated) => {
             if let Err(e) = controllers::gc::finalize_foreground_owner_if_ready(
                 state.db.as_ref(),
                 &updated,
@@ -1975,65 +1991,25 @@ async fn delete_cr_inner(
                 return Ok((StatusCode::ACCEPTED, Json(normalized)).into_response());
             }
         }
-        (_, _) => {
-            let grace_seconds = delete_intent.options._grace_period_seconds.unwrap_or(0);
-            let outcome =
-                crate::api::finalizer_delete::complete_non_foreground_delete_with_live_recheck(
+        crate::api::mutation::delete::DeleteResult::GoneOrUidChanged => {}
+        crate::api::mutation::delete::DeleteResult::HardDeleted(deleted) => {
+            if !delete_intent.orphan_children
+                && let Err(e) = controllers::gc::cascade_delete_with_uid(
                     state.db.as_ref(),
-                    crate::api::finalizer_delete::NonForegroundDeleteRequest {
-                        target: crate::api::finalizer_delete::ResourceDeleteTarget {
-                            api_version: &stored_api_version,
-                            kind: &info.kind,
-                            namespace: ns,
-                            name,
-                        },
-                        initial_resource: resource,
-                        delete_preconditions: delete_intent.preconditions.clone(),
-                        orphan_children_before_completion: delete_intent.orphan_children,
-                        uid_mismatch_is_conflict: delete_intent.preconditions.uid.is_some(),
-                        grace_seconds,
-                    },
+                    &deleted.uid,
+                    &stored_api_version,
+                    &deleted.name,
+                    &info.kind,
+                    ns.map(str::to_string),
+                    state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
                 )
-                .await?;
-
-            match outcome {
-                crate::api::finalizer_delete::DeleteCompletion::MarkedTerminating(updated) => {
-                    let normalized = normalize_custom_resource_response_data(
-                        state.db.as_ref(),
-                        conversion.as_ref(),
-                        group,
-                        plural,
-                        &requested_api_version,
-                        crate::api::mutation::response::accepted_object(
-                            updated.data,
-                            updated.resource_version,
-                        ),
-                    )
-                    .await?;
-                    return Ok((StatusCode::ACCEPTED, Json(normalized)).into_response());
-                }
-                crate::api::finalizer_delete::DeleteCompletion::GoneOrUidChanged => {}
-                crate::api::finalizer_delete::DeleteCompletion::HardDeleted(deleted) => {
-                    if !delete_intent.orphan_children
-                        && let Err(e) = controllers::gc::cascade_delete_with_uid(
-                            state.db.as_ref(),
-                            &deleted.uid,
-                            &stored_api_version,
-                            &deleted.name,
-                            &info.kind,
-                            ns.map(str::to_string),
-                            state.pod_repository.as_ref()
-                                as &dyn crate::controllers::gc::GcPodDeleteSink,
-                        )
-                        .await
-                    {
-                        state
-                            .metrics
-                            .cascade_delete_failures_total
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        tracing::error!(name = %name, kind = %info.kind, error = %e, "CRD cascade delete failed");
-                    }
-                }
+                .await
+            {
+                state
+                    .metrics
+                    .cascade_delete_failures_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(name = %name, kind = %info.kind, error = %e, "CRD cascade delete failed");
             }
         }
     }
@@ -2544,6 +2520,7 @@ pub async fn delete_collection_cluster_custom_resources(
         CustomResourceCollectionDeleteRequest {
             scope: resource_type.scoped(None, true),
             query: &query,
+            body,
             log_context: "delete collection (cluster CRD)",
         },
     )

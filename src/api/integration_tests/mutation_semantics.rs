@@ -612,6 +612,16 @@ async fn mutation_deletecollection_dry_run_returns_status_without_deleting_any_m
     assert_eq!(status, StatusCode::OK);
     assert_eq!(item_names(&widgets), vec!["widget-dry-1", "widget-dry-2"]);
 
+    for name in ["widget-dry-1", "widget-dry-2"] {
+        let (status, live_widget) = get_json(
+            &app,
+            &format!("/apis/example.com/v1/namespaces/default/widgets/{name}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_no_deletion_timestamp(&live_widget);
+    }
+
     for name in ["pod-dry-1", "pod-dry-2"] {
         let pod = crate::kubelet::pod_repository::PodReader::get_pod(
             pod_repository.as_ref(),
@@ -623,6 +633,99 @@ async fn mutation_deletecollection_dry_run_returns_status_without_deleting_any_m
         .expect("dry-run deletecollection must leave matching Pod live");
         assert_no_deletion_timestamp(&pod.data);
     }
+}
+
+#[tokio::test]
+async fn mutation_crd_deletecollection_with_finalizers_marks_instead_of_hard_deleting() {
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+    create_widget_crd(&app).await;
+
+    for name in ["held-widget-a", "held-widget-b"] {
+        create_widget(
+            &app,
+            name,
+            json!({
+                "name": name,
+                "namespace": "default",
+                "labels": {"mutation": "held-crd-collection"},
+                "finalizers": ["example.com/hold"]
+            }),
+        )
+        .await;
+    }
+
+    let response = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets?labelSelector=mutation%3Dheld-crd-collection",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["kind"], "Status");
+    assert_eq!(body["status"], "Success");
+
+    for name in ["held-widget-a", "held-widget-b"] {
+        let live = db
+            .get_resource("example.com/v1", "Widget", Some("default"), name)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("CRD deletecollection hard-deleted {name}"));
+        assert!(
+            live.data.pointer("/metadata/deletionTimestamp").is_some(),
+            "CRD deletecollection must mark {name} terminating: {:?}",
+            live.data
+        );
+        assert_finalizers_include(&live.data, "example.com/hold");
+    }
+}
+
+#[tokio::test]
+async fn mutation_crd_deletecollection_precondition_conflict_leaves_items_live() {
+    let state = build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+    create_widget_crd(&app).await;
+
+    create_widget(
+        &app,
+        "precondition-widget",
+        json!({
+            "name": "precondition-widget",
+            "namespace": "default",
+            "uid": "live-widget-uid",
+            "labels": {"mutation": "precondition-crd-collection"}
+        }),
+    )
+    .await;
+
+    let response = request(
+        &app,
+        "DELETE",
+        "/apis/example.com/v1/namespaces/default/widgets?labelSelector=mutation%3Dprecondition-crd-collection",
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "DeleteOptions",
+            "preconditions": {"uid": "wrong-uid"}
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let live = db
+        .get_resource(
+            "example.com/v1",
+            "Widget",
+            Some("default"),
+            "precondition-widget",
+        )
+        .await
+        .unwrap()
+        .expect("precondition conflict must leave CRD item live");
+    assert!(live.data.pointer("/metadata/deletionTimestamp").is_none());
 }
 
 #[tokio::test]

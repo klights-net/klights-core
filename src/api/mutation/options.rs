@@ -71,6 +71,10 @@ pub struct DeleteIntent {
     pub preconditions: crate::datastore::ResourcePreconditions,
     pub propagation_policy: PropagationPolicy,
     pub orphan_children: bool,
+    /// Whether a UID mismatch discovered during the finalizer-aware delete is a
+    /// hard conflict (single delete with a user-supplied UID precondition) or
+    /// collection progress (stale list item replaced under us -> skip).
+    pub uid_mismatch_is_conflict: bool,
 }
 
 impl DeleteIntent {
@@ -93,6 +97,7 @@ impl DeleteIntent {
         let orphan_children = propagation_policy == PropagationPolicy::Orphan
             || options.orphan_dependents == Some(true)
             || query.orphan_dependents == Some(true);
+        let uid_mismatch_is_conflict = preconditions.uid.is_some();
 
         Ok(Self {
             dry_run,
@@ -100,7 +105,50 @@ impl DeleteIntent {
             preconditions,
             propagation_policy,
             orphan_children,
+            uid_mismatch_is_conflict,
         })
+    }
+
+    pub fn from_delete_collection_query_and_body(
+        query: &crate::api::DeleteCollectionQuery,
+        body: &Bytes,
+    ) -> Result<Self, crate::api::AppError> {
+        let dry_run = DryRunMode::from_delete_collection_query(query)?;
+        let options = crate::api::parse_delete_options_body(body);
+        let preconditions = options
+            .resource_preconditions()
+            .map_err(crate::api::AppError::BadRequest)?;
+        let propagation_policy =
+            PropagationPolicy::from_options(options.propagation_policy.as_deref(), None)?;
+        let orphan_children = propagation_policy == PropagationPolicy::Orphan
+            || options.orphan_dependents == Some(true);
+        let uid_mismatch_is_conflict = preconditions.uid.is_some();
+
+        Ok(Self {
+            dry_run,
+            options,
+            preconditions,
+            propagation_policy,
+            orphan_children,
+            uid_mismatch_is_conflict,
+        })
+    }
+
+    pub fn collection_item(
+        dry_run: DryRunMode,
+        preconditions: crate::datastore::ResourcePreconditions,
+    ) -> Self {
+        Self {
+            dry_run,
+            options: crate::api::DeleteOptions::default(),
+            preconditions,
+            propagation_policy: PropagationPolicy::Background,
+            orphan_children: false,
+            // A collection item's UID is an internal CAS guard derived from a
+            // potentially stale list snapshot; a mismatch means the slot was
+            // replaced and must be skipped, not surfaced as a user conflict.
+            uid_mismatch_is_conflict: false,
+        }
     }
 }
 
@@ -159,5 +207,20 @@ mod tests {
         let intent = DeleteIntent::from_query_and_body(&query, &body).unwrap();
         assert_eq!(intent.preconditions.uid.as_deref(), Some("u1"));
         assert_eq!(intent.preconditions.resource_version, Some(9));
+    }
+
+    #[test]
+    fn delete_collection_intent_extracts_preconditions_from_body() {
+        let query = crate::api::DeleteCollectionQuery {
+            label_selector: Some("mutation=precondition".into()),
+            field_selector: None,
+            dry_run: None,
+        };
+        let body = bytes::Bytes::from_static(
+            br#"{"kind":"DeleteOptions","apiVersion":"v1","preconditions":{"uid":"expected-uid","resourceVersion":"7"}}"#,
+        );
+        let intent = DeleteIntent::from_delete_collection_query_and_body(&query, &body).unwrap();
+        assert_eq!(intent.preconditions.uid.as_deref(), Some("expected-uid"));
+        assert_eq!(intent.preconditions.resource_version, Some(7));
     }
 }

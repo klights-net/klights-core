@@ -1,5 +1,7 @@
+use async_trait::async_trait;
+
 use crate::api::AppError;
-use crate::datastore::{Resource, ResourcePreconditions};
+use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 
 pub fn ensure_delete_preconditions_match(
     resource: &Resource,
@@ -21,6 +23,146 @@ pub fn ensure_delete_preconditions_match(
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+pub enum DeleteResult {
+    HardDeleted(Resource),
+    MarkedTerminating(Resource),
+    GoneOrUidChanged,
+}
+
+#[async_trait]
+pub trait DeleteStrategy: Send + Sync {
+    async fn load(
+        &self,
+        target: &crate::api::mutation::ResourceIdentity,
+    ) -> Result<Resource, AppError>;
+
+    async fn execute(
+        &self,
+        target: &crate::api::mutation::ResourceIdentity,
+        resource: Resource,
+        intent: &crate::api::mutation::DeleteIntent,
+    ) -> Result<DeleteResult, AppError>;
+}
+
+pub struct FinalizerAwareDeleteStrategy<'a> {
+    pub db: &'a dyn DatastoreBackend,
+}
+
+#[async_trait]
+impl DeleteStrategy for FinalizerAwareDeleteStrategy<'_> {
+    async fn load(
+        &self,
+        target: &crate::api::mutation::ResourceIdentity,
+    ) -> Result<Resource, AppError> {
+        self.db
+            .get_resource(
+                &target.api_version,
+                &target.kind,
+                target.namespace.as_deref(),
+                &target.name,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("{} not found", target.kind)))
+    }
+
+    async fn execute(
+        &self,
+        target: &crate::api::mutation::ResourceIdentity,
+        resource: Resource,
+        intent: &crate::api::mutation::DeleteIntent,
+    ) -> Result<DeleteResult, AppError> {
+        if !intent.orphan_children
+            && intent.propagation_policy == crate::api::mutation::PropagationPolicy::Foreground
+        {
+            let updated = crate::api::finalizer_delete::mark_foreground_deletion_with_retry(
+                self.db,
+                &target.api_version,
+                &target.kind,
+                target.namespace.as_deref(),
+                &target.name,
+                resource,
+                intent.preconditions.clone(),
+            )
+            .await?;
+            return Ok(DeleteResult::MarkedTerminating(updated));
+        }
+
+        let grace_seconds = intent.options._grace_period_seconds.unwrap_or(0);
+        match crate::api::finalizer_delete::complete_non_foreground_delete_with_live_recheck(
+            self.db,
+            crate::api::finalizer_delete::NonForegroundDeleteRequest {
+                target: crate::api::finalizer_delete::ResourceDeleteTarget {
+                    api_version: &target.api_version,
+                    kind: &target.kind,
+                    namespace: target.namespace.as_deref(),
+                    name: &target.name,
+                },
+                initial_resource: resource,
+                delete_preconditions: intent.preconditions.clone(),
+                orphan_children_before_completion: intent.orphan_children,
+                uid_mismatch_is_conflict: intent.uid_mismatch_is_conflict,
+                grace_seconds,
+            },
+        )
+        .await?
+        {
+            crate::api::finalizer_delete::DeleteCompletion::HardDeleted(resource) => {
+                Ok(DeleteResult::HardDeleted(resource))
+            }
+            crate::api::finalizer_delete::DeleteCompletion::MarkedTerminating(resource) => {
+                Ok(DeleteResult::MarkedTerminating(resource))
+            }
+            crate::api::finalizer_delete::DeleteCompletion::GoneOrUidChanged => {
+                Ok(DeleteResult::GoneOrUidChanged)
+            }
+        }
+    }
+}
+
+pub async fn delete_loaded_with_strategy<S>(
+    strategy: &S,
+    target: crate::api::mutation::ResourceIdentity,
+    resource: Resource,
+    intent: &crate::api::mutation::DeleteIntent,
+) -> Result<DeleteResult, AppError>
+where
+    S: DeleteStrategy,
+{
+    strategy.execute(&target, resource, intent).await
+}
+
+pub async fn delete_with_strategy<S>(
+    strategy: &S,
+    target: crate::api::mutation::ResourceIdentity,
+    intent: &crate::api::mutation::DeleteIntent,
+) -> Result<DeleteResult, AppError>
+where
+    S: DeleteStrategy,
+{
+    let resource = strategy.load(&target).await?;
+    delete_loaded_with_strategy(strategy, target, resource, intent).await
+}
+
+pub async fn delete_collection_items<S>(
+    strategy: &S,
+    items: Vec<(crate::api::mutation::ResourceIdentity, Resource)>,
+    intent: &crate::api::mutation::DeleteIntent,
+) -> Result<Vec<DeleteResult>, AppError>
+where
+    S: DeleteStrategy,
+{
+    let mut results = Vec::with_capacity(items.len());
+    for (target, resource) in items {
+        match delete_loaded_with_strategy(strategy, target, resource, intent).await {
+            Ok(result) => results.push(result),
+            Err(AppError::NotFound(_)) => results.push(DeleteResult::GoneOrUidChanged),
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(results)
 }
 
 #[cfg(test)]
