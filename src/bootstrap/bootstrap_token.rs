@@ -66,7 +66,7 @@ impl BootstrapTokenScope {
 
 /// Constant-time byte equality, used for the bootstrap token secret so an
 /// attacker cannot recover it byte-by-byte via a timing oracle. The length is
-/// allowed to leak (the token-secret has a fixed length).
+/// allowed to leak (the token secret has a fixed length).
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -122,6 +122,9 @@ pub async fn ensure_bootstrap_token_for_scope(
     {
         let token = token_from_secret(&secret.data)?;
         if validate_fixed_bootstrap_token_secret(&secret, &token, Some(scope)).is_ok() {
+            if !has_single_token_data_field(&secret.data) {
+                rewrite_fixed_bootstrap_token_secret_to_single_field(db, &secret, &token).await?;
+            }
             return Ok(token);
         }
     }
@@ -193,7 +196,7 @@ fn scoped_bootstrap_token_secret(
     token: &str,
     ttl: std::time::Duration,
 ) -> Result<serde_json::Value> {
-    let (token_id, token_secret) = parse_bootstrap_token(token)?;
+    let _ = parse_bootstrap_token(token)?;
     let expiration = expiration_timestamp(ttl)?;
     Ok(serde_json::json!({
         "apiVersion": "v1",
@@ -208,8 +211,7 @@ fn scoped_bootstrap_token_secret(
         },
         "type": BOOTSTRAP_TOKEN_SECRET_TYPE,
         "data": {
-            "token-id": encode_data(&token_id),
-            "token-secret": encode_data(&token_secret),
+            "token": encode_data(token),
             "description": encode_data(scope.description()),
             "expiration": encode_data(&expiration),
             "usage-bootstrap-authentication": encode_data("true"),
@@ -321,10 +323,9 @@ fn validate_bootstrap_token_secret(
         return Err(anyhow!("bootstrap token {token_id} has wrong Secret type"));
     }
 
-    let stored_id = decode_data_field(&secret.data, "token-id")?;
-    let stored_secret = decode_data_field(&secret.data, "token-secret")?;
-    // token-id is public (it is the Secret's name, used for the lookup above);
-    // the token-secret is compared in constant time to avoid a timing oracle.
+    let (stored_id, stored_secret) = token_parts_from_secret_data(&secret.data)?;
+    // token-id is public; the token secret is compared in constant time to
+    // avoid a timing oracle.
     let id_ok = stored_id == token_id;
     let secret_ok = constant_time_eq(stored_secret.as_bytes(), token_secret.as_bytes());
     if !(id_ok && secret_ok) {
@@ -392,6 +393,11 @@ pub async fn rotate_bootstrap_token_secret_for_get(
     let rotate_before =
         time::Duration::try_from(BOOTSTRAP_TOKEN_ROTATE_BEFORE).context("rotation threshold")?;
     if expires_at - now >= rotate_before {
+        if !has_single_token_data_field(&resource.data) {
+            let token = token_from_secret(&resource.data)?;
+            rewrite_fixed_bootstrap_token_secret_to_single_field(db, resource, &token).await?;
+            return read_fixed_secret(db, scope).await;
+        }
         return Ok(resource.clone());
     }
 
@@ -425,9 +431,47 @@ async fn read_fixed_secret(
     .ok_or_else(|| anyhow!("{} not found after rotation", scope.secret_name()))
 }
 
+async fn rewrite_fixed_bootstrap_token_secret_to_single_field(
+    db: &dyn DatastoreBackend,
+    resource: &Resource,
+    token: &str,
+) -> Result<()> {
+    let mut data = resource.data.as_ref().clone();
+    let data_fields = data
+        .pointer_mut("/data")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| anyhow!("bootstrap token Secret missing data object"))?;
+    data_fields.insert(
+        "token".to_string(),
+        serde_json::Value::String(encode_data(token)),
+    );
+    data_fields.remove("token-id");
+    data_fields.remove("token-secret");
+
+    db.update_resource(
+        "v1",
+        "Secret",
+        Some(BOOTSTRAP_TOKEN_NAMESPACE),
+        &resource.name,
+        data,
+        resource.resource_version,
+    )
+    .await?;
+    Ok(())
+}
+
+fn has_single_token_data_field(data: &serde_json::Value) -> bool {
+    data.pointer("/data/token").is_some()
+        && data.pointer("/data/token-id").is_none()
+        && data.pointer("/data/token-secret").is_none()
+}
+
 fn token_from_secret(data: &serde_json::Value) -> Result<String> {
-    let token_id = decode_data_field(data, "token-id")?;
-    let token_secret = decode_data_field(data, "token-secret")?;
+    if let Some(token) = optional_decoded_data_field(data, "token")? {
+        let _ = parse_bootstrap_token(&token)?;
+        return Ok(token);
+    }
+    let (token_id, token_secret) = legacy_token_parts_from_secret_data(data)?;
     Ok(format!("{token_id}.{token_secret}"))
 }
 
@@ -436,12 +480,24 @@ fn matches_token_secret(
     token_id: &str,
     token_secret: &str,
 ) -> Result<bool> {
-    let stored_id = decode_data_field(data, "token-id")?;
-    let stored_secret = decode_data_field(data, "token-secret")?;
+    let (stored_id, stored_secret) = token_parts_from_secret_data(data)?;
     Ok(
         stored_id == token_id
             && constant_time_eq(stored_secret.as_bytes(), token_secret.as_bytes()),
     )
+}
+
+fn token_parts_from_secret_data(data: &serde_json::Value) -> Result<(String, String)> {
+    if let Some(token) = optional_decoded_data_field(data, "token")? {
+        return parse_bootstrap_token(&token);
+    }
+    legacy_token_parts_from_secret_data(data)
+}
+
+fn legacy_token_parts_from_secret_data(data: &serde_json::Value) -> Result<(String, String)> {
+    let token_id = decode_data_field(data, "token-id")?;
+    let token_secret = decode_data_field(data, "token-secret")?;
+    Ok((token_id, token_secret))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -591,6 +647,142 @@ mod tests {
             .is_none(),
             "production bootstrap tokens must not use bootstrap-token-<id> names"
         );
+    }
+
+    #[tokio::test]
+    async fn fixed_join_token_secrets_store_single_token_data_field() {
+        let db = crate::datastore::test_support::in_memory().await;
+        create_scoped_bootstrap_token_secret_for_test(
+            &db,
+            BootstrapTokenScope::Worker,
+            "abcdef.0123456789abcdef",
+        )
+        .await
+        .unwrap();
+        create_scoped_bootstrap_token_secret_for_test(
+            &db,
+            BootstrapTokenScope::Controlplane,
+            "123456.fedcba9876543210",
+        )
+        .await
+        .unwrap();
+
+        for (scope, expected_token) in [
+            (BootstrapTokenScope::Worker, "abcdef.0123456789abcdef"),
+            (BootstrapTokenScope::Controlplane, "123456.fedcba9876543210"),
+        ] {
+            let secret = db
+                .get_resource("v1", "Secret", Some("kube-system"), scope.secret_name())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                decode_data_field(&secret.data, "token").unwrap(),
+                expected_token
+            );
+            assert!(
+                secret.data.pointer("/data/token-id").is_none(),
+                "fixed join token Secret must not expose split token-id"
+            );
+            assert!(
+                secret.data.pointer("/data/token-secret").is_none(),
+                "fixed join token Secret must not expose split token-secret"
+            );
+            validate_bootstrap_token_for_scope(&db, expected_token, scope)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_accepts_legacy_split_token_data_fields() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Secret",
+            Some("kube-system"),
+            WORKER_BOOTSTRAP_TOKEN_SECRET_NAME,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "namespace": "kube-system",
+                    "name": WORKER_BOOTSTRAP_TOKEN_SECRET_NAME
+                },
+                "type": "bootstrap.kubernetes.io/token",
+                "data": {
+                    "token-id": encode_data("abcdef"),
+                    "token-secret": encode_data("0123456789abcdef"),
+                    "usage-bootstrap-authentication": encode_data("true"),
+                    "auth-extra-groups": encode_data(BootstrapTokenScope::Worker.auth_group())
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let identity = validate_bootstrap_token_for_scope(
+            &db,
+            "abcdef.0123456789abcdef",
+            BootstrapTokenScope::Worker,
+        )
+        .await
+        .expect("legacy split-field bootstrap Secret should validate");
+
+        assert_eq!(identity.token_id, "abcdef");
+        assert_eq!(
+            identity.extra_groups,
+            vec![BootstrapTokenScope::Worker.auth_group()]
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_migrates_legacy_fixed_secret_to_single_token_field() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Secret",
+            Some("kube-system"),
+            CONTROLPLANE_BOOTSTRAP_TOKEN_SECRET_NAME,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "namespace": "kube-system",
+                    "name": CONTROLPLANE_BOOTSTRAP_TOKEN_SECRET_NAME
+                },
+                "type": "bootstrap.kubernetes.io/token",
+                "data": {
+                    "token-id": encode_data("123456"),
+                    "token-secret": encode_data("fedcba9876543210"),
+                    "usage-bootstrap-authentication": encode_data("true"),
+                    "usage-bootstrap-signing": encode_data("true"),
+                    "auth-extra-groups": encode_data(BootstrapTokenScope::Controlplane.auth_group())
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let token = ensure_controlplane_bootstrap_token(&db).await.unwrap();
+        assert_eq!(token, "123456.fedcba9876543210");
+
+        let stored = db
+            .get_resource(
+                "v1",
+                "Secret",
+                Some("kube-system"),
+                CONTROLPLANE_BOOTSTRAP_TOKEN_SECRET_NAME,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_data_field(&stored.data, "token").unwrap(),
+            "123456.fedcba9876543210"
+        );
+        assert!(stored.data.pointer("/data/token-id").is_none());
+        assert!(stored.data.pointer("/data/token-secret").is_none());
     }
 
     #[tokio::test]

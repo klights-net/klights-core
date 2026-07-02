@@ -54,14 +54,6 @@ fn bootstrap_secret_token_from_json(secret: &Value) -> String {
     use base64::Engine as _;
 
     let data = secret.get("data").expect("Secret data must exist");
-    let token_id = data
-        .get("token-id")
-        .and_then(|value| value.as_str())
-        .expect("token-id must exist");
-    let token_secret = data
-        .get("token-secret")
-        .and_then(|value| value.as_str())
-        .expect("token-secret must exist");
     let decode = |value: &str| {
         String::from_utf8(
             base64::engine::general_purpose::STANDARD
@@ -70,6 +62,17 @@ fn bootstrap_secret_token_from_json(secret: &Value) -> String {
         )
         .expect("bootstrap token field must be utf-8")
     };
+    if let Some(token) = data.get("token").and_then(|value| value.as_str()) {
+        return decode(token);
+    }
+    let token_id = data
+        .get("token-id")
+        .and_then(|value| value.as_str())
+        .expect("token-id must exist");
+    let token_secret = data
+        .get("token-secret")
+        .and_then(|value| value.as_str())
+        .expect("token-secret must exist");
     format!("{}.{}", decode(token_id), decode(token_secret))
 }
 

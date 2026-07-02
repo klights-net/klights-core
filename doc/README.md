@@ -119,16 +119,12 @@ export KUBECONFIG=/var/lib/klights/cp1/etc/kubeconfig.yaml
 
 kubectl -n kube-system get secret controlplane-bootstrap-token -o json \
   | jq -r '
-      [.data["token-id"], .data["token-secret"]]
-      | map(@base64d)
-      | "\(.[0]).\(.[1])"
+      .data["token"] | @base64d
     ' > /tmp/klights-controlplane.token
 
 kubectl -n kube-system get secret worker-bootstrap-token -o json \
   | jq -r '
-      [.data["token-id"], .data["token-secret"]]
-      | map(@base64d)
-      | "\(.[0]).\(.[1])"
+      .data["token"] | @base64d
     ' > /tmp/klights-worker.token
 
 chmod 600 /tmp/klights-controlplane.token /tmp/klights-worker.token
