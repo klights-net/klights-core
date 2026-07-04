@@ -539,7 +539,7 @@ fn persistentvolume_protobuf_roundtrip() {
     let pv = json!({
         "apiVersion": "v1",
         "kind": "PersistentVolume",
-        "metadata": {"name": "pv-1"},
+        "metadata": {"name": "pv-1", "labels": {"e2e-pv-pool": "pv-1", "pv-1": "updated"}},
         "spec": {
             "capacity": {"storage": "10Gi"},
             "accessModes": ["ReadWriteOnce"],
@@ -562,6 +562,7 @@ fn persistentvolume_protobuf_roundtrip() {
     let bytes = encode_protobuf(&pv).unwrap();
     let decoded = decode_protobuf(&bytes).unwrap();
     assert_eq!(decoded["kind"], "PersistentVolume");
+    assert_eq!(decoded["metadata"]["labels"]["pv-1"], "updated");
     assert_eq!(decoded["spec"]["capacity"]["storage"], "10Gi");
 }
 

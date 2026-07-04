@@ -313,6 +313,107 @@ async fn raft_commit_builder_rejects_update_for_deleted_resource() {
 }
 
 #[tokio::test]
+async fn raft_committed_pv_bind_update_preserves_concurrent_user_labels() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "PersistentVolume",
+            None,
+            "pv-label-race",
+            json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolume",
+                "metadata": {
+                    "name": "pv-label-race",
+                    "uid": "pv-label-race-uid",
+                    "labels": {"e2e-pv-pool": "pv-label-race"}
+                },
+                "spec": {
+                    "capacity": {"storage": "1Gi"},
+                    "accessModes": ["ReadWriteOnce"],
+                    "persistentVolumeReclaimPolicy": "Retain",
+                    "hostPath": {"path": "/tmp/pv-label-race"}
+                },
+                "status": {"phase": "Available"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let mut user_update = (*created.data).clone();
+    user_update["metadata"]["labels"]["pv-label-race"] = json!("updated");
+    db.update_main_resource_with_preconditions(
+        "v1",
+        "PersistentVolume",
+        None,
+        "pv-label-race",
+        user_update,
+        ResourcePreconditions::from_resource(&created),
+    )
+    .await
+    .expect("client PV label update applies before controller bind commit");
+
+    let mut stale_bind = (*created.data).clone();
+    stale_bind["spec"]["claimRef"] = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "namespace": "default",
+        "name": "pvc-label-race",
+        "uid": "pvc-label-race-uid"
+    });
+    stale_bind["status"] = json!({"phase": "Bound"});
+    let committed = crate::log_apply::LogApplyCommit::new(
+        created.resource_version + 2,
+        vec![crate::log_apply::LogApplyMutation::PutResource(
+            crate::log_apply::LogApplyResourceRow {
+                api_version: "v1".to_string(),
+                kind: "PersistentVolume".to_string(),
+                namespace: None,
+                name: "pv-label-race".to_string(),
+                uid: "pv-label-race-uid".to_string(),
+                resource_version: created.resource_version + 2,
+                data: stale_bind,
+                require_absent: false,
+                require_existing: true,
+                precondition_uid: Some("pv-label-race-uid".to_string()),
+                precondition_resource_version: Some(created.resource_version),
+                status_only: false,
+            },
+        )],
+    );
+
+    let result = db
+        .apply_raft_log_apply_commit(committed)
+        .await
+        .expect("committed PV bind row applies authoritatively");
+    assert!(
+        result.error_message.is_none(),
+        "committed PV bind must not be rejected: {result:?}"
+    );
+
+    let live = db
+        .get_resource("v1", "PersistentVolume", None, "pv-label-race")
+        .await
+        .unwrap()
+        .expect("PV remains after bind");
+    assert_eq!(
+        live.data.pointer("/metadata/labels/e2e-pv-pool"),
+        Some(&json!("pv-label-race"))
+    );
+    assert_eq!(
+        live.data.pointer("/metadata/labels/pv-label-race"),
+        Some(&json!("updated")),
+        "controller PV bind commit must preserve labels added by a concurrent user update"
+    );
+    assert_eq!(
+        live.data.pointer("/spec/claimRef/name"),
+        Some(&json!("pvc-label-race")),
+        "controller bind change still applies"
+    );
+}
+
+#[tokio::test]
 async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid() {
     let db = Datastore::new_in_memory().await.unwrap();
     let created = db

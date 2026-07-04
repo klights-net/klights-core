@@ -768,6 +768,7 @@ fn preserve_same_uid_server_metadata_from_existing(
     {
         preserve_live_pod_node_for_stale_put(row, &existing_data);
         preserve_live_owner_refs_for_stale_pod_put(row, &existing_data);
+        preserve_user_metadata_for_stale_storage_put(row, &existing_data);
         // Pod finalizer drain is the handoff back to actor-owned UID cleanup;
         // a committed full PUT that omits finalizers must be honored.
         if row.api_version != "v1" || row.kind != "Pod" {
@@ -1059,6 +1060,51 @@ fn preserve_finalizers_from_existing(data: &mut serde_json::Value, existing: &se
         }
     }
     metadata.insert("finalizers".to_string(), serde_json::Value::Array(merged));
+}
+
+fn preserve_user_metadata_for_stale_storage_put(
+    row: &mut LogApplyResourceRow,
+    existing: &serde_json::Value,
+) {
+    if row.api_version != "v1"
+        || !matches!(
+            row.kind.as_str(),
+            "PersistentVolume" | "PersistentVolumeClaim"
+        )
+    {
+        return;
+    }
+    merge_missing_metadata_map_entries(&mut row.data, existing, "labels");
+    merge_missing_metadata_map_entries(&mut row.data, existing, "annotations");
+}
+
+fn merge_missing_metadata_map_entries(
+    data: &mut serde_json::Value,
+    existing: &serde_json::Value,
+    field: &str,
+) {
+    let Some(existing_entries) = existing
+        .pointer(&format!("/metadata/{field}"))
+        .and_then(|value| value.as_object())
+        .filter(|entries| !entries.is_empty())
+    else {
+        return;
+    };
+    let Some(metadata) = data
+        .get_mut("metadata")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    let entries = metadata
+        .entry(field.to_string())
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    let Some(entries) = entries.as_object_mut() else {
+        return;
+    };
+    for (key, value) in existing_entries {
+        entries.entry(key.clone()).or_insert_with(|| value.clone());
+    }
 }
 
 fn validate_put_resource_apply_preconditions(
