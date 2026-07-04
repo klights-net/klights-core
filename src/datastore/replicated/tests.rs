@@ -3405,4 +3405,102 @@ mod cases {
             Some(&json!("True"))
         );
     }
+
+    #[tokio::test]
+    async fn replicated_stale_cronjob_status_applies_newer_last_schedule_time() {
+        use crate::datastore::replicated::apply_command_to_backend;
+
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "batch/v1",
+                "CronJob",
+                Some("default"),
+                "replicated-stale-cronjob",
+                json!({
+                    "apiVersion": "batch/v1",
+                    "kind": "CronJob",
+                    "metadata": {
+                        "name": "replicated-stale-cronjob",
+                        "namespace": "default",
+                        "uid": "replicated-cronjob-uid"
+                    },
+                    "spec": {
+                        "schedule": "* */1 * * ?",
+                        "jobTemplate": {"spec": {"template": {"spec": {
+                            "containers": [{"name": "main", "image": "nginx"}],
+                            "restartPolicy": "OnFailure"
+                        }}}}
+                    },
+                    "status": {"lastScheduleTime": "2026-07-04T06:21:59Z"}
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.patch_resource_latest_with_preconditions(
+            "batch/v1",
+            "CronJob",
+            Some("default"),
+            "replicated-stale-cronjob",
+            crate::datastore::ResourcePatchRequest::new(
+                crate::datastore::PatchKind::Merge,
+                json!({"metadata": {"annotations": {"patchedstatus": "true"}}}),
+                ResourcePreconditions {
+                    uid: Some("replicated-cronjob-uid".into()),
+                    resource_version: None,
+                },
+            ),
+        )
+        .await
+        .expect("metadata patch advances the live resourceVersion after status patch");
+
+        apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateStatus {
+                api_version: "batch/v1".into(),
+                kind: "CronJob".into(),
+                namespace: Some("default".into()),
+                name: "replicated-stale-cronjob".into(),
+                status: json!({"lastScheduleTime": "2026-07-04T06:22:00Z"}),
+                expected_rv: Some(created.resource_version),
+                preconditions: ResourcePreconditions {
+                    uid: Some("replicated-cronjob-uid".into()),
+                    resource_version: Some(created.resource_version),
+                },
+                observed_status_stamp: None,
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: created.resource_version,
+                uid: Some("replicated-cronjob-uid".into()),
+                timestamp_ms: 0,
+                authoring_node: "controlplane1".into(),
+            },
+        )
+        .await
+        .expect("same-UID CronJob status apply should rebase onto metadata-only rv churn");
+
+        let live = db
+            .get_resource(
+                "batch/v1",
+                "CronJob",
+                Some("default"),
+                "replicated-stale-cronjob",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.data.pointer("/status/lastScheduleTime"),
+            Some(&json!("2026-07-04T06:22:00Z")),
+            "stale raft status apply must not report success while preserving the prior CronJob lastScheduleTime"
+        );
+        assert_eq!(
+            live.data.pointer("/metadata/annotations/patchedstatus"),
+            Some(&json!("true")),
+            "status rebase must preserve metadata-only changes that advanced the resourceVersion"
+        );
+    }
 }

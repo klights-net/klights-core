@@ -102,6 +102,15 @@ impl StatusMergeRegistry {
                     },
                 }))
             }
+            ("batch/v1", "CronJob") => {
+                StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
+                    terminal_condition_types: &[],
+                    stale_mode: GenericStaleStatusMode::Merge {
+                        condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
+                        field_merge: FieldMergeMode::PreserveUnmentioned,
+                    },
+                }))
+            }
             ("v1", "PersistentVolume") | ("v1", "PersistentVolumeClaim") => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
@@ -397,6 +406,19 @@ mod tests {
             }
         );
 
+        let cronjob = StatusMergeRegistry::default().profile("batch/v1", "CronJob");
+        let StatusMergeProfileKind::Generic(policy) = cronjob.kind else {
+            panic!("CronJob must use a Generic policy");
+        };
+        assert!(policy.terminal_condition_types.is_empty());
+        assert_eq!(
+            policy.stale_mode,
+            GenericStaleStatusMode::Merge {
+                condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
+                field_merge: FieldMergeMode::PreserveUnmentioned,
+            }
+        );
+
         for kind in ["PersistentVolume", "PersistentVolumeClaim"] {
             let pv = StatusMergeRegistry::default().profile("v1", kind);
             let StatusMergeProfileKind::Generic(policy) = pv.kind else {
@@ -481,6 +503,12 @@ mod tests {
                 kind: "Job",
                 terminal_type: Some("Complete"),
                 live_preserved_field: ("startTime", json!("2026-07-01T00:00:00Z")),
+            },
+            Case {
+                api_version: "batch/v1",
+                kind: "CronJob",
+                terminal_type: None,
+                live_preserved_field: ("active", json!([])),
             },
             Case {
                 api_version: "v1",

@@ -137,6 +137,90 @@ async fn test_cronjob_status_patch_metadata_annotation_preserved() {
 }
 
 #[tokio::test]
+async fn test_cronjob_status_put_protobuf_updates_last_schedule_time() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    let cronjob = json!({
+        "apiVersion": "batch/v1",
+        "kind": "CronJob",
+        "metadata": {
+            "name": "status-put-cj",
+            "namespace": "default",
+            "annotations": {"updated": "true"}
+        },
+        "spec": {
+            "schedule": "* */1 * * ?",
+            "jobTemplate": {"spec": {"template": {"spec": {
+                "containers": [{"name": "main", "image": "nginx"}],
+                "restartPolicy": "OnFailure"
+            }}}}
+        }
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/apis/batch/v1/namespaces/default/cronjobs")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&cronjob).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let patched_time = "2026-07-04T06:21:59Z";
+    let patch = json!({
+        "metadata": {"annotations": {"patchedstatus": "true"}},
+        "status": {"lastScheduleTime": patched_time}
+    });
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/apis/batch/v1/namespaces/default/cronjobs/status-put-cj/status")
+        .header("content-type", "application/merge-patch+json")
+        .body(Body::from(serde_json::to_vec(&patch).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/apis/batch/v1/namespaces/default/cronjobs/status-put-cj")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let mut update_body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        update_body["status"]["lastScheduleTime"], patched_time,
+        "precondition: status patch must seed lastScheduleTime"
+    );
+
+    let updated_time = "2026-07-04T06:22:00Z";
+    update_body["status"]["lastScheduleTime"] = json!(updated_time);
+    let protobuf_body =
+        crate::protobuf::encode_protobuf(&update_body).expect("CronJob status update encodes");
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/apis/batch/v1/namespaces/default/cronjobs/status-put-cj/status")
+        .header("content-type", "application/vnd.kubernetes.protobuf")
+        .body(Body::from(protobuf_body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        updated["status"]["lastScheduleTime"], "2026-07-04T06:22:00+00:00",
+        "protobuf PUT /status must persist the caller-updated CronJob lastScheduleTime"
+    );
+}
+
+#[tokio::test]
 async fn test_job_status_put_protobuf_updates_existing_custom_condition_timestamp() {
     use axum::{
         body::{Body, to_bytes},
