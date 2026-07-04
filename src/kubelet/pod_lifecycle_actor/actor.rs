@@ -1585,6 +1585,11 @@ impl PodLifecycleActor {
                     reason = ?reason,
                     "pod lifecycle actor received orphan finalization request"
                 );
+                if self.state.active_uid.is_some() && !self.active_uid_is(&key) {
+                    self.warn_active_uid_mismatch("orphan_finalize", &key);
+                    self.state.drop_pending_replacement_if_uid(&key.uid);
+                    return PodAction::Noop;
+                }
                 if self.state.in_flight_kind_for_uid(&key.uid)
                     == Some(PodLifecycleWorkKind::StopPod)
                     || self.state.in_flight_kind_for_uid(&key.uid)

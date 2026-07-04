@@ -3187,6 +3187,90 @@ fn stop_pod_completion_finalizes_delete_before_admitting_pending_replacement() {
 }
 
 #[test]
+fn stale_orphan_finalize_for_old_uid_does_not_steal_active_replacement() {
+    use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
+    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::kubelet::pod_lifecycle_router::OrphanReason;
+
+    let mut actor = direct_test_actor();
+    actor.enable_slot_admission_gate_for_test();
+    let key_a = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let key_b = PodLifecycleKey::new("default", "pod-a", "uid-b");
+    let pod_a = test_pod("default", "pod-a", "uid-a");
+    let pod_b = test_pod("default", "pod-a", "uid-b");
+
+    let check_a = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key_a.clone(),
+        resource_version: Some(1),
+        pod: pod_a.clone(),
+    });
+    let start_a = actor.handle_for_test(LifecycleMessage::SlotAdmissionGranted {
+        key: key_a.clone(),
+        operation_id: check_a.operation_id().expect("old slot admission op"),
+        pod: pod_a.clone(),
+        resource_version: Some(1),
+        start_after_admit: true,
+    });
+    let _ = actor.handle_for_test(LifecycleMessage::PodWorkFailed {
+        key: key_a.clone(),
+        operation_id: start_a.operation_id().expect("old start op"),
+        kind: PodLifecycleWorkKind::StartPod,
+        retryable: false,
+        failure: PodLifecycleWorkFailure::Startup("hostPort admission failed".to_string()),
+    });
+
+    let mut deleting_old = pod_a.clone();
+    deleting_old["metadata"]["deletionTimestamp"] = serde_json::json!("2026-07-04T18:51:57Z");
+    let stop_a = actor.handle_for_test(LifecycleMessage::WatchModified {
+        key: key_a.clone(),
+        resource_version: Some(2),
+        pod: deleting_old,
+    });
+    let finalize_a = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key_a.clone(),
+        operation_id: stop_a.operation_id().expect("old stop op"),
+        kind: PodLifecycleWorkKind::StopPod,
+        sandbox_id: None,
+    });
+    let _ = actor.handle_for_test(LifecycleMessage::PodWorkCompleted {
+        key: key_a.clone(),
+        operation_id: finalize_a.operation_id().expect("old finalization op"),
+        kind: PodLifecycleWorkKind::FinalizePodDeletion,
+        sandbox_id: None,
+    });
+
+    let check_b = actor.handle_for_test(LifecycleMessage::WatchAdded {
+        key: key_b.clone(),
+        resource_version: Some(3),
+        pod: pod_b.clone(),
+    });
+    let check_b_op = check_b
+        .operation_id()
+        .expect("replacement slot admission op");
+
+    let stale_orphan = actor.handle_for_test(LifecycleMessage::OrphanFinalize {
+        key: key_a,
+        reason: OrphanReason::LeaderDeletedWhileDown,
+    });
+    assert!(
+        matches!(stale_orphan, PodAction::Noop),
+        "stale old-UID orphan finalization must not dispatch stop for the active replacement slot"
+    );
+
+    let start_b = actor.handle_for_test(LifecycleMessage::SlotAdmissionGranted {
+        key: key_b.clone(),
+        operation_id: check_b_op,
+        pod: pod_b,
+        resource_version: Some(3),
+        start_after_admit: true,
+    });
+    assert!(
+        matches!(start_b, PodAction::StartPod { key, .. } if key == key_b),
+        "replacement slot admission grant must still start the replacement"
+    );
+}
+
+#[test]
 fn stop_pod_failure_keeps_pending_replacement_parked() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
     use crate::kubelet::pod_lifecycle_core::action::PodAction;
