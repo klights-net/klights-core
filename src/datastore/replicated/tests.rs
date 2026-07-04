@@ -3503,4 +3503,112 @@ mod cases {
             "status rebase must preserve metadata-only changes that advanced the resourceVersion"
         );
     }
+
+    #[tokio::test]
+    async fn replicated_stale_pdb_status_applies_disrupted_pods() {
+        use crate::datastore::replicated::apply_command_to_backend;
+
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "policy/v1",
+                "PodDisruptionBudget",
+                Some("default"),
+                "replicated-stale-pdb",
+                json!({
+                    "apiVersion": "policy/v1",
+                    "kind": "PodDisruptionBudget",
+                    "metadata": {
+                        "name": "replicated-stale-pdb",
+                        "namespace": "default",
+                        "uid": "replicated-pdb-uid"
+                    },
+                    "spec": {
+                        "minAvailable": 1,
+                        "selector": {"matchLabels": {"app": "pdb-stale"}}
+                    },
+                    "status": {
+                        "expectedPods": 1,
+                        "currentHealthy": 1,
+                        "desiredHealthy": 1,
+                        "disruptionsAllowed": 0
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.patch_resource_latest_with_preconditions(
+            "policy/v1",
+            "PodDisruptionBudget",
+            Some("default"),
+            "replicated-stale-pdb",
+            crate::datastore::ResourcePatchRequest::new(
+                crate::datastore::PatchKind::Merge,
+                json!({"metadata": {"annotations": {"patchedstatus": "true"}}}),
+                ResourcePreconditions {
+                    uid: Some("replicated-pdb-uid".into()),
+                    resource_version: None,
+                },
+            ),
+        )
+        .await
+        .expect("metadata patch advances the live resourceVersion after status patch");
+
+        apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateStatus {
+                api_version: "policy/v1".into(),
+                kind: "PodDisruptionBudget".into(),
+                namespace: Some("default".into()),
+                name: "replicated-stale-pdb".into(),
+                status: json!({
+                    "expectedPods": 1,
+                    "currentHealthy": 1,
+                    "desiredHealthy": 1,
+                    "disruptionsAllowed": 0,
+                    "disruptedPods": {
+                        "pod-0": "2026-07-04T17:43:00Z"
+                    }
+                }),
+                expected_rv: Some(created.resource_version),
+                preconditions: ResourcePreconditions {
+                    uid: Some("replicated-pdb-uid".into()),
+                    resource_version: Some(created.resource_version),
+                },
+                observed_status_stamp: None,
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: created.resource_version,
+                uid: Some("replicated-pdb-uid".into()),
+                timestamp_ms: 0,
+                authoring_node: "controlplane1".into(),
+            },
+        )
+        .await
+        .expect("same-UID PDB status apply should rebase onto metadata-only rv churn");
+
+        let live = db
+            .get_resource(
+                "policy/v1",
+                "PodDisruptionBudget",
+                Some("default"),
+                "replicated-stale-pdb",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            live.data.pointer("/status/disruptedPods/pod-0"),
+            Some(&json!("2026-07-04T17:43:00Z")),
+            "stale raft PDB status apply must keep caller-owned disruptedPods entries"
+        );
+        assert_eq!(
+            live.data.pointer("/metadata/annotations/patchedstatus"),
+            Some(&json!("true")),
+            "status rebase must preserve metadata-only changes that advanced the resourceVersion"
+        );
+    }
 }

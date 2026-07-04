@@ -111,6 +111,15 @@ impl StatusMergeRegistry {
                     },
                 }))
             }
+            ("policy/v1", "PodDisruptionBudget") => {
+                StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
+                    terminal_condition_types: &[],
+                    stale_mode: GenericStaleStatusMode::Merge {
+                        condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
+                        field_merge: FieldMergeMode::PreserveUnmentioned,
+                    },
+                }))
+            }
             ("v1", "PersistentVolume") | ("v1", "PersistentVolumeClaim") => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
@@ -419,8 +428,12 @@ mod tests {
             }
         );
 
-        for kind in ["PersistentVolume", "PersistentVolumeClaim"] {
-            let pv = StatusMergeRegistry::default().profile("v1", kind);
+        for (api_version, kind) in [
+            ("policy/v1", "PodDisruptionBudget"),
+            ("v1", "PersistentVolume"),
+            ("v1", "PersistentVolumeClaim"),
+        ] {
+            let pv = StatusMergeRegistry::default().profile(api_version, kind);
             let StatusMergeProfileKind::Generic(policy) = pv.kind else {
                 panic!("{kind} must use a Generic policy");
             };
@@ -509,6 +522,12 @@ mod tests {
                 kind: "CronJob",
                 terminal_type: None,
                 live_preserved_field: ("active", json!([])),
+            },
+            Case {
+                api_version: "policy/v1",
+                kind: "PodDisruptionBudget",
+                terminal_type: None,
+                live_preserved_field: ("observedGeneration", json!(7)),
             },
             Case {
                 api_version: "v1",
