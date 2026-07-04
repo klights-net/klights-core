@@ -1,5 +1,7 @@
 use super::*;
 use crate::api_discovery::{openapi_v2, openapi_v3_discovery_with_crds};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use serde_json::json;
 use std::sync::{LazyLock, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -74,6 +76,26 @@ fn bootstrap_secret_token_from_json(secret: &Value) -> String {
         .and_then(|value| value.as_str())
         .expect("token-secret must exist");
     format!("{}.{}", decode(token_id), decode(token_secret))
+}
+
+#[tokio::test]
+async fn health_endpoints_return_ok() {
+    use tower::ServiceExt;
+
+    for path in ["/healthz", "/livez", "/readyz"] {
+        let app = crate::api::test_support::build_test_router().await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("health request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK, "{path} status");
+    }
 }
 
 #[test]
@@ -5586,6 +5608,36 @@ async fn test_task_supervisor_category_and_task_endpoints() {
         .await
         .unwrap();
     assert_eq!(file_tasks_resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn raft_follower_health_endpoints_bypass_leader_proxy() {
+    use tower::ServiceExt;
+
+    let (_, is_leader_rx) = tokio::sync::watch::channel(false);
+    let (_, leader_addr_rx) = tokio::sync::watch::channel(None::<String>);
+
+    let mut follower_state = crate::api::test_support::build_test_app_state().await;
+    follower_state.is_raft_leader_rx = Some(std::sync::Arc::new(
+        crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
+    ));
+    let app = crate::api::build_router(follower_state);
+
+    for path in ["/healthz", "/livez", "/readyz"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("health request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK, "{path} status");
+    }
 }
 
 #[tokio::test]

@@ -92,6 +92,8 @@ pub fn build_router(state: AppState) -> Router {
     let state = Arc::new(state);
     Router::new()
         .route("/healthz", get(health_check))
+        .route("/livez", get(health_check))
+        .route("/readyz", get(health_check))
         .route("/metrics", get(metrics_handler))
         .route("/version", get(version))
         .route(

@@ -3,7 +3,7 @@
 //! In the klights HA model, all controlplanes bind TCP 7679 but only
 //! the raft leader serves K8s API requests directly. Follower
 //! controlplanes transparently reverse-proxy K8s API requests to the
-//! current leader. gRPC (raft transport) and `/healthz` always go
+//! current leader. gRPC (raft transport) and health endpoints always go
 //! through locally.
 
 use axum::body::Body;
@@ -140,7 +140,7 @@ async fn read_proxy_client_identity_file(
 /// Axum middleware: gate K8s API requests on raft leadership.
 ///
 /// - gRPC requests (raft transport) → always pass through
-/// - `/healthz` → always pass through
+/// - `/healthz`, `/livez`, `/readyz` → always pass through
 /// - On leader → pass through to normal handlers
 /// - On follower → reverse-proxy to the leader
 pub async fn leader_proxy_middleware(
@@ -148,14 +148,14 @@ pub async fn leader_proxy_middleware(
     request: Request,
     next: Next,
 ) -> Response {
-    // Check if this is a gRPC request (raft transport) or healthz
+    // Check if this is a gRPC request (raft transport) or a health endpoint.
     let is_grpc = request
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("application/grpc"));
     let path = request.uri().path();
-    let is_health = path == "/healthz";
+    let is_health = matches!(path, "/healthz" | "/livez" | "/readyz");
 
     if is_grpc || is_health {
         return next.run(request).await;
