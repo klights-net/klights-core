@@ -45,14 +45,24 @@ impl super::GcTask for WatchEventsGc {
         "watch_events_gc"
     }
     async fn run(&self) -> Result<()> {
-        let removed = self
-            .db
-            .gc_watch_events(self.max_rows, self.batch_cap)
-            .await?;
-        if removed > 0 {
+        let mut total_removed = 0usize;
+        let mut batches = 0usize;
+        loop {
+            let removed = self
+                .db
+                .gc_watch_events(self.max_rows, self.batch_cap)
+                .await?;
+            if removed == 0 {
+                break;
+            }
+            total_removed += removed;
+            batches += 1;
+        }
+        if total_removed > 0 {
             tracing::info!(
                 watch_events_gc = true,
-                removed,
+                removed = total_removed,
+                batches,
                 max_rows = self.max_rows,
                 "watch_events_gc: tick complete"
             );
@@ -65,6 +75,7 @@ impl super::GcTask for WatchEventsGc {
 mod tests {
     use super::*;
     use crate::datastore::sqlite::Datastore;
+    use crate::gc::GcTask;
 
     /// Insert N rows into watch_events directly, then GC and assert COUNT(*).
     async fn insert_n_events(db: &Datastore, n: i64) {
@@ -201,6 +212,26 @@ mod tests {
         assert_eq!(
             <WatchEventsGc as super::super::GcTask>::name(&task),
             "watch_events_gc"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_task_drains_backlog_across_bounded_batches() {
+        let db = crate::datastore::test_support::in_memory().await;
+        insert_n_events(&db, 20).await;
+
+        let task = WatchEventsGc {
+            db: std::sync::Arc::new(db.clone()),
+            max_rows: 5,
+            batch_cap: 4,
+        };
+
+        task.run().await.unwrap();
+
+        let count = db.count_watch_events().await.unwrap();
+        assert!(
+            count <= 6,
+            "watch_events GC task must drain backlog to the cap window in one run; count={count}"
         );
     }
 }
