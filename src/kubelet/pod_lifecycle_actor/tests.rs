@@ -3187,6 +3187,89 @@ fn stop_pod_completion_finalizes_delete_before_admitting_pending_replacement() {
 }
 
 #[test]
+fn stale_old_uid_messages_do_not_mutate_active_replacement() {
+    use crate::kubelet::cri_events::KubeletEventKind;
+    use crate::kubelet::lifecycle::LifecycleCommand;
+    use crate::kubelet::pod_lifecycle_core::action::PodAction;
+    use crate::kubelet::pod_lifecycle_router::OrphanReason;
+
+    let mut actor = direct_test_actor();
+    // Admit a replacement UID as the active pod.
+    let new_key = PodLifecycleKey::new("default", "same-name", "uid-new");
+    let new_pod = test_pod("default", "same-name", "uid-new");
+    assert!(matches!(
+        actor.handle_for_test(LifecycleMessage::WatchAdded {
+            key: new_key.clone(),
+            resource_version: Some(1),
+            pod: new_pod.clone(),
+        }),
+        PodAction::StartPod { .. }
+    ));
+    assert_eq!(actor.active_uid_for_test(), Some("uid-new"));
+
+    let old_key = PodLifecycleKey::new("default", "same-name", "uid-old");
+
+    let cases: Vec<(&str, LifecycleMessage)> = vec![
+        (
+            "orphan_finalize",
+            LifecycleMessage::OrphanFinalize {
+                key: old_key.clone(),
+                reason: OrphanReason::LeaderDeletedWhileDown,
+            },
+        ),
+        (
+            "cri_event",
+            LifecycleMessage::CriEvent {
+                key: old_key.clone(),
+                container_id: "container-old".to_string(),
+                kind: KubeletEventKind::Stopped,
+            },
+        ),
+        (
+            "active_deadline_due",
+            LifecycleMessage::ActiveDeadlineDue {
+                key: old_key.clone(),
+            },
+        ),
+        (
+            "lifecycle_command",
+            LifecycleMessage::LifecycleCommand {
+                key: old_key.clone(),
+                command: LifecycleCommand::ReadinessChanged {
+                    pod_uid: "uid-old".to_string(),
+                    namespace: "default".to_string(),
+                    pod_name: "same-name".to_string(),
+                    container_name: "app".to_string(),
+                    ready: true,
+                },
+            },
+        ),
+    ];
+
+    for (workflow, message) in cases {
+        let action = actor.handle_for_test(message);
+        assert!(
+            matches!(action, PodAction::Noop),
+            "stale old-UID {workflow} must yield Noop, got {action:?}"
+        );
+        // Active UID stays the replacement.
+        assert_eq!(
+            actor.active_uid_for_test(),
+            Some("uid-new"),
+            "stale old-UID {workflow} must not steal the active replacement UID"
+        );
+        // No replacement slot is consumed: the old UID never registered a
+        // pending replacement, and the stale messages must not create one
+        // or admit the old UID.
+        assert_eq!(
+            actor.pending_replacement_uid_for_test(),
+            None,
+            "stale old-UID {workflow} must not consume the replacement slot"
+        );
+    }
+}
+
+#[test]
 fn stale_orphan_finalize_for_old_uid_does_not_steal_active_replacement() {
     use super::message::{PodLifecycleWorkFailure, PodLifecycleWorkKind};
     use crate::kubelet::pod_lifecycle_core::action::PodAction;

@@ -965,6 +965,29 @@ impl PodLifecycleActor {
         self.warn_uid_mismatch(workflow, &active_uid, key);
     }
 
+    /// Centralizes equivalent stale old-UID no-op handling for lifecycle
+    /// message arms whose only UID policy is to drop a stale incoming UID.
+    /// Returns `Some(PodAction::Noop)` when `active_uid` is set and does not
+    /// match `key`, after warning and optionally dropping a pending
+    /// replacement for the incoming UID. Returns `None` when the actor has
+    /// no active UID or the message matches the active UID, leaving the
+    /// caller to continue its message-specific handling.
+    fn stale_active_uid_noop(
+        &mut self,
+        workflow: &'static str,
+        key: &PodLifecycleKey,
+        drop_pending_replacement_for_incoming_uid: bool,
+    ) -> Option<PodAction> {
+        if self.state.active_uid.is_none() || self.active_uid_is(key) {
+            return None;
+        }
+        self.warn_active_uid_mismatch(workflow, key);
+        if drop_pending_replacement_for_incoming_uid {
+            self.state.drop_pending_replacement_if_uid(&key.uid);
+        }
+        Some(PodAction::Noop)
+    }
+
     fn reconcile_ephemeral_action(
         &mut self,
         key: PodLifecycleKey,
@@ -1585,10 +1608,8 @@ impl PodLifecycleActor {
                     reason = ?reason,
                     "pod lifecycle actor received orphan finalization request"
                 );
-                if self.state.active_uid.is_some() && !self.active_uid_is(&key) {
-                    self.warn_active_uid_mismatch("orphan_finalize", &key);
-                    self.state.drop_pending_replacement_if_uid(&key.uid);
-                    return PodAction::Noop;
+                if let Some(action) = self.stale_active_uid_noop("orphan_finalize", &key, true) {
+                    return action;
                 }
                 if self.state.in_flight_kind_for_uid(&key.uid)
                     == Some(PodLifecycleWorkKind::StopPod)
@@ -2004,17 +2025,16 @@ impl PodLifecycleActor {
             LifecycleMessage::CriEvent {
                 key, container_id, ..
             } => {
-                if self.state.active_uid.is_some() && !self.active_uid_is(&key) {
-                    self.warn_active_uid_mismatch("cri_event", &key);
-                    return PodAction::Noop;
+                if let Some(action) = self.stale_active_uid_noop("cri_event", &key, false) {
+                    return action;
                 }
                 self.ensure_active_uid(&key);
                 self.runtime_reconcile_action_or_defer(key, Some(container_id.as_str()))
             }
             LifecycleMessage::ActiveDeadlineDue { key } => {
-                if self.state.active_uid.is_some() && !self.active_uid_is(&key) {
-                    self.warn_active_uid_mismatch("active_deadline_due", &key);
-                    return PodAction::Noop;
+                if let Some(action) = self.stale_active_uid_noop("active_deadline_due", &key, false)
+                {
+                    return action;
                 }
                 self.ensure_active_uid(&key);
                 self.runtime_reconcile_action_or_defer(key, None)
@@ -2022,9 +2042,8 @@ impl PodLifecycleActor {
 
             // ── Commands ──
             LifecycleMessage::LifecycleCommand { key, command } => {
-                if self.state.active_uid.is_some() && !self.active_uid_is(&key) {
-                    self.warn_active_uid_mismatch("lifecycle_command", &key);
-                    return PodAction::Noop;
+                if let Some(action) = self.stale_active_uid_noop("lifecycle_command", &key, false) {
+                    return action;
                 }
                 self.ensure_active_uid(&key);
                 self.handle_command_action(key, command)
