@@ -11255,3 +11255,507 @@ async fn gc_marked_pod_enqueues_uid_bound_workqueue_entry() {
         "workqueue row must target the owning kubelet actor"
     );
 }
+
+// --- Task 8: Table-driven UID-bound pod repository deletion invariants ---
+
+/// Helper: create a same-name replacement Pod under `(ns, name)` with
+/// `uid-new` and distinctive owner/label/status data. The returned
+/// `Resource` captures the pre-operation snapshot used by stale-UID
+/// invariant assertions.
+async fn create_replacement_pod(
+    repo: &super::PodRepository,
+    ns: &str,
+    name: &str,
+) -> crate::datastore::Resource {
+    let pod = json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "namespace": ns,
+            "name": name,
+            "uid": "uid-new",
+            "ownerReferences": [{
+                "apiVersion": "apps/v1",
+                "kind": "ReplicaSet",
+                "name": "rs-original",
+                "uid": "rs-uid-original",
+                "controller": true
+            }],
+            "labels": {"app": "original", "env": "prod"}
+        },
+        "spec": {"containers": [{"name": "app", "image": "nginx:1.27"}]},
+        "status": {"phase": "Pending"}
+    });
+    repo.store
+        .create(ns, name, pod)
+        .await
+        .expect("replacement pod created")
+}
+
+/// Assert a replacement Pod survived a stale-UID operation unchanged:
+/// same UID, same resource_version, same ownerReferences, same labels.
+fn assert_replacement_unchanged(
+    live: &crate::datastore::Resource,
+    before: &crate::datastore::Resource,
+) {
+    assert_eq!(
+        live.uid, before.uid,
+        "replacement UID must survive stale-UID operations"
+    );
+    assert_eq!(
+        live.resource_version, before.resource_version,
+        "replacement resource_version must not advance from a stale-UID op"
+    );
+    assert_eq!(
+        live.data.pointer("/metadata/ownerReferences"),
+        before.data.pointer("/metadata/ownerReferences"),
+        "replacement ownerReferences must survive stale-UID operations"
+    );
+    assert_eq!(
+        live.data.pointer("/metadata/labels"),
+        before.data.pointer("/metadata/labels"),
+        "replacement labels must survive stale-UID operations"
+    );
+}
+
+/// Table-driven: every UID-bound repository mutation entrypoint must
+/// reject a stale old UID and leave a same-name replacement Pod
+/// (including its UID, resource_version, and replacement-specific data)
+/// completely unchanged.
+#[tokio::test]
+async fn old_uid_operations_do_not_mutate_replacement() {
+    use super::{PodObjectWriter, PodReader, PodStatusWriter};
+
+    let repo = build_repo().await;
+    let ns = "default";
+    let stale_uid = "uid-old";
+
+    // --- update_pod_owner_references_for_uid ---
+    {
+        let name = "owner-refs";
+        let before = create_replacement_pod(&repo, ns, name).await;
+        let err = repo
+            .update_pod_owner_references_for_uid(
+                ns,
+                name,
+                stale_uid,
+                vec![json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "ReplicaSet",
+                    "name": "rs-attacker",
+                    "uid": "rs-uid-attacker",
+                    "controller": true
+                })],
+            )
+            .await;
+        assert!(
+            err.is_err(),
+            "stale UID update_pod_owner_references_for_uid must be rejected"
+        );
+        let live = repo.get_pod(ns, name).await.unwrap().expect("pod exists");
+        assert_replacement_unchanged(&live, &before);
+    }
+
+    // --- merge_pod_labels_for_uid ---
+    {
+        let name = "labels";
+        let before = create_replacement_pod(&repo, ns, name).await;
+        let err = repo
+            .merge_pod_labels_for_uid(
+                ns,
+                name,
+                stale_uid,
+                vec![
+                    ("app".to_string(), "attacker".to_string()),
+                    ("env".to_string(), "staging".to_string()),
+                ],
+            )
+            .await;
+        assert!(
+            err.is_err(),
+            "stale UID merge_pod_labels_for_uid must be rejected"
+        );
+        let live = repo.get_pod(ns, name).await.unwrap().expect("pod exists");
+        assert_replacement_unchanged(&live, &before);
+    }
+
+    // --- set_pod_status_for_uid ---
+    {
+        let name = "status";
+        let before = create_replacement_pod(&repo, ns, name).await;
+        let update = super::PodStatusUpdate {
+            phase: "Running".to_string(),
+            pod_ip: "10.42.0.99".to_string(),
+            host_ip: "192.168.1.99".to_string(),
+            container_statuses: vec![],
+            init_container_statuses: None,
+            qos_class: None,
+        };
+        let err = repo
+            .set_pod_status_for_uid(ns, name, stale_uid, update, None)
+            .await;
+        assert!(
+            err.is_err(),
+            "stale UID set_pod_status_for_uid must be rejected"
+        );
+        let live = repo.get_pod(ns, name).await.unwrap().expect("pod exists");
+        assert_replacement_unchanged(&live, &before);
+    }
+
+    // --- mark_start_pending_for_retry_for_uid ---
+    {
+        let name = "retry-status";
+        let before = create_replacement_pod(&repo, ns, name).await;
+        let err = repo
+            .mark_start_pending_for_retry_for_uid(
+                ns,
+                name,
+                stale_uid,
+                "Failed to pull image \"nginx:1.27\": connection refused",
+            )
+            .await;
+        assert!(
+            err.is_err(),
+            "stale UID mark_start_pending_for_retry_for_uid must be rejected"
+        );
+        let live = repo.get_pod(ns, name).await.unwrap().expect("pod exists");
+        assert_replacement_unchanged(&live, &before);
+    }
+
+    // --- delete_with_uid ---
+    {
+        let name = "delete";
+        let before = create_replacement_pod(&repo, ns, name).await;
+        let err = repo.store.delete_with_uid(ns, name, stale_uid).await;
+        assert!(err.is_err(), "stale UID delete_with_uid must be rejected");
+        let live = repo.get_pod(ns, name).await.unwrap().expect("pod exists");
+        assert_replacement_unchanged(&live, &before);
+    }
+}
+
+/// Deferred-delete invariants:
+/// 1. A picked-up (nodeName set) terminating Pod must NOT be hard-deleted
+///    by the unscheduled-delete path — it defers to actor-owned
+///    finalization (HR#11).
+/// 2. A same-name replacement Pod (different UID) must survive a stale
+///    old-UID deferred-delete entry.
+#[tokio::test]
+async fn deferred_delete_preserves_same_name_replacement() {
+    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let store = PodStore::new(db);
+
+    // (1) Picked-up terminating Pod: nodeName is set → DeferToActor.
+    {
+        let mut pod = make_terminating_pod("picked-up", "uid-picked");
+        pod["spec"]["nodeName"] = json!("node-a");
+        store.create("default", "picked-up", pod).await.unwrap();
+
+        let outcome = store
+            .delete_unscheduled_with_uid("default", "picked-up", "uid-picked")
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            UnscheduledPodDeleteOutcome::DeferToActor,
+            "a Pod bound to a kubelet must only be removed by its lifecycle actor"
+        );
+        let live = store
+            .get("default", "picked-up")
+            .await
+            .unwrap()
+            .expect("picked-up Pod row must survive deferred delete");
+        assert_eq!(live.uid, "uid-picked");
+    }
+
+    // (2) Same-name replacement: old-UID deferred entry must not touch the
+    //     live replacement Pod. delete_unscheduled_with_uid returns Removed
+    //     (the old UID is already gone) without deleting the replacement.
+    {
+        let replacement = make_terminating_pod("replaced", "uid-new");
+        store
+            .create("default", "replaced", replacement)
+            .await
+            .unwrap();
+
+        let outcome = store
+            .delete_unscheduled_with_uid("default", "replaced", "uid-old")
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            UnscheduledPodDeleteOutcome::Removed,
+            "stale-UID deferred delete must report Removed without touching the replacement"
+        );
+        let live = store
+            .get("default", "replaced")
+            .await
+            .unwrap()
+            .expect("replacement Pod must survive stale-UID deferred delete");
+        assert_eq!(live.uid, "uid-new", "replacement UID must be preserved");
+    }
+}
+
+/// Test-only raft proposer that mutates the target Pod between the
+/// `delete_unscheduled_with_uid` read and its CAS delete, simulating a
+/// concurrent scheduler bind or status write that races the unscheduled
+/// hard-delete. When `set_node_name` is true the race sets `spec.nodeName`
+/// (a kubelet picked the Pod up); otherwise it advances the
+/// resourceVersion via a status write. In both cases the observed-RV CAS
+/// inside `delete_unscheduled_with_uid` must reject the delete and defer
+/// to actor-owned finalization.
+struct DeleteCasRacingRaftProposer {
+    inner: crate::datastore::DatastoreHandle,
+    namespace: String,
+    pod_name: String,
+    set_node_name: bool,
+    raced: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DeleteCasRacingRaftProposer {
+    /// Mutate the target Pod just before the DeleteResource command is
+    /// applied, advancing its resourceVersion so the observed-RV CAS
+    /// precondition becomes stale.
+    async fn race_before_delete(&self) {
+        let current = self
+            .inner
+            .get_resource("v1", "Pod", Some(&self.namespace), &self.pod_name)
+            .await
+            .expect("race proposer reads target pod")
+            .expect("target pod must exist when racing delete");
+        if self.set_node_name {
+            let mut body = serde_json::from_str::<serde_json::Value>(
+                &serde_json::to_string(&current.data).unwrap(),
+            )
+            .unwrap();
+            body["spec"]["nodeName"] = json!("node-bound-by-scheduler");
+            self.inner
+                .update_main_resource_with_preconditions(
+                    "v1",
+                    "Pod",
+                    Some(&self.namespace),
+                    &self.pod_name,
+                    body,
+                    crate::datastore::ResourcePreconditions {
+                        uid: Some(current.uid.clone()),
+                        resource_version: Some(current.resource_version),
+                    },
+                )
+                .await
+                .expect("race proposer sets nodeName to advance resourceVersion");
+        } else {
+            self.inner
+                .update_status_only_with_preconditions(
+                    "v1",
+                    "Pod",
+                    Some(&self.namespace),
+                    &self.pod_name,
+                    json!({
+                        "phase": "Running",
+                        "podIP": "10.42.0.77",
+                        "raceBump": true
+                    }),
+                    crate::datastore::ResourcePreconditions::uid(current.uid),
+                )
+                .await
+                .expect("race proposer bumps status to advance resourceVersion");
+        }
+        self.raced.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn targets_delete_of_pod(&self, command: &crate::datastore::command::StorageCommand) -> bool {
+        matches!(
+            command,
+            crate::datastore::command::StorageCommand::DeleteResource {
+                api_version,
+                kind,
+                namespace,
+                name,
+                ..
+            }
+            if api_version == "v1"
+                && kind == "Pod"
+                && namespace.as_deref() == Some(self.namespace.as_str())
+                && name == &self.pod_name
+        )
+    }
+
+    async fn apply_command_to_inner(
+        &self,
+        command: crate::datastore::command::StorageCommand,
+    ) -> anyhow::Result<()> {
+        let current_rv = self.inner.get_current_resource_version().await.unwrap_or(0);
+        let meta = crate::datastore::command::CommandMeta {
+            command_id: crate::datastore::command::CommandId::new(),
+            codec_version: crate::datastore::command::COMMAND_CODEC_VERSION,
+            resource_version: current_rv.saturating_add(1),
+            uid: match &command {
+                crate::datastore::command::StorageCommand::DeleteResource {
+                    preconditions, ..
+                } => preconditions.uid.clone(),
+                _ => None,
+            },
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| d.as_millis().try_into().ok())
+                .unwrap_or(0),
+            authoring_node: "delete-cas-race-leader".to_string(),
+        };
+        crate::datastore::replicated::apply_command_to_backend(self.inner.as_ref(), command, meta)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::datastore::replicated::RaftProposer for DeleteCasRacingRaftProposer {
+    async fn propose_command(
+        &self,
+        command: crate::datastore::command::StorageCommand,
+    ) -> anyhow::Result<()> {
+        if self.targets_delete_of_pod(&command) {
+            self.race_before_delete().await;
+        }
+        self.apply_command_to_inner(command).await
+    }
+
+    async fn propose_outbox_command(
+        &self,
+        _idempotency_key: &str,
+        _operation: &str,
+        command: crate::datastore::command::StorageCommand,
+        _authoring_node: &str,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        if self.targets_delete_of_pod(&command) {
+            self.race_before_delete().await;
+        }
+        self.apply_command_to_inner(command)
+            .await
+            .map(|_| crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 })
+            .map_err(|err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()))
+    }
+}
+
+/// Build a `PodStore` backed by a `ReplicatedDatastore` whose raft
+/// proposer mutates the target Pod just before the CAS delete fires,
+/// simulating a concurrent scheduler bind or status write.
+async fn build_store_with_delete_cas_race(
+    pod_name: &str,
+    set_node_name: bool,
+) -> (
+    PodStore,
+    crate::datastore::DatastoreHandle,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let inner: crate::datastore::DatastoreHandle =
+        Arc::new(crate::datastore::test_support::in_memory().await);
+    let replicated = Arc::new(crate::datastore::replicated::ReplicatedDatastore::new(
+        inner.clone(),
+        crate::datastore::replicated::ReplicationMode::Raft {
+            node_name: "delete-cas-race-leader".to_string(),
+        },
+    ));
+    let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    replicated.set_raft_proposer(Arc::new(DeleteCasRacingRaftProposer {
+        inner: inner.clone(),
+        namespace: "default".to_string(),
+        pod_name: pod_name.to_string(),
+        set_node_name,
+        raced: raced.clone(),
+    }));
+    let db: crate::datastore::DatastoreHandle = replicated;
+    (PodStore::new(db.clone()), db, raced)
+}
+
+/// CAS race: a scheduler bind lands between the `spec.nodeName` observation
+/// (empty) and the CAS delete. The observed resourceVersion is now stale, so
+/// the compare-and-swap delete must no-op and defer to actor-owned
+/// finalization. The Pod row must survive with the bound nodeName.
+#[tokio::test]
+async fn unscheduled_delete_compare_and_swap_rejects_node_bind_race() {
+    let (store, db, raced) = build_store_with_delete_cas_race("bind-race", true).await;
+
+    let created = store
+        .create(
+            "default",
+            "bind-race",
+            make_terminating_pod("bind-race", "uid-bind"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.uid, "uid-bind");
+
+    let outcome = store
+        .delete_unscheduled_with_uid("default", "bind-race", "uid-bind")
+        .await
+        .expect("CAS race must not propagate a hard error");
+
+    assert_eq!(
+        outcome,
+        UnscheduledPodDeleteOutcome::DeferToActor,
+        "node-bind race must lose the CAS and defer to actor finalization"
+    );
+    assert!(
+        raced.load(std::sync::atomic::Ordering::SeqCst),
+        "test proposer must have raced a nodeName bind before the CAS delete"
+    );
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "bind-race")
+        .await
+        .unwrap()
+        .expect("Pod row must survive the lost CAS delete");
+    assert_eq!(live.uid, "uid-bind");
+    assert_eq!(
+        live.data.pointer("/spec/nodeName").and_then(|v| v.as_str()),
+        Some("node-bound-by-scheduler"),
+        "the racing scheduler bind must be visible on the surviving Pod"
+    );
+}
+
+/// CAS race: any concurrent write that advances the resourceVersion after
+/// the empty-`spec.nodeName` observation must cause the compare-and-swap
+/// delete to no-op (DeferToActor). This exercises the CAS on the observed
+/// resourceVersion, not only stale-UID rejection.
+#[tokio::test]
+async fn unscheduled_delete_compare_and_swap_rejects_resource_version_race() {
+    let (store, db, raced) = build_store_with_delete_cas_race("rv-race", false).await;
+
+    let created = store
+        .create(
+            "default",
+            "rv-race",
+            make_terminating_pod("rv-race", "uid-rv"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.uid, "uid-rv");
+
+    let outcome = store
+        .delete_unscheduled_with_uid("default", "rv-race", "uid-rv")
+        .await
+        .expect("CAS race must not propagate a hard error");
+
+    assert_eq!(
+        outcome,
+        UnscheduledPodDeleteOutcome::DeferToActor,
+        "resourceVersion race must lose the CAS and defer to actor finalization"
+    );
+    assert!(
+        raced.load(std::sync::atomic::Ordering::SeqCst),
+        "test proposer must have advanced resourceVersion before the CAS delete"
+    );
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "rv-race")
+        .await
+        .unwrap()
+        .expect("Pod row must survive the lost CAS delete");
+    assert_eq!(live.uid, "uid-rv");
+    assert!(
+        live.resource_version > created.resource_version,
+        "the racing status write must have advanced the resourceVersion"
+    );
+}
