@@ -1,6 +1,11 @@
 use super::*;
 
+use crate::api::mutation::write::{
+    CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
+    patch_with_strategy, update_with_strategy,
+};
 use crate::auth::identity::AuthenticatedIdentity;
+use async_trait::async_trait;
 use axum::Extension;
 
 // Custom-resource authorization is enforced by the global `authorize_request`
@@ -1753,6 +1758,551 @@ async fn dispatch_custom_resource_mutation_event(
     .await;
 }
 
+async fn after_persisted_custom_resource_write(
+    state: &Arc<AppState>,
+    resource: &Resource,
+    operation: crate::api::mutation::MutationOperation,
+    owner_ref_context: &'static str,
+    event_context: &'static str,
+) {
+    reconcile_custom_resource_owner_refs(state, resource, owner_ref_context).await;
+    dispatch_custom_resource_mutation_event(state, operation, &resource.data, event_context).await;
+}
+
+struct CustomResourceCreateStrategy<'a> {
+    state: &'a Arc<AppState>,
+    scope: CustomResourceScope<'a>,
+    query: &'a CreateUpdateQuery,
+    log_context: &'static str,
+}
+
+#[async_trait]
+impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
+    async fn before_admission(&self, body: Value) -> Result<Value, AppError> {
+        let CustomResourceType {
+            info,
+            group,
+            version,
+            ..
+        } = self.scope.resource_type;
+        let mut body = body;
+        apply_crd_defaults(
+            self.state.db.as_ref(),
+            group,
+            version,
+            &info.kind,
+            &mut body,
+        )
+        .await;
+        if self.query.field_validation.as_deref() == Some("Strict") {
+            check_cr_field_validation_strict(
+                self.state.db.as_ref(),
+                group,
+                version,
+                &info.kind,
+                &body,
+            )
+            .await?;
+        }
+        Ok(body)
+    }
+
+    async fn admit(
+        &self,
+        body: Value,
+        dry_run: crate::api::mutation::DryRunMode,
+    ) -> Result<Value, AppError> {
+        let CustomResourceType { info, .. } = self.scope.resource_type;
+        let api_version = self.scope.resource_type.api_version();
+        let namespace = self.scope.namespace.map(str::to_string);
+        let name = body
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+            .map(ToString::to_string);
+        let mut body = crate::api::mutation::write::run_admission(
+            self.state.db.as_ref(),
+            AdmissionContextRequest {
+                api_version: &api_version,
+                kind: &info.kind,
+                operation: "CREATE",
+                namespace,
+                name,
+                object: body,
+                old_object: None,
+                dry_run: dry_run.is_all(),
+                subresource: None,
+                options: None,
+            },
+        )
+        .await?;
+        let CustomResourceType { group, version, .. } = self.scope.resource_type;
+        apply_crd_pruning(
+            self.state.db.as_ref(),
+            group,
+            version,
+            &info.kind,
+            &mut body,
+        )
+        .await;
+        Ok(body)
+    }
+
+    async fn persist_create(
+        &self,
+        body: Value,
+        dry_run: crate::api::mutation::DryRunMode,
+    ) -> Result<WriteResult, AppError> {
+        if dry_run.is_all() {
+            return Ok(WriteResult::DryRun(body));
+        }
+        let CustomResourceType {
+            info,
+            group,
+            version,
+            plural,
+        } = self.scope.resource_type;
+        let ns = self.scope.namespace;
+        let api_version = self.scope.resource_type.api_version();
+        let name = body["metadata"]["name"]
+            .as_str()
+            .ok_or_else(|| AppError::BadRequest("metadata.name required".to_string()))?
+            .to_string();
+        let conversion = load_crd_conversion_config(self.state.db.as_ref(), group, plural).await?;
+        let storage_api_version =
+            storage_api_version_for_request(group, version, conversion.as_ref());
+        if get_existing_custom_resource_for_write(
+            self.state,
+            group,
+            version,
+            plural,
+            &info.kind,
+            ns.map(str::to_string),
+            &name,
+        )
+        .await
+        .is_ok()
+        {
+            return Err(AppError::Conflict(format!("{} already exists", name)));
+        }
+        let storage_body = normalize_custom_resource_storage_data(
+            self.state.db.as_ref(),
+            conversion.as_ref(),
+            group,
+            plural,
+            &storage_api_version,
+            body,
+        )
+        .await?;
+        let resource = self
+            .state
+            .db
+            .create_resource(&storage_api_version, &info.kind, ns, &name, storage_body)
+            .await?;
+        after_persisted_custom_resource_write(
+            self.state,
+            &resource,
+            crate::api::mutation::MutationOperation::Create,
+            self.log_context,
+            "custom_create",
+        )
+        .await;
+        let data = normalize_custom_resource_response_data(
+            self.state.db.as_ref(),
+            conversion.as_ref(),
+            group,
+            plural,
+            &api_version,
+            inject_resource_version(resource.data, resource.resource_version),
+        )
+        .await?;
+        Ok(WriteResult::Response {
+            status: StatusCode::CREATED,
+            body: data,
+        })
+    }
+}
+
+struct CustomResourceUpdateStrategy<'a> {
+    state: &'a Arc<AppState>,
+    target: CustomResourceName<'a>,
+    log_context: &'static str,
+}
+
+#[async_trait]
+impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
+    async fn load_current(&self) -> Result<Resource, AppError> {
+        let CustomResourceType {
+            info,
+            group,
+            version,
+            plural,
+        } = self.target.scope.resource_type;
+        let ns = self.target.scope.namespace;
+        let (current, _stored_api_version) = get_existing_custom_resource_for_write(
+            self.state,
+            group,
+            version,
+            plural,
+            &info.kind,
+            ns.map(str::to_string),
+            self.target.name,
+        )
+        .await?;
+        Ok(current)
+    }
+
+    async fn prepare_update(
+        &self,
+        current: &Resource,
+        mut body: Value,
+        _dry_run: crate::api::mutation::DryRunMode,
+    ) -> Result<Value, AppError> {
+        let CustomResourceType {
+            info,
+            group,
+            version,
+            ..
+        } = self.target.scope.resource_type;
+        let ns = self.target.scope.namespace;
+        let api_version = self.target.scope.resource_type.api_version();
+        body = crate::api::mutation::write::run_admission(
+            self.state.db.as_ref(),
+            AdmissionContextRequest {
+                api_version: &api_version,
+                kind: &info.kind,
+                operation: "UPDATE",
+                namespace: ns.map(str::to_string),
+                name: Some(self.target.name.to_string()),
+                object: body,
+                old_object: Some((*current.data).clone()),
+                dry_run: false,
+                subresource: None,
+                options: None,
+            },
+        )
+        .await?;
+        apply_crd_pruning(
+            self.state.db.as_ref(),
+            group,
+            version,
+            &info.kind,
+            &mut body,
+        )
+        .await;
+        crate::api::mutation::write::prepare_custom_generation_for_update(&current.data, &mut body);
+        crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(
+            &current.data,
+            &mut body,
+        );
+        Ok(body)
+    }
+
+    async fn persist_update(
+        &self,
+        current: Resource,
+        body: Value,
+        _dry_run: crate::api::mutation::DryRunMode,
+    ) -> Result<WriteResult, AppError> {
+        let CustomResourceType {
+            info,
+            group,
+            version: _,
+            plural,
+        } = self.target.scope.resource_type;
+        let ns = self.target.scope.namespace;
+        let api_version = self.target.scope.resource_type.api_version();
+        let stored_api_version = current.api_version.clone();
+        let conversion = load_crd_conversion_config(self.state.db.as_ref(), group, plural).await?;
+        let storage_body = normalize_custom_resource_storage_data(
+            self.state.db.as_ref(),
+            conversion.as_ref(),
+            group,
+            plural,
+            &stored_api_version,
+            body,
+        )
+        .await?;
+        let resource = self
+            .state
+            .db
+            .update_resource(
+                &stored_api_version,
+                &info.kind,
+                ns,
+                self.target.name,
+                storage_body,
+                current.resource_version,
+            )
+            .await?;
+        after_persisted_custom_resource_write(
+            self.state,
+            &resource,
+            crate::api::mutation::MutationOperation::Update,
+            self.log_context,
+            "custom_update",
+        )
+        .await;
+        crate::api::finalizer_delete::finalize_after_update_if_ready(
+            self.state,
+            &stored_api_version,
+            &info.kind,
+            ns,
+            self.target.name,
+            &resource,
+        )
+        .await;
+        let data = normalize_custom_resource_response_data(
+            self.state.db.as_ref(),
+            conversion.as_ref(),
+            group,
+            plural,
+            &api_version,
+            inject_resource_version(resource.data, resource.resource_version),
+        )
+        .await?;
+        Ok(WriteResult::Response {
+            status: StatusCode::OK,
+            body: data,
+        })
+    }
+}
+
+struct CustomResourcePatchStrategy<'a> {
+    state: &'a Arc<AppState>,
+    target: CustomResourceName<'a>,
+    query: &'a CreateUpdateQuery,
+    headers: &'a HeaderMap,
+    apply_create_context: &'static str,
+    patch_context: &'static str,
+}
+
+#[async_trait]
+impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
+    async fn apply_patch(
+        &self,
+        patch: Value,
+        dry_run: crate::api::mutation::DryRunMode,
+    ) -> Result<WriteResult, AppError> {
+        let CustomResourceType {
+            info,
+            group,
+            version,
+            plural,
+        } = self.target.scope.resource_type;
+        let ns = self.target.scope.namespace;
+        let api_version = self.target.scope.resource_type.api_version();
+        let content_type = self
+            .headers
+            .get("content-type")
+            .and_then(|h| h.to_str().ok());
+        let is_apply_yaml = content_type == Some("application/apply-patch+yaml");
+        let is_dry_run = dry_run.is_all();
+        if is_apply_yaml && self.query.field_validation.as_deref() == Some("Strict") {
+            check_cr_field_validation_strict(
+                self.state.db.as_ref(),
+                group,
+                version,
+                &info.kind,
+                &patch,
+            )
+            .await?;
+        }
+        let conversion = load_crd_conversion_config(self.state.db.as_ref(), group, plural).await?;
+        let storage_api_version =
+            storage_api_version_for_request(group, version, conversion.as_ref());
+
+        let existing = get_existing_custom_resource_for_write(
+            self.state,
+            group,
+            version,
+            plural,
+            &info.kind,
+            ns.map(str::to_string),
+            self.target.name,
+        )
+        .await;
+        let (current, stored_api_version) = match existing {
+            Ok(existing) => existing,
+            Err(AppError::NotFound(_)) if is_apply_yaml => {
+                let mut created_resource = patch.clone();
+                apply_crd_defaults(
+                    self.state.db.as_ref(),
+                    group,
+                    version,
+                    &info.kind,
+                    &mut created_resource,
+                )
+                .await;
+                created_resource = crate::api::mutation::write::run_admission(
+                    self.state.db.as_ref(),
+                    AdmissionContextRequest {
+                        api_version: &api_version,
+                        kind: &info.kind,
+                        operation: "CREATE",
+                        namespace: ns.map(str::to_string),
+                        name: Some(self.target.name.to_string()),
+                        object: created_resource,
+                        old_object: None,
+                        dry_run: is_dry_run,
+                        subresource: None,
+                        options: None,
+                    },
+                )
+                .await?;
+                apply_crd_pruning(
+                    self.state.db.as_ref(),
+                    group,
+                    version,
+                    &info.kind,
+                    &mut created_resource,
+                )
+                .await;
+
+                if is_dry_run {
+                    return Ok(WriteResult::Response {
+                        status: StatusCode::CREATED,
+                        body: created_resource,
+                    });
+                }
+
+                let storage_created_resource = normalize_custom_resource_storage_data(
+                    self.state.db.as_ref(),
+                    conversion.as_ref(),
+                    group,
+                    plural,
+                    &storage_api_version,
+                    created_resource,
+                )
+                .await?;
+                let resource = self
+                    .state
+                    .db
+                    .create_resource(
+                        &storage_api_version,
+                        &info.kind,
+                        ns,
+                        self.target.name,
+                        storage_created_resource,
+                    )
+                    .await?;
+                after_persisted_custom_resource_write(
+                    self.state,
+                    &resource,
+                    crate::api::mutation::MutationOperation::Create,
+                    self.apply_create_context,
+                    "custom_apply_create",
+                )
+                .await;
+                let data = normalize_custom_resource_response_data(
+                    self.state.db.as_ref(),
+                    conversion.as_ref(),
+                    group,
+                    plural,
+                    &api_version,
+                    inject_resource_version(resource.data, resource.resource_version),
+                )
+                .await?;
+                return Ok(WriteResult::Response {
+                    status: StatusCode::CREATED,
+                    body: data,
+                });
+            }
+            Err(err) => return Err(err),
+        };
+
+        let mut patched_resource = crate::api::apply_patch(&current.data, &patch, content_type)?;
+        patched_resource = crate::api::mutation::write::run_admission(
+            self.state.db.as_ref(),
+            AdmissionContextRequest {
+                api_version: &api_version,
+                kind: &info.kind,
+                operation: "UPDATE",
+                namespace: ns.map(str::to_string),
+                name: Some(self.target.name.to_string()),
+                object: patched_resource,
+                old_object: Some((*current.data).clone()),
+                dry_run: is_dry_run,
+                subresource: None,
+                options: None,
+            },
+        )
+        .await?;
+        apply_crd_pruning(
+            self.state.db.as_ref(),
+            group,
+            version,
+            &info.kind,
+            &mut patched_resource,
+        )
+        .await;
+        crate::api::mutation::write::prepare_custom_generation_for_update(
+            &current.data,
+            &mut patched_resource,
+        );
+        crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(
+            &current.data,
+            &mut patched_resource,
+        );
+
+        if is_dry_run {
+            return Ok(WriteResult::DryRun(patched_resource));
+        }
+
+        let storage_patched_resource = normalize_custom_resource_storage_data(
+            self.state.db.as_ref(),
+            conversion.as_ref(),
+            group,
+            plural,
+            &stored_api_version,
+            patched_resource,
+        )
+        .await?;
+        let resource = self
+            .state
+            .db
+            .update_resource(
+                &stored_api_version,
+                &info.kind,
+                ns,
+                self.target.name,
+                storage_patched_resource,
+                current.resource_version,
+            )
+            .await?;
+        after_persisted_custom_resource_write(
+            self.state,
+            &resource,
+            crate::api::mutation::MutationOperation::Patch,
+            self.patch_context,
+            "custom_patch",
+        )
+        .await;
+        crate::api::finalizer_delete::finalize_after_update_if_ready(
+            self.state,
+            &stored_api_version,
+            &info.kind,
+            ns,
+            self.target.name,
+            &resource,
+        )
+        .await;
+        let data = normalize_custom_resource_response_data(
+            self.state.db.as_ref(),
+            conversion.as_ref(),
+            group,
+            plural,
+            &api_version,
+            inject_resource_version(resource.data, resource.resource_version),
+        )
+        .await?;
+        Ok(WriteResult::Response {
+            status: StatusCode::OK,
+            body: data,
+        })
+    }
+}
+
 async fn create_cr_inner(
     state: &Arc<AppState>,
     request: CustomResourceCreateRequest<'_>,
@@ -1760,114 +2310,20 @@ async fn create_cr_inner(
     let CustomResourceCreateRequest {
         scope,
         query,
-        mut body,
+        body,
         log_context,
     } = request;
-    let CustomResourceScope {
-        resource_type,
-        namespace: ns,
-        ..
-    } = scope;
-    let CustomResourceType {
-        info,
-        group,
-        version,
-        plural,
-    } = resource_type;
-    let api_version = resource_type.api_version();
+    let strategy = CustomResourceCreateStrategy {
+        state,
+        scope,
+        query,
+        log_context,
+    };
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(query)?;
-    let is_dry_run = dry_run.is_all();
-    let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
-    let storage_api_version = storage_api_version_for_request(group, version, conversion.as_ref());
-
-    apply_crd_defaults(state.db.as_ref(), group, version, &info.kind, &mut body).await;
-
-    if query.field_validation.as_deref() == Some("Strict") {
-        check_cr_field_validation_strict(state.db.as_ref(), group, version, &info.kind, &body)
-            .await?;
-    }
-
-    body = crate::api::mutation::write::run_admission(
-        state.db.as_ref(),
-        AdmissionContextRequest {
-            api_version: &api_version,
-            kind: &info.kind,
-            operation: "CREATE",
-            namespace: ns.map(str::to_string),
-            name: body
-                .get("metadata")
-                .and_then(|m| m.get("name"))
-                .and_then(|n| n.as_str())
-                .map(ToString::to_string),
-            object: body,
-            old_object: None,
-            dry_run: is_dry_run,
-            subresource: None,
-            options: None,
-        },
-    )
-    .await?;
-    apply_crd_pruning(state.db.as_ref(), group, version, &info.kind, &mut body).await;
-
-    if is_dry_run {
-        return Ok((StatusCode::CREATED, Json(body)).into_response());
-    }
-
-    let name = body["metadata"]["name"]
-        .as_str()
-        .ok_or_else(|| AppError::BadRequest("metadata.name required".to_string()))?
-        .to_string();
-
-    if get_existing_custom_resource_for_write(
-        state,
-        group,
-        version,
-        plural,
-        &info.kind,
-        ns.map(str::to_string),
-        &name,
-    )
-    .await
-    .is_ok()
-    {
-        return Err(AppError::Conflict(format!("{} already exists", name)));
-    }
-
-    let storage_body = normalize_custom_resource_storage_data(
-        state.db.as_ref(),
-        conversion.as_ref(),
-        group,
-        plural,
-        &storage_api_version,
-        body,
-    )
-    .await?;
-
-    let resource = state
-        .db
-        .create_resource(&storage_api_version, &info.kind, ns, &name, storage_body)
-        .await?;
-
-    reconcile_custom_resource_owner_refs(state, &resource, log_context).await;
-
-    dispatch_custom_resource_mutation_event(
-        state,
-        crate::api::mutation::MutationOperation::Create,
-        &resource.data,
-        "custom_create",
-    )
-    .await;
-
-    let data = normalize_custom_resource_response_data(
-        state.db.as_ref(),
-        conversion.as_ref(),
-        group,
-        plural,
-        &api_version,
-        inject_resource_version(resource.data, resource.resource_version),
-    )
-    .await?;
-    Ok((StatusCode::CREATED, Json(data)).into_response())
+    let (status, data) = create_with_strategy(&strategy, body, dry_run)
+        .await?
+        .into_response_parts(StatusCode::CREATED);
+    Ok((status, Json(data)).into_response())
 }
 
 pub async fn create_custom_resource(
@@ -2128,108 +2584,22 @@ async fn update_cr_inner(
 ) -> Result<Response, AppError> {
     let CustomResourceUpdateRequest {
         target,
-        mut body,
+        body,
         log_context,
     } = request;
-    let CustomResourceName { scope, name } = target;
-    let CustomResourceScope {
-        resource_type,
-        namespace: ns,
-        ..
-    } = scope;
-    let CustomResourceType {
-        info,
-        group,
-        version,
-        plural,
-    } = resource_type;
-    if name.trim().is_empty() {
+    if target.name.trim().is_empty() {
         return Err(AppError::BadRequest("resource name required".to_string()));
     }
-
-    let api_version = resource_type.api_version();
-    let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
-    let (current, stored_api_version) = get_existing_custom_resource_for_write(
+    let strategy = CustomResourceUpdateStrategy {
         state,
-        group,
-        version,
-        plural,
-        &info.kind,
-        ns.map(str::to_string),
-        name,
-    )
-    .await?;
-
-    body = crate::api::mutation::write::run_admission(
-        state.db.as_ref(),
-        AdmissionContextRequest {
-            api_version: &api_version,
-            kind: &info.kind,
-            operation: "UPDATE",
-            namespace: ns.map(str::to_string),
-            name: Some(name.to_string()),
-            object: body,
-            old_object: Some((*current.data).clone()),
-            dry_run: false,
-            subresource: None,
-            options: None,
-        },
-    )
-    .await?;
-    apply_crd_pruning(state.db.as_ref(), group, version, &info.kind, &mut body).await;
-    crate::api::mutation::write::prepare_custom_generation_for_update(&current.data, &mut body);
-    crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(&current.data, &mut body);
-
-    let storage_body = normalize_custom_resource_storage_data(
-        state.db.as_ref(),
-        conversion.as_ref(),
-        group,
-        plural,
-        &stored_api_version,
-        body,
-    )
-    .await?;
-
-    let resource = state
-        .db
-        .update_resource(
-            &stored_api_version,
-            &info.kind,
-            ns,
-            name,
-            storage_body,
-            current.resource_version,
-        )
-        .await?;
-
-    reconcile_custom_resource_owner_refs(state, &resource, log_context).await;
-    dispatch_custom_resource_mutation_event(
-        state,
-        crate::api::mutation::MutationOperation::Update,
-        &resource.data,
-        "custom_update",
-    )
-    .await;
-    crate::api::finalizer_delete::finalize_after_update_if_ready(
-        state,
-        &stored_api_version,
-        &info.kind,
-        ns,
-        name,
-        &resource,
-    )
-    .await;
-
-    let data = normalize_custom_resource_response_data(
-        state.db.as_ref(),
-        conversion.as_ref(),
-        group,
-        plural,
-        &api_version,
-        inject_resource_version(resource.data, resource.resource_version),
-    )
-    .await?;
-    Ok(Json(data).into_response())
+        target,
+        log_context,
+    };
+    let (status, data) =
+        update_with_strategy(&strategy, body, crate::api::mutation::DryRunMode::Live)
+            .await?
+            .into_response_parts(StatusCode::OK);
+    Ok((status, Json(data)).into_response())
 }
 
 pub async fn update_custom_resource(
@@ -2283,35 +2653,18 @@ async fn patch_cr_inner(
         headers,
         body,
     } = request;
-    let CustomResourceName { scope, name } = target;
-    let CustomResourceScope {
-        resource_type,
-        namespace: ns,
-        is_cluster_scope,
-    } = scope;
-    let CustomResourceType {
-        info,
-        group,
-        version,
-        plural,
-    } = resource_type;
-    if name.trim().is_empty() {
+    if target.name.trim().is_empty() {
         return Err(AppError::BadRequest("resource name required".to_string()));
     }
 
-    let (apply_create_ctx, patch_ctx) = if is_cluster_scope {
+    let (apply_create_context, patch_context) = if target.scope.is_cluster_scope {
         ("cluster_custom_apply_create", "cluster_custom_patch")
     } else {
         ("custom_apply_create", "custom_patch")
     };
 
-    let api_version = resource_type.api_version();
     let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
     let is_apply_yaml = content_type == Some("application/apply-patch+yaml");
-    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(query)?;
-    let is_dry_run = dry_run.is_all();
-    let conversion = load_crd_conversion_config(state.db.as_ref(), group, plural).await?;
-    let storage_api_version = storage_api_version_for_request(group, version, conversion.as_ref());
 
     let patch: Value = if body.len() >= 4 && &body[..4] == b"k8s\x00" {
         crate::protobuf::decode_protobuf(&body[4..])
@@ -2323,192 +2676,19 @@ async fn patch_cr_inner(
             .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {e}")))?
     };
 
-    if is_apply_yaml && query.field_validation.as_deref() == Some("Strict") {
-        check_cr_field_validation_strict(state.db.as_ref(), group, version, &info.kind, &patch)
-            .await?;
-    }
-
-    let existing = get_existing_custom_resource_for_write(
+    let strategy = CustomResourcePatchStrategy {
         state,
-        group,
-        version,
-        plural,
-        &info.kind,
-        ns.map(str::to_string),
-        name,
-    )
-    .await;
-    let (current, stored_api_version) = match existing {
-        Ok(existing) => existing,
-        Err(AppError::NotFound(_)) if is_apply_yaml => {
-            let mut created_resource = patch.clone();
-            apply_crd_defaults(
-                state.db.as_ref(),
-                group,
-                version,
-                &info.kind,
-                &mut created_resource,
-            )
-            .await;
-            created_resource = crate::api::mutation::write::run_admission(
-                state.db.as_ref(),
-                AdmissionContextRequest {
-                    api_version: &api_version,
-                    kind: &info.kind,
-                    operation: "CREATE",
-                    namespace: ns.map(str::to_string),
-                    name: Some(name.to_string()),
-                    object: created_resource,
-                    old_object: None,
-                    dry_run: is_dry_run,
-                    subresource: None,
-                    options: None,
-                },
-            )
-            .await?;
-            apply_crd_pruning(
-                state.db.as_ref(),
-                group,
-                version,
-                &info.kind,
-                &mut created_resource,
-            )
-            .await;
-
-            if is_dry_run {
-                return Ok((StatusCode::CREATED, Json(created_resource)).into_response());
-            }
-
-            let storage_created_resource = normalize_custom_resource_storage_data(
-                state.db.as_ref(),
-                conversion.as_ref(),
-                group,
-                plural,
-                &storage_api_version,
-                created_resource,
-            )
-            .await?;
-
-            let resource = state
-                .db
-                .create_resource(
-                    &storage_api_version,
-                    &info.kind,
-                    ns,
-                    name,
-                    storage_created_resource,
-                )
-                .await?;
-            reconcile_custom_resource_owner_refs(state, &resource, apply_create_ctx).await;
-            dispatch_custom_resource_mutation_event(
-                state,
-                crate::api::mutation::MutationOperation::Create,
-                &resource.data,
-                "custom_apply_create",
-            )
-            .await;
-            let data = normalize_custom_resource_response_data(
-                state.db.as_ref(),
-                conversion.as_ref(),
-                group,
-                plural,
-                &api_version,
-                inject_resource_version(resource.data, resource.resource_version),
-            )
-            .await?;
-            return Ok((StatusCode::CREATED, Json(data)).into_response());
-        }
-        Err(err) => return Err(err),
+        target,
+        query,
+        headers,
+        apply_create_context,
+        patch_context,
     };
-
-    let mut patched_resource = apply_patch(&current.data, &patch, content_type)?;
-    patched_resource = crate::api::mutation::write::run_admission(
-        state.db.as_ref(),
-        AdmissionContextRequest {
-            api_version: &api_version,
-            kind: &info.kind,
-            operation: "UPDATE",
-            namespace: ns.map(str::to_string),
-            name: Some(name.to_string()),
-            object: patched_resource,
-            old_object: Some((*current.data).clone()),
-            dry_run: is_dry_run,
-            subresource: None,
-            options: None,
-        },
-    )
-    .await?;
-    apply_crd_pruning(
-        state.db.as_ref(),
-        group,
-        version,
-        &info.kind,
-        &mut patched_resource,
-    )
-    .await;
-    crate::api::mutation::write::prepare_custom_generation_for_update(
-        &current.data,
-        &mut patched_resource,
-    );
-    crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(
-        &current.data,
-        &mut patched_resource,
-    );
-
-    if is_dry_run {
-        return Ok(Json(patched_resource).into_response());
-    }
-
-    let storage_patched_resource = normalize_custom_resource_storage_data(
-        state.db.as_ref(),
-        conversion.as_ref(),
-        group,
-        plural,
-        &stored_api_version,
-        patched_resource,
-    )
-    .await?;
-
-    let resource = state
-        .db
-        .update_resource(
-            &stored_api_version,
-            &info.kind,
-            ns,
-            name,
-            storage_patched_resource,
-            current.resource_version,
-        )
-        .await?;
-
-    reconcile_custom_resource_owner_refs(state, &resource, patch_ctx).await;
-    dispatch_custom_resource_mutation_event(
-        state,
-        crate::api::mutation::MutationOperation::Patch,
-        &resource.data,
-        "custom_patch",
-    )
-    .await;
-    crate::api::finalizer_delete::finalize_after_update_if_ready(
-        state,
-        &stored_api_version,
-        &info.kind,
-        ns,
-        name,
-        &resource,
-    )
-    .await;
-
-    let data = normalize_custom_resource_response_data(
-        state.db.as_ref(),
-        conversion.as_ref(),
-        group,
-        plural,
-        &api_version,
-        inject_resource_version(resource.data, resource.resource_version),
-    )
-    .await?;
-    Ok(Json(data).into_response())
+    let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(query)?;
+    let (status, data) = patch_with_strategy(&strategy, patch, dry_run)
+        .await?
+        .into_response_parts(StatusCode::OK);
+    Ok((status, Json(data)).into_response())
 }
 
 pub async fn patch_custom_resource(
