@@ -344,6 +344,96 @@ async fn mutation_dry_run_create_does_not_persist_generated_crd_or_pod() {
 }
 
 #[tokio::test]
+async fn mutation_generated_apply_create_dry_run_does_not_persist() {
+    let state = build_test_app_state().await;
+    let app = crate::api::build_router(state);
+
+    let response = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/api/v1/namespaces/default/configmaps/dry-apply-created-cm?fieldManager=klights-test&dryRun=All",
+        "application/apply-patch+yaml",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "dry-apply-created-cm",
+                "namespace": "default"
+            },
+            "data": {"key": "dry-run"}
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "dry-run generated server-side-apply create must report 201 Created"
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["metadata"]["name"], "dry-apply-created-cm");
+    assert_eq!(body["data"]["key"], "dry-run");
+
+    let (status, missing) = get_json(
+        &app,
+        "/api/v1/namespaces/default/configmaps/dry-apply-created-cm",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(missing["kind"], "Status");
+}
+
+#[tokio::test]
+async fn mutation_generated_update_dry_run_shapes_response_without_persisting() {
+    let state = build_test_app_state().await;
+    let app = crate::api::build_router(state);
+
+    create_deployment(
+        &app,
+        "dry-update-deploy",
+        json!({"name": "dry-update-deploy", "namespace": "default"}),
+    )
+    .await;
+    let (status, mut deployment) = get_json(
+        &app,
+        "/apis/apps/v1/namespaces/default/deployments/dry-update-deploy",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let original_generation = deployment["metadata"]["generation"].as_i64().unwrap();
+    deployment["spec"]["replicas"] = json!(2);
+
+    let response = request(
+        &app,
+        "PUT",
+        "/apis/apps/v1/namespaces/default/deployments/dry-update-deploy?dryRun=All",
+        Some(deployment),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body["metadata"]["generation"].as_i64(),
+        Some(original_generation + 1),
+        "dry-run generated update response must include the would-be generation bump"
+    );
+    assert_eq!(body["spec"]["replicas"], json!(2));
+
+    let (status, stored) = get_json(
+        &app,
+        "/apis/apps/v1/namespaces/default/deployments/dry-update-deploy",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        stored["metadata"]["generation"].as_i64(),
+        Some(original_generation),
+        "dry-run generated update must not persist the generation bump"
+    );
+    assert_eq!(stored["spec"]["replicas"], json!(1));
+}
+
+#[tokio::test]
 async fn mutation_delete_dry_run_does_not_mark_or_remove_generated_crd_or_pod() {
     let state = build_test_app_state().await;
     let pod_repository = state.pod_repository.clone();

@@ -934,10 +934,6 @@ impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
     ) -> Result<WriteResult, AppError> {
         let kind = self.kind;
 
-        if dry_run.is_all() {
-            return Ok(WriteResult::DryRun(body));
-        }
-
         if kind == "Secret" {
             if let Err(err_msg) = validate_secret_data(&body) {
                 return Err(AppError::UnprocessableEntity(err_msg));
@@ -962,6 +958,10 @@ impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
             &current.data,
             &mut body,
         );
+
+        if dry_run.is_all() {
+            return Ok(WriteResult::DryRun(body));
+        }
 
         let resource = self
             .state
@@ -1087,6 +1087,12 @@ impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
                 }
                 let mut admitted_with_annot = admitted;
                 normalize_resource_for_storage(api_version, kind, &mut admitted_with_annot);
+                if is_dry_run {
+                    return Ok(WriteResult::Response {
+                        status: StatusCode::CREATED,
+                        body: admitted_with_annot,
+                    });
+                }
                 let resource = self
                     .state
                     .db
