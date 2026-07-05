@@ -1185,8 +1185,8 @@ description: created via server-side apply
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "SSA PATCH on a non-existent cluster-scoped resource must create-or-update, not 404"
+        StatusCode::CREATED,
+        "SSA PATCH on a non-existent cluster-scoped resource must create with 201, not 404"
     );
 
     let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -1266,13 +1266,13 @@ async fn test_server_side_apply_conflict_and_force() {
         )
     };
 
-    // mgr-a applies and takes ownership of data.key.
+    // mgr-a applies and takes ownership of data.key by creating the ConfigMap.
     let resp = apply(
         "/api/v1/namespaces/default/configmaps/ssa-conflict?fieldManager=mgr-a".to_string(),
         cfg("from-a"),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
     // mgr-b changing data.key without force ⇒ 409 Conflict.
     let resp = apply(
