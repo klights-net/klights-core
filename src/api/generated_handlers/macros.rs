@@ -129,7 +129,7 @@ macro_rules! namespaced_resource_handlers {
             headers: HeaderMap,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
             body: Bytes,
-        ) -> Result<Json<Value>, AppError> {
+        ) -> Result<(StatusCode, Json<Value>), AppError> {
             patch_inner(
                 state,
                 &identity,
@@ -245,7 +245,7 @@ macro_rules! cluster_resource_handlers {
             headers: HeaderMap,
             axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
             body: Bytes,
-        ) -> Result<Json<Value>, AppError> {
+        ) -> Result<(StatusCode, Json<Value>), AppError> {
             patch_inner(
                 state,
                 &identity,

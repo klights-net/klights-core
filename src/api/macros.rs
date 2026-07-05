@@ -76,7 +76,7 @@ macro_rules! reconcile_handlers {
                 headers: HeaderMap,
                 axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
                 body: Bytes,
-            ) -> Result<Json<Value>, AppError> {
+            ) -> Result<(StatusCode, Json<Value>), AppError> {
                 let result = $patch_base(
                     State(state.clone()),
                     Path((namespace.clone(), name.clone())),
@@ -87,7 +87,8 @@ macro_rules! reconcile_handlers {
                 )
                 .await?;
 
-                state.controller_dispatcher.enqueue(&result.0).await;
+                let (_status, json_response) = &result;
+                state.controller_dispatcher.enqueue(&json_response.0).await;
 
                 Ok(result)
             }

@@ -6,6 +6,12 @@ use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 use std::sync::Arc;
 
 use super::helpers::*;
+use crate::api::mutation::write::{
+    CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
+    patch_with_strategy, update_with_strategy,
+};
+use crate::api::mutation::{DryRunMode, MutationOperation};
+use crate::kubelet::pod_repository::PodApiWriter;
 
 pub use crate::api::finalizer_delete::DeleteCompletion;
 
@@ -549,6 +555,739 @@ async fn inject_node_last_heartbeat_on_leader(
     }
 }
 
+struct BuiltinCreateStrategy<'a> {
+    state: &'a Arc<AppState>,
+    identity: &'a crate::auth::AuthenticatedIdentity,
+    api_version: &'static str,
+    kind: &'static str,
+    namespace: Option<&'a str>,
+    query: &'a CreateUpdateQuery,
+}
+
+impl<'a> BuiltinCreateStrategy<'a> {
+    fn is_generated_pod_create(&self) -> bool {
+        self.api_version == "v1" && self.kind == "Pod" && self.namespace.is_some()
+    }
+}
+
+#[async_trait::async_trait]
+impl<'a> CreateStrategy for BuiltinCreateStrategy<'a> {
+    async fn before_admission(&self, mut body: Value) -> Result<Value, AppError> {
+        if let Some(namespace) = self.namespace {
+            reject_if_namespace_missing_or_terminating(self.state.db.as_ref(), namespace).await?;
+        }
+
+        check_field_validation_strict_typed(self.api_version, self.kind, self.query, &body)?;
+
+        // Validate explicit metadata.name before admission. Empty names are
+        // resolved from generateName later.
+        if let Some(name) = body
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            crate::api::validation::validate_metadata_name_for_kind(
+                self.api_version,
+                self.kind,
+                name,
+                &format!("metadata.name for {}", self.kind),
+            )?;
+        }
+
+        if self.is_generated_pod_create() {
+            return Ok(body);
+        }
+
+        if self.kind == "Pod" {
+            if let Err(msg) = crate::kubelet::volumes::validate_volume_subpaths(&body) {
+                return Err(AppError::UnprocessableEntity(msg));
+            }
+            if let Err(msg) = crate::kubelet::volumes::validate_volume_projection_paths(&body) {
+                return Err(AppError::UnprocessableEntity(msg));
+            }
+            validate_pod_sysctls(&body)?;
+        }
+
+        // CSR create: server-fill spec identity fields from authenticated identity.
+        // Clients must not be able to forge these per Kubernetes semantics.
+        if self.kind == "CertificateSigningRequest" {
+            stamp_csr_identity(&mut body, self.identity);
+        }
+
+        prepare_admissionregistration_resource(self.kind, &mut body)?;
+
+        // RBAC privilege-escalation / bind enforcement (k8s parity): a user may not
+        // create a Role/ClusterRole or (Cluster)RoleBinding granting more than they
+        // hold, absent the escalate/bind verb.
+        crate::api::rbac_admission::enforce_rbac_write_authorization(
+            self.state,
+            self.identity,
+            self.api_version,
+            self.kind,
+            self.namespace,
+            &body,
+        )
+        .await?;
+
+        Ok(body)
+    }
+
+    async fn admit(&self, body: Value, dry_run: DryRunMode) -> Result<Value, AppError> {
+        if self.is_generated_pod_create() {
+            return Ok(body);
+        }
+        let is_dry_run = dry_run.is_all();
+        crate::api::mutation::write::run_admission(
+            self.state.db.as_ref(),
+            AdmissionContextRequest {
+                api_version: self.api_version,
+                kind: self.kind,
+                operation: "CREATE",
+                namespace: self.namespace.map(str::to_string),
+                name: body
+                    .get("metadata")
+                    .and_then(|m| m.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(ToString::to_string),
+                object: body,
+                old_object: None,
+                dry_run: is_dry_run,
+                subresource: None,
+                options: None,
+            },
+        )
+        .await
+    }
+
+    async fn persist_create(
+        &self,
+        mut body: Value,
+        dry_run: DryRunMode,
+    ) -> Result<WriteResult, AppError> {
+        let is_dry_run = dry_run.is_all();
+        let ns = self.namespace;
+        let api_version = self.api_version;
+        let kind = self.kind;
+
+        if self.is_generated_pod_create() {
+            // Generated Pod create delegates to PodApiWriter which owns Pod
+            // admission/defaulting/persistence.
+            let namespace = ns.unwrap();
+            let result = self
+                .state
+                .pod_repository
+                .api_create_pod(crate::kubelet::pod_repository::PodApiCreateRequest {
+                    namespace: namespace.to_string(),
+                    name: String::new(),
+                    body,
+                    dry_run: is_dry_run,
+                    run_admission: true,
+                })
+                .await?;
+            return match result.resource {
+                Some(resource) => Ok(WriteResult::Persisted(resource)),
+                None => Ok(WriteResult::DryRun(result.body)),
+            };
+        }
+
+        if kind == "Pod"
+            && let Some(namespace) = ns
+        {
+            apply_pod_runtimeclass_admission(self.state.db.as_ref(), &mut body).await?;
+            apply_limitrange_defaults_to_pod(self.state.db.as_ref(), namespace, &mut body).await?;
+            enforce_limitrange_constraints_for_pod(self.state.db.as_ref(), namespace, &body)
+                .await?;
+        }
+        if kind == "PersistentVolumeClaim"
+            && let Some(namespace) = ns
+        {
+            apply_default_storage_class_admission(self.state.db.as_ref(), &mut body).await?;
+            enforce_limitrange_constraints_for_pvc(self.state.db.as_ref(), namespace, &body)
+                .await?;
+        }
+
+        validate_builtin_resource_spec(kind, &body)?;
+
+        if is_dry_run {
+            return Ok(WriteResult::DryRun(body));
+        }
+
+        if kind != "ResourceQuota"
+            && let Some(namespace) = ns
+        {
+            check_resource_quota_for_creation(self.state.db.as_ref(), namespace, kind, &body)
+                .await?;
+        }
+
+        let resource_name = resolve_resource_name(&mut body)?;
+
+        if !validate_metadata_name_for_kind(api_version, kind, &resource_name) {
+            let detail = if metadata_name_uses_path_segment_validation(api_version, kind)
+                || kind == "IPAddress"
+            {
+                "must be a valid path segment (not '.', '..', and no '/' or '%')"
+            } else {
+                "must be a valid DNS subdomain (lowercase alphanumeric, hyphens, dots; max 253 chars; cannot start/end with hyphen or dot)"
+            };
+            return Err(AppError::UnprocessableEntity(format!(
+                "Invalid metadata.name '{}': {}",
+                resource_name, detail
+            )));
+        }
+
+        crate::api::mutation::write::prepare_create_metadata(ns, &mut body, &resource_name);
+
+        match kind {
+            "Pod" => apply_pod_create_defaults(&mut body),
+            "PersistentVolumeClaim" => apply_pvc_create_defaults(&mut body),
+            "PersistentVolume" => apply_pv_create_defaults(&mut body),
+            "Namespace" => ensure_namespace_status_phase_active(&mut body),
+            "ResourceQuota" => apply_resourcequota_create_status(&mut body),
+            _ => {}
+        }
+
+        apply_workload_replicas_default(kind, &mut body);
+        if kind == "ReplicationController" {
+            apply_replicationcontroller_selector_default(&mut body);
+        }
+        if kind == "StatefulSet" {
+            initialize_statefulset_revision_status_on_create(&resource_name, &mut body);
+        }
+
+        if kind == "Secret" {
+            if let Err(err_msg) = validate_secret_data(&body) {
+                return Err(AppError::UnprocessableEntity(err_msg));
+            }
+            process_secret_stringdata(&mut body);
+        }
+
+        normalize_resource_for_storage(api_version, kind, &mut body);
+
+        let pending_service_allocations = if api_version == "v1" && kind == "Service" {
+            Some(
+                crate::controllers::service::prepare_service_for_create(
+                    self.state.db.as_ref(),
+                    &mut body,
+                    self.state.service_ipam.as_ref(),
+                    self.state.nodeport_alloc.as_ref(),
+                )
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("Failed to allocate service fields: {e}"))
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let resource = match self
+            .state
+            .db
+            .create_resource(api_version, kind, ns, &resource_name, body)
+            .await
+        {
+            Ok(resource) => resource,
+            Err(e) => {
+                if let Some(pending) = pending_service_allocations {
+                    pending.release(
+                        self.state.service_ipam.as_ref(),
+                        self.state.nodeport_alloc.as_ref(),
+                    );
+                }
+                // Attach details.{group,kind,name} to AlreadyExists/Conflict.
+                return Err(AppError::from(e).with_resource_context(
+                    api_version,
+                    kind,
+                    &resource_name,
+                ));
+            }
+        };
+
+        Ok(WriteResult::Persisted(resource))
+    }
+}
+
+struct BuiltinUpdateStrategy<'a> {
+    state: &'a Arc<AppState>,
+    identity: &'a crate::auth::AuthenticatedIdentity,
+    api_version: &'static str,
+    kind: &'static str,
+    namespace: Option<&'a str>,
+    name: &'a str,
+    query: &'a CreateUpdateQuery,
+}
+
+#[async_trait::async_trait]
+impl<'a> UpdateStrategy for BuiltinUpdateStrategy<'a> {
+    async fn load_current(&self) -> Result<Resource, AppError> {
+        self.state
+            .db
+            .get_resource(self.api_version, self.kind, self.namespace, self.name)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("{} not found", self.kind)))
+    }
+
+    async fn prepare_update(
+        &self,
+        current: &Resource,
+        mut body: Value,
+        dry_run: DryRunMode,
+    ) -> Result<Value, AppError> {
+        let kind = self.kind;
+        let ns = self.namespace;
+
+        if (kind == "ConfigMap" || kind == "Secret")
+            && current
+                .data
+                .get("immutable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        {
+            let ns_str = ns.unwrap_or("");
+            check_immutable_fields(&current.data, &body, kind, ns_str, self.name)?;
+        }
+
+        let _ = dry_run;
+
+        check_field_validation_strict_typed(self.api_version, kind, self.query, &body)?;
+
+        if kind == "Pod" {
+            if let Err(msg) = crate::kubelet::volumes::validate_volume_subpaths(&body) {
+                return Err(AppError::UnprocessableEntity(msg));
+            }
+            if let Err(msg) = crate::kubelet::volumes::validate_volume_projection_paths(&body) {
+                return Err(AppError::UnprocessableEntity(msg));
+            }
+            validate_pod_sysctls(&body)?;
+        }
+
+        prepare_admissionregistration_resource(kind, &mut body)?;
+
+        // RBAC privilege-escalation / bind enforcement (k8s parity) on update.
+        crate::api::rbac_admission::enforce_rbac_write_authorization(
+            self.state,
+            self.identity,
+            self.api_version,
+            kind,
+            ns,
+            &body,
+        )
+        .await?;
+
+        body = crate::api::mutation::write::run_admission(
+            self.state.db.as_ref(),
+            AdmissionContextRequest {
+                api_version: self.api_version,
+                kind,
+                operation: "UPDATE",
+                namespace: ns.map(str::to_string),
+                name: Some(self.name.to_string()),
+                object: body,
+                old_object: Some((*current.data).clone()),
+                dry_run: dry_run.is_all(),
+                subresource: None,
+                options: None,
+            },
+        )
+        .await?;
+
+        if kind == "Pod"
+            && let Some(namespace) = ns
+        {
+            validate_pod_resource_requirements_immutable(&current.data, &body)?;
+            check_resource_quota_for_pod_update(
+                self.state.db.as_ref(),
+                namespace,
+                &current.data,
+                &body,
+            )
+            .await?;
+        }
+        if kind == "PersistentVolumeClaim"
+            && let Some(namespace) = ns
+        {
+            check_resource_quota_for_pvc_update(
+                self.state.db.as_ref(),
+                namespace,
+                &current.data,
+                &body,
+            )
+            .await?;
+        }
+
+        if kind == "PriorityClass" {
+            validate_priorityclass_update_immutable(&current.data, &body)?;
+        }
+
+        validate_builtin_resource_spec(kind, &body)?;
+        normalize_resource_for_storage(self.api_version, kind, &mut body);
+
+        Ok(body)
+    }
+
+    async fn persist_update(
+        &self,
+        current: Resource,
+        mut body: Value,
+        dry_run: DryRunMode,
+    ) -> Result<WriteResult, AppError> {
+        let kind = self.kind;
+
+        if dry_run.is_all() {
+            return Ok(WriteResult::DryRun(body));
+        }
+
+        if kind == "Secret" {
+            if let Err(err_msg) = validate_secret_data(&body) {
+                return Err(AppError::UnprocessableEntity(err_msg));
+            }
+            process_secret_stringdata(&mut body);
+        }
+
+        let requested_rv = metadata_resource_version(&body);
+        crate::api::mutation::write::prepare_builtin_generation_for_update(
+            kind,
+            &current.data,
+            &mut body,
+        );
+
+        preserve_status_subresource_on_main_update(
+            self.api_version,
+            kind,
+            &current.data,
+            &mut body,
+        );
+        crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(
+            &current.data,
+            &mut body,
+        );
+
+        let resource = self
+            .state
+            .db
+            .update_main_resource_with_preconditions(
+                self.api_version,
+                kind,
+                self.namespace,
+                self.name,
+                body.clone(),
+                ResourcePreconditions {
+                    uid: Some(current.uid.clone()),
+                    resource_version: requested_rv,
+                },
+            )
+            .await?;
+
+        Ok(WriteResult::Persisted(resource))
+    }
+}
+
+struct BuiltinPatchStrategy<'a> {
+    state: &'a Arc<AppState>,
+    identity: &'a crate::auth::AuthenticatedIdentity,
+    target: GeneratedNamedResource<'a>,
+    query: &'a CreateUpdateQuery,
+    headers: &'a HeaderMap,
+}
+
+#[async_trait::async_trait]
+impl<'a> PatchStrategy for BuiltinPatchStrategy<'a> {
+    async fn apply_patch(
+        &self,
+        mut patch: Value,
+        dry_run: DryRunMode,
+    ) -> Result<WriteResult, AppError> {
+        let content_type = self
+            .headers
+            .get("content-type")
+            .and_then(|h| h.to_str().ok());
+        let is_apply = matches!(
+            content_type,
+            Some("application/apply-patch+yaml") | Some("application/apply-patch+json")
+        );
+        let supports_apply_create = content_type == Some("application/apply-patch+yaml");
+        let apply_manager = crate::api::server_side_apply::resolve_field_manager(
+            self.query.field_manager.as_deref(),
+        );
+        let apply_force = self.query.force.unwrap_or(false);
+        let is_dry_run = dry_run.is_all();
+        let api_version = self.target.api_version;
+        let kind = self.target.kind;
+        let ns = self.target.namespace;
+        let name = self.target.name;
+
+        if is_apply {
+            check_field_validation_strict_typed(api_version, kind, self.query, &patch)?;
+        }
+
+        if supports_apply_create {
+            let exists = self
+                .state
+                .db
+                .get_resource(api_version, kind, ns, name)
+                .await?
+                .is_some();
+            if !exists {
+                // CSR apply-create: server-fill spec identity fields from the
+                // authenticated identity. Clients must not be able to forge
+                // spec.username/groups/uid/extra via server-side-apply (mirrors the
+                // POST create path), or the auto-signer would mint certs for a
+                // forged identity (e.g. system:node:<other>).
+                if kind == "CertificateSigningRequest" {
+                    stamp_csr_identity(&mut patch, self.identity);
+                }
+
+                // RBAC privilege-escalation / bind enforcement (k8s parity) on the
+                // server-side-apply create path.
+                crate::api::rbac_admission::enforce_rbac_write_authorization(
+                    self.state,
+                    self.identity,
+                    api_version,
+                    kind,
+                    ns,
+                    &patch,
+                )
+                .await?;
+                // Server-Side Apply create: build the object (with managedFields)
+                // from the apply config.
+                let applied_object = crate::api::server_side_apply::server_side_apply(
+                    None,
+                    &patch,
+                    &apply_manager,
+                    api_version,
+                    &crate::utils::k8s_time_now(),
+                    apply_force,
+                )
+                .map_err(|conflicts| AppError::Conflict(conflicts.message()))?;
+                let admitted = crate::api::mutation::write::run_admission(
+                    self.state.db.as_ref(),
+                    AdmissionContextRequest {
+                        api_version,
+                        kind,
+                        operation: "CREATE",
+                        namespace: ns.map(str::to_string),
+                        name: Some(name.to_string()),
+                        object: applied_object,
+                        old_object: None,
+                        dry_run: is_dry_run,
+                        subresource: None,
+                        options: None,
+                    },
+                )
+                .await?;
+                if let Some(namespace) = ns {
+                    check_resource_quota_for_creation(
+                        self.state.db.as_ref(),
+                        namespace,
+                        kind,
+                        &admitted,
+                    )
+                    .await?;
+                }
+                let mut admitted_with_annot = admitted;
+                normalize_resource_for_storage(api_version, kind, &mut admitted_with_annot);
+                let resource = self
+                    .state
+                    .db
+                    .create_resource(api_version, kind, ns, name, admitted_with_annot)
+                    .await?;
+                let context = if ns.is_some() {
+                    "namespaced_apply_create"
+                } else {
+                    "cluster_apply_create"
+                };
+                reconcile_owner_refs_after_mutation(self.state, &resource, context).await;
+                crate::api::apiservice_proxy::invalidate_apiservice_proxy_cache_for_resource(
+                    self.state,
+                    api_version,
+                    kind,
+                )
+                .await;
+                dispatch_generated_mutation_event(
+                    self.state,
+                    MutationOperation::Create,
+                    &resource.data,
+                    context,
+                )
+                .await;
+                let data = inject_resource_version(resource.data, resource.resource_version);
+                maybe_reconcile_cluster_role_aggregation(self.state, api_version, kind).await;
+                return Ok(WriteResult::Response {
+                    status: StatusCode::CREATED,
+                    body: data,
+                });
+            }
+        }
+
+        let max_retries = 20;
+        for attempt in 0..max_retries {
+            let current = self
+                .state
+                .db
+                .get_resource(api_version, kind, ns, name)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("{} not found", kind)))?;
+
+            let mut patched = if is_apply {
+                crate::api::server_side_apply::server_side_apply(
+                    Some(&current.data),
+                    &patch,
+                    &apply_manager,
+                    api_version,
+                    &crate::utils::k8s_time_now(),
+                    apply_force,
+                )
+                .map_err(|conflicts| AppError::Conflict(conflicts.message()))?
+            } else {
+                let merged = apply_patch(&current.data, &patch, content_type)?;
+                check_field_validation_strict_typed(api_version, kind, self.query, &merged)?;
+                merged
+            };
+
+            prepare_admissionregistration_resource(kind, &mut patched)?;
+
+            crate::api::rbac_admission::enforce_rbac_write_authorization(
+                self.state,
+                self.identity,
+                api_version,
+                kind,
+                ns,
+                &patched,
+            )
+            .await?;
+
+            patched = crate::api::mutation::write::run_admission(
+                self.state.db.as_ref(),
+                AdmissionContextRequest {
+                    api_version,
+                    kind,
+                    operation: "UPDATE",
+                    namespace: ns.map(str::to_string),
+                    name: Some(name.to_string()),
+                    object: patched,
+                    old_object: Some((*current.data).clone()),
+                    dry_run: is_dry_run,
+                    subresource: None,
+                    options: None,
+                },
+            )
+            .await?;
+
+            if (kind == "ConfigMap" || kind == "Secret")
+                && current
+                    .data
+                    .get("immutable")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            {
+                let ns_str = ns.unwrap_or("");
+                check_immutable_fields(&current.data, &patched, kind, ns_str, name)?;
+            }
+
+            if kind == "Pod"
+                && let Some(namespace) = ns
+            {
+                validate_pod_resource_requirements_immutable(&current.data, &patched)?;
+                check_resource_quota_for_pod_update(
+                    self.state.db.as_ref(),
+                    namespace,
+                    &current.data,
+                    &patched,
+                )
+                .await?;
+            }
+            if kind == "PersistentVolumeClaim"
+                && let Some(namespace) = ns
+            {
+                check_resource_quota_for_pvc_update(
+                    self.state.db.as_ref(),
+                    namespace,
+                    &current.data,
+                    &patched,
+                )
+                .await?;
+            }
+
+            if kind == "PriorityClass" {
+                validate_priorityclass_update_immutable(&current.data, &patched)?;
+            }
+
+            validate_builtin_resource_spec(kind, &patched)?;
+
+            if kind == "Secret" {
+                if let Err(err_msg) = validate_secret_data(&patched) {
+                    return Err(AppError::UnprocessableEntity(err_msg));
+                }
+                process_secret_stringdata(&mut patched);
+            }
+
+            crate::api::mutation::write::prepare_builtin_generation_for_update(
+                kind,
+                &current.data,
+                &mut patched,
+            );
+
+            preserve_status_subresource_on_main_update(
+                api_version,
+                kind,
+                &current.data,
+                &mut patched,
+            );
+            crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(
+                &current.data,
+                &mut patched,
+            );
+            normalize_resource_for_storage(api_version, kind, &mut patched);
+
+            if is_dry_run {
+                return Ok(WriteResult::DryRun(patched));
+            }
+
+            match self
+                .state
+                .db
+                .update_resource(
+                    api_version,
+                    kind,
+                    ns,
+                    name,
+                    patched.clone(),
+                    current.resource_version,
+                )
+                .await
+            {
+                Ok(resource) => return Ok(WriteResult::Persisted(resource)),
+                Err(e)
+                    if attempt < max_retries - 1
+                        && crate::datastore::errors::is_conflict_error(&e) =>
+                {
+                    tracing::debug!(
+                        "PATCH {}/{:?} {}: conflict on attempt {}, retrying",
+                        kind,
+                        ns,
+                        name,
+                        attempt
+                    );
+                    let backoff_ms = std::cmp::min(20u64.saturating_mul(1u64 << attempt), 250);
+                    let _ = self
+                        .state
+                        .task_supervisor
+                        .sleep(
+                            "patch_conflict_retry_backoff",
+                            Duration::from_millis(backoff_ms),
+                        )
+                        .await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        unreachable!("PATCH retry loop exhausted without returning");
+    }
+}
+
 pub async fn create_inner(
     state: Arc<AppState>,
     identity: &crate::auth::AuthenticatedIdentity,
@@ -556,282 +1295,102 @@ pub async fn create_inner(
     kind: &'static str,
     ns: Option<&str>,
     query: CreateUpdateQuery,
-    mut body: Value,
+    body: Value,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    if let Some(namespace) = ns {
-        reject_if_namespace_missing_or_terminating(state.db.as_ref(), namespace).await?;
-    }
-
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
-    let is_dry_run = dry_run.is_all();
-
-    check_field_validation_strict_typed(api_version, kind, &query, &body)?;
-
-    // Validate explicit metadata.name before admission. Empty names are
-    // resolved from generateName later.
-    if let Some(name) = body
-        .get("metadata")
-        .and_then(|m| m.get("name"))
-        .and_then(|n| n.as_str())
-        .filter(|s| !s.is_empty())
-    {
-        crate::api::validation::validate_metadata_name_for_kind(
-            api_version,
-            kind,
-            name,
-            &format!("metadata.name for {kind}"),
-        )?;
-    }
-
-    if kind == "Pod"
-        && let Some(namespace) = ns
-    {
-        use crate::kubelet::pod_repository::PodApiWriter;
-        let result = state
-            .pod_repository
-            .api_create_pod(crate::kubelet::pod_repository::PodApiCreateRequest {
-                namespace: namespace.to_string(),
-                name: String::new(),
-                body,
-                dry_run: is_dry_run,
-                run_admission: true,
-            })
-            .await?;
-
-        if let Some(resource) = result.resource {
-            dispatch_generated_mutation_event(
-                &state,
-                crate::api::mutation::MutationOperation::Create,
-                &resource.data,
-                "pod_create",
-            )
-            .await;
-            let data = inject_resource_version(resource.data, resource.resource_version);
-            return Ok((StatusCode::CREATED, Json(data)));
-        }
-
-        return Ok((StatusCode::CREATED, Json(result.body)));
-    }
-
-    if kind == "Pod" {
-        if let Err(msg) = crate::kubelet::volumes::validate_volume_subpaths(&body) {
-            return Err(AppError::UnprocessableEntity(msg));
-        }
-        if let Err(msg) = crate::kubelet::volumes::validate_volume_projection_paths(&body) {
-            return Err(AppError::UnprocessableEntity(msg));
-        }
-        validate_pod_sysctls(&body)?;
-    }
-
-    // CSR create: server-fill spec identity fields from authenticated identity.
-    // Clients must not be able to forge these per Kubernetes semantics.
-    if kind == "CertificateSigningRequest" {
-        stamp_csr_identity(&mut body, identity);
-    }
-
-    prepare_admissionregistration_resource(kind, &mut body)?;
-
-    // RBAC privilege-escalation / bind enforcement (k8s parity): a user may not
-    // create a Role/ClusterRole or (Cluster)RoleBinding granting more than they
-    // hold, absent the escalate/bind verb.
-    crate::api::rbac_admission::enforce_rbac_write_authorization(
-        &state,
+    let strategy = BuiltinCreateStrategy {
+        state: &state,
         identity,
         api_version,
         kind,
-        ns,
-        &body,
-    )
-    .await?;
-
-    body = crate::api::mutation::write::run_admission(
-        state.db.as_ref(),
-        AdmissionContextRequest {
-            api_version,
-            kind,
-            operation: "CREATE",
-            namespace: ns.map(str::to_string),
-            name: body
-                .get("metadata")
-                .and_then(|m| m.get("name"))
-                .and_then(|n| n.as_str())
-                .map(ToString::to_string),
-            object: body,
-            old_object: None,
-            dry_run: is_dry_run,
-            subresource: None,
-            options: None,
-        },
-    )
-    .await?;
-
-    if kind == "Pod"
-        && let Some(namespace) = ns
-    {
-        apply_pod_runtimeclass_admission(state.db.as_ref(), &mut body).await?;
-        apply_limitrange_defaults_to_pod(state.db.as_ref(), namespace, &mut body).await?;
-        enforce_limitrange_constraints_for_pod(state.db.as_ref(), namespace, &body).await?;
-    }
-    if kind == "PersistentVolumeClaim"
-        && let Some(namespace) = ns
-    {
-        apply_default_storage_class_admission(state.db.as_ref(), &mut body).await?;
-        enforce_limitrange_constraints_for_pvc(state.db.as_ref(), namespace, &body).await?;
-    }
-
-    validate_builtin_resource_spec(kind, &body)?;
-
-    if is_dry_run {
-        return Ok((StatusCode::CREATED, Json(body)));
-    }
-
-    if kind != "ResourceQuota"
-        && let Some(namespace) = ns
-    {
-        check_resource_quota_for_creation(state.db.as_ref(), namespace, kind, &body).await?;
-    }
-
-    let resource_name = resolve_resource_name(&mut body)?;
-
-    if !validate_metadata_name_for_kind(api_version, kind, &resource_name) {
-        let detail = if metadata_name_uses_path_segment_validation(api_version, kind)
-            || kind == "IPAddress"
-        {
-            "must be a valid path segment (not '.', '..', and no '/' or '%')"
-        } else {
-            "must be a valid DNS subdomain (lowercase alphanumeric, hyphens, dots; max 253 chars; cannot start/end with hyphen or dot)"
-        };
-        return Err(AppError::UnprocessableEntity(format!(
-            "Invalid metadata.name '{}': {}",
-            resource_name, detail
-        )));
-    }
-
-    crate::api::mutation::write::prepare_create_metadata(ns, &mut body, &resource_name);
-
-    match kind {
-        "Pod" => apply_pod_create_defaults(&mut body),
-        "PersistentVolumeClaim" => apply_pvc_create_defaults(&mut body),
-        "PersistentVolume" => apply_pv_create_defaults(&mut body),
-        "Namespace" => ensure_namespace_status_phase_active(&mut body),
-        "ResourceQuota" => apply_resourcequota_create_status(&mut body),
-        _ => {}
-    }
-
-    apply_workload_replicas_default(kind, &mut body);
-    if kind == "ReplicationController" {
-        apply_replicationcontroller_selector_default(&mut body);
-    }
-    if kind == "StatefulSet" {
-        initialize_statefulset_revision_status_on_create(&resource_name, &mut body);
-    }
-
-    if kind == "Secret" {
-        if let Err(err_msg) = validate_secret_data(&body) {
-            return Err(AppError::UnprocessableEntity(err_msg));
-        }
-        process_secret_stringdata(&mut body);
-    }
-
-    normalize_resource_for_storage(api_version, kind, &mut body);
-
-    let pending_service_allocations = if api_version == "v1" && kind == "Service" {
-        Some(
-            crate::controllers::service::prepare_service_for_create(
-                state.db.as_ref(),
-                &mut body,
-                state.service_ipam.as_ref(),
-                state.nodeport_alloc.as_ref(),
-            )
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to allocate service fields: {e}")))?,
-        )
-    } else {
-        None
+        namespace: ns,
+        query: &query,
     };
+    let result = create_with_strategy(&strategy, body, dry_run).await?;
+    match result {
+        WriteResult::Persisted(resource) => {
+            if api_version == "v1" && kind == "Pod" && ns.is_some() {
+                dispatch_generated_mutation_event(
+                    &state,
+                    MutationOperation::Create,
+                    &resource.data,
+                    "pod_create",
+                )
+                .await;
+                let data = inject_resource_version(resource.data, resource.resource_version);
+                Ok((StatusCode::CREATED, Json(data)))
+            } else {
+                let resource_name = resource.name.clone();
+                let context = if ns.is_some() {
+                    "namespaced_create"
+                } else {
+                    "cluster_create"
+                };
+                reconcile_owner_refs_after_mutation(&state, &resource, context).await;
+                crate::api::apiservice_proxy::invalidate_apiservice_proxy_cache_for_resource(
+                    &state,
+                    api_version,
+                    kind,
+                )
+                .await;
 
-    let resource = match state
-        .db
-        .create_resource(api_version, kind, ns, &resource_name, body)
-        .await
-    {
-        Ok(resource) => resource,
-        Err(e) => {
-            if let Some(pending) = pending_service_allocations {
-                pending.release(state.service_ipam.as_ref(), state.nodeport_alloc.as_ref());
+                if kind == "Namespace" {
+                    if let Err(e) = crate::controllers::namespace::create_default_service_account(
+                        state.db.as_ref(),
+                        &resource_name,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to create default ServiceAccount in namespace {}: {:#}",
+                            resource_name,
+                            e
+                        );
+                    }
+
+                    let ca_cert_path =
+                        crate::paths::ca_cert_path(&state.config.containerd_namespace);
+                    if let Ok(ca_cert_pem) = crate::utils::read_utf8_file_async(&ca_cert_path).await
+                    {
+                        if let Err(e) =
+                            crate::controllers::namespace::create_kube_root_ca_configmap(
+                                state.db.as_ref(),
+                                &resource_name,
+                                &ca_cert_pem,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to create kube-root-ca.crt ConfigMap in namespace {}: {:#}",
+                                resource_name,
+                                e
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "Failed to read CA cert from {} for kube-root-ca.crt ConfigMap",
+                            ca_cert_path.display()
+                        );
+                    }
+                }
+
+                dispatch_generated_mutation_event(
+                    &state,
+                    MutationOperation::Create,
+                    &resource.data,
+                    context,
+                )
+                .await;
+
+                let data = inject_resource_version(resource.data, resource.resource_version);
+                enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
+                maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
+                Ok((StatusCode::CREATED, Json(data)))
             }
-            // Attach details.{group,kind,name} to AlreadyExists/Conflict.
-            return Err(AppError::from(e).with_resource_context(api_version, kind, &resource_name));
         }
-    };
-
-    let context = if ns.is_some() {
-        "namespaced_create"
-    } else {
-        "cluster_create"
-    };
-    reconcile_owner_refs_after_mutation(&state, &resource, context).await;
-    crate::api::apiservice_proxy::invalidate_apiservice_proxy_cache_for_resource(
-        &state,
-        api_version,
-        kind,
-    )
-    .await;
-
-    if kind == "Namespace" {
-        if let Err(e) = crate::controllers::namespace::create_default_service_account(
-            state.db.as_ref(),
-            &resource_name,
-        )
-        .await
-        {
-            tracing::warn!(
-                "Failed to create default ServiceAccount in namespace {}: {:#}",
-                resource_name,
-                e
-            );
-        }
-
-        let ca_cert_path = crate::paths::ca_cert_path(&state.config.containerd_namespace);
-        if let Ok(ca_cert_pem) = crate::utils::read_utf8_file_async(&ca_cert_path).await {
-            if let Err(e) = crate::controllers::namespace::create_kube_root_ca_configmap(
-                state.db.as_ref(),
-                &resource_name,
-                &ca_cert_pem,
-            )
-            .await
-            {
-                tracing::warn!(
-                    "Failed to create kube-root-ca.crt ConfigMap in namespace {}: {:#}",
-                    resource_name,
-                    e
-                );
-            }
-        } else {
-            tracing::warn!(
-                "Failed to read CA cert from {} for kube-root-ca.crt ConfigMap",
-                ca_cert_path.display()
-            );
-        }
+        WriteResult::DryRun(value) => Ok((StatusCode::CREATED, Json(value))),
+        _ => unreachable!("create strategy returned unexpected WriteResult variant"),
     }
-
-    let context = if ns.is_some() {
-        "namespaced_create"
-    } else {
-        "cluster_create"
-    };
-    dispatch_generated_mutation_event(
-        &state,
-        crate::api::mutation::MutationOperation::Create,
-        &resource.data,
-        context,
-    )
-    .await;
-
-    let data = inject_resource_version(resource.data, resource.resource_version);
-    enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
-    maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
-    Ok((StatusCode::CREATED, Json(data)))
 }
 
 pub async fn update_inner(
@@ -842,7 +1401,7 @@ pub async fn update_inner(
     let GeneratedUpdateInnerRequest {
         target,
         query,
-        mut body,
+        body,
     } = request;
     let GeneratedNamedResource {
         api_version,
@@ -850,204 +1409,102 @@ pub async fn update_inner(
         namespace: ns,
         name,
     } = target;
-    let current = state
-        .db
-        .get_resource(api_version, kind, ns, name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} not found", kind)))?;
-
-    if (kind == "ConfigMap" || kind == "Secret")
-        && current
-            .data
-            .get("immutable")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    {
-        let ns_str = ns.unwrap_or("");
-        check_immutable_fields(&current.data, &body, kind, ns_str, name)?;
-    }
-
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
-    let is_dry_run = dry_run.is_all();
-
-    check_field_validation_strict_typed(api_version, kind, &query, &body)?;
-
-    if kind == "Pod" {
-        if let Err(msg) = crate::kubelet::volumes::validate_volume_subpaths(&body) {
-            return Err(AppError::UnprocessableEntity(msg));
-        }
-        if let Err(msg) = crate::kubelet::volumes::validate_volume_projection_paths(&body) {
-            return Err(AppError::UnprocessableEntity(msg));
-        }
-        validate_pod_sysctls(&body)?;
-    }
-
-    prepare_admissionregistration_resource(kind, &mut body)?;
-
-    // RBAC privilege-escalation / bind enforcement (k8s parity) on update.
-    crate::api::rbac_admission::enforce_rbac_write_authorization(
-        &state,
+    let strategy = BuiltinUpdateStrategy {
+        state: &state,
         identity,
         api_version,
         kind,
-        ns,
-        &body,
-    )
-    .await?;
+        namespace: ns,
+        name,
+        query: &query,
+    };
+    let result = update_with_strategy(&strategy, body, dry_run).await?;
+    match result {
+        WriteResult::DryRun(value) => Ok(Json(value)),
+        WriteResult::Persisted(resource) => {
+            if kind == "Pod" {
+                if let Some(namespace) = ns {
+                    maybe_hard_delete_pod_after_finalizers_drained(
+                        state.db.as_ref(),
+                        api_version,
+                        kind,
+                        namespace,
+                        name,
+                        &resource.data,
+                    )
+                    .await;
+                }
+            } else {
+                crate::api::finalizer_delete::finalize_after_update_if_ready(
+                    &state,
+                    api_version,
+                    kind,
+                    ns,
+                    name,
+                    &resource,
+                )
+                .await;
+            }
 
-    body = crate::api::mutation::write::run_admission(
-        state.db.as_ref(),
-        AdmissionContextRequest {
-            api_version,
-            kind,
-            operation: "UPDATE",
-            namespace: ns.map(str::to_string),
-            name: Some(name.to_string()),
-            object: body,
-            old_object: Some((*current.data).clone()),
-            dry_run: is_dry_run,
-            subresource: None,
-            options: None,
-        },
-    )
-    .await?;
-
-    if kind == "Pod"
-        && let Some(namespace) = ns
-    {
-        validate_pod_resource_requirements_immutable(&current.data, &body)?;
-        check_resource_quota_for_pod_update(state.db.as_ref(), namespace, &current.data, &body)
-            .await?;
-    }
-    if kind == "PersistentVolumeClaim"
-        && let Some(namespace) = ns
-    {
-        check_resource_quota_for_pvc_update(state.db.as_ref(), namespace, &current.data, &body)
-            .await?;
-    }
-
-    if kind == "PriorityClass" {
-        validate_priorityclass_update_immutable(&current.data, &body)?;
-    }
-
-    validate_builtin_resource_spec(kind, &body)?;
-    normalize_resource_for_storage(api_version, kind, &mut body);
-
-    if is_dry_run {
-        return Ok(Json(body));
-    }
-
-    if kind == "Secret" {
-        if let Err(err_msg) = validate_secret_data(&body) {
-            return Err(AppError::UnprocessableEntity(err_msg));
-        }
-        process_secret_stringdata(&mut body);
-    }
-
-    let requested_rv = metadata_resource_version(&body);
-    crate::api::mutation::write::prepare_builtin_generation_for_update(
-        kind,
-        &current.data,
-        &mut body,
-    );
-
-    preserve_status_subresource_on_main_update(api_version, kind, &current.data, &mut body);
-    crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(&current.data, &mut body);
-
-    let resource = state
-        .db
-        .update_main_resource_with_preconditions(
-            api_version,
-            kind,
-            ns,
-            name,
-            body.clone(),
-            ResourcePreconditions {
-                uid: Some(current.uid.clone()),
-                resource_version: requested_rv,
-            },
-        )
-        .await?;
-
-    if kind == "Pod" {
-        if let Some(namespace) = ns {
-            maybe_hard_delete_pod_after_finalizers_drained(
-                state.db.as_ref(),
+            let context = if ns.is_some() {
+                "namespaced_update"
+            } else {
+                "cluster_update"
+            };
+            reconcile_owner_refs_after_mutation(&state, &resource, context).await;
+            crate::api::apiservice_proxy::invalidate_apiservice_proxy_cache_for_resource(
+                &state,
                 api_version,
                 kind,
-                namespace,
-                name,
-                &resource.data,
             )
             .await;
-        }
-    } else {
-        crate::api::finalizer_delete::finalize_after_update_if_ready(
-            &state,
-            api_version,
-            kind,
-            ns,
-            name,
-            &resource,
-        )
-        .await;
-    }
 
-    let context = if ns.is_some() {
-        "namespaced_update"
-    } else {
-        "cluster_update"
-    };
-    reconcile_owner_refs_after_mutation(&state, &resource, context).await;
-    crate::api::apiservice_proxy::invalidate_apiservice_proxy_cache_for_resource(
-        &state,
-        api_version,
-        kind,
-    )
-    .await;
-
-    dispatch_generated_mutation_event(
-        &state,
-        crate::api::mutation::MutationOperation::Update,
-        &resource.data,
-        context,
-    )
-    .await;
-
-    // Reconcile kube-root-ca.crt if the ca.crt data was cleared or modified.
-    // The K8s conformance test clears the data and expects the control
-    // plane to restore it. We write the correct data back into the
-    // existing ConfigMap.
-    if kind == "ConfigMap"
-        && name == "kube-root-ca.crt"
-        && let Some(namespace) = ns
-    {
-        let ca_crt_empty = resource
-            .data
-            .pointer("/data/ca.crt")
-            .and_then(|v| v.as_str())
-            .is_none_or(|s| s.is_empty());
-        if ca_crt_empty
-            && let Err(e) = crate::controllers::namespace::reconcile_kube_root_ca_data(
-                state.db.as_ref(),
-                namespace,
+            dispatch_generated_mutation_event(
+                &state,
+                MutationOperation::Update,
+                &resource.data,
+                context,
             )
-            .await
-        {
-            tracing::warn!(
-                namespace = %namespace,
-                error = %e,
-                "failed to reconcile kube-root-ca.crt after data modification"
-            );
-        }
-    }
+            .await;
 
-    let data = inject_resource_version(resource.data, resource.resource_version);
-    if !(api_version == "v1" && kind == "Service") {
-        enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
+            // Reconcile kube-root-ca.crt if the ca.crt data was cleared or modified.
+            // The K8s conformance test clears the data and expects the control
+            // plane to restore it. We write the correct data back into the
+            // existing ConfigMap.
+            if kind == "ConfigMap"
+                && name == "kube-root-ca.crt"
+                && let Some(namespace) = ns
+            {
+                let ca_crt_empty = resource
+                    .data
+                    .pointer("/data/ca.crt")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(|s| s.is_empty());
+                if ca_crt_empty
+                    && let Err(e) = crate::controllers::namespace::reconcile_kube_root_ca_data(
+                        state.db.as_ref(),
+                        namespace,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        namespace = %namespace,
+                        error = %e,
+                        "failed to reconcile kube-root-ca.crt after data modification"
+                    );
+                }
+            }
+
+            let data = inject_resource_version(resource.data, resource.resource_version);
+            if !(api_version == "v1" && kind == "Service") {
+                enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
+            }
+            maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
+            Ok(Json(data))
+        }
+        _ => unreachable!("update strategy returned unexpected WriteResult variant"),
     }
-    maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
-    Ok(Json(data))
 }
 
 fn metadata_resource_version(body: &Value) -> Option<i64> {
@@ -1390,7 +1847,7 @@ pub async fn patch_inner(
     state: Arc<AppState>,
     identity: &crate::auth::AuthenticatedIdentity,
     request: GeneratedPatchInnerRequest<'_>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let GeneratedPatchInnerRequest {
         target,
         query,
@@ -1407,7 +1864,7 @@ pub async fn patch_inner(
 
     let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
 
-    let mut patch: Value = if body.len() >= 4 && &body[..4] == b"k8s\x00" {
+    let patch: Value = if body.len() >= 4 && &body[..4] == b"k8s\x00" {
         crate::protobuf::decode_protobuf(&body[4..])
             .map_err(|e| AppError::BadRequest(format!("Failed to decode protobuf: {}", e)))?
     } else if content_type == Some("application/apply-patch+yaml") {
@@ -1417,92 +1874,45 @@ pub async fn patch_inner(
             .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?
     };
 
-    // Server-Side Apply covers both `apply-patch+yaml` and `apply-patch+json`.
-    let is_apply = matches!(
-        content_type,
-        Some("application/apply-patch+yaml") | Some("application/apply-patch+json")
-    );
-    let apply_manager =
-        crate::api::server_side_apply::resolve_field_manager(query.field_manager.as_deref());
-    let apply_force = query.force.unwrap_or(false);
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
-    let is_dry_run = dry_run.is_all();
-
-    if is_apply {
-        check_field_validation_strict_typed(api_version, kind, &query, &patch)?;
-    }
-
-    if is_apply {
-        let exists = state
-            .db
-            .get_resource(api_version, kind, ns, name)
-            .await?
-            .is_some();
-        if !exists {
-            // CSR apply-create: server-fill spec identity fields from the
-            // authenticated identity. Clients must not be able to forge
-            // spec.username/groups/uid/extra via server-side-apply (mirrors the
-            // POST create path), or the auto-signer would mint certs for a
-            // forged identity (e.g. system:node:<other>).
-            if kind == "CertificateSigningRequest" {
-                stamp_csr_identity(&mut patch, identity);
-            }
-
-            // RBAC privilege-escalation / bind enforcement (k8s parity) on the
-            // server-side-apply create path: a user may not apply a
-            // Role/ClusterRole or (Cluster)RoleBinding granting more than they
-            // hold, absent the escalate/bind verb.
-            crate::api::rbac_admission::enforce_rbac_write_authorization(
-                &state,
-                identity,
-                api_version,
-                kind,
-                ns,
-                &patch,
-            )
-            .await?;
-            // Server-Side Apply create: build the object (with managedFields)
-            // from the apply config. A create has no other owners, so it cannot
-            // conflict; force is irrelevant here.
-            let applied_object = crate::api::server_side_apply::server_side_apply(
-                None,
-                &patch,
-                &apply_manager,
-                api_version,
-                &crate::utils::k8s_time_now(),
-                apply_force,
-            )
-            .map_err(|conflicts| AppError::Conflict(conflicts.message()))?;
-            let admitted = crate::api::mutation::write::run_admission(
-                state.db.as_ref(),
-                AdmissionContextRequest {
+    let strategy = BuiltinPatchStrategy {
+        state: &state,
+        identity,
+        target: GeneratedNamedResource::new(api_version, kind, ns, name),
+        query: &query,
+        headers: &headers,
+    };
+    let result = patch_with_strategy(&strategy, patch, dry_run).await?;
+    let result = match result {
+        WriteResult::Persisted(resource) => {
+            if kind == "Pod" {
+                if let Some(namespace) = ns {
+                    maybe_hard_delete_pod_after_finalizers_drained(
+                        state.db.as_ref(),
+                        api_version,
+                        kind,
+                        namespace,
+                        name,
+                        &resource.data,
+                    )
+                    .await;
+                }
+            } else {
+                crate::api::finalizer_delete::finalize_after_update_if_ready(
+                    &state,
                     api_version,
                     kind,
-                    operation: "CREATE",
-                    namespace: ns.map(str::to_string),
-                    name: Some(name.to_string()),
-                    object: applied_object,
-                    old_object: None,
-                    dry_run: is_dry_run,
-                    subresource: None,
-                    options: None,
-                },
-            )
-            .await?;
-            if let Some(namespace) = ns {
-                check_resource_quota_for_creation(state.db.as_ref(), namespace, kind, &admitted)
-                    .await?;
+                    ns,
+                    name,
+                    &resource,
+                )
+                .await;
             }
-            let mut admitted_with_annot = admitted;
-            normalize_resource_for_storage(api_version, kind, &mut admitted_with_annot);
-            let resource = state
-                .db
-                .create_resource(api_version, kind, ns, name, admitted_with_annot)
-                .await?;
+
             let context = if ns.is_some() {
-                "namespaced_apply_create"
+                "namespaced_patch"
             } else {
-                "cluster_apply_create"
+                "cluster_patch"
             };
             reconcile_owner_refs_after_mutation(&state, &resource, context).await;
             crate::api::apiservice_proxy::invalidate_apiservice_proxy_cache_for_resource(
@@ -1511,239 +1921,26 @@ pub async fn patch_inner(
                 kind,
             )
             .await;
+
             dispatch_generated_mutation_event(
                 &state,
-                crate::api::mutation::MutationOperation::Create,
+                MutationOperation::Patch,
                 &resource.data,
                 context,
             )
             .await;
-            let data = inject_resource_version(resource.data, resource.resource_version);
+
+            let data = inject_resource_version(resource.data.clone(), resource.resource_version);
+            if !(api_version == "v1" && kind == "Service") {
+                enqueue_generated_controller_after_mutation(&state, api_version, kind, &data).await;
+            }
             maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
-            return Ok(Json(data));
+            WriteResult::Persisted(resource)
         }
-    }
-
-    let max_retries = 20;
-    for attempt in 0..max_retries {
-        let current = state
-            .db
-            .get_resource(api_version, kind, ns, name)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("{} not found", kind)))?;
-
-        // Server-Side Apply computes the merge against fresh live state each
-        // attempt (ownership/conflict resolution + field pruning). Other patch
-        // types use the strategic/JSON/merge-patch path. SSA does not write the
-        // client-side `last-applied-configuration` annotation.
-        let mut patched = if is_apply {
-            crate::api::server_side_apply::server_side_apply(
-                Some(&current.data),
-                &patch,
-                &apply_manager,
-                api_version,
-                &crate::utils::k8s_time_now(),
-                apply_force,
-            )
-            .map_err(|conflicts| AppError::Conflict(conflicts.message()))?
-        } else {
-            let merged = apply_patch(&current.data, &patch, content_type)?;
-            // Strict field validation on the merged result: catches nested
-            // unknown fields introduced by merge/strategic/JSON patches
-            // (e.g. spec.bogus), mirroring the create/update strict paths.
-            // SSA bodies are already validated above before merging.
-            check_field_validation_strict_typed(api_version, kind, &query, &merged)?;
-            merged
-        };
-
-        prepare_admissionregistration_resource(kind, &mut patched)?;
-
-        // RBAC privilege-escalation / bind enforcement (k8s parity) on the patch
-        // path: the post-patch object must not grant more than the user holds,
-        // absent the escalate/bind verb. Checked before admission mutates it.
-        crate::api::rbac_admission::enforce_rbac_write_authorization(
-            &state,
-            identity,
-            api_version,
-            kind,
-            ns,
-            &patched,
-        )
-        .await?;
-
-        patched = crate::api::mutation::write::run_admission(
-            state.db.as_ref(),
-            AdmissionContextRequest {
-                api_version,
-                kind,
-                operation: "UPDATE",
-                namespace: ns.map(str::to_string),
-                name: Some(name.to_string()),
-                object: patched,
-                old_object: Some((*current.data).clone()),
-                dry_run: is_dry_run,
-                subresource: None,
-                options: None,
-            },
-        )
-        .await?;
-
-        if (kind == "ConfigMap" || kind == "Secret")
-            && current
-                .data
-                .get("immutable")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        {
-            let ns_str = ns.unwrap_or("");
-            check_immutable_fields(&current.data, &patched, kind, ns_str, name)?;
-        }
-
-        if kind == "Pod"
-            && let Some(namespace) = ns
-        {
-            validate_pod_resource_requirements_immutable(&current.data, &patched)?;
-            check_resource_quota_for_pod_update(
-                state.db.as_ref(),
-                namespace,
-                &current.data,
-                &patched,
-            )
-            .await?;
-        }
-        if kind == "PersistentVolumeClaim"
-            && let Some(namespace) = ns
-        {
-            check_resource_quota_for_pvc_update(
-                state.db.as_ref(),
-                namespace,
-                &current.data,
-                &patched,
-            )
-            .await?;
-        }
-
-        if kind == "PriorityClass" {
-            validate_priorityclass_update_immutable(&current.data, &patched)?;
-        }
-
-        validate_builtin_resource_spec(kind, &patched)?;
-
-        if kind == "Secret" {
-            if let Err(err_msg) = validate_secret_data(&patched) {
-                return Err(AppError::UnprocessableEntity(err_msg));
-            }
-            process_secret_stringdata(&mut patched);
-        }
-
-        crate::api::mutation::write::prepare_builtin_generation_for_update(
-            kind,
-            &current.data,
-            &mut patched,
-        );
-
-        preserve_status_subresource_on_main_update(api_version, kind, &current.data, &mut patched);
-        crate::api::finalizer_delete::preserve_deletion_timestamp_on_update(
-            &current.data,
-            &mut patched,
-        );
-        normalize_resource_for_storage(api_version, kind, &mut patched);
-
-        if is_dry_run {
-            return Ok(Json(patched));
-        }
-
-        match state
-            .db
-            .update_resource(
-                api_version,
-                kind,
-                ns,
-                name,
-                patched.clone(),
-                current.resource_version,
-            )
-            .await
-        {
-            Ok(resource) => {
-                if kind == "Pod" {
-                    if let Some(namespace) = ns {
-                        maybe_hard_delete_pod_after_finalizers_drained(
-                            state.db.as_ref(),
-                            api_version,
-                            kind,
-                            namespace,
-                            name,
-                            &resource.data,
-                        )
-                        .await;
-                    }
-                } else {
-                    crate::api::finalizer_delete::finalize_after_update_if_ready(
-                        &state,
-                        api_version,
-                        kind,
-                        ns,
-                        name,
-                        &resource,
-                    )
-                    .await;
-                }
-
-                let context = if ns.is_some() {
-                    "namespaced_patch"
-                } else {
-                    "cluster_patch"
-                };
-                reconcile_owner_refs_after_mutation(&state, &resource, context).await;
-                crate::api::apiservice_proxy::invalidate_apiservice_proxy_cache_for_resource(
-                    &state,
-                    api_version,
-                    kind,
-                )
-                .await;
-
-                dispatch_generated_mutation_event(
-                    &state,
-                    crate::api::mutation::MutationOperation::Patch,
-                    &resource.data,
-                    context,
-                )
-                .await;
-
-                let data = inject_resource_version(resource.data, resource.resource_version);
-                if !(api_version == "v1" && kind == "Service") {
-                    enqueue_generated_controller_after_mutation(&state, api_version, kind, &data)
-                        .await;
-                }
-                maybe_reconcile_cluster_role_aggregation(&state, api_version, kind).await;
-                return Ok(Json(data));
-            }
-            Err(e)
-                if attempt < max_retries - 1 && crate::datastore::errors::is_conflict_error(&e) =>
-            {
-                tracing::debug!(
-                    "PATCH {}/{:?} {}: conflict on attempt {}, retrying",
-                    kind,
-                    ns,
-                    name,
-                    attempt
-                );
-                let backoff_ms = std::cmp::min(20u64.saturating_mul(1u64 << attempt), 250);
-                let _ = state
-                    .task_supervisor
-                    .sleep(
-                        "patch_conflict_retry_backoff",
-                        Duration::from_millis(backoff_ms),
-                    )
-                    .await;
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    unreachable!("PATCH retry loop exhausted without returning");
+        other => other,
+    };
+    let (status, data) = result.into_response_parts(StatusCode::OK);
+    Ok((status, Json(data)))
 }
 
 pub async fn delete_collection_inner(

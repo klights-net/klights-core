@@ -1526,3 +1526,43 @@ async fn mutation_patch_preserves_deletion_timestamp_and_generation_rules() {
         Some(widget_generation + 1)
     );
 }
+
+#[tokio::test]
+async fn mutation_generated_apply_create_returns_created_status() {
+    let state = build_test_app_state().await;
+    let app = crate::api::build_router(state);
+
+    let response = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/api/v1/namespaces/default/configmaps/apply-created-cm?fieldManager=klights-test",
+        "application/apply-patch+yaml",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "apply-created-cm",
+                "namespace": "default"
+            },
+            "data": {"key": "created-by-apply"}
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "generated server-side-apply create must return 201 Created"
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["metadata"]["name"], "apply-created-cm");
+    assert_eq!(body["data"]["key"], "created-by-apply");
+
+    let (status, stored) = get_json(
+        &app,
+        "/api/v1/namespaces/default/configmaps/apply-created-cm",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stored["metadata"]["name"], "apply-created-cm");
+}

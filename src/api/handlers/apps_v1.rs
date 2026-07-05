@@ -184,7 +184,7 @@ async fn patch_deployment(
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
     body: Bytes,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let result = patch_deployment_base(
         State(state.clone()),
         Path((namespace.clone(), name.clone())),
@@ -195,7 +195,8 @@ async fn patch_deployment(
     )
     .await?;
 
-    state.controller_dispatcher.enqueue(&result.0).await;
+    let (_status, json_response) = &result;
+    state.controller_dispatcher.enqueue(&json_response.0).await;
 
     Ok(result)
 }

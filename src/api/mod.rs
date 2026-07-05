@@ -567,7 +567,7 @@ async fn patch_replicationcontroller(
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
     body: Bytes,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     let result = generated_handlers::patch_replicationcontroller(
         State(state.clone()),
         Path((namespace, name)),
@@ -578,7 +578,8 @@ async fn patch_replicationcontroller(
     )
     .await?;
 
-    state.controller_dispatcher.enqueue(&result.0).await;
+    let (_status, json_response) = &result;
+    state.controller_dispatcher.enqueue(&json_response.0).await;
 
     Ok(result)
 }

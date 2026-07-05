@@ -486,7 +486,7 @@ async fn patch_service(
     headers: HeaderMap,
     axum::Extension(identity): axum::Extension<crate::auth::AuthenticatedIdentity>,
     body: Bytes,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(StatusCode, Json<Value>), AppError> {
     // F6-02: Check if NodePort allocator is ready before allowing Service mutations.
     // This ensures leader promotion has completed the rebuild before accepting new allocations.
     if !state.nodeport_alloc.is_ready() {
@@ -504,6 +504,7 @@ async fn patch_service(
         body,
     )
     .await?;
+    let (status, json_response) = &result;
 
     // Allocation/defaulting runs synchronously so the API response reflects
     // allocated fields. Endpoint/EndpointSlice reconciliation and the dataplane
@@ -511,7 +512,7 @@ async fn patch_service(
     // enqueue below — never inline on the request path.
     let allocated = crate::controllers::service::allocate_service_fields_for_api_write(
         state.db.as_ref(),
-        &result.0,
+        &json_response.0,
         state.service_ipam.as_ref(),
         state.nodeport_alloc.as_ref(),
     )
@@ -523,9 +524,9 @@ async fn patch_service(
             state.controller_dispatcher.enqueue(&allocated).await;
             allocated
         }
-        None => result.0.clone(),
+        None => json_response.0.clone(),
     };
-    Ok(Json(response))
+    Ok((*status, Json(response)))
 }
 
 async fn delete_service(
