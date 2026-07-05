@@ -389,6 +389,48 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    struct GenericStatusPolicyCase {
+        api_version: &'static str,
+        kind: &'static str,
+        terminal_type: Option<&'static str>,
+        live_preserved_field: (&'static str, serde_json::Value),
+    }
+
+    fn generic_status_policy_cases() -> [GenericStatusPolicyCase; 5] {
+        [
+            GenericStatusPolicyCase {
+                api_version: "batch/v1",
+                kind: "Job",
+                terminal_type: Some("Complete"),
+                live_preserved_field: ("startTime", json!("2026-07-01T00:00:00Z")),
+            },
+            GenericStatusPolicyCase {
+                api_version: "batch/v1",
+                kind: "CronJob",
+                terminal_type: None,
+                live_preserved_field: ("active", json!([])),
+            },
+            GenericStatusPolicyCase {
+                api_version: "policy/v1",
+                kind: "PodDisruptionBudget",
+                terminal_type: None,
+                live_preserved_field: ("observedGeneration", json!(7)),
+            },
+            GenericStatusPolicyCase {
+                api_version: "v1",
+                kind: "PersistentVolume",
+                terminal_type: None,
+                live_preserved_field: ("phase", json!("Bound")),
+            },
+            GenericStatusPolicyCase {
+                api_version: "v1",
+                kind: "PersistentVolumeClaim",
+                terminal_type: None,
+                live_preserved_field: ("phase", json!("Bound")),
+            },
+        ]
+    }
+
     #[test]
     fn status_merge_registry_has_profiles_for_current_special_cases() {
         assert_eq!(
@@ -504,46 +546,7 @@ mod tests {
 
     #[test]
     fn status_merge_matrix_protects_every_generic_registry_kind() {
-        struct Case {
-            api_version: &'static str,
-            kind: &'static str,
-            terminal_type: Option<&'static str>,
-            live_preserved_field: (&'static str, serde_json::Value),
-        }
-        let cases = [
-            Case {
-                api_version: "batch/v1",
-                kind: "Job",
-                terminal_type: Some("Complete"),
-                live_preserved_field: ("startTime", json!("2026-07-01T00:00:00Z")),
-            },
-            Case {
-                api_version: "batch/v1",
-                kind: "CronJob",
-                terminal_type: None,
-                live_preserved_field: ("active", json!([])),
-            },
-            Case {
-                api_version: "policy/v1",
-                kind: "PodDisruptionBudget",
-                terminal_type: None,
-                live_preserved_field: ("observedGeneration", json!(7)),
-            },
-            Case {
-                api_version: "v1",
-                kind: "PersistentVolume",
-                terminal_type: None,
-                live_preserved_field: ("phase", json!("Bound")),
-            },
-            Case {
-                api_version: "v1",
-                kind: "PersistentVolumeClaim",
-                terminal_type: None,
-                live_preserved_field: ("phase", json!("Bound")),
-            },
-        ];
-
-        for case in cases {
+        for case in generic_status_policy_cases() {
             if let Some(term) = case.terminal_type {
                 let mut live_status = serde_json::Map::new();
                 live_status.insert(

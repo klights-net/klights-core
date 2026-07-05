@@ -3406,66 +3406,63 @@ mod cases {
         );
     }
 
-    #[tokio::test]
-    async fn replicated_stale_cronjob_status_applies_newer_last_schedule_time() {
+    struct ReplicatedStaleStatusCase {
+        api_version: &'static str,
+        kind: &'static str,
+        namespace: Option<&'static str>,
+        name: &'static str,
+        uid: &'static str,
+        initial: serde_json::Value,
+        stale_status: serde_json::Value,
+        expected_pointer: &'static str,
+        expected_value: serde_json::Value,
+    }
+
+    async fn apply_replicated_stale_status_case(
+        case: ReplicatedStaleStatusCase,
+    ) -> crate::datastore::Resource {
         use crate::datastore::replicated::apply_command_to_backend;
 
         let db = crate::datastore::test_support::in_memory().await;
         let created = db
             .create_resource(
-                "batch/v1",
-                "CronJob",
-                Some("default"),
-                "replicated-stale-cronjob",
-                json!({
-                    "apiVersion": "batch/v1",
-                    "kind": "CronJob",
-                    "metadata": {
-                        "name": "replicated-stale-cronjob",
-                        "namespace": "default",
-                        "uid": "replicated-cronjob-uid"
-                    },
-                    "spec": {
-                        "schedule": "* */1 * * ?",
-                        "jobTemplate": {"spec": {"template": {"spec": {
-                            "containers": [{"name": "main", "image": "nginx"}],
-                            "restartPolicy": "OnFailure"
-                        }}}}
-                    },
-                    "status": {"lastScheduleTime": "2026-07-04T06:21:59Z"}
-                }),
+                case.api_version,
+                case.kind,
+                case.namespace,
+                case.name,
+                case.initial,
             )
             .await
-            .unwrap();
+            .expect("create stale status fixture");
 
         db.patch_resource_latest_with_preconditions(
-            "batch/v1",
-            "CronJob",
-            Some("default"),
-            "replicated-stale-cronjob",
+            case.api_version,
+            case.kind,
+            case.namespace,
+            case.name,
             crate::datastore::ResourcePatchRequest::new(
                 crate::datastore::PatchKind::Merge,
-                json!({"metadata": {"annotations": {"patchedstatus": "true"}}}),
+                serde_json::json!({"metadata": {"annotations": {"patchedstatus": "true"}}}),
                 ResourcePreconditions {
-                    uid: Some("replicated-cronjob-uid".into()),
+                    uid: Some(case.uid.to_string()),
                     resource_version: None,
                 },
             ),
         )
         .await
-        .expect("metadata patch advances the live resourceVersion after status patch");
+        .expect("metadata patch advances live resourceVersion");
 
         apply_command_to_backend(
             &db,
             StorageCommand::UpdateStatus {
-                api_version: "batch/v1".into(),
-                kind: "CronJob".into(),
-                namespace: Some("default".into()),
-                name: "replicated-stale-cronjob".into(),
-                status: json!({"lastScheduleTime": "2026-07-04T06:22:00Z"}),
+                api_version: case.api_version.into(),
+                kind: case.kind.into(),
+                namespace: case.namespace.map(str::to_string),
+                name: case.name.into(),
+                status: case.stale_status.clone(),
                 expected_rv: Some(created.resource_version),
                 preconditions: ResourcePreconditions {
-                    uid: Some("replicated-cronjob-uid".into()),
+                    uid: Some(case.uid.into()),
                     resource_version: Some(created.resource_version),
                 },
                 observed_status_stamp: None,
@@ -3474,141 +3471,150 @@ mod cases {
                 command_id: CommandId::new(),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: created.resource_version,
-                uid: Some("replicated-cronjob-uid".into()),
+                uid: Some(case.uid.into()),
                 timestamp_ms: 0,
                 authoring_node: "controlplane1".into(),
             },
         )
         .await
-        .expect("same-UID CronJob status apply should rebase onto metadata-only rv churn");
+        .expect("same-UID stale status apply should rebase onto metadata-only rv churn");
 
         let live = db
-            .get_resource(
-                "batch/v1",
-                "CronJob",
-                Some("default"),
-                "replicated-stale-cronjob",
-            )
+            .get_resource(case.api_version, case.kind, case.namespace, case.name)
             .await
-            .unwrap()
-            .unwrap();
+            .expect("read final stale status fixture")
+            .expect("final stale status fixture exists");
         assert_eq!(
-            live.data.pointer("/status/lastScheduleTime"),
-            Some(&json!("2026-07-04T06:22:00Z")),
-            "stale raft status apply must not report success while preserving the prior CronJob lastScheduleTime"
+            live.data.pointer(case.expected_pointer),
+            Some(&case.expected_value)
         );
         assert_eq!(
             live.data.pointer("/metadata/annotations/patchedstatus"),
-            Some(&json!("true")),
+            Some(&serde_json::json!("true")),
             "status rebase must preserve metadata-only changes that advanced the resourceVersion"
         );
+        live
+    }
+
+    #[tokio::test]
+    async fn replicated_stale_cronjob_status_applies_newer_last_schedule_time() {
+        apply_replicated_stale_status_case(ReplicatedStaleStatusCase {
+            api_version: "batch/v1",
+            kind: "CronJob",
+            namespace: Some("default"),
+            name: "replicated-stale-cronjob",
+            uid: "replicated-cronjob-uid",
+            initial: serde_json::json!({
+                "apiVersion": "batch/v1",
+                "kind": "CronJob",
+                "metadata": {
+                    "name": "replicated-stale-cronjob",
+                    "namespace": "default",
+                    "uid": "replicated-cronjob-uid"
+                },
+                "spec": {
+                    "schedule": "* */1 * * ?",
+                    "jobTemplate": {"spec": {"template": {"spec": {
+                        "containers": [{"name": "main", "image": "nginx"}],
+                        "restartPolicy": "OnFailure"
+                    }}}}
+                },
+                "status": {"lastScheduleTime": "2026-07-04T06:21:59Z"}
+            }),
+            stale_status: serde_json::json!({"lastScheduleTime": "2026-07-04T06:22:00Z"}),
+            expected_pointer: "/status/lastScheduleTime",
+            expected_value: serde_json::json!("2026-07-04T06:22:00Z"),
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn replicated_stale_pdb_status_applies_disrupted_pods() {
-        use crate::datastore::replicated::apply_command_to_backend;
-
-        let db = crate::datastore::test_support::in_memory().await;
-        let created = db
-            .create_resource(
-                "policy/v1",
-                "PodDisruptionBudget",
-                Some("default"),
-                "replicated-stale-pdb",
-                json!({
-                    "apiVersion": "policy/v1",
-                    "kind": "PodDisruptionBudget",
-                    "metadata": {
-                        "name": "replicated-stale-pdb",
-                        "namespace": "default",
-                        "uid": "replicated-pdb-uid"
-                    },
-                    "spec": {
-                        "minAvailable": 1,
-                        "selector": {"matchLabels": {"app": "pdb-stale"}}
-                    },
-                    "status": {
-                        "expectedPods": 1,
-                        "currentHealthy": 1,
-                        "desiredHealthy": 1,
-                        "disruptionsAllowed": 0
-                    }
-                }),
-            )
-            .await
-            .unwrap();
-
-        db.patch_resource_latest_with_preconditions(
-            "policy/v1",
-            "PodDisruptionBudget",
-            Some("default"),
-            "replicated-stale-pdb",
-            crate::datastore::ResourcePatchRequest::new(
-                crate::datastore::PatchKind::Merge,
-                json!({"metadata": {"annotations": {"patchedstatus": "true"}}}),
-                ResourcePreconditions {
-                    uid: Some("replicated-pdb-uid".into()),
-                    resource_version: None,
+        apply_replicated_stale_status_case(ReplicatedStaleStatusCase {
+            api_version: "policy/v1",
+            kind: "PodDisruptionBudget",
+            namespace: Some("default"),
+            name: "replicated-stale-pdb",
+            uid: "replicated-pdb-uid",
+            initial: serde_json::json!({
+                "apiVersion": "policy/v1",
+                "kind": "PodDisruptionBudget",
+                "metadata": {
+                    "name": "replicated-stale-pdb",
+                    "namespace": "default",
+                    "uid": "replicated-pdb-uid"
                 },
-            ),
-        )
-        .await
-        .expect("metadata patch advances the live resourceVersion after status patch");
-
-        apply_command_to_backend(
-            &db,
-            StorageCommand::UpdateStatus {
-                api_version: "policy/v1".into(),
-                kind: "PodDisruptionBudget".into(),
-                namespace: Some("default".into()),
-                name: "replicated-stale-pdb".into(),
-                status: json!({
+                "spec": {
+                    "minAvailable": 1,
+                    "selector": {"matchLabels": {"app": "pdb-stale"}}
+                },
+                "status": {
                     "expectedPods": 1,
                     "currentHealthy": 1,
                     "desiredHealthy": 1,
-                    "disruptionsAllowed": 0,
-                    "disruptedPods": {
-                        "pod-0": "2026-07-04T17:43:00Z"
-                    }
-                }),
-                expected_rv: Some(created.resource_version),
-                preconditions: ResourcePreconditions {
-                    uid: Some("replicated-pdb-uid".into()),
-                    resource_version: Some(created.resource_version),
-                },
-                observed_status_stamp: None,
-            },
-            CommandMeta {
-                command_id: CommandId::new(),
-                codec_version: COMMAND_CODEC_VERSION,
-                resource_version: created.resource_version,
-                uid: Some("replicated-pdb-uid".into()),
-                timestamp_ms: 0,
-                authoring_node: "controlplane1".into(),
-            },
-        )
-        .await
-        .expect("same-UID PDB status apply should rebase onto metadata-only rv churn");
+                    "disruptionsAllowed": 0
+                }
+            }),
+            stale_status: serde_json::json!({
+                "expectedPods": 1,
+                "currentHealthy": 1,
+                "desiredHealthy": 1,
+                "disruptionsAllowed": 0,
+                "disruptedPods": {
+                    "pod-0": "2026-07-04T17:43:00Z"
+                }
+            }),
+            expected_pointer: "/status/disruptedPods/pod-0",
+            expected_value: serde_json::json!("2026-07-04T17:43:00Z"),
+        })
+        .await;
+    }
 
-        let live = db
-            .get_resource(
-                "policy/v1",
-                "PodDisruptionBudget",
-                Some("default"),
-                "replicated-stale-pdb",
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            live.data.pointer("/status/disruptedPods/pod-0"),
-            Some(&json!("2026-07-04T17:43:00Z")),
-            "stale raft PDB status apply must keep caller-owned disruptedPods entries"
-        );
-        assert_eq!(
-            live.data.pointer("/metadata/annotations/patchedstatus"),
-            Some(&json!("true")),
-            "status rebase must preserve metadata-only changes that advanced the resourceVersion"
-        );
+    #[tokio::test]
+    async fn replicated_stale_persistentvolume_status_applies_newer_phase() {
+        apply_replicated_stale_status_case(ReplicatedStaleStatusCase {
+            api_version: "v1",
+            kind: "PersistentVolume",
+            namespace: None,
+            name: "replicated-stale-pv",
+            uid: "replicated-pv-uid",
+            initial: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolume",
+                "metadata": {"name": "replicated-stale-pv", "uid": "replicated-pv-uid"},
+                "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteOnce"]},
+                "status": {"phase": "Available"}
+            }),
+            stale_status: serde_json::json!({"phase": "Bound"}),
+            expected_pointer: "/status/phase",
+            expected_value: serde_json::json!("Bound"),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn replicated_stale_persistentvolumeclaim_status_applies_newer_phase() {
+        apply_replicated_stale_status_case(ReplicatedStaleStatusCase {
+            api_version: "v1",
+            kind: "PersistentVolumeClaim",
+            namespace: Some("default"),
+            name: "replicated-stale-pvc",
+            uid: "replicated-pvc-uid",
+            initial: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {
+                    "name": "replicated-stale-pvc",
+                    "namespace": "default",
+                    "uid": "replicated-pvc-uid"
+                },
+                "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}},
+                "status": {"phase": "Pending"}
+            }),
+            stale_status: serde_json::json!({"phase": "Bound"}),
+            expected_pointer: "/status/phase",
+            expected_value: serde_json::json!("Bound"),
+        })
+        .await;
     }
 }
