@@ -21,6 +21,7 @@ pub mod replicated;
 pub mod selector;
 pub mod snapshot;
 pub mod sqlite;
+pub mod stale_apply_policy;
 pub mod status_merge_policy;
 pub mod types;
 
