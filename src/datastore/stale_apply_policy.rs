@@ -15,7 +15,7 @@ use serde_json::Value;
 /// `incoming` is the committed payload being applied; `existing` is the live
 /// row currently stored under the same UID. The policy mutates `incoming` in
 /// place to preserve only the shared actor-owned fields (Pod node name, Pod
-/// owner references, and PV/PVC user labels/annotations).
+/// status, Pod owner references, and PV/PVC user labels/annotations).
 pub fn apply_same_uid_stale_full_resource_policy(
     api_version: &str,
     kind: &str,
@@ -23,6 +23,7 @@ pub fn apply_same_uid_stale_full_resource_policy(
     existing: &Value,
 ) {
     preserve_pod_node_for_stale_put(api_version, kind, incoming, existing);
+    preserve_pod_status_for_stale_main_put(api_version, kind, incoming, existing);
     preserve_pod_owner_refs_for_stale_put(api_version, kind, incoming, existing);
     preserve_storage_user_metadata_for_stale_put(api_version, kind, incoming, existing);
 }
@@ -61,6 +62,39 @@ fn preserve_pod_node_for_stale_put(
         return;
     };
     spec.insert("nodeName".to_string(), Value::String(existing_node));
+}
+
+fn preserve_pod_status_for_stale_main_put(
+    api_version: &str,
+    kind: &str,
+    incoming: &mut Value,
+    existing: &Value,
+) {
+    if api_version != "v1" || kind != "Pod" {
+        return;
+    }
+    if has_deletion_timestamp(incoming) {
+        return;
+    }
+    let Some(object) = incoming.as_object_mut() else {
+        return;
+    };
+    if let Some(existing_status) = existing.get("status") {
+        object.insert("status".to_string(), existing_status.clone());
+    } else {
+        object.remove("status");
+    }
+}
+
+fn has_deletion_timestamp(data: &Value) -> bool {
+    data.pointer("/metadata/deletionTimestamp")
+        .filter(|value| !value.is_null())
+        .filter(|value| {
+            value
+                .as_str()
+                .is_none_or(|timestamp| !timestamp.trim().is_empty())
+        })
+        .is_some()
 }
 
 fn preserve_pod_owner_refs_for_stale_put(
@@ -282,6 +316,18 @@ mod tests {
                 expected: json!("worker-a"),
             },
             Case {
+                name: "pod_status",
+                api_version: "v1",
+                kind: "Pod",
+                incoming: json!({
+                    "metadata": {"name": "pod-a"},
+                    "status": {"phase": "Pending"}
+                }),
+                existing: json!({"status": {"phase": "Running"}}),
+                assert_path: "/status/phase",
+                expected: json!("Running"),
+            },
+            Case {
                 name: "pod_missing_owner_refs",
                 api_version: "v1",
                 kind: "Pod",
@@ -346,5 +392,33 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn same_uid_stale_pod_delete_put_keeps_incoming_terminating_status() {
+        let mut incoming = json!({
+            "metadata": {
+                "name": "pod-a",
+                "deletionTimestamp": "2026-07-05T09:32:10Z"
+            },
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "False", "reason": "PodTerminating"}]
+            }
+        });
+        let existing = json!({
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        });
+
+        apply_same_uid_stale_full_resource_policy("v1", "Pod", &mut incoming, &existing);
+
+        assert_eq!(
+            incoming.pointer("/status/conditions/0/status"),
+            Some(&json!("False")),
+            "delete-mark PUTs must keep their terminating status instead of restoring the live pre-delete status"
+        );
     }
 }

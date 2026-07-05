@@ -1683,6 +1683,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_same_uid_pod_put_after_status_rv_advance_preserves_live_status() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("sonobuoy"),
+                "sonobuoy",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "sonobuoy",
+                        "namespace": "sonobuoy",
+                        "uid": "sonobuoy-uid",
+                        "generation": 1
+                    },
+                    "spec": {
+                        "nodeName": "mn-controlplane2",
+                        "containers": [{
+                            "name": "kube-sonobuoy",
+                            "image": "sonobuoy/sonobuoy:v0.57.5"
+                        }]
+                    },
+                    "status": {
+                        "phase": "Pending",
+                        "containerStatuses": [{
+                            "name": "kube-sonobuoy",
+                            "containerID": "containerd://ctr-sonobuoy",
+                            "ready": false,
+                            "started": false,
+                            "restartCount": 0,
+                            "state": {"waiting": {"reason": "ContainerCreating"}}
+                        }]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        let running = db
+            .update_status_only_with_preconditions(
+                "v1",
+                "Pod",
+                Some("sonobuoy"),
+                "sonobuoy",
+                serde_json::json!({
+                    "phase": "Running",
+                    "conditions": [
+                        {"type": "PodScheduled", "status": "True"},
+                        {"type": "Initialized", "status": "True"},
+                        {"type": "ContainersReady", "status": "True"},
+                        {"type": "Ready", "status": "True"}
+                    ],
+                    "containerStatuses": [{
+                        "name": "kube-sonobuoy",
+                        "containerID": "containerd://ctr-sonobuoy",
+                        "ready": true,
+                        "started": true,
+                        "restartCount": 0,
+                        "state": {"running": {"startedAt": "2026-07-05T09:32:10Z"}}
+                    }]
+                }),
+                crate::datastore::ResourcePreconditions::uid(created.uid.clone()),
+            )
+            .await
+            .expect("kubelet status update should advance rv before stale put apply");
+        assert!(
+            running.resource_version > created.resource_version,
+            "status update must create the stale-precondition overlap"
+        );
+
+        let result = db
+            .apply_raft_log_apply_commit(LogApplyCommit::new(
+                60,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("sonobuoy".to_string()),
+                    name: "sonobuoy".to_string(),
+                    uid: "sonobuoy-uid".to_string(),
+                    resource_version: 60,
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": "sonobuoy",
+                            "namespace": "sonobuoy",
+                            "uid": "sonobuoy-uid",
+                            "generation": 1,
+                            "resourceVersion": "60",
+                            "annotations": {
+                                "sonobuoy.hept.io/status": "{\"status\":\"running\"}"
+                            }
+                        },
+                        "spec": {
+                            "nodeName": "mn-controlplane2",
+                            "containers": [{
+                                "name": "kube-sonobuoy",
+                                "image": "sonobuoy/sonobuoy:v0.57.5"
+                            }]
+                        },
+                        "status": {
+                            "phase": "Pending",
+                            "containerStatuses": [{
+                                "name": "kube-sonobuoy",
+                                "containerID": "containerd://ctr-sonobuoy",
+                                "ready": false,
+                                "started": false,
+                                "restartCount": 0,
+                                "state": {"waiting": {"reason": "ContainerCreating"}}
+                            }]
+                        }
+                    }),
+                    require_absent: false,
+                    require_existing: true,
+                    precondition_uid: Some("sonobuoy-uid".to_string()),
+                    precondition_resource_version: Some(created.resource_version),
+                    status_only: false,
+                })],
+            ))
+            .await
+            .expect("stale committed Pod PUT should apply by rebasing status");
+        assert!(
+            result.error_message.is_none(),
+            "stale committed Pod PUT must not fail raft apply: {result:?}"
+        );
+
+        let row = db
+            .get_resource("v1", "Pod", Some("sonobuoy"), "sonobuoy")
+            .await
+            .unwrap()
+            .expect("pod remains after stale committed put");
+        assert_eq!(
+            row.data
+                .pointer("/metadata/annotations/sonobuoy.hept.io~1status"),
+            Some(&serde_json::json!("{\"status\":\"running\"}")),
+            "metadata-only Pod patch content from the committed PUT must still apply"
+        );
+        assert_eq!(
+            row.data.pointer("/status/phase"),
+            Some(&serde_json::json!("Running")),
+            "stale same-UID Pod PUT must preserve the newer kubelet-owned phase"
+        );
+        assert!(
+            row.data
+                .pointer("/status/containerStatuses/0/state/running")
+                .is_some(),
+            "stale same-UID Pod PUT must not regress a running container to ContainerCreating"
+        );
+        assert_eq!(
+            row.data.pointer("/status/containerStatuses/0/ready"),
+            Some(&serde_json::json!(true)),
+            "stale same-UID Pod PUT must preserve container readiness"
+        );
+    }
+
+    #[tokio::test]
     async fn committed_pod_put_preserves_existing_deletion_metadata_for_same_uid() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
