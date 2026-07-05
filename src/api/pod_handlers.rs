@@ -6,7 +6,12 @@
 //! path through `PodApiService::api_create_pod`; for now this file mirrors the
 //! macro expansion bit-for-bit.
 
+use crate::api::mutation::write::{
+    CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
+    patch_with_strategy, update_with_strategy,
+};
 use crate::api::*;
+use async_trait::async_trait;
 
 async fn dispatch_pod_handler_mutation_event(
     state: &Arc<AppState>,
@@ -244,39 +249,30 @@ pub async fn create_pod(
     Query(query): Query<CreateUpdateQuery>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
-    reject_if_namespace_missing_or_terminating(state.db.as_ref(), &namespace).await?;
-
+    let strategy = PodCreateStrategy {
+        state: &state,
+        namespace: &namespace,
+        query: &query,
+    };
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
-    let is_dry_run = dry_run.is_all();
-
-    // Strict field validation (deep: catches nested unknown fields like spec.bogus)
-    check_field_validation_strict_typed("v1", "Pod", &query, &body)?;
-
-    let result = crate::kubelet::pod_repository::PodApiWriter::api_create_pod(
-        state.pod_repository.as_ref(),
-        crate::kubelet::pod_repository::PodApiCreateRequest {
-            namespace: namespace.clone(),
-            name: String::new(),
-            body,
-            dry_run: is_dry_run,
-            run_admission: true,
-        },
-    )
-    .await?;
-
-    if let Some(resource) = result.resource {
-        dispatch_pod_handler_mutation_event(
-            &state,
-            crate::api::mutation::MutationOperation::Create,
-            &resource.data,
-            "pod_create",
-        )
-        .await;
-        let data = inject_resource_version(resource.data, resource.resource_version);
-        return Ok((StatusCode::CREATED, Json(data)));
+    let result = create_with_strategy(&strategy, body, dry_run).await?;
+    match result {
+        WriteResult::Persisted(resource) => {
+            dispatch_pod_handler_mutation_event(
+                &state,
+                crate::api::mutation::MutationOperation::Create,
+                &resource.data,
+                "pod_create",
+            )
+            .await;
+            let data = inject_resource_version(resource.data, resource.resource_version);
+            Ok((StatusCode::CREATED, Json(data)))
+        }
+        WriteResult::DryRun(body) | WriteResult::PersistedValue(body) => {
+            Ok((StatusCode::CREATED, Json(body)))
+        }
+        WriteResult::Response { status, body } => Ok((status, Json(body))),
     }
-
-    Ok((StatusCode::CREATED, Json(result.body)))
 }
 
 pub async fn update_pod(
@@ -293,33 +289,18 @@ pub async fn update_pod(
         body.as_object().map(|o| o.keys().collect::<Vec<_>>())
     );
 
-    let current = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
-        &namespace,
-        &name,
-    )
-    .await?
-    .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?;
-
+    let strategy = PodUpdateStrategy {
+        state: &state,
+        namespace: &namespace,
+        name: &name,
+        query: &query,
+    };
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
-    let is_dry_run = dry_run.is_all();
-
-    // Strict field validation (deep: catches nested unknown fields like spec.bogus)
-    check_field_validation_strict_typed("v1", "Pod", &query, &body)?;
-
-    let outcome = crate::kubelet::pod_repository::PodApiWriter::api_update_pod(
-        state.pod_repository.as_ref(),
-        &namespace,
-        &name,
-        body,
-        current,
-        is_dry_run,
-    )
-    .await?;
-
-    let resource = match outcome {
-        crate::kubelet::pod_repository::PodApiUpdateOutcome::DryRun(b) => return Ok(Json(b)),
-        crate::kubelet::pod_repository::PodApiUpdateOutcome::Persisted(r) => r,
+    let result = update_with_strategy(&strategy, body, dry_run).await?;
+    let resource = match result {
+        WriteResult::DryRun(b) | WriteResult::PersistedValue(b) => return Ok(Json(b)),
+        WriteResult::Persisted(r) => r,
+        WriteResult::Response { status: _, body } => return Ok(Json(body)),
     };
 
     tracing::debug!(
@@ -411,44 +392,19 @@ pub async fn patch_pod(
             .map_err(|e| AppError::BadRequest(format!("Invalid JSON: {}", e)))?
     };
 
-    // For server-side apply (SSA), validate fields strictly if requested
-    // (deep: catches nested unknown fields like spec.bogus).
-    let is_apply = content_type == Some("application/apply-patch+yaml")
-        || content_type == Some("application/apply-patch+json");
-    if is_apply {
-        check_field_validation_strict_typed("v1", "Pod", &query, &patch)?;
-    } else if query.field_validation.as_deref() == Some("Strict") {
-        // Non-apply patch (merge/strategic/JSON): deep-validate the *merged*
-        // result so nested unknown fields are rejected under Strict, matching
-        // the generic patch path. Only runs on the opt-in Strict path.
-        let current = crate::kubelet::pod_repository::PodReader::get_pod(
-            state.pod_repository.as_ref(),
-            &namespace,
-            &name,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?;
-        let merged = apply_patch(&current.data, &patch, content_type)?;
-        check_field_validation_strict_typed("v1", "Pod", &query, &merged)?;
-    }
-
-    let patch_type = content_type_to_patch_type(content_type);
+    let strategy = PodPatchStrategy {
+        state: &state,
+        namespace: &namespace,
+        name: &name,
+        query: &query,
+        headers: &headers,
+    };
     let dry_run = crate::api::mutation::DryRunMode::from_create_update_query(&query)?;
-    let is_dry_run = dry_run.is_all();
-
-    let outcome = crate::kubelet::pod_repository::PodApiWriter::api_patch_pod(
-        state.pod_repository.as_ref(),
-        &namespace,
-        &name,
-        patch,
-        patch_type,
-        is_dry_run,
-    )
-    .await?;
-
-    let resource = match outcome {
-        crate::kubelet::pod_repository::PodApiUpdateOutcome::DryRun(b) => return Ok(Json(b)),
-        crate::kubelet::pod_repository::PodApiUpdateOutcome::Persisted(r) => r,
+    let result = patch_with_strategy(&strategy, patch, dry_run).await?;
+    let resource = match result {
+        WriteResult::DryRun(b) | WriteResult::PersistedValue(b) => return Ok(Json(b)),
+        WriteResult::Persisted(r) => r,
+        WriteResult::Response { status: _, body } => return Ok(Json(body)),
     };
 
     reconcile_owner_refs_after_mutation(&state, &resource, "namespaced_patch").await;
@@ -684,4 +640,176 @@ pub async fn list_all_pods(
     });
 
     Ok(K8sResponse::new(response, &headers).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Pod write strategies
+//
+// Wrap the handler-owned pre-flight checks (namespace guard, dry-run parsing,
+// strict field validation) and delegate persistence to `PodApiWriter`. Pod
+// admission, validation, quota, status preservation, and actor-finalize
+// enqueue stay inside `PodApiWriter` (no admission duplication here).
+// ---------------------------------------------------------------------------
+
+struct PodCreateStrategy<'a> {
+    state: &'a Arc<AppState>,
+    namespace: &'a str,
+    query: &'a CreateUpdateQuery,
+}
+
+struct PodUpdateStrategy<'a> {
+    state: &'a Arc<AppState>,
+    namespace: &'a str,
+    name: &'a str,
+    query: &'a CreateUpdateQuery,
+}
+
+struct PodPatchStrategy<'a> {
+    state: &'a Arc<AppState>,
+    namespace: &'a str,
+    name: &'a str,
+    query: &'a CreateUpdateQuery,
+    headers: &'a HeaderMap,
+}
+
+#[async_trait]
+impl CreateStrategy for PodCreateStrategy<'_> {
+    async fn before_admission(&self, body: Value) -> Result<Value, AppError> {
+        reject_if_namespace_missing_or_terminating(self.state.db.as_ref(), self.namespace).await?;
+        check_field_validation_strict_typed("v1", "Pod", self.query, &body)?;
+        Ok(body)
+    }
+
+    async fn admit(
+        &self,
+        body: Value,
+        _dry_run: crate::api::mutation::DryRunMode,
+    ) -> Result<Value, AppError> {
+        // Admission stays inside `PodApiWriter::api_create_pod`.
+        Ok(body)
+    }
+
+    async fn persist_create(
+        &self,
+        body: Value,
+        dry_run: crate::api::mutation::DryRunMode,
+    ) -> Result<WriteResult, AppError> {
+        let result = crate::kubelet::pod_repository::PodApiWriter::api_create_pod(
+            self.state.pod_repository.as_ref(),
+            crate::kubelet::pod_repository::PodApiCreateRequest {
+                namespace: self.namespace.to_string(),
+                name: String::new(),
+                body,
+                dry_run: dry_run.is_all(),
+                run_admission: true,
+            },
+        )
+        .await?;
+        Ok(match result.resource {
+            Some(resource) => WriteResult::Persisted(resource),
+            None => WriteResult::DryRun(result.body),
+        })
+    }
+}
+
+#[async_trait]
+impl UpdateStrategy for PodUpdateStrategy<'_> {
+    async fn load_current(&self) -> Result<crate::datastore::Resource, AppError> {
+        crate::kubelet::pod_repository::PodReader::get_pod(
+            self.state.pod_repository.as_ref(),
+            self.namespace,
+            self.name,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))
+    }
+
+    async fn prepare_update(
+        &self,
+        _current: &crate::datastore::Resource,
+        body: Value,
+        _dry_run: crate::api::mutation::DryRunMode,
+    ) -> Result<Value, AppError> {
+        check_field_validation_strict_typed("v1", "Pod", self.query, &body)?;
+        Ok(body)
+    }
+
+    async fn persist_update(
+        &self,
+        current: crate::datastore::Resource,
+        body: Value,
+        dry_run: crate::api::mutation::DryRunMode,
+    ) -> Result<WriteResult, AppError> {
+        let outcome = crate::kubelet::pod_repository::PodApiWriter::api_update_pod(
+            self.state.pod_repository.as_ref(),
+            self.namespace,
+            self.name,
+            body,
+            current,
+            dry_run.is_all(),
+        )
+        .await?;
+        Ok(match outcome {
+            crate::kubelet::pod_repository::PodApiUpdateOutcome::Persisted(resource) => {
+                WriteResult::Persisted(resource)
+            }
+            crate::kubelet::pod_repository::PodApiUpdateOutcome::DryRun(value) => {
+                WriteResult::DryRun(value)
+            }
+        })
+    }
+}
+
+#[async_trait]
+impl PatchStrategy for PodPatchStrategy<'_> {
+    async fn apply_patch(
+        &self,
+        patch: Value,
+        dry_run: crate::api::mutation::DryRunMode,
+    ) -> Result<WriteResult, AppError> {
+        let content_type = self
+            .headers
+            .get("content-type")
+            .and_then(|h| h.to_str().ok());
+
+        // For server-side apply (SSA), validate fields strictly if requested
+        // (deep: catches nested unknown fields like spec.bogus).
+        let is_apply = content_type == Some("application/apply-patch+yaml")
+            || content_type == Some("application/apply-patch+json");
+        if is_apply {
+            check_field_validation_strict_typed("v1", "Pod", self.query, &patch)?;
+        } else if self.query.field_validation.as_deref() == Some("Strict") {
+            // Non-apply patch (merge/strategic/JSON): deep-validate the *merged*
+            // result so nested unknown fields are rejected under Strict, matching
+            // the generic patch path. Only runs on the opt-in Strict path.
+            let current = crate::kubelet::pod_repository::PodReader::get_pod(
+                self.state.pod_repository.as_ref(),
+                self.namespace,
+                self.name,
+            )
+            .await?
+            .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?;
+            let merged = apply_patch(&current.data, &patch, content_type)?;
+            check_field_validation_strict_typed("v1", "Pod", self.query, &merged)?;
+        }
+
+        let patch_type = content_type_to_patch_type(content_type);
+        let outcome = crate::kubelet::pod_repository::PodApiWriter::api_patch_pod(
+            self.state.pod_repository.as_ref(),
+            self.namespace,
+            self.name,
+            patch,
+            patch_type,
+            dry_run.is_all(),
+        )
+        .await?;
+        Ok(match outcome {
+            crate::kubelet::pod_repository::PodApiUpdateOutcome::Persisted(resource) => {
+                WriteResult::Persisted(resource)
+            }
+            crate::kubelet::pod_repository::PodApiUpdateOutcome::DryRun(value) => {
+                WriteResult::DryRun(value)
+            }
+        })
+    }
 }
