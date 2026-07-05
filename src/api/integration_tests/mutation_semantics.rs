@@ -433,6 +433,116 @@ async fn mutation_generated_update_dry_run_shapes_response_without_persisting() 
     assert_eq!(stored["spec"]["replicas"], json!(1));
 }
 
+// Migration-fidelity matrix for the dry-run return-point invariant.
+//
+// `40d4c32` regressed the generated strategy family by returning the dry-run
+// response either before field shaping (update lost the would-be generation
+// bump) or after datastore persistence (apply-create wrote the row anyway).
+// The two generated tests above pin the invariant for the generated family.
+// The two CRD tests below pin the same invariant for the CRD strategy family
+// (Task 3 migration), so a future strategy migration cannot silently slip the
+// dry-run cutoff on one family while the other keeps passing. New strategy
+// families must extend this matrix.
+
+#[tokio::test]
+async fn mutation_crd_patch_dry_run_shapes_response_without_persisting() {
+    let state = build_test_app_state().await;
+    let app = crate::api::build_router(state);
+    create_widget_crd(&app).await;
+    create_widget(
+        &app,
+        "dry-patch-widget",
+        json!({"name": "dry-patch-widget", "namespace": "default"}),
+    )
+    .await;
+    let (status, widget) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/dry-patch-widget",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let original_generation = widget["metadata"]["generation"].as_i64().unwrap();
+
+    let response = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/apis/example.com/v1/namespaces/default/widgets/dry-patch-widget?dryRun=All",
+        "application/merge-patch+json",
+        json!({"spec": {"value": "patched"}}),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "dry-run CRD patch on an existing resource must report 200 OK"
+    );
+    let body = response_json(response).await;
+    assert_eq!(
+        body["metadata"]["generation"].as_i64(),
+        Some(original_generation + 1),
+        "dry-run CRD patch response must include the would-be generation bump"
+    );
+    assert_eq!(body["spec"]["value"], json!("patched"));
+
+    let (status, stored) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/dry-patch-widget",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        stored["metadata"]["generation"].as_i64(),
+        Some(original_generation),
+        "dry-run CRD patch must not persist the generation bump"
+    );
+    assert_ne!(stored["spec"]["value"], json!("patched"));
+}
+
+#[tokio::test]
+async fn mutation_crd_apply_create_dry_run_returns_created_without_persisting() {
+    let state = build_test_app_state().await;
+    let app = crate::api::build_router(state);
+    create_widget_crd(&app).await;
+
+    let response = request_json_with_content_type(
+        &app,
+        "PATCH",
+        "/apis/example.com/v1/namespaces/default/widgets/dry-apply-created-widget?fieldManager=klights-test&dryRun=All",
+        "application/apply-patch+yaml",
+        json!({
+            "apiVersion": "example.com/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "dry-apply-created-widget",
+                "namespace": "default"
+            },
+            "spec": {"value": "dry-run"}
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "dry-run CRD server-side-apply create must report 201 Created"
+    );
+    let body = response_json(response).await;
+    assert_eq!(body["metadata"]["name"], "dry-apply-created-widget");
+    assert_eq!(body["spec"]["value"], json!("dry-run"));
+
+    let (status, missing) = get_json(
+        &app,
+        "/apis/example.com/v1/namespaces/default/widgets/dry-apply-created-widget",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "dry-run CRD apply-create must not persist the resource"
+    );
+    assert_eq!(missing["kind"], "Status");
+}
+
 #[tokio::test]
 async fn mutation_delete_dry_run_does_not_mark_or_remove_generated_crd_or_pod() {
     let state = build_test_app_state().await;
