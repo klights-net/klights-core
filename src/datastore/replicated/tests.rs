@@ -3198,6 +3198,131 @@ mod cases {
         );
     }
 
+    /// Multinode scheduler bind regression: the scheduler writes a full Pod
+    /// `UpdateResource` carrying both `spec.nodeName` and `PodScheduled=True`.
+    /// Raft apply preserves Pod status for ordinary main-resource updates, but
+    /// it must not preserve the old `SchedulingPending` condition over a
+    /// scheduler-owned bind transition. Otherwise the object becomes internally
+    /// inconsistent (`spec.nodeName` set while `PodScheduled=False`) and e2e
+    /// waits for Running time out on a pod that kubelet never admits.
+    #[tokio::test]
+    async fn replicated_scheduler_bind_overwrites_pod_scheduled_pending_condition() {
+        use crate::datastore::replicated::apply_command_to_backend;
+
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "bind-me",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "bind-me",
+                    "namespace": "default",
+                    "uid": "bind-me-uid"
+                },
+                "spec": {"containers": [{"name": "c", "image": "busybox"}]},
+                "status": {
+                    "phase": "Pending",
+                    "conditions": [
+                        {
+                            "type": "PodScheduled",
+                            "status": "False",
+                            "reason": "SchedulingPending"
+                        },
+                        {"type": "Initialized", "status": "True"},
+                        {"type": "ContainersReady", "status": "False"},
+                        {"type": "Ready", "status": "False"}
+                    ]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateResource {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                namespace: Some("default".into()),
+                name: "bind-me".into(),
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "bind-me",
+                        "namespace": "default",
+                        "uid": "bind-me-uid"
+                    },
+                    "spec": {
+                        "nodeName": "worker-a",
+                        "containers": [{"name": "c", "image": "busybox"}]
+                    },
+                    "status": {
+                        "phase": "Pending",
+                        "conditions": [
+                            {"type": "PodScheduled", "status": "True"},
+                            {"type": "Initialized", "status": "True"},
+                            {"type": "ContainersReady", "status": "False"},
+                            {"type": "Ready", "status": "False"}
+                        ]
+                    }
+                }),
+                expected_rv: 0,
+                preconditions: ResourcePreconditions {
+                    uid: Some("bind-me-uid".into()),
+                    resource_version: None,
+                },
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: 1,
+                uid: Some("bind-me-uid".into()),
+                timestamp_ms: 0,
+                authoring_node: "leader".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .get_resource("v1", "Pod", Some("default"), "bind-me")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .data
+                .pointer("/spec/nodeName")
+                .and_then(|v| v.as_str()),
+            Some("worker-a")
+        );
+        let pod_scheduled = stored
+            .data
+            .pointer("/status/conditions")
+            .and_then(|value| value.as_array())
+            .and_then(|conditions| {
+                conditions.iter().find(|condition| {
+                    condition.pointer("/type").and_then(|v| v.as_str()) == Some("PodScheduled")
+                })
+            })
+            .expect("PodScheduled condition must be present after scheduler bind");
+        assert_eq!(
+            pod_scheduled.pointer("/status").and_then(|v| v.as_str()),
+            Some("True"),
+            "replicated scheduler bind must overwrite the old SchedulingPending condition: {:?}",
+            stored.data.pointer("/status/conditions")
+        );
+        assert!(
+            pod_scheduled.pointer("/reason").is_none(),
+            "successful scheduling must not retain the SchedulingPending reason: {pod_scheduled:?}"
+        );
+    }
+
     /// Reproduces the live SchedulerPreemption conformance failure: after the
     /// leader-side scheduler preemption writes `DisruptionTarget` to the victim,
     /// the leader's own kubelet runtime-reconcile status write races the

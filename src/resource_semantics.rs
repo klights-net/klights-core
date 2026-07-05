@@ -86,12 +86,87 @@ pub fn preserve_status_subresource_on_main_update(
             &mut status,
             crate::pod_status_merge::PodStatusOwner::ApiStatusSubresource,
         );
+        carry_scheduler_bind_pod_scheduled_condition(
+            api_version,
+            kind,
+            current,
+            proposed,
+            &mut status,
+        );
         if let Some(obj) = proposed.as_object_mut() {
             obj.insert("status".to_string(), status);
         }
     } else if let Some(obj) = proposed.as_object_mut() {
         obj.remove("status");
     }
+}
+
+fn carry_scheduler_bind_pod_scheduled_condition(
+    api_version: &str,
+    kind: &str,
+    current: &Value,
+    proposed: &Value,
+    status: &mut Value,
+) {
+    if api_version != "v1" || kind != "Pod" {
+        return;
+    }
+    if !is_pod_bind_transition(current, proposed) {
+        return;
+    }
+    let Some(proposed_condition) = pod_condition(proposed, "PodScheduled") else {
+        return;
+    };
+    if proposed_condition.get("status").and_then(Value::as_str) != Some("True") {
+        return;
+    }
+    upsert_pod_condition(status, proposed_condition.clone());
+}
+
+fn is_pod_bind_transition(current: &Value, proposed: &Value) -> bool {
+    pod_node_name(current).is_none() && pod_node_name(proposed).is_some()
+}
+
+fn pod_node_name(pod: &Value) -> Option<&str> {
+    pod.pointer("/spec/nodeName")
+        .and_then(Value::as_str)
+        .filter(|node_name| !node_name.is_empty())
+}
+
+fn pod_condition<'a>(pod: &'a Value, condition_type: &str) -> Option<&'a Value> {
+    pod.pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .and_then(|conditions| {
+            conditions.iter().find(|condition| {
+                condition.get("type").and_then(Value::as_str) == Some(condition_type)
+            })
+        })
+}
+
+fn upsert_pod_condition(status: &mut Value, condition: Value) {
+    let Some(status_object) = status.as_object_mut() else {
+        return;
+    };
+    let condition_type = condition
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(condition_type) = condition_type else {
+        return;
+    };
+    let conditions = status_object
+        .entry("conditions".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !conditions.is_array() {
+        *conditions = Value::Array(Vec::new());
+    }
+    let Some(conditions) = conditions.as_array_mut() else {
+        return;
+    };
+    conditions.retain(|existing| {
+        existing.get("type").and_then(Value::as_str) != Some(condition_type.as_str())
+    });
+    conditions.push(condition);
 }
 
 pub fn is_pod_delete_mark_patch(api_version: &str, kind: &str, patch: &Value) -> bool {
