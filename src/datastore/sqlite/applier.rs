@@ -106,42 +106,42 @@ impl DatastoreApplier for Datastore {
                 observed_status_stamp,
             } => {
                 let mut status = status;
-                if observed_status_stamp.is_some()
-                    && api_version == "v1"
-                    && kind == "Pod"
-                    && let Some(current) = self
-                        .get_resource(&api_version, &kind, namespace.as_deref(), &name)
-                        .await?
-                {
-                    crate::datastore::status_merge_policy::merge_status_for_apply(
-                        &api_version,
-                        &kind,
-                        current.data.as_ref(),
-                        &mut status,
-                        crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
-                        crate::datastore::status_merge_policy::StatusApplyOrigin::KubeletOutbox,
-                    );
-                }
                 let mut preconditions = preconditions;
                 if preconditions.resource_version.is_none() {
                     preconditions.resource_version = expected_rv;
                 }
-                if let Some(expected_rv) = preconditions.resource_version
-                    && let Some(current) = self
-                        .get_resource(&api_version, &kind, namespace.as_deref(), &name)
-                        .await?
-                    && expected_rv < current.resource_version
-                    && preconditions.uid.as_deref() == Some(current.uid.as_str())
-                    && !(api_version == "v1" && kind == "Pod")
+                // Collapse the prior Pod-stamp and non-Pod-stale branches into
+                // one load→merge→clear pass routed through the single
+                // registry-owned boundary (raft-fix.md). The merge is a no-op
+                // for a fresh non-Pod apply; Pod stays typed-merged regardless
+                // of freshness (matching the replicated/forwarded paths), and
+                // its origin is stamp-derived.
+                let mut clear_stale_resource_version = false;
+                if let Some(current) = self
+                    .get_resource(&api_version, &kind, namespace.as_deref(), &name)
+                    .await?
                 {
-                    crate::datastore::status_merge_policy::merge_status_for_apply(
+                    let freshness = crate::datastore::status_merge_policy::apply_status_merge(
                         &api_version,
                         &kind,
                         current.data.as_ref(),
                         &mut status,
-                        crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
-                        crate::datastore::status_merge_policy::StatusApplyOrigin::ReplicatedApply,
+                        preconditions.resource_version,
+                        current.resource_version,
+                        observed_status_stamp.is_some(),
                     );
+                    // Pod status is deduped via the observed_status_stamp
+                    // outbox, so only a non-Pod stale rebase clears the
+                    // resourceVersion precondition.
+                    if freshness
+                        == crate::datastore::status_merge_policy::StatusApplyFreshness::Stale
+                        && preconditions.uid.as_deref() == Some(current.uid.as_str())
+                        && !(api_version == "v1" && kind == "Pod")
+                    {
+                        clear_stale_resource_version = true;
+                    }
+                }
+                if clear_stale_resource_version {
                     preconditions.resource_version = None;
                 }
                 self.update_status_only_with_preconditions(

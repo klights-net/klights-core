@@ -161,7 +161,15 @@ pub fn merge_status_for_apply(
 ) {
     let profile = StatusMergeRegistry::default().profile(api_version, kind);
 
-    if freshness == StatusApplyFreshness::Fresh && profile.kind != StatusMergeProfileKind::PodTyped
+    // A fresh apply of a GENERIC kind is authoritative — the writer had the
+    // latest resourceVersion, so its status replaces the live one without
+    // merging (the registry has nothing to preserve). Pod and Node are never
+    // short-circuited: Pod status is always reconciled against the live
+    // kubelet-owned object, and Node status is a heartbeat where each reporter
+    // sends partial conditions that must always be merged by transition time
+    // (a stale worker Ready=True must not overwrite a fresher leader Unknown).
+    if freshness == StatusApplyFreshness::Fresh
+        && matches!(profile.kind, StatusMergeProfileKind::Generic(_))
     {
         return;
     }
@@ -177,6 +185,57 @@ pub fn merge_status_for_apply(
             merge_generic_status(policy, live_resource, incoming_status)
         }
     }
+}
+
+/// Pure (no I/O) status-merge decision shared by every apply/forward site so the
+/// per-kind `StatusMergeRegistry` is the single owner of preservation behavior
+/// and dispatch sites never re-filter by kind (raft-fix.md: collapse the
+/// load→freshness→origin→merge boilerplate that was copy-pasted across the
+/// sqlite/replicated/forwarded apply paths with diverging `Pod || Node` gates).
+///
+/// Mutates `incoming_status` in place:
+/// - a **stale** apply (`expected_rv < current_rv`) routes through the
+///   registry's per-kind policy — Pod/Node typed merge, and for generic kinds
+///   their registered `Merge` policy preserves live actor-owned
+///   fields/conditions instead of clobbering them;
+/// - a **fresh** non-Pod apply is a no-op (the registry early-returns), so it
+///   is always safe to call this whenever a live row exists. Pod always merges
+///   (typed) regardless of freshness, matching the prior unconditional Pod path.
+///
+/// `kubelet_origin` is true when the command carries a kubelet status-outbox
+/// stamp (`observed_status_stamp.is_some()`); the origin is stamp-derived, not
+/// kind-derived. Returns the resolved freshness so each caller can apply its
+/// own resourceVersion-precondition clear rule (the authoritative raft-apply
+/// path clears for every kind; worker-forward paths keep their Pod
+/// idempotency-stamp rule).
+pub fn apply_status_merge(
+    api_version: &str,
+    kind: &str,
+    live_resource: &Value,
+    incoming_status: &mut Value,
+    expected_rv: Option<i64>,
+    current_rv: i64,
+    kubelet_origin: bool,
+) -> StatusApplyFreshness {
+    let freshness = if expected_rv.is_some_and(|expected| expected < current_rv) {
+        StatusApplyFreshness::Stale
+    } else {
+        StatusApplyFreshness::Fresh
+    };
+    let origin = if kubelet_origin {
+        StatusApplyOrigin::KubeletOutbox
+    } else {
+        StatusApplyOrigin::ReplicatedApply
+    };
+    merge_status_for_apply(
+        api_version,
+        kind,
+        live_resource,
+        incoming_status,
+        freshness,
+        origin,
+    );
+    freshness
 }
 
 fn merge_generic_status(

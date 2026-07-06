@@ -26,6 +26,51 @@ pub fn apply_same_uid_stale_full_resource_policy(
     preserve_pod_status_for_stale_main_put(api_version, kind, incoming, existing);
     preserve_pod_owner_refs_for_stale_put(api_version, kind, incoming, existing);
     preserve_storage_user_metadata_for_stale_put(api_version, kind, incoming, existing);
+    preserve_finalizers_for_stale_put(api_version, kind, incoming, existing);
+}
+
+/// Preserve live finalizers on a same-UID stale full PUT for non-Pod kinds.
+///
+/// Pod finalizer drain is the handoff back to actor-owned UID cleanup, so a
+/// committed full PUT that omits Pod finalizers must be honored (Pod is
+/// excluded). For every other kind, a stale PUT that drops a live finalizer
+/// would prematurely abandon cleanup, so unmentioned live finalizers are
+/// merged back in. Moved here from `cluster_state_apply/resource.rs` so the
+/// entire same-UID stale full-resource policy lives in one module
+/// (raft-fix.md Step C).
+fn preserve_finalizers_for_stale_put(
+    api_version: &str,
+    kind: &str,
+    incoming: &mut Value,
+    existing: &Value,
+) {
+    if api_version == "v1" && kind == "Pod" {
+        return;
+    }
+    let Some(existing_finalizers) = existing
+        .pointer("/metadata/finalizers")
+        .and_then(|value| value.as_array())
+        .filter(|finalizers| !finalizers.is_empty())
+    else {
+        return;
+    };
+    let Some(metadata) = incoming
+        .get_mut("metadata")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    let mut merged = metadata
+        .get("finalizers")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for finalizer in existing_finalizers {
+        if !merged.iter().any(|value| value == finalizer) {
+            merged.push(finalizer.clone());
+        }
+    }
+    metadata.insert("finalizers".to_string(), Value::Array(merged));
 }
 
 fn preserve_pod_node_for_stale_put(
@@ -371,6 +416,15 @@ mod tests {
                 existing: json!({"metadata": {"labels": {"user": "live"}, "annotations": {"note": "live"}}}),
                 assert_path: "/metadata/labels/user",
                 expected: Value::Null,
+            },
+            Case {
+                name: "non_pod_finalizers_preserved",
+                api_version: "v1",
+                kind: "ConfigMap",
+                incoming: json!({"metadata": {"name": "cm-a"}}),
+                existing: json!({"metadata": {"finalizers": ["klights.io/cleanup"]}}),
+                assert_path: "/metadata/finalizers/0",
+                expected: json!("klights.io/cleanup"),
             },
         ];
 

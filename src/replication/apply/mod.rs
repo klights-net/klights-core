@@ -218,35 +218,44 @@ pub(crate) async fn apply_forwarded_command(
             observed_status_stamp,
         } => {
             let mut status = status;
-            // Route typed status merges (Pod, Node) through the single
-            // merge_status_for_apply boundary so the per-kind stale-status
-            // policy owns preservation behavior (e.g. scheduler-owned Pod
-            // conditions like DisruptionTarget survive a forwarded kubelet
-            // snapshot; Node status is merged against the live object).
-            let needs_typed_apply_merge = (api_version == "v1" && kind == "Pod")
-                || (api_version == "v1" && kind == "Node" && namespace.is_none());
-            if needs_typed_apply_merge
-                && let Some(current) = db
-                    .get_resource(&api_version, &kind, namespace.as_deref(), &name)
-                    .await?
+            let mut preconditions = preconditions;
+            // Load the live row once and route the merge through the single
+            // registry-owned boundary for EVERY kind (raft-fix.md: the prior
+            // `kind == "Pod" || kind == "Node"` gate silently skipped generic
+            // workload kinds, so a stale forwarded ReplicaSet/Job/PDB status
+            // 409'd or clobbered the live condition instead of rebasing). The
+            // merge is a no-op for a fresh non-Pod apply, so unconditionally
+            // merging whenever a live row exists is safe.
+            let mut clear_stale_resource_version = false;
+            if let Some(current) = db
+                .get_resource(&api_version, &kind, namespace.as_deref(), &name)
+                .await?
             {
-                let origin = if observed_status_stamp.is_some() {
-                    crate::datastore::status_merge_policy::StatusApplyOrigin::KubeletOutbox
-                } else {
-                    crate::datastore::status_merge_policy::StatusApplyOrigin::ReplicatedApply
-                };
-                crate::datastore::status_merge_policy::merge_status_for_apply(
+                let freshness = crate::datastore::status_merge_policy::apply_status_merge(
                     &api_version,
                     &kind,
                     current.data.as_ref(),
                     &mut status,
-                    crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
-                    origin,
+                    preconditions.resource_version.or(expected_rv),
+                    current.resource_version,
+                    observed_status_stamp.is_some(),
                 );
+                // Worker-forward paths keep the Pod idempotency-stamp rule:
+                // Pod status is deduped via observed_status_stamp, so only a
+                // non-Pod stale rebase clears the resourceVersion precondition
+                // (otherwise the stale forward 409s instead of converging).
+                if freshness == crate::datastore::status_merge_policy::StatusApplyFreshness::Stale
+                    && preconditions.uid.as_deref() == Some(current.uid.as_str())
+                    && !(api_version == "v1" && kind == "Pod")
+                {
+                    clear_stale_resource_version = true;
+                }
             }
-            let mut preconditions = preconditions;
             if preconditions.resource_version.is_none() {
                 preconditions.resource_version = expected_rv;
+            }
+            if clear_stale_resource_version {
+                preconditions.resource_version = None;
             }
             let resource = db
                 .update_status_only_with_preconditions(

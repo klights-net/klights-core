@@ -3820,4 +3820,144 @@ mod cases {
         })
         .await;
     }
+
+    // ── raft-fix.md: forwarded stale-status path (site #4, `replication/apply/mod.rs`) ──
+    // The forwarded UpdateStatus path hard-codes `kind == "Pod" || kind == "Node"`
+    // and silently skips every generic workload kind, so a stale forwarded
+    // status either 409s or clobbers the live condition instead of rebasing
+    // through the registry Merge policy. These must converge like the
+    // replicated backend path does.
+
+    async fn forwarded_stale_status_preserves_live_condition(
+        api_version: &str,
+        kind: &str,
+        name: &str,
+        uid: &str,
+        initial: serde_json::Value,
+        live_status: serde_json::Value,
+        stale_status: serde_json::Value,
+        preserved_pointer: &str,
+        preserved_value: serde_json::Value,
+    ) {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(api_version, kind, Some("default"), name, initial)
+            .await
+            .expect("create fixture");
+
+        db.update_status_only(
+            api_version,
+            kind,
+            Some("default"),
+            name,
+            live_status,
+            Some(created.resource_version),
+        )
+        .await
+        .expect("live status advances rv");
+
+        let applied = crate::replication::apply::apply_forwarded_command(
+            &db,
+            StorageCommand::UpdateStatus {
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: Some("default".to_string()),
+                name: name.to_string(),
+                status: stale_status,
+                expected_rv: Some(created.resource_version),
+                preconditions: ResourcePreconditions {
+                    uid: Some(uid.to_string()),
+                    resource_version: Some(created.resource_version),
+                },
+                observed_status_stamp: None,
+            },
+            "worker-a".to_string(),
+        )
+        .await
+        .expect("forwarded stale status must rebase through the registry, not 409");
+
+        let resource = applied
+            .resource
+            .expect("forwarded apply returns the resource");
+        assert_eq!(
+            resource
+                .data
+                .pointer(preserved_pointer)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            preserved_value,
+            "forwarded stale {kind} status must preserve the live {preserved_pointer} via the registry Merge policy",
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_stale_replicaset_status_preserves_live_condition() {
+        forwarded_stale_status_preserves_live_condition(
+            "apps/v1",
+            "ReplicaSet",
+            "forwarded-stale-rs",
+            "forwarded-rs-uid",
+            serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "ReplicaSet",
+                "metadata": {"name": "forwarded-stale-rs", "namespace": "default", "uid": "forwarded-rs-uid"},
+                "spec": {"replicas": 1},
+                "status": {"replicas": 0, "conditions": [{"type": "Available", "status": "True"}]}
+            }),
+            serde_json::json!({"replicas": 1, "conditions": [{"type": "Available", "status": "True"}]}),
+            serde_json::json!({"conditions": [{"type": "Progressing", "status": "True"}]}),
+            "/status/conditions/1/type",
+            serde_json::json!("Available"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn forwarded_stale_job_status_preserves_live_scalars() {
+        forwarded_stale_status_preserves_live_condition(
+            "batch/v1",
+            "Job",
+            "forwarded-stale-job",
+            "forwarded-job-uid",
+            serde_json::json!({
+                "apiVersion": "batch/v1",
+                "kind": "Job",
+                "metadata": {"name": "forwarded-stale-job", "namespace": "default", "uid": "forwarded-job-uid"},
+                "spec": {},
+                "status": {"active": 1, "succeeded": 0}
+            }),
+            serde_json::json!({
+                "active": 0,
+                "succeeded": 1,
+                "completionTime": "2026-07-06T00:00:00Z",
+                "conditions": [{"type": "Complete", "status": "True"}]
+            }),
+            serde_json::json!({"active": 1, "succeeded": 0}),
+            "/status/succeeded",
+            serde_json::json!(1),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn forwarded_stale_pdb_status_preserves_live_disrupted_pods() {
+        forwarded_stale_status_preserves_live_condition(
+            "policy/v1",
+            "PodDisruptionBudget",
+            "forwarded-stale-pdb",
+            "forwarded-pdb-uid",
+            serde_json::json!({
+                "apiVersion": "policy/v1",
+                "kind": "PodDisruptionBudget",
+                "metadata": {"name": "forwarded-stale-pdb", "namespace": "default", "uid": "forwarded-pdb-uid"},
+                "spec": {},
+                "status": {"disruptedPods": {}}
+            }),
+            serde_json::json!({"disruptedPods": {"pod-a": "2026-07-06T00:00:00Z"}}),
+            serde_json::json!({}),
+            "/status/disruptedPods/pod-a",
+            serde_json::json!("2026-07-06T00:00:00Z"),
+        )
+        .await;
+    }
 }

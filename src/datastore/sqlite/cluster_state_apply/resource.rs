@@ -771,11 +771,6 @@ fn preserve_same_uid_server_metadata_from_existing(
             &mut row.data,
             &existing_data,
         );
-        // Pod finalizer drain is the handoff back to actor-owned UID cleanup;
-        // a committed full PUT that omits finalizers must be honored.
-        if row.api_version != "v1" || row.kind != "Pod" {
-            preserve_finalizers_from_existing(&mut row.data, &existing_data);
-        }
     }
     if row.api_version == "v1"
         && row.kind == "Pod"
@@ -836,33 +831,6 @@ fn pod_terminating_condition_time(data: &serde_json::Value) -> Option<&str> {
                     .flatten()
             })
         })
-}
-
-fn preserve_finalizers_from_existing(data: &mut serde_json::Value, existing: &serde_json::Value) {
-    let Some(existing_finalizers) = existing
-        .pointer("/metadata/finalizers")
-        .and_then(|value| value.as_array())
-        .filter(|finalizers| !finalizers.is_empty())
-    else {
-        return;
-    };
-    let Some(metadata) = data
-        .get_mut("metadata")
-        .and_then(|value| value.as_object_mut())
-    else {
-        return;
-    };
-    let mut merged = metadata
-        .get("finalizers")
-        .and_then(|value| value.as_array())
-        .cloned()
-        .unwrap_or_default();
-    for finalizer in existing_finalizers {
-        if !merged.iter().any(|value| value == finalizer) {
-            merged.push(finalizer.clone());
-        }
-    }
-    metadata.insert("finalizers".to_string(), serde_json::Value::Array(merged));
 }
 
 fn validate_put_resource_apply_preconditions(

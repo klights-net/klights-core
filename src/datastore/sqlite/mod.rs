@@ -1092,23 +1092,27 @@ impl Datastore {
                 let mut live: Value =
                     serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
                 let mut next_status = status;
-                let needs_typed_apply_merge = apply_against_latest
-                    || (api_version == "v1" && kind == "Node" && namespace.is_none());
-                if needs_typed_apply_merge {
-                    let origin = if observed_status_stamp.is_some() {
-                        crate::datastore::status_merge_policy::StatusApplyOrigin::KubeletOutbox
+                // Route every kind through the single registry-owned merge
+                // boundary (raft-fix.md): the prior `apply_against_latest ||
+                // kind == "Node"` gate skipped generic workload kinds, so a
+                // stale status commit carried clobbered status (only recovered
+                // later by the raft-apply safety net in cluster_state_apply).
+                // The merge is a no-op for a fresh non-Pod apply, so merging
+                // unconditionally is safe; Pod (`apply_against_latest`) and
+                // Node stay typed-merged regardless of freshness.
+                crate::datastore::status_merge_policy::apply_status_merge(
+                    &api_version,
+                    &kind,
+                    &live,
+                    &mut next_status,
+                    if apply_against_latest {
+                        None
                     } else {
-                        crate::datastore::status_merge_policy::StatusApplyOrigin::ReplicatedApply
-                    };
-                    crate::datastore::status_merge_policy::merge_status_for_apply(
-                        &api_version,
-                        &kind,
-                        &live,
-                        &mut next_status,
-                        crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
-                        origin,
-                    );
-                }
+                        expected_rv.filter(|rv| *rv > 0)
+                    },
+                    live_rv,
+                    observed_status_stamp.is_some(),
+                );
                 live["status"] = next_status;
                 ensure_resource_type_meta(&mut live, &api_version, &kind);
                 let uid = ensure_metadata_uid(&mut live);

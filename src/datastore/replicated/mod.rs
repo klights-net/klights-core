@@ -345,35 +345,36 @@ where
                 .get_resource(&api_version, &kind, namespace.as_deref(), &name)
                 .await?;
             let mut status = status;
-            // Route typed status merges (Pod, Node) and stale-RV precondition
-            // merges through the single merge_status_for_apply boundary so the
-            // per-kind stale-status policy owns preservation behavior.
-            let needs_typed_apply_merge = (api_version == "v1" && kind == "Pod")
-                || (api_version == "v1" && kind == "Node" && namespace.is_none());
-            let has_stale_matching_precondition = current.as_ref().is_some_and(|current| {
-                preconditions.resource_version.is_some_and(|expected_rv| {
-                    expected_rv < current.resource_version
-                        && preconditions.uid.as_deref() == Some(current.uid.as_str())
-                })
-            });
-            if let Some(current) = current.as_ref()
-                && (needs_typed_apply_merge || has_stale_matching_precondition)
-            {
-                let origin = if observed_status_stamp.is_some() {
-                    crate::datastore::status_merge_policy::StatusApplyOrigin::KubeletOutbox
-                } else {
-                    crate::datastore::status_merge_policy::StatusApplyOrigin::ReplicatedApply
-                };
-                crate::datastore::status_merge_policy::merge_status_for_apply(
+            // Route every kind through the single registry-owned merge
+            // boundary (raft-fix.md): the prior `Pod || Node` gate (plus a
+            // stale-RV fallback) left generic workload kinds path-dependent —
+            // a stale ReplicaSet/Job/PDB status only converged if it happened
+            // to carry a matching uid precondition. Merging whenever a live
+            // row exists is safe: the merge is a no-op for a fresh non-Pod
+            // apply, and Pod/Node stay typed-merged regardless of freshness.
+            let mut clear_stale_resource_version = false;
+            if let Some(current) = current.as_ref() {
+                let freshness = crate::datastore::status_merge_policy::apply_status_merge(
                     &api_version,
                     &kind,
                     current.data.as_ref(),
                     &mut status,
-                    crate::datastore::status_merge_policy::StatusApplyFreshness::Stale,
-                    origin,
+                    preconditions.resource_version,
+                    current.resource_version,
+                    observed_status_stamp.is_some(),
                 );
+                // Pod status is deduped via the observed_status_stamp outbox,
+                // so only a non-Pod stale rebase clears the resourceVersion
+                // precondition (otherwise the stale write 409s instead of
+                // converging).
+                if freshness == crate::datastore::status_merge_policy::StatusApplyFreshness::Stale
+                    && preconditions.uid.as_deref() == Some(current.uid.as_str())
+                    && !(api_version == "v1" && kind == "Pod")
+                {
+                    clear_stale_resource_version = true;
+                }
             }
-            if has_stale_matching_precondition && !(api_version == "v1" && kind == "Pod") {
+            if clear_stale_resource_version {
                 preconditions.resource_version = None;
             }
             backend
