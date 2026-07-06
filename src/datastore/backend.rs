@@ -610,14 +610,29 @@ pub trait DatastoreBackend: Send + Sync {
     async fn list_all_watch_events_since_paged(
         &self,
         since_rv: i64,
-        after_resource_version: i64,
+        _after_resource_version: i64,
         after_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
-        let _ = (since_rv, after_resource_version, after_id, limit);
-        Err(anyhow::anyhow!(
-            "backend does not support paginated watch event listing"
-        ))
+        // memory-improvement.md §10 P1: default fallback for backends that do
+        // not override this with a true keyset query (e.g. redb / replicated /
+        // worker adapters). It loads the full list and paginates in memory by
+        // position, preserving the pre-P1 behavior — correct, but without the
+        // peak-memory win. Production sqlite overrides this with a real
+        // keyset-paged SQL query.
+        let limit = limit.get();
+        let rows = self.list_all_watch_events_since(since_rv).await?;
+        let mut out: Vec<(i64, CatchUpResource)> = Vec::with_capacity(rows.len().min(limit));
+        for (idx, item) in rows.into_iter().enumerate() {
+            let id = (idx as i64) + 1;
+            if id > after_id {
+                out.push((id, item));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// List deleted resource watch events after `since_rv` across all scopes.
@@ -849,10 +864,23 @@ pub trait DatastoreBackend: Send + Sync {
         after_key: Option<&str>,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<AppliedOutboxRecord>> {
-        let _ = (after_key, limit);
-        Err(anyhow::anyhow!(
-            "backend does not support paginated applied_outbox listing"
-        ))
+        // memory-improvement.md §10 P1: default fallback — load the full
+        // ledger and filter by `idempotency_key` in memory. Production sqlite
+        // overrides with a real keyset query; this preserves pre-P1 behavior
+        // for backends that don't.
+        let limit = limit.get();
+        let rows = self.list_applied_outbox().await?;
+        let mut out: Vec<AppliedOutboxRecord> = Vec::with_capacity(rows.len().min(limit));
+        for record in rows {
+            let past_cursor = after_key.is_none_or(|k| record.idempotency_key.as_str() > k);
+            if past_cursor {
+                out.push(record);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn delete_uncommitted_applied_outbox_placeholder(
