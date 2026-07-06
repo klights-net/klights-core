@@ -129,6 +129,18 @@ impl StatusMergeRegistry {
                     },
                 }))
             }
+            ("apps/v1", "ReplicaSet")
+            | ("apps/v1", "Deployment")
+            | ("apps/v1", "StatefulSet")
+            | ("apps/v1", "DaemonSet") => {
+                StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
+                    terminal_condition_types: &[],
+                    stale_mode: GenericStaleStatusMode::Merge {
+                        condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
+                        field_merge: FieldMergeMode::PreserveUnmentioned,
+                    },
+                }))
+            }
             _ => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
@@ -396,7 +408,7 @@ mod tests {
         live_preserved_field: (&'static str, serde_json::Value),
     }
 
-    fn generic_status_policy_cases() -> [GenericStatusPolicyCase; 5] {
+    fn generic_status_policy_cases() -> [GenericStatusPolicyCase; 9] {
         [
             GenericStatusPolicyCase {
                 api_version: "batch/v1",
@@ -427,6 +439,30 @@ mod tests {
                 kind: "PersistentVolumeClaim",
                 terminal_type: None,
                 live_preserved_field: ("phase", json!("Bound")),
+            },
+            GenericStatusPolicyCase {
+                api_version: "apps/v1",
+                kind: "ReplicaSet",
+                terminal_type: None,
+                live_preserved_field: ("replicas", json!(1)),
+            },
+            GenericStatusPolicyCase {
+                api_version: "apps/v1",
+                kind: "Deployment",
+                terminal_type: None,
+                live_preserved_field: ("replicas", json!(1)),
+            },
+            GenericStatusPolicyCase {
+                api_version: "apps/v1",
+                kind: "StatefulSet",
+                terminal_type: None,
+                live_preserved_field: ("replicas", json!(1)),
+            },
+            GenericStatusPolicyCase {
+                api_version: "apps/v1",
+                kind: "DaemonSet",
+                terminal_type: None,
+                live_preserved_field: ("numberReady", json!(1)),
             },
         ]
     }
@@ -493,7 +529,13 @@ mod tests {
         let StatusMergeProfileKind::Generic(policy) = default_kind.kind else {
             panic!("unknown kind must use a Generic policy");
         };
-        assert_eq!(policy.stale_mode, GenericStaleStatusMode::UseLiveStatus);
+        assert_eq!(
+            policy.stale_mode,
+            GenericStaleStatusMode::Merge {
+                condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
+                field_merge: FieldMergeMode::PreserveUnmentioned,
+            }
+        );
     }
 
     #[test]
@@ -501,8 +543,8 @@ mod tests {
         let live = json!({"status": {"observedGeneration": 9}});
         let mut incoming = json!({"observedGeneration": 1});
         merge_status_for_apply(
-            "apps/v1",
-            "Deployment",
+            "custom.example/v1",
+            "CustomUnknown",
             &live,
             &mut incoming,
             StatusApplyFreshness::Stale,
@@ -686,14 +728,65 @@ mod tests {
 
         let live = json!({"status": {"observedGeneration": 9}});
         let mut incoming = json!({"observedGeneration": 1});
+        // Use an unknown type that still gets UseLiveStatus (the default).
         merge_status_for_apply(
-            "apps/v1",
-            "Deployment",
+            "custom.example/v1",
+            "CustomUnknown",
             &live,
             &mut incoming,
             StatusApplyFreshness::Stale,
             StatusApplyOrigin::ReplicatedApply,
         );
         assert_eq!(incoming, json!({"observedGeneration": 9}));
+    }
+
+    /// ReplicaSet stale status merge must preserve incoming conditions
+    /// while back-filling controller-owned conditions from the live status.
+    #[test]
+    fn stale_replicaset_status_merge_preserves_incoming_conditions() {
+        // Live status has controller-owned conditions and fields.
+        let live = json!({
+            "status": {
+                "replicas": 1,
+                "readyReplicas": 1,
+                "conditions": [
+                    {"type": "Available", "status": "True", "lastTransitionTime": "2026-07-05T00:00:00Z"}
+                ]
+            }
+        });
+
+        // Incoming status from API /status PUT has a custom condition.
+        let mut incoming = json!({
+            "conditions": [
+                {"type": "NotExistingCondition", "status": "True", "lastTransitionTime": "2026-07-06T07:09:22Z", "reason": "TestReason"}
+            ]
+        });
+
+        merge_status_for_apply(
+            "apps/v1",
+            "ReplicaSet",
+            &live,
+            &mut incoming,
+            StatusApplyFreshness::Stale,
+            StatusApplyOrigin::ReplicatedApply,
+        );
+
+        // The stale merge must:
+        // 1. Preserve the incoming custom condition
+        assert_eq!(incoming["conditions"][0]["type"], "NotExistingCondition");
+        // 2. Back-fill the live controller condition (by type)
+        let types: Vec<&str> = incoming["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["type"].as_str().unwrap())
+            .collect();
+        assert!(
+            types.contains(&"Available"),
+            "stale merge must back-fill live conditions by type"
+        );
+        // 3. Preserve live fields not mentioned in incoming
+        assert_eq!(incoming["replicas"], 1);
+        assert_eq!(incoming["readyReplicas"], 1);
     }
 }

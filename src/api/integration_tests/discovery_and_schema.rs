@@ -2553,3 +2553,129 @@ async fn test_resourcequota_status_get_put_patch() {
         "PATCH /status must update status.used.secrets"
     );
 }
+
+/// Regression: ReplicaSet status subresource PUT must persist and round-trip
+/// `status.conditions`.  The upstream conformance test `[sig-apps] ReplicaSet
+/// should validate Replicaset Status endpoints` PUTs status with a custom
+/// condition and verifies the response includes it.
+#[tokio::test]
+async fn test_replicaset_status_put_persists_conditions() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+
+    // Create namespace
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"rs-status-test"}}"#,
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Create ReplicaSet
+    let rs = r#"{
+      "apiVersion":"apps/v1",
+      "kind":"ReplicaSet",
+      "metadata":{"name":"test-rs","namespace":"rs-status-test"},
+      "spec":{
+        "replicas":1,
+        "selector":{"matchLabels":{"app":"rs-test"}},
+        "template":{
+          "metadata":{"labels":{"app":"rs-test"}},
+          "spec":{"containers":[{"name":"httpd","image":"httpd"}]}
+        }
+      }
+    }"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/apis/apps/v1/namespaces/rs-status-test/replicasets")
+        .header("content-type", "application/json")
+        .body(Body::from(rs))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // Fetch latest resourceVersion in case the ReplicaSet controller
+    // has reconciled since create (the controller bumps the RV).
+    let req = Request::builder()
+        .method("GET")
+        .uri("/apis/apps/v1/namespaces/rs-status-test/replicasets/test-rs")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let latest: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let rv = latest["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap_or("0");
+
+    // PUT /status with a custom condition — emulates the conformance test.
+    let status_put = format!(
+        r#"{{
+          "apiVersion":"apps/v1",
+          "kind":"ReplicaSet",
+          "metadata":{{"name":"test-rs","namespace":"rs-status-test","resourceVersion":"{rv}"}},
+          "status":{{
+            "conditions":[
+              {{"type":"NotExistingCondition","status":"True","lastTransitionTime":"2026-07-06T07:09:22Z","reason":"TestReason","message":"Test message"}}
+            ]
+          }}
+        }}"#
+    );
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/apis/apps/v1/namespaces/rs-status-test/replicasets/test-rs/status")
+        .header("content-type", "application/json")
+        .body(Body::from(status_put))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "PUT /status must return 200");
+
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let conditions = updated
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array());
+    assert!(
+        conditions.is_some_and(|arr| !arr.is_empty()),
+        "PUT /status must round-trip conditions (found: {:?})",
+        updated.pointer("/status/conditions")
+    );
+    assert_eq!(
+        updated["status"]["conditions"][0]["type"],
+        "NotExistingCondition"
+    );
+    assert_eq!(updated["status"]["conditions"][0]["status"], "True");
+
+    // Also verify via GET that conditions persisted.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/apis/apps/v1/namespaces/rs-status-test/replicasets/test-rs")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let got: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let got_conditions = got.pointer("/status/conditions").and_then(|v| v.as_array());
+    assert!(
+        got_conditions.is_some_and(|arr| !arr.is_empty()),
+        "GET after status PUT must return conditions (found: {:?})",
+        got.pointer("/status/conditions")
+    );
+    assert_eq!(
+        got["status"]["conditions"][0]["type"],
+        "NotExistingCondition"
+    );
+}

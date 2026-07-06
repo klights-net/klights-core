@@ -3742,4 +3742,82 @@ mod cases {
         })
         .await;
     }
+
+    #[tokio::test]
+    async fn replicated_stale_replicaset_status_preserves_conditions() {
+        apply_replicated_stale_status_case(ReplicatedStaleStatusCase {
+            api_version: "apps/v1",
+            kind: "ReplicaSet",
+            namespace: Some("default"),
+            name: "replicated-stale-rs",
+            uid: "replicated-rs-uid",
+            initial: serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "ReplicaSet",
+                "metadata": {
+                    "name": "replicated-stale-rs",
+                    "namespace": "default",
+                    "uid": "replicated-rs-uid"
+                },
+                "spec": {"replicas": 1},
+                "status": {"replicas": 0, "conditions": [{"type": "Available", "status": "True"}]}
+            }),
+            stale_status: serde_json::json!({"conditions": [{"type": "Progressing", "status": "True"}]}),
+            expected_pointer: "/status/conditions/0/type",
+            expected_value: serde_json::json!("Progressing"),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn replicated_stale_statefulset_status_preserves_conditions() {
+        apply_replicated_stale_status_case(ReplicatedStaleStatusCase {
+            api_version: "apps/v1",
+            kind: "StatefulSet",
+            namespace: Some("default"),
+            name: "replicated-stale-sts",
+            uid: "replicated-sts-uid",
+            initial: serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "metadata": {
+                    "name": "replicated-stale-sts",
+                    "namespace": "default",
+                    "uid": "replicated-sts-uid"
+                },
+                "spec": {"replicas": 1},
+                "status": {"replicas": 0}
+            }),
+            stale_status: serde_json::json!({"replicas": 1}),
+            expected_pointer: "/status/replicas",
+            expected_value: serde_json::json!(1),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn replicated_stale_daemonset_status_preserves_fields() {
+        apply_replicated_stale_status_case(ReplicatedStaleStatusCase {
+            api_version: "apps/v1",
+            kind: "DaemonSet",
+            namespace: Some("default"),
+            name: "replicated-stale-ds",
+            uid: "replicated-ds-uid",
+            initial: serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": "DaemonSet",
+                "metadata": {
+                    "name": "replicated-stale-ds",
+                    "namespace": "default",
+                    "uid": "replicated-ds-uid"
+                },
+                "spec": {},
+                "status": {"numberReady": 0}
+            }),
+            stale_status: serde_json::json!({"numberReady": 1}),
+            expected_pointer: "/status/numberReady",
+            expected_value: serde_json::json!(1),
+        })
+        .await;
+    }
 }
