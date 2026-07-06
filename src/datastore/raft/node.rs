@@ -29,7 +29,7 @@ use crate::datastore::raft::types::{NodeId, RaftShape, StorageCommandPayload, Ty
 
 /// Lossy-link transport sizing (finding.md H3). `max_payload_entries` keeps each
 /// AppendEntries retry small (it bounds **retransmit cost**: leader→follower).
-pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 3;
+pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 16;
 
 /// Leader proposal flow-control cap: the maximum number of unacknowledged
 /// proposals that may be in flight simultaneously. This is DECOUPLED from
@@ -40,7 +40,7 @@ pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 3;
 /// Coupling both to 3 capped leader commit concurrency at 3 — at ~200 ms quorum
 /// RTT a hard ~15 commits/sec ceiling. Default 16 keeps the cap in the measured
 /// safe range 8..=32.
-pub(crate) const RAFT_MAX_INFLIGHT_PROPOSALS: usize = 16;
+pub(crate) const RAFT_MAX_INFLIGHT_PROPOSALS: usize = 32;
 
 pub struct RaftNode {
     pub node_id: NodeId,
