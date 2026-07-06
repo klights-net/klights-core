@@ -84,4 +84,42 @@ mod tests {
             .unwrap();
         assert_eq!(second, vec![2]);
     }
+
+    /// P0 (memory-improvement.md §10): when the cached value is an `Arc`, every
+    /// hit — including the generation-time return — must share the SAME heap
+    /// allocation (refcount bumps, never a deep copy). This is what kills the
+    /// N+1 deep-copy amplifier in the gRPC snapshot serve path: the production
+    /// `snapshot_cache` field is typed `SnapshotCache<_, Arc<Vec<LogApplyCommit>>>`.
+    #[tokio::test]
+    async fn snapshot_cache_arc_hit_shares_allocation_not_deep_copy() {
+        let cache = SnapshotCache::new(Duration::from_secs(30));
+        // Generation path: stores and returns handles to the same allocation.
+        let first = cache
+            .get_or_generate(10, || async {
+                Ok::<_, anyhow::Error>(std::sync::Arc::new(vec![1, 2, 3]))
+            })
+            .await
+            .unwrap();
+        // Hit path (same key, within TTL): must return a handle to the stored allocation.
+        let second = cache
+            .get_or_generate(10, || async {
+                Ok::<_, anyhow::Error>(std::sync::Arc::new(vec![9]))
+            })
+            .await
+            .unwrap();
+        let third = cache
+            .get_or_generate(10, || async {
+                Ok::<_, anyhow::Error>(std::sync::Arc::new(vec![7]))
+            })
+            .await
+            .unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "generation return and first hit must share the allocation"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&second, &third),
+            "all hits must share the allocation"
+        );
+    }
 }

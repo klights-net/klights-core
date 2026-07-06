@@ -140,12 +140,19 @@ pub fn insert_tonic_tcp_connect_info<B>(
         });
 }
 
+/// P0 (memory-improvement.md §10): the gRPC snapshot serve path caches the
+/// assembled snapshot as an `Arc<Vec<LogApplyCommit>>` so concurrent
+/// followers share ONE heap allocation via refcount bumps instead of each
+/// deep-cloning a hundreds-of-MiB `Vec`. `SnapshotCache`'s `.clone()` calls
+/// become refcount bumps because the value type is `Arc`.
+type SnapshotResultCache = SnapshotCache<(i64, i64), Arc<Vec<crate::log_apply::LogApplyCommit>>>;
+
 pub struct GrpcReplicationServer {
     service: Arc<ReplicationService>,
     db: DatastoreHandle,
     controller_dispatcher: Option<Arc<ControllerDispatcher>>,
     node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
-    snapshot_cache: Arc<SnapshotCache<(i64, i64), Vec<crate::log_apply::LogApplyCommit>>>,
+    snapshot_cache: Arc<SnapshotResultCache>,
     /// Phase 3 raft RPC dispatcher. Populated by the leader bootstrap
     /// (P3-11c) when raft mode is wired. When None, the three Raft
     /// RPCs respond with `RaftRpcRouterError::Disabled` so the client
@@ -919,13 +926,15 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let entries = self
             .snapshot_cache
             .get_or_generate(key, move || async move {
-                crate::replication::snapshot::generate_snapshot(db.as_ref(), last_applied_rv).await
+                crate::replication::snapshot::generate_snapshot(db.as_ref(), last_applied_rv)
+                    .await
+                    .map(std::sync::Arc::new)
             })
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         let stream = async_stream::stream! {
-            for entry in entries {
-                match log_apply_commit_to_proto(&entry) {
+            for entry in entries.iter() {
+                match log_apply_commit_to_proto(entry) {
                     Ok(entry) => yield Ok(entry),
                     Err(err) => {
                         yield Err(Status::internal(err.to_string()));
