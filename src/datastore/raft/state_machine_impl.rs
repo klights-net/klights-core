@@ -693,6 +693,117 @@ mod tests {
         );
     }
 
+    /// Regression: `build_snapshot` must read the leader `current_rv` AFTER
+    /// streaming the snapshot commits, not before. Reading it before streaming
+    /// opens a TOCTOU window — commits applied during the (many) streaming
+    /// awaits land in the snapshot with a `resourceVersion` higher than the
+    /// already-captured `current_rv`, producing an internally inconsistent
+    /// snapshot that a follower rejects in `replace_resource_state_in_conn`
+    /// ("snapshot entry resourceVersion N is ahead of leader current_rv M").
+    /// A rejected `install_snapshot` permanently breaks raft catch-up, which
+    /// stalls replication, drops quorum, and flips leadership under load.
+    ///
+    /// This test applies commits concurrently while a snapshot is built and
+    /// asserts the snapshot is internally consistent and installs cleanly on a
+    /// fresh follower. On a current-thread test runtime the spawned applier
+    /// runs cooperatively at each of the builder's await points.
+    #[tokio::test]
+    async fn build_snapshot_current_rv_not_behind_commits_applied_during_build() {
+        let backend: Arc<dyn DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        backend
+            .create_namespace(
+                "race-ns",
+                serde_json::json!({"metadata": {"name": "race-ns", "uid": "uid-race-ns"}}),
+            )
+            .await
+            .expect("seed namespace");
+        for i in 0..5 {
+            backend
+                .create_resource(
+                    "v1",
+                    "ConfigMap",
+                    Some("race-ns"),
+                    &format!("seed-{i}"),
+                    serde_json::json!({
+                        "metadata": {
+                            "name": format!("seed-{i}"),
+                            "namespace": "race-ns",
+                            "uid": format!("uid-seed-{i}")
+                        },
+                        "data": {"k": "v"}
+                    }),
+                )
+                .await
+                .expect("seed configmap");
+        }
+
+        let mut sm = build_sm_with_backend(backend.clone()).await;
+        sm.apply(vec![Entry::<TypeConfig> {
+            log_id: LogId::new(LeaderId::new(1, 10), 1),
+            payload: EntryPayload::Blank,
+        }])
+        .await
+        .expect("advance last_applied");
+        let mut builder = sm.get_snapshot_builder().await;
+
+        // Concurrently apply commits while the snapshot is being built. Each
+        // create_resource awaits, yielding back to the builder so the two
+        // interleaving tasks race exactly like leader writes during a snapshot.
+        let bg = backend.clone();
+        let race = tokio::spawn(async move {
+            for i in 0..60u32 {
+                let _ = bg
+                    .create_resource(
+                        "v1",
+                        "ConfigMap",
+                        Some("race-ns"),
+                        &format!("race-{i}"),
+                        serde_json::json!({
+                            "metadata": {
+                                "name": format!("race-{i}"),
+                                "namespace": "race-ns",
+                                "uid": format!("uid-race-{i}")
+                            },
+                            "data": {"k": "v"}
+                        }),
+                    )
+                    .await;
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let snapshot = builder.build_snapshot().await.expect("build snapshot");
+        race.await.expect("concurrent applier finished");
+        let snapshot_bytes = snapshot.snapshot.into_inner();
+
+        let data = RaftSnapshotData::deserialize_from_bytes(&snapshot_bytes)
+            .expect("deserialize snapshot");
+        let max_emitted_rv = data
+            .commits
+            .iter()
+            .map(|commit| commit.resource_version)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            data.current_rv >= max_emitted_rv,
+            "snapshot current_rv ({}) must be >= every emitted commit's resourceVersion (max {}); \
+             otherwise install_snapshot rejects the snapshot for being ahead of current_rv",
+            data.current_rv,
+            max_emitted_rv,
+        );
+
+        // The snapshot must install cleanly on a fresh follower: a follower
+        // applying replace_replicated_resource_state must not reject it.
+        let backend_dst: Arc<dyn DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        let mut sm_dst = build_sm_with_backend(backend_dst).await;
+        sm_dst
+            .install_snapshot(&snapshot.meta, Box::new(Cursor::new(snapshot_bytes)))
+            .await
+            .expect("install_snapshot must not reject an internally-consistent snapshot");
+    }
+
     #[tokio::test]
     async fn get_current_snapshot_builds_fresh_snapshot_when_missing() {
         let mut sm = fresh_sm().await;

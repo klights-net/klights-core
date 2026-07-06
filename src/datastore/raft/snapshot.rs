@@ -59,17 +59,30 @@ impl RaftSnapshotData {
         db: &dyn DatastoreBackend,
         last_applied: Option<LogId<NodeId>>,
         membership: &StoredMembership<NodeId, openraft::BasicNode>,
-        current_rv: i64,
     ) -> Result<Cursor<Vec<u8>>> {
         let mut cursor = Cursor::new(Vec::new());
         cursor.write_all(b"{\"last_applied\":")?;
         serde_json::to_writer(&mut cursor, &last_applied)?;
         cursor.write_all(b",\"membership\":")?;
         serde_json::to_writer(&mut cursor, membership)?;
-        cursor.write_all(b",\"current_rv\":")?;
-        serde_json::to_writer(&mut cursor, &current_rv)?;
+        // Stream the snapshot commits BEFORE reading the leader current_rv.
+        // Reading current_rv first opens a TOCTOU window: commits applied
+        // during the many streaming awaits below would land in the snapshot
+        // with a resourceVersion higher than the already-captured current_rv,
+        // producing an internally inconsistent snapshot that a follower
+        // rejects in `replace_resource_state_in_conn` ("snapshot entry
+        // resourceVersion N is ahead of leader current_rv M"), permanently
+        // breaking raft catch-up. Because every emitted commit was already
+        // applied to the leader store (and its metadata.resource_version
+        // advanced atomically in the same transaction) before we read its
+        // rows, reading current_rv last guarantees it is >= the maximum
+        // emitted resourceVersion. The JSON key order is irrelevant to serde
+        // deserialization, so emitting `commits` before `current_rv` is safe.
         cursor.write_all(b",\"commits\":")?;
         crate::replication::snapshot::write_snapshot_commits_json_array(db, 0, &mut cursor).await?;
+        let current_rv = db.get_current_resource_version().await?;
+        cursor.write_all(b",\"current_rv\":")?;
+        serde_json::to_writer(&mut cursor, &current_rv)?;
         cursor.write_all(b"}")?;
         cursor.set_position(0);
         // T2: compress the assembled JSON with zstd framing so the snapshot
@@ -96,12 +109,6 @@ fn snapshot_write_err<E: std::fmt::Display>(e: E) -> StorageError<NodeId> {
     }
 }
 
-fn snapshot_read_err<E: std::fmt::Display>(e: E) -> StorageError<NodeId> {
-    StorageError::IO {
-        source: StorageIOError::read_snapshot(None, AnyError::error(e.to_string())),
-    }
-}
-
 /// Real snapshot builder used by `SqliteRaftStateMachine::get_snapshot_builder`.
 /// Owns the cluster backend handle plus a snapshot of the engine's
 /// `last_applied` / `membership` at build-request time so the produced
@@ -117,16 +124,10 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteRaftSnapshotBuilder {
     async fn build_snapshot(
         &mut self,
     ) -> std::result::Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let current_rv = self
-            .backend
-            .get_current_resource_version()
-            .await
-            .map_err(snapshot_read_err)?;
         let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor(
             self.backend.as_ref(),
             self.last_applied,
             &self.membership,
-            current_rv,
         )
         .await
         .map_err(snapshot_write_err)?;
