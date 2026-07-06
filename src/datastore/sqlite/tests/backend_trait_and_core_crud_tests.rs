@@ -7152,3 +7152,138 @@ async fn apply_resource_batch_rolls_back_reserved_rv_on_apply_failure() {
         "row data must be unchanged after a rolled-back batch (op 1 must not leak)"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// memory-improvement.md §10 P1 — paginated snapshot input variants.
+// These keyset-paginated forms let `emit_snapshot_commits` consume the
+// (potentially huge) `watch_events` and `applied_outbox` tables batch by
+// batch instead of materializing each entire table into one Vec. The
+// parity tests below assert they return EXACTLY the same rows, in the
+// same order, as the legacy full-list forms.
+// ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn list_all_watch_events_since_paged_matches_full_list_across_batch_boundaries() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    for i in 0..7u8 {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            &format!("cm{i}"),
+            json!({"metadata": {"name": format!("cm{i}")}}),
+        )
+        .await
+        .unwrap();
+    }
+
+    let full = db.list_all_watch_events_since(0).await.unwrap();
+    assert!(
+        full.len() > 3,
+        "fixture must produce more rows than the page size"
+    );
+
+    // Walk the table in pages of 3 — strictly smaller than the row count —
+    // keyset-paging on (resource_version, id).
+    let mut paged: Vec<(i64, crate::datastore::types::CatchUpResource)> = Vec::new();
+    let mut after_rv = 0i64;
+    let mut after_id = 0i64;
+    let page_size = std::num::NonZeroUsize::new(3).unwrap();
+    loop {
+        let batch = db
+            .list_all_watch_events_since_paged(0, after_rv, after_id, page_size)
+            .await
+            .unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        let last = batch.last().unwrap();
+        after_rv = last.1.resource.resource_version;
+        after_id = last.0;
+        paged.extend(batch);
+    }
+
+    assert_eq!(
+        paged.len(),
+        full.len(),
+        "paginated walk must visit every row exactly once"
+    );
+    for ((id_p, item_p), item_f) in paged.iter().zip(full.iter()) {
+        assert!(
+            *id_p > 0,
+            "watch event id must be surfaced for keyset paging"
+        );
+        assert_eq!(item_p.resource.api_version, item_f.resource.api_version);
+        assert_eq!(item_p.resource.kind, item_f.resource.kind);
+        assert_eq!(item_p.resource.namespace, item_f.resource.namespace);
+        assert_eq!(item_p.resource.name, item_f.resource.name);
+        assert_eq!(
+            item_p.resource.resource_version,
+            item_f.resource.resource_version
+        );
+        assert_eq!(item_p.event_type, item_f.event_type);
+    }
+    // ids strictly increasing across the walk → no row visited twice.
+    assert!(
+        paged.windows(2).all(|w| w[0].0 < w[1].0),
+        "paginated ids must be strictly increasing"
+    );
+}
+
+#[tokio::test]
+async fn list_applied_outbox_paged_matches_full_list_across_batch_boundaries() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    for i in 0..7u16 {
+        db.insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+            idempotency_key: format!("key-{i:03}"),
+            subject_key: format!("subj-{i}"),
+            operation: "PodMetadata".to_string(),
+            first_seen_ms: now_ms + i as i64,
+            applied_rv: Some(100 + i as i64),
+            result_proto: vec![0u8; i as usize],
+            status_stamp: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    let full = db.list_applied_outbox().await.unwrap();
+    assert_eq!(full.len(), 7);
+
+    let mut paged: Vec<crate::datastore::AppliedOutboxRecord> = Vec::new();
+    let mut after_key: Option<String> = None;
+    let page_size = std::num::NonZeroUsize::new(3).unwrap();
+    loop {
+        let batch = db
+            .list_applied_outbox_paged(after_key.as_deref(), page_size)
+            .await
+            .unwrap();
+        if batch.is_empty() {
+            break;
+        }
+        let last_key = batch.last().unwrap().idempotency_key.clone();
+        after_key = Some(last_key);
+        paged.extend(batch);
+    }
+
+    assert_eq!(paged.len(), full.len());
+    for (paged_row, full_row) in paged.iter().zip(full.iter()) {
+        assert_eq!(paged_row.idempotency_key, full_row.idempotency_key);
+        assert_eq!(paged_row.subject_key, full_row.subject_key);
+        assert_eq!(paged_row.operation, full_row.operation);
+        assert_eq!(paged_row.first_seen_ms, full_row.first_seen_ms);
+        assert_eq!(paged_row.applied_rv, full_row.applied_rv);
+        assert_eq!(paged_row.result_proto, full_row.result_proto);
+        assert_eq!(paged_row.status_stamp, full_row.status_stamp);
+    }
+    assert!(
+        paged
+            .windows(2)
+            .all(|w| w[0].idempotency_key < w[1].idempotency_key),
+        "paginated keys must be strictly increasing (matches ORDER BY idempotency_key)"
+    );
+}

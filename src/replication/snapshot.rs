@@ -32,6 +32,13 @@ use crate::log_apply::{
 
 const SNAPSHOT_JSON_COMMIT_BATCH_SIZE: usize = 128;
 
+/// memory-improvement.md §10 P1: page size for the keyset-paginated reads
+/// (`list_all_watch_events_since_paged`, `list_applied_outbox_paged`) inside
+/// `emit_snapshot_commits`. Bounded so a multi-million-row table is consumed
+/// batch by batch instead of materialized into one `Vec`. 1024 rows ≈ a few
+/// MiB of working set, regardless of total table size.
+const SNAPSHOT_EMIT_PAGE_SIZE: usize = 512;
+
 /// Result of comparing local replica metadata against leader metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataComparison {
@@ -171,6 +178,12 @@ pub fn needs_confirmation(comparison: &MetadataComparison) -> bool {
 /// copy modes. This snapshot is installed by destructive replacement, so it must
 /// include the full live state and durable watch history, not only rows newer
 /// than the cursor.
+///
+/// memory-improvement.md §10 P1: the production gRPC serve path no longer
+/// calls this — it streams via `stream_snapshot_commits` + a channel sink.
+/// This Vec-collecting form is retained `#[cfg(test)]`-only as the
+/// equivalence oracle for the streaming path.
+#[cfg(test)]
 pub async fn generate_snapshot(
     db: &dyn DatastoreBackend,
     after_rv: i64,
@@ -196,18 +209,18 @@ pub async fn write_snapshot_commits_json_array<W: Write>(
     Ok(())
 }
 
-async fn stream_snapshot_commits<S: SnapshotCommitSink>(
+pub(crate) async fn stream_snapshot_commits<S: SnapshotCommitSink + Unpin>(
     db: &dyn DatastoreBackend,
     _after_rv: i64,
     sink: &mut S,
 ) -> Result<()> {
     let mut batcher = SnapshotCommitBatcher::new(sink);
     emit_snapshot_commits(db, &mut batcher).await?;
-    batcher.finish()?;
+    batcher.finish().await?;
     sink.finish()
 }
 
-async fn emit_snapshot_commits<S: SnapshotCommitSink>(
+async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
     db: &dyn DatastoreBackend,
     sink: &mut S,
 ) -> Result<()> {
@@ -246,45 +259,62 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink>(
         insert_live_resource(&mut live_resources, resource);
     }
 
-    let all_watch_events = db.list_all_watch_events_since(0).await?;
     let mut emitted_live_keys = HashSet::new();
     let mut checked_watch_keys = HashSet::new();
-
-    for event in all_watch_events {
-        let event_type = event.event_type.into_owned();
-        let resource = event.resource;
-        let key = SnapshotResourceKey::from_resource(&resource);
-
-        if should_probe_live_resource_from_watch(&resource)
-            && !live_resources.contains_key(&key)
-            && checked_watch_keys.insert(key.clone())
-            && let Some(current) = db
-                .get_resource(
-                    &resource.api_version,
-                    &resource.kind,
-                    resource.namespace.as_deref(),
-                    &resource.name,
-                )
-                .await?
-        {
-            insert_live_resource(&mut live_resources, current);
+    let page_limit = std::num::NonZeroUsize::new(SNAPSHOT_EMIT_PAGE_SIZE)
+        .expect("SNAPSHOT_EMIT_PAGE_SIZE is nonzero");
+    // memory-improvement.md §10 P1: page the watch-events table instead of
+    // loading it all into one Vec. The loop keyset-pages on (rv, id) in the
+    // same ordering the unbounded form used, so content/order are unchanged.
+    let mut after_rv = 0i64;
+    let mut after_id = 0i64;
+    loop {
+        let page = db
+            .list_all_watch_events_since_paged(0, after_rv, after_id, page_limit)
+            .await?;
+        if page.is_empty() {
+            break;
         }
+        let last = page.last().expect("non-empty page has a last row");
+        after_rv = last.1.resource.resource_version;
+        after_id = last.0;
+        for (_id, event) in page {
+            let event_type = event.event_type.into_owned();
+            let resource = event.resource;
+            let key = SnapshotResourceKey::from_resource(&resource);
 
-        let resource_version = resource.resource_version;
-        let mut mutations: Vec<ClusterMutation> = Vec::new();
-        if event_type == "DELETED" {
-            mutations.push(delete_mutation_from_watch_resource(&resource));
-        } else if let Some(current) = live_resources.get(&key)
-            && current.resource_version == resource_version
-            && emitted_live_keys.insert(key.clone())
-        {
-            mutations.push(live_resource_mutation(current));
+            if should_probe_live_resource_from_watch(&resource)
+                && !live_resources.contains_key(&key)
+                && checked_watch_keys.insert(key.clone())
+                && let Some(current) = db
+                    .get_resource(
+                        &resource.api_version,
+                        &resource.kind,
+                        resource.namespace.as_deref(),
+                        &resource.name,
+                    )
+                    .await?
+            {
+                insert_live_resource(&mut live_resources, current);
+            }
+
+            let resource_version = resource.resource_version;
+            let mut mutations: Vec<ClusterMutation> = Vec::new();
+            if event_type == "DELETED" {
+                mutations.push(delete_mutation_from_watch_resource(&resource));
+            } else if let Some(current) = live_resources.get(&key)
+                && current.resource_version == resource_version
+                && emitted_live_keys.insert(key.clone())
+            {
+                mutations.push(live_resource_mutation(current));
+            }
+            mutations.push(watch_event_mutation(resource, event_type));
+            sink.push(LogApplyCommit::from_cluster_mutations(
+                resource_version,
+                mutations,
+            ))
+            .await?;
         }
-        mutations.push(watch_event_mutation(resource, event_type));
-        sink.push(LogApplyCommit::from_cluster_mutations(
-            resource_version,
-            mutations,
-        ))?;
     }
 
     let mut remaining_live: Vec<_> = live_resources
@@ -298,7 +328,7 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink>(
             .then_with(|| left_key.cmp(right_key))
     });
     for (_key, resource) in remaining_live {
-        sink.push(live_resource_commit(&resource))?;
+        sink.push(live_resource_commit(&resource)).await?;
     }
 
     let current_rv = db.get_current_resource_version().await.unwrap_or(0);
@@ -310,22 +340,43 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink>(
             sink.push(snapshot_commit_from_family(
                 current_rv,
                 cluster_network_mutation_from_subnet(&peer),
-            ))?;
+            ))
+            .await?;
             if let Some(dataplane) = db.get_node_dataplane(&node_name).await? {
                 sink.push(snapshot_commit_from_family(
                     current_rv,
                     cluster_network_mutation_from_dataplane(&dataplane),
-                ))?;
+                ))
+                .await?;
             }
         }
     }
 
     if current_rv > 0 {
-        for record in db.list_applied_outbox().await? {
-            sink.push(snapshot_commit_from_family(
-                current_rv,
-                cluster_outbox_mutation_from_record(record),
-            ))?;
+        // memory-improvement.md §10 P1: page the dedup ledger instead of
+        // loading it all into one Vec. Ordering/content match the unbounded
+        // form (ORDER BY idempotency_key ASC).
+        let mut after_key: Option<String> = None;
+        loop {
+            let page = db
+                .list_applied_outbox_paged(after_key.as_deref(), page_limit)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            after_key = Some(
+                page.last()
+                    .expect("non-empty page has a last row")
+                    .idempotency_key
+                    .clone(),
+            );
+            for record in page {
+                sink.push(snapshot_commit_from_family(
+                    current_rv,
+                    cluster_outbox_mutation_from_record(record),
+                ))
+                .await?;
+            }
         }
     }
 
@@ -334,27 +385,28 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink>(
             sink.push(snapshot_commit_from_family(
                 intent.resource_version,
                 cluster_pod_cleanup_mutation_from_intent(intent),
-            ))?;
+            ))
+            .await?;
         }
     }
 
     Ok(())
 }
 
-trait SnapshotCommitSink {
-    fn push(&mut self, commit: LogApplyCommit) -> Result<()>;
+pub(crate) trait SnapshotCommitSink {
+    async fn push(&mut self, commit: LogApplyCommit) -> Result<()>;
 
     fn finish(&mut self) -> Result<()> {
         Ok(())
     }
 }
 
-struct SnapshotCommitBatcher<'a, S: SnapshotCommitSink> {
+struct SnapshotCommitBatcher<'a, S: SnapshotCommitSink + Unpin + ?Sized> {
     sink: &'a mut S,
     pending: Option<LogApplyCommit>,
 }
 
-impl<'a, S: SnapshotCommitSink> SnapshotCommitBatcher<'a, S> {
+impl<'a, S: SnapshotCommitSink + Unpin + ?Sized> SnapshotCommitBatcher<'a, S> {
     fn new(sink: &'a mut S) -> Self {
         Self {
             sink,
@@ -362,16 +414,16 @@ impl<'a, S: SnapshotCommitSink> SnapshotCommitBatcher<'a, S> {
         }
     }
 
-    fn finish(&mut self) -> Result<()> {
+    async fn finish(&mut self) -> Result<()> {
         if let Some(commit) = self.pending.take() {
-            self.sink.push(commit)?;
+            self.sink.push(commit).await?;
         }
         Ok(())
     }
 }
 
-impl<S: SnapshotCommitSink> SnapshotCommitSink for SnapshotCommitBatcher<'_, S> {
-    fn push(&mut self, commit: LogApplyCommit) -> Result<()> {
+impl<S: SnapshotCommitSink + Unpin + ?Sized> SnapshotCommitSink for SnapshotCommitBatcher<'_, S> {
+    async fn push(&mut self, commit: LogApplyCommit) -> Result<()> {
         if commit.mutations.is_empty() {
             return Ok(());
         }
@@ -381,7 +433,7 @@ impl<S: SnapshotCommitSink> SnapshotCommitSink for SnapshotCommitBatcher<'_, S> 
             }
             Some(_) => {
                 let previous = self.pending.replace(commit).expect("pending checked");
-                self.sink.push(previous)?;
+                self.sink.push(previous).await?;
             }
             None => {
                 self.pending = Some(commit);
@@ -392,12 +444,14 @@ impl<S: SnapshotCommitSink> SnapshotCommitSink for SnapshotCommitBatcher<'_, S> 
 }
 
 #[derive(Default)]
+#[cfg(test)]
 struct VecSnapshotCommitSink {
     entries: Vec<LogApplyCommit>,
 }
 
+#[cfg(test)]
 impl SnapshotCommitSink for VecSnapshotCommitSink {
-    fn push(&mut self, commit: LogApplyCommit) -> Result<()> {
+    async fn push(&mut self, commit: LogApplyCommit) -> Result<()> {
         self.entries.push(commit);
         Ok(())
     }
@@ -431,7 +485,7 @@ impl<'a, W: Write> JsonArrayCommitSink<'a, W> {
 }
 
 impl<W: Write> SnapshotCommitSink for JsonArrayCommitSink<'_, W> {
-    fn push(&mut self, commit: LogApplyCommit) -> Result<()> {
+    async fn push(&mut self, commit: LogApplyCommit) -> Result<()> {
         self.pending.push(commit);
         if self.pending.len() >= SNAPSHOT_JSON_COMMIT_BATCH_SIZE {
             self.flush()?;
@@ -1442,5 +1496,170 @@ mod tests {
         //   NodeRole::Worker { .. } => bail!("not yet implemented")
         //
         // This test documents the 2A-5 contract.
+    }
+    // memory-improvement.md §10 P1 — characterization test for the
+    // keyset-paginated emit path. With more watch_events than the emit page
+    // size (SNAPSHOT_EMIT_PAGE_SIZE), the snapshot must still reconstruct a
+    // follower byte-for-byte: no rows dropped or duplicated across the page
+    // boundary, dedup ledger intact.
+    #[tokio::test]
+    async fn snapshot_emits_complete_watch_history_across_page_boundaries() {
+        let leader = crate::datastore::test_support::in_memory().await;
+        crate::controllers::namespace::init_default_namespaces(&leader)
+            .await
+            .unwrap();
+
+        // Insert strictly more watch_events than SNAPSHOT_EMIT_PAGE_SIZE so the
+        // emitter's paged loop crosses at least one boundary.
+        let n = super::SNAPSHOT_EMIT_PAGE_SIZE + 2;
+        for i in 0..n {
+            leader
+                .create_resource(
+                    "v1",
+                    "ConfigMap",
+                    Some("default"),
+                    &format!("cm-page-{i}"),
+                    serde_json::json!({"metadata": {"name": format!("cm-page-{i}")}}),
+                )
+                .await
+                .unwrap();
+        }
+        let leader_events = watch_history_for_compare(&leader).await;
+        assert!(
+            leader_events.len() >= n,
+            "fixture must produce more watch events than the emit page size ({}), got {}",
+            n,
+            leader_events.len()
+        );
+
+        let leader_rv = leader.get_current_resource_version().await.unwrap();
+        let snapshot = generate_snapshot(&leader, 0).await.unwrap();
+        let follower = crate::datastore::test_support::in_memory().await;
+        follower
+            .replace_replicated_resource_state(snapshot, leader_rv, None)
+            .await
+            .unwrap();
+
+        // Watch history must round-trip exactly across the page boundary.
+        assert_eq!(watch_history_for_compare(&follower).await, leader_events);
+        // And the live rows must all be present.
+        for i in 0..n {
+            assert!(
+                follower
+                    .get_resource("v1", "ConfigMap", Some("default"), &format!("cm-page-{i}"))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "live row cm-page-{i} must be present after paged snapshot restore"
+            );
+        }
+    }
+
+    // memory-improvement.md §10 P1 — the streamed (proto sink) output must be
+    // byte-equivalent to the legacy Vec path over the same fixture, for both
+    // watch_events-heavy and applied_outbox-heavy cases. Drives a fixture table
+    // through both codepaths and compares the decoded LogApplyCommit sequence.
+    #[tokio::test]
+    async fn streamed_snapshot_matches_vec_path_across_fixture_table() {
+        use crate::log_apply::LogApplyCommit;
+        use crate::replication::grpc::{
+            generated, log_apply_commit_from_proto, log_apply_commit_to_proto,
+        };
+        use crate::replication::snapshot::SnapshotCommitSink;
+        use crate::replication::snapshot_commit_channel_sink::SnapshotCommitChannelSink;
+        use tokio::sync::mpsc;
+
+        for (case, n_resources, n_outbox) in [
+            ("empty", 0, 0),
+            ("resources-only", 3, 0),
+            ("watch-heavy", super::SNAPSHOT_EMIT_PAGE_SIZE + 1, 0),
+            ("outbox-heavy", 1, super::SNAPSHOT_EMIT_PAGE_SIZE + 1),
+            ("mixed", 5, 7),
+        ] {
+            let leader = crate::datastore::test_support::in_memory().await;
+            crate::controllers::namespace::init_default_namespaces(&leader)
+                .await
+                .unwrap();
+            for i in 0..n_resources {
+                leader
+                    .create_resource(
+                        "v1",
+                        "ConfigMap",
+                        Some("default"),
+                        &format!("cm-{case}-{i}"),
+                        serde_json::json!({"metadata": {"name": format!("cm-{case}-{i}")}}),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            for i in 0..n_outbox {
+                leader
+                    .insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+                        idempotency_key: format!("key-{case}-{i:05}"),
+                        subject_key: format!("subj-{case}-{i}"),
+                        operation: "PodMetadata".to_string(),
+                        first_seen_ms: now_ms + i as i64,
+                        applied_rv: Some(100 + i as i64),
+                        result_proto: vec![0u8; i % 7],
+                        status_stamp: None,
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            // Baseline: the legacy Vec path (encode each commit to proto).
+            let baseline_commits = generate_snapshot(&leader, 0).await.unwrap();
+            let baseline_protos: Vec<generated::ReplicationEntry> = baseline_commits
+                .iter()
+                .map(log_apply_commit_to_proto)
+                .collect::<Result<_, _>>()
+                .unwrap();
+
+            // Streaming path: proto sink into a bounded channel. The producer
+            // and consumer must run concurrently (a bounded channel backpressures
+            // once > capacity commits are queued), so drive them with join!.
+            let (tx, mut rx) =
+                mpsc::channel::<Result<generated::ReplicationEntry, tonic::Status>>(64);
+            let mut streamed_protos: Vec<generated::ReplicationEntry> = Vec::new();
+            let producer = async {
+                let mut sink = SnapshotCommitChannelSink::new(tx);
+                crate::replication::snapshot::stream_snapshot_commits(&leader, 0, &mut sink)
+                    .await
+                    .unwrap();
+                sink.finish().unwrap();
+            };
+            let consumer = async {
+                while let Some(item) = rx.recv().await {
+                    streamed_protos.push(item.expect("proto encode must succeed"));
+                }
+            };
+            tokio::join!(producer, consumer);
+
+            assert_eq!(
+                streamed_protos.len(),
+                baseline_protos.len(),
+                "case `{case}`: streamed commit count must match Vec path"
+            );
+            for (s, b) in streamed_protos.iter().zip(baseline_protos.iter()) {
+                assert_eq!(
+                    s.commit_protobuf, b.commit_protobuf,
+                    "case `{case}`: streamed proto bytes must equal Vec-path proto bytes"
+                );
+            }
+            // Decode round-trip preserves the commit sequence.
+            let decoded: Vec<LogApplyCommit> = streamed_protos
+                .into_iter()
+                .map(log_apply_commit_from_proto)
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for (got, want) in decoded.iter().zip(baseline_commits.iter()) {
+                assert_eq!(got.resource_version, want.resource_version);
+                assert_eq!(got.mutations.len(), want.mutations.len());
+            }
+        }
     }
 }

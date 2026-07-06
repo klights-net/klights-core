@@ -3,6 +3,7 @@ use futures::stream::BoxStream;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, metadata::MetadataMap};
 
 use crate::controller_dispatcher::ControllerDispatcher;
@@ -10,18 +11,16 @@ use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{Resource, ResourcePreconditions, WatchTarget};
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
-use crate::replication::grpc::{
-    JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, log_apply_commit_to_proto,
-};
+use crate::replication::grpc::{JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated};
 use crate::replication::protocol::{
     ExecStreamChannel, FollowerControlMessage, JoinResponse, JoinRole, NodeExecRequest,
     NodeExecStreamFrame, NodeExecSyncRequest, NodeExecSyncResponse, PodLogRequest, PodLogResponse,
 };
 use crate::replication::service::ReplicationService;
+use crate::replication::snapshot::SnapshotCommitSink;
 use crate::watch::WatchEventSelection;
 
 use super::ca_files::ControlplaneCaFiles;
-use super::snapshot_cache::SnapshotCache;
 
 pub fn validate_join_metadata(join: &generated::JoinRequest) -> Result<DataplanePeerMetadata> {
     validate_join_metadata_with_endpoint(join, None)
@@ -140,19 +139,17 @@ pub fn insert_tonic_tcp_connect_info<B>(
         });
 }
 
-/// P0 (memory-improvement.md §10): the gRPC snapshot serve path caches the
-/// assembled snapshot as an `Arc<Vec<LogApplyCommit>>` so concurrent
-/// followers share ONE heap allocation via refcount bumps instead of each
-/// deep-cloning a hundreds-of-MiB `Vec`. `SnapshotCache`'s `.clone()` calls
-/// become refcount bumps because the value type is `Arc`.
-type SnapshotResultCache = SnapshotCache<(i64, i64), Arc<Vec<crate::log_apply::LogApplyCommit>>>;
-
+/// P0 (memory-improvement.md §10) made the snapshot serve path cache its
+/// result as an `Arc<Vec<LogApplyCommit>>`. P1 supersedes that: the serve
+/// path now STREAMS the snapshot through a bounded channel and never
+/// materializes a `Vec` at all, so no cache is held on the server struct.
+/// The `SnapshotCache` type itself is kept (in `snapshot_cache.rs`) for its
+/// unit tests and any future callers that want the Arc-sharing semantics.
 pub struct GrpcReplicationServer {
     service: Arc<ReplicationService>,
     db: DatastoreHandle,
     controller_dispatcher: Option<Arc<ControllerDispatcher>>,
     node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
-    snapshot_cache: Arc<SnapshotResultCache>,
     /// Phase 3 raft RPC dispatcher. Populated by the leader bootstrap
     /// (P3-11c) when raft mode is wired. When None, the three Raft
     /// RPCs respond with `RaftRpcRouterError::Disabled` so the client
@@ -188,7 +185,6 @@ impl GrpcReplicationServer {
             db,
             controller_dispatcher,
             node_lease_tracker,
-            snapshot_cache: Arc::new(SnapshotCache::new(Duration::from_secs(30))),
             raft_rpc_router: None,
             controlplane_join_handler: None,
             controlplane_ca_files,
@@ -920,29 +916,73 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
     ) -> std::result::Result<Response<Self::SnapshotStream>, Status> {
         self.require_steady_state_auth(&request).await?;
         let last_applied_rv = request.into_inner().last_applied_rv;
-        let metadata = self.service.handle_metadata().await;
-        let key = (metadata.current_rv, last_applied_rv);
         let db = self.db.clone();
-        let entries = self
-            .snapshot_cache
-            .get_or_generate(key, move || async move {
-                crate::replication::snapshot::generate_snapshot(db.as_ref(), last_applied_rv)
-                    .await
-                    .map(std::sync::Arc::new)
-            })
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+
+        // memory-improvement.md §10 P1: stream the snapshot straight to the
+        // wire instead of materializing it into one `Arc<Vec<LogApplyCommit>>`.
+        // The producer drives `emit_snapshot_commits` (which keyset-pages the
+        // watch_events and applied_outbox tables) and pushes each commit's
+        // protobuf into a bounded channel; the stream yields from that channel.
+        //
+        // The producer and consumer run COOPERATIVELY on this one stream
+        // future (no spawn): `select!` races the bounded-channel recv against
+        // the producer so that when the channel fills up the producer awaits
+        // while the consumer drains — that backpressure is what bounds peak
+        // resident memory to O(channel capacity + page size), not O(rows).
         let stream = async_stream::stream! {
-            for entry in entries.iter() {
-                match log_apply_commit_to_proto(entry) {
-                    Ok(entry) => yield Ok(entry),
-                    Err(err) => {
-                        yield Err(Status::internal(err.to_string()));
-                        break;
+            const SNAPSHOT_STREAM_CHANNEL_CAPACITY: usize = 256;
+            let (tx, mut rx) = mpsc::channel::<
+                std::result::Result<generated::ReplicationEntry, Status>,
+            >(SNAPSHOT_STREAM_CHANNEL_CAPACITY);
+            let err_tx = tx.clone();
+            let producer = async move {
+                let mut sink = crate::replication::snapshot_commit_channel_sink::SnapshotCommitChannelSink::new(tx);
+                let result = crate::replication::snapshot::stream_snapshot_commits(
+                    db.as_ref(),
+                    last_applied_rv,
+                    &mut sink,
+                )
+                .await;
+                if let Err(err) = result {
+                    // Surface the generation error as a terminal stream item,
+                    // then close the channel via finish().
+                    let _ = err_tx
+                        .send(Err(Status::internal(err.to_string())))
+                        .await;
+                }
+                let _ = sink.finish();
+            };
+            tokio::pin!(producer);
+            let mut producer_done = false;
+            loop {
+                if producer_done {
+                    match rx.recv().await {
+                        Some(Ok(proto)) => yield Ok(proto),
+                        Some(Err(status)) => {
+                            yield Err(status);
+                            return;
+                        }
+                        None => return,
+                    }
+                } else {
+                    tokio::select! {
+                        biased;
+                        item = rx.recv() => match item {
+                            Some(Ok(proto)) => yield Ok(proto),
+                            Some(Err(status)) => {
+                                yield Err(status);
+                                return;
+                            }
+                            None => return,
+                        },
+                        _ = &mut producer => {
+                            producer_done = true;
+                        }
                     }
                 }
             }
         };
+
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -4570,5 +4610,77 @@ mod tests {
             "bookmark metadata must carry the cursor RV as the resume point"
         );
         assert_eq!(data.get("kind").and_then(|v| v.as_str()), Some("Pod"));
+    }
+    // ─────────────────────────────────────────────────────────────────
+    // memory-improvement.md §10 P1 — streaming snapshot serve path.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn channel_proto_sink_forwards_commits_as_protos_round_trip() {
+        use crate::replication::snapshot::SnapshotCommitSink;
+        use crate::replication::snapshot::stream_snapshot_commits;
+        use crate::replication::snapshot_commit_channel_sink::SnapshotCommitChannelSink;
+
+        // Build a fixture cluster with a couple of resources so the snapshot
+        // emitter has real commits to stream.
+        let db = crate::datastore::test_support::in_memory().await;
+        crate::controllers::namespace::init_default_namespaces(&db)
+            .await
+            .unwrap();
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "cm-stream-1",
+            serde_json::json!({"metadata": {"name": "cm-stream-1"}}),
+        )
+        .await
+        .unwrap();
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "cm-stream-2",
+            serde_json::json!({"metadata": {"name": "cm-stream-2"}}),
+        )
+        .await
+        .unwrap();
+
+        // Baseline: the legacy Vec path (equivalence oracle).
+        let baseline = crate::replication::snapshot::generate_snapshot(&db, 0)
+            .await
+            .unwrap();
+
+        // Streaming path: push straight into a bounded channel.
+        let (tx, mut rx) = mpsc::channel::<Result<generated::ReplicationEntry, tonic::Status>>(64);
+        let mut sink = SnapshotCommitChannelSink::new(tx);
+        stream_snapshot_commits(&db, 0, &mut sink).await.unwrap();
+        // `finish` drops the inner sender so the receiver stream terminates.
+        sink.finish().unwrap();
+
+        // Drain the channel, decode each proto back to a LogApplyCommit.
+        let mut collected: Vec<crate::log_apply::LogApplyCommit> = Vec::new();
+        while let Some(item) = rx.recv().await {
+            let proto = item.expect("proto conversion must not fail");
+            let commit = crate::replication::grpc::log_apply_commit_from_proto(proto).unwrap();
+            collected.push(commit);
+        }
+
+        assert_eq!(
+            collected.len(),
+            baseline.len(),
+            "streamed commit count must match the legacy Vec path"
+        );
+        for (streamed_commit, baseline_commit) in collected.iter().zip(baseline.iter()) {
+            assert_eq!(
+                streamed_commit.resource_version, baseline_commit.resource_version,
+                "resource_version must match per commit"
+            );
+            assert_eq!(
+                streamed_commit.mutations.len(),
+                baseline_commit.mutations.len(),
+                "mutation count must match per commit"
+            );
+        }
     }
 }

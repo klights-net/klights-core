@@ -275,6 +275,40 @@ impl Datastore {
         .map_err(|e| anyhow!("applied outbox list failed: {e}"))
     }
 
+    /// memory-improvement.md §10 P1: keyset-paginated form of
+    /// `list_applied_outbox`. Returns up to `limit` rows whose
+    /// `idempotency_key > after_key` (pass `None` for the first page), in the
+    /// same `ORDER BY idempotency_key ASC` ordering as the full-list form.
+    /// Lets the snapshot emitter stream the dedup ledger batch by batch
+    /// instead of materializing the whole table into one `Vec`.
+    pub async fn list_applied_outbox_paged(
+        &self,
+        after_key: Option<&str>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<AppliedOutboxRecord>> {
+        let after = after_key.unwrap_or("").to_string();
+        let limit_i64 = limit.get() as i64;
+        self.db_call("db_applied_outbox_list_all_paged", move |conn| {
+            let rows = conn
+                .prepare(queries::APPLIED_OUTBOX_LIST_ALL_PAGED)?
+                .query_map(rusqlite::params![after, limit_i64], |row| {
+                    Ok(AppliedOutboxRecord {
+                        idempotency_key: row.get(0)?,
+                        subject_key: row.get(1)?,
+                        operation: row.get(2)?,
+                        first_seen_ms: row.get(3)?,
+                        applied_rv: row.get(4)?,
+                        result_proto: row.get(5)?,
+                        status_stamp: row.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| anyhow!("applied outbox paged list failed: {e}"))
+    }
+
     pub async fn apply_resource_batch(
         &self,
         operations: Vec<ResourceBatchOperation>,
@@ -2783,6 +2817,23 @@ impl DatastoreBackend for Datastore {
         Datastore::list_all_watch_events_since(self, since_rv).await
     }
 
+    async fn list_all_watch_events_since_paged(
+        &self,
+        since_rv: i64,
+        after_resource_version: i64,
+        after_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        Datastore::list_all_watch_events_since_paged(
+            self,
+            since_rv,
+            after_resource_version,
+            after_id,
+            limit,
+        )
+        .await
+    }
+
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
         Datastore::list_deleted_watch_events_since(self, since_rv).await
     }
@@ -3050,6 +3101,14 @@ impl DatastoreBackend for Datastore {
 
     async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
         Datastore::list_applied_outbox(self).await
+    }
+
+    async fn list_applied_outbox_paged(
+        &self,
+        after_key: Option<&str>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<AppliedOutboxRecord>> {
+        Datastore::list_applied_outbox_paged(self, after_key, limit).await
     }
 
     async fn delete_uncommitted_applied_outbox_placeholder(

@@ -91,6 +91,18 @@ pub(super) const WATCH_EVENTS_LIST_ALL_SINCE: &str = "SELECT api_version, kind, 
      WHERE resource_version > ?1 \
      ORDER BY resource_version ASC, id ASC";
 
+/// memory-improvement.md §10 P1: keyset-paginated form of
+/// `WATCH_EVENTS_LIST_ALL_SINCE`. Adds the `id` column (for the next cursor)
+/// and restricts to rows strictly AFTER `(?2, ?3)` in the same
+/// `(resource_version ASC, id ASC)` ordering the full-list form uses. The
+/// first page passes the floor rv as both `?1` and `?2` with `?3 = 0`.
+pub(super) const WATCH_EVENTS_LIST_ALL_SINCE_PAGED: &str = "SELECT api_version, kind, namespace, name, resource_version, event_type, data, id \
+     FROM watch_events \
+     WHERE resource_version > ?1 \
+       AND (resource_version > ?2 OR (resource_version = ?2 AND id > ?3)) \
+     ORDER BY resource_version ASC, id ASC \
+     LIMIT ?4";
+
 pub(super) const WATCH_EVENTS_LIST_DELETED_SINCE: &str = "SELECT api_version, kind, namespace, name, resource_version, event_type, data \
      FROM watch_events \
      WHERE resource_version > ?1 AND event_type = 'DELETED' \
@@ -158,6 +170,14 @@ pub(super) const APPLIED_OUTBOX_GET: &str = "SELECT idempotency_key, subject_key
 
 pub(super) const APPLIED_OUTBOX_LIST_ALL: &str = "SELECT idempotency_key, subject_key, operation, \
      first_seen_ms, applied_rv, result_proto, status_stamp FROM applied_outbox ORDER BY idempotency_key";
+
+/// memory-improvement.md §10 P1: keyset-paginated form of
+/// `APPLIED_OUTBOX_LIST_ALL`. Rows with `idempotency_key > ?1` in the same
+/// `ORDER BY idempotency_key ASC` ordering, capped by `LIMIT ?2`. The first
+/// page passes an empty string (every real key is greater than `''`).
+pub(super) const APPLIED_OUTBOX_LIST_ALL_PAGED: &str = "SELECT idempotency_key, subject_key, operation, \
+     first_seen_ms, applied_rv, result_proto, status_stamp FROM applied_outbox \
+     WHERE idempotency_key > ?1 ORDER BY idempotency_key ASC LIMIT ?2";
 
 pub(super) const APPLIED_OUTBOX_INSERT: &str = "INSERT OR IGNORE INTO applied_outbox \
      (idempotency_key, subject_key, operation, first_seen_ms, applied_rv, result_proto, status_stamp) \

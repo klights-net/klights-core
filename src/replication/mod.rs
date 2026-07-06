@@ -15,6 +15,7 @@ pub mod grpc;
 pub mod protocol;
 pub mod service;
 pub mod snapshot;
+pub mod snapshot_commit_channel_sink;
 
 pub use service::ReplicationService;
 

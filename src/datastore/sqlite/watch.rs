@@ -106,6 +106,18 @@ impl Datastore {
         })
     }
 
+    /// memory-improvement.md §10 P1: same mapping as
+    /// `watch_row_to_catchup_resource`, but also surfaces the `watch_events.id`
+    /// column (position 7) so the snapshot emitter can keyset-page the table
+    /// without materializing it all at once.
+    pub(super) fn watch_row_to_catchup_resource_with_id(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<(i64, CatchUpResource)> {
+        let id: i64 = row.get(7)?;
+        let catchup = Self::watch_row_to_catchup_resource(row)?;
+        Ok((id, catchup))
+    }
+
     #[cfg(test)]
     pub fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
         self.watch_bus.subscribe(topic)

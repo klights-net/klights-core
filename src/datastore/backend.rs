@@ -601,6 +601,25 @@ pub trait DatastoreBackend: Send + Sync {
     /// MODIFIED, and DELETED events in resourceVersion order.
     async fn list_all_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>>;
 
+    /// memory-improvement.md §10 P1: keyset-paginated form of
+    /// `list_all_watch_events_since`. Streams the watch-events table batch
+    /// by batch for the snapshot serve path so a multi-million-row table
+    /// never has to be materialized into one `Vec`. Each item carries its
+    /// `watch_events.id` so the caller can advance the cursor; ordering and
+    /// content match the full-list form exactly.
+    async fn list_all_watch_events_since_paged(
+        &self,
+        since_rv: i64,
+        after_resource_version: i64,
+        after_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        let _ = (since_rv, after_resource_version, after_id, limit);
+        Err(anyhow::anyhow!(
+            "backend does not support paginated watch event listing"
+        ))
+    }
+
     /// List deleted resource watch events after `since_rv` across all scopes.
     ///
     /// Replication reconnect uses this to catch up deletes that cannot be
@@ -818,6 +837,21 @@ pub trait DatastoreBackend: Send + Sync {
     async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
         Err(anyhow::anyhow!(
             "backend does not support applied_outbox listing"
+        ))
+    }
+
+    /// memory-improvement.md §10 P1: keyset-paginated form of
+    /// `list_applied_outbox`. Streams the dedup ledger batch by batch for
+    /// the snapshot serve path. Ordering and content match the full-list
+    /// form exactly.
+    async fn list_applied_outbox_paged(
+        &self,
+        after_key: Option<&str>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<AppliedOutboxRecord>> {
+        let _ = (after_key, limit);
+        Err(anyhow::anyhow!(
+            "backend does not support paginated applied_outbox listing"
         ))
     }
 

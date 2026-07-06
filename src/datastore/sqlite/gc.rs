@@ -327,6 +327,37 @@ impl Datastore {
         Ok(items)
     }
 
+    /// memory-improvement.md §10 P1: keyset-paginated form of
+    /// `list_all_watch_events_since`. Returns up to `limit` rows whose
+    /// `(resource_version, id)` strictly follows `(<after_resource_version>,
+    /// <after_id>)`, with `resource_version > since_rv`, in the same
+    /// `(resource_version ASC, id ASC)` ordering as the full-list form.
+    /// Each item carries its `watch_events.id` so the caller can advance the
+    /// cursor. The first page passes `(since_rv, 0)`.
+    pub async fn list_all_watch_events_since_paged(
+        &self,
+        since_rv: i64,
+        after_resource_version: i64,
+        after_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        let limit_i64 = limit.get() as i64;
+        let items = self
+            .db_call("list_all_watch_events_since_paged", move |conn| {
+                let mut stmt = conn.prepare(queries::WATCH_EVENTS_LIST_ALL_SINCE_PAGED)?;
+                let rows = stmt
+                    .query_map(
+                        rusqlite::params![since_rv, after_resource_version, after_id, limit_i64],
+                        Self::watch_row_to_catchup_resource_with_id,
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .await?;
+
+        Ok(items)
+    }
+
     pub async fn list_deleted_watch_events_since(
         &self,
         since_rv: i64,
