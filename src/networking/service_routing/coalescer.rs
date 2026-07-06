@@ -853,21 +853,74 @@ async fn run_service_routing_watch_worker(
                                 api_version = target.api_version,
                                 kind = target.kind,
                                 error = %err,
-                                "service routing watch stream failed; scheduling full service sync"
+                                "service routing watch stream failed; reconnecting that one watch and scheduling full sync"
                             );
                             force_full_sync.store(true, Ordering::Release);
                             notify.notify_one();
-                            reopen_watch_set = true;
+                            // memory-improvement.md: reconnect only the failed
+                            // watch target instead of tearing down ALL six. The
+                            // old `reopen_watch_set = true` caused healthy
+                            // Service/Endpoints/EndpointSlice watches to be
+                            // restarted every time the high-volume Pod watch
+                            // hiccuped, creating repeated windows where new
+                            // service endpoints were invisible to nftables.
+                            let reopened = match cluster_api
+                                .watch_resources(target.request())
+                                .await
+                            {
+                                Ok(new_stream) => {
+                                    streams.push(wrap_service_routing_watch_stream(
+                                        target,
+                                        new_stream,
+                                    ));
+                                    true
+                                }
+                                Err(reopen_err) => {
+                                    tracing::warn!(
+                                        api_version = target.api_version,
+                                        kind = target.kind,
+                                        error = %reopen_err,
+                                        "target watch stream reconnect failed; scheduling full watch set reopen"
+                                    );
+                                    false
+                                }
+                            };
+                            if !reopened {
+                                reopen_watch_set = true;
+                            }
                         }
                         Some(ServiceRoutingWatchItem::Closed { target }) => {
                             tracing::warn!(
                                 api_version = target.api_version,
                                 kind = target.kind,
-                                "service routing watch stream closed; scheduling full service sync"
+                                "service routing watch stream closed; reconnecting that one watch and scheduling full sync"
                             );
                             force_full_sync.store(true, Ordering::Release);
                             notify.notify_one();
-                            reopen_watch_set = true;
+                            let reopened = match cluster_api
+                                .watch_resources(target.request())
+                                .await
+                            {
+                                Ok(new_stream) => {
+                                    streams.push(wrap_service_routing_watch_stream(
+                                        target,
+                                        new_stream,
+                                    ));
+                                    true
+                                }
+                                Err(reopen_err) => {
+                                    tracing::warn!(
+                                        api_version = target.api_version,
+                                        kind = target.kind,
+                                        error = %reopen_err,
+                                        "target watch stream reopen after close failed; scheduling full watch set reopen"
+                                    );
+                                    false
+                                }
+                            };
+                            if !reopened {
+                                reopen_watch_set = true;
+                            }
                         }
                         None => {
                             tracing::warn!(
@@ -1483,10 +1536,10 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            client.wait_for_opened(SERVICE_ROUTING_WATCH_TARGETS.len() * 2),
+            client.wait_for_opened(SERVICE_ROUTING_WATCH_TARGETS.len() + 1),
         )
         .await
-        .expect("watch worker must reopen all watches after one stream closes");
+        .expect("watch worker must reconnect the closed watch without reopening all watches");
 
         cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(1), worker.join())
