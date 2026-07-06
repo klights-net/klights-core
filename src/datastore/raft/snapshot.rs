@@ -60,11 +60,24 @@ impl RaftSnapshotData {
         last_applied: Option<LogId<NodeId>>,
         membership: &StoredMembership<NodeId, openraft::BasicNode>,
     ) -> Result<Cursor<Vec<u8>>> {
-        let mut cursor = Cursor::new(Vec::new());
-        cursor.write_all(b"{\"last_applied\":")?;
-        serde_json::to_writer(&mut cursor, &last_applied)?;
-        cursor.write_all(b",\"membership\":")?;
-        serde_json::to_writer(&mut cursor, membership)?;
+        // P2 (memory-improvement.md): stream the JSON through a zstd encoder
+        // so the uncompressed JSON is never fully materialized in memory.
+        // The old code wrote ALL commits to a raw Cursor<Vec<u8>> (hundreds
+        // of MiB under e2e churn) then compressed the whole Vec in one shot.
+        // This stream-compresses incrementally: each JSON write goes through
+        // the zstd encoder, which flushes compressed blocks to `framed` as
+        // they fill. Peak memory is O(zstd window size + page size), not
+        // O(total snapshot size).
+        let mut framed = Vec::new();
+        // Always emit TAG_ZSTD — the streaming encoder can't know the final
+        // size to decide RAW fallback, and JSON always compresses well.
+        framed.push(crate::datastore::raft::compressed::TAG_ZSTD);
+        let mut encoder = zstd::Encoder::new(&mut framed, 3)?;
+        // Write the JSON envelope through the encoder.
+        encoder.write_all(b"{\"last_applied\":")?;
+        serde_json::to_writer(&mut encoder, &last_applied)?;
+        encoder.write_all(b",\"membership\":")?;
+        serde_json::to_writer(&mut encoder, membership)?;
         // Stream the snapshot commits BEFORE reading the leader current_rv.
         // Reading current_rv first opens a TOCTOU window: commits applied
         // during the many streaming awaits below would land in the snapshot
@@ -78,20 +91,15 @@ impl RaftSnapshotData {
         // rows, reading current_rv last guarantees it is >= the maximum
         // emitted resourceVersion. The JSON key order is irrelevant to serde
         // deserialization, so emitting `commits` before `current_rv` is safe.
-        cursor.write_all(b",\"commits\":")?;
-        crate::replication::snapshot::write_snapshot_commits_json_array(db, 0, &mut cursor).await?;
+        encoder.write_all(b",\"commits\":")?;
+        crate::replication::snapshot::write_snapshot_commits_json_array(db, 0, &mut encoder)
+            .await?;
         let current_rv = db.get_current_resource_version().await?;
-        cursor.write_all(b",\"current_rv\":")?;
-        serde_json::to_writer(&mut cursor, &current_rv)?;
-        cursor.write_all(b"}")?;
-        cursor.set_position(0);
-        // T2: compress the assembled JSON with zstd framing so the snapshot
-        // travels as fewer bytes over the chunked InstallSnapshot transfer
-        // (decode side is `deserialize_from_bytes`). Compress here, after the
-        // streaming JSON build, so the streaming writer stays uncompressed and
-        // the framed payload is what is stored/streamed.
-        let raw_json = cursor.into_inner();
-        let framed = crate::datastore::raft::compressed::encode(&raw_json)?;
+        encoder.write_all(b",\"current_rv\":")?;
+        serde_json::to_writer(&mut encoder, &current_rv)?;
+        encoder.write_all(b"}")?;
+        // Finish the zstd stream — flushes remaining compressed data to `framed`.
+        encoder.finish()?;
         Ok(Cursor::new(framed))
     }
 }
@@ -140,5 +148,58 @@ impl RaftSnapshotBuilder<TypeConfig> for SqliteRaftSnapshotBuilder {
             meta,
             snapshot: Box::new(snapshot),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datastore::test_support;
+
+    /// P2 (memory): serialize_from_backend_to_cursor must produce a valid
+    /// zstd-framed payload that round-trips through deserialize_from_bytes.
+    /// The streaming path always emits TAG_ZSTD (no RAW fallback), because
+    /// the streaming encoder can't know the final size to decide fallback.
+    #[tokio::test]
+    async fn streaming_snapshot_round_trips_and_is_zstd_framed() {
+        let db = test_support::in_memory().await;
+        crate::controllers::namespace::init_default_namespaces(&db)
+            .await
+            .unwrap();
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "cm-stream-test",
+            serde_json::json!({"metadata": {"name": "cm-stream-test"}}),
+        )
+        .await
+        .unwrap();
+
+        let membership = StoredMembership::<NodeId, openraft::BasicNode>::default();
+        let cursor = RaftSnapshotData::serialize_from_backend_to_cursor(&db, None, &membership)
+            .await
+            .unwrap();
+
+        let framed = cursor.into_inner();
+        assert_eq!(
+            framed[0],
+            crate::datastore::raft::compressed::TAG_ZSTD,
+            "streaming snapshot must be zstd-framed (P2)"
+        );
+
+        let decoded = RaftSnapshotData::deserialize_from_bytes(&framed).unwrap();
+        assert_eq!(
+            decoded.current_rv,
+            db.get_current_resource_version().await.unwrap()
+        );
+        assert!(!decoded.commits.is_empty(), "snapshot must contain commits");
+        assert!(
+            decoded.commits.iter().any(|c| c.mutations.iter().any(|m| {
+                matches!(m, crate::log_apply::LogApplyMutation::PutResource(row)
+                    if row.name == "cm-stream-test")
+            })),
+            "snapshot must contain the ConfigMap"
+        );
     }
 }

@@ -17,7 +17,7 @@ use anyhow::Result;
 /// Framing tag: the byte preceding the payload identifies its encoding.
 /// `0x00` = raw (uncompressed), `0x5a` = zstd-compressed.
 const TAG_RAW: u8 = 0x00;
-const TAG_ZSTD: u8 = 0x5a;
+pub(crate) const TAG_ZSTD: u8 = 0x5a;
 
 /// Compress `raw` bytes with zstd (level 3), returning `TAG_ZSTD || data`.
 /// Returns `TAG_RAW || raw` when compression does not shrink the input (small
