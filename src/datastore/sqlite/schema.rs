@@ -28,6 +28,16 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
         "CREATE INDEX IF NOT EXISTS idx_namespaced_watch ON namespaced_resources(api_version, kind, namespace, resource_version)",
         [],
     )?;
+    // Namespace-leading index for "list every kind in one namespace"
+    // (`WHERE namespace=? ORDER BY kind, name`), used by namespace-content
+    // listing and GC. The identity/watch indexes above lead with api_version,
+    // so without this index those reads full-SCAN + temp-B-tree sort the
+    // table on the single serialized DB thread (slow as the table grows,
+    // and it starves raft DB I/O).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_namespaced_namespace ON namespaced_resources(namespace, kind, name)",
+        [],
+    )?;
     // First-ownerRef expression index retained as a fast path for legacy/simple
     // owner queries. Correct GC owner matching is done through the normalized
     // resource_owner_refs table so non-first owners are never missed.
@@ -185,6 +195,19 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_events_identity_rv
          ON watch_events(api_version, kind, COALESCE(namespace, '#cluster'), name, resource_version)",
+        [],
+    )?;
+    // resource_version-leading index for rv-ordered reads: the raft
+    // snapshot streamer (`WATCH_EVENTS_LIST_ALL_SINCE[_PAGED]`), the deleted-
+    // event sweep, and watch catch-up all read `ORDER BY resource_version,
+    // id`. Every other watch_events index leads with (api_version, kind), so
+    // those reads otherwise full-SCAN + temp-B-tree sort the whole table on
+    // the single serialized DB thread — slow as watch_events grows through a
+    // conformance run, and it blocks raft log/apply I/O long enough to miss
+    // heartbeat deadlines.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_watch_events_rv_id
+         ON watch_events(resource_version, id)",
         [],
     )?;
     conn.execute(
@@ -426,3 +449,102 @@ impl std::fmt::Display for NodeSubnetParseError {
     }
 }
 impl std::error::Error for NodeSubnetParseError {}
+
+#[cfg(test)]
+mod tests {
+    use super::init_schema_in_conn;
+
+    fn explain(conn: &rusqlite::Connection, sql: &str) -> String {
+        let mut out = String::new();
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare explain");
+        let mut rows = stmt.query([]).expect("query explain");
+        while let Ok(Some(row)) = rows.next() {
+            // EXPLAIN QUERY PLAN columns: (id, parent, notused, detail)
+            let detail: String = row.get(3).unwrap_or_default();
+            out.push_str(&detail);
+            out.push('\n');
+        }
+        out
+    }
+
+    fn index_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            == 1
+    }
+
+    /// Regression: the raft snapshot/GC `watch_events` paged reads order by
+    /// `(resource_version, id)`, but every existing watch_events index led
+    /// with `(api_version, kind)`, so the planner full-SCANned + temp-B-tree
+    /// sorted the whole table on the single serialized DB thread. As
+    /// watch_events grows through a conformance run this saturates the DB
+    /// thread and starves raft heartbeats. There must be an index leading
+    /// with `resource_version` that the rv-ordered reads seek into.
+    #[test]
+    fn watch_events_rv_ordered_reads_use_index_not_full_scan() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        init_schema_in_conn(&mut conn).expect("init schema");
+        assert!(
+            index_exists(&conn, "idx_watch_events_rv_id"),
+            "schema must create idx_watch_events_rv_id for rv-ordered watch_event reads"
+        );
+        // Seed enough rows that the planner prefers the index over a scan.
+        for rv in 1..=2000i64 {
+            conn.execute(
+                "INSERT INTO watch_events
+                 (api_version, kind, namespace, name, resource_version, event_type, data)
+                 VALUES ('v1','Pod','ns','n',?1,'MODIFIED',x'00')",
+                [rv],
+            )
+            .unwrap();
+        }
+        let plan = explain(
+            &conn,
+            "SELECT id, resource_version FROM watch_events
+             WHERE resource_version > 0
+               AND (resource_version > 0 OR (resource_version = 0 AND id > 0))
+             ORDER BY resource_version ASC, id ASC LIMIT 500",
+        );
+        assert!(
+            !plan.contains("SCAN watch_events"),
+            "rv-ordered watch_events read must seek an index, not full-scan. Plan:\n{plan}"
+        );
+    }
+
+    /// Regression: listing every kind in one namespace (`WHERE namespace=?
+    /// ORDER BY kind, name`) full-SCANned because every namespaced index led
+    /// with `api_version`. There must be a namespace-leading index.
+    #[test]
+    fn namespaced_all_kinds_in_namespace_uses_index_not_full_scan() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        init_schema_in_conn(&mut conn).expect("init schema");
+        assert!(
+            index_exists(&conn, "idx_namespaced_namespace"),
+            "schema must create idx_namespaced_namespace for all-kinds-in-namespace lists"
+        );
+        for i in 1..=2000i64 {
+            conn.execute(
+                "INSERT INTO namespaced_resources
+                 (api_version, kind, namespace, name, uid, resource_version, created_rv, data)
+                 VALUES ('v1',?1,'ns',?2,'u',?3,?3,x'00')",
+                rusqlite::params![format!("Kind{}", i % 7), format!("n{i}"), i],
+            )
+            .unwrap();
+        }
+        let plan = explain(
+            &conn,
+            "SELECT data FROM namespaced_resources
+             WHERE namespace='ns' ORDER BY kind, name",
+        );
+        assert!(
+            !plan.contains("SCAN namespaced_resources"),
+            "all-kinds-in-namespace list must seek an index, not full-scan. Plan:\n{plan}"
+        );
+    }
+}
