@@ -107,7 +107,7 @@ rpmsign --addsign "${sign_defines[@]}" "${rpm_files[@]}"
 for rpm_file in "${rpm_files[@]}"; do
   check_output="$(rpm --define "_dbpath $TMPROOT/rpmdb" --checksig --verbose "$rpm_file")"
   printf '%s\n' "$check_output"
-  if ! grep -Eq 'Header .*Signature.*, key ID .*, OK|digests signatures OK' <<<"$check_output"; then
+  if ! grep -Eq 'Header .*Signature.*, key ID .*[:,] OK|digests signatures OK' <<<"$check_output"; then
     echo "RPM signature verification failed for $rpm_file" >&2
     exit 1
   fi
