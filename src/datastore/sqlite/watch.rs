@@ -86,7 +86,9 @@ impl Datastore {
     pub(super) fn watch_row_to_catchup_resource(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<CatchUpResource> {
+        let start = std::time::Instant::now();
         let data_bytes: Vec<u8> = row.get(6)?;
+        let data_len = data_bytes.len();
         let data: serde_json::Value = serde_json::from_slice(&data_bytes)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let event_type: String = row.get(5)?;
@@ -100,6 +102,18 @@ impl Datastore {
             uid: Resource::uid_from_data(&data),
             data: std::sync::Arc::new(data),
         };
+        crate::datastore::diagnostics::log_slow_watch_replay_decode(
+            crate::datastore::diagnostics::SlowWatchReplayDecode {
+                elapsed: start.elapsed(),
+                data_len,
+                api_version: &resource.api_version,
+                kind: &resource.kind,
+                namespace: resource.namespace.as_deref(),
+                name: &resource.name,
+                resource_version: resource.resource_version,
+                event_type: &event_type,
+            },
+        );
         Ok(CatchUpResource {
             resource,
             event_type: catchup_event_type_from_db(event_type),

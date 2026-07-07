@@ -469,7 +469,15 @@ pub fn encode_commit_json(commit: &LogApplyCommit) -> Result<Vec<u8>> {
 }
 
 pub fn decode_commit_json(bytes: &[u8]) -> Result<LogApplyCommit> {
+    let start = std::time::Instant::now();
     if let Ok(commit) = serde_json::from_slice::<LogApplyCommit>(bytes) {
+        crate::datastore::diagnostics::log_slow_log_apply_decode(
+            "json",
+            start.elapsed(),
+            bytes.len(),
+            commit.resource_version,
+            commit.mutations.len(),
+        );
         return Ok(commit);
     }
     let versioned: VersionedLogApplyCommit = serde_json::from_slice(bytes)?;
@@ -480,6 +488,13 @@ pub fn decode_commit_json(bytes: &[u8]) -> Result<LogApplyCommit> {
         .collect::<Result<Vec<_>>>()?;
     let mut commit = LogApplyCommit::new(versioned.resource_version, mutations);
     commit.outbox_watermark = versioned.outbox_watermark;
+    crate::datastore::diagnostics::log_slow_log_apply_decode(
+        "json_legacy",
+        start.elapsed(),
+        bytes.len(),
+        commit.resource_version,
+        commit.mutations.len(),
+    );
     Ok(commit)
 }
 
@@ -497,8 +512,17 @@ pub fn encode_commit_protobuf(commit: &LogApplyCommit) -> Result<Vec<u8>> {
 }
 
 pub fn decode_commit_protobuf(bytes: &[u8]) -> Result<LogApplyCommit> {
+    let start = std::time::Instant::now();
     let proto = ProtoLogApplyCommit::decode(bytes)?;
-    proto.try_into()
+    let commit: LogApplyCommit = proto.try_into()?;
+    crate::datastore::diagnostics::log_slow_log_apply_decode(
+        "protobuf",
+        start.elapsed(),
+        bytes.len(),
+        commit.resource_version,
+        commit.mutations.len(),
+    );
+    Ok(commit)
 }
 
 #[derive(Clone, PartialEq, Message)]

@@ -1668,6 +1668,17 @@ impl Datastore {
                     tx.commit()?;
                     return Ok(BuildOutboxTxnOutcome::Built { commit, rv });
                 }
+                if Self::should_consume_watermark_for_idempotent_existing_create_in_tx(
+                    &tx,
+                    &claim_operation,
+                    &decoded.command,
+                )? {
+                    let rv = Self::next_resource_version_in_tx(&tx)?;
+                    let mut commit = crate::log_apply::LogApplyCommit::new(rv, Vec::new());
+                    commit.outbox_watermark = watermark_for_tx;
+                    tx.commit()?;
+                    return Ok(BuildOutboxTxnOutcome::Built { commit, rv });
+                }
                 let (mut commit, rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
                     decoded.command,
@@ -2084,6 +2095,38 @@ impl Datastore {
                 Ok(OutboxApplyResult::Applied { applied_rv: 0 })
             }
         }
+    }
+
+    fn should_consume_watermark_for_idempotent_existing_create_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        operation: &str,
+        command: &crate::datastore::command::StorageCommand,
+    ) -> tokio_rusqlite::Result<bool> {
+        let idempotent_create = operation
+            == crate::kubelet::outbox::payload::OutboxOperation::EventCreate.as_str()
+            || operation
+                == crate::kubelet::outbox::payload::OutboxOperation::NodeRegistration.as_str();
+        if !idempotent_create {
+            return Ok(false);
+        }
+        let crate::datastore::command::StorageCommand::CreateResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        } = command
+        else {
+            return Ok(false);
+        };
+        Self::resource_row_optional_for_update_in_tx(
+            tx,
+            api_version,
+            kind,
+            namespace.as_deref(),
+            name,
+        )
+        .map(|existing| existing.is_some())
     }
 
     fn should_consume_watermark_for_stale_uid_bound_pod_in_tx(

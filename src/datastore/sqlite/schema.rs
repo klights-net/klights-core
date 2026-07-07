@@ -210,6 +210,14 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
          ON watch_events(resource_version, id)",
         [],
     )?;
+    // GC ranks each resource scope by newest `id` and then deletes old rows.
+    // Match that window partition/order so the serialized DB thread does not
+    // sort the growing watch_events table every GC tick.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_watch_events_scope_id_desc
+         ON watch_events(api_version, kind, COALESCE(namespace, '#cluster'), id DESC)",
+        [],
+    )?;
     conn.execute(
         "CREATE TABLE IF NOT EXISTS watch_replay_floors (
             api_version   TEXT NOT NULL,
@@ -527,6 +535,53 @@ mod tests {
         assert!(
             !plan.contains("SCAN watch_events"),
             "rv-ordered watch_events read must seek an index, not full-scan. Plan:\n{plan}"
+        );
+    }
+
+    /// Regression: watch_events GC ranks rows inside each
+    /// `(api_version, kind, namespace)` scope by descending `id`. Without a
+    /// matching expression index, SQLite scans an unrelated identity index and
+    /// builds a temp B-tree for the window order on the serialized DB thread.
+    #[test]
+    fn watch_events_gc_scope_rank_uses_matching_index() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        init_schema_in_conn(&mut conn).expect("init schema");
+        assert!(
+            index_exists(&conn, "idx_watch_events_scope_id_desc"),
+            "schema must create idx_watch_events_scope_id_desc for watch_event GC scope ranking"
+        );
+        for rv in 1..=2000i64 {
+            conn.execute(
+                "INSERT INTO watch_events
+                 (api_version, kind, namespace, name, resource_version, event_type, data)
+                 VALUES ('v1','Pod',?1,?2,?3,'MODIFIED',x'00')",
+                rusqlite::params![format!("ns{}", rv % 5), format!("n{rv}"), rv],
+            )
+            .unwrap();
+        }
+        let plan = explain(
+            &conn,
+            "SELECT id, api_version, kind, COALESCE(namespace, '#cluster'), resource_version
+             FROM (
+                 SELECT id, api_version, kind, namespace, resource_version,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY api_version, kind, COALESCE(namespace, '#cluster')
+                            ORDER BY id DESC
+                        ) AS scope_rank
+                 FROM watch_events
+             )
+             WHERE id <= COALESCE((SELECT MAX(id) FROM watch_events), 0) - 1000
+               AND scope_rank > 1000
+             ORDER BY id ASC
+             LIMIT 100",
+        );
+        assert!(
+            plan.contains("idx_watch_events_scope_id_desc"),
+            "watch_events GC scope ranking must use its matching index. Plan:\n{plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR RIGHT PART OF ORDER BY"),
+            "watch_events GC scope ranking must not sort each partition on the DB thread. Plan:\n{plan}"
         );
     }
 

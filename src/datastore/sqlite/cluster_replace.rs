@@ -355,6 +355,8 @@ fn apply_commit_in_tx_with_watch_events(
         }
         OutboxWatermarkDecision::Apply => {}
     }
+    let mutation_count = commit.mutations.len();
+    let apply_start = std::time::Instant::now();
     let mut effects = ApplyEffects::new();
     let mut applier = RaftClusterStateApplier::new(tx);
     for mutation in commit.mutations {
@@ -370,7 +372,16 @@ fn apply_commit_in_tx_with_watch_events(
         upsert_outbox_watermark_in_tx(tx, watermark)?;
     }
     advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
-    Ok((applied_rv, effects.into_pending_watch_events()))
+    let pending = effects.into_pending_watch_events();
+    crate::datastore::diagnostics::log_slow_log_apply_commit(
+        apply_start.elapsed(),
+        commit.resource_version,
+        mutation_count,
+        pending.len(),
+        emit_watch_events,
+        raft_authoritative,
+    );
+    Ok((applied_rv, pending))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

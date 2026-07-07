@@ -352,6 +352,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watermarked_terminal_event_create_conflict_advances_stream() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_namespace(
+            "event-conflict",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "event-conflict"}
+            }),
+        )
+        .await
+        .expect("create event namespace");
+        db.create_resource(
+            "events.k8s.io/v1",
+            "Event",
+            Some("event-conflict"),
+            "duplicate-event",
+            json!({
+                "apiVersion": "events.k8s.io/v1",
+                "kind": "Event",
+                "metadata": {
+                    "namespace": "event-conflict",
+                    "name": "duplicate-event",
+                    "uid": "existing-event-uid"
+                },
+                "eventTime": "2026-07-07T00:00:00Z",
+                "reportingController": "klights.test",
+                "reportingInstance": "worker-a",
+                "action": "Started",
+                "reason": "AlreadyThere",
+                "regarding": {"kind": "Pod", "namespace": "event-conflict", "name": "pod-a"}
+            }),
+        )
+        .await
+        .expect("seed duplicate Event");
+
+        let first_watermark = crate::log_apply::OutboxStreamWatermark {
+            client_id: "worker-client".to_string(),
+            stream_id: 54,
+            stream_seq: 1,
+        };
+        let first = propose_outbox_on_backend_with_watermark(
+            &db,
+            "duplicate-event-create",
+            OutboxOperation::EventCreate,
+            outbox_payload(StorageCommand::CreateResource {
+                api_version: "events.k8s.io/v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some("event-conflict".to_string()),
+                name: "duplicate-event".to_string(),
+                data: json!({
+                    "apiVersion": "events.k8s.io/v1",
+                    "kind": "Event",
+                    "metadata": {
+                        "namespace": "event-conflict",
+                        "name": "duplicate-event"
+                    },
+                    "eventTime": "2026-07-07T00:00:01Z",
+                    "reportingController": "klights.test",
+                    "reportingInstance": "worker-a",
+                    "action": "Started",
+                    "reason": "Duplicate",
+                    "regarding": {"kind": "Pod", "namespace": "event-conflict", "name": "pod-a"}
+                }),
+            }),
+            "worker-a",
+            Some(first_watermark.clone()),
+        )
+        .await
+        .expect("terminal duplicate Event must still consume the stream watermark");
+
+        assert!(matches!(first.result, OutboxApplyResult::Applied { .. }));
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![first_watermark]
+        );
+
+        propose_outbox_on_backend_with_watermark(
+            &db,
+            "next-event-create",
+            OutboxOperation::EventCreate,
+            outbox_payload(StorageCommand::CreateResource {
+                api_version: "events.k8s.io/v1".to_string(),
+                kind: "Event".to_string(),
+                namespace: Some("event-conflict".to_string()),
+                name: "next-event".to_string(),
+                data: json!({
+                    "apiVersion": "events.k8s.io/v1",
+                    "kind": "Event",
+                    "metadata": {
+                        "namespace": "event-conflict",
+                        "name": "next-event"
+                    },
+                    "eventTime": "2026-07-07T00:00:02Z",
+                    "reportingController": "klights.test",
+                    "reportingInstance": "worker-a",
+                    "action": "Started",
+                    "reason": "Next",
+                    "regarding": {"kind": "Pod", "namespace": "event-conflict", "name": "pod-b"}
+                }),
+            }),
+            "worker-a",
+            Some(crate::log_apply::OutboxStreamWatermark {
+                client_id: "worker-client".to_string(),
+                stream_id: 54,
+                stream_seq: 2,
+            }),
+        )
+        .await
+        .expect("next stream entry must not wedge behind terminal EventCreate conflict");
+
+        assert!(
+            db.get_resource(
+                "events.k8s.io/v1",
+                "Event",
+                Some("event-conflict"),
+                "next-event"
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn watermarked_duplicate_node_registration_advances_stream() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            "mn-replica",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "mn-replica", "uid": "existing-node-uid"}
+            }),
+        )
+        .await
+        .expect("seed duplicate Node");
+
+        let first_watermark = crate::log_apply::OutboxStreamWatermark {
+            client_id: "worker-client".to_string(),
+            stream_id: 62,
+            stream_seq: 1,
+        };
+        let first = propose_outbox_on_backend_with_watermark(
+            &db,
+            "duplicate-node-registration",
+            OutboxOperation::NodeRegistration,
+            outbox_payload(StorageCommand::CreateResource {
+                api_version: "v1".to_string(),
+                kind: "Node".to_string(),
+                namespace: None,
+                name: "mn-replica".to_string(),
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {"name": "mn-replica"},
+                    "spec": {},
+                    "status": {}
+                }),
+            }),
+            "mn-replica",
+            Some(first_watermark.clone()),
+        )
+        .await
+        .expect("duplicate NodeRegistration must still consume the stream watermark");
+
+        assert!(matches!(first.result, OutboxApplyResult::Applied { .. }));
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![first_watermark]
+        );
+
+        propose_outbox_on_backend_with_watermark(
+            &db,
+            "next-node-registration-stream-entry",
+            OutboxOperation::PodMetadata,
+            outbox_payload(StorageCommand::CreateNamespace {
+                name: "after-node-registration-gap".to_string(),
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {"name": "after-node-registration-gap"}
+                }),
+            }),
+            "mn-replica",
+            Some(crate::log_apply::OutboxStreamWatermark {
+                client_id: "worker-client".to_string(),
+                stream_id: 62,
+                stream_seq: 2,
+            }),
+        )
+        .await
+        .expect("next stream entry must not wedge behind duplicate NodeRegistration");
+
+        assert!(
+            db.get_namespace("after-node-registration-gap")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn raft_outbox_runtime_reconcile_applies_complete_worker_status() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
