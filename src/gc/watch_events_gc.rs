@@ -196,6 +196,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gc_makes_progress_when_transient_scopes_exceed_global_cap() {
+        let db = crate::datastore::test_support::in_memory().await;
+
+        for i in 0..30 {
+            db.create_resource(
+                "v1",
+                "ConfigMap",
+                Some(&format!("transient-{i}")),
+                "cm",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "cm", "namespace": format!("transient-{i}")},
+                    "data": {"k": "v"}
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let removed = db.gc_watch_events(10, 1000).await.unwrap();
+        assert!(
+            removed > 0,
+            "GC must not stall forever when many sparse transient scopes exceed the global cap"
+        );
+    }
+
+    #[tokio::test]
     async fn watch_events_gc_task_name() {
         let db = crate::datastore::test_support::in_memory().await;
         let task = WatchEventsGc::new(std::sync::Arc::new(db));

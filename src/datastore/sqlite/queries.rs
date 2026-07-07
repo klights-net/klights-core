@@ -118,6 +118,11 @@ pub(super) const WATCH_EVENTS_COUNT: &str = "SELECT COUNT(*) FROM watch_events";
 pub(super) const WATCH_EVENTS_MIN_RV: &str =
     "SELECT resource_version FROM watch_events ORDER BY id ASC LIMIT 1";
 
+pub(super) const WATCH_EVENTS_SCOPE_COUNT: &str = "SELECT COUNT(*) FROM (
+         SELECT 1 FROM watch_events
+         GROUP BY api_version, kind, COALESCE(namespace, '#cluster')
+     )";
+
 pub(super) const WATCH_REPLAY_FLOOR_UPSERT: &str =
     "INSERT INTO watch_replay_floors (api_version, kind, namespace_key, floor_rv)
      VALUES (?1, ?2, ?3, ?4)

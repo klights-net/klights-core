@@ -12,9 +12,20 @@ use crate::datastore::types::*;
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 const DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE: i64 = 1_024;
+const MIN_SCOPE_COUNT_BEFORE_EXPIRING_SCOPES: usize = 16;
 
-fn watch_events_min_scope_rows(max_rows: i64) -> usize {
-    max_rows.clamp(1, DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE) as usize
+fn watch_events_min_scope_rows(max_rows: i64, scope_count: usize) -> usize {
+    if max_rows <= 0 || scope_count == 0 {
+        return 0;
+    }
+    let fair_share = (max_rows as usize) / scope_count;
+    let dynamic_floor = if fair_share == 0 && scope_count <= MIN_SCOPE_COUNT_BEFORE_EXPIRING_SCOPES
+    {
+        1
+    } else {
+        fair_share
+    };
+    (max_rows.clamp(1, DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE) as usize).min(dynamic_floor)
 }
 
 fn watch_events_max_rows(max_rows: i64) -> usize {
@@ -343,7 +354,6 @@ fn watch_gc_candidates(
     }
 
     let global_prunable = entries.len() - max_rows;
-    let min_scope_rows = watch_events_min_scope_rows(max_rows as i64);
     let batch_cap = watch_events_batch_cap(batch_cap);
     let mut scope_totals: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     for (_, floor_key) in entries {
@@ -351,6 +361,7 @@ fn watch_gc_candidates(
             *scope_totals.entry(key.clone()).or_default() += 1;
         }
     }
+    let min_scope_rows = watch_events_min_scope_rows(max_rows as i64, scope_totals.len());
 
     let mut seen_by_scope: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let mut candidates = Vec::new();

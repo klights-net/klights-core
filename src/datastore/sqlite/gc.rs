@@ -6,9 +6,36 @@ use std::collections::HashMap;
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 const DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE: i64 = 1_024;
+const MIN_SCOPE_COUNT_BEFORE_EXPIRING_SCOPES: i64 = 16;
 
 pub(super) fn watch_events_min_scope_rows(max_rows: i64) -> i64 {
     max_rows.clamp(1, DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE)
+}
+
+fn watch_events_min_scope_rows_for_scope_count(max_rows: i64, scope_count: i64) -> i64 {
+    if max_rows <= 0 || scope_count <= 0 {
+        return 0;
+    }
+    let fair_share = max_rows / scope_count;
+    let dynamic_floor = if fair_share == 0 && scope_count <= MIN_SCOPE_COUNT_BEFORE_EXPIRING_SCOPES
+    {
+        1
+    } else {
+        fair_share
+    };
+    watch_events_min_scope_rows(max_rows).min(dynamic_floor)
+}
+
+fn watch_events_min_scope_rows_in_conn(
+    conn: &rusqlite::Connection,
+    max_rows: i64,
+) -> rusqlite::Result<i64> {
+    let scope_count =
+        conn.query_row::<i64, _, _>(queries::WATCH_EVENTS_SCOPE_COUNT, [], |row| row.get(0))?;
+    Ok(watch_events_min_scope_rows_for_scope_count(
+        max_rows,
+        scope_count,
+    ))
 }
 
 impl Datastore {
@@ -107,9 +134,9 @@ impl Datastore {
         max_rows: i64,
         batch_cap: i64,
     ) -> Result<usize> {
-        let min_scope_rows = watch_events_min_scope_rows(max_rows);
         let count = self
             .db_call("watch_events_gc_prunable_count", move |conn| {
+                let min_scope_rows = watch_events_min_scope_rows_in_conn(conn, max_rows)?;
                 Ok(conn.query_row::<i64, _, _>(
                     queries::WATCH_EVENTS_GC_PRUNABLE_COUNT,
                     rusqlite::params![max_rows, batch_cap, min_scope_rows],
@@ -385,7 +412,7 @@ pub(super) fn gc_watch_events_in_tx(
     batch_cap: i64,
 ) -> rusqlite::Result<usize> {
     let (ids, floors) = {
-        let min_scope_rows = watch_events_min_scope_rows(max_rows);
+        let min_scope_rows = watch_events_min_scope_rows_in_conn(tx, max_rows)?;
         let mut stmt = tx.prepare(queries::WATCH_EVENTS_GC_CANDIDATES)?;
         let rows = stmt.query_map(
             rusqlite::params![max_rows, batch_cap, min_scope_rows],
@@ -497,4 +524,33 @@ fn read_namespaced_all_floor(
         rusqlite::params![api_version, kind],
         |row| row.get::<_, Option<i64>>(0),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_events_scope_floor_shrinks_when_scope_count_would_exceed_global_cap() {
+        assert_eq!(
+            watch_events_min_scope_rows_for_scope_count(100_000, 40),
+            1_024,
+            "normal scope counts keep the configured rare-scope floor"
+        );
+        assert_eq!(
+            watch_events_min_scope_rows_for_scope_count(100_000, 1_000),
+            100,
+            "many e2e-created scopes must not reserve 1024 rows each"
+        );
+        assert_eq!(
+            watch_events_min_scope_rows_for_scope_count(10, 30),
+            0,
+            "when scopes outnumber the global cap, global retention must be allowed to expire some scopes"
+        );
+        assert_eq!(
+            watch_events_min_scope_rows_for_scope_count(1, 3),
+            1,
+            "small scope counts should still preserve one rare-scope row even with an aggressive cap"
+        );
+    }
 }
