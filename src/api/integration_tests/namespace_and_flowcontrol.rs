@@ -3666,11 +3666,26 @@ async fn test_gc_foreground_rc_delete_retains_parent_until_pods_are_deleted() {
         parent.data
     );
 
-    let child = db
-        .get_resource("v1", "Pod", Some("default"), "gc-foreground-child")
-        .await
-        .unwrap()
-        .expect("foreground GC must not hard-delete Pod rows");
+    let child = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let child = db
+                .get_resource("v1", "Pod", Some("default"), "gc-foreground-child")
+                .await
+                .unwrap()
+                .expect("foreground GC must not hard-delete Pod rows");
+            if child
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(|v| v.as_str())
+                .is_some()
+            {
+                break child;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("foreground GC should asynchronously mark owned Pod terminating");
     assert!(
         child
             .data
@@ -3750,10 +3765,20 @@ async fn test_gc_foreground_delete_ignores_non_blocking_owner_ref_child() {
     let resp = app.clone().oneshot(del).await.unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-    let parent = db
-        .get_resource("v1", "ConfigMap", Some("default"), "gc-nonblocking-owner")
-        .await
-        .unwrap();
+    let parent = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let parent = db
+                .get_resource("v1", "ConfigMap", Some("default"), "gc-nonblocking-owner")
+                .await
+                .unwrap();
+            if parent.is_none() {
+                break parent;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("foreground GC should asynchronously finalize non-blocked owner");
     assert!(
         parent.is_none(),
         "non-blocking ownerReferences must not retain a foreground-deleting owner: {:?}",

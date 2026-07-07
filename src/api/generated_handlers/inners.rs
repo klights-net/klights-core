@@ -105,6 +105,93 @@ async fn maybe_reconcile_cluster_role_aggregation(
     }
 }
 
+async fn schedule_foreground_owner_finalization(
+    state: &Arc<AppState>,
+    api_version: &'static str,
+    kind: &'static str,
+    namespace: Option<&str>,
+    name: &str,
+    owner: Resource,
+) {
+    let dispatch_state = state.clone();
+    let namespace = namespace.map(str::to_string);
+    let name = name.to_string();
+    let dispatch_namespace = namespace.clone();
+    let dispatch_name = name.clone();
+
+    if let Err(err) = state
+        .task_supervisor
+        .spawn_async(
+            crate::task_supervisor::TaskCategory::Background,
+            "foreground_owner_finalization_dispatch",
+            async move {
+                let worker_state = dispatch_state.clone();
+                let worker_namespace = dispatch_namespace.clone();
+                let worker_name = dispatch_name.clone();
+                let worker_owner = owner;
+                let worker_supervisor = dispatch_state.task_supervisor.clone();
+                let worker_metrics = dispatch_state.metrics.clone();
+                if let Err(err) = worker_supervisor
+                    .spawn_async(
+                        crate::task_supervisor::TaskCategory::PodDeleteWorkqueue,
+                        "foreground_owner_finalization",
+                        async move {
+                            if let Err(err) = controllers::gc::finalize_foreground_owner_if_ready(
+                                worker_state.db.as_ref(),
+                                &worker_owner,
+                                worker_state.pod_repository.as_ref()
+                                    as &dyn crate::controllers::gc::GcPodDeleteSink,
+                            )
+                            .await
+                            {
+                                worker_metrics
+                                    .cascade_delete_failures_total
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(
+                                    namespace = ?worker_namespace,
+                                    name = %worker_name,
+                                    api_version = %api_version,
+                                    kind = %kind,
+                                    error = %err,
+                                    "foreground owner finalization failed"
+                                );
+                            }
+                        },
+                    )
+                    .await
+                {
+                    dispatch_state
+                        .metrics
+                        .cascade_delete_failures_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        namespace = ?dispatch_namespace,
+                        name = %dispatch_name,
+                        api_version = %api_version,
+                        kind = %kind,
+                        error = %err,
+                        "failed to schedule foreground owner finalization work task"
+                    );
+                }
+            },
+        )
+        .await
+    {
+        state
+            .metrics
+            .cascade_delete_failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            namespace = ?namespace,
+            name = %name,
+            api_version = %api_version,
+            kind = %kind,
+            error = %err,
+            "failed to schedule foreground owner finalization dispatch task"
+        );
+    }
+}
+
 async fn dispatch_generated_mutation_event(
     state: &Arc<AppState>,
     operation: crate::api::mutation::MutationOperation,
@@ -1703,19 +1790,15 @@ pub async fn delete_inner(
     .await?;
     let resource = match outcome {
         crate::api::mutation::delete::DeleteResult::MarkedTerminating(updated) => {
-            if let Err(e) = controllers::gc::finalize_foreground_owner_if_ready(
-                state.db.as_ref(),
-                &updated,
-                state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+            schedule_foreground_owner_finalization(
+                &state,
+                api_version,
+                kind,
+                ns,
+                name,
+                updated.clone(),
             )
-            .await
-            {
-                state
-                    .metrics
-                    .cascade_delete_failures_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::error!(namespace = ?ns, name = %name, error = %e, "foreground delete readiness check failed");
-            }
+            .await;
 
             crate::api::apiservice_proxy::invalidate_apiservice_proxy_cache_for_resource(
                 &state,
@@ -2445,5 +2528,148 @@ mod tests {
             !view_has_rule(&state, &aggregate_rule).await,
             "live ClusterRole delete should revoke aggregated source rules"
         );
+    }
+
+    #[tokio::test]
+    async fn foreground_delete_returns_after_marking_owner_without_synchronous_pod_cascade() {
+        let mut app_state = crate::api::test_support::build_test_app_state().await;
+        let release_workqueue = Arc::new(tokio::sync::Notify::new());
+        let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig {
+                pod_delete_workqueue: 1,
+                ..crate::task_supervisor::TaskCategoryConfig::default()
+            },
+        ));
+        let held_workqueue = task_supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::PodDeleteWorkqueue,
+                "hold_foreground_delete_workqueue_for_test",
+                {
+                    let release_workqueue = release_workqueue.clone();
+                    async move {
+                        release_workqueue.notified().await;
+                    }
+                },
+            )
+            .await
+            .expect("hold pod-delete workqueue permit");
+        app_state.task_supervisor = task_supervisor;
+        let state = Arc::new(app_state);
+        let owner_uid = "fg-rc-owner-uid";
+        state
+            .db
+            .create_resource(
+                "v1",
+                "ReplicationController",
+                Some("default"),
+                "fg-rc",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ReplicationController",
+                    "metadata": {
+                        "name": "fg-rc",
+                        "namespace": "default",
+                        "uid": owner_uid
+                    }
+                }),
+            )
+            .await
+            .expect("create foreground RC");
+
+        for i in 0..3 {
+            let pod_name = format!("fg-rc-pod-{i}");
+            let pod_uid = format!("fg-rc-pod-{i}-uid");
+            state
+                .db
+                .create_resource(
+                    "v1",
+                    "Pod",
+                    Some("default"),
+                    &pod_name,
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "name": pod_name,
+                            "namespace": "default",
+                            "uid": pod_uid,
+                            "ownerReferences": [{
+                                "apiVersion": "v1",
+                                "kind": "ReplicationController",
+                                "name": "fg-rc",
+                                "uid": owner_uid,
+                                "blockOwnerDeletion": true
+                            }]
+                        },
+                        "spec": {
+                            "containers": [{"name": "nginx", "image": "nginx"}]
+                        }
+                    }),
+                )
+                .await
+                .expect("create RC child Pod");
+        }
+
+        let identity = crate::auth::AuthenticatedIdentity::admin("test-admin");
+        let (status, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            delete_inner(
+                state.clone(),
+                &identity,
+                GeneratedDeleteInnerRequest {
+                    target: GeneratedNamedResource {
+                        api_version: "v1",
+                        kind: "ReplicationController",
+                        namespace: Some("default"),
+                        name: "fg-rc",
+                    },
+                    query: CreateUpdateQuery {
+                        dry_run: None,
+                        field_manager: None,
+                        field_validation: None,
+                        force: None,
+                        orphan_dependents: None,
+                        propagation_policy: Some("Foreground".to_string()),
+                        grace_period_seconds: None,
+                    },
+                    body: Bytes::new(),
+                },
+            ),
+        )
+        .await
+        .expect("foreground delete response should not wait for pod-delete workqueue")
+        .expect("foreground delete RC");
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(
+            body.0.pointer("/metadata/deletionTimestamp").is_some(),
+            "foreground delete response must mark the owner terminating"
+        );
+        assert!(
+            body.0
+                .pointer("/metadata/finalizers")
+                .and_then(Value::as_array)
+                .is_some_and(|finalizers| finalizers
+                    .iter()
+                    .any(|finalizer| finalizer.as_str() == Some("foregroundDeletion"))),
+            "foreground delete response must retain the foregroundDeletion finalizer"
+        );
+
+        for i in 0..3 {
+            let pod_name = format!("fg-rc-pod-{i}");
+            let pod = state
+                .db
+                .get_resource("v1", "Pod", Some("default"), &pod_name)
+                .await
+                .expect("read child Pod")
+                .expect("child Pod should still exist");
+            assert!(
+                pod.data.pointer("/metadata/deletionTimestamp").is_none(),
+                "foreground delete must not mark child Pod {pod_name} terminating before the owner DELETE response returns"
+            );
+        }
+
+        release_workqueue.notify_waiters();
+        held_workqueue.abort();
     }
 }
