@@ -73,6 +73,17 @@ fn has_finalizer(data: &Value, finalizer: &str) -> bool {
         })
 }
 
+fn has_only_orphan_finalizer(data: &Value) -> bool {
+    data.pointer("/metadata/finalizers")
+        .and_then(|v| v.as_array())
+        .filter(|finalizers| !finalizers.is_empty())
+        .is_some_and(|finalizers| {
+            finalizers
+                .iter()
+                .all(|value| value.as_str() == Some(ORPHAN_FINALIZER))
+        })
+}
+
 fn add_finalizer(data: &mut Value, finalizer: &'static str) {
     let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut()) else {
         return;
@@ -375,6 +386,23 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
             }
         }
 
+        if orphan_children_before_completion && has_only_orphan_finalizer(&resource.data) {
+            if attempt < DELETE_MAX_CONFLICT_RETRIES {
+                tracing::debug!(
+                    api_version = %api_version,
+                    kind = %kind,
+                    namespace = ?namespace,
+                    name = %name,
+                    attempt = attempt,
+                    "orphan delete observed only the internal orphan finalizer after completion attempt; retrying"
+                );
+                continue;
+            }
+            return Err(AppError::Conflict(
+                "orphan delete conflicted after retries".to_string(),
+            ));
+        }
+
         let has_finalizers = resource
             .data
             .pointer("/metadata/finalizers")
@@ -554,12 +582,278 @@ pub async fn finalize_after_update_if_ready(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use std::time::Duration;
 
+    use async_trait::async_trait;
     use serde_json::json;
 
     use super::*;
+    use crate::datastore::command::StorageCommand;
     use crate::watch::EventType;
+
+    struct OrphanFinalizerReinjectingProposer {
+        inner: crate::datastore::backend::DatastoreHandle,
+        reinjected: AtomicBool,
+    }
+
+    impl OrphanFinalizerReinjectingProposer {
+        fn should_reinject_orphan_finalizer(command: &StorageCommand) -> bool {
+            let StorageCommand::UpdateResource {
+                api_version,
+                kind,
+                namespace,
+                name,
+                data,
+                ..
+            } = command
+            else {
+                return false;
+            };
+            api_version == "apps/v1"
+                && kind == "Deployment"
+                && namespace.as_deref() == Some("orphan-raft-race")
+                && name == "demo"
+                && data
+                    .pointer("/metadata/deletionTimestamp")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| !value.is_empty())
+                && !data
+                    .pointer("/metadata/finalizers")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|finalizers| {
+                        finalizers
+                            .iter()
+                            .any(|finalizer| finalizer.as_str() == Some("orphan"))
+                    })
+        }
+
+        async fn apply_inline(&self, command: StorageCommand) -> anyhow::Result<()> {
+            let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+                .encode_protobuf()?;
+            let key = format!("orphan-race-{}", uuid::Uuid::new_v4());
+            crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                self.inner.as_ref(),
+                &key,
+                crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
+                bytes::Bytes::from(payload),
+                "orphan-race-proposer",
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("inline propose: {err}"))?;
+            Ok(())
+        }
+
+        async fn reinsert_orphan_finalizer(&self) -> anyhow::Result<()> {
+            let current = self
+                .inner
+                .get_resource("apps/v1", "Deployment", Some("orphan-raft-race"), "demo")
+                .await?
+                .expect("Deployment must exist before racing stale status write");
+            let mut data: serde_json::Value = (*current.data).clone();
+            let metadata = data
+                .get_mut("metadata")
+                .and_then(|value| value.as_object_mut())
+                .expect("Deployment metadata must be an object");
+            metadata.insert("finalizers".to_string(), json!(["orphan"]));
+            data["status"] = json!({"racedStatusWrite": true});
+            self.inner
+                .update_resource_with_preconditions(
+                    "apps/v1",
+                    "Deployment",
+                    Some("orphan-raft-race"),
+                    "demo",
+                    data,
+                    ResourcePreconditions::from_resource(&current),
+                )
+                .await?;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl crate::datastore::replicated::RaftProposer for OrphanFinalizerReinjectingProposer {
+        async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+            let should_reinject = Self::should_reinject_orphan_finalizer(&command)
+                && !self.reinjected.swap(true, Ordering::SeqCst);
+            self.apply_inline(command).await?;
+            if should_reinject {
+                self.reinsert_orphan_finalizer().await?;
+            }
+            Ok(())
+        }
+
+        async fn propose_outbox_command(
+            &self,
+            _idempotency_key: &str,
+            _operation: &str,
+            command: StorageCommand,
+            _authoring_node: &str,
+        ) -> std::result::Result<
+            crate::kubelet::outbox::OutboxApplyResult,
+            crate::kubelet::outbox::OutboxApplyError,
+        > {
+            self.propose_command(command).await.map_err(|err| {
+                crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+            })?;
+            let applied_rv = self
+                .inner
+                .get_current_resource_version()
+                .await
+                .map_err(|err| {
+                    crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                })?;
+            Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv })
+        }
+    }
+
+    #[tokio::test]
+    async fn orphan_delete_retries_when_raft_race_reintroduces_internal_orphan_finalizer() {
+        let inner: crate::datastore::backend::DatastoreHandle =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        let db = crate::datastore::replicated::ReplicatedDatastore::new(
+            inner.clone(),
+            crate::datastore::replicated::ReplicationMode::Raft {
+                node_name: "test-node".to_string(),
+            },
+        );
+        let proposer = Arc::new(OrphanFinalizerReinjectingProposer {
+            inner,
+            reinjected: AtomicBool::new(false),
+        });
+        db.set_raft_proposer(proposer.clone());
+
+        db.create_namespace(
+            "orphan-raft-race",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "orphan-raft-race"}
+            }),
+        )
+        .await
+        .unwrap();
+        db.create_resource(
+            "apps/v1",
+            "Deployment",
+            Some("orphan-raft-race"),
+            "demo",
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "namespace": "orphan-raft-race",
+                    "name": "demo",
+                    "uid": "deploy-uid"
+                },
+                "spec": {
+                    "replicas": 1,
+                    "selector": {"matchLabels": {"app": "demo"}},
+                    "template": {
+                        "metadata": {"labels": {"app": "demo"}},
+                        "spec": {"containers": [{"name": "nginx", "image": "nginx"}]}
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        db.create_resource(
+            "apps/v1",
+            "ReplicaSet",
+            Some("orphan-raft-race"),
+            "demo-abc123",
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "ReplicaSet",
+                "metadata": {
+                    "namespace": "orphan-raft-race",
+                    "name": "demo-abc123",
+                    "uid": "rs-uid",
+                    "ownerReferences": [{
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "name": "demo",
+                        "uid": "deploy-uid",
+                        "controller": true,
+                        "blockOwnerDeletion": true
+                    }]
+                },
+                "spec": {
+                    "replicas": 1,
+                    "selector": {"matchLabels": {"app": "demo"}},
+                    "template": {
+                        "metadata": {"labels": {"app": "demo"}},
+                        "spec": {"containers": [{"name": "nginx", "image": "nginx"}]}
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let owner = db
+            .get_resource("apps/v1", "Deployment", Some("orphan-raft-race"), "demo")
+            .await
+            .unwrap()
+            .expect("deployment exists");
+        let outcome = complete_non_foreground_delete_with_live_recheck(
+            &db,
+            NonForegroundDeleteRequest {
+                target: ResourceDeleteTarget {
+                    api_version: "apps/v1",
+                    kind: "Deployment",
+                    namespace: Some("orphan-raft-race"),
+                    name: "demo",
+                },
+                initial_resource: owner,
+                delete_preconditions: ResourcePreconditions::uid("deploy-uid"),
+                orphan_children_before_completion: true,
+                uid_mismatch_is_conflict: true,
+                grace_seconds: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            proposer.reinjected.load(Ordering::SeqCst),
+            "test proposer must have simulated a stale status write that restored the internal orphan finalizer"
+        );
+        assert!(
+            matches!(outcome, DeleteCompletion::HardDeleted(_)),
+            "orphan delete must retry internal orphan-finalizer reintroduction and hard-delete the owner, got {outcome:?}"
+        );
+        assert!(
+            db.get_resource("apps/v1", "Deployment", Some("orphan-raft-race"), "demo")
+                .await
+                .unwrap()
+                .is_none(),
+            "Deployment must not remain visible with klights' internal orphan finalizer"
+        );
+        let child = db
+            .get_resource(
+                "apps/v1",
+                "ReplicaSet",
+                Some("orphan-raft-race"),
+                "demo-abc123",
+            )
+            .await
+            .unwrap()
+            .expect("orphaned ReplicaSet must survive");
+        assert!(
+            child
+                .data
+                .pointer("/metadata/ownerReferences")
+                .and_then(|value| value.as_array())
+                .is_none_or(|refs| refs.is_empty()),
+            "orphaned ReplicaSet must not retain Deployment ownerRef: {:?}",
+            child.data
+        );
+    }
 
     #[tokio::test]
     async fn orphan_delete_marks_owner_terminating_before_ownerref_removal_and_hard_delete() {
