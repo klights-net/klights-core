@@ -1066,6 +1066,84 @@ async fn call_db_cancellation_cleans_up_active_task() {
     .await;
 }
 
+/// A caller that is cancelled *while still queued* (waiting to acquire the
+/// category permit) must not leak the `queued` gauge. The counter is bumped
+/// +1 before awaiting the semaphore and -1 after; if the await is cancelled
+/// the decrement must still run, or `category_status(..).queued` drifts
+/// upward forever. Regression for the observed steady `db queued=22,
+/// active=0` on the live leader.
+#[tokio::test]
+async fn queued_gauge_recovers_when_waiting_caller_is_cancelled() {
+    let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+    let conn = tokio_rusqlite::Connection::open_in_memory().await.unwrap();
+    let gate = Arc::new((Mutex::new(0usize), Condvar::new()));
+    let first_started = Arc::new(AtomicUsize::new(0));
+
+    // First caller holds the single DB slot on the gate.
+    let first = {
+        let supervisor = supervisor.clone();
+        let conn = conn.clone();
+        let gate = gate.clone();
+        let first_started = first_started.clone();
+        tokio::spawn(async move {
+            supervisor
+                .call_db("holder", "conn-a", conn, move |_conn| {
+                    first_started.store(1, Ordering::SeqCst);
+                    wait_on_gate(&gate);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        })
+    };
+    wait_for(
+        || first_started.load(Ordering::SeqCst) == 1,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Second caller cannot acquire the slot; it parks in acquire_permit.
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let waiter = {
+        let supervisor = supervisor.clone();
+        let conn = conn.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                r = supervisor.call_db("waiter", "conn-a", conn, move |_conn| Ok(())) => { let _ = r; }
+                _ = cancel.notified() => {}
+            }
+        })
+    };
+
+    // The waiter is now queued.
+    wait_for(
+        || category_status(&supervisor, TaskCategory::Db).queued == 1,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // Cancel the waiter while it is still queued (before it ever acquires).
+    cancel.notify_one();
+    waiter.await.unwrap();
+
+    // The queued gauge must return to 0 — not stay stuck at 1.
+    wait_for(
+        || category_status(&supervisor, TaskCategory::Db).queued == 0,
+        Duration::from_secs(2),
+    )
+    .await;
+    assert_eq!(
+        category_status(&supervisor, TaskCategory::Db).queued,
+        0,
+        "queued gauge must not leak when a waiting caller is cancelled"
+    );
+
+    // Cleanup: release the holder.
+    release_gate(&gate, 1);
+    first.await.unwrap();
+}
+
 /// When the caller future is cancelled (e.g. by timeout or select!), the
 /// semaphore permit must remain held until the underlying spawn_blocking
 /// work completes. Releasing the permit early over-admits blocking work

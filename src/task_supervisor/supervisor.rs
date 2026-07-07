@@ -550,12 +550,18 @@ impl TaskSupervisor {
             return Ok(None);
         };
 
-        self.bump_queued(category, 1);
+        // Cancel-safe queued accounting: the guard decrements the `queued`
+        // gauge on drop, so a caller cancelled *while still waiting* for the
+        // permit (the `.acquire_owned().await` below is a cancellation point)
+        // cannot leak the counter. Without this, a dropped API request future
+        // that was parked here leaves `queued` stuck high forever (observed as
+        // steady `db queued>0, active=0` on the live leader).
+        let queued_guard = QueuedGuard::new(self.clone(), category);
         let permit = semaphore
             .acquire_owned()
             .await
             .map_err(|error| anyhow!("task category semaphore closed: {error}"))?;
-        self.bump_queued(category, -1);
+        drop(queued_guard);
         Ok(Some(CategoryPermit {
             _permit: permit,
             notify: self.inner.category_free_notifies.get(&category).cloned(),
@@ -570,6 +576,30 @@ impl TaskSupervisor {
             return;
         }
         *entry += delta.unsigned_abs();
+    }
+}
+
+/// RAII guard that bumps the `queued` gauge on construction and decrements it
+/// on drop, so the counter is decremented even if the awaiting caller future
+/// is cancelled before it acquires the permit.
+struct QueuedGuard {
+    supervisor: TaskSupervisor,
+    category: TaskCategory,
+}
+
+impl QueuedGuard {
+    fn new(supervisor: TaskSupervisor, category: TaskCategory) -> Self {
+        supervisor.bump_queued(category, 1);
+        Self {
+            supervisor,
+            category,
+        }
+    }
+}
+
+impl Drop for QueuedGuard {
+    fn drop(&mut self) {
+        self.supervisor.bump_queued(self.category, -1);
     }
 }
 
