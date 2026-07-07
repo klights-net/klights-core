@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::command::StorageCommand;
+use crate::datastore::node_local::sqlite::outbox_stream_id;
 use crate::datastore::node_local::{NodeLocalHandle, selector};
 use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
 use crate::kubelet::outbox::{
@@ -59,6 +60,37 @@ fn pod_delete_command(namespace: &str, name: &str, uid: &str) -> StorageCommand 
             resource_version: None,
         },
     }
+}
+
+fn event_create_command(namespace: &str, name: &str, uid: &str) -> StorageCommand {
+    StorageCommand::CreateResource {
+        api_version: "events.k8s.io/v1".to_string(),
+        kind: "Event".to_string(),
+        namespace: Some(namespace.to_string()),
+        name: name.to_string(),
+        data: serde_json::json!({
+            "apiVersion": "events.k8s.io/v1",
+            "kind": "Event",
+            "metadata": {
+                "namespace": namespace,
+                "name": name,
+                "uid": uid,
+            },
+        }),
+    }
+}
+
+fn same_stream_event_subject(pod_subject: &str) -> (String, String, String) {
+    let target_stream = outbox_stream_id(pod_subject);
+    for i in 0..10_000 {
+        let name = format!("event-{i}");
+        let uid = format!("event-uid-{i}");
+        let subject = format!("events.k8s.io/v1/Event/default/{name}");
+        if outbox_stream_id(&subject) == target_stream {
+            return (subject, name, uid);
+        }
+    }
+    panic!("failed to find same-stream Event subject for {pod_subject}");
 }
 
 /// A fake apply client that records calls. Responses must be pre-loaded
@@ -547,6 +579,168 @@ async fn batch_claim_leases_only_terminal_delete_when_older_status_is_also_due()
             .collect::<Vec<_>>(),
         vec!["web-actor-finalize-delete-due"],
         "terminal delete must be the only leased row for this subject"
+    );
+}
+
+#[tokio::test]
+async fn batch_claim_does_not_deadlock_same_stream_behind_superseded_status() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+    let pod_subject = "v1/Pod/default/web/uid-web";
+    let (event_subject, event_name, event_uid) = same_stream_event_subject(pod_subject);
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-status-superseded-stream-blocker",
+            OutboxOperation::PodStatus,
+            OutboxSubject::new(
+                pod_subject,
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_status_command("default", "web", "uid-web"),
+            1_000,
+        ))
+        .await
+        .expect("enqueue status");
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "same-stream-event-after-superseded-status",
+            OutboxOperation::EventCreate,
+            OutboxSubject::new(
+                event_subject,
+                Some("default".to_string()),
+                event_name.clone(),
+                Some(event_uid.clone()),
+            ),
+            &event_uid,
+            event_create_command("default", &event_name, &event_uid),
+            1_001,
+        ))
+        .await
+        .expect("enqueue event");
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-actor-finalize-delete-after-event",
+            OutboxOperation::PodMetadata,
+            OutboxSubject::new(
+                pod_subject,
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_delete_command("default", "web", "uid-web"),
+            1_002,
+        ))
+        .await
+        .expect("enqueue actor finalize delete");
+
+    let claimed = node_db
+        .claim_due_outbox_batch(1_002, 16, 100, "event-lease")
+        .await
+        .expect("claim event batch");
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|row| row.idempotency_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["same-stream-event-after-superseded-status"],
+        "superseded status must not make the whole stream unclaimable"
+    );
+
+    node_db
+        .complete_outbox(claimed[0].id, "event-lease")
+        .await
+        .expect("complete event");
+
+    let claimed = node_db
+        .claim_due_outbox_batch(1_002, 16, 100, "delete-lease")
+        .await
+        .expect("claim delete batch");
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|row| row.idempotency_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["web-actor-finalize-delete-after-event"],
+        "actor-owned terminal delete must be claimable after the live older stream row completes"
+    );
+}
+
+#[tokio::test]
+async fn batch_claim_keeps_same_stream_blocked_while_superseded_status_is_in_flight() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+    let pod_subject = "v1/Pod/default/web/uid-web";
+    let (event_subject, event_name, event_uid) = same_stream_event_subject(pod_subject);
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-status-in-flight",
+            OutboxOperation::PodStatus,
+            OutboxSubject::new(
+                pod_subject,
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_status_command("default", "web", "uid-web"),
+            1_000,
+        ))
+        .await
+        .expect("enqueue status");
+    let status = node_db
+        .claim_due_outbox_batch(1_000, 16, 10_000, "status-lease")
+        .await
+        .expect("claim status")
+        .pop()
+        .expect("status row due");
+    assert_eq!(status.idempotency_key, "web-status-in-flight");
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "same-stream-event-behind-in-flight-status",
+            OutboxOperation::EventCreate,
+            OutboxSubject::new(
+                event_subject,
+                Some("default".to_string()),
+                event_name.clone(),
+                Some(event_uid.clone()),
+            ),
+            &event_uid,
+            event_create_command("default", &event_name, &event_uid),
+            1_001,
+        ))
+        .await
+        .expect("enqueue event");
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "web-actor-finalize-delete-behind-in-flight-status",
+            OutboxOperation::PodMetadata,
+            OutboxSubject::new(
+                pod_subject,
+                Some("default".to_string()),
+                "web",
+                Some("uid-web".to_string()),
+            ),
+            "uid-web",
+            pod_delete_command("default", "web", "uid-web"),
+            1_002,
+        ))
+        .await
+        .expect("enqueue actor finalize delete");
+
+    let claimed = node_db
+        .claim_due_outbox_batch(1_002, 16, 100, "blocked-lease")
+        .await
+        .expect("claim while status is in-flight");
+    assert!(
+        claimed.is_empty(),
+        "same-stream rows must remain blocked while an older status row is still leased"
     );
 }
 

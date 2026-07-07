@@ -101,6 +101,20 @@ pub(super) const OUTBOX_CLAIM_NEXT_DUE: &str = "SELECT id FROM outbox candidate 
                      'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
                  AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
              ) \
+             AND NOT ( \
+                 older_stream.is_terminal_pod_delete = 0 \
+                 AND older_stream.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
+                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+                 AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
+                 AND EXISTS ( \
+                     SELECT 1 FROM outbox superseding_terminal \
+                     WHERE superseding_terminal.subject_key = older_stream.subject_key \
+                       AND superseding_terminal.id > older_stream.id \
+                       AND superseding_terminal.is_terminal_pod_delete = 1 \
+                       AND superseding_terminal.next_due_ms <= ?1 \
+                       AND (superseding_terminal.leased_until_ms = 0 OR superseding_terminal.leased_until_ms <= ?1) \
+                 ) \
+             ) \
        )) \
      ORDER BY CASE candidate.operation \
            WHEN 'LeaseRenew' THEN 0 \
@@ -167,6 +181,20 @@ pub(super) const OUTBOX_CLAIM_DUE_BATCH: &str = "SELECT id FROM outbox candidate
                  AND older_stream.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
                      'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
                  AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
+             ) \
+             AND NOT ( \
+                 older_stream.is_terminal_pod_delete = 0 \
+                 AND older_stream.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
+                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+                 AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
+                 AND EXISTS ( \
+                     SELECT 1 FROM outbox superseding_terminal \
+                     WHERE superseding_terminal.subject_key = older_stream.subject_key \
+                       AND superseding_terminal.id > older_stream.id \
+                       AND superseding_terminal.is_terminal_pod_delete = 1 \
+                       AND superseding_terminal.next_due_ms <= ?1 \
+                       AND (superseding_terminal.leased_until_ms = 0 OR superseding_terminal.leased_until_ms <= ?1) \
+                 ) \
              ) \
        )) \
      ORDER BY CASE candidate.operation \
