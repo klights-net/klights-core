@@ -847,6 +847,7 @@ impl Datastore {
         use crate::datastore::sqlite::resource_shape::{
             ensure_metadata_create_defaults, ensure_metadata_identity, ensure_metadata_uid,
             ensure_pod_status_ip_arrays, ensure_resource_type_meta,
+            preserve_server_metadata_fields_from_existing, validate_metadata_uid_immutable,
             validate_resource_preconditions,
         };
         use crate::datastore::types::{
@@ -1178,7 +1179,7 @@ impl Datastore {
                                     }
                                 }
                                 ResourceBatchPutMode::Update => {
-                                    let (live_rv, live_uid, _) =
+                                    let (live_rv, live_uid, live_data) =
                                         Self::resource_row_for_update_in_tx(
                                             tx,
                                             &api_version,
@@ -1192,6 +1193,11 @@ impl Datastore {
                                         live_rv,
                                     )
                                     .map_err(Self::sqlite_conversion_error)?;
+                                    let live: Value = serde_json::from_slice(&live_data)
+                                        .map_err(serde_to_sqlite_error)?;
+                                    validate_metadata_uid_immutable(&data, &live)
+                                        .map_err(Self::sqlite_conversion_error)?;
+                                    preserve_server_metadata_fields_from_existing(&mut data, &live);
                                 }
                             }
                             ensure_resource_type_meta(&mut data, &api_version, &kind);

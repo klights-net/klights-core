@@ -172,6 +172,133 @@ async fn apply_resource_batch_update_requires_resource_version_precondition() {
 }
 
 #[tokio::test]
+async fn apply_resource_batch_update_preserves_existing_server_metadata() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let existing = db
+        .create_resource(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            "batched-update-klights",
+            json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {"name": "batched-update-klights", "namespace": "default"},
+                "addressType": "IPv4",
+                "endpoints": [],
+                "ports": []
+            }),
+        )
+        .await
+        .unwrap();
+    let original_uid = existing.uid.clone();
+    let original_creation_timestamp = existing
+        .data
+        .pointer("/metadata/creationTimestamp")
+        .cloned()
+        .expect("create should stamp creationTimestamp");
+
+    db.apply_resource_batch(vec![ResourceBatchOperation::Put {
+        api_version: "discovery.k8s.io/v1".to_string(),
+        kind: "EndpointSlice".to_string(),
+        namespace: Some("default".to_string()),
+        name: "batched-update-klights".to_string(),
+        data: json!({
+            "apiVersion": "discovery.k8s.io/v1",
+            "kind": "EndpointSlice",
+            "metadata": {"name": "batched-update-klights", "namespace": "default"},
+            "addressType": "IPv4",
+            "endpoints": [{"addresses": ["10.50.0.10"]}],
+            "ports": []
+        }),
+        mode: ResourceBatchPutMode::Update,
+        preconditions: ResourcePreconditions::from_resource(&existing),
+    }])
+    .await
+    .unwrap();
+
+    let updated = db
+        .get_resource(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            "batched-update-klights",
+        )
+        .await
+        .unwrap()
+        .expect("EndpointSlice should still exist");
+
+    assert_eq!(
+        updated.uid, original_uid,
+        "batch update must not change row UID"
+    );
+    assert_eq!(
+        updated
+            .data
+            .pointer("/metadata/uid")
+            .and_then(|v| v.as_str()),
+        Some(original_uid.as_str()),
+        "batch update must preserve metadata.uid when the desired object omits it"
+    );
+    assert_eq!(
+        updated.data.pointer("/metadata/creationTimestamp"),
+        Some(&original_creation_timestamp),
+        "batch update must preserve metadata.creationTimestamp"
+    );
+}
+
+#[tokio::test]
+async fn apply_resource_batch_update_rejects_metadata_uid_change() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let existing = db
+        .create_resource(
+            "discovery.k8s.io/v1",
+            "EndpointSlice",
+            Some("default"),
+            "batched-uid-guard-klights",
+            json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {"name": "batched-uid-guard-klights", "namespace": "default"},
+                "addressType": "IPv4",
+                "endpoints": [],
+                "ports": []
+            }),
+        )
+        .await
+        .unwrap();
+
+    let err = db
+        .apply_resource_batch(vec![ResourceBatchOperation::Put {
+            api_version: "discovery.k8s.io/v1".to_string(),
+            kind: "EndpointSlice".to_string(),
+            namespace: Some("default".to_string()),
+            name: "batched-uid-guard-klights".to_string(),
+            data: json!({
+                "apiVersion": "discovery.k8s.io/v1",
+                "kind": "EndpointSlice",
+                "metadata": {
+                    "name": "batched-uid-guard-klights",
+                    "namespace": "default",
+                    "uid": "different-uid"
+                },
+                "addressType": "IPv4",
+                "endpoints": [{"addresses": ["10.50.0.10"]}],
+                "ports": []
+            }),
+            mode: ResourceBatchPutMode::Update,
+            preconditions: ResourcePreconditions::from_resource(&existing),
+        }])
+        .await
+        .expect_err("batch update must reject metadata.uid changes");
+
+    assert!(
+        err.to_string().contains("metadata.uid is immutable"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn apply_resource_batch_public_api_writes_resources_with_one_rv() {
     let db = Datastore::new_in_memory().await.unwrap();
     db.apply_resource_batch(vec![

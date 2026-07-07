@@ -24,6 +24,7 @@ pub fn apply_same_uid_stale_full_resource_policy(
 ) {
     preserve_pod_node_for_stale_put(api_version, kind, incoming, existing);
     preserve_pod_status_for_stale_main_put(api_version, kind, incoming, existing);
+    preserve_pod_scheduled_true_for_stale_bound_put(api_version, kind, incoming, existing);
     preserve_pod_owner_refs_for_stale_put(api_version, kind, incoming, existing);
     preserve_storage_user_metadata_for_stale_put(api_version, kind, incoming, existing);
     preserve_finalizers_for_stale_put(api_version, kind, incoming, existing);
@@ -129,6 +130,79 @@ fn preserve_pod_status_for_stale_main_put(
     } else {
         object.remove("status");
     }
+}
+
+fn preserve_pod_scheduled_true_for_stale_bound_put(
+    api_version: &str,
+    kind: &str,
+    incoming: &mut Value,
+    existing: &Value,
+) {
+    if api_version != "v1" || kind != "Pod" {
+        return;
+    }
+    let incoming_bound = incoming
+        .pointer("/spec/nodeName")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.trim().is_empty());
+    if !incoming_bound {
+        return;
+    }
+
+    let mut scheduled = existing
+        .pointer("/status/conditions")
+        .and_then(|value| value.as_array())
+        .and_then(|conditions| {
+            conditions.iter().find(|condition| {
+                condition.pointer("/type").and_then(|value| value.as_str()) == Some("PodScheduled")
+                    && condition
+                        .pointer("/status")
+                        .and_then(|value| value.as_str())
+                        == Some("True")
+            })
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "type": "PodScheduled",
+                "status": "True",
+                "reason": "PodScheduled"
+            })
+        });
+    if let Some(scheduled) = scheduled.as_object_mut() {
+        scheduled.insert("type".to_string(), serde_json::json!("PodScheduled"));
+        scheduled.insert("status".to_string(), serde_json::json!("True"));
+        scheduled
+            .entry("reason".to_string())
+            .or_insert_with(|| serde_json::json!("PodScheduled"));
+    }
+
+    let Some(object) = incoming.as_object_mut() else {
+        return;
+    };
+    let status = object
+        .entry("status".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !status.is_object() {
+        *status = serde_json::json!({});
+    }
+    let Some(status) = status.as_object_mut() else {
+        return;
+    };
+    status.remove("nominatedNodeName");
+    let conditions = status
+        .entry("conditions".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !conditions.is_array() {
+        *conditions = serde_json::json!([]);
+    }
+    let Some(conditions) = conditions.as_array_mut() else {
+        return;
+    };
+    conditions.retain(|condition| {
+        condition.pointer("/type").and_then(|value| value.as_str()) != Some("PodScheduled")
+    });
+    conditions.push(scheduled);
 }
 
 fn has_deletion_timestamp(data: &Value) -> bool {
@@ -473,6 +547,70 @@ mod tests {
             incoming.pointer("/status/conditions/0/status"),
             Some(&json!("False")),
             "delete-mark PUTs must keep their terminating status instead of restoring the live pre-delete status"
+        );
+    }
+
+    #[test]
+    fn same_uid_stale_bound_pod_delete_put_preserves_scheduled_true() {
+        let mut incoming = json!({
+            "metadata": {
+                "name": "pod-a",
+                "deletionTimestamp": "2026-07-05T09:32:10Z"
+            },
+            "spec": {
+                "containers": [{"name": "pause", "image": "pause"}]
+            },
+            "status": {
+                "phase": "Pending",
+                "conditions": [
+                    {
+                        "type": "PodScheduled",
+                        "status": "False",
+                        "reason": "Unschedulable",
+                        "message": "0/1 nodes are available: Insufficient cpu."
+                    },
+                    {"type": "Ready", "status": "False", "reason": "PodTerminating"}
+                ]
+            }
+        });
+        let existing = json!({
+            "spec": {
+                "nodeName": "mn-replica",
+                "containers": [{"name": "pause", "image": "pause"}]
+            },
+            "status": {
+                "phase": "Pending",
+                "conditions": [{"type": "PodScheduled", "status": "True", "reason": "PodScheduled"}]
+            }
+        });
+
+        apply_same_uid_stale_full_resource_policy("v1", "Pod", &mut incoming, &existing);
+
+        let conditions = incoming
+            .pointer("/status/conditions")
+            .and_then(|value| value.as_array())
+            .expect("conditions must remain an array");
+        let scheduled = conditions
+            .iter()
+            .find(|condition| {
+                condition.pointer("/type").and_then(|value| value.as_str()) == Some("PodScheduled")
+            })
+            .expect("PodScheduled condition should exist");
+        assert_eq!(
+            scheduled.pointer("/status"),
+            Some(&json!("True")),
+            "a terminating Pod with a preserved bound nodeName must not retain a stale Unschedulable condition"
+        );
+        let ready = conditions
+            .iter()
+            .find(|condition| {
+                condition.pointer("/type").and_then(|value| value.as_str()) == Some("Ready")
+            })
+            .expect("Ready condition should exist");
+        assert_eq!(
+            ready.pointer("/status"),
+            Some(&json!("False")),
+            "terminating readiness must stay unready"
         );
     }
 }
