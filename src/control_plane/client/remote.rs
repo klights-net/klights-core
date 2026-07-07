@@ -609,7 +609,9 @@ impl LeaderApiClient for RemoteApiClient {
         stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
         let Some(grpc) = &self.grpc else {
-            return Ok(OutboxApplyResult::Applied { applied_rv: 0 });
+            return Err(OutboxApplyError::Retryable(
+                "RemoteApiClient missing gRPC transport".to_string(),
+            ));
         };
         grpc.apply_outbox_rpc(
             idempotency_key,
@@ -858,6 +860,28 @@ mod tests {
             "cache hit should not perform an unnecessary strong read"
         );
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_grpc_apply_outbox_is_retryable_not_acknowledged() {
+        let client = RemoteApiClient::new_for_tests("worker-1");
+
+        let err = client
+            .apply_outbox(
+                "missing-grpc-watermarked-status",
+                OutboxOperation::PodStatus,
+                pod_status_payload("uid-1"),
+                "worker-client",
+                7,
+                1,
+            )
+            .await
+            .expect_err("missing gRPC must not acknowledge a sequenced outbox row");
+
+        assert!(
+            matches!(&err, OutboxApplyError::Retryable(message) if message.contains("missing gRPC transport")),
+            "missing gRPC should be a retryable dispatcher error, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1147,13 +1171,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_outbox_uid_mismatch_propagates() {
-        // Tests that apply_outbox handles the UID mismatch error path.
-        // In the real implementation, the gRPC response carries the error;
-        // in test mode, we verify the success path is wired.
+    async fn apply_outbox_without_grpc_is_retryable() {
         let client = RemoteApiClient::new_for_tests("worker-1");
 
-        let result = client
+        let err = client
             .apply_outbox(
                 "key-1",
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
@@ -1162,16 +1183,12 @@ mod tests {
                 1,
                 1,
             )
-            .await;
+            .await
+            .expect_err("missing gRPC must not acknowledge an outbox row");
         assert!(
-            result.is_ok(),
-            "apply_outbox should succeed: {:?}",
-            result.err()
+            matches!(&err, OutboxApplyError::Retryable(message) if message.contains("missing gRPC transport")),
+            "missing gRPC should be retryable, got {err:?}"
         );
-        assert!(matches!(
-            result.unwrap(),
-            crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
-        ));
     }
 
     #[tokio::test]
