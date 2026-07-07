@@ -1885,6 +1885,10 @@ fn preempted_status(data: &Value, preemptor_namespace: &str, preemptor_name: &st
     if !status.is_object() {
         status = json!({});
     }
+    let has_bound_node = data
+        .pointer("/spec/nodeName")
+        .and_then(|v| v.as_str())
+        .is_some_and(|node_name| !node_name.is_empty());
     let condition = json!({
         "type": "DisruptionTarget",
         "status": "True",
@@ -1897,9 +1901,32 @@ fn preempted_status(data: &Value, preemptor_namespace: &str, preemptor_name: &st
             .entry("conditions".to_string())
             .or_insert_with(|| json!([]));
         if let Some(conditions) = conditions.as_array_mut() {
+            let pod_scheduled_true = if has_bound_node {
+                conditions
+                    .iter()
+                    .find(|existing| {
+                        existing.get("type").and_then(|v| v.as_str()) == Some("PodScheduled")
+                            && existing.get("status").and_then(|v| v.as_str()) == Some("True")
+                    })
+                    .cloned()
+                    .or_else(|| {
+                        Some(json!({
+                            "type": "PodScheduled",
+                            "status": "True",
+                            "lastTransitionTime": crate::utils::k8s_timestamp(),
+                        }))
+                    })
+            } else {
+                None
+            };
             conditions.retain(|existing| {
-                existing.get("type").and_then(|v| v.as_str()) != Some("DisruptionTarget")
+                let condition_type = existing.get("type").and_then(|v| v.as_str());
+                condition_type != Some("DisruptionTarget")
+                    && (!has_bound_node || condition_type != Some("PodScheduled"))
             });
+            if let Some(pod_scheduled_true) = pod_scheduled_true {
+                conditions.push(pod_scheduled_true);
+            }
             conditions.push(condition);
         }
     }

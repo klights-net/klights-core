@@ -7130,6 +7130,122 @@ async fn leader_scheduler_marks_finalized_preemption_victim_terminating() {
 }
 
 #[tokio::test]
+async fn preemption_victim_termination_preserves_bound_podscheduled_true() {
+    use super::{PodApiWriter, PodReader};
+
+    let repo =
+        build_repo_with_scheduling_mode(super::api::PodSchedulingMode::DeferredMultiNodeLeader)
+            .await;
+    repo.store
+        .db()
+        .create_resource(
+            "v1",
+            "Node",
+            None,
+            "test-node",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "test-node"},
+                "spec": {"unschedulable": false},
+                "status": {
+                    "allocatable": {
+                        "cpu": "8",
+                        "memory": "32Gi",
+                        "pods": "110",
+                        "scheduling.k8s.io/foo": "5"
+                    },
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    repo.store
+        .create(
+            "default",
+            "victim",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": "victim", "namespace": "default"},
+                "spec": {
+                    "nodeName": "test-node",
+                    "priority": 1,
+                    "containers": [{
+                        "name": "c",
+                        "image": "registry.k8s.io/pause:3.10",
+                        "resources": {"requests": {"scheduling.k8s.io/foo": "5"}}
+                    }]
+                },
+                "status": {
+                    "phase": "Running",
+                    "conditions": [{
+                        "type": "PodScheduled",
+                        "status": "False",
+                        "reason": "Unschedulable",
+                        "message": "stale scheduler status from an older unschedulable write"
+                    }]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    repo.api_create_pod(api_create_request(
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "preemptor"},
+            "spec": {
+                "priority": 2,
+                "containers": [{
+                    "name": "c",
+                    "image": "registry.k8s.io/pause:3.10",
+                    "resources": {"requests": {"scheduling.k8s.io/foo": "5"}}
+                }]
+            }
+        }),
+        false,
+    ))
+    .await
+    .unwrap();
+
+    repo.schedule_all_unbound_pods().await.unwrap();
+
+    let victim = repo.get_pod("default", "victim").await.unwrap().unwrap();
+    assert!(
+        victim
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .and_then(|v| v.as_str())
+            .is_some(),
+        "preemption victim must be marked terminating"
+    );
+    let conditions = victim
+        .data
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array())
+        .expect("victim status conditions present");
+    let scheduled = conditions
+        .iter()
+        .find(|condition| condition.get("type").and_then(|v| v.as_str()) == Some("PodScheduled"))
+        .expect("PodScheduled condition present");
+    assert_eq!(
+        scheduled.get("status").and_then(|v| v.as_str()),
+        Some("True"),
+        "a bound preemption victim must not be persisted as PodScheduled=False: {victim:?}"
+    );
+    assert!(
+        conditions.iter().any(|condition| {
+            condition.get("type").and_then(|v| v.as_str()) == Some("DisruptionTarget")
+                && condition.get("status").and_then(|v| v.as_str()) == Some("True")
+        }),
+        "preemption must still add DisruptionTarget: {victim:?}"
+    );
+}
+
+#[tokio::test]
 async fn api_create_pod_leader_mode_respects_explicit_node_name() {
     use super::PodApiWriter;
 
