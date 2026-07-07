@@ -142,6 +142,52 @@ async fn watermarked_outbox_commit_does_not_append_applied_outbox_ledger_mutatio
 }
 
 #[tokio::test]
+async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit() {
+    use crate::datastore::ResourcePreconditions;
+    use crate::datastore::sqlite::BuildOutboxOutcome;
+    use crate::log_apply::OutboxStreamWatermark;
+
+    let db = Datastore::new_in_memory().await.unwrap();
+    let command = StorageCommand::UpdateStatus {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("default".to_string()),
+        name: "already-gone".to_string(),
+        status: json!({"phase": "Running"}),
+        expected_rv: None,
+        preconditions: ResourcePreconditions {
+            uid: Some("gone-uid".to_string()),
+            resource_version: None,
+        },
+        observed_status_stamp: Some(42),
+    };
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+
+    let outcome = db
+        .build_log_apply_commit_for_outbox_with_watermark(
+            "missing-pod-status",
+            "PodStatus",
+            payload.as_ref(),
+            "worker-a",
+            Some(OutboxStreamWatermark {
+                client_id: "worker-client".to_string(),
+                stream_id: 9,
+                stream_seq: 1,
+            }),
+        )
+        .await
+        .expect("stale UID-bound Pod outbox row should build a watermark-only commit");
+
+    let BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+        panic!("expected stale UID-bound Pod row to consume its stream watermark");
+    };
+    assert_eq!(commit.mutations.len(), 0);
+    assert_eq!(commit.outbox_watermark.unwrap().stream_seq, 1);
+}
+
+#[tokio::test]
 async fn build_log_apply_commit_for_command_has_no_applied_outbox_mutation() {
     use crate::datastore::command::StorageCommand;
     use crate::log_apply::LogApplyMutation;

@@ -879,11 +879,11 @@ mod tests {
                 OutboxOperation::PodStatus,
                 pod_status_payload("uid-2"),
                 "client",
-                1,
-                1,
+                0,
+                0,
             )
             .await
-            .expect_err("leader uid mismatch must propagate");
+            .expect_err("unwatermarked leader uid mismatch must propagate");
         assert!(matches!(err, OutboxApplyError::UidMismatch { .. }));
         handle.abort();
     }

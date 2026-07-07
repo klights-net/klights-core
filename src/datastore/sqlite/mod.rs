@@ -1658,6 +1658,16 @@ impl Datastore {
                         ));
                     }
                 }
+                if Self::should_consume_watermark_for_stale_uid_bound_pod_in_tx(
+                    &tx,
+                    &decoded.command,
+                )? {
+                    let rv = Self::next_resource_version_in_tx(&tx)?;
+                    let mut commit = crate::log_apply::LogApplyCommit::new(rv, Vec::new());
+                    commit.outbox_watermark = watermark_for_tx;
+                    tx.commit()?;
+                    return Ok(BuildOutboxTxnOutcome::Built { commit, rv });
+                }
                 let (mut commit, rv) = Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
                     decoded.command,
@@ -2029,6 +2039,111 @@ impl Datastore {
             precondition_resource_version: None,
             status_only: false,
         }))
+    }
+
+    pub async fn apply_outbox_transactionally_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        use crate::datastore::sqlite::BuildOutboxOutcome;
+        use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
+
+        if watermark.is_none() {
+            return self
+                .apply_outbox_transactionally(idempotency_key, operation, payload, authoring_node)
+                .await;
+        }
+
+        match self
+            .build_log_apply_commit_for_outbox_with_watermark(
+                idempotency_key,
+                operation,
+                payload,
+                authoring_node,
+                watermark,
+            )
+            .await?
+        {
+            BuildOutboxOutcome::NeedsPropose { commit, applied_rv } => {
+                self.apply_log_apply_commit(commit)
+                    .await
+                    .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
+                Ok(OutboxApplyResult::Applied { applied_rv })
+            }
+            BuildOutboxOutcome::AlreadyApplied { applied_rv } => {
+                Ok(OutboxApplyResult::AlreadyApplied { applied_rv })
+            }
+            BuildOutboxOutcome::LeaseRenewShortcircuit => {
+                Ok(OutboxApplyResult::Applied { applied_rv: 0 })
+            }
+        }
+    }
+
+    fn should_consume_watermark_for_stale_uid_bound_pod_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        command: &crate::datastore::command::StorageCommand,
+    ) -> tokio_rusqlite::Result<bool> {
+        let Some((namespace, name, expected_uid)) = Self::uid_bound_pod_target(command) else {
+            return Ok(false);
+        };
+        match Self::resource_row_optional_for_update_in_tx(tx, "v1", "Pod", Some(namespace), name)?
+        {
+            Some((_rv, live_uid, _data)) => Ok(live_uid != expected_uid),
+            None => Ok(true),
+        }
+    }
+
+    fn uid_bound_pod_target(
+        command: &crate::datastore::command::StorageCommand,
+    ) -> Option<(&str, &str, &str)> {
+        use crate::datastore::command::StorageCommand;
+        let (api_version, kind, namespace, name, preconditions) = match command {
+            StorageCommand::UpdateStatus {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions,
+                ..
+            }
+            | StorageCommand::UpdateResource {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions,
+                ..
+            }
+            | StorageCommand::PatchResource {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions,
+                ..
+            }
+            | StorageCommand::DeleteResource {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions,
+            } => (api_version, kind, namespace, name, preconditions),
+            _ => return None,
+        };
+        if api_version != "v1" || kind != "Pod" {
+            return None;
+        }
+        let namespace = namespace.as_deref()?;
+        let expected_uid = preconditions.uid.as_deref().filter(|uid| !uid.is_empty())?;
+        Some((namespace, name.as_str(), expected_uid))
     }
 
     fn sqlite_conversion_error(err: anyhow::Error) -> tokio_rusqlite::Error {
@@ -3293,6 +3408,28 @@ impl DatastoreBackend for Datastore {
             operation,
             payload,
             authoring_node,
+        )
+        .await
+    }
+
+    async fn apply_outbox_transactionally_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        Datastore::apply_outbox_transactionally_with_watermark(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+            watermark,
         )
         .await
     }

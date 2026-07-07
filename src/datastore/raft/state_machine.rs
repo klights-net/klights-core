@@ -105,8 +105,12 @@ pub async fn propose_outbox_on_backend_with_watermark(
             command: None,
         });
     }
-    crate::control_plane::client::apply::reject_pod_uid_mismatch(db, &decoded.command).await?;
+    if watermark.is_none() {
+        crate::control_plane::client::apply::reject_pod_uid_mismatch(db, &decoded.command).await?;
+    }
 
+    let watermark_present = watermark.is_some();
+    let uid_bound_pod_target = is_uid_bound_pod_command(&decoded.command);
     let deleted_resource = resource_before_delete(db, &decoded.command).await?;
     let result = match db
         .apply_outbox_transactionally_with_watermark(
@@ -144,11 +148,52 @@ pub async fn propose_outbox_on_backend_with_watermark(
     // follower ensures proper state ordering so these no longer
     // need to be silently swallowed.
     let resource = resource_after_apply(db, &decoded.command, deleted_resource).await?;
+    let command = if watermark_present && uid_bound_pod_target && resource.is_none() {
+        None
+    } else {
+        Some(decoded.command)
+    };
     Ok(RaftOutboxApply {
         result,
         resource,
-        command: Some(decoded.command),
+        command,
     })
+}
+
+fn is_uid_bound_pod_command(command: &StorageCommand) -> bool {
+    let (api_version, kind, preconditions) = match command {
+        StorageCommand::UpdateStatus {
+            api_version,
+            kind,
+            preconditions,
+            ..
+        }
+        | StorageCommand::UpdateResource {
+            api_version,
+            kind,
+            preconditions,
+            ..
+        }
+        | StorageCommand::PatchResource {
+            api_version,
+            kind,
+            preconditions,
+            ..
+        }
+        | StorageCommand::DeleteResource {
+            api_version,
+            kind,
+            preconditions,
+            ..
+        } => (api_version, kind, preconditions),
+        _ => return false,
+    };
+    api_version == "v1"
+        && kind == "Pod"
+        && preconditions
+            .uid
+            .as_deref()
+            .is_some_and(|uid| !uid.is_empty())
 }
 
 pub struct RaftOutboxApply {
@@ -236,6 +281,74 @@ mod tests {
                 .encode_protobuf()
                 .expect("encode outbox payload"),
         )
+    }
+
+    #[tokio::test]
+    async fn watermarked_stale_uid_bound_pod_row_advances_stream_without_side_effect_command() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let watermark = crate::log_apply::OutboxStreamWatermark {
+            client_id: "worker-client".to_string(),
+            stream_id: 11,
+            stream_seq: 1,
+        };
+
+        let result = propose_outbox_on_backend_with_watermark(
+            &db,
+            "missing-pod-status",
+            OutboxOperation::PodStatus,
+            outbox_payload(StorageCommand::UpdateStatus {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "already-gone".to_string(),
+                status: json!({"phase": "Running"}),
+                expected_rv: None,
+                preconditions: ResourcePreconditions {
+                    uid: Some("gone-uid".to_string()),
+                    resource_version: None,
+                },
+                observed_status_stamp: Some(42),
+            }),
+            "worker-a",
+            Some(watermark.clone()),
+        )
+        .await
+        .expect("stale UID-bound Pod status must consume its outbox stream watermark");
+
+        assert!(matches!(result.result, OutboxApplyResult::Applied { .. }));
+        assert!(result.resource.is_none());
+        assert!(
+            result.command.is_none(),
+            "watermark-only stale Pod consumption must not fire resource side effects"
+        );
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![watermark]
+        );
+
+        propose_outbox_on_backend_with_watermark(
+            &db,
+            "next-stream-entry",
+            OutboxOperation::PodMetadata,
+            outbox_payload(StorageCommand::CreateNamespace {
+                name: "after-stale-gap".to_string(),
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {"name": "after-stale-gap"}
+                }),
+            }),
+            "worker-a",
+            Some(crate::log_apply::OutboxStreamWatermark {
+                client_id: "worker-client".to_string(),
+                stream_id: 11,
+                stream_seq: 2,
+            }),
+        )
+        .await
+        .expect("next stream entry must not wedge behind a stale Pod row gap");
+
+        assert!(db.get_namespace("after-stale-gap").await.unwrap().is_some());
     }
 
     #[tokio::test]

@@ -371,11 +371,11 @@ mod tests {
             OutboxOperation::PodStatus,
             pod_status_payload("uid-2"),
             "client",
-            1,
-            1,
+            0,
+            0,
         )
         .await
-        .expect_err("uid mismatch");
+        .expect_err("unwatermarked uid mismatch");
         assert!(matches!(err, OutboxApplyError::UidMismatch { .. }));
     }
 
