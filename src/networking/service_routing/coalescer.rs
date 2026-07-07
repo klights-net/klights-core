@@ -639,7 +639,23 @@ fn wrap_service_routing_watch_stream(
 
     Box::pin(async_stream::stream! {
         while let Some(event) = stream.next().await {
-            yield ServiceRoutingWatchItem::Event { target, event };
+            match event {
+                Ok(event) => {
+                    yield ServiceRoutingWatchItem::Event { target, event: Ok(event) };
+                }
+                Err(err) => {
+                    // A decode/transport error means the stream can no longer
+                    // be trusted to stay in sync. Terminate it so the worker
+                    // performs a single, backoff-throttled reconnect via the
+                    // Closed item below, instead of layering a second live
+                    // watch on top of this one. Keeping the loop alive after an
+                    // error (the f46660f regression) leaked duplicate watches
+                    // under the sustained errors the high-volume Pod watch
+                    // produces under e2e churn, eventually starving the runtime.
+                    yield ServiceRoutingWatchItem::Event { target, event: Err(err) };
+                    break;
+                }
+            }
         }
         yield ServiceRoutingWatchItem::Closed { target };
     })
@@ -853,41 +869,18 @@ async fn run_service_routing_watch_worker(
                                 api_version = target.api_version,
                                 kind = target.kind,
                                 error = %err,
-                                "service routing watch stream failed; reconnecting that one watch and scheduling full sync"
+                                "service routing watch stream returned an error; closing it for a single reconnect"
                             );
                             force_full_sync.store(true, Ordering::Release);
                             notify.notify_one();
-                            // memory-improvement.md: reconnect only the failed
-                            // watch target instead of tearing down ALL six. The
-                            // old `reopen_watch_set = true` caused healthy
-                            // Service/Endpoints/EndpointSlice watches to be
-                            // restarted every time the high-volume Pod watch
-                            // hiccuped, creating repeated windows where new
-                            // service endpoints were invisible to nftables.
-                            let reopened = match cluster_api
-                                .watch_resources(target.request())
-                                .await
-                            {
-                                Ok(new_stream) => {
-                                    streams.push(wrap_service_routing_watch_stream(
-                                        target,
-                                        new_stream,
-                                    ));
-                                    true
-                                }
-                                Err(reopen_err) => {
-                                    tracing::warn!(
-                                        api_version = target.api_version,
-                                        kind = target.kind,
-                                        error = %reopen_err,
-                                        "target watch stream reconnect failed; scheduling full watch set reopen"
-                                    );
-                                    false
-                                }
-                            };
-                            if !reopened {
-                                reopen_watch_set = true;
-                            }
+                            // The wrapper terminates the stream after an error,
+                            // so the single reconnect happens in the `Closed` arm
+                            // below with backoff. Do NOT open a replacement here:
+                            // the errored stream is still alive at this point, and
+                            // pushing a second watch would leak duplicate streams
+                            // under sustained errors (e.g. the Pod watch under e2e
+                            // churn), eventually starving the runtime and breaking
+                            // time-sensitive admission webhook callouts.
                         }
                         Some(ServiceRoutingWatchItem::Closed { target }) => {
                             tracing::warn!(
@@ -897,29 +890,55 @@ async fn run_service_routing_watch_worker(
                             );
                             force_full_sync.store(true, Ordering::Release);
                             notify.notify_one();
-                            let reopened = match cluster_api
-                                .watch_resources(target.request())
-                                .await
-                            {
-                                Ok(new_stream) => {
-                                    streams.push(wrap_service_routing_watch_stream(
-                                        target,
-                                        new_stream,
-                                    ));
-                                    true
-                                }
-                                Err(reopen_err) => {
-                                    tracing::warn!(
-                                        api_version = target.api_version,
-                                        kind = target.kind,
-                                        error = %reopen_err,
-                                        "target watch stream reopen after close failed; scheduling full watch set reopen"
-                                    );
-                                    false
-                                }
-                            };
-                            if !reopened {
+
+                            // Back off before reconnecting when watch streams
+                            // flap. The first close (no prior failed reconnect)
+                            // reconnects immediately so a single transient close
+                            // is not penalized; consecutive closures with no
+                            // successful event in between back off exponentially
+                            // (500ms -> 60s) to avoid a tight reconnect loop
+                            // that would starve the async runtime — the same
+                            // backoff the old full-reopen path applied via this
+                            // loop's outer arm. reconnect_attempt is reset to 0
+                            // once a healthy event arrives (see the Ok arm above).
+                            let attempt = reconnect_attempt;
+                            reconnect_attempt = reconnect_attempt.saturating_add(1);
+                            let backoff_cancelled = attempt > 0
+                                && !service_routing_watch_reconnect_delay(
+                                    &task_supervisor,
+                                    &cancel,
+                                    attempt,
+                                )
+                                .await;
+                            if backoff_cancelled {
+                                // Cancelled during backoff; fall through to the
+                                // outer loop which also exits on cancel.
                                 reopen_watch_set = true;
+                            } else {
+                                let reopened = match cluster_api
+                                    .watch_resources(target.request())
+                                    .await
+                                {
+                                    Ok(new_stream) => {
+                                        streams.push(wrap_service_routing_watch_stream(
+                                            target,
+                                            new_stream,
+                                        ));
+                                        true
+                                    }
+                                    Err(reopen_err) => {
+                                        tracing::warn!(
+                                            api_version = target.api_version,
+                                            kind = target.kind,
+                                            error = %reopen_err,
+                                            "target watch stream reopen after close failed; scheduling full watch set reopen"
+                                        );
+                                        false
+                                    }
+                                };
+                                if !reopened {
+                                    reopen_watch_set = true;
+                                }
                             }
                         }
                         None => {
@@ -1543,6 +1562,197 @@ mod tests {
 
         cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(1), worker.join())
+            .await
+            .expect("watch worker must exit after cancellation")
+            .expect("watch worker task must not panic");
+    }
+
+    /// Fake leader API client whose `Pod` watch stream yields a burst of
+    /// errors and then ends, every time it is opened. Models the
+    /// high-volume Pod watch flapping under e2e churn that f46660f
+    /// identified as unreliable.
+    #[derive(Default)]
+    struct ErroringLeaderApiClient {
+        watches_opened: AtomicUsize,
+        opened_notify: Notify,
+    }
+
+    impl ErroringLeaderApiClient {
+        async fn wait_for_opened(&self, expected: usize) {
+            loop {
+                if self.watches_opened.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                self.opened_notify.notified().await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LeaderApiClient for ErroringLeaderApiClient {
+        async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
+            Err(anyhow!("unexpected get_resource for {key:?}"))
+        }
+
+        async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
+            Err(anyhow!("unexpected list_resources for {req:?}"))
+        }
+
+        async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
+            self.watches_opened.fetch_add(1, Ordering::SeqCst);
+            self.opened_notify.notify_waiters();
+            if req.kind == "Pod" {
+                // Each open of the Pod watch immediately delivers a burst of
+                // errors, then ends. A leaky reconnect (one new open per error,
+                // keeping the old stream alive) would fan out into hundreds of
+                // duplicate opens; a backoff-less reconnect would tight-loop.
+                let burst: Vec<Result<ResourceEvent>> = (0..20)
+                    .map(|_| Err(anyhow!("simulated watch error")))
+                    .collect();
+                return Ok(Box::pin(futures::stream::iter(burst)));
+            }
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()> {
+            Err(anyhow!("unexpected wait_cache_ready for {scope:?}"))
+        }
+
+        async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
+            Err(anyhow!("unexpected get_pod for {ns}/{name}"))
+        }
+
+        async fn get_pod_for_uid(
+            &self,
+            ns: &str,
+            name: &str,
+            uid: &str,
+        ) -> Result<Option<Resource>> {
+            Err(anyhow!("unexpected get_pod_for_uid for {ns}/{name}/{uid}"))
+        }
+
+        async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Resource>> {
+            Err(anyhow!("unexpected watch_pods_on_node for {node_name}"))
+        }
+
+        async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Resource>> {
+            Err(anyhow!("unexpected list_pods_on_node for {node_name}"))
+        }
+
+        async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
+            Err(anyhow!("unexpected get_configmap for {ns}/{name}"))
+        }
+
+        async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
+            Err(anyhow!("unexpected get_secret for {ns}/{name}"))
+        }
+
+        async fn get_node(&self, name: &str) -> Result<Resource> {
+            Err(anyhow!("unexpected get_node for {name}"))
+        }
+
+        async fn watch_node(&self, name: &str) -> Result<WatchStream<Resource>> {
+            Err(anyhow!("unexpected watch_node for {name}"))
+        }
+
+        async fn allocate_node_subnet(
+            &self,
+            node_name: &str,
+            _cluster_cidr: &str,
+            _node_ip: &str,
+        ) -> Result<NodeSubnet> {
+            Err(anyhow!("unexpected allocate_node_subnet for {node_name}"))
+        }
+
+        async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+            Err(anyhow!("unexpected get_node_subnet for {node_name}"))
+        }
+
+        async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
+            Err(anyhow!("unexpected list_peer_subnets for {my_node_name}"))
+        }
+
+        async fn get_node_dataplane(
+            &self,
+            node_name: &str,
+        ) -> Result<Option<DataplanePeerMetadata>> {
+            Err(anyhow!("unexpected get_node_dataplane for {node_name}"))
+        }
+
+        async fn apply_outbox(
+            &self,
+            idempotency_key: &str,
+            _operation: OutboxOperation,
+            _payload: Bytes,
+        ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
+            Err(OutboxApplyError::Retryable(format!(
+                "unexpected apply_outbox for {idempotency_key}"
+            )))
+        }
+    }
+
+    /// Regression test for the per-watch reconnect introduced in f46660f: an
+    /// erroring watch stream must NOT leak duplicate watches (one new open per
+    /// error while the old stream stays alive) nor tight-loop reconnect
+    /// without backoff. The worker must terminate the errored stream after the
+    /// first error and perform a single backoff-throttled reconnect, keeping
+    /// total watch opens bounded even under a sustained error burst.
+    #[tokio::test]
+    async fn service_routing_watch_worker_bounds_reconnects_on_repeated_watch_errors() {
+        let client = Arc::new(ErroringLeaderApiClient::default());
+        let notify = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let table = test_service_table(supervisor.clone());
+        let force_full_sync = Arc::new(AtomicBool::new(false));
+
+        let worker = supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::Network,
+                "test_service_routing_watch_worker_bounds_errors",
+                run_service_routing_watch_worker(
+                    client.clone(),
+                    table,
+                    notify.clone(),
+                    cancel.clone(),
+                    supervisor.clone(),
+                    force_full_sync.clone(),
+                ),
+            )
+            .await
+            .expect("spawn watch worker under task supervisor");
+
+        // Initial 6 opens + the first immediate Pod reconnect (attempt 0, no
+        // backoff). A leaky implementation would already have opened far more
+        // because each Pod stream delivers a 20-error burst.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.wait_for_opened(SERVICE_ROUTING_WATCH_TARGETS.len() + 1),
+        )
+        .await
+        .expect(
+            "watch worker must open the initial watch set and reconnect the errored Pod watch once",
+        );
+
+        // Give a window for any leak / busy-loop to manifest. The buggy
+        // per-watch reconnect (one new open per error, no backoff) opens
+        // hundreds here; the fixed worker terminates the stream after the first
+        // error and backs off (1s) before the next reconnect.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let opens = client.watches_opened.load(Ordering::SeqCst);
+        assert!(
+            opens <= SERVICE_ROUTING_WATCH_TARGETS.len() + 2,
+            "repeated watch errors must not leak duplicate watches or busy-loop \
+             reconnect; expected at most {} opens (initial set + immediate \
+             reconnect), got {opens}",
+            SERVICE_ROUTING_WATCH_TARGETS.len() + 2
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), worker.join())
             .await
             .expect("watch worker must exit after cancellation")
             .expect("watch worker task must not panic");
