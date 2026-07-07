@@ -2603,7 +2603,7 @@ async fn test_replicaset_status_put_persists_conditions() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let _created: serde_json::Value = serde_json::from_slice(&body).unwrap();
     // Fetch latest resourceVersion in case the ReplicaSet controller
     // has reconciled since create (the controller bumps the RV).
     let req = Request::builder()
