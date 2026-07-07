@@ -1013,6 +1013,12 @@ impl DatastoreBackend for ReplicatedDatastore {
         self.propose_command_via_raft(&proposer, command).await
     }
 
+    async fn list_outbox_stream_watermarks(
+        &self,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        self.inner.list_outbox_stream_watermarks().await
+    }
+
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
@@ -1068,7 +1074,55 @@ impl DatastoreBackend for ReplicatedDatastore {
             .require_raft_proposer()
             .map_err(|e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()))?;
         proposer
-            .propose_outbox_command(idempotency_key, operation, command, authoring_node)
+            .propose_outbox_command(idempotency_key, operation, command, authoring_node, None)
+            .await
+    }
+
+    async fn apply_outbox_transactionally_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        let payload_decoded = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(
+            payload,
+        )
+        .map_err(|err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()))?;
+        let command = payload_decoded.command;
+        if operation == crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str() {
+            crate::node_lease_tracker::ensure_lease_renew_command(&command, authoring_node)
+                .map_err(|err| {
+                    crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(err.to_string())
+                })?;
+            return Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 });
+        }
+        let proposer = self
+            .require_raft_proposer()
+            .map_err(|e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()))?;
+        proposer
+            .propose_outbox_command(
+                idempotency_key,
+                operation,
+                command,
+                authoring_node,
+                watermark,
+            )
+            .await
+    }
+
+    async fn build_log_apply_commit_for_command(
+        &self,
+        command: StorageCommand,
+        operation: &str,
+        authoring_node: &str,
+    ) -> Result<crate::log_apply::LogApplyCommit> {
+        self.inner
+            .build_log_apply_commit_for_command(command, operation, authoring_node)
             .await
     }
 
@@ -1084,6 +1138,28 @@ impl DatastoreBackend for ReplicatedDatastore {
     > {
         self.inner
             .build_log_apply_commit_for_outbox(idempotency_key, operation, payload, authoring_node)
+            .await
+    }
+
+    async fn build_log_apply_commit_for_outbox_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::datastore::sqlite::BuildOutboxOutcome,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        self.inner
+            .build_log_apply_commit_for_outbox_with_watermark(
+                idempotency_key,
+                operation,
+                payload,
+                authoring_node,
+                watermark,
+            )
             .await
     }
 

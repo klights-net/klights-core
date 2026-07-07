@@ -55,14 +55,14 @@ pub struct RaftNode {
     /// keeping a clone here avoids reaching back through openraft just to
     /// drive the leader-side build.
     backend: Arc<dyn DatastoreBackend>,
-    /// T1.4: node name used by `build_log_apply_commit_for_outbox` to
+    /// T1.4: node name used by `build_log_apply_commit_for_command` to
     /// stamp the authoring node on the resulting commit.
     authoring_node: String,
     /// Flow-control gate: at most 3 general proposals plus one reserved
     /// control-critical outbox proposal may be in flight simultaneously.
-    /// A permit is acquired BEFORE build_log_apply_commit_for_outbox reserves
-    /// the next resourceVersion so the leader cannot build an unacknowledged
-    /// RV backlog ahead of raft progress under loss (finding.md flow-control plan).
+    /// A permit is acquired BEFORE the leader materializes the next
+    /// resourceVersion so the leader cannot build an unacknowledged RV backlog
+    /// ahead of raft progress under loss (finding.md flow-control plan).
     pub(crate) flow_control: Arc<crate::datastore::raft::flow_control::RaftCommitFlowControl>,
 }
 
@@ -530,65 +530,30 @@ fn local_commit_materialization_allowed(
 }
 
 /// `RaftProposer` impl that lets `ReplicatedDatastore::Raft` mutations
-/// T1.4: build a `LogApplyCommit` on the leader (via
-/// `backend.build_log_apply_commit_for_outbox` — runs an IMMEDIATE txn
-/// that allocates the rv, validates preconditions, captures UIDs, and
-/// claims the idempotency slot WITHOUT applying resource mutations) and
-/// submit the encoded commit through openraft's `client_write`. The
-/// state machine apply path on every node — leader, voter follower, and
-/// learner — is the only caller of `apply_commit_in_tx` after raft
-/// commits the entry.
+/// build a `LogApplyCommit` on the leader and submit the encoded commit
+/// through openraft's `client_write`. Generic `propose_command` uses the
+/// ledger-free command builder; worker outbox writes use the separate
+/// watermarked outbox builder. The state machine apply path on every node —
+/// leader, voter follower, and learner — is the only caller of
+/// `apply_commit_in_tx` after raft commits the entry.
 #[async_trait]
 impl crate::datastore::replicated::RaftProposer for RaftNode {
     async fn propose_command(
         &self,
         command: crate::datastore::command::StorageCommand,
     ) -> Result<()> {
-        use crate::datastore::sqlite::BuildOutboxOutcome;
         self.ensure_local_leader_for_commit_materialization()?;
-        let idempotency_key = format!(
-            "raft-leader-{}-{}",
-            self.authoring_node,
-            uuid::Uuid::new_v4()
-        );
         let operation = derive_operation_label(&command);
-        // Flow-control gate: acquire a permit BEFORE build_log_apply_commit_for_outbox
-        // reserves the next resourceVersion. This is the core of the flow-control plan
-        // (finding.md): the leader cannot build an unacknowledged RV backlog ahead of
-        // raft progress. The permit is held as an RAII guard; every exit path (success,
-        // materialization failure, client_write failure) returns it to the pool.
+        // Flow-control gate: acquire a permit BEFORE commit materialization. The
+        // leader cannot build an unacknowledged RV backlog ahead of raft progress.
+        // The permit is held as an RAII guard; every exit path (success, materialization
+        // failure, client_write failure) returns it to the pool.
         let _flow_permit = self.flow_control.acquire().await;
-        // T1.4: the proposer's "payload" is now the StorageCommand's
-        // OutboxPayload protobuf, but only as input to the builder.
-        // The builder decodes it, constructs the LogApplyCommit, and
-        // returns it — we encode THAT as the raft entry payload.
-        let payload_bytes = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
-            .encode_protobuf()
-            .context("encode StorageCommand for raft build")?;
-        let outcome = self
+        let commit = self
             .backend
-            .build_log_apply_commit_for_outbox(
-                &idempotency_key,
-                operation.as_str(),
-                payload_bytes.as_ref(),
-                &self.authoring_node,
-            )
+            .build_log_apply_commit_for_command(command, operation.as_str(), &self.authoring_node)
             .await
             .map_err(|err| anyhow::anyhow!("build log_apply commit for raft propose: {err}"))?;
-        let commit = match outcome {
-            BuildOutboxOutcome::NeedsPropose { commit, .. } => commit,
-            BuildOutboxOutcome::LeaseRenewShortcircuit => {
-                // Lease renews don't go through raft — the builder
-                // already validated and the leader returns success.
-                return Ok(());
-            }
-            BuildOutboxOutcome::AlreadyApplied { .. } => {
-                // The idempotency key was already recorded as applied;
-                // the leader returns success without proposing again.
-                return Ok(());
-            }
-        };
-        let reserved_rv = commit.resource_version;
         let entry_bytes = crate::log_apply::encode_commit_protobuf(&commit)
             .context("encode LogApplyCommit for raft propose")?;
         let apply_result = match self
@@ -596,11 +561,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
             .await
         {
             Ok(result) => result,
-            Err(err) => {
-                self.cleanup_rejected_materialized_commit(&idempotency_key, reserved_rv)
-                    .await;
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
         if let Some(message) = apply_result.error_message {
             return Err(anyhow::anyhow!(message));
@@ -610,8 +571,8 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
 
     /// T6 step 4c: propose an outbox-flavored write through raft.
     /// Same flow as `propose_command` but preserves the caller's
-    /// idempotency + operation for applied_outbox dedup coherence.
-    /// Returns the committed `OutboxApplyResult` after raft has
+    /// idempotency + stream watermark metadata for durable worker retry
+    /// dedupe. Returns the committed `OutboxApplyResult` after raft has
     /// applied the entry on this member.
     async fn propose_outbox_command(
         &self,
@@ -619,6 +580,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
         operation: &str,
         command: crate::datastore::command::StorageCommand,
         authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::kubelet::outbox::OutboxApplyResult,
         crate::kubelet::outbox::OutboxApplyError,
@@ -659,11 +621,12 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
             })?;
         let outcome = self
             .backend
-            .build_log_apply_commit_for_outbox(
+            .build_log_apply_commit_for_outbox_with_watermark(
                 idempotency_key,
                 operation,
                 payload_bytes.as_ref(),
                 authoring_node,
+                watermark,
             )
             .await
             .map_err(|err| match err {
@@ -1778,9 +1741,8 @@ mod tests {
             .await
             .expect("list applied_outbox");
         assert!(
-            rows.iter()
-                .all(|row| !row.subject_key.is_empty() && row.applied_rv.is_some()),
-            "raft apply must finalize every outbox placeholder: {rows:?}"
+            rows.is_empty(),
+            "generic raft proposals via propose_command should not touch applied_outbox: {rows:?}"
         );
         let worker = backend
             .get_node_subnet("mn-worker")
@@ -1793,6 +1755,61 @@ mod tests {
             .expect("read worker2 subnet")
             .expect("worker2 subnet exists");
         assert_ne!(worker.subnet, worker2.subnet);
+
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raft_node_propose_command_does_not_create_applied_outbox_placeholder() {
+        use crate::datastore::replicated::RaftProposer;
+
+        let (node, backend) = fresh_node(92).await;
+        node.bootstrap_single_voter("https://10.99.0.92:7679".into())
+            .await
+            .expect("bootstrap");
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .expect("become leader");
+
+        let subnet_command = crate::datastore::command::StorageCommand::AllocateNodeSubnet {
+            node_name: "mn-worker-placeholder-check".into(),
+            subnet: "10.60.0.0/16".into(),
+            node_ip: "10.99.0.99".into(),
+        };
+        node.propose_command(subnet_command)
+            .await
+            .expect("propose subnet command");
+
+        node.propose_command(crate::datastore::command::StorageCommand::CreateResource {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            namespace: Some("default".into()),
+            name: "no-outbox-after-propose".into(),
+            data: serde_json::json!({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": "no-outbox-after-propose", "namespace": "default"}}),
+        })
+        .await
+        .expect("propose create command");
+
+        let applied = backend
+            .list_applied_outbox()
+            .await
+            .expect("list applied_outbox");
+        assert!(
+            applied.is_empty(),
+            "propose_command must not insert applied_outbox placeholders for generic writes: {applied:?}"
+        );
+
+        let create_resource = backend
+            .get_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "no-outbox-after-propose",
+            )
+            .await
+            .expect("lookup created configmap")
+            .expect("created configmap should exist");
+        assert!(create_resource.resource_version > 0);
 
         node.shutdown().await.unwrap();
     }
@@ -2566,6 +2583,7 @@ mod tests {
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
                 propose_create_command("outbox-permit-ordering"),
                 "worker-1",
+                None,
             );
             tokio::pin!(proposal);
             tokio::select! {
@@ -2623,6 +2641,7 @@ mod tests {
                 OutboxOperation::NodeRegistration.as_str(),
                 propose_node_registration_command("mn-critical-worker", "uid-critical-worker"),
                 "mn-critical-worker",
+                None,
             ),
         )
         .await

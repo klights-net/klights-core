@@ -153,6 +153,9 @@ pub trait LeaderApiClient: Send + Sync {
         idempotency_key: &str,
         operation: OutboxOperation,
         payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError>;
 }
 
@@ -327,6 +330,9 @@ mod tests {
             "stable-key",
             OutboxOperation::PodStatus,
             pod_status_payload("uid-1"),
+            "client",
+            1,
+            1,
         )
         .await
         .expect("first apply");
@@ -335,6 +341,9 @@ mod tests {
             "stable-key",
             OutboxOperation::PodStatus,
             pod_status_payload("uid-1"),
+            "client",
+            1,
+            1,
         )
         .await
         .expect("duplicate apply");
@@ -361,6 +370,9 @@ mod tests {
             "uid-mismatch-key",
             OutboxOperation::PodStatus,
             pod_status_payload("uid-2"),
+            "client",
+            1,
+            1,
         )
         .await
         .expect_err("uid mismatch");
@@ -401,6 +413,9 @@ mod tests {
             "raft-client-key",
             OutboxOperation::PodStatus,
             pod_status_payload("uid-1"),
+            "client",
+            1,
+            1,
         )
         .await
         .expect("apply outbox through local client");
@@ -432,6 +447,9 @@ mod tests {
             "lease-renew-memory-key",
             OutboxOperation::LeaseRenew,
             node_lease_renew_payload("worker-a", "2026-05-25T14:00:10.000000Z"),
+            "",
+            0,
+            0,
         )
         .await
         .expect("lease renew should be accepted");
@@ -589,6 +607,9 @@ mod tests {
             "worker-pod-actor-finalize-delete",
             OutboxOperation::PodMetadata,
             pod_delete_payload_for("worker-finalize-ns", "worker-pod", "worker-pod-uid"),
+            "client",
+            1,
+            1,
         )
         .await
         .expect("apply worker pod delete outbox");
@@ -683,6 +704,9 @@ mod tests {
             "foreground-child-actor-finalize-delete",
             OutboxOperation::PodMetadata,
             pod_delete_payload("foreground-child", "foreground-child-uid"),
+            "client",
+            1,
+            1,
         )
         .await
         .expect("apply pod delete outbox");

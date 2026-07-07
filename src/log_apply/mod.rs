@@ -21,13 +21,23 @@ pub use mutation::*;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogApplyCommit {
     pub resource_version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbox_watermark: Option<OutboxStreamWatermark>,
     pub mutations: Vec<LogApplyMutation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxStreamWatermark {
+    pub client_id: String,
+    pub stream_id: i64,
+    pub stream_seq: i64,
 }
 
 impl LogApplyCommit {
     pub fn new(resource_version: i64, mutations: Vec<LogApplyMutation>) -> Self {
         Self {
             resource_version,
+            outbox_watermark: None,
             mutations,
         }
     }
@@ -35,6 +45,7 @@ impl LogApplyCommit {
     pub fn from_cluster_mutations(resource_version: i64, mutations: Vec<ClusterMutation>) -> Self {
         Self {
             resource_version,
+            outbox_watermark: None,
             mutations: mutations
                 .into_iter()
                 .map(ClusterMutation::into_log_apply_mutation)
@@ -467,12 +478,16 @@ pub fn decode_commit_json(bytes: &[u8]) -> Result<LogApplyCommit> {
         .into_iter()
         .map(LogApplyMutation::try_from)
         .collect::<Result<Vec<_>>>()?;
-    Ok(LogApplyCommit::new(versioned.resource_version, mutations))
+    let mut commit = LogApplyCommit::new(versioned.resource_version, mutations);
+    commit.outbox_watermark = versioned.outbox_watermark;
+    Ok(commit)
 }
 
 #[derive(Deserialize)]
 struct VersionedLogApplyCommit {
     resource_version: i64,
+    #[serde(default)]
+    outbox_watermark: Option<OutboxStreamWatermark>,
     mutations: Vec<VersionedClusterMutation>,
 }
 
@@ -492,6 +507,18 @@ struct ProtoLogApplyCommit {
     resource_version: i64,
     #[prost(message, repeated, tag = "2")]
     mutations: Vec<ProtoLogApplyMutation>,
+    #[prost(message, optional, tag = "3")]
+    outbox_watermark: Option<ProtoOutboxStreamWatermark>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct ProtoOutboxStreamWatermark {
+    #[prost(string, tag = "1")]
+    client_id: String,
+    #[prost(int64, tag = "2")]
+    stream_id: i64,
+    #[prost(int64, tag = "3")]
+    stream_seq: i64,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -776,11 +803,32 @@ struct ProtoLogApplyPodCleanupIntentKey {
     reason: String,
 }
 
+impl From<OutboxStreamWatermark> for ProtoOutboxStreamWatermark {
+    fn from(watermark: OutboxStreamWatermark) -> Self {
+        Self {
+            client_id: watermark.client_id,
+            stream_id: watermark.stream_id,
+            stream_seq: watermark.stream_seq,
+        }
+    }
+}
+
+impl From<ProtoOutboxStreamWatermark> for OutboxStreamWatermark {
+    fn from(watermark: ProtoOutboxStreamWatermark) -> Self {
+        Self {
+            client_id: watermark.client_id,
+            stream_id: watermark.stream_id,
+            stream_seq: watermark.stream_seq,
+        }
+    }
+}
+
 impl From<LogApplyCommit> for ProtoLogApplyCommit {
     fn from(commit: LogApplyCommit) -> Self {
         Self {
             resource_version: commit.resource_version,
             mutations: commit.mutations.into_iter().map(Into::into).collect(),
+            outbox_watermark: commit.outbox_watermark.map(Into::into),
         }
     }
 }
@@ -791,6 +839,7 @@ impl TryFrom<ProtoLogApplyCommit> for LogApplyCommit {
     fn try_from(proto: ProtoLogApplyCommit) -> Result<Self> {
         Ok(Self {
             resource_version: proto.resource_version,
+            outbox_watermark: proto.outbox_watermark.map(Into::into),
             mutations: proto
                 .mutations
                 .into_iter()
@@ -1555,6 +1604,31 @@ mod parity_tests {
                 "{label}: JSON and protobuf decoded into different values"
             );
         }
+    }
+
+    #[test]
+    fn outbox_stream_watermark_round_trips_json_and_protobuf() {
+        let mut commit = LogApplyCommit::new(
+            77,
+            vec![LogApplyMutation::AdvanceResourceVersion {
+                resource_version: 77,
+            }],
+        );
+        commit.outbox_watermark = Some(OutboxStreamWatermark {
+            client_id: "client-a".to_string(),
+            stream_id: 12,
+            stream_seq: 34,
+        });
+
+        let from_json: LogApplyCommit =
+            decode_commit_json(&encode_commit_json(&commit).unwrap()).unwrap();
+        let from_proto: LogApplyCommit =
+            decode_commit_protobuf(&encode_commit_protobuf(&commit).unwrap()).unwrap();
+        assert_eq!(from_json, commit, "JSON must preserve outbox watermark");
+        assert_eq!(
+            from_proto, commit,
+            "protobuf must preserve outbox watermark"
+        );
     }
 
     #[test]

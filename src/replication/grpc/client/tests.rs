@@ -45,6 +45,10 @@ mod cases {
         crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default()
     }
 
+    fn current_renew_time_for_test() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
     fn grpc_config_for_tls(ca_cert_path: Option<PathBuf>, skip_ca: bool) -> GrpcClientConfig {
         GrpcClientConfig {
             leader_endpoint: "https://leader:7679".to_string(),
@@ -761,6 +765,9 @@ mod cases {
                 "status-key-0",
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
                 bytes::Bytes::new(),
+                "client",
+                1,
+                1,
             )
             .await;
         let after_first = client.channel_build_count();
@@ -776,6 +783,9 @@ mod cases {
                     &format!("status-key-{i}"),
                     crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
                     bytes::Bytes::new(),
+                    "client",
+                    1,
+                    i,
                 )
                 .await;
         }
@@ -856,7 +866,14 @@ mod cases {
 
         // First send: the leader commits and records the idempotency ledger.
         let first = client
-            .apply_outbox_rpc(key, OutboxOperation::PodStatus, payload.clone())
+            .apply_outbox_rpc(
+                key,
+                OutboxOperation::PodStatus,
+                payload.clone(),
+                "client",
+                1,
+                1,
+            )
             .await
             .expect("first apply must commit");
         let applied_rv = match first {
@@ -885,7 +902,7 @@ mod cases {
         // The first response was "lost" on the wire; the dispatcher retries the
         // SAME key. The leader must replay the ledger as AlreadyApplied.
         let second = client
-            .apply_outbox_rpc(key, OutboxOperation::PodStatus, payload)
+            .apply_outbox_rpc(key, OutboxOperation::PodStatus, payload, "client", 1, 1)
             .await
             .expect("lost-response retry must succeed");
         match second {
@@ -990,6 +1007,9 @@ mod cases {
                 "deadline-key",
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
                 bytes::Bytes::new(),
+                "client",
+                1,
+                1,
             ),
         )
         .await;
@@ -1079,7 +1099,7 @@ mod cases {
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            client.renew_node_lease_rpc("2026-06-11T00:00:00Z", 40),
+            client.renew_node_lease_rpc(&current_renew_time_for_test(), 40),
         )
         .await;
         let result = outcome.expect("renew_node_lease_rpc must return within the wall-clock bound");
@@ -1218,7 +1238,7 @@ mod cases {
         );
         assert_bounded!(
             "renew_node_lease_rpc",
-            client.renew_node_lease_rpc("2026-06-11T00:00:00Z", 40)
+            client.renew_node_lease_rpc(&current_renew_time_for_test(), 40)
         );
         assert_bounded!(
             "allocate_node_subnet_rpc",
@@ -1254,6 +1274,9 @@ mod cases {
                 "k",
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
                 bytes::Bytes::new(),
+                "client",
+                1,
+                1,
             )
         );
         handle.abort();
@@ -1836,7 +1859,7 @@ mod cases {
 
         // Warm the Status lane with a successful lease renewal.
         client
-            .renew_node_lease_rpc("2026-01-01T00:00:00Z", 40)
+            .renew_node_lease_rpc(&current_renew_time_for_test(), 40)
             .await
             .expect("initial lease renewal should succeed");
         assert!(
@@ -1849,7 +1872,7 @@ mod cases {
         // the heartbeat loop rebuilds a fresh channel on the next attempt.
         fixture.shutdown().await;
         let result = client
-            .renew_node_lease_rpc("2026-01-01T00:00:08Z", 40)
+            .renew_node_lease_rpc(&current_renew_time_for_test(), 40)
             .await;
         assert!(
             result.is_err(),

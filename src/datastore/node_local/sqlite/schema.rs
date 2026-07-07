@@ -11,6 +11,7 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
         "
         CREATE TABLE IF NOT EXISTS outbox (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id           TEXT NOT NULL DEFAULT '',
             idempotency_key     TEXT NOT NULL UNIQUE,
             enqueued_ms         INTEGER NOT NULL,
             subject_key         TEXT NOT NULL,
@@ -35,6 +36,8 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
                 'EventCreate'
             )),
             is_terminal_pod_delete INTEGER NOT NULL DEFAULT 0 CHECK(is_terminal_pod_delete IN (0, 1)),
+            stream_id           INTEGER NOT NULL DEFAULT 0,
+            stream_seq          INTEGER NOT NULL DEFAULT 0,
             payload_proto       BLOB NOT NULL,
             attempt             INTEGER NOT NULL DEFAULT 0,
             next_due_ms         INTEGER NOT NULL,
@@ -47,6 +50,14 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
         CREATE INDEX IF NOT EXISTS idx_outbox_lease ON outbox(leased_until_ms);
         CREATE INDEX IF NOT EXISTS idx_outbox_subject ON outbox(subject_key, id);
         CREATE INDEX IF NOT EXISTS idx_outbox_pod_uid ON outbox(pod_uid) WHERE pod_uid <> '';
+        CREATE INDEX IF NOT EXISTS idx_outbox_stream_inflight
+            ON outbox(stream_id, id)
+            WHERE leased_until_ms > 0;
+
+        CREATE TABLE IF NOT EXISTS outbox_stream_sequences (
+            stream_id INTEGER PRIMARY KEY,
+            last_seq  INTEGER NOT NULL
+        ) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS pod_runtime (
             pod_uid     TEXT NOT NULL PRIMARY KEY,
@@ -199,7 +210,54 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
         ",
     )?;
 
+    migrate_outbox_stream_fields(conn)?;
     migrate_pod_endpoint_encrypted_direct_mode(conn)
+}
+
+fn outbox_has_column(conn: &mut rusqlite::Connection, column_name: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(outbox)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_outbox_stream_fields(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    if !outbox_has_column(conn, "client_id")? {
+        conn.execute(
+            "ALTER TABLE outbox ADD COLUMN client_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !outbox_has_column(conn, "stream_id")? {
+        conn.execute(
+            "ALTER TABLE outbox ADD COLUMN stream_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !outbox_has_column(conn, "stream_seq")? {
+        conn.execute(
+            "ALTER TABLE outbox ADD COLUMN stream_seq INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outbox_stream_inflight
+         ON outbox(stream_id, id)
+         WHERE leased_until_ms > 0",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS outbox_stream_sequences (
+            stream_id INTEGER PRIMARY KEY,
+            last_seq  INTEGER NOT NULL
+        ) WITHOUT ROWID",
+        [],
+    )?;
+    Ok(())
 }
 
 fn migrate_pod_endpoint_encrypted_direct_mode(

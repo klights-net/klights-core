@@ -22,20 +22,18 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::datastore::types::{AppliedOutboxRecord, NodeSubnet, PodCleanupIntent, Resource};
+use crate::datastore::types::{NodeSubnet, PodCleanupIntent, Resource};
 use crate::log_apply::{
     ClusterMutation, LogApplyCommit, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
     LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourceRow, LogApplyWatchEventRow,
-    NamespaceMutation, NetworkMutation, OutboxLedgerMutation, PodCleanupMutation, ResourceMutation,
-    WatchHistoryMutation,
+    NamespaceMutation, NetworkMutation, PodCleanupMutation, ResourceMutation, WatchHistoryMutation,
 };
 
 const SNAPSHOT_JSON_COMMIT_BATCH_SIZE: usize = 128;
 
-/// memory-improvement.md §10 P1: page size for the keyset-paginated reads
-/// (`list_all_watch_events_since_paged`, `list_applied_outbox_paged`) inside
+/// memory-improvement.md §10 P1: page size for keyset-paginated reads inside
 /// `emit_snapshot_commits`. Bounded so a multi-million-row table is consumed
-/// batch by batch instead of materialized into one `Vec`. 1024 rows ≈ a few
+/// batch by batch instead of materialized into one `Vec`. 512 rows ≈ a few
 /// MiB of working set, regardless of total table size.
 const SNAPSHOT_EMIT_PAGE_SIZE: usize = 512;
 
@@ -350,33 +348,14 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
                 .await?;
             }
         }
-    }
 
-    if current_rv > 0 {
-        // memory-improvement.md §10 P1: page the dedup ledger instead of
-        // loading it all into one Vec. Ordering/content match the unbounded
-        // form (ORDER BY idempotency_key ASC).
-        let mut after_key: Option<String> = None;
-        loop {
-            let page = db
-                .list_applied_outbox_paged(after_key.as_deref(), page_limit)
-                .await?;
-            if page.is_empty() {
-                break;
-            }
-            after_key = Some(
-                page.last()
-                    .expect("non-empty page has a last row")
-                    .idempotency_key
-                    .clone(),
-            );
-            for record in page {
-                sink.push(snapshot_commit_from_family(
-                    current_rv,
-                    cluster_outbox_mutation_from_record(record),
-                ))
-                .await?;
-            }
+        for watermark in db.list_outbox_stream_watermarks().await? {
+            sink.push(LogApplyCommit {
+                resource_version: current_rv,
+                mutations: Vec::new(),
+                outbox_watermark: Some(watermark),
+            })
+            .await?;
         }
     }
 
@@ -425,6 +404,20 @@ impl<'a, S: SnapshotCommitSink + Unpin + ?Sized> SnapshotCommitBatcher<'a, S> {
 impl<S: SnapshotCommitSink + Unpin + ?Sized> SnapshotCommitSink for SnapshotCommitBatcher<'_, S> {
     async fn push(&mut self, commit: LogApplyCommit) -> Result<()> {
         if commit.mutations.is_empty() {
+            if commit.outbox_watermark.is_none() {
+                return Ok(());
+            }
+            if let Some(previous) = self.pending.take() {
+                self.sink.push(previous).await?;
+            }
+            self.sink.push(commit).await?;
+            return Ok(());
+        }
+        if commit.outbox_watermark.is_some() {
+            if let Some(previous) = self.pending.take() {
+                self.sink.push(previous).await?;
+            }
+            self.sink.push(commit).await?;
             return Ok(());
         }
         match self.pending.as_mut() {
@@ -632,10 +625,6 @@ fn cluster_network_mutation_from_dataplane(
             port: row.port,
         },
     ))
-}
-
-fn cluster_outbox_mutation_from_record(record: AppliedOutboxRecord) -> ClusterMutation {
-    ClusterMutation::OutboxLedger(OutboxLedgerMutation::PutAppliedOutbox(record.into()))
 }
 
 fn cluster_pod_cleanup_mutation_from_intent(intent: PodCleanupIntent) -> ClusterMutation {
@@ -967,6 +956,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_generation_preserves_outbox_stream_watermarks() {
+        use crate::log_apply::OutboxStreamWatermark;
+
+        let leader = crate::datastore::test_support::in_memory().await;
+        let watermark = OutboxStreamWatermark {
+            client_id: "snapshot-client".to_string(),
+            stream_id: 7,
+            stream_seq: 5,
+        };
+        for seq in 1..=watermark.stream_seq {
+            leader
+                .apply_raft_log_apply_commit(LogApplyCommit {
+                    resource_version: seq,
+                    mutations: Vec::new(),
+                    outbox_watermark: Some(OutboxStreamWatermark {
+                        client_id: watermark.client_id.clone(),
+                        stream_id: watermark.stream_id,
+                        stream_seq: seq,
+                    }),
+                })
+                .await
+                .unwrap();
+        }
+
+        let leader_rv = leader.get_current_resource_version().await.unwrap();
+        let snapshot = generate_snapshot(&leader, 0).await.unwrap();
+        let follower = crate::datastore::test_support::in_memory().await;
+        follower
+            .replace_replicated_resource_state(snapshot, leader_rv, None)
+            .await
+            .unwrap();
+
+        let duplicate = follower
+            .apply_raft_log_apply_commit(LogApplyCommit {
+                resource_version: 2,
+                mutations: Vec::new(),
+                outbox_watermark: Some(watermark),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            duplicate.applied_rv,
+            Some(2),
+            "restored watermark should make duplicate seq a no-op, not a gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_generation_does_not_export_legacy_applied_outbox_rows() {
+        let leader = crate::datastore::test_support::in_memory().await;
+        leader
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "snapshot-rv-anchor",
+                serde_json::json!({
+                    "metadata": {"name": "snapshot-rv-anchor", "namespace": "default"},
+                    "data": {"anchor": "rv"}
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(leader.get_current_resource_version().await.unwrap() > 0);
+        leader
+            .insert_applied_outbox(crate::datastore::AppliedOutboxRecord {
+                idempotency_key: "legacy-snapshot-key".to_string(),
+                subject_key: "legacy-subject".to_string(),
+                operation: "PodStatus".to_string(),
+                first_seen_ms: 1,
+                applied_rv: Some(2),
+                result_proto: vec![1, 2, 3],
+                status_stamp: None,
+            })
+            .await
+            .unwrap();
+
+        let snapshot = generate_snapshot(&leader, 0).await.unwrap();
+        let follower = crate::datastore::test_support::in_memory().await;
+        follower
+            .replace_replicated_resource_state(
+                snapshot,
+                leader.get_current_resource_version().await.unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            follower.list_applied_outbox().await.unwrap().is_empty(),
+            "snapshots must not replicate legacy applied_outbox rows"
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_restore_preserves_rv_counter_for_next_raft_apply() {
         let leader = crate::datastore::test_support::in_memory().await;
         crate::controllers::namespace::init_default_namespaces(&leader)
@@ -1016,22 +1100,25 @@ mod tests {
                 "data": {"state": "after"}
             }),
         };
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
-            .encode_protobuf()
-            .unwrap();
-        let outcome = follower
-            .build_log_apply_commit_for_outbox(
-                "snapshot-next-rv-key",
-                "CreateResource",
-                payload.as_ref(),
-                "leader",
-            )
+        let outbox_before = follower.list_applied_outbox().await.expect("outbox before");
+
+        let commit = follower
+            .build_log_apply_commit_for_command(command, "CreateResource", "leader")
             .await
             .unwrap();
-        let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome
-        else {
-            panic!("expected create after snapshot to need proposal");
-        };
+
+        let outbox_after = follower.list_applied_outbox().await.expect("outbox after");
+        assert_eq!(
+            outbox_before, outbox_after,
+            "generic commit builder should not mutate applied_outbox"
+        );
+        assert!(
+            !commit.mutations.iter().any(|mutation| matches!(
+                mutation,
+                crate::log_apply::LogApplyMutation::PutAppliedOutbox(_)
+            )),
+            "generic post-snapshot commit must not emit applied_outbox mutations"
+        );
         assert!(
             commit.resource_version > leader_rv,
             "post-snapshot raft proposals must reserve a leader RV greater than snapshot RV {leader_rv}, got {}",
@@ -1113,11 +1200,19 @@ mod tests {
 
     #[tokio::test]
     async fn stale_pod_status_replay_rejected_after_snapshot_install() {
+        use crate::datastore::sqlite::BuildOutboxOutcome;
+        use crate::log_apply::OutboxStreamWatermark;
+
         let leader = crate::datastore::test_support::in_memory().await;
         create_pod_for_status_snapshot(&leader, "uid-1").await;
+        let watermark = OutboxStreamWatermark {
+            client_id: "worker-a-epoch".to_string(),
+            stream_id: 11,
+            stream_seq: 1,
+        };
 
-        leader
-            .apply_outbox_transactionally(
+        let newer = leader
+            .build_log_apply_commit_for_outbox_with_watermark(
                 "status-newer",
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
                 &pod_status_payload(
@@ -1126,10 +1221,23 @@ mod tests {
                     200,
                 ),
                 "worker-a",
+                Some(watermark.clone()),
             )
+            .await
+            .expect("build newer status");
+        let BuildOutboxOutcome::NeedsPropose { commit, .. } = newer else {
+            panic!("newer status should produce a commit");
+        };
+        leader
+            .apply_raft_log_apply_commit(commit)
             .await
             .expect("apply newer status");
         assert_eq!(pod_status_message(&leader).await.as_deref(), Some("newer"));
+        assert_eq!(
+            leader.list_outbox_stream_watermarks().await.unwrap(),
+            vec![watermark.clone()],
+            "leader must have recorded the worker stream watermark"
+        );
 
         let leader_rv = leader.get_current_resource_version().await.unwrap();
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
@@ -1144,9 +1252,14 @@ mod tests {
             Some("newer"),
             "snapshot must carry the live newer status"
         );
+        assert_eq!(
+            follower.list_outbox_stream_watermarks().await.unwrap(),
+            vec![watermark.clone()],
+            "snapshot must carry stream watermarks"
+        );
 
-        follower
-            .apply_outbox_transactionally(
+        let stale = follower
+            .build_log_apply_commit_for_outbox_with_watermark(
                 "status-stale-after-snapshot",
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
                 &pod_status_payload(
@@ -1155,14 +1268,18 @@ mod tests {
                     100,
                 ),
                 "worker-a",
+                Some(watermark),
             )
             .await
-            .expect("stale status replay should complete as a no-op");
-
+            .expect("stale duplicate should complete as already-applied");
+        assert!(
+            matches!(stale, BuildOutboxOutcome::AlreadyApplied { .. }),
+            "restored outbox stream watermark should no-op stale duplicate replay"
+        );
         assert_eq!(
             pod_status_message(&follower).await.as_deref(),
             Some("newer"),
-            "snapshot restore must preserve applied-outbox status stamps so stale status replays no-op"
+            "snapshot restore must preserve stream watermarks so stale status replays no-op"
         );
     }
 

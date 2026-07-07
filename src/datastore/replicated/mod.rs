@@ -59,16 +59,16 @@ pub trait RaftProposer: Send + Sync {
 
     /// T6 step 4c: propose an outbox-flavored write through raft.
     /// Same end result as `propose_command` (build LogApplyCommit →
-    /// raft commit → state machine apply on every member) but
-    /// preserves the caller's `idempotency_key` and `operation` so
-    /// the applied_outbox dedup row is keyed correctly. Returns
-    /// `OutboxApplyResult` for the outbox dispatcher.
+    /// raft commit → state machine apply on every member) but preserves
+    /// the worker outbox idempotency key plus stream watermark metadata.
+    /// Returns `OutboxApplyResult` for the outbox dispatcher.
     async fn propose_outbox_command(
         &self,
         idempotency_key: &str,
         operation: &str,
         command: StorageCommand,
         authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::kubelet::outbox::OutboxApplyResult,
         crate::kubelet::outbox::OutboxApplyError,

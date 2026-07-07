@@ -1603,6 +1603,9 @@ mod tests {
             _idempotency_key: &str,
             _operation: crate::kubelet::outbox::payload::OutboxOperation,
             _payload: bytes::Bytes,
+            _client_id: &str,
+            _stream_id: i64,
+            _stream_seq: i64,
         ) -> std::result::Result<
             crate::kubelet::outbox::OutboxApplyResult,
             crate::kubelet::outbox::OutboxApplyError,
@@ -2498,6 +2501,9 @@ mod tests {
                 _idempotency_key: &str,
                 _operation: crate::kubelet::outbox::payload::OutboxOperation,
                 _payload: bytes::Bytes,
+                _client_id: &str,
+                _stream_id: i64,
+                _stream_seq: i64,
             ) -> std::result::Result<
                 crate::kubelet::outbox::OutboxApplyResult,
                 crate::kubelet::outbox::OutboxApplyError,

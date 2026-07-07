@@ -250,6 +250,19 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
         [],
     )?;
 
+    // Raft-replicated worker outbox stream watermarks. This is durable cluster
+    // metadata, not resource state: resource/namespace deletes must never remove
+    // these rows. The primary key is the lookup/reload index used by leaders.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS outbox_stream_watermarks (
+            client_id TEXT NOT NULL,
+            stream_id INTEGER NOT NULL,
+            last_seq  INTEGER NOT NULL,
+            PRIMARY KEY(client_id, stream_id)
+        ) WITHOUT ROWID",
+        [],
+    )?;
+
     // UID-bound cleanup intents for Pods whose active API object was removed
     // without kubelet contact, e.g. a Pod left behind on a lost node.
     conn.execute(

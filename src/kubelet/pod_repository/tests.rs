@@ -281,6 +281,9 @@ impl LeaderApiClient for FakeLeaderApiClient {
         _idempotency_key: &str,
         _operation: crate::kubelet::outbox::payload::OutboxOperation,
         _payload: bytes::Bytes,
+        _client_id: &str,
+        _stream_id: i64,
+        _stream_seq: i64,
     ) -> std::result::Result<
         crate::kubelet::outbox::OutboxApplyResult,
         crate::kubelet::outbox::OutboxApplyError,
@@ -341,6 +344,9 @@ impl crate::kubelet::outbox::OutboxApplyClient for TestOutboxApplyClient {
         _idempotency_key: &str,
         _operation: crate::kubelet::outbox::payload::OutboxOperation,
         payload: bytes::Bytes,
+        _client_id: &str,
+        _stream_id: i64,
+        _stream_seq: i64,
     ) -> std::result::Result<
         crate::kubelet::outbox::OutboxApplyResult,
         crate::kubelet::outbox::OutboxApplyError,
@@ -2461,6 +2467,7 @@ impl StatusRacingRaftProposer {
         idempotency_key: &str,
         operation: crate::kubelet::outbox::payload::OutboxOperation,
         authoring_node: &str,
+        _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::datastore::raft::state_machine::RaftOutboxApply,
         crate::kubelet::outbox::OutboxApplyError,
@@ -2492,6 +2499,7 @@ impl crate::datastore::replicated::RaftProposer for StatusRacingRaftProposer {
             &key,
             crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
             "status-race-leader",
+            None,
         )
         .await
         .map_err(|err| anyhow::anyhow!("status race raft propose: {err}"))?;
@@ -2504,6 +2512,7 @@ impl crate::datastore::replicated::RaftProposer for StatusRacingRaftProposer {
         operation: &str,
         command: crate::datastore::command::StorageCommand,
         authoring_node: &str,
+        _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::kubelet::outbox::OutboxApplyResult,
         crate::kubelet::outbox::OutboxApplyError,
@@ -2511,7 +2520,7 @@ impl crate::datastore::replicated::RaftProposer for StatusRacingRaftProposer {
         let operation = crate::kubelet::outbox::payload::OutboxOperation::try_from(operation)
             .map_err(|err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()))?;
         let outcome = self
-            .apply_command(command, idempotency_key, operation, authoring_node)
+            .apply_command(command, idempotency_key, operation, authoring_node, None)
             .await?;
         Ok(outcome.result)
     }
@@ -11740,6 +11749,7 @@ impl crate::datastore::replicated::RaftProposer for DeleteCasRacingRaftProposer 
         _operation: &str,
         command: crate::datastore::command::StorageCommand,
         _authoring_node: &str,
+        _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::kubelet::outbox::OutboxApplyResult,
         crate::kubelet::outbox::OutboxApplyError,

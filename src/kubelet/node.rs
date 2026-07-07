@@ -774,6 +774,9 @@ pub(crate) async fn register_node_impl_opts(
                             &idempotency_key,
                             OutboxOperation::NodeRegistration,
                             bytes::Bytes::from(proto),
+                            "",
+                            0,
+                            0,
                         )
                         .await
                     {

@@ -283,17 +283,6 @@ async fn start_leader_scoped_tasks(
         db_handle.clone(),
     )));
 
-    // The global GC is intentionally hourly, not part of the 30s operational
-    // GC cadence: on an idle cluster this adds at most one short
-    // gc_applied_outbox transaction per hour. It currently runs only
-    // twelve-hour applied_outbox idempotency-ledger pruning.
-    let mut global_gc = gc::GcScheduler::new(std::time::Duration::from_secs(
-        gc::applied_outbox_gc::APPLIED_OUTBOX_GC_INTERVAL_SECS,
-    ));
-    global_gc.register(Arc::new(gc::applied_outbox_gc::AppliedOutboxGc::new(
-        db_handle.clone(),
-    )));
-
     let cancel = lease_cancel.child_token();
     let ts = task_supervisor.clone();
     if let Err(e) = task_supervisor
@@ -307,21 +296,6 @@ async fn start_leader_scoped_tasks(
         .await
     {
         tracing::warn!("Failed to spawn GC scheduler: {}", e);
-    }
-
-    let global_cancel = lease_cancel.child_token();
-    let global_ts = task_supervisor.clone();
-    if let Err(e) = task_supervisor
-        .spawn_async(
-            crate::task_supervisor::TaskCategory::Background,
-            "runtime_global_gc_scheduler",
-            async move {
-                global_gc.run(global_ts, global_cancel).await;
-            },
-        )
-        .await
-    {
-        tracing::warn!("Failed to spawn global GC scheduler: {}", e);
     }
 
     Ok(())

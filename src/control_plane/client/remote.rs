@@ -604,12 +604,22 @@ impl LeaderApiClient for RemoteApiClient {
         idempotency_key: &str,
         operation: OutboxOperation,
         payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
         let Some(grpc) = &self.grpc else {
             return Ok(OutboxApplyResult::Applied { applied_rv: 0 });
         };
-        grpc.apply_outbox_rpc(idempotency_key, operation, payload)
-            .await
+        grpc.apply_outbox_rpc(
+            idempotency_key,
+            operation,
+            payload,
+            client_id,
+            stream_id,
+            stream_seq,
+        )
+        .await
     }
 }
 
@@ -620,8 +630,20 @@ impl OutboxApplyClient for RemoteApiClient {
         idempotency_key: &str,
         operation: OutboxOperation,
         payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        LeaderApiClient::apply_outbox(self, idempotency_key, operation, payload).await
+        LeaderApiClient::apply_outbox(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            client_id,
+            stream_id,
+            stream_seq,
+        )
+        .await
     }
 }
 
@@ -856,6 +878,9 @@ mod tests {
                 "uid-mismatch",
                 OutboxOperation::PodStatus,
                 pod_status_payload("uid-2"),
+                "client",
+                1,
+                1,
             )
             .await
             .expect_err("leader uid mismatch must propagate");
@@ -1133,6 +1158,9 @@ mod tests {
                 "key-1",
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
                 bytes::Bytes::from_static(b"test"),
+                "client",
+                1,
+                1,
             )
             .await;
         assert!(

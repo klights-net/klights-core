@@ -45,24 +45,14 @@ impl super::GcTask for WatchEventsGc {
         "watch_events_gc"
     }
     async fn run(&self) -> Result<()> {
-        let mut total_removed = 0usize;
-        let mut batches = 0usize;
-        loop {
-            let removed = self
-                .db
-                .gc_watch_events(self.max_rows, self.batch_cap)
-                .await?;
-            if removed == 0 {
-                break;
-            }
-            total_removed += removed;
-            batches += 1;
-        }
-        if total_removed > 0 {
+        let removed = self
+            .db
+            .gc_watch_events(self.max_rows, self.batch_cap)
+            .await?;
+        if removed > 0 {
             tracing::info!(
                 watch_events_gc = true,
-                removed = total_removed,
-                batches,
+                removed,
                 max_rows = self.max_rows,
                 "watch_events_gc: tick complete"
             );
@@ -216,7 +206,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_task_drains_backlog_across_bounded_batches() {
+    async fn gc_task_runs_one_bounded_batch_per_tick() {
         let db = crate::datastore::test_support::in_memory().await;
         insert_n_events(&db, 20).await;
 
@@ -229,9 +219,9 @@ mod tests {
         task.run().await.unwrap();
 
         let count = db.count_watch_events().await.unwrap();
-        assert!(
-            count <= 6,
-            "watch_events GC task must drain backlog to the cap window in one run; count={count}"
+        assert_eq!(
+            count, 16,
+            "watch_events GC task must run only one bounded batch per scheduler tick"
         );
     }
 }

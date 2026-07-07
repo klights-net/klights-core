@@ -111,6 +111,9 @@ pub trait OutboxApplyClient: Send + Sync {
         idempotency_key: &str,
         operation: OutboxOperation,
         payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError>;
 }
 
@@ -121,9 +124,19 @@ impl OutboxApplyClient for crate::replication::grpc::client::ReplicationGrpcClie
         idempotency_key: &str,
         operation: OutboxOperation,
         payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        self.apply_outbox_rpc(idempotency_key, operation, payload)
-            .await
+        self.apply_outbox_rpc(
+            idempotency_key,
+            operation,
+            payload,
+            client_id,
+            stream_id,
+            stream_seq,
+        )
+        .await
     }
 }
 
@@ -145,9 +158,19 @@ impl OutboxApplyClient for LeaderApiOutboxClient {
         idempotency_key: &str,
         operation: OutboxOperation,
         payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
         self.client
-            .apply_outbox(idempotency_key, operation, payload)
+            .apply_outbox(
+                idempotency_key,
+                operation,
+                payload,
+                client_id,
+                stream_id,
+                stream_seq,
+            )
             .await
     }
 }
@@ -955,6 +978,9 @@ impl OutboxDispatcher {
                 &row.idempotency_key,
                 operation,
                 Bytes::from(row.payload_proto.clone()),
+                &row.client_id,
+                row.stream_id,
+                row.stream_seq,
             )
             .await;
         let elapsed_ms = dispatch_start.elapsed().as_millis() as u64;
@@ -1464,6 +1490,9 @@ mod tests {
             idempotency_key: &str,
             _operation: OutboxOperation,
             _payload: Bytes,
+            _client_id: &str,
+            _stream_id: i64,
+            _stream_seq: i64,
         ) -> Result<OutboxApplyResult, OutboxApplyError> {
             self.calls.lock().await.push(idempotency_key.to_string());
             self.responses
@@ -1497,6 +1526,9 @@ mod tests {
             idempotency_key: &str,
             _operation: OutboxOperation,
             _payload: Bytes,
+            _client_id: &str,
+            _stream_id: i64,
+            _stream_seq: i64,
         ) -> Result<OutboxApplyResult, OutboxApplyError> {
             self.calls.lock().await.push(idempotency_key.to_string());
             let mut applied = self.applied.lock().await;
@@ -1535,6 +1567,9 @@ mod tests {
             _idempotency_key: &str,
             _operation: OutboxOperation,
             _payload: Bytes,
+            _client_id: &str,
+            _stream_id: i64,
+            _stream_seq: i64,
         ) -> Result<OutboxApplyResult, OutboxApplyError> {
             use std::sync::atomic::Ordering;
             let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1979,6 +2014,9 @@ mod tests {
                     &row.idempotency_key,
                     OutboxOperation::try_from(row.operation.as_str()).expect("operation"),
                     Bytes::from(row.payload_proto),
+                    &row.client_id,
+                    row.stream_id,
+                    row.stream_seq,
                 )
                 .await
                 .expect("simulate leader effect before crash");

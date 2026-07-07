@@ -52,14 +52,15 @@ pub(super) const RUNTIME_OBSERVATION_CHECKPOINT_DELETE_UID: &str =
     "DELETE FROM pod_runtime_observation_checkpoints WHERE pod_uid = ?1";
 
 pub(super) const OUTBOX_INSERT: &str = "INSERT INTO outbox \
-     (idempotency_key, enqueued_ms, subject_key, subject_api_version, subject_kind, \
+     (client_id, idempotency_key, enqueued_ms, subject_key, subject_api_version, subject_kind, \
       subject_namespace, subject_name, subject_uid, pod_uid, operation, \
-      is_terminal_pod_delete, payload_proto, next_due_ms) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)";
-pub(super) const OUTBOX_ROW_SELECT: &str = "SELECT id, idempotency_key, enqueued_ms, \
+      is_terminal_pod_delete, stream_id, stream_seq, payload_proto, next_due_ms) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
+pub(super) const OUTBOX_ROW_SELECT: &str = "SELECT id, client_id, idempotency_key, enqueued_ms, \
      subject_key, subject_api_version, subject_kind, subject_namespace, subject_name, \
-     subject_uid, pod_uid, operation, is_terminal_pod_delete, payload_proto, attempt, next_due_ms, \
-     leased_until_ms, lease_token, last_error FROM outbox WHERE id = ?1";
+     subject_uid, pod_uid, operation, is_terminal_pod_delete, stream_id, stream_seq, \
+     payload_proto, attempt, next_due_ms, leased_until_ms, lease_token, last_error \
+     FROM outbox WHERE id = ?1";
 pub(super) const OUTBOX_CLAIM_NEXT_DUE: &str = "SELECT id FROM outbox candidate \
      WHERE candidate.next_due_ms <= ?1 \
        AND (candidate.leased_until_ms = 0 OR candidate.leased_until_ms <= ?1) \
@@ -88,6 +89,19 @@ pub(super) const OUTBOX_CLAIM_NEXT_DUE: &str = "SELECT id FROM outbox candidate 
                  AND (older.leased_until_ms = 0 OR older.leased_until_ms <= ?1) \
              ) \
        ) \
+       AND (candidate.stream_id = 0 OR NOT EXISTS ( \
+           SELECT 1 FROM outbox older_stream \
+           WHERE older_stream.stream_id = candidate.stream_id \
+             AND older_stream.id < candidate.id \
+             AND NOT ( \
+                 candidate.is_terminal_pod_delete = 1 \
+                 AND older_stream.subject_key = candidate.subject_key \
+                 AND older_stream.is_terminal_pod_delete = 0 \
+                 AND older_stream.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
+                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+                 AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
+             ) \
+       )) \
      ORDER BY CASE candidate.operation \
            WHEN 'LeaseRenew' THEN 0 \
            WHEN 'NodeStatus' THEN 1 \
@@ -142,6 +156,19 @@ pub(super) const OUTBOX_CLAIM_DUE_BATCH: &str = "SELECT id FROM outbox candidate
                  AND (older.leased_until_ms = 0 OR older.leased_until_ms <= ?1) \
              ) \
        ) \
+       AND (candidate.stream_id = 0 OR NOT EXISTS ( \
+           SELECT 1 FROM outbox older_stream \
+           WHERE older_stream.stream_id = candidate.stream_id \
+             AND older_stream.id < candidate.id \
+             AND NOT ( \
+                 candidate.is_terminal_pod_delete = 1 \
+                 AND older_stream.subject_key = candidate.subject_key \
+                 AND older_stream.is_terminal_pod_delete = 0 \
+                 AND older_stream.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
+                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+                 AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
+             ) \
+       )) \
      ORDER BY CASE candidate.operation \
            WHEN 'LeaseRenew' THEN 0 \
            WHEN 'NodeStatus' THEN 1 \

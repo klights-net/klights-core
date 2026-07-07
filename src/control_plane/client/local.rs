@@ -454,6 +454,9 @@ impl LeaderApiClient for LocalApiClient {
         idempotency_key: &str,
         operation: OutboxOperation,
         payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
         // T6 step 1 inner gate. Refuse all apply_outbox calls when this
         // node is not the elected leader, including LeaseRenew — the
@@ -471,7 +474,17 @@ impl LeaderApiClient for LocalApiClient {
         }
         let outcome = self
             .raft
-            .propose_outbox(idempotency_key, operation, payload, &self.authoring_node)
+            .propose_outbox_with_watermark(
+                idempotency_key,
+                operation,
+                payload,
+                &self.authoring_node,
+                (stream_seq > 0).then(|| crate::log_apply::OutboxStreamWatermark {
+                    client_id: client_id.to_string(),
+                    stream_id,
+                    stream_seq,
+                }),
+            )
             .await?;
         if let Some(command) = outcome.command.as_ref() {
             crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
@@ -493,8 +506,20 @@ impl OutboxApplyClient for LocalApiClient {
         idempotency_key: &str,
         operation: OutboxOperation,
         payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        LeaderApiClient::apply_outbox(self, idempotency_key, operation, payload).await
+        LeaderApiClient::apply_outbox(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            client_id,
+            stream_id,
+            stream_seq,
+        )
+        .await
     }
 }
 
@@ -636,6 +661,9 @@ mod inner_gate_tests {
             "idem-1",
             OutboxOperation::PodStatus,
             pod_status_payload(),
+            "client",
+            1,
+            1,
         )
         .await
         .expect_err("non-leader apply_outbox must be rejected");
@@ -664,6 +692,9 @@ mod inner_gate_tests {
             "idem-lease",
             OutboxOperation::LeaseRenew,
             lease_renew_payload("node-a"),
+            "",
+            0,
+            0,
         )
         .await
         .expect_err("non-leader lease renew must be rejected");
@@ -756,6 +787,9 @@ mod inner_gate_tests {
             "idem-2",
             OutboxOperation::PodStatus,
             pod_status_payload(),
+            "client",
+            1,
+            1,
         )
         .await;
         assert!(pre.is_err(), "pre-promotion write must be refused");
@@ -769,6 +803,9 @@ mod inner_gate_tests {
             "idem-3",
             OutboxOperation::PodStatus,
             pod_status_payload(),
+            "client",
+            1,
+            1,
         )
         .await;
         assert!(
@@ -793,6 +830,9 @@ mod inner_gate_tests {
             "idem-4",
             OutboxOperation::PodStatus,
             pod_status_payload(),
+            "client",
+            1,
+            1,
         )
         .await;
         assert!(pre.is_ok(), "pre-demotion write must succeed");
@@ -806,6 +846,9 @@ mod inner_gate_tests {
             "idem-5",
             OutboxOperation::PodStatus,
             pod_status_payload(),
+            "client",
+            1,
+            1,
         )
         .await
         .expect_err("post-demotion write must be refused");
@@ -827,7 +870,14 @@ mod inner_gate_tests {
         let trait_obj: &dyn OutboxApplyClient = &client;
 
         let err = trait_obj
-            .apply_outbox("idem-6", OutboxOperation::PodStatus, pod_status_payload())
+            .apply_outbox(
+                "idem-6",
+                OutboxOperation::PodStatus,
+                pod_status_payload(),
+                "client",
+                1,
+                1,
+            )
             .await
             .expect_err("non-leader outbox apply must be refused");
         assert!(
@@ -901,6 +951,9 @@ mod inner_gate_tests {
             "n1raft-audit",
             OutboxOperation::PodStatus,
             pod_status_payload(),
+            "client",
+            1,
+            1,
         )
         .await
         .expect_err("non-leader apply_outbox must refuse before reaching N1Raft");

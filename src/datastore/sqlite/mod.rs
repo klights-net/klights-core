@@ -189,654 +189,7 @@ impl crate::kubelet::volume_sources::VolumeSourceReader for Datastore {
 }
 
 impl Datastore {
-    pub async fn db_call<T, F>(&self, query_name: &'static str, f: F) -> tokio_rusqlite::Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
-    {
-        self.executor.call_raw(query_name, f).await
-    }
-
-    pub async fn node_db_call<T, F>(
-        &self,
-        query_name: &'static str,
-        f: F,
-    ) -> tokio_rusqlite::Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
-    {
-        self.node_local.db_call(query_name, f).await
-    }
-
-    pub async fn get_applied_outbox(
-        &self,
-        idempotency_key: &str,
-    ) -> Result<Option<AppliedOutboxRecord>> {
-        let idempotency_key = idempotency_key.to_string();
-        self.db_call("db_applied_outbox_get", move |conn| {
-            conn.query_row(queries::APPLIED_OUTBOX_GET, [idempotency_key], |row| {
-                Ok(AppliedOutboxRecord {
-                    idempotency_key: row.get(0)?,
-                    subject_key: row.get(1)?,
-                    operation: row.get(2)?,
-                    first_seen_ms: row.get(3)?,
-                    applied_rv: row.get(4)?,
-                    result_proto: row.get(5)?,
-                    status_stamp: row.get(6)?,
-                })
-            })
-            .optional()
-            .map_err(tokio_rusqlite::Error::from)
-        })
-        .await
-        .map_err(|e| anyhow!("applied outbox get failed: {e}"))
-    }
-
-    pub async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
-        self.db_call("db_applied_outbox_insert", move |conn| {
-            let changed = conn.execute(
-                queries::APPLIED_OUTBOX_INSERT,
-                rusqlite::params![
-                    record.idempotency_key,
-                    record.subject_key,
-                    record.operation,
-                    record.first_seen_ms,
-                    record.applied_rv,
-                    record.result_proto,
-                    record.status_stamp
-                ],
-            )?;
-            Ok(changed > 0)
-        })
-        .await
-        .map_err(|e| anyhow!("applied outbox insert failed: {e}"))
-    }
-
-    pub async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
-        self.db_call("db_applied_outbox_list_all", move |conn| {
-            let rows = conn
-                .prepare(queries::APPLIED_OUTBOX_LIST_ALL)?
-                .query_map([], |row| {
-                    Ok(AppliedOutboxRecord {
-                        idempotency_key: row.get(0)?,
-                        subject_key: row.get(1)?,
-                        operation: row.get(2)?,
-                        first_seen_ms: row.get(3)?,
-                        applied_rv: row.get(4)?,
-                        result_proto: row.get(5)?,
-                        status_stamp: row.get(6)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| anyhow!("applied outbox list failed: {e}"))
-    }
-
-    /// memory-improvement.md §10 P1: keyset-paginated form of
-    /// `list_applied_outbox`. Returns up to `limit` rows whose
-    /// `idempotency_key > after_key` (pass `None` for the first page), in the
-    /// same `ORDER BY idempotency_key ASC` ordering as the full-list form.
-    /// Lets the snapshot emitter stream the dedup ledger batch by batch
-    /// instead of materializing the whole table into one `Vec`.
-    pub async fn list_applied_outbox_paged(
-        &self,
-        after_key: Option<&str>,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<AppliedOutboxRecord>> {
-        let after = after_key.unwrap_or("").to_string();
-        let limit_i64 = limit.get() as i64;
-        self.db_call("db_applied_outbox_list_all_paged", move |conn| {
-            let rows = conn
-                .prepare(queries::APPLIED_OUTBOX_LIST_ALL_PAGED)?
-                .query_map(rusqlite::params![after, limit_i64], |row| {
-                    Ok(AppliedOutboxRecord {
-                        idempotency_key: row.get(0)?,
-                        subject_key: row.get(1)?,
-                        operation: row.get(2)?,
-                        first_seen_ms: row.get(3)?,
-                        applied_rv: row.get(4)?,
-                        result_proto: row.get(5)?,
-                        status_stamp: row.get(6)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| anyhow!("applied outbox paged list failed: {e}"))
-    }
-
-    pub async fn apply_resource_batch(
-        &self,
-        operations: Vec<ResourceBatchOperation>,
-    ) -> Result<()> {
-        if operations.is_empty() {
-            return Ok(());
-        }
-        let command = crate::datastore::command::StorageCommand::ApplyResourceBatch { operations };
-        // Build + apply in a single IMMEDIATE transaction so the reserved
-        // resourceVersion and the written rows are always committed together.
-        // A two-step approach (build in one txn, apply in a second) leaves a
-        // window where the metadata_rv is advanced but no rows exist yet —
-        // visible to concurrent readers as a reserved-but-not-applied batch.
-        let pending = self
-            .db_call("db_apply_resource_batch", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
-                    &tx,
-                    command,
-                    "ResourceBatch",
-                    "",
-                )?;
-                let pending =
-                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx(&tx, commit)?;
-                tx.commit()?;
-                Ok(pending)
-            })
-            .await
-            .map_err(|e| anyhow!("apply resource batch failed: {e}"))?;
-        self.publish_watch_events(pending);
-        Ok(())
-    }
-
-    pub async fn delete_uncommitted_applied_outbox_placeholder(
-        &self,
-        idempotency_key: &str,
-        reserved_rv: i64,
-    ) -> Result<bool> {
-        let idempotency_key = idempotency_key.to_string();
-        self.db_call(
-            "db_applied_outbox_delete_uncommitted_placeholder",
-            move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let changed = tx.execute(
-                    queries::APPLIED_OUTBOX_DELETE_UNCOMMITTED_PLACEHOLDER_BY_KEY,
-                    rusqlite::params![idempotency_key],
-                )?;
-                if changed > 0 {
-                    crate::datastore::sqlite::cluster_replace::rollback_uncommitted_metadata_rv_if_current_tx(
-                        &tx,
-                        reserved_rv,
-                    )?;
-                }
-                tx.commit()?;
-                Ok(changed > 0)
-            },
-        )
-        .await
-        .map_err(|e| anyhow!("applied outbox placeholder delete failed: {e}"))
-    }
-
-    pub async fn move_pod_to_cleanup_intent(
-        &self,
-        node_name: &str,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        reason: &str,
-    ) -> Result<()> {
-        let command = crate::datastore::command::StorageCommand::MovePodToCleanupIntent {
-            node_name: node_name.to_string(),
-            namespace: namespace.to_string(),
-            pod_name: pod_name.to_string(),
-            pod_uid: pod_uid.to_string(),
-            reason: reason.to_string(),
-        };
-        let authoring_node = node_name.to_string();
-        let pending = self
-            .db_call("db_move_pod_to_cleanup_intent", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
-                    &tx,
-                    command,
-                    "ClusterMaintenance",
-                    &authoring_node,
-                )?;
-                let pending =
-                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx(&tx, commit)?;
-                tx.commit()?;
-                Ok(pending)
-            })
-            .await
-            .map_err(|e| anyhow!("move pod to cleanup intent failed: {e}"))?;
-        self.publish_watch_events(pending);
-        Ok(())
-    }
-
-    pub async fn list_pod_cleanup_intents_for_node(
-        &self,
-        node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
-        let node_name = node_name.to_string();
-        self.db_call("db_list_pod_cleanup_intents_for_node", move |conn| {
-            let rows = conn
-                .prepare(queries::POD_CLEANUP_INTENT_LIST_BY_NODE)?
-                .query_map([node_name], |row| {
-                    let pod_data_bytes: Vec<u8> = row.get(7)?;
-                    let pod_data = serde_json::from_slice(&pod_data_bytes).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            7,
-                            rusqlite::types::Type::Blob,
-                            Box::new(err),
-                        )
-                    })?;
-                    Ok(PodCleanupIntent {
-                        node_name: row.get(0)?,
-                        namespace: row.get(1)?,
-                        pod_name: row.get(2)?,
-                        pod_uid: row.get(3)?,
-                        reason: row.get(4)?,
-                        resource_version: row.get(5)?,
-                        created_at_ms: row.get(6)?,
-                        pod_data,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .map_err(|e| anyhow!("list pod cleanup intents failed: {e}"))
-    }
-
-    pub async fn delete_pod_cleanup_intent(
-        &self,
-        node_name: &str,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        reason: &str,
-    ) -> Result<()> {
-        let command = crate::datastore::command::StorageCommand::DeletePodCleanupIntent {
-            node_name: node_name.to_string(),
-            namespace: namespace.to_string(),
-            pod_name: pod_name.to_string(),
-            pod_uid: pod_uid.to_string(),
-            reason: reason.to_string(),
-        };
-        self.apply_cluster_maintenance_command(command, node_name)
-            .await
-    }
-
-    pub async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
-        let command = crate::datastore::command::StorageCommand::DeletePodCleanupIntentsForNode {
-            node_name: node_name.to_string(),
-        };
-        self.apply_cluster_maintenance_command(command, node_name)
-            .await
-    }
-
-    async fn apply_cluster_maintenance_command(
-        &self,
-        command: crate::datastore::command::StorageCommand,
-        authoring_node: &str,
-    ) -> Result<()> {
-        let authoring_node = authoring_node.to_string();
-        let pending = self
-            .db_call("db_apply_cluster_maintenance_command", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
-                    &tx,
-                    command,
-                    "ClusterMaintenance",
-                    &authoring_node,
-                )?;
-                let pending =
-                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx(&tx, commit)?;
-                tx.commit()?;
-                Ok(pending)
-            })
-            .await
-            .map_err(|e| anyhow!("apply cluster maintenance command failed: {e}"))?;
-        self.publish_watch_events(pending);
-        Ok(())
-    }
-
-    pub async fn current_log_apply_index(&self) -> Result<i64> {
-        self.node_local.current_log_apply_index().await
-    }
-
-    async fn gc_stale_applied_outbox_placeholders(&self, now_ms: i64) -> Result<usize> {
-        let cutoff_ms = now_ms.saturating_sub(APPLIED_OUTBOX_PLACEHOLDER_RECOVERY_TTL_MS);
-        self.db_call("db_gc_stale_applied_outbox_placeholders", move |conn| {
-            Ok(conn.execute(
-                queries::APPLIED_OUTBOX_DELETE_STALE_PLACEHOLDERS,
-                [cutoff_ms],
-            )?)
-        })
-        .await
-        .map_err(|e| anyhow!("applied outbox stale placeholder gc failed: {e}"))
-    }
-
-    /// T1.3/T1.4: build (without applying) the `LogApplyCommit` that the
-    /// leader's raft proposer should submit. Mirrors the early stages of
-    /// `apply_outbox_transactionally` (decode payload, lease-renew shortcut,
-    /// idempotency check, placeholder claim) but stops short of calling
-    /// `apply_commit_in_tx`. The leader reserves the resourceVersion in the
-    /// committed payload so every raft member materializes the same object RV.
-    ///
-    /// On committed exit an `applied_outbox` placeholder row is recorded so
-    /// a duplicate proposal for the same `idempotency_key` short-circuits.
-    pub async fn build_log_apply_commit_for_outbox(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-        payload: &[u8],
-        authoring_node: &str,
-    ) -> std::result::Result<BuildOutboxOutcome, crate::kubelet::outbox::OutboxApplyError> {
-        use crate::control_plane::client::apply::subject_key_for_command;
-        use crate::kubelet::outbox::OutboxApplyError;
-        use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
-        use crate::log_apply::{ClusterMutation, LogApplyAppliedOutboxRow, OutboxLedgerMutation};
-
-        let decoded = OutboxPayload::decode_protobuf(payload)
-            .map_err(|e| OutboxApplyError::Retryable(e.to_string()))?;
-        if operation == OutboxOperation::LeaseRenew.as_str() {
-            crate::node_lease_tracker::ensure_lease_renew_command(&decoded.command, authoring_node)
-                .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
-            return Ok(BuildOutboxOutcome::LeaseRenewShortcircuit);
-        }
-        let subject_key = subject_key_for_command(&decoded.command);
-        let status_stamp = Self::pod_status_stamp_of(&decoded.command);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let claim_key = idempotency_key.to_string();
-        let claim_operation = operation.to_string();
-        let stale_cutoff_ms = now.saturating_sub(APPLIED_OUTBOX_PLACEHOLDER_RECOVERY_TTL_MS);
-        let authoring_node_owned = authoring_node.to_string();
-
-        let outcome = self
-            .db_call("db_build_log_apply_commit_for_outbox", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-                // Idempotency check + placeholder claim. Mirrors the same
-                // logic in apply_outbox_transactionally so the leader does
-                // not double-propose for a key that has already been
-                // applied (or whose placeholder is still in-flight).
-                let existing: Option<AppliedOutboxRecord> = tx
-                    .query_row(queries::APPLIED_OUTBOX_GET, [&claim_key], |row| {
-                        Ok(AppliedOutboxRecord {
-                            idempotency_key: row.get(0)?,
-                            subject_key: row.get(1)?,
-                            operation: row.get(2)?,
-                            first_seen_ms: row.get(3)?,
-                            applied_rv: row.get(4)?,
-                            result_proto: row.get(5)?,
-                            status_stamp: row.get(6)?,
-                        })
-                    })
-                    .optional()?;
-                if let Some(ref row) = existing {
-                    let placeholder = row.applied_rv.is_none() && row.result_proto.is_empty();
-                    if placeholder && row.first_seen_ms < stale_cutoff_ms {
-                        tx.execute(queries::APPLIED_OUTBOX_DELETE_BY_KEY, [&claim_key])?;
-                    } else if placeholder {
-                        tx.commit()?;
-                        return Ok(BuildOutboxTxnOutcome::InFlightPlaceholder);
-                    } else {
-                        tx.commit()?;
-                        return Ok(BuildOutboxTxnOutcome::AlreadyApplied(existing));
-                    }
-                }
-
-                let (mut commit, rv) = Self::build_log_apply_commit_in_tx_from_command(
-                    &tx,
-                    decoded.command,
-                    &claim_operation,
-                    &authoring_node_owned,
-                )?;
-
-                // Claim the placeholder in the same transaction that reserves
-                // the RV so list snapshots can avoid anchoring past unapplied
-                // raft entries for this resource collection.
-                tx.execute(
-                    queries::APPLIED_OUTBOX_INSERT_PLACEHOLDER_WITH_RESERVED_RV,
-                    rusqlite::params![&claim_key, &subject_key, &claim_operation, now, rv],
-                )?;
-
-                // Append PutAppliedOutbox so the state-machine apply on
-                // every node records the final idempotency outcome. On
-                // the leader this UPSERT overwrites the placeholder we
-                // just claimed; on followers it inserts fresh.
-                use crate::datastore::command::{StorageResponse, encode_response_protobuf};
-                commit.mutations.push(
-                    ClusterMutation::OutboxLedger(OutboxLedgerMutation::PutAppliedOutbox(
-                        LogApplyAppliedOutboxRow {
-                            idempotency_key: claim_key.clone(),
-                            subject_key,
-                            operation: claim_operation,
-                            first_seen_ms: now,
-                            applied_rv: None,
-                            result_proto: encode_response_protobuf(&StorageResponse::Ack {
-                                resource_version: 0,
-                            })
-                            .unwrap_or_default(),
-                            status_stamp,
-                        },
-                    ))
-                    .into_log_apply_mutation(),
-                );
-
-                tx.commit()?;
-                Ok(BuildOutboxTxnOutcome::Built { commit, rv })
-            })
-            .await
-            .map_err(Self::outbox_apply_error_from_db_error)?;
-
-        match outcome {
-            BuildOutboxTxnOutcome::Built { commit, rv } => Ok(BuildOutboxOutcome::NeedsPropose {
-                commit,
-                applied_rv: rv,
-            }),
-            BuildOutboxTxnOutcome::AlreadyApplied(record) => {
-                if let Some(message) = Self::cached_outbox_terminal_error(record.as_ref())? {
-                    return Err(crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(
-                        message,
-                    ));
-                }
-                Ok(BuildOutboxOutcome::AlreadyApplied {
-                    applied_rv: record.and_then(|r| r.applied_rv),
-                })
-            }
-            BuildOutboxTxnOutcome::InFlightPlaceholder => {
-                Err(Self::inflight_outbox_placeholder_error(idempotency_key))
-            }
-        }
-    }
-
-    pub async fn apply_outbox_transactionally(
-        &self,
-        idempotency_key: &str,
-        operation: &str,
-        payload: &[u8],
-        authoring_node: &str,
-    ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
-        use crate::control_plane::client::apply::subject_key_for_command;
-        use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
-        use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
-        let decoded = OutboxPayload::decode_protobuf(payload)
-            .map_err(|e| OutboxApplyError::Retryable(e.to_string()))?;
-        if operation == OutboxOperation::LeaseRenew.as_str() {
-            crate::node_lease_tracker::ensure_lease_renew_command(&decoded.command, authoring_node)
-                .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
-            return Ok(OutboxApplyResult::Applied { applied_rv: 0 });
-        }
-        let subject_key = subject_key_for_command(&decoded.command);
-        let status_stamp = Self::pod_status_stamp_of(&decoded.command);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-
-        let claim_key = idempotency_key.to_string();
-        let claim_operation = operation.to_string();
-        let stale_cutoff_ms = now.saturating_sub(APPLIED_OUTBOX_PLACEHOLDER_RECOVERY_TTL_MS);
-        let authoring_node = authoring_node.to_string();
-        let outcome = self
-            .db_call("db_apply_outbox_atomic", move |conn| {
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-                let mut existing: Option<AppliedOutboxRecord> = tx
-                    .query_row(queries::APPLIED_OUTBOX_GET, [&claim_key], |row| {
-                        Ok(AppliedOutboxRecord {
-                            idempotency_key: row.get(0)?,
-                            subject_key: row.get(1)?,
-                            operation: row.get(2)?,
-                            first_seen_ms: row.get(3)?,
-                            applied_rv: row.get(4)?,
-                            result_proto: row.get(5)?,
-                            status_stamp: row.get(6)?,
-                        })
-                    })
-                    .optional()?;
-
-                if let Some(ref row) = existing {
-                    let placeholder = row.applied_rv.is_none() && row.result_proto.is_empty();
-                    if placeholder && row.first_seen_ms < stale_cutoff_ms {
-                        tx.execute(queries::APPLIED_OUTBOX_DELETE_BY_KEY, [&claim_key])?;
-                    } else if placeholder {
-                        tx.commit()?;
-                        return Ok(OutboxTxnOutcome::InFlightPlaceholder);
-                    } else {
-                        tx.commit()?;
-                        return Ok(OutboxTxnOutcome::AlreadyApplied(existing));
-                    }
-                }
-
-                tx.execute(
-                    queries::APPLIED_OUTBOX_INSERT,
-                    rusqlite::params![
-                        &claim_key,
-                        "",
-                        &claim_operation,
-                        now,
-                        Option::<i64>::None,
-                        Vec::<u8>::new(),
-                        Option::<i64>::None
-                    ],
-                )?;
-                let mutation = Self::apply_outbox_command_in_tx(
-                    &tx,
-                    decoded.command,
-                    &claim_operation,
-                    &authoring_node,
-                )?;
-                tx.execute(
-                    queries::APPLIED_OUTBOX_UPDATE_RESULT,
-                    rusqlite::params![
-                        &claim_key,
-                        subject_key,
-                        mutation.applied_rv,
-                        mutation.result_proto,
-                        status_stamp
-                    ],
-                )?;
-                if tx.changes() == 0 {
-                    existing = tx
-                        .query_row(queries::APPLIED_OUTBOX_GET, [&claim_key], |row| {
-                            Ok(AppliedOutboxRecord {
-                                idempotency_key: row.get(0)?,
-                                subject_key: row.get(1)?,
-                                operation: row.get(2)?,
-                                first_seen_ms: row.get(3)?,
-                                applied_rv: row.get(4)?,
-                                result_proto: row.get(5)?,
-                                status_stamp: row.get(6)?,
-                            })
-                        })
-                        .optional()?;
-                    tx.commit()?;
-                    return Ok(OutboxTxnOutcome::AlreadyApplied(existing));
-                }
-                tx.commit()?;
-                Ok(OutboxTxnOutcome::Applied {
-                    applied_rv: mutation.applied_rv.unwrap_or(0),
-                    pending: mutation.pending,
-                })
-            })
-            .await
-            .map_err(Self::outbox_apply_error_from_db_error)?;
-
-        match outcome {
-            OutboxTxnOutcome::Applied {
-                applied_rv,
-                pending,
-            } => {
-                if let Some(pending) = pending {
-                    self.publish_watch_event(pending);
-                }
-                Ok(OutboxApplyResult::Applied { applied_rv })
-            }
-            OutboxTxnOutcome::AlreadyApplied(record) => {
-                if let Some(message) = Self::cached_outbox_terminal_error(record.as_ref())? {
-                    return Err(OutboxApplyError::ConflictTerminal(message));
-                }
-                Ok(OutboxApplyResult::AlreadyApplied {
-                    applied_rv: record.and_then(|record| record.applied_rv),
-                })
-            }
-            OutboxTxnOutcome::InFlightPlaceholder => {
-                Err(Self::inflight_outbox_placeholder_error(idempotency_key))
-            }
-        }
-    }
-
-    /// Apply a StorageCommand within a transaction by converting it to
-    /// a LogApplyCommit and routing through `apply_commit_in_tx`. This ensures:
-    ///   - All StorageCommand variants are supported (no "unsupported" gap)
-    ///   - Leader-local outbox apply and raft state-machine replay share row semantics
-    ///   - The applied outbox result is derived from the same committed mutation data
-    fn apply_outbox_command_in_tx(
-        tx: &rusqlite::Transaction<'_>,
-        command: crate::datastore::command::StorageCommand,
-        operation: &str,
-        authoring_node: &str,
-    ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
-        use crate::datastore::command::StorageResponse;
-        use crate::datastore::command::encode_response_protobuf;
-
-        let (commit, _provisional_rv) = Self::build_log_apply_commit_in_tx_from_command(
-            tx,
-            command,
-            operation,
-            authoring_node,
-        )?;
-
-        let (applied_rv, pending) =
-            crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_returning_rv(
-                tx, commit, false,
-            )?;
-
-        let pending_event = pending.into_iter().next();
-        let result_proto = encode_response_protobuf(&StorageResponse::Ack {
-            resource_version: applied_rv,
-        })
-        .unwrap_or_default();
-        Ok(AtomicOutboxMutation {
-            applied_rv: Some(applied_rv),
-            result_proto,
-            pending: pending_event,
-        })
-    }
-
-    /// T1.3/T1.4: build a `LogApplyCommit` from a `StorageCommand` inside
-    /// an open transaction WITHOUT applying it. The leader's raft proposer
-    /// uses this to construct the commit, encode it as the raft entry
-    /// payload, and submit through `client_write`. The state machine apply
-    /// path on every node (leader included) is the only caller of
-    /// `apply_commit_in_tx` after raft commits.
-    ///
-    /// The returned commit reserves the leader's next resourceVersion without
-    /// applying resource mutations. Raft then serializes that materialized RV so
-    /// followers do not derive divergent object RVs from their local counters.
-    pub(crate) fn build_log_apply_commit_in_tx_from_command(
+    fn build_log_apply_commit_in_tx_from_command(
         tx: &rusqlite::Transaction<'_>,
         command: crate::datastore::command::StorageCommand,
         operation: &str,
@@ -1722,6 +1075,794 @@ impl Datastore {
         };
 
         Ok((commit, rv))
+    }
+
+    pub async fn db_call<T, F>(&self, query_name: &'static str, f: F) -> tokio_rusqlite::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+    {
+        self.executor.call_raw(query_name, f).await
+    }
+
+    pub async fn node_db_call<T, F>(
+        &self,
+        query_name: &'static str,
+        f: F,
+    ) -> tokio_rusqlite::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+    {
+        self.node_local.db_call(query_name, f).await
+    }
+
+    pub async fn get_applied_outbox(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<AppliedOutboxRecord>> {
+        let idempotency_key = idempotency_key.to_string();
+        self.db_call("db_applied_outbox_get", move |conn| {
+            conn.query_row(queries::APPLIED_OUTBOX_GET, [idempotency_key], |row| {
+                Ok(AppliedOutboxRecord {
+                    idempotency_key: row.get(0)?,
+                    subject_key: row.get(1)?,
+                    operation: row.get(2)?,
+                    first_seen_ms: row.get(3)?,
+                    applied_rv: row.get(4)?,
+                    result_proto: row.get(5)?,
+                    status_stamp: row.get(6)?,
+                })
+            })
+            .optional()
+            .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .map_err(|e| anyhow!("applied outbox get failed: {e}"))
+    }
+
+    pub async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
+        self.db_call("db_applied_outbox_insert", move |conn| {
+            let changed = conn.execute(
+                queries::APPLIED_OUTBOX_INSERT,
+                rusqlite::params![
+                    record.idempotency_key,
+                    record.subject_key,
+                    record.operation,
+                    record.first_seen_ms,
+                    record.applied_rv,
+                    record.result_proto,
+                    record.status_stamp
+                ],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+        .map_err(|e| anyhow!("applied outbox insert failed: {e}"))
+    }
+
+    pub async fn list_outbox_stream_watermarks(
+        &self,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        self.db_call("db_outbox_stream_watermarks_list_all", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT client_id, stream_id, last_seq FROM outbox_stream_watermarks \
+                 ORDER BY client_id ASC, stream_id ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(crate::log_apply::OutboxStreamWatermark {
+                    client_id: row.get(0)?,
+                    stream_id: row.get(1)?,
+                    stream_seq: row.get(2)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+        .map_err(|e| anyhow!("list outbox stream watermarks failed: {e}"))
+    }
+
+    pub async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
+        self.db_call("db_applied_outbox_list_all", move |conn| {
+            let rows = conn
+                .prepare(queries::APPLIED_OUTBOX_LIST_ALL)?
+                .query_map([], |row| {
+                    Ok(AppliedOutboxRecord {
+                        idempotency_key: row.get(0)?,
+                        subject_key: row.get(1)?,
+                        operation: row.get(2)?,
+                        first_seen_ms: row.get(3)?,
+                        applied_rv: row.get(4)?,
+                        result_proto: row.get(5)?,
+                        status_stamp: row.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| anyhow!("applied outbox list failed: {e}"))
+    }
+
+    /// memory-improvement.md §10 P1: keyset-paginated form of
+    /// `list_applied_outbox`. Returns up to `limit` rows whose
+    /// `idempotency_key > after_key` (pass `None` for the first page), in the
+    /// same `ORDER BY idempotency_key ASC` ordering as the full-list form.
+    /// Lets the snapshot emitter stream the dedup ledger batch by batch
+    /// instead of materializing the whole table into one `Vec`.
+    pub async fn list_applied_outbox_paged(
+        &self,
+        after_key: Option<&str>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<AppliedOutboxRecord>> {
+        let after = after_key.unwrap_or("").to_string();
+        let limit_i64 = limit.get() as i64;
+        self.db_call("db_applied_outbox_list_all_paged", move |conn| {
+            let rows = conn
+                .prepare(queries::APPLIED_OUTBOX_LIST_ALL_PAGED)?
+                .query_map(rusqlite::params![after, limit_i64], |row| {
+                    Ok(AppliedOutboxRecord {
+                        idempotency_key: row.get(0)?,
+                        subject_key: row.get(1)?,
+                        operation: row.get(2)?,
+                        first_seen_ms: row.get(3)?,
+                        applied_rv: row.get(4)?,
+                        result_proto: row.get(5)?,
+                        status_stamp: row.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| anyhow!("applied outbox paged list failed: {e}"))
+    }
+
+    pub async fn apply_resource_batch(
+        &self,
+        operations: Vec<ResourceBatchOperation>,
+    ) -> Result<()> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let command = crate::datastore::command::StorageCommand::ApplyResourceBatch { operations };
+        // Build + apply in a single IMMEDIATE transaction so the reserved
+        // resourceVersion and the written rows are always committed together.
+        // A two-step approach (build in one txn, apply in a second) leaves a
+        // window where the metadata_rv is advanced but no rows exist yet —
+        // visible to concurrent readers as a reserved-but-not-applied batch.
+        let pending = self
+            .db_call("db_apply_resource_batch", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
+                    &tx,
+                    command,
+                    "ResourceBatch",
+                    "",
+                )?;
+                let pending =
+                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx(&tx, commit)?;
+                tx.commit()?;
+                Ok(pending)
+            })
+            .await
+            .map_err(|e| anyhow!("apply resource batch failed: {e}"))?;
+        self.publish_watch_events(pending);
+        Ok(())
+    }
+
+    pub async fn delete_uncommitted_applied_outbox_placeholder(
+        &self,
+        idempotency_key: &str,
+        reserved_rv: i64,
+    ) -> Result<bool> {
+        let idempotency_key = idempotency_key.to_string();
+        self.db_call(
+            "db_applied_outbox_delete_uncommitted_placeholder_call",
+            move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let changed = tx.execute(
+                    queries::APPLIED_OUTBOX_DELETE_UNCOMMITTED_PLACEHOLDER_BY_KEY,
+                    rusqlite::params![idempotency_key],
+                )?;
+                if changed > 0 {
+                    crate::datastore::sqlite::cluster_replace::rollback_uncommitted_metadata_rv_if_current_tx(
+                        &tx,
+                        reserved_rv,
+                    )?;
+                }
+                tx.commit()?;
+                Ok(changed > 0)
+            },
+        )
+        .await
+        .map_err(|e| anyhow!("applied outbox placeholder delete failed: {e}"))
+    }
+
+    pub async fn move_pod_to_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let command = crate::datastore::command::StorageCommand::MovePodToCleanupIntent {
+            node_name: node_name.to_string(),
+            namespace: namespace.to_string(),
+            pod_name: pod_name.to_string(),
+            pod_uid: pod_uid.to_string(),
+            reason: reason.to_string(),
+        };
+        let authoring_node = node_name.to_string();
+        let pending = self
+            .db_call("db_move_pod_to_cleanup_intent", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
+                    &tx,
+                    command,
+                    "ClusterMaintenance",
+                    &authoring_node,
+                )?;
+                let pending =
+                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx(&tx, commit)?;
+                tx.commit()?;
+                Ok(pending)
+            })
+            .await
+            .map_err(|e| anyhow!("move pod to cleanup intent failed: {e}"))?;
+        self.publish_watch_events(pending);
+        Ok(())
+    }
+
+    pub async fn list_pod_cleanup_intents_for_node(
+        &self,
+        node_name: &str,
+    ) -> Result<Vec<PodCleanupIntent>> {
+        let node_name = node_name.to_string();
+        self.db_call("db_list_pod_cleanup_intents_for_node", move |conn| {
+            let rows = conn
+                .prepare(queries::POD_CLEANUP_INTENT_LIST_BY_NODE)?
+                .query_map([node_name], |row| {
+                    let pod_data_bytes: Vec<u8> = row.get(7)?;
+                    let pod_data = serde_json::from_slice(&pod_data_bytes).map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            7,
+                            rusqlite::types::Type::Blob,
+                            Box::new(err),
+                        )
+                    })?;
+                    Ok(PodCleanupIntent {
+                        node_name: row.get(0)?,
+                        namespace: row.get(1)?,
+                        pod_name: row.get(2)?,
+                        pod_uid: row.get(3)?,
+                        reason: row.get(4)?,
+                        resource_version: row.get(5)?,
+                        created_at_ms: row.get(6)?,
+                        pod_data,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| anyhow!("list pod cleanup intents failed: {e}"))
+    }
+
+    pub async fn delete_pod_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let command = crate::datastore::command::StorageCommand::DeletePodCleanupIntent {
+            node_name: node_name.to_string(),
+            namespace: namespace.to_string(),
+            pod_name: pod_name.to_string(),
+            pod_uid: pod_uid.to_string(),
+            reason: reason.to_string(),
+        };
+        self.apply_cluster_maintenance_command(command, node_name)
+            .await
+    }
+
+    pub async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
+        let command = crate::datastore::command::StorageCommand::DeletePodCleanupIntentsForNode {
+            node_name: node_name.to_string(),
+        };
+        self.apply_cluster_maintenance_command(command, node_name)
+            .await
+    }
+
+    async fn apply_cluster_maintenance_command(
+        &self,
+        command: crate::datastore::command::StorageCommand,
+        authoring_node: &str,
+    ) -> Result<()> {
+        let authoring_node = authoring_node.to_string();
+        let pending = self
+            .db_call("db_apply_cluster_maintenance_command", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
+                    &tx,
+                    command,
+                    "ClusterMaintenance",
+                    &authoring_node,
+                )?;
+                let pending =
+                    crate::datastore::sqlite::cluster_replace::apply_commit_in_tx(&tx, commit)?;
+                tx.commit()?;
+                Ok(pending)
+            })
+            .await
+            .map_err(|e| anyhow!("apply cluster maintenance command failed: {e}"))?;
+        self.publish_watch_events(pending);
+        Ok(())
+    }
+
+    pub async fn current_log_apply_index(&self) -> Result<i64> {
+        self.node_local.current_log_apply_index().await
+    }
+
+    async fn gc_stale_applied_outbox_placeholders(&self, now_ms: i64) -> Result<usize> {
+        let cutoff_ms = now_ms.saturating_sub(APPLIED_OUTBOX_PLACEHOLDER_RECOVERY_TTL_MS);
+        self.db_call("db_gc_stale_applied_outbox_placeholders", move |conn| {
+            Ok(conn.execute(
+                queries::APPLIED_OUTBOX_DELETE_STALE_PLACEHOLDERS,
+                [cutoff_ms],
+            )?)
+        })
+        .await
+        .map_err(|e| anyhow!("applied outbox stale placeholder gc failed: {e}"))
+    }
+
+    /// T1.4: build (without applying) a `LogApplyCommit` for regular raft writes.
+    ///
+    /// This variant intentionally skips outbox idempotency side effects and is used
+    /// by `propose_command` for non-outbox writes. It still reserves the
+    /// resourceVersion in the committed payload and applies the same operation-
+    /// specific precondition behavior through
+    /// `build_log_apply_commit_in_tx_from_command`.
+    pub async fn build_log_apply_commit_for_command(
+        &self,
+        command: crate::datastore::command::StorageCommand,
+        operation: &str,
+        authoring_node: &str,
+    ) -> Result<crate::log_apply::LogApplyCommit> {
+        let operation = operation.to_string();
+        let authoring_node_owned = authoring_node.to_string();
+
+        self.db_call("db_build_log_apply_commit_for_command", move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (commit, _rv) = Self::build_log_apply_commit_in_tx_from_command(
+                &tx,
+                command,
+                &operation,
+                &authoring_node_owned,
+            )?;
+            tx.commit()?;
+            Ok(commit)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("build log_apply commit failed: {e}"))
+    }
+
+    /// T1.3/T1.4: build (without applying) the `LogApplyCommit` that the
+    /// leader's raft proposer should submit. Mirrors the early stages of
+    /// `apply_outbox_transactionally` (decode payload, lease-renew shortcut,
+    /// idempotency check, placeholder claim) but stops short of calling
+    /// `apply_commit_in_tx`. The leader reserves the resourceVersion in the
+    /// committed payload so every raft member materializes the same object RV.
+    ///
+    /// On committed exit an `applied_outbox` placeholder row is recorded so
+    /// a duplicate proposal for the same `idempotency_key` short-circuits.
+    pub async fn build_log_apply_commit_for_outbox(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+    ) -> std::result::Result<BuildOutboxOutcome, crate::kubelet::outbox::OutboxApplyError> {
+        use crate::control_plane::client::apply::subject_key_for_command;
+        use crate::kubelet::outbox::OutboxApplyError;
+        use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+        use crate::log_apply::{ClusterMutation, LogApplyAppliedOutboxRow, OutboxLedgerMutation};
+
+        let decoded = OutboxPayload::decode_protobuf(payload)
+            .map_err(|e| OutboxApplyError::Retryable(e.to_string()))?;
+        if operation == OutboxOperation::LeaseRenew.as_str() {
+            crate::node_lease_tracker::ensure_lease_renew_command(&decoded.command, authoring_node)
+                .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
+            return Ok(BuildOutboxOutcome::LeaseRenewShortcircuit);
+        }
+        let subject_key = subject_key_for_command(&decoded.command);
+        let status_stamp = Self::pod_status_stamp_of(&decoded.command);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let claim_key = idempotency_key.to_string();
+        let claim_operation = operation.to_string();
+        let stale_cutoff_ms = now.saturating_sub(APPLIED_OUTBOX_PLACEHOLDER_RECOVERY_TTL_MS);
+        let authoring_node_owned = authoring_node.to_string();
+
+        let outcome = self
+            .db_call("db_build_log_apply_commit_for_outbox", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+                // Idempotency check + placeholder claim. Mirrors the same
+                // logic in apply_outbox_transactionally so the leader does
+                // not double-propose for a key that has already been
+                // applied (or whose placeholder is still in-flight).
+                let existing: Option<AppliedOutboxRecord> = tx
+                    .query_row(queries::APPLIED_OUTBOX_GET, [&claim_key], |row| {
+                        Ok(AppliedOutboxRecord {
+                            idempotency_key: row.get(0)?,
+                            subject_key: row.get(1)?,
+                            operation: row.get(2)?,
+                            first_seen_ms: row.get(3)?,
+                            applied_rv: row.get(4)?,
+                            result_proto: row.get(5)?,
+                            status_stamp: row.get(6)?,
+                        })
+                    })
+                    .optional()?;
+                if let Some(ref row) = existing {
+                    let placeholder = row.applied_rv.is_none() && row.result_proto.is_empty();
+                    if placeholder && row.first_seen_ms < stale_cutoff_ms {
+                        tx.execute(queries::APPLIED_OUTBOX_DELETE_BY_KEY, [&claim_key])?;
+                    } else if placeholder {
+                        tx.commit()?;
+                        return Ok(BuildOutboxTxnOutcome::InFlightPlaceholder);
+                    } else {
+                        tx.commit()?;
+                        return Ok(BuildOutboxTxnOutcome::AlreadyApplied(existing));
+                    }
+                }
+
+                let (mut commit, rv) = Self::build_log_apply_commit_in_tx_from_command(
+                    &tx,
+                    decoded.command,
+                    &claim_operation,
+                    &authoring_node_owned,
+                )?;
+
+                // Claim the placeholder in the same transaction that reserves
+                // the RV so list snapshots can avoid anchoring past unapplied
+                // raft entries for this resource collection.
+                tx.execute(
+                    queries::APPLIED_OUTBOX_INSERT_PLACEHOLDER_WITH_RESERVED_RV,
+                    rusqlite::params![&claim_key, &subject_key, &claim_operation, now, rv],
+                )?;
+
+                // Append PutAppliedOutbox so the state-machine apply on
+                // every node records the final idempotency outcome. On
+                // the leader this UPSERT overwrites the placeholder we
+                // just claimed; on followers it inserts fresh.
+                use crate::datastore::command::{StorageResponse, encode_response_protobuf};
+                commit.mutations.push(
+                    ClusterMutation::OutboxLedger(OutboxLedgerMutation::PutAppliedOutbox(
+                        LogApplyAppliedOutboxRow {
+                            idempotency_key: claim_key.clone(),
+                            subject_key,
+                            operation: claim_operation,
+                            first_seen_ms: now,
+                            applied_rv: None,
+                            result_proto: encode_response_protobuf(&StorageResponse::Ack {
+                                resource_version: 0,
+                            })
+                            .unwrap_or_default(),
+                            status_stamp,
+                        },
+                    ))
+                    .into_log_apply_mutation(),
+                );
+
+                tx.commit()?;
+                Ok(BuildOutboxTxnOutcome::Built { commit, rv })
+            })
+            .await
+            .map_err(Self::outbox_apply_error_from_db_error)?;
+
+        match outcome {
+            BuildOutboxTxnOutcome::Built { commit, rv } => Ok(BuildOutboxOutcome::NeedsPropose {
+                commit,
+                applied_rv: rv,
+            }),
+            BuildOutboxTxnOutcome::AlreadyApplied(record) => {
+                if let Some(message) = Self::cached_outbox_terminal_error(record.as_ref())? {
+                    return Err(crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(
+                        message,
+                    ));
+                }
+                Ok(BuildOutboxOutcome::AlreadyApplied {
+                    applied_rv: record.and_then(|r| r.applied_rv),
+                })
+            }
+            BuildOutboxTxnOutcome::InFlightPlaceholder => {
+                Err(Self::inflight_outbox_placeholder_error(idempotency_key))
+            }
+        }
+    }
+
+    pub async fn build_log_apply_commit_for_outbox_with_watermark(
+        &self,
+        _idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<BuildOutboxOutcome, crate::kubelet::outbox::OutboxApplyError> {
+        if watermark.is_none() {
+            return self
+                .build_log_apply_commit_for_outbox(
+                    _idempotency_key,
+                    operation,
+                    payload,
+                    authoring_node,
+                )
+                .await;
+        }
+        use crate::kubelet::outbox::OutboxApplyError;
+        use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+
+        let decoded = OutboxPayload::decode_protobuf(payload)
+            .map_err(|e| OutboxApplyError::Retryable(e.to_string()))?;
+        if operation == OutboxOperation::LeaseRenew.as_str() {
+            crate::node_lease_tracker::ensure_lease_renew_command(&decoded.command, authoring_node)
+                .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
+            return Ok(BuildOutboxOutcome::LeaseRenewShortcircuit);
+        }
+        let claim_operation = operation.to_string();
+        let authoring_node_owned = authoring_node.to_string();
+        let watermark_for_tx = watermark.clone();
+
+        let outcome = self
+            .db_call("db_build_log_apply_commit_for_outbox_watermark", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                if let Some(ref watermark) = watermark_for_tx {
+                    let last_seq: Option<i64> = tx
+                        .query_row(
+                            "SELECT last_seq FROM outbox_stream_watermarks WHERE client_id = ?1 AND stream_id = ?2",
+                            rusqlite::params![&watermark.client_id, watermark.stream_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if watermark.stream_seq <= 0 {
+                        return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                            "outbox stream seq must be positive",
+                        ));
+                    }
+                    if let Some(last_seq) = last_seq {
+                        if watermark.stream_seq <= last_seq {
+                            tx.commit()?;
+                            return Ok(BuildOutboxTxnOutcome::AlreadyApplied(None));
+                        }
+                        if watermark.stream_seq != last_seq.saturating_add(1) {
+                            return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                                format!(
+                                    "outbox stream gap for seq {}: last committed seq is {}",
+                                    watermark.stream_seq, last_seq
+                                ),
+                            ));
+                        }
+                    } else if watermark.stream_seq != 1 {
+                        return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                            format!(
+                                "outbox stream gap for seq {}: last committed seq is 0",
+                                watermark.stream_seq
+                            ),
+                        ));
+                    }
+                }
+                let (mut commit, rv) = Self::build_log_apply_commit_in_tx_from_command(
+                    &tx,
+                    decoded.command,
+                    &claim_operation,
+                    &authoring_node_owned,
+                )?;
+                commit.outbox_watermark = watermark_for_tx;
+                tx.commit()?;
+                Ok(BuildOutboxTxnOutcome::Built { commit, rv })
+            })
+            .await
+            .map_err(Self::outbox_apply_error_from_db_error)?;
+
+        match outcome {
+            BuildOutboxTxnOutcome::Built { commit, rv } => Ok(BuildOutboxOutcome::NeedsPropose {
+                commit,
+                applied_rv: rv,
+            }),
+            BuildOutboxTxnOutcome::AlreadyApplied(record) => {
+                Ok(BuildOutboxOutcome::AlreadyApplied {
+                    applied_rv: record.and_then(|r| r.applied_rv),
+                })
+            }
+            BuildOutboxTxnOutcome::InFlightPlaceholder => {
+                Err(Self::inflight_outbox_placeholder_error("outbox watermark"))
+            }
+        }
+    }
+
+    pub async fn apply_outbox_transactionally(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        use crate::control_plane::client::apply::subject_key_for_command;
+        use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+        use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
+        let decoded = OutboxPayload::decode_protobuf(payload)
+            .map_err(|e| OutboxApplyError::Retryable(e.to_string()))?;
+        if operation == OutboxOperation::LeaseRenew.as_str() {
+            crate::node_lease_tracker::ensure_lease_renew_command(&decoded.command, authoring_node)
+                .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
+            return Ok(OutboxApplyResult::Applied { applied_rv: 0 });
+        }
+        let subject_key = subject_key_for_command(&decoded.command);
+        let status_stamp = Self::pod_status_stamp_of(&decoded.command);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let claim_key = idempotency_key.to_string();
+        let claim_operation = operation.to_string();
+        let stale_cutoff_ms = now.saturating_sub(APPLIED_OUTBOX_PLACEHOLDER_RECOVERY_TTL_MS);
+        let authoring_node = authoring_node.to_string();
+        let outcome = self
+            .db_call("db_apply_outbox_atomic", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+                let mut existing: Option<AppliedOutboxRecord> = tx
+                    .query_row(queries::APPLIED_OUTBOX_GET, [&claim_key], |row| {
+                        Ok(AppliedOutboxRecord {
+                            idempotency_key: row.get(0)?,
+                            subject_key: row.get(1)?,
+                            operation: row.get(2)?,
+                            first_seen_ms: row.get(3)?,
+                            applied_rv: row.get(4)?,
+                            result_proto: row.get(5)?,
+                            status_stamp: row.get(6)?,
+                        })
+                    })
+                    .optional()?;
+
+                if let Some(ref row) = existing {
+                    let placeholder = row.applied_rv.is_none() && row.result_proto.is_empty();
+                    if placeholder && row.first_seen_ms < stale_cutoff_ms {
+                        tx.execute(queries::APPLIED_OUTBOX_DELETE_BY_KEY, [&claim_key])?;
+                    } else if placeholder {
+                        tx.commit()?;
+                        return Ok(OutboxTxnOutcome::InFlightPlaceholder);
+                    } else {
+                        tx.commit()?;
+                        return Ok(OutboxTxnOutcome::AlreadyApplied(existing));
+                    }
+                }
+
+                tx.execute(
+                    queries::APPLIED_OUTBOX_INSERT,
+                    rusqlite::params![
+                        &claim_key,
+                        "",
+                        &claim_operation,
+                        now,
+                        Option::<i64>::None,
+                        Vec::<u8>::new(),
+                        Option::<i64>::None
+                    ],
+                )?;
+                let mutation = Self::apply_outbox_command_in_tx(
+                    &tx,
+                    decoded.command,
+                    &claim_operation,
+                    &authoring_node,
+                )?;
+                tx.execute(
+                    queries::APPLIED_OUTBOX_UPDATE_RESULT,
+                    rusqlite::params![
+                        &claim_key,
+                        subject_key,
+                        mutation.applied_rv,
+                        mutation.result_proto,
+                        status_stamp
+                    ],
+                )?;
+                if tx.changes() == 0 {
+                    existing = tx
+                        .query_row(queries::APPLIED_OUTBOX_GET, [&claim_key], |row| {
+                            Ok(AppliedOutboxRecord {
+                                idempotency_key: row.get(0)?,
+                                subject_key: row.get(1)?,
+                                operation: row.get(2)?,
+                                first_seen_ms: row.get(3)?,
+                                applied_rv: row.get(4)?,
+                                result_proto: row.get(5)?,
+                                status_stamp: row.get(6)?,
+                            })
+                        })
+                        .optional()?;
+                    tx.commit()?;
+                    return Ok(OutboxTxnOutcome::AlreadyApplied(existing));
+                }
+                tx.commit()?;
+                Ok(OutboxTxnOutcome::Applied {
+                    applied_rv: mutation.applied_rv.unwrap_or(0),
+                    pending: mutation.pending,
+                })
+            })
+            .await
+            .map_err(Self::outbox_apply_error_from_db_error)?;
+
+        match outcome {
+            OutboxTxnOutcome::Applied {
+                applied_rv,
+                pending,
+            } => {
+                if let Some(pending) = pending {
+                    self.publish_watch_event(pending);
+                }
+                Ok(OutboxApplyResult::Applied { applied_rv })
+            }
+            OutboxTxnOutcome::AlreadyApplied(record) => {
+                if let Some(message) = Self::cached_outbox_terminal_error(record.as_ref())? {
+                    return Err(OutboxApplyError::ConflictTerminal(message));
+                }
+                Ok(OutboxApplyResult::AlreadyApplied {
+                    applied_rv: record.and_then(|record| record.applied_rv),
+                })
+            }
+            OutboxTxnOutcome::InFlightPlaceholder => {
+                Err(Self::inflight_outbox_placeholder_error(idempotency_key))
+            }
+        }
+    }
+
+    /// Apply a StorageCommand within a transaction by converting it to
+    /// a LogApplyCommit and routing through `apply_commit_in_tx`. This ensures:
+    ///   - All StorageCommand variants are supported (no "unsupported" gap)
+    ///   - Leader-local outbox apply and raft state-machine replay share row semantics
+    ///   - The applied outbox result is derived from the same committed mutation data
+    fn apply_outbox_command_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        command: crate::datastore::command::StorageCommand,
+        operation: &str,
+        authoring_node: &str,
+    ) -> tokio_rusqlite::Result<AtomicOutboxMutation> {
+        use crate::datastore::command::StorageResponse;
+        use crate::datastore::command::encode_response_protobuf;
+
+        let (commit, _provisional_rv) = Self::build_log_apply_commit_in_tx_from_command(
+            tx,
+            command,
+            operation,
+            authoring_node,
+        )?;
+
+        let (applied_rv, pending) =
+            crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_returning_rv(
+                tx, commit, false,
+            )?;
+
+        let pending_event = pending.into_iter().next();
+        let result_proto = encode_response_protobuf(&StorageResponse::Ack {
+            resource_version: applied_rv,
+        })
+        .unwrap_or_default();
+        Ok(AtomicOutboxMutation {
+            applied_rv: Some(applied_rv),
+            result_proto,
+            pending: pending_event,
+        })
     }
 
     fn resource_snapshot_for_key_at_rv_in_tx(
@@ -3098,6 +3239,12 @@ impl DatastoreBackend for Datastore {
         .map_err(|e| anyhow::anyhow!("set_klights_meta failed: {}", e))
     }
 
+    async fn list_outbox_stream_watermarks(
+        &self,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        Datastore::list_outbox_stream_watermarks(self).await
+    }
+
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
@@ -3150,6 +3297,16 @@ impl DatastoreBackend for Datastore {
         .await
     }
 
+    async fn build_log_apply_commit_for_command(
+        &self,
+        command: crate::datastore::command::StorageCommand,
+        operation: &str,
+        authoring_node: &str,
+    ) -> Result<crate::log_apply::LogApplyCommit> {
+        Datastore::build_log_apply_commit_for_command(self, command, operation, authoring_node)
+            .await
+    }
+
     async fn build_log_apply_commit_for_outbox(
         &self,
         idempotency_key: &str,
@@ -3163,6 +3320,25 @@ impl DatastoreBackend for Datastore {
             operation,
             payload,
             authoring_node,
+        )
+        .await
+    }
+
+    async fn build_log_apply_commit_for_outbox_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<BuildOutboxOutcome, crate::kubelet::outbox::OutboxApplyError> {
+        Datastore::build_log_apply_commit_for_outbox_with_watermark(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+            watermark,
         )
         .await
     }

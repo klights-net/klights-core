@@ -318,6 +318,9 @@ message ApplyOutboxRequest {
   string operation = 2;
   bytes payload_proto = 3;
   string authoring_node = 4;
+  string client_id = 5;
+  int64 stream_id = 6;
+  int64 stream_seq = 7;
 }
 
 message ApplyOutboxResponse {

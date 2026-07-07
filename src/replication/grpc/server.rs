@@ -22,6 +22,8 @@ use crate::watch::WatchEventSelection;
 
 use super::ca_files::ControlplaneCaFiles;
 
+const MAX_NODE_LEASE_RENEW_TIME_SKEW_SECONDS: i64 = 100;
+
 pub fn validate_join_metadata(join: &generated::JoinRequest) -> Result<DataplanePeerMetadata> {
     validate_join_metadata_with_endpoint(join, None)
 }
@@ -43,6 +45,22 @@ fn dataplane_port_from_u32(port: u32) -> Result<Option<u16>> {
             u16::try_from(port).map_err(|_| anyhow!("dataplane port exceeds u16"))?,
         ))
     }
+}
+
+fn validate_node_lease_renew_time_skew(
+    renew_time: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::result::Result<(), Status> {
+    let renew_time = chrono::DateTime::parse_from_rfc3339(renew_time)
+        .map_err(|err| Status::invalid_argument(format!("invalid node lease renewTime: {err}")))?
+        .with_timezone(&chrono::Utc);
+    let skew_seconds = now.signed_duration_since(renew_time).num_seconds().abs();
+    if skew_seconds > MAX_NODE_LEASE_RENEW_TIME_SKEW_SECONDS {
+        return Err(Status::invalid_argument(format!(
+            "node lease renewTime clock skew {skew_seconds}s exceeds {MAX_NODE_LEASE_RENEW_TIME_SKEW_SECONDS}s"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_join_metadata_with_endpoint(
@@ -920,9 +938,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
 
         // memory-improvement.md §10 P1: stream the snapshot straight to the
         // wire instead of materializing it into one `Arc<Vec<LogApplyCommit>>`.
-        // The producer drives `emit_snapshot_commits` (which keyset-pages the
-        // watch_events and applied_outbox tables) and pushes each commit's
-        // protobuf into a bounded channel; the stream yields from that channel.
+        // The producer drives `emit_snapshot_commits` (which keyset-pages
+        // watch_events) and pushes each commit's protobuf into a bounded
+        // channel; the stream yields from that channel.
         //
         // The producer and consumer run COOPERATIVELY on this one stream
         // future (no spawn): `select!` races the bounded-channel recv against
@@ -1257,6 +1275,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             )
             .map_err(|err| Status::permission_denied(err.to_string()))?;
         }
+        let watermark = crate::control_plane::client::apply::outbox_stream_watermark(
+            &req.client_id,
+            req.stream_id,
+            req.stream_seq,
+        );
         let result =
             crate::control_plane::client::apply::apply_outbox_to_local_leader_with_resource(
                 self.db.as_ref(),
@@ -1264,6 +1287,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 operation,
                 payload,
                 &req.authoring_node,
+                watermark,
             )
             .await;
         match result {
@@ -1326,6 +1350,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let req = request.into_inner();
         // NodeRestriction: a node may only renew its own lease.
         enforce_node_authority(&caller, &req.node_name)?;
+        validate_node_lease_renew_time_skew(&req.renew_time, chrono::Utc::now())?;
         self.node_lease_tracker
             .record_from_lease_object(
                 &req.node_name,
@@ -2233,6 +2258,34 @@ mod tests {
         server_reflection_request, server_reflection_response,
     };
 
+    #[test]
+    fn node_lease_renew_time_skew_allows_100_seconds_but_rejects_101() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-07T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let past_100 = crate::utils::k8s_time_format(now - chrono::Duration::seconds(100));
+        let future_100 = crate::utils::k8s_time_format(now + chrono::Duration::seconds(100));
+        let past_101 = crate::utils::k8s_time_format(now - chrono::Duration::seconds(101));
+        let future_101 = crate::utils::k8s_time_format(now + chrono::Duration::seconds(101));
+
+        super::validate_node_lease_renew_time_skew(&past_100, now)
+            .expect("100s past skew is accepted at boundary");
+        super::validate_node_lease_renew_time_skew(&future_100, now)
+            .expect("100s future skew is accepted at boundary");
+        assert_eq!(
+            super::validate_node_lease_renew_time_skew(&past_101, now)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        assert_eq!(
+            super::validate_node_lease_renew_time_skew(&future_101, now)
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
     fn valid_join() -> JoinRequest {
         JoinRequest {
             token: "token".to_string(),
@@ -2554,6 +2607,9 @@ mod tests {
             operation: "create".to_string(),
             payload_proto: vec![0u8; 8 * 1024],
             authoring_node: "worker-1".to_string(),
+            client_id: "client".to_string(),
+            stream_id: 1,
+            stream_seq: 1,
         });
         let result = client.apply_outbox(oversized).await;
         assert!(
@@ -2568,6 +2624,9 @@ mod tests {
             operation: "create".to_string(),
             payload_proto: vec![0u8; 16],
             authoring_node: "worker-1".to_string(),
+            client_id: "client".to_string(),
+            stream_id: 1,
+            stream_seq: 1,
         });
         if let Err(status) = client.apply_outbox(small).await {
             assert_ne!(
@@ -3431,6 +3490,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let db: DatastoreHandle = Arc::new(db);
+        let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
+            chrono::Utc::now(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let grpc = super::GrpcReplicationServer::new_with_node_lease_tracker(
+            service,
+            db.clone(),
+            tracker.clone(),
+        );
+
+        let skewed =
+            crate::utils::k8s_time_format(chrono::Utc::now() - chrono::Duration::seconds(101));
+        let status = grpc
+            .renew_node_lease(request_with_node_client_cert(
+                generated::RenewNodeLeaseRequest {
+                    node_name: "worker-1".to_string(),
+                    renew_time: skewed,
+                    lease_duration_seconds: 50,
+                },
+                "worker-1",
+            ))
+            .await
+            .expect_err("heartbeat renewTime skew over 100 seconds must be rejected");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            tracker.observed("worker-1").await.is_none(),
+            "rejected skewed heartbeat must not update in-memory lease state"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_outbox_rejects_node_dataplane_for_mismatched_author() {
         let db = crate::datastore::test_support::in_memory().await;
         let db: DatastoreHandle = Arc::new(db);
@@ -3458,6 +3553,9 @@ mod tests {
                         .to_string(),
                     payload_proto: payload,
                     authoring_node: "worker-1".to_string(),
+                    client_id: "client".to_string(),
+                    stream_id: 1,
+                    stream_seq: 1,
                 },
                 "worker-1",
             ))
@@ -3789,10 +3887,11 @@ mod tests {
             tracker.clone(),
         );
 
+        let renew_time = crate::utils::k8s_time_format(chrono::Utc::now());
         grpc.renew_node_lease(request_with_node_client_cert(
             generated::RenewNodeLeaseRequest {
                 node_name: "worker-1".to_string(),
-                renew_time: "2026-05-25T00:00:10Z".to_string(),
+                renew_time: renew_time.clone(),
                 lease_duration_seconds: 50,
             },
             "worker-1",
@@ -3805,7 +3904,7 @@ mod tests {
             .await
             .expect("renewal should be recorded in memory");
         assert_eq!(observed.node_name, "worker-1");
-        assert_eq!(observed.renew_time_string(), "2026-05-25T00:00:10Z");
+        assert_eq!(observed.renew_time_string(), renew_time);
         assert_eq!(db.get_current_resource_version().await.unwrap(), before_rv);
         assert!(
             db.get_resource(
@@ -4567,6 +4666,9 @@ mod tests {
                         .to_string(),
                     payload_proto: payload,
                     authoring_node: "worker-1".to_string(),
+                    client_id: "client".to_string(),
+                    stream_id: 1,
+                    stream_seq: 1,
                 },
                 "worker-1",
             ))

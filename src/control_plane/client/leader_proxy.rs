@@ -276,9 +276,19 @@ impl LeaderApiClient for LeaderProxyApiClient {
         idempotency_key: &str,
         operation: OutboxOperation,
         payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
         self.leader_target()
-            .apply_outbox(idempotency_key, operation, payload)
+            .apply_outbox(
+                idempotency_key,
+                operation,
+                payload,
+                client_id,
+                stream_id,
+                stream_seq,
+            )
             .await
     }
 }
@@ -396,6 +406,9 @@ impl LeaderApiClient for StubRemoteForwarder {
         _k: &str,
         _o: OutboxOperation,
         _p: Bytes,
+        _client_id: &str,
+        _stream_id: i64,
+        _stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
         Err(OutboxApplyError::Retryable(self.unavailable()))
     }
@@ -593,6 +606,9 @@ mod tests {
             _idempotency_key: &str,
             _operation: OutboxOperation,
             _payload: Bytes,
+            _client_id: &str,
+            _stream_id: i64,
+            _stream_seq: i64,
         ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
             self.apply_outbox.fetch_add(1, Ordering::Relaxed);
             Ok(OutboxApplyResult::Applied { applied_rv: 0 })
@@ -617,7 +633,14 @@ mod tests {
         let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), true);
 
         proxy
-            .apply_outbox("k-1", OutboxOperation::PodStatus, Bytes::from_static(b"x"))
+            .apply_outbox(
+                "k-1",
+                OutboxOperation::PodStatus,
+                Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
+            )
             .await
             .expect("apply_outbox");
         proxy
@@ -639,7 +662,14 @@ mod tests {
         let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), false);
 
         proxy
-            .apply_outbox("k-2", OutboxOperation::PodStatus, Bytes::from_static(b"x"))
+            .apply_outbox(
+                "k-2",
+                OutboxOperation::PodStatus,
+                Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
+            )
             .await
             .expect("apply_outbox");
         proxy
@@ -901,7 +931,14 @@ mod tests {
 
         // Initially leader: write goes local.
         proxy
-            .apply_outbox("pre", OutboxOperation::PodStatus, Bytes::from_static(b"x"))
+            .apply_outbox(
+                "pre",
+                OutboxOperation::PodStatus,
+                Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
+            )
             .await
             .expect("pre");
         assert_eq!(local.apply_outbox.load(Ordering::Relaxed), 1);
@@ -910,7 +947,14 @@ mod tests {
         // Lose leadership: next write goes remote.
         tx.send(false).expect("send loss");
         proxy
-            .apply_outbox("lost", OutboxOperation::PodStatus, Bytes::from_static(b"x"))
+            .apply_outbox(
+                "lost",
+                OutboxOperation::PodStatus,
+                Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
+            )
             .await
             .expect("lost");
         assert_eq!(local.apply_outbox.load(Ordering::Relaxed), 1);
@@ -923,6 +967,9 @@ mod tests {
                 "regain",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
             )
             .await
             .expect("regain");
@@ -1037,6 +1084,9 @@ mod tests {
                 _k: &str,
                 _o: OutboxOperation,
                 _p: Bytes,
+                _client_id: &str,
+                _stream_id: i64,
+                _stream_seq: i64,
             ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
                 Err(OutboxApplyError::Retryable(
                     "no leader currently elected; retry later".to_string(),
@@ -1056,6 +1106,9 @@ mod tests {
                 "no-leader",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
             )
             .await
             .expect_err("must surface no-leader error");
@@ -1108,7 +1161,14 @@ mod tests {
     async fn stub_remote_forwarder_refuses_writes_with_retryable() {
         let stub = StubRemoteForwarder::new("cp2".into());
         let err = stub
-            .apply_outbox("boot", OutboxOperation::PodStatus, Bytes::from_static(b"x"))
+            .apply_outbox(
+                "boot",
+                OutboxOperation::PodStatus,
+                Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
+            )
             .await
             .expect_err("stub must refuse");
         match err {
@@ -1160,6 +1220,9 @@ mod tests {
                 "boot-1",
                 OutboxOperation::PodStatus,
                 pod_status_minimal_payload(),
+                "client",
+                1,
+                1,
             )
             .await;
         // The payload references a Pod that doesn't exist, so the
@@ -1185,6 +1248,9 @@ mod tests {
                 "boot-2",
                 OutboxOperation::PodStatus,
                 pod_status_minimal_payload(),
+                "client",
+                1,
+                1,
             )
             .await
             .expect_err("non-leader write goes to stub remote");
@@ -1315,6 +1381,9 @@ mod tests {
                 "leader-write",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
             )
             .await
             .expect("leader write");
@@ -1323,6 +1392,9 @@ mod tests {
                 "f1-write",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
             )
             .await
             .expect("follower1 write");
@@ -1331,6 +1403,9 @@ mod tests {
                 "f2-write",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
             )
             .await
             .expect("follower2 write");
@@ -1362,7 +1437,14 @@ mod tests {
 
         // Follower write → remote.
         proxy
-            .apply_outbox("pre", OutboxOperation::PodStatus, Bytes::from_static(b"x"))
+            .apply_outbox(
+                "pre",
+                OutboxOperation::PodStatus,
+                Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
+            )
             .await
             .expect("pre");
         assert_eq!(remote.apply_outbox.load(Ordering::Relaxed), 1);
@@ -1377,6 +1459,9 @@ mod tests {
                 "post-promote",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
             )
             .await
             .expect("post");
@@ -1407,7 +1492,14 @@ mod tests {
 
         // As leader, writes go to local
         proxy
-            .apply_outbox("key", OutboxOperation::PodStatus, Bytes::from_static(b"x"))
+            .apply_outbox(
+                "key",
+                OutboxOperation::PodStatus,
+                Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
+            )
             .await
             .unwrap();
         assert_eq!(local.apply_outbox.load(Ordering::Relaxed), 1);
@@ -1418,7 +1510,14 @@ mod tests {
 
         // After leadership loss, writes go to remote
         proxy
-            .apply_outbox("key2", OutboxOperation::PodStatus, Bytes::from_static(b"y"))
+            .apply_outbox(
+                "key2",
+                OutboxOperation::PodStatus,
+                Bytes::from_static(b"y"),
+                "client",
+                1,
+                1,
+            )
             .await
             .unwrap();
         assert_eq!(

@@ -47,8 +47,7 @@ impl GcScheduler {
     ) {
         let (tick_tx, mut tick_rx) = tokio::sync::mpsc::channel::<()>(1);
         // JUSTIFY: external-state drift sweep for surfaces that don't emit events
-        // (sandbox GC, watch_events GC, hourly applied_outbox GC). No producer
-        // to subscribe to.
+        // (sandbox GC and watch_events GC). No producer to subscribe to.
         if let Err(err) = task_supervisor
             .spawn_interval("gc_scheduler_tick", self.interval, move |tick| {
                 let tick_tx = tick_tx.clone();

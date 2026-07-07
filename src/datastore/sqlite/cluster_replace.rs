@@ -4,7 +4,7 @@ use crate::bootstrap::cluster_meta::{
     KEY_CLUSTER_ID, KEY_LEADER_EPOCH, KEY_RAFT_LEADER_HINT, KEY_RAFT_TERM, KEY_RAFT_VOTERS,
 };
 use crate::datastore::types::{AppliedOutboxRecord, PendingWatchEvent, ReplicatedSnapshotMetadata};
-use crate::log_apply::{ClusterMutation, LogApplyCommit, LogApplyMutation};
+use crate::log_apply::{ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark};
 #[cfg(test)]
 use crate::log_apply::{LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow, LogApplyWatchEventRow};
 #[cfg(test)]
@@ -334,6 +334,27 @@ fn apply_commit_in_tx_with_watch_events(
     }
     let commit = stamp_provisional_resource_version_in_tx(tx, commit)?;
     let applied_rv = commit.resource_version;
+    let watermark = commit.outbox_watermark.clone();
+    let watermark_only_snapshot_restore = watermark.is_some() && commit.mutations.is_empty();
+    if watermark_only_snapshot_restore {
+        if let Some(watermark) = watermark.as_ref() {
+            upsert_outbox_watermark_in_tx(tx, watermark)?;
+        }
+        advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
+        return Ok((applied_rv, Vec::new()));
+    }
+    match outbox_watermark_decision_in_tx(tx, watermark.as_ref())? {
+        OutboxWatermarkDecision::Duplicate => {
+            advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
+            return Ok((applied_rv, Vec::new()));
+        }
+        OutboxWatermarkDecision::Gap { last_seq, next_seq } => {
+            return Err(other_error(format!(
+                "outbox stream gap for seq {next_seq}: last committed seq is {last_seq}"
+            )));
+        }
+        OutboxWatermarkDecision::Apply => {}
+    }
     let mut effects = ApplyEffects::new();
     let mut applier = RaftClusterStateApplier::new(tx);
     for mutation in commit.mutations {
@@ -345,8 +366,70 @@ fn apply_commit_in_tx_with_watch_events(
             &mut effects,
         )?;
     }
+    if let Some(watermark) = watermark.as_ref() {
+        upsert_outbox_watermark_in_tx(tx, watermark)?;
+    }
     advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
     Ok((applied_rv, effects.into_pending_watch_events()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboxWatermarkDecision {
+    Apply,
+    Duplicate,
+    Gap { last_seq: i64, next_seq: i64 },
+}
+
+fn outbox_watermark_decision_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    watermark: Option<&OutboxStreamWatermark>,
+) -> tokio_rusqlite::Result<OutboxWatermarkDecision> {
+    let Some(watermark) = watermark else {
+        return Ok(OutboxWatermarkDecision::Apply);
+    };
+    if watermark.stream_seq <= 0 {
+        return Err(other_error("outbox stream seq must be positive"));
+    }
+    let last_seq: Option<i64> = tx
+        .query_row(
+            "SELECT last_seq FROM outbox_stream_watermarks WHERE client_id = ?1 AND stream_id = ?2",
+            rusqlite::params![&watermark.client_id, watermark.stream_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match last_seq {
+        Some(last_seq) if watermark.stream_seq <= last_seq => {
+            Ok(OutboxWatermarkDecision::Duplicate)
+        }
+        Some(last_seq) if watermark.stream_seq != last_seq.saturating_add(1) => {
+            Ok(OutboxWatermarkDecision::Gap {
+                last_seq,
+                next_seq: watermark.stream_seq,
+            })
+        }
+        Some(_) => Ok(OutboxWatermarkDecision::Apply),
+        None if watermark.stream_seq == 1 => Ok(OutboxWatermarkDecision::Apply),
+        None => Ok(OutboxWatermarkDecision::Gap {
+            last_seq: 0,
+            next_seq: watermark.stream_seq,
+        }),
+    }
+}
+
+fn upsert_outbox_watermark_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    watermark: &OutboxStreamWatermark,
+) -> tokio_rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO outbox_stream_watermarks (client_id, stream_id, last_seq) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(client_id, stream_id) DO UPDATE SET last_seq = excluded.last_seq",
+        rusqlite::params![
+            &watermark.client_id,
+            watermark.stream_id,
+            watermark.stream_seq
+        ],
+    )?;
+    Ok(())
 }
 
 fn stamp_provisional_resource_version_in_tx(

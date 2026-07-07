@@ -1350,6 +1350,9 @@ mod tests {
             idempotency_key: &str,
             _operation: OutboxOperation,
             _payload: Bytes,
+            _client_id: &str,
+            _stream_id: i64,
+            _stream_seq: i64,
         ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
             Err(OutboxApplyError::Retryable(format!(
                 "unexpected apply_outbox for {idempotency_key}"
@@ -1450,6 +1453,9 @@ mod tests {
             idempotency_key: &str,
             _operation: OutboxOperation,
             _payload: Bytes,
+            _client_id: &str,
+            _stream_id: i64,
+            _stream_seq: i64,
         ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
             Err(OutboxApplyError::Retryable(format!(
                 "unexpected apply_outbox for {idempotency_key}"
@@ -1684,6 +1690,9 @@ mod tests {
             idempotency_key: &str,
             _operation: OutboxOperation,
             _payload: Bytes,
+            _client_id: &str,
+            _stream_id: i64,
+            _stream_seq: i64,
         ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
             Err(OutboxApplyError::Retryable(format!(
                 "unexpected apply_outbox for {idempotency_key}"

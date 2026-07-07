@@ -8,12 +8,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
+use crate::datastore::command::StorageCommand;
 #[cfg(test)]
 use crate::watch::{WatchEvent, WatchReceiver};
 use crate::watch::{WatchSignal, WatchTopic};
 
 #[cfg(test)]
-use super::command::{CommandMeta, StorageCommand};
+use super::command::CommandMeta;
 #[cfg(test)]
 use super::types::PendingWatchEvent;
 #[cfg(test)]
@@ -842,6 +843,17 @@ pub trait DatastoreBackend: Send + Sync {
     /// Write a key/value pair to the `_klights_meta` table.
     async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()>;
 
+    /// List raft-replicated worker outbox stream watermarks. Snapshot emitters
+    /// use this to preserve retry/dedup progress without the legacy
+    /// applied_outbox ledger.
+    async fn list_outbox_stream_watermarks(
+        &self,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        Err(anyhow::anyhow!(
+            "backend does not support outbox stream watermark listing"
+        ))
+    }
+
     async fn get_applied_outbox(
         &self,
         idempotency_key: &str,
@@ -908,11 +920,45 @@ pub trait DatastoreBackend: Send + Sync {
         crate::kubelet::outbox::OutboxApplyError,
     >;
 
+    async fn apply_outbox_transactionally_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        let _ = watermark;
+        self.apply_outbox_transactionally(idempotency_key, operation, payload, authoring_node)
+            .await
+    }
+
+    /// T1.4: build a materialized `LogApplyCommit` for a regular (non-outbox)
+    /// raft write without touching the applied_outbox ledger. The leader's
+    /// proposer encodes the returned commit and submits it through
+    /// `client_write`; every raft member then applies the decoded commit via
+    /// `apply_log_apply_commit`.
+    async fn build_log_apply_commit_for_command(
+        &self,
+        command: StorageCommand,
+        operation: &str,
+        authoring_node: &str,
+    ) -> Result<crate::log_apply::LogApplyCommit> {
+        let _ = (command, operation, authoring_node);
+        Err(anyhow::anyhow!(
+            "backend does not support generic raft commit materialization"
+        ))
+    }
+
     /// T1.3/T1.4: build a `LogApplyCommit` from an outbox payload WITHOUT
     /// applying it. The leader's raft proposer encodes the returned commit
-    /// as the raft entry payload and submits through `client_write`; the
-    /// state machine apply path on every node is the only caller that
-    /// actually mutates `cluster.db` (via `apply_log_apply_commit`).
+    /// as the raft entry payload (via a placeholder/ledger-aware path) and
+    /// submits through `client_write`; the state machine apply path on every
+    /// node is the only caller that actually mutates `cluster.db` (via
+    /// `apply_log_apply_commit`).
     async fn build_log_apply_commit_for_outbox(
         &self,
         idempotency_key: &str,
@@ -923,6 +969,22 @@ pub trait DatastoreBackend: Send + Sync {
         crate::datastore::sqlite::BuildOutboxOutcome,
         crate::kubelet::outbox::OutboxApplyError,
     >;
+
+    async fn build_log_apply_commit_for_outbox_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::datastore::sqlite::BuildOutboxOutcome,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        let _ = watermark;
+        self.build_log_apply_commit_for_outbox(idempotency_key, operation, payload, authoring_node)
+            .await
+    }
 
     /// Prune all applied_outbox entries older than `ttl_ms`. Returns the
     /// number of pruned rows.

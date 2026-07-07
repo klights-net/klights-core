@@ -5,6 +5,7 @@ use crate::datastore::ResourcePreconditions;
 use crate::datastore::command::StorageCommand;
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
+use crate::log_apply::OutboxStreamWatermark;
 use crate::replication::protocol::ForwardedResource;
 
 #[cfg(test)]
@@ -39,12 +40,25 @@ pub async fn gc_applied_outbox(
         .map_err(|e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()))
 }
 
+pub fn outbox_stream_watermark(
+    client_id: &str,
+    stream_id: i64,
+    stream_seq: i64,
+) -> Option<OutboxStreamWatermark> {
+    (stream_seq > 0).then(|| OutboxStreamWatermark {
+        client_id: client_id.to_string(),
+        stream_id,
+        stream_seq,
+    })
+}
+
 pub async fn apply_outbox_to_local_leader(
     db: &dyn DatastoreBackend,
     idempotency_key: &str,
     operation: OutboxOperation,
     payload: Bytes,
     authoring_node: &str,
+    watermark: Option<OutboxStreamWatermark>,
 ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
     Ok(apply_outbox_to_local_leader_with_resource(
         db,
@@ -52,6 +66,7 @@ pub async fn apply_outbox_to_local_leader(
         operation,
         payload,
         authoring_node,
+        watermark,
     )
     .await?
     .result)
@@ -72,13 +87,15 @@ pub async fn apply_outbox_to_local_leader_with_resource(
     operation: OutboxOperation,
     payload: Bytes,
     authoring_node: &str,
+    watermark: Option<OutboxStreamWatermark>,
 ) -> std::result::Result<LocalOutboxApply, OutboxApplyError> {
-    let applied = crate::datastore::raft::state_machine::propose_outbox_on_backend(
+    let applied = crate::datastore::raft::state_machine::propose_outbox_on_backend_with_watermark(
         db,
         idempotency_key,
         operation,
         payload,
         authoring_node,
+        watermark,
     )
     .await?;
     Ok(LocalOutboxApply {

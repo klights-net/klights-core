@@ -54,6 +54,175 @@ async fn schema_namespaces_includes_uid_column() {
 }
 
 #[tokio::test]
+async fn raft_outbox_stream_duplicate_seq_noops_whole_commit() {
+    use crate::log_apply::{
+        LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, OutboxStreamWatermark,
+    };
+
+    let db = Datastore::new_in_memory().await.unwrap();
+    let commit = LogApplyCommit {
+        resource_version: 50,
+        outbox_watermark: Some(OutboxStreamWatermark {
+            client_id: "worker-a".to_string(),
+            stream_id: 7,
+            stream_seq: 1,
+        }),
+        mutations: vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+            name: "dup-watermark".to_string(),
+            uid: "dup-watermark-uid".to_string(),
+            resource_version: 50,
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "dup-watermark", "uid": "dup-watermark-uid"}
+            }),
+        })],
+    };
+
+    db.db_call("test_duplicate_outbox_watermark_noop", move |conn| {
+        let tx = conn.transaction()?;
+        crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_for_raft(
+            &tx,
+            commit.clone(),
+        )?;
+        crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_for_raft(&tx, commit)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let namespace = db.get_namespace("dup-watermark").await.unwrap().unwrap();
+    assert_eq!(namespace.resource_version, 50);
+}
+
+#[tokio::test]
+async fn watermarked_outbox_commit_does_not_append_applied_outbox_ledger_mutation() {
+    use crate::datastore::sqlite::BuildOutboxOutcome;
+    use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark};
+
+    let db = Datastore::new_in_memory().await.unwrap();
+    let command = StorageCommand::create_namespace(
+        "watermarked-no-ledger",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "watermarked-no-ledger"}
+        }),
+    );
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+
+    let outcome = db
+        .build_log_apply_commit_for_outbox_with_watermark(
+            "legacy-key-ignored-for-watermark",
+            "PodMetadata",
+            payload.as_ref(),
+            "worker-a",
+            Some(OutboxStreamWatermark {
+                client_id: "client-a".to_string(),
+                stream_id: 3,
+                stream_seq: 1,
+            }),
+        )
+        .await
+        .unwrap();
+    let BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+        panic!("expected a watermarked commit to propose");
+    };
+
+    assert!(commit.outbox_watermark.is_some());
+    assert!(
+        commit
+            .mutations
+            .iter()
+            .all(|mutation| { !matches!(mutation, LogApplyMutation::PutAppliedOutbox(_)) })
+    );
+}
+
+#[tokio::test]
+async fn build_log_apply_commit_for_command_has_no_applied_outbox_mutation() {
+    use crate::datastore::command::StorageCommand;
+    use crate::log_apply::LogApplyMutation;
+
+    let db = Datastore::new_in_memory().await.unwrap();
+    let command = StorageCommand::create_namespace(
+        "generic-no-outbox",
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "generic-no-outbox"},
+        }),
+    );
+
+    let before = db.list_applied_outbox().await.unwrap();
+    let commit = db
+        .build_log_apply_commit_for_command(command, "CreateResource", "test-node")
+        .await
+        .expect("build generic commit");
+    let after = db.list_applied_outbox().await.unwrap();
+
+    assert_eq!(
+        before, after,
+        "generic commit build should not mutate applied_outbox"
+    );
+    assert!(
+        commit
+            .mutations
+            .iter()
+            .all(|mutation| !matches!(mutation, LogApplyMutation::PutAppliedOutbox(_))),
+        "generic builder should never emit OutboxLedger mutations"
+    );
+}
+
+#[tokio::test]
+async fn raft_outbox_stream_gap_rejects_without_mutating_resource() {
+    use crate::log_apply::{
+        LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, OutboxStreamWatermark,
+    };
+
+    let db = Datastore::new_in_memory().await.unwrap();
+    let commit = LogApplyCommit {
+        resource_version: 60,
+        outbox_watermark: Some(OutboxStreamWatermark {
+            client_id: "worker-a".to_string(),
+            stream_id: 8,
+            stream_seq: 2,
+        }),
+        mutations: vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
+            name: "gap-watermark".to_string(),
+            uid: "gap-watermark-uid".to_string(),
+            resource_version: 60,
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "gap-watermark", "uid": "gap-watermark-uid"}
+            }),
+        })],
+    };
+
+    let result = db
+        .db_call("test_outbox_watermark_gap_rejects", move |conn| {
+            let tx = conn.transaction()?;
+            let result =
+                crate::datastore::sqlite::cluster_replace::apply_commit_in_tx_for_raft(&tx, commit);
+            tx.commit()?;
+            result.map(|_| ())
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "missing seq 1 must reject seq 2 as a retryable gap"
+    );
+    assert!(
+        db.get_namespace("gap-watermark").await.unwrap().is_none(),
+        "gap rejection must not apply resource mutation"
+    );
+}
+
+#[tokio::test]
 async fn apply_resource_batch_command_builds_one_commit_with_two_puts() {
     let db = Datastore::new_in_memory().await.unwrap();
     let command = StorageCommand::apply_resource_batch(vec![

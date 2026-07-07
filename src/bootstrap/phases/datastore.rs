@@ -1363,6 +1363,9 @@ mod tests {
                 "test",
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
                 bytes::Bytes::from_static(b"x"),
+                "client",
+                1,
+                1,
             )
             .await
             .expect_err("connection to nonexistent leader fails");

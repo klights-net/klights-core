@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::node_local::{
-    NodeLocalBackend, NodeLocalDb, NodeLocalHandle, SqliteNodeLocalDb, selector,
+    NodeLocalBackend, NodeLocalDb, NodeLocalHandle, OutboxInsert, SqliteNodeLocalDb, selector,
 };
 use crate::datastore::sqlite::{DbExecutor, opener};
 use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
@@ -32,6 +32,137 @@ async fn open_sqlite_node_local_backend_handle() -> NodeLocalHandle {
     .expect("open node-local executor");
     let db = SqliteNodeLocalDb::from_executor(executor).expect("create sqlite node-local db");
     Arc::new(db)
+}
+
+fn test_outbox_insert(key: &str, subject_key: &str, now_ms: i64) -> OutboxInsert {
+    OutboxInsert {
+        idempotency_key: key.to_string(),
+        enqueued_ms: now_ms,
+        subject_key: subject_key.to_string(),
+        subject_api_version: "v1".to_string(),
+        subject_kind: "Pod".to_string(),
+        subject_namespace: Some("default".to_string()),
+        subject_name: "web".to_string(),
+        subject_uid: Some("pod-uid".to_string()),
+        pod_uid: "pod-uid".to_string(),
+        operation: "PodStatus".to_string(),
+        payload_proto: vec![],
+        next_due_ms: now_ms,
+    }
+}
+
+#[tokio::test]
+async fn node_local_outbox_assigns_monotonic_seq_per_stream() {
+    let db = open_node_local_in_memory().await;
+    db.enqueue_outbox(test_outbox_insert(
+        "same-stream-1",
+        "v1/Pod/default/web/pod-uid",
+        1,
+    ))
+    .await
+    .unwrap();
+    db.enqueue_outbox(test_outbox_insert(
+        "same-stream-2",
+        "v1/Pod/default/web/pod-uid",
+        2,
+    ))
+    .await
+    .unwrap();
+
+    let first = db
+        .claim_next_due_outbox(10, 1000, "lease-a")
+        .await
+        .unwrap()
+        .unwrap();
+    db.complete_outbox(first.id, "lease-a").await.unwrap();
+    let second = db
+        .claim_next_due_outbox(10, 1000, "lease-b")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(first.stream_id, second.stream_id);
+    assert_eq!(first.stream_seq, 1);
+    assert_eq!(second.stream_seq, 2);
+}
+
+#[tokio::test]
+async fn node_local_outbox_rows_share_stable_client_epoch() {
+    let db = open_node_local_in_memory().await;
+    db.enqueue_outbox(test_outbox_insert(
+        "client-epoch-1",
+        "v1/Pod/default/a/uid-a",
+        1,
+    ))
+    .await
+    .unwrap();
+    db.enqueue_outbox(test_outbox_insert(
+        "client-epoch-2",
+        "v1/Pod/default/b/uid-b",
+        2,
+    ))
+    .await
+    .unwrap();
+
+    let first = db
+        .claim_next_due_outbox(10, 1000, "lease-a")
+        .await
+        .unwrap()
+        .unwrap();
+    db.complete_outbox(first.id, "lease-a").await.unwrap();
+    let second = db
+        .claim_next_due_outbox(10, 1000, "lease-b")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(!first.client_id.is_empty());
+    assert_eq!(first.client_id, second.client_id);
+}
+
+#[test]
+fn node_local_outbox_hash_reserves_zero_for_unsequenced_ops() {
+    for i in 0..4096 {
+        let subject_key = format!("v1/Pod/default/web-{i}/uid-{i}");
+        let stream_id = crate::datastore::node_local::sqlite::outbox_stream_id(&subject_key);
+        assert!(
+            (1..=64).contains(&stream_id),
+            "normal hashed subject {subject_key} must use a 1-based stream id, got {stream_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn node_local_outbox_claim_skips_rows_with_stream_in_flight() {
+    let db = open_node_local_in_memory().await;
+    db.enqueue_outbox(test_outbox_insert(
+        "inflight-stream-1",
+        "v1/Pod/default/web-2/uid-2",
+        1,
+    ))
+    .await
+    .unwrap();
+    db.enqueue_outbox(test_outbox_insert(
+        "inflight-stream-2",
+        "v1/Pod/default/web-3/uid-3",
+        2,
+    ))
+    .await
+    .unwrap();
+
+    let first = db
+        .claim_next_due_outbox(10, 1000, "lease-a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.stream_seq, 1);
+    assert!(
+        db.claim_next_due_outbox(10, 1000, "lease-b")
+            .await
+            .unwrap()
+            .is_none(),
+        "same stream must wait until the earlier leased row completes"
+    );
 }
 
 #[tokio::test]

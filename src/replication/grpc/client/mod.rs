@@ -1487,6 +1487,9 @@ impl ReplicationGrpcClient {
         idempotency_key: &str,
         operation: OutboxOperation,
         payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
     ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
         // bug-grpc A2: reimplemented on the generic `unary_call` executor.
         // Idempotency key + response decode stay here; the retry/deadline/
@@ -1495,6 +1498,7 @@ impl ReplicationGrpcClient {
         let operation = operation.as_str().to_string();
         let payload = payload.to_vec();
         let authoring_node = self.node_name().to_string();
+        let client_id = client_id.to_string();
         let response = match self
             .unary_call(
                 "grpc_apply_outbox",
@@ -1505,6 +1509,9 @@ impl ReplicationGrpcClient {
                         operation: operation.clone(),
                         payload_proto: payload.clone(),
                         authoring_node: authoring_node.clone(),
+                        client_id: client_id.clone(),
+                        stream_id,
+                        stream_seq,
                     };
                     async move { client.apply_outbox(request).await.map(|r| r.into_inner()) }
                 },

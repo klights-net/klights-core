@@ -34,12 +34,31 @@ impl N1Raft {
         payload: Bytes,
         authoring_node: &str,
     ) -> std::result::Result<RaftOutboxApply, OutboxApplyError> {
-        let applied = propose_outbox_on_backend(
+        self.propose_outbox_with_watermark(
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+            None,
+        )
+        .await
+    }
+
+    pub async fn propose_outbox_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: OutboxOperation,
+        payload: Bytes,
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<RaftOutboxApply, OutboxApplyError> {
+        let applied = propose_outbox_on_backend_with_watermark(
             self.backend.as_ref(),
             idempotency_key,
             operation,
             payload,
             authoring_node,
+            watermark,
         )
         .await?;
         if let Some(applied_rv) = applied.applied_resource_version() {
@@ -56,6 +75,25 @@ pub async fn propose_outbox_on_backend(
     payload: Bytes,
     authoring_node: &str,
 ) -> std::result::Result<RaftOutboxApply, OutboxApplyError> {
+    propose_outbox_on_backend_with_watermark(
+        db,
+        idempotency_key,
+        operation,
+        payload,
+        authoring_node,
+        None,
+    )
+    .await
+}
+
+pub async fn propose_outbox_on_backend_with_watermark(
+    db: &dyn DatastoreBackend,
+    idempotency_key: &str,
+    operation: OutboxOperation,
+    payload: Bytes,
+    authoring_node: &str,
+    watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+) -> std::result::Result<RaftOutboxApply, OutboxApplyError> {
     let decoded = OutboxPayload::decode_protobuf(&payload)
         .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
     if operation == OutboxOperation::LeaseRenew {
@@ -71,11 +109,12 @@ pub async fn propose_outbox_on_backend(
 
     let deleted_resource = resource_before_delete(db, &decoded.command).await?;
     let result = match db
-        .apply_outbox_transactionally(
+        .apply_outbox_transactionally_with_watermark(
             idempotency_key,
             operation.as_str(),
             payload.as_ref(),
             authoring_node,
+            watermark,
         )
         .await
     {

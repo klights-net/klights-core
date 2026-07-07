@@ -4,6 +4,7 @@ pub mod schema;
 use anyhow::{Result, anyhow};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use crate::datastore::command::{StorageCommand, decode_command_protobuf};
@@ -15,6 +16,7 @@ use crate::datastore::{
 
 const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
 const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
+pub const OUTBOX_STREAM_SHARDS: i64 = 64;
 
 #[derive(Clone)]
 pub struct SqliteNodeLocalDb {
@@ -80,6 +82,7 @@ pub struct OutboxInsert {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboxRow {
     pub id: i64,
+    pub client_id: String,
     pub idempotency_key: String,
     pub enqueued_ms: i64,
     pub subject_key: String,
@@ -91,6 +94,8 @@ pub struct OutboxRow {
     pub pod_uid: String,
     pub operation: String,
     pub is_terminal_pod_delete: bool,
+    pub stream_id: i64,
+    pub stream_seq: i64,
     pub payload_proto: Vec<u8>,
     pub attempt: i64,
     pub next_due_ms: i64,
@@ -471,9 +476,20 @@ impl SqliteNodeLocalDb {
         let is_terminal_pod_delete =
             is_terminal_pod_delete_outbox_row(row.operation.as_str(), row.payload_proto.as_slice());
         self.db_call("node_local:outbox_enqueue", move |conn| {
-            conn.execute(
+            let tx = conn.transaction()?;
+            let client_id = ensure_outbox_client_id_in_tx(&tx)?;
+            let sequenced = row.operation
+                != crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str();
+            let stream_id = if sequenced {
+                outbox_stream_id(&row.subject_key)
+            } else {
+                0
+            };
+            let stream_seq = 0_i64;
+            tx.execute(
                 queries::OUTBOX_INSERT,
                 rusqlite::params![
+                    client_id,
                     row.idempotency_key,
                     row.enqueued_ms,
                     row.subject_key,
@@ -485,10 +501,13 @@ impl SqliteNodeLocalDb {
                     row.pod_uid,
                     row.operation,
                     if is_terminal_pod_delete { 1_i64 } else { 0_i64 },
+                    stream_id,
+                    stream_seq,
                     row.payload_proto,
                     row.next_due_ms
                 ],
             )?;
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -512,6 +531,7 @@ impl SqliteNodeLocalDb {
                 return Ok(None);
             };
             let leased_until_ms = now_ms.saturating_add(lease_ms.max(1));
+            assign_outbox_stream_seq_if_needed(&tx, id)?;
             tx.execute(
                 queries::OUTBOX_SET_LEASE,
                 rusqlite::params![id, leased_until_ms, lease_token],
@@ -611,6 +631,7 @@ impl SqliteNodeLocalDb {
                 let leased_until_ms = now_ms.saturating_add(lease_ms.max(1));
                 let mut leased_ids = Vec::new();
                 for &id in &ids {
+                    assign_outbox_stream_seq_if_needed(&tx, id)?;
                     let changed = tx.execute(
                         queries::OUTBOX_SET_LEASE,
                         rusqlite::params![id, leased_until_ms, lease_token],
@@ -621,10 +642,11 @@ impl SqliteNodeLocalDb {
                 }
                 let mut rows = Vec::with_capacity(leased_ids.len());
                 {
-                    let mut stmt = tx.prepare("SELECT id, idempotency_key, enqueued_ms, \
+                    let mut stmt = tx.prepare("SELECT id, client_id, idempotency_key, enqueued_ms, \
                         subject_key, subject_api_version, subject_kind, subject_namespace, subject_name, \
-                        subject_uid, pod_uid, operation, is_terminal_pod_delete, payload_proto, attempt, next_due_ms, \
-                        leased_until_ms, lease_token, last_error FROM outbox WHERE id = ?1")?;
+                        subject_uid, pod_uid, operation, is_terminal_pod_delete, stream_id, stream_seq, \
+                        payload_proto, attempt, next_due_ms, leased_until_ms, lease_token, last_error \
+                        FROM outbox WHERE id = ?1")?;
                     for id in leased_ids {
                         if let Some(row) = stmt.query_row([id], row_to_outbox).optional()? {
                             rows.push(row);
@@ -788,9 +810,19 @@ impl SqliteNodeLocalDb {
 
         self.db_call("node_local:outbox_dead_letter_replay", move |conn| {
             let tx = conn.transaction()?;
+            let client_id = ensure_outbox_client_id_in_tx(&tx)?;
+            let sequenced = row.operation
+                != crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str();
+            let stream_id = if sequenced {
+                outbox_stream_id(&row.subject_key)
+            } else {
+                0
+            };
+            let stream_seq = 0_i64;
             tx.execute(
                 queries::OUTBOX_INSERT,
                 rusqlite::params![
+                    client_id,
                     row.idempotency_key,
                     row.enqueued_ms,
                     row.subject_key,
@@ -802,6 +834,8 @@ impl SqliteNodeLocalDb {
                     row.pod_uid,
                     row.operation,
                     if is_terminal_pod_delete { 1_i64 } else { 0_i64 },
+                    stream_id,
+                    stream_seq,
                     row.payload_proto,
                     now,
                 ],
@@ -1202,6 +1236,51 @@ fn ensure_meta_matches_or_insert(
     }
 }
 
+fn ensure_outbox_client_id_in_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<String> {
+    const KEY: &str = "outbox_client_id";
+    if let Some(client_id) = tx
+        .query_row(queries::META_GET, [KEY], |row| row.get::<_, String>(0))
+        .optional()?
+    {
+        return Ok(client_id);
+    }
+    let client_id = format!("outbox-{}", uuid::Uuid::new_v4());
+    tx.execute(queries::META_SET, rusqlite::params![KEY, &client_id])?;
+    Ok(client_id)
+}
+
+fn assign_outbox_stream_seq_if_needed(
+    tx: &rusqlite::Transaction<'_>,
+    outbox_id: i64,
+) -> rusqlite::Result<()> {
+    let (stream_id, stream_seq): (i64, i64) = tx.query_row(
+        "SELECT stream_id, stream_seq FROM outbox WHERE id = ?1",
+        [outbox_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if stream_id == 0 || stream_seq > 0 {
+        return Ok(());
+    }
+    let prior_seq: Option<i64> = tx
+        .query_row(
+            "SELECT last_seq FROM outbox_stream_sequences WHERE stream_id = ?1",
+            [stream_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let next_seq = prior_seq.unwrap_or(0).saturating_add(1);
+    tx.execute(
+        "INSERT INTO outbox_stream_sequences (stream_id, last_seq) VALUES (?1, ?2) \
+         ON CONFLICT(stream_id) DO UPDATE SET last_seq = excluded.last_seq",
+        rusqlite::params![stream_id, next_seq],
+    )?;
+    tx.execute(
+        "UPDATE outbox SET stream_seq = ?2 WHERE id = ?1",
+        rusqlite::params![outbox_id, next_seq],
+    )?;
+    Ok(())
+}
+
 fn row_to_pod_runtime(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodRuntimeRow> {
     Ok(PodRuntimeRow {
         pod_uid: row.get(0)?,
@@ -1218,24 +1297,35 @@ fn row_to_pod_runtime(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodRuntimeRow
 fn row_to_outbox(row: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxRow> {
     Ok(OutboxRow {
         id: row.get(0)?,
-        idempotency_key: row.get(1)?,
-        enqueued_ms: row.get(2)?,
-        subject_key: row.get(3)?,
-        subject_api_version: row.get(4)?,
-        subject_kind: row.get(5)?,
-        subject_namespace: row.get(6)?,
-        subject_name: row.get(7)?,
-        subject_uid: row.get(8)?,
-        pod_uid: row.get(9)?,
-        operation: row.get(10)?,
-        is_terminal_pod_delete: row.get::<_, i64>(11)? != 0,
-        payload_proto: row.get(12)?,
-        attempt: row.get(13)?,
-        next_due_ms: row.get(14)?,
-        leased_until_ms: row.get(15)?,
-        lease_token: row.get(16)?,
-        last_error: row.get(17)?,
+        client_id: row.get(1)?,
+        idempotency_key: row.get(2)?,
+        enqueued_ms: row.get(3)?,
+        subject_key: row.get(4)?,
+        subject_api_version: row.get(5)?,
+        subject_kind: row.get(6)?,
+        subject_namespace: row.get(7)?,
+        subject_name: row.get(8)?,
+        subject_uid: row.get(9)?,
+        pod_uid: row.get(10)?,
+        operation: row.get(11)?,
+        is_terminal_pod_delete: row.get::<_, i64>(12)? != 0,
+        stream_id: row.get(13)?,
+        stream_seq: row.get(14)?,
+        payload_proto: row.get(15)?,
+        attempt: row.get(16)?,
+        next_due_ms: row.get(17)?,
+        leased_until_ms: row.get(18)?,
+        lease_token: row.get(19)?,
+        last_error: row.get(20)?,
     })
+}
+
+pub fn outbox_stream_id(subject_key: &str) -> i64 {
+    let digest = Sha256::digest(subject_key.as_bytes());
+    let mut shard_bytes = [0_u8; 8];
+    shard_bytes.copy_from_slice(&digest[..8]);
+    let value = u64::from_be_bytes(shard_bytes);
+    1 + (value % OUTBOX_STREAM_SHARDS as u64) as i64
 }
 
 fn is_terminal_pod_delete_outbox_row(operation: &str, payload_proto: &[u8]) -> bool {

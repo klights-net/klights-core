@@ -86,6 +86,9 @@ impl OutboxApplyClient for StackApplyClient {
         idempotency_key: &str,
         _operation: OutboxOperation,
         _payload: Bytes,
+        _client_id: &str,
+        _stream_id: i64,
+        _stream_seq: i64,
     ) -> Result<OutboxApplyResult, OutboxApplyError> {
         self.calls.lock().await.push(idempotency_key.to_string());
         self.responses
@@ -825,6 +828,9 @@ impl OutboxApplyClient for CrashRecoveryApplyClient {
         idempotency_key: &str,
         _operation: OutboxOperation,
         _payload: Bytes,
+        _client_id: &str,
+        _stream_id: i64,
+        _stream_seq: i64,
     ) -> Result<OutboxApplyResult, OutboxApplyError> {
         self.calls.lock().await.push(idempotency_key.to_string());
         let mut applied = self.applied.lock().await;
@@ -884,6 +890,9 @@ async fn crash_after_cluster_apply_before_node_complete_replays_from_ledger() {
                         .encode_protobuf()
                         .unwrap(),
                 ),
+                "client",
+                1,
+                1,
             )
             .await
             .expect("cluster apply");
@@ -912,7 +921,14 @@ async fn crash_after_cluster_apply_before_node_complete_replays_from_ledger() {
 
         // Pre-seed the leader with the same key to simulate ledger replay.
         client
-            .apply_outbox("crash-key", OutboxOperation::PodStatus, Bytes::new())
+            .apply_outbox(
+                "crash-key",
+                OutboxOperation::PodStatus,
+                Bytes::new(),
+                "client",
+                1,
+                1,
+            )
             .await
             .expect("pre-seed ledger");
 

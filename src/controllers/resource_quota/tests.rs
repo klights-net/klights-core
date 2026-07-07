@@ -42,6 +42,7 @@ async fn make_raft_resourcequota_datastore() -> (
             operation: &str,
             command: StorageCommand,
             authoring_node: &str,
+            _watermark: Option<crate::log_apply::OutboxStreamWatermark>,
         ) -> std::result::Result<
             crate::kubelet::outbox::OutboxApplyResult,
             crate::kubelet::outbox::OutboxApplyError,
