@@ -28,6 +28,9 @@ pub enum ConditionMergeMode {
     /// Keep incoming conditions, back-filling live condition types the writer
     /// omitted, keyed by `type` (never overwrite an incoming condition).
     PreserveUnmentionedByType,
+    /// Keep live conditions on same-type collisions, while preserving incoming
+    /// condition types the live status does not have.
+    PreserveLiveByType,
     /// Merge by `type`, preferring whichever of the live/incoming condition has
     /// the newer `lastTransitionTime` (live wins ties / when incoming lacks it).
     MergeByNewestTransitionTime,
@@ -40,6 +43,9 @@ pub enum FieldMergeMode {
     ReplaceAll,
     /// Keep incoming fields, back-filling live fields the writer omitted.
     PreserveUnmentioned,
+    /// Keep live fields on key collisions, while preserving incoming fields the
+    /// live status does not have.
+    PreserveLive,
 }
 
 /// Parameterized stale-status behavior for a generic (non-typed) kind.
@@ -124,8 +130,8 @@ impl StatusMergeRegistry {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
                     stale_mode: GenericStaleStatusMode::Merge {
-                        condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
-                        field_merge: FieldMergeMode::PreserveUnmentioned,
+                        condition_merge: ConditionMergeMode::PreserveLiveByType,
+                        field_merge: FieldMergeMode::PreserveLive,
                     },
                 }))
             }
@@ -263,6 +269,9 @@ fn merge_generic_status(
                         incoming_status,
                     );
                 }
+                ConditionMergeMode::PreserveLiveByType => {
+                    preserve_live_status_conditions_by_type(live_resource, incoming_status);
+                }
                 ConditionMergeMode::MergeByNewestTransitionTime => {
                     merge_conditions_by_newest_transition_time(live_resource, incoming_status);
                 }
@@ -271,6 +280,9 @@ fn merge_generic_status(
                 FieldMergeMode::ReplaceAll => {}
                 FieldMergeMode::PreserveUnmentioned => {
                     preserve_unmentioned_live_status_fields(live_resource, incoming_status);
+                }
+                FieldMergeMode::PreserveLive => {
+                    preserve_live_status_fields(live_resource, incoming_status);
                 }
             }
         }
@@ -386,6 +398,21 @@ fn preserve_unmentioned_live_status_fields(live_resource: &Value, incoming_statu
     }
 }
 
+fn preserve_live_status_fields(live_resource: &Value, incoming_status: &mut Value) {
+    let Some(live_status) = live_resource.get("status").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(incoming_status) = incoming_status.as_object_mut() else {
+        return;
+    };
+    for (key, value) in live_status {
+        if key == "conditions" {
+            continue;
+        }
+        incoming_status.insert(key.clone(), value.clone());
+    }
+}
+
 fn preserve_unmentioned_live_status_conditions_by_type(
     live_resource: &Value,
     incoming_status: &mut Value,
@@ -419,6 +446,58 @@ fn preserve_unmentioned_live_status_conditions_by_type(
         else {
             continue;
         };
+        seen_types.insert(condition_type);
+    }
+
+    for live_condition in live_conditions {
+        let Some(condition_type) = live_condition
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if seen_types.insert(condition_type.to_string()) {
+            incoming_conditions.push(live_condition.clone());
+        }
+    }
+}
+
+fn preserve_live_status_conditions_by_type(live_resource: &Value, incoming_status: &mut Value) {
+    let Some(live_conditions) = live_resource
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    if live_conditions.is_empty() {
+        return;
+    }
+    let Some(status_obj) = incoming_status.as_object_mut() else {
+        return;
+    };
+    let incoming_conditions = status_obj
+        .entry("conditions".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(incoming_conditions) = incoming_conditions.as_array_mut() else {
+        return;
+    };
+
+    let mut seen_types = std::collections::HashSet::new();
+    for incoming in incoming_conditions.iter_mut() {
+        let Some(condition_type) = incoming
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(live_condition) = live_conditions.iter().find(|condition| {
+            condition.get("type").and_then(Value::as_str) == Some(condition_type.as_str())
+        }) {
+            *incoming = live_condition.clone();
+        }
         seen_types.insert(condition_type);
     }
 
@@ -565,11 +644,7 @@ mod tests {
             }
         );
 
-        for (api_version, kind) in [
-            ("policy/v1", "PodDisruptionBudget"),
-            ("v1", "PersistentVolume"),
-            ("v1", "PersistentVolumeClaim"),
-        ] {
+        for (api_version, kind) in [("policy/v1", "PodDisruptionBudget")] {
             let pv = StatusMergeRegistry::default().profile(api_version, kind);
             let StatusMergeProfileKind::Generic(policy) = pv.kind else {
                 panic!("{kind} must use a Generic policy");
@@ -580,6 +655,21 @@ mod tests {
                 GenericStaleStatusMode::Merge {
                     condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
                     field_merge: FieldMergeMode::PreserveUnmentioned,
+                }
+            );
+        }
+
+        for (api_version, kind) in [("v1", "PersistentVolume"), ("v1", "PersistentVolumeClaim")] {
+            let pv = StatusMergeRegistry::default().profile(api_version, kind);
+            let StatusMergeProfileKind::Generic(policy) = pv.kind else {
+                panic!("{kind} must use a Generic policy");
+            };
+            assert!(policy.terminal_condition_types.is_empty());
+            assert_eq!(
+                policy.stale_mode,
+                GenericStaleStatusMode::Merge {
+                    condition_merge: ConditionMergeMode::PreserveLiveByType,
+                    field_merge: FieldMergeMode::PreserveLive,
                 }
             );
         }

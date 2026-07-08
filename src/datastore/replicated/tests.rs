@@ -3702,7 +3702,7 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn replicated_stale_persistentvolume_status_applies_newer_phase() {
+    async fn replicated_stale_persistentvolume_status_preserves_live_phase() {
         apply_replicated_stale_status_case(ReplicatedStaleStatusCase {
             api_version: "v1",
             kind: "PersistentVolume",
@@ -3718,13 +3718,13 @@ mod cases {
             }),
             stale_status: serde_json::json!({"phase": "Bound"}),
             expected_pointer: "/status/phase",
-            expected_value: serde_json::json!("Bound"),
+            expected_value: serde_json::json!("Available"),
         })
         .await;
     }
 
     #[tokio::test]
-    async fn replicated_stale_persistentvolumeclaim_status_applies_newer_phase() {
+    async fn replicated_stale_persistentvolumeclaim_status_preserves_live_phase() {
         apply_replicated_stale_status_case(ReplicatedStaleStatusCase {
             api_version: "v1",
             kind: "PersistentVolumeClaim",
@@ -3744,7 +3744,7 @@ mod cases {
             }),
             stale_status: serde_json::json!({"phase": "Bound"}),
             expected_pointer: "/status/phase",
-            expected_value: serde_json::json!("Bound"),
+            expected_value: serde_json::json!("Pending"),
         })
         .await;
     }

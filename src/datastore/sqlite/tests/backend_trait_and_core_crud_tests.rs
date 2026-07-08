@@ -2264,7 +2264,11 @@ async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
         .await
         .unwrap()
         .expect("PVC remains");
-    assert_eq!(live.data.pointer("/status/phase"), Some(&json!("Bound")));
+    assert_eq!(
+        live.data.pointer("/status/phase"),
+        Some(&json!("Pending")),
+        "stale controller status must not overwrite a newer live phase"
+    );
     assert_eq!(
         live.data.pointer("/status/volumeName"),
         Some(&json!("pv-status-condition-race"))
@@ -2277,7 +2281,7 @@ async fn status_only_committed_pvc_apply_preserves_unrelated_live_conditions() {
 }
 
 #[tokio::test]
-async fn stale_status_only_apply_uses_incoming_pv_and_pvc_condition_values() {
+async fn stale_status_only_apply_preserves_newer_pv_and_pvc_condition_values() {
     for (kind, namespace) in [
         ("PersistentVolumeClaim", Some("default")),
         ("PersistentVolume", None),
@@ -2391,13 +2395,13 @@ async fn stale_status_only_apply_uses_incoming_pv_and_pvc_condition_values() {
             .expect("resource remains");
         assert_eq!(
             live.data.pointer("/status/reason"),
-            Some(&json!("E2E updateStatus")),
-            "{kind} stale status apply must publish incoming reason"
+            Some(&json!("E2E patchStatus")),
+            "{kind} stale status apply must preserve newer live reason"
         );
         assert_eq!(
             live.data.pointer("/status/message"),
-            Some(&json!("E2E updateStatus")),
-            "{kind} stale status apply must publish incoming message"
+            Some(&json!("E2E patchStatus")),
+            "{kind} stale status apply must preserve newer live message"
         );
         let conditions = live
             .data
@@ -2408,11 +2412,11 @@ async fn stale_status_only_apply_uses_incoming_pv_and_pvc_condition_values() {
             conditions.iter().any(|condition| {
                 condition.get("type").and_then(|value| value.as_str()) == Some("StatusPatched")
                     && condition.get("reason").and_then(|value| value.as_str())
-                        == Some("E2E updateStatus")
+                        == Some("E2E patchStatus")
                     && condition.get("message").and_then(|value| value.as_str())
-                        == Some("E2E updateStatus")
+                        == Some("E2E patchStatus")
             }),
-            "{kind} incoming same-type condition must replace the live patched value: {conditions:?}"
+            "{kind} stale same-type condition must not replace the live patched value: {conditions:?}"
         );
         assert!(
             conditions.iter().any(|condition| {

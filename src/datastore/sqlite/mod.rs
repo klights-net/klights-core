@@ -58,9 +58,10 @@ pub use super::types::{
     AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PatchKind,
     PendingWatchEvent, PodCleanupIntent, PodEndpointEvent, PodEndpointMode, PodEndpointRow,
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState,
-    PodWorkqueueEntry, PodWorkqueueKind, ReplicatedCreateOptions, ReplicatedSnapshotMetadata,
-    Resource, ResourceBatchOperation, ResourceList, ResourceListQuery, ResourcePatchRequest,
-    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchTarget, WatchTargetScope,
+    PodWorkqueueEntry, PodWorkqueueKind, RawWatchEvent, ReplicatedCreateOptions,
+    ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation, ResourceList, ResourceListQuery,
+    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchTarget,
+    WatchTargetScope,
 };
 
 pub use executor::DbExecutor;
@@ -3297,6 +3298,15 @@ impl DatastoreBackend for Datastore {
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead> {
         Datastore::list_watch_events_since_checked_bounded(self, targets, since_rv, limit).await
+    }
+
+    async fn list_raw_watch_events_since_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+        Datastore::list_raw_watch_events_since_checked_bounded(self, targets, since_rv, limit).await
     }
 
     async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {

@@ -275,6 +275,33 @@ impl Datastore {
         .map_err(|e| anyhow::anyhow!("Failed to bounded checked-list watch_events: {}", e))
     }
 
+    pub async fn list_raw_watch_events_since_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+        if targets.is_empty() {
+            return Ok(WatchReplayRead::Events(Vec::new()));
+        }
+
+        let targets = targets.to_vec();
+        self.read_db_call("list_raw_watch_events_since_checked_bounded", move |conn| {
+            if watch_replay_expired_for_targets(conn, &targets, since_rv)? {
+                return Ok(WatchReplayRead::Expired);
+            }
+            Ok(Self::list_raw_watch_events_since_in_conn_with_limit(
+                conn,
+                &targets,
+                since_rv,
+                Some(limit),
+            )
+            .map(WatchReplayRead::Events)?)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to raw bounded checked-list watch_events: {}", e))
+    }
+
     fn list_watch_events_since_in_conn(
         conn: &rusqlite::Connection,
         targets: &[WatchTarget],
@@ -330,6 +357,60 @@ impl Datastore {
             params.iter().map(|param| param.as_ref()).collect();
         let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(&param_refs[..], Self::watch_row_to_catchup_resource)?;
+        let mut items = Vec::new();
+        for row in rows {
+            items.push(row?);
+        }
+        Ok(items)
+    }
+
+    fn list_raw_watch_events_since_in_conn_with_limit(
+        conn: &rusqlite::Connection,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: Option<std::num::NonZeroUsize>,
+    ) -> rusqlite::Result<Vec<RawWatchEvent>> {
+        let mut query = queries::WATCH_EVENTS_LIST_TARGETS_HEAD.to_string();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since_rv)];
+
+        for (idx, target) in targets.iter().enumerate() {
+            if idx > 0 {
+                query.push_str(" OR ");
+            }
+            query.push('(');
+            query.push_str(&format!(
+                "api_version = ?{} AND kind = ?{}",
+                params.len() + 1,
+                params.len() + 2
+            ));
+            params.push(Box::new(target.api_version.clone()));
+            params.push(Box::new(target.kind.clone()));
+
+            match &target.scope {
+                WatchTargetScope::Cluster => {
+                    query.push_str(" AND namespace IS NULL");
+                }
+                WatchTargetScope::Namespaced(Some(namespace)) => {
+                    query.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
+                    params.push(Box::new(namespace.clone()));
+                }
+                WatchTargetScope::Namespaced(None) => {
+                    query.push_str(" AND namespace IS NOT NULL");
+                }
+            }
+            query.push(')');
+        }
+
+        query.push_str(") ORDER BY resource_version ASC, id ASC");
+        if let Some(limit) = limit {
+            query.push_str(&format!(" LIMIT ?{}", params.len() + 1));
+            params.push(Box::new(limit.get() as i64));
+        }
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|param| param.as_ref()).collect();
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(&param_refs[..], Self::watch_row_to_raw_watch_event)?;
         let mut items = Vec::new();
         for row in rows {
             items.push(row?);

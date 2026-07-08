@@ -4,7 +4,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use ::redb::{ReadableDatabase, ReadableTable};
 use anyhow::Result;
-use serde_json::Value;
+use bytes::Bytes;
+use serde::Deserialize;
+use serde_json::{Value, value::RawValue};
 
 use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::tables;
@@ -13,6 +15,19 @@ use crate::datastore::types::*;
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 const DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE: i64 = 1_024;
 const MIN_SCOPE_COUNT_BEFORE_EXPIRING_SCOPES: usize = 16;
+
+#[derive(Deserialize)]
+struct StoredRawWatchEvent<'a> {
+    #[serde(rename = "apiVersion")]
+    api_version: Option<&'a str>,
+    kind: Option<&'a str>,
+    namespace: Option<&'a str>,
+    name: Option<&'a str>,
+    #[serde(rename = "eventType")]
+    event_type: Option<&'a str>,
+    #[serde(borrow)]
+    data: Option<&'a RawValue>,
+}
 
 fn watch_events_min_scope_rows(max_rows: i64, scope_count: usize) -> usize {
     if max_rows <= 0 || scope_count == 0 {
@@ -111,6 +126,80 @@ impl RedbWatchStore {
             }
             WatchReplayRead::Expired => Ok(WatchReplayRead::Expired),
         }
+    }
+
+    pub async fn watch_list_raw_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+        if targets.is_empty() {
+            return Ok(WatchReplayRead::Events(Vec::new()));
+        }
+
+        let targets_owned = targets.to_vec();
+        self.db_call("watch_list_raw_checked_bounded", move |db| {
+            let targets: &[WatchTarget] = &targets_owned;
+            let r = db.begin_read()?;
+            if since_rv > 0 {
+                for target in targets {
+                    if let Some(floor_rv) = target_floor(&r, target)?
+                        && since_rv < floor_rv
+                    {
+                        return Ok(WatchReplayRead::Expired);
+                    }
+                }
+            }
+            Self::watch_list_raw_in_read(&r, targets, since_rv, limit.get())
+                .map(WatchReplayRead::Events)
+        })
+        .await
+    }
+
+    fn watch_list_raw_in_read(
+        read_txn: &::redb::ReadTransaction,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: usize,
+    ) -> Result<Vec<RawWatchEvent>> {
+        let tbl = read_txn.open_table(tables::WATCH_EVENTS)?;
+        let mut result = Vec::new();
+        let start = (since_rv + 1).max(0) as u64;
+        for e in tbl.range(start..)? {
+            let (rv_guard, event_ref) = e?;
+            let rv = rv_guard.value() as i64;
+            let Ok(event) = serde_json::from_slice::<StoredRawWatchEvent<'_>>(event_ref.value())
+            else {
+                continue;
+            };
+            let ev_av = event.api_version.unwrap_or("");
+            let ev_kind = event.kind.unwrap_or("");
+            let ev_ns = event.namespace;
+            if !targets
+                .iter()
+                .any(|target| watch_event_matches_target(target, ev_av, ev_kind, ev_ns))
+            {
+                continue;
+            }
+
+            result.push(RawWatchEvent {
+                api_version: ev_av.to_string(),
+                kind: ev_kind.to_string(),
+                namespace: ev_ns.map(str::to_string),
+                name: event.name.unwrap_or("").to_string(),
+                resource_version: rv,
+                event_type: std::borrow::Cow::Owned(event.event_type.unwrap_or("").to_string()),
+                object_json: event.data.map_or_else(
+                    || Bytes::from_static(b"null"),
+                    |data| Bytes::copy_from_slice(data.get().as_bytes()),
+                ),
+            });
+            if result.len() >= limit {
+                break;
+            }
+        }
+        Ok(result)
     }
 
     fn watch_list_in_read(

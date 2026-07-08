@@ -655,6 +655,17 @@ impl DatastoreBackend for ReplicatedDatastore {
             .await
     }
 
+    async fn list_raw_watch_events_since_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+        self.inner
+            .list_raw_watch_events_since_checked_bounded(targets, since_rv, limit)
+            .await
+    }
+
     async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
         self.inner.earliest_watch_event_rv().await
     }

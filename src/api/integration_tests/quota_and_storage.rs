@@ -1527,7 +1527,16 @@ async fn test_patch_pvc_status_condition_survives_stale_controller_status_commit
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body.pointer("/status/phase"), Some(&json!("Bound")));
+    assert_eq!(
+        body.pointer("/status/phase"),
+        Some(&json!("Pending")),
+        "stale controller status commit must not overwrite fresher live phase"
+    );
+    assert_eq!(
+        body.pointer("/status/volumeName"),
+        Some(&json!("pv-pvc-status-race")),
+        "stale controller status commit may still fill fields omitted by the live patch"
+    );
     assert_eq!(
         body.pointer("/status/conditions/0/type"),
         Some(&json!("StatusPatched")),

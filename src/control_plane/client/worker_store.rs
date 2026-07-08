@@ -17,8 +17,8 @@ use crate::datastore::{
     PodCleanupIntent, PodEndpointEvent, PodEndpointRow, PodNetworkAllocationLink,
     PodNetworkAllocationPod, PodNetworkAllocationRequest, PodNetworkAllocationSubnet,
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodWorkqueueEntry,
-    PodWorkqueueKind, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions,
-    SandboxRef, WatchTarget, WatchTargetScope,
+    PodWorkqueueKind, RawWatchEvent, Resource, ResourceList, ResourcePatchRequest,
+    ResourcePreconditions, SandboxRef, WatchReplayRead, WatchTarget, WatchTargetScope,
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
@@ -1083,6 +1083,15 @@ impl DatastoreBackend for WorkerStoreAdapter {
         }
         events.sort_by_key(|event| event.resource.resource_version);
         Ok(events)
+    }
+
+    async fn list_raw_watch_events_since_checked_bounded(
+        &self,
+        _targets: &[WatchTarget],
+        _since_rv: i64,
+        _limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+        self.unsupported("list_raw_watch_events_since_checked_bounded")
     }
 
     async fn list_all_watch_events_since(&self, _since_rv: i64) -> Result<Vec<CatchUpResource>> {

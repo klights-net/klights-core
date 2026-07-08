@@ -5,8 +5,10 @@
 //! against `crate::datastore::*` without pulling in SQLite-specific code.
 
 use anyhow::{Result, anyhow};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -458,6 +460,31 @@ pub struct CatchUpResource {
     /// three labels) reuses static literals — avoiding a per-event String
     /// allocation across N watchers × M events/sec.
     pub event_type: std::borrow::Cow<'static, str>,
+}
+
+/// Durable watch replay row with routing/cursor fields lifted out of the JSON
+/// object payload. Selectorless JSON watch streams can use this shape to avoid
+/// parsing `watch_events.data` just to recover metadata already stored in
+/// columns.
+#[derive(Debug, Clone)]
+pub struct RawWatchEvent {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace: Option<String>,
+    pub name: String,
+    pub resource_version: i64,
+    pub event_type: Cow<'static, str>,
+    pub object_json: Bytes,
+}
+
+impl RawWatchEvent {
+    pub fn topic(&self) -> crate::watch::WatchTopic {
+        crate::watch::WatchTopic::new(&self.api_version, &self.kind)
+    }
+
+    pub fn key(&self) -> (Option<String>, String) {
+        (self.namespace.clone(), self.name.clone())
+    }
 }
 
 /// Result of a checked durable watch replay read.

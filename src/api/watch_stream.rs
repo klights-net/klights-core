@@ -1,6 +1,6 @@
 use crate::api::watch_event_to_table;
-use crate::datastore::CatchUpResource;
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
+use crate::datastore::{CatchUpResource, RawWatchEvent};
 use crate::datastore::{DatastoreHandle, WatchTarget};
 use crate::label_selector::LabelSelector;
 use crate::watch::{
@@ -9,7 +9,7 @@ use crate::watch::{
 };
 use axum::body::Body;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -225,6 +225,169 @@ pub fn serialize_watch_event_line(event: WatchEvent, kind: &str, table_format: b
     let mut json = serde_json::to_vec(&event).unwrap_or_default();
     json.push(b'\n');
     json
+}
+
+pub fn serialize_raw_watch_event_line(event: &RawWatchEvent) -> Vec<u8> {
+    let event_type = event.event_type.as_ref();
+    let mut line = Vec::with_capacity(event_type.len() + event.object_json.len() + 23);
+    line.extend_from_slice(br#"{"type":""#);
+    line.extend_from_slice(event_type.as_bytes());
+    line.extend_from_slice(br#"","object":"#);
+    line.extend_from_slice(&event.object_json);
+    line.extend_from_slice(b"}\n");
+    line
+}
+
+struct RawSignalWatchCursor {
+    signal_rx: broadcast::Receiver<WatchSignal>,
+    db: DatastoreHandle,
+    targets: Vec<WatchTarget>,
+    topic: WatchTopic,
+    scope: WatchDeliveryScope,
+    accepted_rv: i64,
+    pending: VecDeque<RawWatchEvent>,
+    replay_needed: bool,
+    replay_resume_rv: Option<i64>,
+    seen_rvs: HashSet<i64>,
+    seen_order: VecDeque<i64>,
+}
+
+impl RawSignalWatchCursor {
+    fn new(
+        signal_rx: broadcast::Receiver<WatchSignal>,
+        db: DatastoreHandle,
+        targets: Vec<WatchTarget>,
+        topic: WatchTopic,
+        scope: WatchDeliveryScope,
+        accepted_rv: i64,
+    ) -> Self {
+        Self {
+            signal_rx,
+            db,
+            targets,
+            topic,
+            scope,
+            accepted_rv,
+            pending: VecDeque::new(),
+            replay_needed: false,
+            replay_resume_rv: None,
+            seen_rvs: HashSet::new(),
+            seen_order: VecDeque::new(),
+        }
+    }
+
+    fn accepted_rv(&self) -> i64 {
+        self.accepted_rv
+    }
+
+    fn accept_event(&mut self, rv: i64) {
+        self.record_seen(rv);
+        if rv > self.accepted_rv {
+            self.accepted_rv = rv;
+        }
+    }
+
+    fn mark_delivered(&mut self, rv: i64) {
+        self.record_seen(rv);
+    }
+
+    async fn prime_replay_or_expired(&mut self) -> Result<usize, WatchCursorError> {
+        self.replay_once_from(self.accepted_rv).await
+    }
+
+    async fn next_event(&mut self) -> Result<RawWatchEvent, WatchCursorError> {
+        loop {
+            if let Some(event) = self.pop_pending_event() {
+                return Ok(event);
+            }
+
+            if self.replay_needed {
+                self.replay_needed = false;
+                let since_rv = self.replay_resume_rv.take().unwrap_or(self.accepted_rv);
+                self.replay_once_from(since_rv).await?;
+                continue;
+            }
+
+            match self.signal_rx.recv().await {
+                Ok(signal) => {
+                    if let Some(since_rv) = self.matching_signal_replay_since(&signal) {
+                        self.replay_once_from(since_rv).await?;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    self.replay_needed = true;
+                }
+                Err(broadcast::error::RecvError::Closed) => return Err(WatchCursorError::Closed),
+            }
+        }
+    }
+
+    async fn replay_once_from(&mut self, since_rv: i64) -> Result<usize, WatchCursorError> {
+        let limit = WindowPolicy::default_watch_delivery().limit();
+        let replay = self
+            .db
+            .list_raw_watch_events_since_checked_bounded(&self.targets, since_rv, limit)
+            .await
+            .map_err(WatchCursorError::Replay)?;
+        match replay {
+            crate::datastore::WatchReplayRead::Events(events) => {
+                let event_count = events.len();
+                let max_rv = events.iter().map(|event| event.resource_version).max();
+                self.replay_needed = event_count == limit.get();
+                self.replay_resume_rv = self.replay_needed.then_some(max_rv.unwrap_or(since_rv));
+                self.pending.extend(events);
+                Ok(event_count)
+            }
+            crate::datastore::WatchReplayRead::Expired => Err(WatchCursorError::Expired),
+        }
+    }
+
+    fn pop_pending_event(&mut self) -> Option<RawWatchEvent> {
+        while let Some(event) = self.pending.pop_front() {
+            let rv = event.resource_version;
+            if rv <= self.accepted_rv || self.seen_rvs.contains(&rv) {
+                continue;
+            }
+            if !self.event_matches(&event) {
+                self.accept_event(rv);
+                continue;
+            }
+            self.record_seen(rv);
+            return Some(event);
+        }
+        None
+    }
+
+    fn matching_signal_replay_since(&self, signal: &WatchSignal) -> Option<i64> {
+        if signal.topic != self.topic {
+            return None;
+        }
+        signal
+            .advances
+            .iter()
+            .filter(|advance| self.scope.matches_namespace(advance.namespace.as_deref()))
+            .filter(|advance| advance.high_rv > self.accepted_rv)
+            .map(|_| self.accepted_rv)
+            .min()
+    }
+
+    fn event_matches(&self, event: &RawWatchEvent) -> bool {
+        event.topic() == self.topic && self.scope.matches_namespace(event.namespace.as_deref())
+    }
+
+    fn record_seen(&mut self, rv: i64) {
+        if rv <= 0 {
+            return;
+        }
+        if self.seen_rvs.insert(rv) {
+            self.seen_order.push_back(rv);
+            while self.seen_order.len() > 32_768 {
+                if let Some(oldest) = self.seen_order.pop_front() {
+                    self.seen_rvs.remove(&oldest);
+                }
+            }
+        }
+    }
 }
 
 /// Serialize a mid-stream watch failure as a proper `ERROR` watch event:
@@ -791,13 +954,129 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             }
             (WatchCatchUpMode::ClusterOnly, _) => WatchTarget::cluster(api_version.clone(), kind.clone()),
         };
-        let replay_source = DatastoreWatchReplaySource::new(db.clone(), vec![replay_target]);
+        let replay_source =
+            DatastoreWatchReplaySource::new(db.clone(), vec![replay_target.clone()]);
         let topic = WatchTopic::new(&api_version, &kind);
         let delivery_scope = match (catch_up_mode, watch_namespace.clone()) {
             (WatchCatchUpMode::ClusterOnly, _) => WatchDeliveryScope::Cluster,
             (WatchCatchUpMode::NamespacedScoped, Some(ns)) => WatchDeliveryScope::Namespaced(ns),
             (WatchCatchUpMode::NamespacedScoped, None) => WatchDeliveryScope::NamespacedAll,
         };
+        if !has_selector && !table_format {
+            let mut cursor = RawSignalWatchCursor::new(
+                signal_rx,
+                db.clone(),
+                vec![replay_target.clone()],
+                topic.clone(),
+                delivery_scope.clone(),
+                initial_list_rv.max(requested_rv),
+            );
+            for rv in baseline_delivered_rvs {
+                cursor.mark_delivered(rv);
+            }
+            if requested_rv > 0 || send_initial_events {
+                match cursor.prime_replay_or_expired().await {
+                    Ok(_) => {}
+                    Err(WatchCursorError::Expired) => {
+                        yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                            410,
+                            "Expired",
+                            "too old resource version: requested resourceVersion is older than the watch history window",
+                        ));
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!("Initial raw watch replay failed for {}: {:#?}", kind, err);
+                    }
+                }
+            }
+
+            let bookmark_task_name = format!("watch_stream_bookmarks_{}_{}", api_version, kind);
+            let mut bookmark_ticks = maybe_spawn_bookmark_tick_stream(
+                send_bookmarks,
+                task_supervisor.clone(),
+                bookmark_task_name,
+            )
+            .await;
+            let timeout_task_name = format!("watch_stream_timeout_{}_{}", api_version, kind);
+            let mut timeout_tick = maybe_spawn_watch_timeout_stream(
+                timeout_seconds,
+                task_supervisor.clone(),
+                timeout_task_name,
+            )
+            .await;
+
+            loop {
+                tokio::select! {
+                    Some(()) = recv_watch_timeout(&mut timeout_tick) => {
+                        break;
+                    }
+                    result = cursor.next_event() => {
+                        let event = match result {
+                            Ok(event) => event,
+                            Err(WatchCursorError::Replay(err)) => {
+                                match watch_namespace.as_deref() {
+                                    Some(ns) => tracing::warn!("Raw watch replay failed for {}/{}: {:#}", ns, kind, err),
+                                    None => tracing::warn!("Raw watch replay failed for {}: {:#}", kind, err),
+                                }
+                                continue;
+                            }
+                            Err(WatchCursorError::Expired) => {
+                                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                                    410,
+                                    "Expired",
+                                    "too old resource version: watch fell behind the history window",
+                                ));
+                                break;
+                            }
+                            Err(WatchCursorError::Closed) => {
+                                tracing::debug!("Watch broadcast channel closed");
+                                break;
+                            }
+                        };
+
+                        let rv = event.resource_version;
+                        yield Ok::<_, std::convert::Infallible>(serialize_raw_watch_event_line(&event));
+                        cursor.accept_event(rv);
+                        last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
+                    }
+                    Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
+                        let decision = resolve_periodic_bookmark_decision(PeriodicBookmarkContext {
+                            db: &db,
+                            api_version: &api_version,
+                            kind: &kind,
+                            watch_namespace: watch_namespace.as_deref(),
+                            label_selector: label_selector.as_deref(),
+                            field_selector: field_selector.as_deref(),
+                            requested_rv,
+                            has_scope_filter,
+                            cursor_high_water_rv: cursor.accepted_rv(),
+                            last_delivered_scoped_rv,
+                        })
+                        .await;
+                        match decision {
+                            PeriodicBookmarkDecision::Bookmark(rv) => {
+                                let event = WatchEvent::bookmark_typed(rv, &api_version, &kind);
+                                yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
+                                    event,
+                                    &kind,
+                                    table_format,
+                                ));
+                            }
+                            PeriodicBookmarkDecision::Expired => {
+                                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                                    410,
+                                    "Expired",
+                                    "too old resource version: exact-name watch scope is absent and the watch cursor advanced",
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let mut cursor = SignalWatchCursor::new(
             signal_rx,
             replay_source,
@@ -1770,6 +2049,27 @@ mod tests {
             serde_json::from_slice(&line1[..line1.len() - 1]).unwrap();
         assert_eq!(expected["type"], "ADDED");
         assert_eq!(expected["object"]["metadata"]["name"], "p1");
+    }
+
+    #[test]
+    fn raw_watch_json_line_wraps_stored_object_bytes_without_reparse() {
+        let row = crate::datastore::RawWatchEvent {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "p1".to_string(),
+            resource_version: 9,
+            event_type: std::borrow::Cow::Borrowed("MODIFIED"),
+            object_json: bytes::Bytes::from_static(
+                br#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"p1","namespace":"default","resourceVersion":"9"}}"#,
+            ),
+        };
+
+        let line = serialize_raw_watch_event_line(&row);
+        let decoded: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(decoded["type"], "MODIFIED");
+        assert_eq!(decoded["object"]["metadata"]["name"], "p1");
+        assert_eq!(decoded["object"]["metadata"]["resourceVersion"], "9");
     }
 
     #[test]
