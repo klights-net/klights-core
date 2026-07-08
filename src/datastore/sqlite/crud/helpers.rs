@@ -52,6 +52,7 @@ pub struct WatchEventInsert<'a> {
     pub resource_version: i64,
     pub event_type: &'a str,
     pub data: &'a [u8],
+    canonicalize_object: bool,
 }
 
 impl<'a> WatchEventInsert<'a> {
@@ -72,6 +73,28 @@ impl<'a> WatchEventInsert<'a> {
             resource_version,
             event_type,
             data,
+            canonicalize_object: true,
+        }
+    }
+
+    pub fn preserve_committed_payload(
+        api_version: &'a str,
+        kind: &'a str,
+        namespace: Option<&'a str>,
+        name: &'a str,
+        resource_version: i64,
+        event_type: &'a str,
+        data: &'a [u8],
+    ) -> Self {
+        Self {
+            api_version,
+            kind,
+            namespace,
+            name,
+            resource_version,
+            event_type,
+            data,
+            canonicalize_object: false,
         }
     }
 }
@@ -88,7 +111,20 @@ pub fn insert_watch_event_in_conn(
         resource_version,
         event_type,
         data,
+        canonicalize_object,
     } = event;
+    let data = if canonicalize_object {
+        canonical_watch_event_object_bytes(
+            api_version,
+            kind,
+            namespace,
+            name,
+            resource_version,
+            data,
+        )?
+    } else {
+        data.to_vec()
+    };
     match conn.execute(
         queries::WATCH_EVENTS_INSERT,
         rusqlite::params![
@@ -98,7 +134,7 @@ pub fn insert_watch_event_in_conn(
             name,
             resource_version,
             event_type,
-            data
+            &data
         ],
     ) {
         Ok(_) => Ok(()),
@@ -119,11 +155,26 @@ pub fn insert_watch_event_in_conn(
                 },
             );
             match existing {
-                Ok(ex) if ex.matches(event_type, data) => Ok(()),
+                Ok(ex) if ex.matches(event_type, &data) => Ok(()),
                 _ => Err(err),
             }
         }
     }
+}
+
+fn canonical_watch_event_object_bytes(
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    resource_version: i64,
+    data: &[u8],
+) -> rusqlite::Result<Vec<u8>> {
+    let data: Value = serde_json::from_slice(data)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let data = hydrate_watch_event_data(data, api_version, kind, namespace, name, resource_version);
+    serde_json::to_vec(&data)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
 }
 
 pub struct ExistingWatchEvent {

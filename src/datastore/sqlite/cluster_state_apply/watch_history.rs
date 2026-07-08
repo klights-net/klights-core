@@ -19,7 +19,7 @@ impl<'tx, 'conn> WatchHistoryStateApplier<'tx, 'conn> {
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
         insert_watch_event_in_conn(
             self.tx,
-            WatchEventInsert::new(
+            WatchEventInsert::preserve_committed_payload(
                 &row.api_version,
                 &row.kind,
                 row.namespace.as_deref(),

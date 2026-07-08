@@ -80,7 +80,6 @@ use filters::{
 };
 #[cfg(test)]
 use filters::{resolve_field_path, split_selector};
-#[cfg(test)]
 use resource_shape::hydrate_watch_event_data;
 use resource_shape::{
     ensure_metadata_create_defaults, ensure_metadata_identity, ensure_metadata_uid,
@@ -1026,7 +1025,15 @@ impl Datastore {
                 let namespace = event["namespace"].as_str().map(str::to_string);
                 let name = event["name"].as_str().unwrap_or("").to_string();
                 let event_type = event["type"].as_str().unwrap_or("ADDED").to_string();
-                let data = event["object"].clone();
+                let resource_version = watch_rv.max(rv);
+                let data = hydrate_watch_event_data(
+                    event["object"].clone(),
+                    &api_version,
+                    &kind,
+                    namespace.as_deref(),
+                    &name,
+                    resource_version,
+                );
                 LogApplyCommit::from_cluster_mutations(
                     rv,
                     vec![ClusterMutation::WatchHistory(
@@ -1035,7 +1042,7 @@ impl Datastore {
                             kind,
                             namespace,
                             name,
-                            resource_version: watch_rv.max(rv),
+                            resource_version,
                             event_type,
                             data,
                         }),

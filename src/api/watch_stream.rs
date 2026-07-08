@@ -744,6 +744,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         };
         let has_label_selector = parsed_label_selector.is_some();
         let has_selector = has_label_selector || field_selector.is_some();
+        let use_raw_selectorless_json = !has_selector && !table_format;
         let has_scope_filter = watch_namespace.is_some() || has_selector;
 
         // Read-freshness: when resuming from a resourceVersion, ensure this
@@ -769,7 +770,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         let mut initial_list_rv = requested_rv;
         let mut last_delivered_scoped_rv = requested_rv;
 
-        if !send_initial_events && requested_rv > 0 {
+        if !use_raw_selectorless_json && !send_initial_events && requested_rv > 0 {
             // If the resume point predates the retained watch-event window, the
             // catch-up below (current-state of modified resources) cannot
             // replay deletions that have aged out — the client would silently
@@ -962,7 +963,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             (WatchCatchUpMode::NamespacedScoped, Some(ns)) => WatchDeliveryScope::Namespaced(ns),
             (WatchCatchUpMode::NamespacedScoped, None) => WatchDeliveryScope::NamespacedAll,
         };
-        if !has_selector && !table_format {
+        if use_raw_selectorless_json {
             let mut cursor = RawSignalWatchCursor::new(
                 signal_rx,
                 db.clone(),

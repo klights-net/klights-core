@@ -979,6 +979,76 @@ async fn test_namespaced_watch_catchup_replays_intermediate_events_before_delete
 }
 
 #[tokio::test]
+async fn test_raw_watch_replay_object_resource_version_matches_watch_row() {
+    let db = Datastore::new_in_memory().await.unwrap();
+
+    let created = db
+        .create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "raw-rv-cm",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "raw-rv-cm", "namespace": "default"},
+                "data": {"step": "created"}
+            }),
+        )
+        .await
+        .unwrap();
+    let updated = db
+        .update_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "raw-rv-cm",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "raw-rv-cm",
+                    "namespace": "default",
+                    "resourceVersion": created.resource_version.to_string()
+                },
+                "data": {"step": "updated"}
+            }),
+            created.resource_version,
+        )
+        .await
+        .unwrap();
+
+    let raw = db
+        .list_raw_watch_events_since_checked_bounded(
+            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+                "v1",
+                "ConfigMap",
+                "default",
+            )],
+            created.resource_version,
+            std::num::NonZeroUsize::new(8).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let crate::datastore::WatchReplayRead::Events(events) = raw else {
+        panic!("fresh in-memory watch history must not be expired");
+    };
+    let event = events
+        .iter()
+        .find(|event| event.resource_version == updated.resource_version)
+        .expect("updated raw watch row must be replayed");
+    let object: serde_json::Value = serde_json::from_slice(&event.object_json).unwrap();
+
+    assert_eq!(event.event_type, "MODIFIED");
+    assert_eq!(
+        object.pointer("/metadata/resourceVersion"),
+        Some(&json!(updated.resource_version.to_string())),
+        "raw replay wraps stored object bytes directly, so the object payload must already carry the row resourceVersion"
+    );
+}
+
+#[tokio::test]
 async fn test_cluster_watch_catchup_replays_intermediate_events_before_delete() {
     let db = Datastore::new_in_memory().await.unwrap();
 
