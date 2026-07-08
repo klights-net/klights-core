@@ -1,0 +1,70 @@
+use anyhow::Result;
+
+use crate::datastore::{DatastoreHandle, RawWatchEvent, WatchReplayRead, WatchTarget};
+
+use super::signal_replay_cursor_core::{SignalReplayCursorCore, SignalReplayCursorSource};
+use super::{WatchCursorError, WatchDeliveryScope, WatchSignalReceiver, WatchTopic, WindowPolicy};
+
+pub struct RawSignalWatchCursor {
+    core: SignalReplayCursorCore<RawWatchEvent, RawWatchReplaySource>,
+}
+
+impl RawSignalWatchCursor {
+    pub fn new(
+        signal_rx: impl Into<WatchSignalReceiver>,
+        db: DatastoreHandle,
+        targets: Vec<WatchTarget>,
+        topic: WatchTopic,
+        scope: WatchDeliveryScope,
+        accepted_rv: i64,
+    ) -> Self {
+        Self {
+            core: SignalReplayCursorCore::new(
+                signal_rx,
+                RawWatchReplaySource { db, targets },
+                vec![topic],
+                scope,
+                accepted_rv,
+                WindowPolicy::default_watch_delivery(),
+            ),
+        }
+    }
+
+    pub fn accepted_rv(&self) -> i64 {
+        self.core.accepted_rv()
+    }
+
+    pub fn accept_event(&mut self, rv: i64) {
+        self.core.accept_event(rv);
+    }
+
+    pub fn mark_delivered(&mut self, rv: i64) {
+        self.core.mark_delivered(rv);
+    }
+
+    pub async fn prime_replay_or_expired(&mut self) -> Result<usize, WatchCursorError> {
+        self.core.prime_replay_or_expired().await
+    }
+
+    pub async fn next_event(&mut self) -> Result<RawWatchEvent, WatchCursorError> {
+        self.core.next_event().await
+    }
+}
+
+struct RawWatchReplaySource {
+    db: DatastoreHandle,
+    targets: Vec<WatchTarget>,
+}
+
+#[async_trait::async_trait]
+impl SignalReplayCursorSource<RawWatchEvent> for RawWatchReplaySource {
+    async fn replay_since_checked(
+        &self,
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+        self.db
+            .list_raw_watch_events_since_checked_bounded(&self.targets, since_rv, limit)
+            .await
+    }
+}

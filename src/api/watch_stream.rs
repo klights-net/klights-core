@@ -4,12 +4,12 @@ use crate::datastore::{CatchUpResource, RawWatchEvent};
 use crate::datastore::{DatastoreHandle, WatchTarget};
 use crate::label_selector::LabelSelector;
 use crate::watch::{
-    EventType, SignalWatchCursor, WatchContentType, WatchCursorError, WatchDeliveryScope,
-    WatchEvent, WatchSignal, WatchTopic, WindowPolicy,
+    EventType, RawSignalWatchCursor, SignalWatchCursor, WatchContentType, WatchCursorError,
+    WatchDeliveryScope, WatchEvent, WatchSignal, WatchTopic, WindowPolicy,
 };
 use axum::body::Body;
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -236,158 +236,6 @@ pub fn serialize_raw_watch_event_line(event: &RawWatchEvent) -> Vec<u8> {
     line.extend_from_slice(&event.object_json);
     line.extend_from_slice(b"}\n");
     line
-}
-
-struct RawSignalWatchCursor {
-    signal_rx: broadcast::Receiver<WatchSignal>,
-    db: DatastoreHandle,
-    targets: Vec<WatchTarget>,
-    topic: WatchTopic,
-    scope: WatchDeliveryScope,
-    accepted_rv: i64,
-    pending: VecDeque<RawWatchEvent>,
-    replay_needed: bool,
-    replay_resume_rv: Option<i64>,
-    seen_rvs: HashSet<i64>,
-    seen_order: VecDeque<i64>,
-}
-
-impl RawSignalWatchCursor {
-    fn new(
-        signal_rx: broadcast::Receiver<WatchSignal>,
-        db: DatastoreHandle,
-        targets: Vec<WatchTarget>,
-        topic: WatchTopic,
-        scope: WatchDeliveryScope,
-        accepted_rv: i64,
-    ) -> Self {
-        Self {
-            signal_rx,
-            db,
-            targets,
-            topic,
-            scope,
-            accepted_rv,
-            pending: VecDeque::new(),
-            replay_needed: false,
-            replay_resume_rv: None,
-            seen_rvs: HashSet::new(),
-            seen_order: VecDeque::new(),
-        }
-    }
-
-    fn accepted_rv(&self) -> i64 {
-        self.accepted_rv
-    }
-
-    fn accept_event(&mut self, rv: i64) {
-        self.record_seen(rv);
-        if rv > self.accepted_rv {
-            self.accepted_rv = rv;
-        }
-    }
-
-    fn mark_delivered(&mut self, rv: i64) {
-        self.record_seen(rv);
-    }
-
-    async fn prime_replay_or_expired(&mut self) -> Result<usize, WatchCursorError> {
-        self.replay_once_from(self.accepted_rv).await
-    }
-
-    async fn next_event(&mut self) -> Result<RawWatchEvent, WatchCursorError> {
-        loop {
-            if let Some(event) = self.pop_pending_event() {
-                return Ok(event);
-            }
-
-            if self.replay_needed {
-                self.replay_needed = false;
-                let since_rv = self.replay_resume_rv.take().unwrap_or(self.accepted_rv);
-                self.replay_once_from(since_rv).await?;
-                continue;
-            }
-
-            match self.signal_rx.recv().await {
-                Ok(signal) => {
-                    if let Some(since_rv) = self.matching_signal_replay_since(&signal) {
-                        self.replay_once_from(since_rv).await?;
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    self.replay_needed = true;
-                }
-                Err(broadcast::error::RecvError::Closed) => return Err(WatchCursorError::Closed),
-            }
-        }
-    }
-
-    async fn replay_once_from(&mut self, since_rv: i64) -> Result<usize, WatchCursorError> {
-        let limit = WindowPolicy::default_watch_delivery().limit();
-        let replay = self
-            .db
-            .list_raw_watch_events_since_checked_bounded(&self.targets, since_rv, limit)
-            .await
-            .map_err(WatchCursorError::Replay)?;
-        match replay {
-            crate::datastore::WatchReplayRead::Events(events) => {
-                let event_count = events.len();
-                let max_rv = events.iter().map(|event| event.resource_version).max();
-                self.replay_needed = event_count == limit.get();
-                self.replay_resume_rv = self.replay_needed.then_some(max_rv.unwrap_or(since_rv));
-                self.pending.extend(events);
-                Ok(event_count)
-            }
-            crate::datastore::WatchReplayRead::Expired => Err(WatchCursorError::Expired),
-        }
-    }
-
-    fn pop_pending_event(&mut self) -> Option<RawWatchEvent> {
-        while let Some(event) = self.pending.pop_front() {
-            let rv = event.resource_version;
-            if rv <= self.accepted_rv || self.seen_rvs.contains(&rv) {
-                continue;
-            }
-            if !self.event_matches(&event) {
-                self.accept_event(rv);
-                continue;
-            }
-            self.record_seen(rv);
-            return Some(event);
-        }
-        None
-    }
-
-    fn matching_signal_replay_since(&self, signal: &WatchSignal) -> Option<i64> {
-        if signal.topic != self.topic {
-            return None;
-        }
-        signal
-            .advances
-            .iter()
-            .filter(|advance| self.scope.matches_namespace(advance.namespace.as_deref()))
-            .filter(|advance| advance.high_rv > self.accepted_rv)
-            .map(|_| self.accepted_rv)
-            .min()
-    }
-
-    fn event_matches(&self, event: &RawWatchEvent) -> bool {
-        event.topic() == self.topic && self.scope.matches_namespace(event.namespace.as_deref())
-    }
-
-    fn record_seen(&mut self, rv: i64) {
-        if rv <= 0 {
-            return;
-        }
-        if self.seen_rvs.insert(rv) {
-            self.seen_order.push_back(rv);
-            while self.seen_order.len() > 32_768 {
-                if let Some(oldest) = self.seen_order.pop_front() {
-                    self.seen_rvs.remove(&oldest);
-                }
-            }
-        }
-    }
 }
 
 /// Serialize a mid-stream watch failure as a proper `ERROR` watch event:

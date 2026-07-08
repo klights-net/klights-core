@@ -162,6 +162,7 @@ fn list_response_resource_version(
     _items: &[Resource],
     current_rv: i64,
     pending_reserved_rv: Option<i64>,
+    exact_name_deleted_replay_floor_rv: Option<i64>,
     _request_had_continue: bool,
     _response_has_continue: bool,
 ) -> i64 {
@@ -177,10 +178,14 @@ fn list_response_resource_version(
     // be higher than a mutation that is not yet visible in rows/watch history.
     // Cap the list RV just before the earliest unapplied reservation so a
     // follow-up watch cannot skip that eventual ADDED/MODIFIED/DELETED event.
+    let mut response_rv = current_rv;
     if let Some(reserved_rv) = pending_reserved_rv.filter(|rv| *rv > 0) {
-        return current_rv.min(reserved_rv.saturating_sub(1));
+        response_rv = response_rv.min(reserved_rv.saturating_sub(1));
     }
-    current_rv
+    if let Some(floor_rv) = exact_name_deleted_replay_floor_rv.filter(|rv| *rv >= 0) {
+        response_rv = response_rv.min(floor_rv);
+    }
+    response_rv
 }
 
 fn list_subject_key_prefix(api_version: &str, kind: &str, namespace: Option<&str>) -> String {
@@ -205,7 +210,88 @@ fn pending_reserved_rv_for_collection_in_tx(
     )
 }
 
+fn retained_exact_name_delete_rv_in_conn(
+    conn: &rusqlite::Connection,
+    api_version: &str,
+    kind: &str,
+    namespace: Option<&str>,
+    name: &str,
+    current_rv: i64,
+) -> rusqlite::Result<Option<i64>> {
+    if let Some(namespace) = namespace {
+        conn.query_row(
+            "SELECT MAX(resource_version) FROM watch_events
+             WHERE api_version = ?1
+               AND kind = ?2
+               AND namespace = ?3
+               AND name = ?4
+               AND event_type = 'DELETED'
+               AND resource_version <= ?5",
+            rusqlite::params![api_version, kind, namespace, name, current_rv],
+            |row| row.get(0),
+        )
+    } else {
+        conn.query_row(
+            "SELECT MAX(resource_version) FROM watch_events
+             WHERE api_version = ?1
+               AND kind = ?2
+               AND name = ?3
+               AND event_type = 'DELETED'
+               AND resource_version <= ?4",
+            rusqlite::params![api_version, kind, name, current_rv],
+            |row| row.get(0),
+        )
+    }
+}
+
+struct ExactNameDeletedReplayFloorRequest<'a> {
+    api_version: &'a str,
+    kind: &'a str,
+    namespace: Option<&'a str>,
+    field_selector: Option<&'a str>,
+    items_empty: bool,
+    request_had_continue: bool,
+    current_rv: i64,
+}
+
 impl Datastore {
+    async fn exact_name_deleted_replay_floor_rv(
+        &self,
+        request: ExactNameDeletedReplayFloorRequest<'_>,
+    ) -> Result<Option<i64>> {
+        if !request.items_empty || request.request_had_continue || request.current_rv <= 0 {
+            return Ok(None);
+        }
+        let Some(field_selector) = request
+            .field_selector
+            .filter(|selector| !selector.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let pushdown = split_sql_pushdown_conditions(field_selector);
+        let Some(name) = pushdown.sql_name_eq.filter(|name| !name.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let namespace = request.namespace.or(pushdown.sql_namespace_eq.as_deref());
+        let av = request.api_version.to_string();
+        let k = request.kind.to_string();
+        let ns = namespace.map(str::to_string);
+        let current_rv = request.current_rv;
+        let deleted_rv = self
+            .read_db_call("db_query", move |conn| {
+                Ok(retained_exact_name_delete_rv_in_conn(
+                    conn,
+                    &av,
+                    &k,
+                    ns.as_deref(),
+                    &name,
+                    current_rv,
+                )?)
+            })
+            .await?;
+        Ok(deleted_rv.map(|rv| rv.saturating_sub(1)))
+    }
+
     #[cfg(test)]
     pub(crate) fn install_list_resources_snapshot_pause_for_test(
         api_version: &str,
@@ -541,6 +627,7 @@ impl Datastore {
                 &items,
                 current_rv,
                 pending_reserved_rv,
+                None,
                 request_had_continue,
                 next_token.is_some(),
             );
@@ -1099,10 +1186,22 @@ impl Datastore {
                 items.truncate(lim);
                 next_token = items.last().map(|r| r.name.clone());
             }
+            let exact_name_deleted_replay_floor_rv = self
+                .exact_name_deleted_replay_floor_rv(ExactNameDeletedReplayFloorRequest {
+                    api_version,
+                    kind,
+                    namespace,
+                    field_selector,
+                    items_empty: items.is_empty(),
+                    request_had_continue,
+                    current_rv,
+                })
+                .await?;
             let response_rv = list_response_resource_version(
                 &items,
                 current_rv,
                 pending_reserved_rv,
+                exact_name_deleted_replay_floor_rv,
                 request_had_continue,
                 next_token.is_some(),
             );
@@ -1341,10 +1440,22 @@ impl Datastore {
             items.truncate(lim as usize);
             next_token = Some(items.last().unwrap().name.clone());
         }
+        let exact_name_deleted_replay_floor_rv = self
+            .exact_name_deleted_replay_floor_rv(ExactNameDeletedReplayFloorRequest {
+                api_version,
+                kind,
+                namespace,
+                field_selector,
+                items_empty: items.is_empty(),
+                request_had_continue,
+                current_rv,
+            })
+            .await?;
         let response_rv = list_response_resource_version(
             &items,
             current_rv,
             pending_reserved_rv,
+            exact_name_deleted_replay_floor_rv,
             request_had_continue,
             next_token.is_some(),
         );

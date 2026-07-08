@@ -15,7 +15,8 @@ use crate::pod_identity::PodIdentity;
 use crate::side_effects::SideEffectMetrics;
 use crate::task_supervisor::{TaskCategory, TaskSupervisor};
 
-use super::store::{PodStore, UnscheduledPodDeleteOutcome};
+use super::delete_coordinator::{PodDeleteCoordinator, PodDeleteRetryDecision};
+use super::store::PodStore;
 const MAX_ATTEMPTS: i64 = 720;
 const MIN_DELAY_MS: i64 = 5_000;
 const POD_DELETE_TARGET_NODE_PAYLOAD_KEY: &str = "target_node";
@@ -114,13 +115,26 @@ impl PodWorkqueue {
         target_node: Option<String>,
     ) -> Result<()> {
         self.ensure_reconciler_started().await?;
+        self.enqueue_deferred_delete_row_with_target_node(ns, name, uid, run_after, target_node)
+            .await?;
+        self.wake.notify_one();
+        Ok(())
+    }
+
+    pub(super) async fn enqueue_deferred_delete_row_with_target_node(
+        &self,
+        ns: String,
+        name: String,
+        uid: String,
+        run_after: Duration,
+        target_node: Option<String>,
+    ) -> Result<()> {
         let delay_ms = run_after.as_millis().min(i64::MAX as u128) as i64;
         let pod = PodIdentity::new(&ns, &name, &uid);
         let payload = pod_delete_target_payload(target_node.as_deref());
         self.db
             .pod_workqueue_enqueue(PodWorkqueueKind::Pod, &pod, payload, 0, delay_ms, None)
             .await?;
-        self.wake.notify_one();
         Ok(())
     }
 
@@ -357,39 +371,27 @@ impl PodWorkqueue {
                 );
             }
             Some(resource) if resource.uid == uid => {
-                // HR#11 exception: a Pod never picked up by a kubelet
-                // (spec.nodeName empty) has no lifecycle actor to finalize it,
-                // so its row — and namespace — would linger forever. The
-                // leader removes the row directly, atomically confirming no
-                // kubelet has claimed it. Once a kubelet owns the Pod, only
-                // the actor may remove the row (the actor-wake path below).
-                let resource = if pod_target_node_from_pod_data(&resource.data).is_some() {
-                    resource
-                } else {
-                    match self
-                        .store
-                        .delete_unscheduled_with_uid(&ns, &name, &uid)
-                        .await?
-                    {
-                        UnscheduledPodDeleteOutcome::Removed => return Ok(()),
-                        UnscheduledPodDeleteOutcome::FinalizersPending => {
-                            anyhow::bail!(
-                                "unscheduled pod {}/{} uid {} awaiting finalizer removal",
-                                ns,
-                                name,
-                                uid
-                            );
-                        }
-                        UnscheduledPodDeleteOutcome::DeferToActor => {
-                            // A bind raced the atomic delete; re-read so the
-                            // node-targeted actor path below routes to the
-                            // now-assigned node.
-                            match self.store.get(&ns, &name).await? {
-                                Some(fresh) if fresh.uid == uid => fresh,
-                                _ => return Ok(()),
-                            }
-                        }
+                // HR#11 exception: unscheduled-row removal and bind-race
+                // retry decisions are centralized in PodDeleteCoordinator.
+                let resource = match PodDeleteCoordinator::resolve_retry_resource(
+                    self.store.as_ref(),
+                    &ns,
+                    &name,
+                    &uid,
+                    resource,
+                )
+                .await?
+                {
+                    PodDeleteRetryDecision::Removed => return Ok(()),
+                    PodDeleteRetryDecision::FinalizersPending => {
+                        anyhow::bail!(
+                            "unscheduled pod {}/{} uid {} awaiting finalizer removal",
+                            ns,
+                            name,
+                            uid
+                        );
                     }
+                    PodDeleteRetryDecision::Actor(resource) => resource,
                 };
                 if !self.should_process_deferred_pod_delete_for_target(
                     "pod deferred delete is not targeted to this node",
@@ -625,49 +627,24 @@ impl PodWorkqueue {
     }
 
     async fn enqueue_actor_deletes_for_terminating_namespace_pods(
-        &self,
+        self: &Arc<Self>,
         namespace: &str,
     ) -> Result<()> {
         let pods = self
             .store
             .list(Some(namespace), None, None, None, None)
             .await?;
+        let coordinator = PodDeleteCoordinator::new(
+            self.store.clone(),
+            self.clone(),
+            self.supervisor.clone(),
+            self.metrics.clone(),
+        );
         let mut enqueued_any = false;
         for resource in pods.items {
-            let target_node = pod_target_node_from_pod_data(&resource.data);
-            if resource
-                .data
-                .pointer("/metadata/deletionTimestamp")
-                .and_then(|value| value.as_str())
-                .is_none()
-            {
-                continue;
-            }
-            if resource.uid.is_empty() {
-                tracing::warn!(
-                    namespace = %namespace,
-                    pod = %resource.name,
-                    "namespace termination cannot enqueue actor-owned Pod delete without UID"
-                );
-                continue;
-            }
-
-            // Namespace termination can mark unscheduled Pods terminating; no
-            // node-scoped Pod watcher will see those events. Queue the same
-            // UID-bound actor wake used by Pod DELETE so final row removal
-            // remains actor-owned.
-            let pod = PodIdentity::new(namespace, &resource.name, &resource.uid);
-            self.db
-                .pod_workqueue_enqueue(
-                    PodWorkqueueKind::Pod,
-                    &pod,
-                    pod_delete_target_payload(target_node.as_deref()),
-                    0,
-                    0,
-                    None,
-                )
+            enqueued_any |= coordinator
+                .enqueue_terminating_namespace_pod(namespace, &resource)
                 .await?;
-            enqueued_any = true;
         }
         if enqueued_any {
             self.wake.notify_one();
@@ -696,13 +673,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
-    pod.pointer("/spec/nodeName")
-        .and_then(|node| node.as_str())
-        .filter(|node| !node.trim().is_empty())
-        .map(ToString::to_string)
 }
 
 fn pod_delete_target_payload(target_node: Option<&str>) -> Value {

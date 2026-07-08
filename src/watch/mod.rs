@@ -4,10 +4,12 @@ pub mod bus;
 mod cursor;
 pub mod events;
 mod filter;
+mod raw_signal_cursor;
 mod replay;
 mod scope;
 mod selection;
 mod signal_cursor;
+mod signal_replay_cursor_core;
 mod window;
 
 #[cfg(test)]
@@ -22,6 +24,7 @@ pub use events::{
     EventType, WatchContentType, WatchEvent, encode_watch_payload, value_matches_field_selector,
 };
 pub use filter::WatchEventFilter;
+pub use raw_signal_cursor::RawSignalWatchCursor;
 pub use replay::{WatchCursorError, WatchReplaySource};
 pub use scope::WatchDeliveryScope;
 pub use selection::WatchEventSelection;

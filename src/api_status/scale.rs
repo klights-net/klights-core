@@ -4,79 +4,25 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::api::{AppError, AppState, LenientJson, apply_patch};
-use crate::datastore::{PatchKind, Resource, ResourcePreconditions};
+use crate::api::{AppError, AppState, LenientJson};
+use crate::api_status::{
+    DatastoreScaleMutationWriter, JsonScaleMutationResponder, ScaleMutationPipeline,
+    ScaleMutationTarget, ScalePatchOperation, ScalePutOperation, ScaleSelectorStyle,
+    build_scale_response,
+};
+use crate::datastore::Resource;
+
+#[cfg(test)]
+use crate::api_status::{extract_scale_replicas, extract_scale_resource_version};
+#[cfg(test)]
+use crate::datastore::ResourcePreconditions;
 
 // Scale endpoints are split from helpers to keep each file manageable.
 // Authorization for scale subresources is enforced by the global
 // `authorize_request` middleware chokepoint (see src/auth/middleware.rs).
-
-/// Build a Scale JSON response from a resource's current state.
-fn build_scale_response(
-    name: &str,
-    namespace: &str,
-    resource_version: i64,
-    replicas: i64,
-    status_replicas: i64,
-    selector_str: String,
-) -> Value {
-    let scale = k8s_openapi::api::autoscaling::v1::Scale {
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            namespace: Some(namespace.to_string()),
-            resource_version: Some(resource_version.to_string()),
-            ..Default::default()
-        },
-        spec: Some(k8s_openapi::api::autoscaling::v1::ScaleSpec {
-            replicas: Some(replicas as i32),
-        }),
-        status: Some(k8s_openapi::api::autoscaling::v1::ScaleStatus {
-            replicas: status_replicas as i32,
-            selector: if selector_str.is_empty() {
-                None
-            } else {
-                Some(selector_str)
-            },
-        }),
-    };
-    serde_json::to_value(scale).unwrap_or_default()
-}
-
-/// Extract and validate `spec.replicas` from a Scale request body.
-/// Returns the validated `i32` replica count or an appropriate error.
-fn extract_scale_replicas(body: &Value) -> Result<i32, AppError> {
-    let replicas_value = body
-        .pointer("/spec/replicas")
-        .ok_or_else(|| AppError::BadRequest("spec.replicas is required".to_string()))?;
-
-    // Reject non-integer values (strings, floats, null, etc.)
-    let as_i64 = replicas_value
-        .as_i64()
-        .ok_or_else(|| AppError::BadRequest("spec.replicas must be an integer".to_string()))?;
-
-    // Reject values outside i32 range
-    i32::try_from(as_i64)
-        .map_err(|_| AppError::BadRequest("spec.replicas must fit in a 32-bit integer".to_string()))
-}
-
-fn extract_scale_resource_version(body: &Value) -> Result<Option<i64>, AppError> {
-    let Some(resource_version) = body
-        .pointer("/metadata/resourceVersion")
-        .and_then(|v| v.as_str())
-    else {
-        return Ok(None);
-    };
-    if resource_version.is_empty() {
-        return Ok(None);
-    }
-    resource_version.parse::<i64>().map(Some).map_err(|_| {
-        AppError::BadRequest("metadata.resourceVersion must be an integer string".to_string())
-    })
-}
 
 /// Extract the selector string from a resource's spec.selector.
 /// For apps/v1 resources (Deployment, StatefulSet, ReplicaSet), the selector
@@ -194,136 +140,14 @@ async fn update_apps_v1_scale(
     name: String,
     body: Value,
 ) -> Result<Json<Value>, AppError> {
-    let new_replicas = extract_scale_replicas(&body)?;
-    let expected_resource_version = extract_scale_resource_version(&body)?;
-
-    let resource = state
-        .db
-        .get_resource("apps/v1", kind, Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind.to_lowercase(), name)))?;
-
-    let updated = state
-        .db
-        .patch_resource_latest_with_preconditions(
-            "apps/v1",
-            kind,
-            Some(&namespace),
-            &name,
-            crate::datastore::ResourcePatchRequest::new(
-                PatchKind::Merge,
-                serde_json::json!({"spec": {"replicas": new_replicas}}),
-                ResourcePreconditions {
-                    uid: Some(resource.uid),
-                    resource_version: expected_resource_version,
-                },
-            )
-            .with_strict_resource_version(),
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind.to_lowercase(), name)))?;
-
-    state.controller_dispatcher.enqueue(&updated.data).await;
-
-    let status_replicas = updated
-        .data
-        .pointer("/status/replicas")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    Ok(Json(build_scale_response(
-        &name,
-        &namespace,
-        updated.resource_version,
-        new_replicas as i64,
-        status_replicas,
-        selector_string_from_match_labels(&updated),
-    )))
-}
-
-async fn patch_apps_v1_scale_replicas_latest(
-    state: Arc<AppState>,
-    kind: &str,
-    namespace: String,
-    name: String,
-    uid: String,
-    replicas: i32,
-) -> Result<Json<Value>, AppError> {
-    let updated = state
-        .db
-        .patch_resource_latest_with_preconditions(
-            "apps/v1",
-            kind,
-            Some(&namespace),
-            &name,
-            crate::datastore::ResourcePatchRequest::new(
-                PatchKind::Merge,
-                serde_json::json!({"spec": {"replicas": replicas}}),
-                ResourcePreconditions::uid(uid),
-            ),
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind.to_lowercase(), name)))?;
-
-    state.controller_dispatcher.enqueue(&updated.data).await;
-
-    let status_replicas = updated
-        .data
-        .pointer("/status/replicas")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let selector_str = selector_string_from_match_labels(&updated);
-
-    Ok(Json(build_scale_response(
-        &name,
-        &namespace,
-        updated.resource_version,
-        replicas as i64,
-        status_replicas,
-        selector_str,
-    )))
-}
-
-async fn patch_replicationcontroller_scale_replicas_latest(
-    state: Arc<AppState>,
-    namespace: String,
-    name: String,
-    uid: String,
-    replicas: i32,
-) -> Result<Json<Value>, AppError> {
-    let updated = state
-        .db
-        .patch_resource_latest_with_preconditions(
-            "v1",
-            "ReplicationController",
-            Some(&namespace),
-            &name,
-            crate::datastore::ResourcePatchRequest::new(
-                PatchKind::Merge,
-                serde_json::json!({"spec": {"replicas": replicas}}),
-                ResourcePreconditions::uid(uid),
-            ),
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("replicationcontroller {} not found", name)))?;
-
-    state.controller_dispatcher.enqueue(&updated.data).await;
-
-    let status_replicas = updated
-        .data
-        .pointer("/status/replicas")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let selector_str = selector_string_from_flat_selector(&updated);
-
-    Ok(Json(build_scale_response(
-        &name,
-        &namespace,
-        updated.resource_version,
-        replicas as i64,
-        status_replicas,
-        selector_str,
-    )))
+    let target = ScaleMutationTarget::namespaced("apps/v1", kind, namespace, name);
+    let pipeline = ScaleMutationPipeline::new(
+        DatastoreScaleMutationWriter::new(state),
+        JsonScaleMutationResponder::new(ScaleSelectorStyle::MatchLabels),
+    );
+    pipeline
+        .execute(&target, &ScalePutOperation::new(body))
+        .await
 }
 
 pub async fn get_deployment_scale(
@@ -376,36 +200,13 @@ async fn patch_apps_v1_scale(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let patch = crate::api_status::decode_patch_body(&body)?;
-
-    let resource = state
-        .db
-        .get_resource("apps/v1", kind, Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind.to_lowercase(), name)))?;
-
-    let replicas = resource
-        .data
-        .pointer("/spec/replicas")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let status_replicas = resource
-        .data
-        .pointer("/status/replicas")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let selector_str = selector_string_from_match_labels(&resource);
-    let current_scale = build_scale_response(
-        &name,
-        &namespace,
-        resource.resource_version,
-        replicas,
-        status_replicas,
-        selector_str,
+    let target = ScaleMutationTarget::namespaced("apps/v1", kind, namespace, name);
+    let pipeline = ScaleMutationPipeline::new(
+        DatastoreScaleMutationWriter::new(state),
+        JsonScaleMutationResponder::new(ScaleSelectorStyle::MatchLabels),
     );
-    let patched = apply_patch(&current_scale, &patch, content_type.as_deref())?;
-    let new_replicas = extract_scale_replicas(&patched)?;
-
-    patch_apps_v1_scale_replicas_latest(state, kind, namespace, name, resource.uid, new_replicas)
+    pipeline
+        .execute(&target, &ScalePatchOperation::new(patch, content_type))
         .await
 }
 
@@ -437,48 +238,7 @@ pub async fn patch_replicaset_scale(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<Value>, AppError> {
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let patch = crate::api_status::decode_patch_body(&body)?;
-
-    let resource = state
-        .db
-        .get_resource("apps/v1", "ReplicaSet", Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("replicaset {} not found", name)))?;
-    let replicas = resource
-        .data
-        .pointer("/spec/replicas")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let status_replicas = resource
-        .data
-        .pointer("/status/replicas")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let selector_str = selector_string_from_match_labels(&resource);
-    let current_scale = build_scale_response(
-        &name,
-        &namespace,
-        resource.resource_version,
-        replicas,
-        status_replicas,
-        selector_str,
-    );
-    let patched = apply_patch(&current_scale, &patch, content_type.as_deref())?;
-    let new_replicas = extract_scale_replicas(&patched)?;
-
-    patch_apps_v1_scale_replicas_latest(
-        state,
-        "ReplicaSet",
-        namespace,
-        name,
-        resource.uid,
-        new_replicas,
-    )
-    .await
+    patch_apps_v1_scale(state, "ReplicaSet", namespace, name, headers, body).await
 }
 
 pub async fn get_replicationcontroller_scale(
@@ -518,51 +278,14 @@ pub async fn update_replicationcontroller_scale(
     Path((namespace, name)): Path<(String, String)>,
     LenientJson(body): LenientJson<Value>,
 ) -> Result<Json<Value>, AppError> {
-    let new_replicas = extract_scale_replicas(&body)?;
-    let expected_resource_version = extract_scale_resource_version(&body)?;
-
-    let rc = state
-        .db
-        .get_resource("v1", "ReplicationController", Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("replicationcontroller {} not found", name)))?;
-
-    let updated = state
-        .db
-        .patch_resource_latest_with_preconditions(
-            "v1",
-            "ReplicationController",
-            Some(&namespace),
-            &name,
-            crate::datastore::ResourcePatchRequest::new(
-                PatchKind::Merge,
-                serde_json::json!({"spec": {"replicas": new_replicas}}),
-                ResourcePreconditions {
-                    uid: Some(rc.uid),
-                    resource_version: expected_resource_version,
-                },
-            )
-            .with_strict_resource_version(),
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("replicationcontroller {} not found", name)))?;
-
-    state.controller_dispatcher.enqueue(&updated.data).await;
-
-    let status_replicas = updated
-        .data
-        .pointer("/status/replicas")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    Ok(Json(build_scale_response(
-        &name,
-        &namespace,
-        updated.resource_version,
-        new_replicas as i64,
-        status_replicas,
-        selector_string_from_flat_selector(&updated),
-    )))
+    let target = ScaleMutationTarget::namespaced("v1", "ReplicationController", namespace, name);
+    let pipeline = ScaleMutationPipeline::new(
+        DatastoreScaleMutationWriter::new(state),
+        JsonScaleMutationResponder::new(ScaleSelectorStyle::FlatSelector),
+    );
+    pipeline
+        .execute(&target, &ScalePutOperation::new(body))
+        .await
 }
 
 pub async fn patch_replicationcontroller_scale(
@@ -576,42 +299,14 @@ pub async fn patch_replicationcontroller_scale(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let patch = crate::api_status::decode_patch_body(&body)?;
-
-    let resource = state
-        .db
-        .get_resource("v1", "ReplicationController", Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("replicationcontroller {} not found", name)))?;
-    let replicas = resource
-        .data
-        .pointer("/spec/replicas")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let status_replicas = resource
-        .data
-        .pointer("/status/replicas")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let selector_str = selector_string_from_flat_selector(&resource);
-    let current_scale = build_scale_response(
-        &name,
-        &namespace,
-        resource.resource_version,
-        replicas,
-        status_replicas,
-        selector_str,
+    let target = ScaleMutationTarget::namespaced("v1", "ReplicationController", namespace, name);
+    let pipeline = ScaleMutationPipeline::new(
+        DatastoreScaleMutationWriter::new(state),
+        JsonScaleMutationResponder::new(ScaleSelectorStyle::FlatSelector),
     );
-    let patched = apply_patch(&current_scale, &patch, content_type.as_deref())?;
-    let new_replicas = extract_scale_replicas(&patched)?;
-
-    patch_replicationcontroller_scale_replicas_latest(
-        state,
-        namespace,
-        name,
-        resource.uid,
-        new_replicas,
-    )
-    .await
+    pipeline
+        .execute(&target, &ScalePatchOperation::new(patch, content_type))
+        .await
 }
 
 #[cfg(test)]

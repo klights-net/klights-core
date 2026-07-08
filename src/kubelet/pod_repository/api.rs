@@ -4,8 +4,8 @@
 //!
 //! Holds `Arc<PodStore>` for every `("v1","Pod",...)` write, plus
 //! `DatastoreHandle` for the non-Pod admission/quota/limitrange helpers
-//! that touch other kinds. `Arc<PodWorkqueue>` carries deferred
-//! UID-bound actor wakeups; the API service never calls
+//! that touch other kinds. `Arc<PodDeleteCoordinator>` carries deferred
+//! UID-bound actor wakeup decisions; the API service never calls
 //! `TaskSupervisor::spawn_delay` directly. `Arc<SideEffectRegistry>` and
 //! `Arc<SideEffectMetrics>` are reserved for post-write hooks.
 //!
@@ -34,13 +34,13 @@ use crate::task_supervisor::TaskSupervisor;
 
 use crate::api::DeleteOptions;
 
+use super::delete_coordinator::PodDeleteCoordinator;
 use super::state_only_writer::StateOnlyWriter;
 use super::store::{PodStore, preserve_status_from_current};
 use super::types::{
     PodApiCreateRequest, PodApiCreateResult, PodApiDeleteOutcome, PodApiUpdateOutcome,
     PodStatusPatchType,
 };
-use super::workqueue::PodWorkqueue;
 
 pub(super) const SCHED_BIND_CONCURRENCY: usize = 8;
 
@@ -178,7 +178,7 @@ struct PreemptionVictim {
 
 struct PreemptionApplyContext<'a> {
     store: &'a PodStore,
-    workqueue: &'a Arc<PodWorkqueue>,
+    delete_coordinator: &'a PodDeleteCoordinator,
     side_effects: &'a SideEffectRegistry,
     metrics: &'a SideEffectMetrics,
     preemptor_namespace: &'a str,
@@ -190,7 +190,7 @@ pub struct PodApiService {
     status_only: Arc<dyn StateOnlyWriter>,
     db: DatastoreHandle,
     supervisor: Arc<TaskSupervisor>,
-    workqueue: Arc<PodWorkqueue>,
+    delete_coordinator: Arc<PodDeleteCoordinator>,
     side_effects: Arc<SideEffectRegistry>,
     metrics: Arc<SideEffectMetrics>,
     outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
@@ -203,58 +203,20 @@ pub struct PodApiServiceDependencies {
     pub status_only: Arc<dyn StateOnlyWriter>,
     pub db: DatastoreHandle,
     pub supervisor: Arc<TaskSupervisor>,
-    pub workqueue: Arc<PodWorkqueue>,
+    pub delete_coordinator: Arc<PodDeleteCoordinator>,
     pub side_effects: Arc<SideEffectRegistry>,
     pub metrics: Arc<SideEffectMetrics>,
     pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
 }
 
 impl PodApiService {
-    async fn enqueue_actor_finalize_if_ready(&self, ns: &str, name: &str, resource: &Resource) {
-        if resource
-            .data
-            .pointer("/metadata/deletionTimestamp")
-            .is_none()
-            || resource
-                .data
-                .pointer("/metadata/finalizers")
-                .and_then(|finalizers| finalizers.as_array())
-                .is_some_and(|finalizers| !finalizers.is_empty())
-        {
-            return;
-        }
-
-        if let Err(err) = self
-            .workqueue
-            .enqueue_deferred_delete_with_target_node(
-                ns.to_string(),
-                name.to_string(),
-                resource.uid.clone(),
-                Duration::ZERO,
-                pod_target_node_from_pod_data(&resource.data),
-            )
-            .await
-        {
-            self.metrics
-                .cascade_delete_failures_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::error!(
-                namespace = %ns,
-                name = %name,
-                uid = %resource.uid,
-                error = %err,
-                "failed to enqueue actor finalization after pod finalizers drained"
-            );
-        }
-    }
-
     pub fn new(dependencies: PodApiServiceDependencies) -> Self {
         let PodApiServiceDependencies {
             store,
             status_only,
             db,
             supervisor,
-            workqueue,
+            delete_coordinator,
             side_effects,
             metrics,
             outbox,
@@ -264,7 +226,7 @@ impl PodApiService {
             status_only,
             db,
             supervisor,
-            workqueue,
+            delete_coordinator,
             side_effects,
             metrics,
             outbox,
@@ -775,7 +737,7 @@ impl PodApiService {
         apply_preemption_victims(
             PreemptionApplyContext {
                 store: self.store.as_ref(),
-                workqueue: &self.workqueue,
+                delete_coordinator: self.delete_coordinator.as_ref(),
                 side_effects: self.side_effects.as_ref(),
                 metrics: self.metrics.as_ref(),
                 preemptor_namespace: namespace,
@@ -966,7 +928,8 @@ impl PodApiService {
                 "failed to enqueue Service reconcile after pod endpoint state changed"
             );
         }
-        self.enqueue_actor_finalize_if_ready(ns, name, &resource)
+        self.delete_coordinator
+            .enqueue_actor_finalize_if_ready(ns, name, &resource)
             .await;
         Ok(PodApiUpdateOutcome::Persisted(resource))
     }
@@ -1086,7 +1049,8 @@ impl PodApiService {
                             "failed to enqueue Service reconcile after pod endpoint state changed"
                         );
                     }
-                    self.enqueue_actor_finalize_if_ready(ns, name, &resource)
+                    self.delete_coordinator
+                        .enqueue_actor_finalize_if_ready(ns, name, &resource)
                         .await;
                     return Ok(PodApiUpdateOutcome::Persisted(resource));
                 }
@@ -1176,82 +1140,20 @@ impl PodApiService {
         )
         .await?;
 
-        let grace_period_seconds = pod_delete_grace_period_seconds(&resource.data, &options);
-        let data = pod_data_with_deletion_metadata(&resource.data, grace_period_seconds);
-
         if dry_run {
-            let mut dry = data;
-            if let Some(obj) = dry.as_object_mut()
-                && let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut())
-            {
-                meta.insert(
-                    "resourceVersion".to_string(),
-                    Value::String(resource.resource_version.to_string()),
-                );
-            }
-            return Ok(PodApiDeleteOutcome::DryRun(dry));
+            return Ok(PodApiDeleteOutcome::DryRun(
+                self.delete_coordinator
+                    .dry_run_delete_body(&resource, &options),
+            ));
         }
 
-        const MAX_DELETE_CONFLICT_RETRIES: u32 = 8;
-        let mut current = resource;
-        let mut attempt = 0u32;
-        let (updated, previous) = loop {
-            let delete_base = if delete_preconditions.resource_version.is_some() {
-                current.clone()
-            } else {
-                self.store
-                    .get(ns, name)
-                    .await?
-                    .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?
-            };
-            ensure_resource_preconditions_match(&delete_base, &delete_preconditions)?;
-            let grace_period_seconds = pod_delete_grace_period_seconds(&delete_base.data, &options);
-            let data = pod_data_with_deletion_metadata(&delete_base.data, grace_period_seconds);
-            let mark_result = if delete_preconditions.resource_version.is_some() {
-                self.store
-                    .mark_deleting_at_resource_version(
-                        ns,
-                        name,
-                        &delete_base.uid,
-                        data,
-                        delete_base.resource_version,
-                    )
-                    .await
-            } else {
-                self.store
-                    .mark_deleting_latest(ns, name, &delete_base.uid, &data)
-                    .await
-            };
-            match mark_result {
-                Ok(updated) => break (updated, std::sync::Arc::unwrap_or_clone(delete_base.data)),
-                Err(e) if is_conflict_error(&e) && attempt + 1 < MAX_DELETE_CONFLICT_RETRIES => {
-                    let backoff_ms = std::cmp::min(20u64.saturating_mul(1u64 << attempt), 250);
-                    let _ = self
-                        .supervisor
-                        .sleep(
-                            "pod_delete_conflict_retry_backoff",
-                            Duration::from_millis(backoff_ms),
-                        )
-                        .await;
-                    current = self
-                        .store
-                        .get(ns, name)
-                        .await?
-                        .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?;
-                    attempt += 1;
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        };
-
-        let uid = updated
-            .data
-            .get("metadata")
-            .and_then(|m| m.get("uid"))
-            .and_then(|u| u.as_str())
-            .unwrap_or("")
-            .to_string();
+        let delete_outcome = self
+            .delete_coordinator
+            .mark_and_queue_api_delete(ns, name, &options, &delete_preconditions, resource)
+            .await?;
+        let updated = delete_outcome.updated;
+        let previous = delete_outcome.previous;
+        let uid = delete_outcome.uid;
         if let Err(err) = crate::side_effects::service_pod::enqueue_services_after_pod_update(
             &previous,
             &updated.data,
@@ -1290,34 +1192,6 @@ impl PodApiService {
                 name = %name,
                 error = %e,
                 "pod delete: cascade delete of dependents failed"
-            );
-        }
-
-        // Fallback cleanup reminder. The kubelet-side runtime cleanup path
-        // removes the API object after hooks and sandbox teardown complete.
-        // The workqueue is UID-bound and must not free the name slot while the
-        // same UID still exists; otherwise force/grace=0 could bypass preStop
-        // and CRI cleanup or delete a same-name replacement.
-        let deferred_delete_delay = Duration::from_secs(grace_period_seconds as u64);
-        if let Err(e) = self
-            .workqueue
-            .enqueue_deferred_delete_with_target_node(
-                ns.to_string(),
-                name.to_string(),
-                uid,
-                deferred_delete_delay,
-                pod_target_node_from_pod_data(&updated.data),
-            )
-            .await
-        {
-            self.metrics
-                .cascade_delete_failures_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::error!(
-                namespace = %ns,
-                name = %name,
-                error = %e,
-                "failed to enqueue pod deferred delete"
             );
         }
 
@@ -1793,13 +1667,13 @@ async fn apply_preemption_victims(
         .await?;
         let uid = updated.uid.clone();
         let hook_resource = std::sync::Arc::unwrap_or_clone(updated.data);
-        ctx.workqueue
-            .enqueue_deferred_delete_with_target_node(
+        ctx.delete_coordinator
+            .enqueue_marked_pod_retry(
                 victim.namespace.clone(),
                 victim.name.clone(),
                 uid,
                 Duration::ZERO,
-                pod_target_node_from_pod_data(&hook_resource),
+                &hook_resource,
             )
             .await
             .map_err(|e| -> AppError { e.into() })?;
@@ -2098,51 +1972,8 @@ fn upsert_pod_scheduled_true(pod: &mut Value) -> Result<(), AppError> {
     Ok(())
 }
 
-fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds: i64) -> Value {
-    let mut data = data.clone();
-    if let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut())
-        && meta
-            .get("deletionTimestamp")
-            .is_none_or(|timestamp| timestamp.is_null())
-    {
-        meta.insert(
-            "deletionTimestamp".to_string(),
-            Value::String(crate::utils::k8s_timestamp()),
-        );
-        meta.insert(
-            "deletionGracePeriodSeconds".to_string(),
-            json!(grace_period_seconds),
-        );
-    }
-    if data
-        .pointer("/metadata/deletionTimestamp")
-        .is_some_and(|timestamp| !timestamp.is_null())
-    {
-        crate::resource_semantics::mark_terminating_pod_unready(&mut data);
-    }
-    data
-}
-
-fn pod_delete_grace_period_seconds(data: &Value, options: &DeleteOptions) -> i64 {
-    options
-        ._grace_period_seconds
-        .or_else(|| {
-            data.pointer("/spec/terminationGracePeriodSeconds")
-                .and_then(|value| value.as_i64())
-        })
-        .unwrap_or(30)
-        .max(0)
-}
-
 fn is_conflict_error(err: &anyhow::Error) -> bool {
     crate::datastore::errors::is_conflict_error(err)
-}
-
-fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
-    pod.pointer("/spec/nodeName")
-        .and_then(|node| node.as_str())
-        .filter(|node| !node.trim().is_empty())
-        .map(ToString::to_string)
 }
 
 async fn apply_priority_class_to_pod(

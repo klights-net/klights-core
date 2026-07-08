@@ -1,0 +1,501 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use serde_json::{Value, json};
+
+use crate::api::{AppError, DeleteOptions};
+use crate::datastore::{Resource, ResourcePreconditions};
+use crate::side_effects::SideEffectMetrics;
+use crate::task_supervisor::TaskSupervisor;
+
+use super::store::{PodStore, UnscheduledPodDeleteOutcome};
+use super::workqueue::PodWorkqueue;
+
+const MAX_DELETE_CONFLICT_RETRIES: u32 = 8;
+
+#[derive(Debug)]
+pub(super) struct PodDeleteMarkOutcome {
+    pub updated: Resource,
+    pub previous: Value,
+    pub uid: String,
+}
+
+pub(super) enum PodDeleteRetryDecision {
+    Removed,
+    FinalizersPending,
+    Actor(Resource),
+}
+
+#[async_trait]
+pub(crate) trait PodDeleteStorePort: Send + Sync {
+    async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>>;
+
+    async fn mark_deleting_latest(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        body: &Value,
+    ) -> Result<Resource>;
+
+    async fn mark_deleting_at_resource_version(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        body: Value,
+        expected_rv: i64,
+    ) -> Result<Resource>;
+
+    async fn delete_unscheduled_with_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+    ) -> Result<UnscheduledPodDeleteOutcome>;
+}
+
+#[async_trait]
+impl PodDeleteStorePort for PodStore {
+    async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
+        PodStore::get(self, ns, name).await
+    }
+
+    async fn mark_deleting_latest(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        body: &Value,
+    ) -> Result<Resource> {
+        PodStore::mark_deleting_latest(self, ns, name, uid, body).await
+    }
+
+    async fn mark_deleting_at_resource_version(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        body: Value,
+        expected_rv: i64,
+    ) -> Result<Resource> {
+        PodStore::mark_deleting_at_resource_version(self, ns, name, uid, body, expected_rv).await
+    }
+
+    async fn delete_unscheduled_with_uid(
+        &self,
+        ns: &str,
+        name: &str,
+        uid: &str,
+    ) -> Result<UnscheduledPodDeleteOutcome> {
+        PodStore::delete_unscheduled_with_uid(self, ns, name, uid).await
+    }
+}
+
+#[async_trait]
+pub(crate) trait PodDeleteQueuePort: Send + Sync {
+    async fn enqueue_deferred_delete_with_target_node(
+        &self,
+        ns: String,
+        name: String,
+        uid: String,
+        run_after: Duration,
+        target_node: Option<String>,
+    ) -> Result<()>;
+
+    async fn enqueue_namespace_termination_pod(
+        &self,
+        ns: String,
+        name: String,
+        uid: String,
+        target_node: Option<String>,
+    ) -> Result<()>;
+}
+
+struct WorkqueuePodDeleteQueue {
+    workqueue: Arc<PodWorkqueue>,
+}
+
+#[async_trait]
+impl PodDeleteQueuePort for WorkqueuePodDeleteQueue {
+    async fn enqueue_deferred_delete_with_target_node(
+        &self,
+        ns: String,
+        name: String,
+        uid: String,
+        run_after: Duration,
+        target_node: Option<String>,
+    ) -> Result<()> {
+        self.workqueue
+            .enqueue_deferred_delete_with_target_node(ns, name, uid, run_after, target_node)
+            .await
+    }
+
+    async fn enqueue_namespace_termination_pod(
+        &self,
+        ns: String,
+        name: String,
+        uid: String,
+        target_node: Option<String>,
+    ) -> Result<()> {
+        self.workqueue
+            .enqueue_deferred_delete_row_with_target_node(
+                ns,
+                name,
+                uid,
+                Duration::ZERO,
+                target_node,
+            )
+            .await
+    }
+}
+
+#[async_trait]
+pub(crate) trait PodDeleteSleeperPort: Send + Sync {
+    async fn sleep(&self, name: &'static str, duration: Duration);
+}
+
+struct SupervisorPodDeleteSleeper {
+    supervisor: Arc<TaskSupervisor>,
+}
+
+#[async_trait]
+impl PodDeleteSleeperPort for SupervisorPodDeleteSleeper {
+    async fn sleep(&self, name: &'static str, duration: Duration) {
+        let _ = self.supervisor.sleep(name, duration).await;
+    }
+}
+
+pub struct PodDeleteCoordinator {
+    store: Arc<dyn PodDeleteStorePort>,
+    queue: Arc<dyn PodDeleteQueuePort>,
+    sleeper: Arc<dyn PodDeleteSleeperPort>,
+    metrics: Arc<SideEffectMetrics>,
+}
+
+impl PodDeleteCoordinator {
+    pub(crate) fn new(
+        store: Arc<PodStore>,
+        workqueue: Arc<PodWorkqueue>,
+        supervisor: Arc<TaskSupervisor>,
+        metrics: Arc<SideEffectMetrics>,
+    ) -> Self {
+        Self::new_with_ports(
+            store,
+            Arc::new(WorkqueuePodDeleteQueue { workqueue }),
+            Arc::new(SupervisorPodDeleteSleeper { supervisor }),
+            metrics,
+        )
+    }
+
+    pub(crate) fn new_with_ports(
+        store: Arc<dyn PodDeleteStorePort>,
+        queue: Arc<dyn PodDeleteQueuePort>,
+        sleeper: Arc<dyn PodDeleteSleeperPort>,
+        metrics: Arc<SideEffectMetrics>,
+    ) -> Self {
+        Self {
+            store,
+            queue,
+            sleeper,
+            metrics,
+        }
+    }
+
+    pub(super) fn dry_run_delete_body(
+        &self,
+        resource: &Resource,
+        options: &DeleteOptions,
+    ) -> Value {
+        let grace_period_seconds = pod_delete_grace_period_seconds(&resource.data, options);
+        let mut data = pod_data_with_deletion_metadata(&resource.data, grace_period_seconds);
+        if let Some(obj) = data.as_object_mut()
+            && let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut())
+        {
+            meta.insert(
+                "resourceVersion".to_string(),
+                Value::String(resource.resource_version.to_string()),
+            );
+        }
+        data
+    }
+
+    pub(super) async fn enqueue_actor_finalize_if_ready(
+        &self,
+        ns: &str,
+        name: &str,
+        resource: &Resource,
+    ) {
+        if resource
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .is_none()
+            || resource
+                .data
+                .pointer("/metadata/finalizers")
+                .and_then(|finalizers| finalizers.as_array())
+                .is_some_and(|finalizers| !finalizers.is_empty())
+        {
+            return;
+        }
+
+        if let Err(err) = self
+            .enqueue_marked_pod_retry(
+                ns.to_string(),
+                name.to_string(),
+                resource.uid.clone(),
+                Duration::ZERO,
+                &resource.data,
+            )
+            .await
+        {
+            self.metrics
+                .cascade_delete_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                namespace = %ns,
+                name = %name,
+                uid = %resource.uid,
+                error = %err,
+                "failed to enqueue actor finalization after pod finalizers drained"
+            );
+        }
+    }
+
+    pub(super) async fn mark_and_queue_api_delete(
+        &self,
+        ns: &str,
+        name: &str,
+        options: &DeleteOptions,
+        delete_preconditions: &ResourcePreconditions,
+        initial_resource: Resource,
+    ) -> Result<PodDeleteMarkOutcome, AppError> {
+        let mut current = initial_resource;
+        let mut attempt = 0u32;
+
+        let (updated, previous, grace_period_seconds) = loop {
+            let delete_base = if delete_preconditions.resource_version.is_some() {
+                current.clone()
+            } else {
+                self.store
+                    .get(ns, name)
+                    .await?
+                    .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?
+            };
+            ensure_resource_preconditions_match(&delete_base, delete_preconditions)?;
+            let grace_period_seconds = pod_delete_grace_period_seconds(&delete_base.data, options);
+            let data = pod_data_with_deletion_metadata(&delete_base.data, grace_period_seconds);
+            let mark_result = if delete_preconditions.resource_version.is_some() {
+                self.store
+                    .mark_deleting_at_resource_version(
+                        ns,
+                        name,
+                        &delete_base.uid,
+                        data,
+                        delete_base.resource_version,
+                    )
+                    .await
+            } else {
+                self.store
+                    .mark_deleting_latest(ns, name, &delete_base.uid, &data)
+                    .await
+            };
+
+            match mark_result {
+                Ok(updated) => {
+                    break (
+                        updated,
+                        std::sync::Arc::unwrap_or_clone(delete_base.data),
+                        grace_period_seconds,
+                    );
+                }
+                Err(e)
+                    if crate::datastore::errors::is_conflict_error(&e)
+                        && attempt + 1 < MAX_DELETE_CONFLICT_RETRIES =>
+                {
+                    let backoff_ms = std::cmp::min(20u64.saturating_mul(1u64 << attempt), 250);
+                    self.sleeper
+                        .sleep(
+                            "pod_delete_conflict_retry_backoff",
+                            Duration::from_millis(backoff_ms),
+                        )
+                        .await;
+                    current = self
+                        .store
+                        .get(ns, name)
+                        .await?
+                        .ok_or_else(|| AppError::NotFound("Pod not found".to_string()))?;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+
+        let uid = updated
+            .data
+            .get("metadata")
+            .and_then(|m| m.get("uid"))
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string();
+        let deferred_delete_delay = Duration::from_secs(grace_period_seconds as u64);
+        if let Err(e) = self
+            .enqueue_marked_pod_retry(
+                ns.to_string(),
+                name.to_string(),
+                uid.clone(),
+                deferred_delete_delay,
+                &updated.data,
+            )
+            .await
+        {
+            self.metrics
+                .cascade_delete_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                namespace = %ns,
+                name = %name,
+                error = %e,
+                "failed to enqueue pod deferred delete"
+            );
+        }
+
+        Ok(PodDeleteMarkOutcome {
+            updated,
+            previous,
+            uid,
+        })
+    }
+
+    pub(super) async fn enqueue_marked_pod_retry(
+        &self,
+        ns: String,
+        name: String,
+        uid: String,
+        run_after: Duration,
+        pod_data: &Value,
+    ) -> Result<()> {
+        self.queue
+            .enqueue_deferred_delete_with_target_node(
+                ns,
+                name,
+                uid,
+                run_after,
+                pod_target_node_from_pod_data(pod_data),
+            )
+            .await
+    }
+
+    pub(super) async fn enqueue_terminating_namespace_pod(
+        &self,
+        namespace: &str,
+        resource: &Resource,
+    ) -> Result<bool> {
+        if resource
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .and_then(|value| value.as_str())
+            .is_none()
+        {
+            return Ok(false);
+        }
+        if resource.uid.is_empty() {
+            tracing::warn!(
+                namespace = %namespace,
+                pod = %resource.name,
+                "namespace termination cannot enqueue actor-owned Pod delete without UID"
+            );
+            return Ok(false);
+        }
+
+        self.queue
+            .enqueue_namespace_termination_pod(
+                namespace.to_string(),
+                resource.name.clone(),
+                resource.uid.clone(),
+                pod_target_node_from_pod_data(&resource.data),
+            )
+            .await?;
+        Ok(true)
+    }
+
+    pub(super) async fn resolve_retry_resource(
+        store: &dyn PodDeleteStorePort,
+        ns: &str,
+        name: &str,
+        uid: &str,
+        resource: Resource,
+    ) -> Result<PodDeleteRetryDecision> {
+        if pod_target_node_from_pod_data(&resource.data).is_some() {
+            return Ok(PodDeleteRetryDecision::Actor(resource));
+        }
+
+        match store.delete_unscheduled_with_uid(ns, name, uid).await? {
+            UnscheduledPodDeleteOutcome::Removed => Ok(PodDeleteRetryDecision::Removed),
+            UnscheduledPodDeleteOutcome::FinalizersPending => {
+                Ok(PodDeleteRetryDecision::FinalizersPending)
+            }
+            UnscheduledPodDeleteOutcome::DeferToActor => {
+                // A bind raced the atomic delete; re-read so the node-targeted
+                // actor path routes to the now-assigned node.
+                match store.get(ns, name).await? {
+                    Some(fresh) if fresh.uid == uid => Ok(PodDeleteRetryDecision::Actor(fresh)),
+                    _ => Ok(PodDeleteRetryDecision::Removed),
+                }
+            }
+        }
+    }
+}
+
+fn ensure_resource_preconditions_match(
+    resource: &Resource,
+    preconditions: &ResourcePreconditions,
+) -> Result<(), AppError> {
+    crate::api::mutation::delete::ensure_delete_preconditions_match(resource, preconditions)
+}
+
+pub(super) fn pod_data_with_deletion_metadata(data: &Value, grace_period_seconds: i64) -> Value {
+    let mut data = data.clone();
+    if let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut())
+        && meta
+            .get("deletionTimestamp")
+            .is_none_or(|timestamp| timestamp.is_null())
+    {
+        meta.insert(
+            "deletionTimestamp".to_string(),
+            Value::String(crate::utils::k8s_timestamp()),
+        );
+        meta.insert(
+            "deletionGracePeriodSeconds".to_string(),
+            json!(grace_period_seconds),
+        );
+    }
+    if data
+        .pointer("/metadata/deletionTimestamp")
+        .is_some_and(|timestamp| !timestamp.is_null())
+    {
+        crate::resource_semantics::mark_terminating_pod_unready(&mut data);
+    }
+    data
+}
+
+pub(super) fn pod_delete_grace_period_seconds(data: &Value, options: &DeleteOptions) -> i64 {
+    options
+        ._grace_period_seconds
+        .or_else(|| {
+            data.pointer("/spec/terminationGracePeriodSeconds")
+                .and_then(|value| value.as_i64())
+        })
+        .unwrap_or(30)
+        .max(0)
+}
+
+pub(super) fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
+    pod.pointer("/spec/nodeName")
+        .and_then(|node| node.as_str())
+        .filter(|node| !node.trim().is_empty())
+        .map(ToString::to_string)
+}

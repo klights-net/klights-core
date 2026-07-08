@@ -2,14 +2,49 @@ use std::sync::Arc;
 
 use super::PodApiFacade;
 use crate::kubelet::pod_repository::api::PodSchedulingMode;
+use crate::kubelet::pod_repository::delete_coordinator::{
+    PodDeleteCoordinator, PodDeleteQueuePort, PodDeleteSleeperPort,
+};
 use crate::kubelet::pod_repository::state_only_writer::StatusOnlyWriterService;
 use crate::kubelet::pod_repository::store::PodStore;
-use crate::kubelet::pod_repository::workqueue::PodWorkqueue;
 use crate::kubelet::pod_repository::{PodApiDeleteOutcome, PodApiUpdateOutcome, PodReader};
 use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
 use crate::task_supervisor::TaskSupervisor;
 
 use crate::kubelet::pod_repository::PodApiCreateRequest;
+
+struct NoopPodDeleteQueue;
+
+#[async_trait::async_trait]
+impl PodDeleteQueuePort for NoopPodDeleteQueue {
+    async fn enqueue_deferred_delete_with_target_node(
+        &self,
+        _ns: String,
+        _name: String,
+        _uid: String,
+        _run_after: std::time::Duration,
+        _target_node: Option<String>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn enqueue_namespace_termination_pod(
+        &self,
+        _ns: String,
+        _name: String,
+        _uid: String,
+        _target_node: Option<String>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct NoopPodDeleteSleeper;
+
+#[async_trait::async_trait]
+impl PodDeleteSleeperPort for NoopPodDeleteSleeper {
+    async fn sleep(&self, _name: &'static str, _duration: std::time::Duration) {}
+}
 
 fn fixture_supervisor() -> Arc<TaskSupervisor> {
     Arc::new(TaskSupervisor::new(
@@ -43,12 +78,12 @@ fn fixture_facade(db: crate::datastore::DatastoreHandle) -> PodApiFacade {
 
     let repository = Arc::new(parts.repository);
     let store = Arc::new(PodStore::new(db.clone()));
-    let workqueue = PodWorkqueue::new(
+    let delete_coordinator = Arc::new(PodDeleteCoordinator::new_with_ports(
         store.clone(),
-        db.clone(),
-        supervisor.clone(),
+        Arc::new(NoopPodDeleteQueue),
+        Arc::new(NoopPodDeleteSleeper),
         metrics.clone(),
-    );
+    ));
     let status_only = Arc::new(StatusOnlyWriterService::new(store.clone()));
 
     PodApiFacade::new(
@@ -58,7 +93,7 @@ fn fixture_facade(db: crate::datastore::DatastoreHandle) -> PodApiFacade {
             status_only,
             db,
             supervisor,
-            workqueue,
+            delete_coordinator,
             side_effects,
             metrics,
             outbox: None,

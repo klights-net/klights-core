@@ -33,6 +33,7 @@ use crate::watch::WatchEvent;
 
 pub mod api;
 pub mod background;
+pub mod delete_coordinator;
 pub mod facade;
 pub mod network;
 pub mod objects;
@@ -56,6 +57,7 @@ pub use types::{
 
 use api::{PodApiService, PodApiServiceDependencies};
 use background::PodRepositoryBackground;
+use delete_coordinator::PodDeleteCoordinator;
 use network::PodNetworkService;
 use objects::PodObjectService;
 use state_only_writer::StatusOnlyWriterService;
@@ -606,13 +608,19 @@ impl PodRepository {
             supervisor.clone(),
             metrics.clone(),
         );
+        let delete_coordinator = Arc::new(PodDeleteCoordinator::new(
+            store.clone(),
+            workqueue.clone(),
+            supervisor.clone(),
+            metrics.clone(),
+        ));
         let status_only = Arc::new(StatusOnlyWriterService::new(store.clone()));
         let api = Arc::new(PodApiService::new(PodApiServiceDependencies {
             store: store.clone(),
             status_only: status_only.clone(),
             db: db.clone(),
             supervisor: supervisor.clone(),
-            workqueue: workqueue.clone(),
+            delete_coordinator,
             side_effects: side_effects.clone(),
             metrics: metrics.clone(),
             outbox: outbox.clone(),

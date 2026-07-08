@@ -9,8 +9,12 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::api::{AppError, AppState, LenientJson, apply_patch, inject_resource_version};
-use crate::datastore::{PatchKind, ResourcePreconditions};
+use crate::api::{AppError, AppState, LenientJson, inject_resource_version};
+use crate::api_status::{
+    ApiSubresourceStatusMergePolicy, DatastoreStatusMutationWriter,
+    LenientStatusResourceVersionPrecondition, ResourceStatusResponder, StatusMutationPipeline,
+    StatusMutationTarget, StatusPatchOperation, StatusPutOperation,
+};
 
 pub fn ensure_type_meta(
     obj: impl Into<std::sync::Arc<Value>>,
@@ -96,69 +100,16 @@ pub async fn update_status_subresource(
     name: String,
     body: Value,
 ) -> Result<Json<Value>, AppError> {
-    // Existence check — surface 404 before any write attempt.
-    let existing_resource = state
-        .db
-        .get_resource(&api_version, &kind, Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {}/{} not found", kind, namespace, name)))?;
-
-    // Honor body's metadata.resourceVersion as the CAS guard when the caller
-    // supplied one; otherwise skip CAS (K8s contract for unconditional updates).
-    let expected_rv = body
-        .pointer("/metadata/resourceVersion")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<i64>().ok());
-
-    // 1. Apply status atomically via json_set — preserves `.spec` against any
-    //    concurrent user write.
-    let mut body_status = body.get("status").cloned().unwrap_or(Value::Null);
-    crate::datastore::status_merge_policy::merge_status_for_apply(
-        &api_version,
-        &kind,
-        existing_resource.data.as_ref(),
-        &mut body_status,
-        crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
-        crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+    let target = StatusMutationTarget::namespaced(&api_version, &kind, &namespace, &name);
+    let pipeline = StatusMutationPipeline::new(
+        DatastoreStatusMutationWriter::new(state.clone()),
+        ApiSubresourceStatusMergePolicy::new(None),
+        LenientStatusResourceVersionPrecondition,
+        ResourceStatusResponder::new(true),
     );
-    state
-        .db
-        .update_status_only_with_preconditions(
-            &api_version,
-            &kind,
-            Some(&namespace),
-            &name,
-            body_status,
-            ResourcePreconditions {
-                uid: Some(existing_resource.uid.clone()),
-                resource_version: expected_rv,
-            },
-        )
+    let outcome = pipeline
+        .execute(&target, &StatusPutOperation::new(body))
         .await?;
-
-    // 2. If the body specifies annotation or label updates, apply them as a
-    //    metadata-only merge patch. patch_resource_latest runs inside an
-    //    Immediate transaction, so this second write is also race-safe against
-    //    concurrent spec edits (untouched fields pass through verbatim).
-    if let Some(metadata_patch) = build_status_metadata_patch(body.get("metadata")) {
-        state
-            .db
-            .patch_resource_latest_with_preconditions(
-                &api_version,
-                &kind,
-                Some(&namespace),
-                &name,
-                crate::datastore::ResourcePatchRequest::new(
-                    PatchKind::Merge,
-                    metadata_patch,
-                    ResourcePreconditions {
-                        uid: Some(existing_resource.uid.clone()),
-                        resource_version: None,
-                    },
-                ),
-            )
-            .await?;
-    }
 
     // ResourceQuota: do NOT reconcile immediately after a /status PATCH/PUT.
     // The K8s conformance test watches for the patched status value to appear
@@ -167,40 +118,14 @@ pub async fn update_status_subresource(
     // the watch can observe it. The periodic background reconciler handles
     // syncing Status.Hard = Spec.Hard.
 
-    let final_resource = state
-        .db
-        .get_resource(&api_version, &kind, Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "{} {}/{} disappeared after status update",
-                kind, namespace, name
-            ))
-        })?;
-    let with_type_meta = ensure_type_meta(final_resource.data.clone(), &api_version, &kind);
-    let result =
-        crate::api::inject_resource_version(with_type_meta, final_resource.resource_version);
-    enqueue_post_status_reconcile(state.as_ref(), &api_version, &kind, &final_resource.data).await;
-    Ok(Json(result))
-}
-
-/// Build a merge-patch body that touches only the metadata fields the K8s
-/// status subresource is allowed to mutate (`annotations`, `labels`). Returns
-/// `None` when the body has none — saves a redundant DB write.
-fn build_status_metadata_patch(body_meta: Option<&Value>) -> Option<Value> {
-    let body_meta = body_meta?.as_object()?;
-    let mut patch_meta = serde_json::Map::new();
-    if let Some(annotations) = body_meta.get("annotations") {
-        patch_meta.insert("annotations".to_string(), annotations.clone());
-    }
-    if let Some(labels) = body_meta.get("labels") {
-        patch_meta.insert("labels".to_string(), labels.clone());
-    }
-    if patch_meta.is_empty() {
-        None
-    } else {
-        Some(serde_json::json!({"metadata": Value::Object(patch_meta)}))
-    }
+    enqueue_post_status_reconcile(
+        state.as_ref(),
+        &api_version,
+        &kind,
+        &outcome.final_resource.data,
+    )
+    .await;
+    Ok(Json(outcome.response))
 }
 
 pub async fn patch_status_subresource(
@@ -212,85 +137,19 @@ pub async fn patch_status_subresource(
     patch: Value,
     content_type: Option<&str>,
 ) -> Result<Json<Value>, AppError> {
-    // GET to apply the patch against the latest snapshot — needed to compute
-    // the post-patch status and metadata. The actual writes go through paths
-    // that do NOT depend on this snapshot's resourceVersion for `.spec`
-    // preservation: the status write uses json_set inside SQLite, and the
-    // metadata write uses an Immediate-tx merge patch.
-    let resource = state
-        .db
-        .get_resource(&api_version, &kind, Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {}/{} not found", kind, namespace, name)))?;
-
-    let patched = apply_patch(&resource.data, &patch, content_type)?;
-
-    // Honor a CLIENT-SUPPLIED `metadata.resourceVersion` as the OCC guard when
-    // the caller put one in the patch body (kubectl status PATCH with a stale
-    // RV must 409); otherwise skip CAS (K8s contract for unconditional status
-    // updates). The RV is read from the raw client patch body, not from the
-    // merged `patched` result, so a resourceVersion carried in the live
-    // resource data is never mistaken for a client precondition. This applies
-    // only to API status-subresource clients — the kubelet forwarded status
-    // outbox keeps its UID + observed_status_stamp + apply-against-latest
-    // behavior and does NOT go through this path.
-    let expected_rv = patch
-        .pointer("/metadata/resourceVersion")
-        .and_then(|value| value.as_str())
-        .and_then(|value| value.parse::<i64>().ok());
-
-    // 1. Status write — atomic, preserves spec.
-    if let Some(new_status) = patched.get("status") {
-        let mut new_status = new_status.clone();
-        crate::datastore::status_merge_policy::merge_status_for_apply(
-            &api_version,
-            &kind,
-            resource.data.as_ref(),
-            &mut new_status,
-            crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
-            crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
-        );
-        state
-            .db
-            .update_status_only_with_preconditions(
-                &api_version,
-                &kind,
-                Some(&namespace),
-                &name,
-                new_status,
-                ResourcePreconditions {
-                    uid: Some(resource.uid.clone()),
-                    resource_version: expected_rv,
-                },
-            )
-            .await?;
-    }
-
-    // 2. Metadata write — annotations/labels only (status subresource may not
-    //    overwrite uid/resourceVersion/creationTimestamp). Skip when nothing
-    //    actually changed in the allowed fields.
-    if let Some(metadata_patch) = build_status_metadata_patch_from_diff(
-        resource.data.get("metadata"),
-        patched.get("metadata"),
-    ) {
-        state
-            .db
-            .patch_resource_latest_with_preconditions(
-                &api_version,
-                &kind,
-                Some(&namespace),
-                &name,
-                crate::datastore::ResourcePatchRequest::new(
-                    PatchKind::Merge,
-                    metadata_patch,
-                    ResourcePreconditions {
-                        uid: Some(resource.uid.clone()),
-                        resource_version: None,
-                    },
-                ),
-            )
-            .await?;
-    }
+    let target = StatusMutationTarget::namespaced(&api_version, &kind, &namespace, &name);
+    let pipeline = StatusMutationPipeline::new(
+        DatastoreStatusMutationWriter::new(state.clone()),
+        ApiSubresourceStatusMergePolicy::new(None),
+        LenientStatusResourceVersionPrecondition,
+        ResourceStatusResponder::new(true),
+    );
+    let outcome = pipeline
+        .execute(
+            &target,
+            &StatusPatchOperation::new(patch, content_type.map(str::to_string)),
+        )
+        .await?;
 
     // ResourceQuota: the /status PATCH may diverge Status.Hard from Spec.Hard.
     // Spawn an async reconcile so the controller re-syncs Status.Hard = Spec.Hard.
@@ -330,51 +189,14 @@ pub async fn patch_status_subresource(
         }
     }
 
-    let final_resource = state
-        .db
-        .get_resource(&api_version, &kind, Some(&namespace), &name)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "{} {}/{} disappeared after status patch",
-                kind, namespace, name
-            ))
-        })?;
-    let with_type_meta = ensure_type_meta(final_resource.data.clone(), &api_version, &kind);
-    let result =
-        crate::api::inject_resource_version(with_type_meta, final_resource.resource_version);
-    enqueue_post_status_reconcile(state.as_ref(), &api_version, &kind, &final_resource.data).await;
-    Ok(Json(result))
-}
-
-/// Compute a metadata merge-patch body limited to annotation/label deltas
-/// between the pre-patch and post-patch metadata. Returns `None` when nothing
-/// changed in either of those fields.
-fn build_status_metadata_patch_from_diff(
-    before: Option<&Value>,
-    after: Option<&Value>,
-) -> Option<Value> {
-    let after_obj = after?.as_object()?;
-    let mut patch_meta = serde_json::Map::new();
-    let before_annotations = before.and_then(|m| m.get("annotations"));
-    let after_annotations = after_obj.get("annotations");
-    if after_annotations != before_annotations
-        && let Some(v) = after_annotations
-    {
-        patch_meta.insert("annotations".to_string(), v.clone());
-    }
-    let before_labels = before.and_then(|m| m.get("labels"));
-    let after_labels = after_obj.get("labels");
-    if after_labels != before_labels
-        && let Some(v) = after_labels
-    {
-        patch_meta.insert("labels".to_string(), v.clone());
-    }
-    if patch_meta.is_empty() {
-        None
-    } else {
-        Some(serde_json::json!({"metadata": Value::Object(patch_meta)}))
-    }
+    enqueue_post_status_reconcile(
+        state.as_ref(),
+        &api_version,
+        &kind,
+        &outcome.final_resource.data,
+    )
+    .await;
+    Ok(Json(outcome.response))
 }
 
 // Generic cluster-scoped status helpers moved for cross-module re-use.
@@ -402,73 +224,19 @@ pub async fn update_cluster_status_subresource(
     name: String,
     body: Value,
 ) -> Result<Json<Value>, AppError> {
-    let existing_resource = state
-        .db
-        .get_resource(&api_version, &kind, None, &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind, name)))?;
-
-    let expected_rv = body
-        .pointer("/metadata/resourceVersion")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<i64>().ok());
-
-    let mut body_status = body.get("status").cloned().unwrap_or(Value::Null);
-    if api_version == "v1" && kind == "Node" {
-        preserve_node_extended_resources(existing_resource.data.get("status"), &mut body_status);
-    }
-    crate::datastore::status_merge_policy::merge_status_for_apply(
-        &api_version,
-        &kind,
-        existing_resource.data.as_ref(),
-        &mut body_status,
-        crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
-        crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
+    let target = StatusMutationTarget::cluster(&api_version, &kind, &name);
+    let pre_merge = (api_version == "v1" && kind == "Node")
+        .then_some(preserve_node_extended_resources as fn(Option<&Value>, &mut Value));
+    let pipeline = StatusMutationPipeline::new(
+        DatastoreStatusMutationWriter::new(state),
+        ApiSubresourceStatusMergePolicy::new(pre_merge),
+        LenientStatusResourceVersionPrecondition,
+        ResourceStatusResponder::new(false),
     );
-    state
-        .db
-        .update_status_only_with_preconditions(
-            &api_version,
-            &kind,
-            None,
-            &name,
-            body_status,
-            ResourcePreconditions {
-                uid: Some(existing_resource.uid.clone()),
-                resource_version: expected_rv,
-            },
-        )
+    let outcome = pipeline
+        .execute(&target, &StatusPutOperation::new(body))
         .await?;
-
-    if let Some(metadata_patch) = build_status_metadata_patch(body.get("metadata")) {
-        state
-            .db
-            .patch_resource_latest_with_preconditions(
-                &api_version,
-                &kind,
-                None,
-                &name,
-                crate::datastore::ResourcePatchRequest::new(
-                    PatchKind::Merge,
-                    metadata_patch,
-                    ResourcePreconditions {
-                        uid: Some(existing_resource.uid.clone()),
-                        resource_version: None,
-                    },
-                ),
-            )
-            .await?;
-    }
-
-    let final_resource = state
-        .db
-        .get_resource(&api_version, &kind, None, &name)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("{} {} disappeared after status update", kind, name))
-        })?;
-    let result = inject_resource_version(final_resource.data, final_resource.resource_version);
-    Ok(Json(result))
+    Ok(Json(outcome.response))
 }
 
 pub fn preserve_node_extended_resources(existing_status: Option<&Value>, new_status: &mut Value) {
@@ -604,81 +372,22 @@ pub async fn patch_cluster_status_subresource(
     patch: Value,
     content_type: Option<&str>,
 ) -> Result<Json<Value>, AppError> {
-    let resource = state
-        .db
-        .get_resource(&api_version, &kind, None, &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind, name)))?;
-
-    let patched = apply_patch(&resource.data, &patch, content_type)?;
-
-    // OCC: honor a CLIENT-SUPPLIED `metadata.resourceVersion` from the raw
-    // patch body (kubectl status PATCH with stale RV must 409). Unconditional
-    // when the client omitted it. Read from the patch body, not the merged
-    // result, so live-data RV is never mistaken for a client precondition.
-    let expected_rv = patch
-        .pointer("/metadata/resourceVersion")
-        .and_then(|value| value.as_str())
-        .and_then(|value| value.parse::<i64>().ok());
-
-    if let Some(new_status) = patched.get("status") {
-        let mut new_status = new_status.clone();
-        crate::datastore::status_merge_policy::merge_status_for_apply(
-            &api_version,
-            &kind,
-            resource.data.as_ref(),
-            &mut new_status,
-            crate::datastore::status_merge_policy::StatusApplyFreshness::Fresh,
-            crate::datastore::status_merge_policy::StatusApplyOrigin::ApiSubresource,
-        );
-        state
-            .db
-            .update_status_only_with_preconditions(
-                &api_version,
-                &kind,
-                None,
-                &name,
-                new_status,
-                ResourcePreconditions {
-                    uid: Some(resource.uid.clone()),
-                    resource_version: expected_rv,
-                },
-            )
-            .await?;
-    }
-
-    if let Some(metadata_patch) = build_status_metadata_patch_from_diff(
-        resource.data.get("metadata"),
-        patched.get("metadata"),
-    ) {
-        state
-            .db
-            .patch_resource_latest_with_preconditions(
-                &api_version,
-                &kind,
-                None,
-                &name,
-                crate::datastore::ResourcePatchRequest::new(
-                    PatchKind::Merge,
-                    metadata_patch,
-                    ResourcePreconditions {
-                        uid: Some(resource.uid.clone()),
-                        resource_version: None,
-                    },
-                ),
-            )
-            .await?;
-    }
-
-    let final_resource = state
-        .db
-        .get_resource(&api_version, &kind, None, &name)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("{} {} disappeared after status patch", kind, name))
-        })?;
-    let result = inject_resource_version(final_resource.data, final_resource.resource_version);
-    Ok(Json(result))
+    let target = StatusMutationTarget::cluster(&api_version, &kind, &name);
+    let pre_merge = (api_version == "v1" && kind == "Node")
+        .then_some(preserve_node_extended_resources as fn(Option<&Value>, &mut Value));
+    let pipeline = StatusMutationPipeline::new(
+        DatastoreStatusMutationWriter::new(state),
+        ApiSubresourceStatusMergePolicy::new(pre_merge),
+        LenientStatusResourceVersionPrecondition,
+        ResourceStatusResponder::new(false),
+    );
+    let outcome = pipeline
+        .execute(
+            &target,
+            &StatusPatchOperation::new(patch, content_type.map(str::to_string)),
+        )
+        .await?;
+    Ok(Json(outcome.response))
 }
 
 // Wrapper functions for specific resource types' status subresources

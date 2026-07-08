@@ -5077,6 +5077,137 @@ async fn test_list_rv_is_global_snapshot_so_watch_does_not_replay_deleted_object
     assert_eq!(event["type"], "ADDED");
 }
 
+/// A field-selected empty list for a just-deleted object is the handoff used by
+/// `kubectl delete --wait`: the client lists `metadata.name=<name>` and then
+/// watches from the returned list RV until it sees `DELETED`. If the list RV is
+/// equal to the retained delete event RV, the strictly-after watch replay skips
+/// the only terminal event and the client reconnects forever.
+#[tokio::test]
+async fn test_exact_name_empty_list_watch_handoff_replays_retained_delete() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let ns = "delete-wait-handoff";
+    let name = "wait-target";
+
+    let ns_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":ns}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+
+    let cm = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": name, "namespace": ns}
+    });
+    let create_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/namespaces/{ns}/configmaps"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&cm).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let delete_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/namespaces/{ns}/configmaps/{name}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+
+    let list_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/{ns}/configmaps?fieldSelector=metadata.name%3D{name}&limit=500"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let list: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    assert_eq!(
+        list.pointer("/items")
+            .and_then(|items| items.as_array())
+            .map(Vec::len),
+        Some(0),
+        "exact-name list must observe the object as gone"
+    );
+    let list_rv = list
+        .pointer("/metadata/resourceVersion")
+        .and_then(|rv| rv.as_str())
+        .expect("list must carry a resourceVersion");
+
+    let watch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/{ns}/configmaps?watch=true&resourceVersion={list_rv}&fieldSelector=metadata.name%3D{name}&allowWatchBookmarks=true&timeoutSeconds=1"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+
+    let mut stream = watch_resp.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("watch from exact-name empty-list RV should yield retained delete")
+        .expect("watch stream should yield a chunk")
+        .expect("watch chunk should be ok");
+    let event: serde_json::Value = serde_json::from_slice(&chunk).unwrap();
+    assert_eq!(
+        event["type"], "DELETED",
+        "exact-name list/watch handoff must deliver the terminal delete event, got {event:#?}"
+    );
+    assert_eq!(
+        event
+            .pointer("/object/metadata/name")
+            .and_then(|value| value.as_str()),
+        Some(name)
+    );
+}
+
 /// bug-grpc B1: a plain (selector-less) RV-less watch must not drop an event
 /// committed in the establishment window.
 ///
