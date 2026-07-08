@@ -7671,9 +7671,9 @@ async fn test_cluster_custom_resource_watch_skips_stale_backlog_event_when_rv_ze
     let mut stream = watch_resp.into_body().into_data_stream();
 
     // Simulate delayed/stale broadcast delivery from backlog.
-    db.broadcast_watch_event(crate::datastore::PendingWatchEvent {
-        event: crate::watch::WatchEvent::added(old_object.clone()),
-    });
+    db.broadcast_watch_event(crate::datastore::PendingWatchEvent::from_event(
+        crate::watch::WatchEvent::added(old_object.clone()),
+    ));
 
     let patch_fresh = app
         .clone()

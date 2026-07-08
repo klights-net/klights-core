@@ -1,13 +1,16 @@
 use serde_json::Value;
+use std::collections::HashMap;
 use tokio::sync::broadcast;
 
 #[cfg(test)]
-use crate::watch::WatchReceiver;
-use crate::watch::{WatchContentType, WatchEvent, WatchSignal, WatchTopic, encode_watch_payload};
+use super::hydrate_watch_event_data;
+#[cfg(test)]
+use crate::watch::{WatchContentType, WatchEvent, WatchReceiver, encode_watch_payload};
+use crate::watch::{WatchSignal, WatchTopic};
 
 use super::{
     CatchUpResource, Datastore, PendingWatchEvent, PodEndpointEvent, PodSlotAdmissionEvent,
-    Resource, hydrate_watch_event_data,
+    Resource,
 };
 
 /// Free function to publish a pending watch event after DB commit.
@@ -29,16 +32,20 @@ pub fn publish_pending_batch(
     pending: impl IntoIterator<Item = PendingWatchEvent>,
     bus: &crate::watch::WatchBus,
 ) {
+    let pending = pending.into_iter().collect::<Vec<_>>();
+
+    #[cfg(test)]
     let events = pending
-        .into_iter()
-        .map(|pending| pending.event)
+        .iter()
+        .map(|pending| pending.event.clone())
         .collect::<Vec<_>>();
 
+    #[cfg(test)]
     for event in &events {
         crate::datastore::diagnostics::log_watch_event_broadcast(event);
     }
 
-    for signal in WatchSignal::from_events(events.iter()) {
+    for signal in pending_watch_signals(&pending) {
         bus.publish_signal(signal);
     }
 
@@ -46,6 +53,48 @@ pub fn publish_pending_batch(
     for event in events {
         bus.publish(event);
     }
+}
+
+fn pending_watch_signals<I, P>(pending: I) -> Vec<WatchSignal>
+where
+    I: IntoIterator<Item = P>,
+    P: std::borrow::Borrow<PendingWatchEvent>,
+{
+    let mut grouped: HashMap<WatchTopic, HashMap<Option<String>, i64>> = HashMap::new();
+
+    for pending in pending {
+        let pending = pending.borrow();
+        if pending.resource_version <= 0 {
+            continue;
+        }
+        let topic = WatchTopic::new(&pending.api_version, &pending.kind);
+        let topic_advances = grouped.entry(topic).or_default();
+        let entry = topic_advances
+            .entry(pending.namespace.clone())
+            .or_insert(pending.resource_version);
+        *entry = (*entry).max(pending.resource_version);
+    }
+
+    let mut signals = Vec::new();
+    for (topic, namespace_rvs) in grouped {
+        let mut advances = namespace_rvs
+            .into_iter()
+            .map(|(namespace, high_rv)| crate::watch::WatchAdvance { namespace, high_rv })
+            .collect::<Vec<_>>();
+        advances.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+
+        for chunk in advances.chunks(crate::watch::DEFAULT_WATCH_ADVANCE_GROUP_LIMIT) {
+            signals.push(WatchSignal {
+                topic: topic.clone(),
+                advances: chunk.to_vec(),
+            });
+        }
+    }
+    signals.sort_by(|left, right| {
+        (left.topic.api_version(), left.topic.kind())
+            .cmp(&(right.topic.api_version(), right.topic.kind()))
+    });
+    signals
 }
 
 /// Map a DB-stored event_type string back to a `Cow<'static, str>` reusing
@@ -73,13 +122,28 @@ pub fn create_pending_watch_event(
     event_type: &str,
     data: impl Into<std::sync::Arc<Value>>,
 ) -> PendingWatchEvent {
-    let data = std::sync::Arc::unwrap_or_clone(data.into());
-    let mut event = WatchEvent::from_type(
-        event_type,
-        hydrate_watch_event_data(data, api_version, kind, namespace, name, resource_version),
-    );
-    event.encoded_payload = encode_watch_payload(&event, WatchContentType::Json).ok();
-    PendingWatchEvent { event }
+    #[cfg(not(test))]
+    {
+        let _ = (name, event_type, data);
+        PendingWatchEvent::from_signal_metadata(api_version, kind, namespace, resource_version)
+    }
+
+    #[cfg(test)]
+    {
+        let data = std::sync::Arc::unwrap_or_clone(data.into());
+        let mut event = WatchEvent::from_type(
+            event_type,
+            hydrate_watch_event_data(data, api_version, kind, namespace, name, resource_version),
+        );
+        event.encoded_payload = encode_watch_payload(&event, WatchContentType::Json).ok();
+        PendingWatchEvent {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            resource_version,
+            event,
+        }
+    }
 }
 
 impl Datastore {
@@ -542,6 +606,29 @@ mod tests {
             high_rv: 12,
         }));
         assert!(signal.advances.contains(&WatchAdvance {
+            namespace: Some("kube-system".to_string()),
+            high_rv: 11,
+        }));
+    }
+
+    #[test]
+    fn pending_watch_signals_are_grouped_from_pending_metadata() {
+        use crate::watch::WatchAdvance;
+
+        let signals = pending_watch_signals(vec![
+            PendingWatchEvent::from_signal_metadata("v1", "Pod", Some("default"), 10),
+            PendingWatchEvent::from_signal_metadata("v1", "Pod", Some("default"), 12),
+            PendingWatchEvent::from_signal_metadata("v1", "Pod", Some("kube-system"), 11),
+        ]);
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].topic, WatchTopic::new("v1", "Pod"));
+        assert_eq!(signals[0].advances.len(), 2);
+        assert!(signals[0].advances.contains(&WatchAdvance {
+            namespace: Some("default".to_string()),
+            high_rv: 12,
+        }));
+        assert!(signals[0].advances.contains(&WatchAdvance {
             namespace: Some("kube-system".to_string()),
             high_rv: 11,
         }));

@@ -880,7 +880,69 @@ pub enum PodEndpointEvent {
 /// any backend's mutation methods can stage events the same way.
 #[derive(Clone, Debug)]
 pub struct PendingWatchEvent {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace: Option<String>,
+    pub resource_version: i64,
+    #[cfg(test)]
     pub event: WatchEvent,
+}
+
+impl PendingWatchEvent {
+    pub fn from_signal_metadata(
+        api_version: impl Into<String>,
+        kind: impl Into<String>,
+        namespace: Option<&str>,
+        resource_version: i64,
+    ) -> Self {
+        let api_version = api_version.into();
+        let kind = kind.into();
+        let namespace = namespace.map(str::to_string);
+
+        Self {
+            #[cfg(test)]
+            event: WatchEvent::modified(serde_json::json!({
+                "apiVersion": api_version.clone(),
+                "kind": kind.clone(),
+                "metadata": {
+                    "namespace": namespace.clone(),
+                    "resourceVersion": resource_version.to_string()
+                }
+            })),
+            api_version,
+            kind,
+            namespace,
+            resource_version,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn from_event(event: WatchEvent) -> Self {
+        let object = event.object.as_ref();
+        let metadata = object.get("metadata").unwrap_or(&Value::Null);
+        Self {
+            api_version: object
+                .get("apiVersion")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            kind: object
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            namespace: metadata
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            resource_version: metadata
+                .get("resourceVersion")
+                .and_then(Value::as_str)
+                .and_then(|rv| rv.parse::<i64>().ok())
+                .unwrap_or_default(),
+            event,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -2817,8 +2817,8 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        db.broadcast_watch_event(crate::datastore::PendingWatchEvent {
-            event: crate::watch::WatchEvent::modified(serde_json::json!({
+        db.broadcast_watch_event(crate::datastore::PendingWatchEvent::from_event(
+            crate::watch::WatchEvent::modified(serde_json::json!({
                 "apiVersion": "v1",
                 "kind": "Pod",
                 "metadata": {
@@ -2833,7 +2833,7 @@ mod tests {
                 },
                 "status": {"phase": "Pending"}
             })),
-        });
+        ));
 
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), watch.message())
             .await

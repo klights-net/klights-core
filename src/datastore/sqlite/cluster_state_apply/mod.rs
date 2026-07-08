@@ -250,15 +250,15 @@ mod tests {
         assert!(effects.into_pending_watch_events().is_empty());
 
         let mut effects = ApplyEffects::new();
-        effects.push_watch_event(PendingWatchEvent {
-            event: WatchEvent::added(json!({"kind":"ConfigMap","metadata":{"name":"first"}})),
-        });
-        effects.push_watch_event(PendingWatchEvent {
-            event: WatchEvent::modified(json!({"kind":"ConfigMap","metadata":{"name":"second"}})),
-        });
-        effects.push_watch_event(PendingWatchEvent {
-            event: WatchEvent::deleted(json!({"kind":"ConfigMap","metadata":{"name":"third"}})),
-        });
+        effects.push_watch_event(PendingWatchEvent::from_event(WatchEvent::added(
+            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"first","resourceVersion":"1"}}),
+        )));
+        effects.push_watch_event(PendingWatchEvent::from_event(WatchEvent::modified(
+            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"second","resourceVersion":"2"}}),
+        )));
+        effects.push_watch_event(PendingWatchEvent::from_event(WatchEvent::deleted(
+            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"third","resourceVersion":"3"}}),
+        )));
 
         let events = effects.into_pending_watch_events();
         assert_eq!(events.len(), 3);

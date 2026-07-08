@@ -79,9 +79,11 @@ use filters::{
 };
 #[cfg(test)]
 use filters::{resolve_field_path, split_selector};
+#[cfg(test)]
+use resource_shape::hydrate_watch_event_data;
 use resource_shape::{
     ensure_metadata_create_defaults, ensure_metadata_identity, ensure_metadata_uid,
-    ensure_pod_status_ip_arrays, ensure_resource_type_meta, hydrate_watch_event_data, metadata_uid,
+    ensure_pod_status_ip_arrays, ensure_resource_type_meta, metadata_uid,
     preserve_server_metadata_fields_from_existing, resource_client_owned_state_equal,
     validate_metadata_uid_immutable, validate_resource_preconditions,
     warn_uid_precondition_mismatch,
