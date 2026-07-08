@@ -621,30 +621,10 @@ pub trait DatastoreBackend: Send + Sync {
     async fn list_all_watch_events_since_paged(
         &self,
         since_rv: i64,
-        _after_resource_version: i64,
+        after_resource_version: i64,
         after_id: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<(i64, CatchUpResource)>> {
-        // memory-improvement.md §10 P1: default fallback for backends that do
-        // not override this with a true keyset query (e.g. redb / replicated /
-        // worker adapters). It loads the full list and paginates in memory by
-        // position, preserving the pre-P1 behavior — correct, but without the
-        // peak-memory win. Production sqlite overrides this with a real
-        // keyset-paged SQL query.
-        let limit = limit.get();
-        let rows = self.list_all_watch_events_since(since_rv).await?;
-        let mut out: Vec<(i64, CatchUpResource)> = Vec::with_capacity(rows.len().min(limit));
-        for (idx, item) in rows.into_iter().enumerate() {
-            let id = (idx as i64) + 1;
-            if id > after_id {
-                out.push((id, item));
-                if out.len() >= limit {
-                    break;
-                }
-            }
-        }
-        Ok(out)
-    }
+    ) -> Result<Vec<(i64, CatchUpResource)>>;
 
     /// List deleted resource watch events after `since_rv` across all scopes.
     ///

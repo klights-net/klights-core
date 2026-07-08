@@ -338,6 +338,64 @@ impl RedbWatchStore {
         .await
     }
 
+    pub async fn watch_list_all_since_paged(
+        &self,
+        since_rv: i64,
+        after_resource_version: i64,
+        _after_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        self.db_call("watch_list_all_since_paged", move |db| {
+            let r = db.begin_read()?;
+            let tbl = r.open_table(tables::WATCH_EVENTS)?;
+            let limit = limit.get();
+            let mut result = Vec::with_capacity(limit);
+            let start = since_rv
+                .max(after_resource_version)
+                .saturating_add(1)
+                .max(0) as u64;
+            for e in tbl.range(start..)? {
+                let (rv_guard, event_ref) = e?;
+                let rv = rv_guard.value() as i64;
+                let body = event_ref.value().to_vec();
+                let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let ev_av = event
+                    .get("apiVersion")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let ev_kind = event.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                let ev_data = event.get("data").cloned().unwrap_or(Value::Null);
+                let ev_type = event
+                    .get("eventType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let ev_ns = event.get("namespace").and_then(|v| v.as_str());
+                let ev_name = event.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                result.push((
+                    rv,
+                    CatchUpResource {
+                        resource: Resource {
+                            id: 0,
+                            api_version: ev_av.to_string(),
+                            kind: ev_kind.to_string(),
+                            namespace: ev_ns.map(str::to_string),
+                            name: ev_name.to_string(),
+                            uid: Resource::uid_from_data(&ev_data),
+                            resource_version: rv,
+                            data: std::sync::Arc::new(ev_data),
+                        },
+                        event_type: std::borrow::Cow::Owned(ev_type.to_string()),
+                    },
+                ));
+                if result.len() >= limit {
+                    break;
+                }
+            }
+            Ok(result)
+        })
+        .await
+    }
+
     pub async fn modified_since(
         &self,
         av: &str,
@@ -641,6 +699,45 @@ mod tests {
         let results = s.watch_list_all_since(1).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].resource.name, "new");
+    }
+
+    #[tokio::test]
+    async fn watch_list_all_since_paged_keysets_across_resource_versions() {
+        let s = store();
+        for i in 1..=5 {
+            insert_watch_event(&s, i, "v1", "Pod", Some("ns"), &format!("p{i}"), "ADDED");
+        }
+        let limit = std::num::NonZeroUsize::new(2).unwrap();
+
+        let page1 = s.watch_list_all_since_paged(1, 0, 0, limit).await.unwrap();
+        assert_eq!(
+            page1
+                .iter()
+                .map(|(_, event)| event.resource.resource_version)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(
+            page1.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        let last = page1.last().unwrap();
+        let page2 = s
+            .watch_list_all_since_paged(1, last.1.resource.resource_version, last.0, limit)
+            .await
+            .unwrap();
+        assert_eq!(
+            page2
+                .iter()
+                .map(|(_, event)| event.resource.resource_version)
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert_eq!(
+            page2.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
     }
 
     #[tokio::test]

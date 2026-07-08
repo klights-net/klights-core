@@ -1098,6 +1098,16 @@ impl DatastoreBackend for WorkerStoreAdapter {
         Ok(Vec::new())
     }
 
+    async fn list_all_watch_events_since_paged(
+        &self,
+        _since_rv: i64,
+        _after_resource_version: i64,
+        _after_id: i64,
+        _limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        Ok(Vec::new())
+    }
+
     async fn list_deleted_watch_events_since(
         &self,
         _since_rv: i64,

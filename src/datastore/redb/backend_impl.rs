@@ -500,6 +500,17 @@ impl DatastoreBackend for RedbDatastore {
     async fn list_all_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {
         self.watch_store.watch_list_all_since(s).await
     }
+    async fn list_all_watch_events_since_paged(
+        &self,
+        s: i64,
+        after_resource_version: i64,
+        after_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        self.watch_store
+            .watch_list_all_since_paged(s, after_resource_version, after_id, limit)
+            .await
+    }
     async fn list_deleted_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {
         self.watch_store.watch_list_deleted_since(s).await
     }
