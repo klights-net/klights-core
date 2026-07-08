@@ -61,6 +61,7 @@ where
     replay_resume_rv: Option<i64>,
     seen_rvs: HashSet<i64>,
     seen_order: VecDeque<i64>,
+    non_advancing_seen_rvs: HashSet<i64>,
     low_rv_allowlist: HashMap<(Option<String>, String), i64>,
 }
 
@@ -89,6 +90,7 @@ where
             replay_resume_rv: None,
             seen_rvs: HashSet::new(),
             seen_order: VecDeque::new(),
+            non_advancing_seen_rvs: HashSet::new(),
             low_rv_allowlist: HashMap::new(),
         }
     }
@@ -102,7 +104,11 @@ where
     }
 
     pub fn mark_delivered(&mut self, rv: i64) {
-        self.record_seen(rv);
+        self.record_non_advancing_seen(rv);
+    }
+
+    pub fn mark_filtered(&mut self, rv: i64) {
+        self.record_non_advancing_seen(rv);
     }
 
     pub fn allow_low_rv_for_key(&mut self, namespace: Option<String>, name: String, after_rv: i64) {
@@ -180,7 +186,9 @@ where
                 }
             }
             if self.seen_rvs.contains(&rv) {
-                self.advance_processed_rv(rv);
+                if !self.non_advancing_seen_rvs.contains(&rv) {
+                    self.advance_processed_rv(rv);
+                }
                 continue;
             }
             if !self.event_matches(&event) {
@@ -239,9 +247,17 @@ where
     }
 
     fn advance_processed_rv(&mut self, rv: i64) {
+        self.non_advancing_seen_rvs.remove(&rv);
         self.record_seen(rv);
         if rv > self.accepted_rv {
             self.accepted_rv = rv;
+        }
+    }
+
+    fn record_non_advancing_seen(&mut self, rv: i64) {
+        self.record_seen(rv);
+        if rv > 0 {
+            self.non_advancing_seen_rvs.insert(rv);
         }
     }
 
@@ -254,6 +270,7 @@ where
             while self.seen_order.len() > RECENT_SIGNAL_SEEN_RV_CAPACITY {
                 if let Some(oldest) = self.seen_order.pop_front() {
                     self.seen_rvs.remove(&oldest);
+                    self.non_advancing_seen_rvs.remove(&oldest);
                 }
             }
         }

@@ -1117,7 +1117,12 @@ async fn list_cr_inner(
                 replay_source,
                 watch_topics,
                 delivery_scope,
-                initial_list_rv.max(requested_rv),
+                crate::api::watch_stream::selector_watch_cursor_floor(
+                    has_selector,
+                    requested_rv,
+                    initial_list_rv,
+                    last_delivered_scoped_rv,
+                ),
                 crate::watch::WindowPolicy::default_watch_delivery(),
             );
             for rv in baseline_delivered_rvs {
@@ -1221,11 +1226,15 @@ async fn list_cr_inner(
                             watch_ns.as_deref(),
                             parsed_label_selector.as_ref(),
                         ) && event.matches_field_selector(field_selector.as_deref());
+                        let event_rv = event.resource_version();
                         let Some(event) = apply_selector_transition_event(
                             event,
                             matches_selector,
                             &mut matched_selector_keys,
                         ) else {
+                            if let Some(rv) = event_rv {
+                                cursor.mark_filtered(rv);
+                            }
                             continue;
                         };
                         let delivered_rv = event.resource_version();

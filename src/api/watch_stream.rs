@@ -267,6 +267,19 @@ fn serialize_watch_catch_up_failure_status_line() -> Vec<u8> {
     )
 }
 
+pub(crate) fn selector_watch_cursor_floor(
+    has_selector: bool,
+    requested_rv: i64,
+    catch_up_frontier_rv: i64,
+    delivered_scoped_rv: i64,
+) -> i64 {
+    if has_selector {
+        requested_rv.max(delivered_scoped_rv)
+    } else {
+        requested_rv.max(catch_up_frontier_rv)
+    }
+}
+
 pub async fn spawn_bookmark_tick_stream(
     task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     task_name: impl Into<String>,
@@ -955,7 +968,12 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             replay_source,
             topic,
             delivery_scope,
-            initial_list_rv.max(requested_rv),
+            selector_watch_cursor_floor(
+                has_selector,
+                requested_rv,
+                initial_list_rv,
+                last_delivered_scoped_rv,
+            ),
             WindowPolicy::default_watch_delivery(),
         );
         for rv in baseline_delivered_rvs {
@@ -1056,6 +1074,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         )
                         .then(|| watch_event_key(&event))
                         .flatten();
+                        let event_rv = event.resource_version();
                         if let Some(transitioned) = apply_selector_transition_event(
                             event,
                             matches,
@@ -1090,6 +1109,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                                 cursor.accept_event(rv);
                                 last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
                             }
+                        } else if let Some(rv) = event_rv {
+                            cursor.mark_filtered(rv);
                         }
                     } else if event.matches_filter_parsed(&kind, watch_namespace.as_deref(), parsed_label_selector.as_ref())
                         && event.matches_field_selector(field_selector.as_deref()) {
@@ -1198,6 +1219,25 @@ mod tests {
         }
         let watch_event = event.into_watch_event();
         assert_eq!(watch_event.event_type, EventType::Added);
+    }
+
+    #[test]
+    fn selector_watch_cursor_floor_uses_delivered_scoped_rv() {
+        assert_eq!(
+            selector_watch_cursor_floor(true, 10, 50, 14),
+            14,
+            "selector watches must not let unrelated catch-up churn inflate the live replay floor"
+        );
+        assert_eq!(
+            selector_watch_cursor_floor(true, 10, 50, 0),
+            10,
+            "when no scoped event was delivered, selector watches resume from the client RV"
+        );
+        assert_eq!(
+            selector_watch_cursor_floor(false, 10, 50, 14),
+            50,
+            "selector-free watches keep the complete catch-up frontier"
+        );
     }
 
     #[test]

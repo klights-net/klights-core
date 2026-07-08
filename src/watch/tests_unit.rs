@@ -221,6 +221,28 @@ impl SignalCursorReplaySource {
     }
 }
 
+#[derive(Clone)]
+struct MutableSignalCursorReplaySource {
+    events: std::sync::Arc<std::sync::Mutex<Vec<WatchEvent>>>,
+    calls: std::sync::Arc<std::sync::Mutex<Vec<(i64, usize)>>>,
+}
+
+impl MutableSignalCursorReplaySource {
+    fn new(events: Vec<WatchEvent>) -> Self {
+        Self {
+            events: std::sync::Arc::new(std::sync::Mutex::new(events)),
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn push(&self, event: WatchEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+}
+
 #[async_trait::async_trait]
 impl WatchReplaySource for SignalCursorReplaySource {
     async fn replay_since(&self, since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
@@ -246,6 +268,44 @@ impl WatchReplaySource for SignalCursorReplaySource {
         }
         Ok(crate::datastore::WatchReplayRead::Events(
             self.events
+                .iter()
+                .filter(|event| event.resource_version().unwrap_or_default() > since_rv)
+                .take(limit.get())
+                .cloned()
+                .collect(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl WatchReplaySource for MutableSignalCursorReplaySource {
+    async fn replay_since(&self, since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(events
+            .iter()
+            .filter(|event| event.resource_version().unwrap_or_default() > since_rv)
+            .cloned()
+            .collect())
+    }
+
+    async fn replay_since_checked(
+        &self,
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<crate::datastore::WatchReplayRead<WatchEvent>> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((since_rv, limit.get()));
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(crate::datastore::WatchReplayRead::Events(
+            events
                 .iter()
                 .filter(|event| event.resource_version().unwrap_or_default() > since_rv)
                 .take(limit.get())
@@ -391,6 +451,41 @@ async fn signal_cursor_skipped_out_of_scope_event_advances_replay_safe_frontier(
     cursor.accept_event(12);
     assert_eq!(cursor.accepted_rv(), 12);
     assert_eq!(source.calls(), vec![(10, 3)]);
+}
+
+#[tokio::test]
+async fn signal_cursor_filtered_event_does_not_advance_past_late_lower_rv() {
+    let (tx, rx) = broadcast::channel(4);
+    let source =
+        MutableSignalCursorReplaySource::new(vec![signal_cursor_pod("default", "unmatched", 50)]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
+    let filtered = cursor.next_event().await.unwrap();
+    assert_eq!(filtered.resource_version(), Some(50));
+    cursor.mark_filtered(50);
+    assert_eq!(
+        cursor.accepted_rv(),
+        10,
+        "selector-filtered events suppress duplicates without proving lower RVs are visible"
+    );
+
+    source.push(signal_cursor_pod("default", "frontend", 14));
+    tx.send(signal_cursor_signal(Some("default"), 14)).unwrap();
+    let delivered = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
+        .await
+        .expect("lower matching event must not be hidden by the filtered high-RV event")
+        .unwrap();
+
+    assert_eq!(delivered.resource_version(), Some(14));
+    assert_eq!(delivered.object["metadata"]["name"], "frontend");
 }
 
 #[tokio::test]
