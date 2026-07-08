@@ -7,6 +7,7 @@ pub enum TaskCategory {
     Background,
     File,
     Db,
+    DbRead,
     Timer,
     /// Networking-owned long-running work (rtnetlink connection drivers,
     /// service-routing coalescer worker, future rootless sidecars).
@@ -30,11 +31,12 @@ pub enum TaskCategory {
 }
 
 impl TaskCategory {
-    pub const fn all() -> [Self; 10] {
+    pub const fn all() -> [Self; 11] {
         [
             Self::Background,
             Self::File,
             Self::Db,
+            Self::DbRead,
             Self::Timer,
             Self::Network,
             Self::PodDeleteWorkqueue,
@@ -51,6 +53,7 @@ pub struct TaskCategoryConfig {
     pub background: usize,
     pub file: usize,
     pub db: usize,
+    pub db_read: usize,
     pub timer: usize,
     pub network: usize,
     pub pod_delete_workqueue: usize,
@@ -66,6 +69,7 @@ impl Default for TaskCategoryConfig {
             background: 0,
             file: 3,
             db: 1,
+            db_read: 1,
             timer: 0,
             network: 256,
             pod_delete_workqueue: 10,
@@ -83,6 +87,7 @@ impl TaskCategoryConfig {
             TaskCategory::Background => self.background,
             TaskCategory::File => self.file,
             TaskCategory::Db => self.db,
+            TaskCategory::DbRead => self.db_read,
             TaskCategory::Timer => self.timer,
             TaskCategory::Network => self.network,
             TaskCategory::PodDeleteWorkqueue => self.pod_delete_workqueue,
@@ -98,6 +103,7 @@ impl TaskCategoryConfig {
         cfg.background = parse_limit("KLIGHTS_TASK_BACKGROUND", cfg.background)?;
         cfg.file = parse_limit("KLIGHTS_TASK_FILE", cfg.file)?;
         cfg.db = parse_limit("KLIGHTS_TASK_DB", cfg.db)?;
+        cfg.db_read = parse_limit("KLIGHTS_TASK_DB_READ", cfg.db_read)?;
         cfg.timer = parse_limit("KLIGHTS_TASK_TIMER", cfg.timer)?;
         cfg.network = parse_limit("KLIGHTS_TASK_NETWORK", cfg.network)?;
         cfg.pod_delete_workqueue = parse_limit(

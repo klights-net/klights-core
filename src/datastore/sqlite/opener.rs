@@ -202,6 +202,52 @@ pub fn apply_pragmas(conn: &rusqlite::Connection, profile: PragmaProfile) -> rus
     conn.execute_batch(&batch)
 }
 
+/// Apply connection-local settings for a read-only datastore connection.
+///
+/// The write connection owns persistent PRAGMAs, schema initialization, and
+/// fingerprint creation. Read connections stay query-only and only apply
+/// connection-scoped tuning that does not mutate the database file.
+pub fn apply_read_pragmas(
+    conn: &rusqlite::Connection,
+    profile: PragmaProfile,
+) -> rusqlite::Result<()> {
+    if matches!(profile, PragmaProfile::Encrypted) {
+        #[cfg(not(feature = "sqlcipher"))]
+        {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                Some("Encrypted profile requires sqlcipher cargo feature".into()),
+            ));
+        }
+    }
+
+    let mmap_val: String = if matches!(profile, PragmaProfile::Encrypted) {
+        "0".to_string()
+    } else {
+        queries::PRAGMA_VALUE_MMAP_SIZE.to_string()
+    };
+
+    let batch = format!(
+        "PRAGMA query_only = ON; \
+         PRAGMA {cs} = {cs_v}; \
+         PRAGMA {ts} = {ts_v}; \
+         PRAGMA {mm} = {mm_v}; \
+         PRAGMA {fk} = {fk_v}; \
+         PRAGMA {bt} = {bt_v};",
+        cs = queries::PRAGMA_CACHE_SIZE,
+        cs_v = queries::PRAGMA_VALUE_CACHE_SIZE,
+        ts = queries::PRAGMA_TEMP_STORE,
+        ts_v = queries::PRAGMA_VALUE_TEMP_STORE_MEMORY,
+        mm = queries::PRAGMA_MMAP_SIZE,
+        mm_v = mmap_val,
+        fk = queries::PRAGMA_FOREIGN_KEYS,
+        fk_v = queries::PRAGMA_VALUE_FOREIGN_KEYS_ON,
+        bt = queries::PRAGMA_BUSY_TIMEOUT,
+        bt_v = queries::PRAGMA_VALUE_BUSY_TIMEOUT_MS,
+    );
+    conn.execute_batch(&batch)
+}
+
 /// Ensure the parent directory exists with `0700` and chmod the DB file
 /// (and its WAL/SHM siblings, when present) to `0600`.
 ///

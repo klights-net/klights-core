@@ -90,7 +90,7 @@ impl Datastore {
         let n = snapshot_rv;
 
         let raw = self
-            .db_call("snapshot_resources_at_rv", move |conn| {
+            .read_db_call("snapshot_resources_at_rv", move |conn| {
                 let tx = conn.transaction()?;
 
                 let current_rv = Self::current_resource_version_in_tx(&tx)?;

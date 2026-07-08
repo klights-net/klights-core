@@ -94,7 +94,7 @@ impl Datastore {
     pub async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
         let name_owned = name.to_string();
         let result = self
-            .db_call("db_query", move |conn| {
+            .read_db_call("db_query", move |conn| {
                 let mut stmt = conn.prepare(queries::NAMESPACE_GET)?;
                 let row = stmt.query_row([&name_owned], |row| {
                     let data_bytes: Vec<u8> = row.get(3)?;
@@ -136,7 +136,7 @@ impl Datastore {
             .map_err(|e| anyhow!("Invalid label selector: {e}"))?;
         let field_selector_owned = field_selector.map(str::to_string);
 
-        self.db_call("db_query", move |conn| {
+        self.read_db_call("db_query", move |conn| {
             let mut query = queries::NAMESPACES_LIST_HEAD.to_string();
             let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -431,7 +431,7 @@ impl Datastore {
             ),
         };
         let rows = self
-            .db_call("db_query", move |conn| {
+            .read_db_call("db_query", move |conn| {
                 let mut stmt = conn.prepare(sql)?;
                 let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Resource> {
                     let data_bytes: Vec<u8> = row.get(7)?;
@@ -472,7 +472,7 @@ impl Datastore {
     pub async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
         let ns = namespace.to_string();
         let count = self
-            .db_call("db_query", move |conn| {
+            .read_db_call("db_query", move |conn| {
                 let n: i64 = conn.query_row(
                     queries::NAMESPACE_RESOURCES_COUNT,
                     rusqlite::params![&ns],

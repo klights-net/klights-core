@@ -88,6 +88,7 @@ fn parse_category(raw: &str) -> Result<TaskCategory, AppError> {
         "background" => Ok(TaskCategory::Background),
         "file" => Ok(TaskCategory::File),
         "db" => Ok(TaskCategory::Db),
+        "db-read" => Ok(TaskCategory::DbRead),
         "timer" => Ok(TaskCategory::Timer),
         "network" => Ok(TaskCategory::Network),
         "pod-delete-workqueue" => Ok(TaskCategory::PodDeleteWorkqueue),

@@ -22,7 +22,7 @@ impl Datastore {
         let mut items = Vec::new();
 
         let namespaced = self
-            .db_call("db_query", {
+            .read_db_call("db_query", {
                 let namespace = namespace_owned.clone();
                 let uid = owner_uid.clone();
                 move |conn| {
@@ -67,7 +67,7 @@ impl Datastore {
         if namespace_owned.is_none() {
             let uid = owner_uid.clone();
             let cluster = self
-                .db_call("db_query", move |conn| {
+                .read_db_call("db_query", move |conn| {
                     let mut stmt = conn.prepare(queries::OWNERSHIP_INDEXED_CLUSTER_BY_UID)?;
                     let rows = stmt.query_map([&uid], |row| {
                         let data_bytes: Vec<u8> = row.get(6)?;
@@ -133,7 +133,7 @@ impl Datastore {
         let owner_uid_for_filter = owner_uid.clone();
 
         let rows = self
-            .db_call("db_query", move |conn| {
+            .read_db_call("db_query", move |conn| {
                 let items = match namespace_owned.as_deref() {
                     Some(ns) => {
                         let mut stmt =
@@ -237,7 +237,7 @@ impl Datastore {
         let owner_kind_for_filter = owner_kind.clone();
 
         let namespaced = self
-            .db_call("db_query", {
+            .read_db_call("db_query", {
                 let namespace = namespace_owned.clone();
                 let owner_api_version = owner_api_version.clone();
                 let owner_name = owner_name.clone();

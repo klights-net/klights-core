@@ -352,6 +352,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watermarked_stale_pod_metadata_duplicate_consumes_stream_without_overwriting_live_labels()
+     {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "adopted-pod",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "adopted-pod",
+                        "uid": "pod-uid",
+                        "labels": {"name": "matching-name"},
+                        "ownerReferences": [{
+                            "apiVersion": "apps/v1",
+                            "kind": "ReplicaSet",
+                            "name": "adopter",
+                            "uid": "rs-uid",
+                            "controller": true,
+                            "blockOwnerDeletion": true
+                        }]
+                    },
+                    "spec": {"nodeName": "worker-a"},
+                    "status": {"phase": "Running"}
+                }),
+            )
+            .await
+            .expect("seed adopted Pod");
+
+        let mut relabeled = (*created.data).clone();
+        relabeled["metadata"]["labels"] = json!({"name": "not-matching-name"});
+        db.update_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "adopted-pod",
+            relabeled,
+            created.resource_version,
+        )
+        .await
+        .expect("relabel Pod before stale duplicate adoption reaches leader");
+
+        let first_watermark = crate::log_apply::OutboxStreamWatermark {
+            client_id: "worker-client".to_string(),
+            stream_id: 84,
+            stream_seq: 1,
+        };
+        let first = propose_outbox_on_backend_with_watermark(
+            &db,
+            "stale-duplicate-adoption",
+            OutboxOperation::PodMetadata,
+            outbox_payload(StorageCommand::UpdateResource {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "adopted-pod".to_string(),
+                data: (*created.data).clone(),
+                expected_rv: created.resource_version,
+                preconditions: ResourcePreconditions {
+                    uid: Some("pod-uid".to_string()),
+                    resource_version: Some(created.resource_version),
+                },
+            }),
+            "worker-a",
+            Some(first_watermark.clone()),
+        )
+        .await
+        .expect("stale duplicate PodMetadata must consume its stream watermark");
+
+        assert!(matches!(first.result, OutboxApplyResult::Applied { .. }));
+        let live = db
+            .get_resource("v1", "Pod", Some("default"), "adopted-pod")
+            .await
+            .unwrap()
+            .expect("live Pod remains");
+        assert_eq!(
+            live.data.pointer("/metadata/labels/name"),
+            Some(&json!("not-matching-name")),
+            "stale duplicate metadata must not overwrite the live relabel"
+        );
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![first_watermark]
+        );
+
+        propose_outbox_on_backend_with_watermark(
+            &db,
+            "next-after-stale-duplicate-adoption",
+            OutboxOperation::PodMetadata,
+            outbox_payload(StorageCommand::CreateNamespace {
+                name: "after-stale-podmetadata".to_string(),
+                data: json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {"name": "after-stale-podmetadata"}
+                }),
+            }),
+            "worker-a",
+            Some(crate::log_apply::OutboxStreamWatermark {
+                client_id: "worker-client".to_string(),
+                stream_id: 84,
+                stream_seq: 2,
+            }),
+        )
+        .await
+        .expect("next stream entry must not wedge behind stale PodMetadata");
+
+        assert!(
+            db.get_namespace("after-stale-podmetadata")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn watermarked_stale_pod_metadata_release_clears_ownerrefs_without_overwriting_live_metadata()
+     {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "release-pod",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "release-pod",
+                        "uid": "release-pod-uid",
+                        "labels": {"name": "matching-name"},
+                        "ownerReferences": [{
+                            "apiVersion": "apps/v1",
+                            "kind": "ReplicaSet",
+                            "name": "adopter",
+                            "uid": "rs-uid",
+                            "controller": true,
+                            "blockOwnerDeletion": true
+                        }]
+                    },
+                    "spec": {"nodeName": "worker-a"},
+                    "status": {"phase": "Running"}
+                }),
+            )
+            .await
+            .expect("seed adopted Pod");
+
+        let mut relabeled = (*created.data).clone();
+        relabeled["metadata"]["labels"] = json!({"name": "not-matching-name"});
+        let relabeled = db
+            .update_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "release-pod",
+                relabeled,
+                created.resource_version,
+            )
+            .await
+            .expect("relabel adopted Pod");
+
+        let mut live_with_annotation = (*relabeled.data).clone();
+        live_with_annotation["metadata"]["annotations"] = json!({"live": "preserve"});
+        db.update_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "release-pod",
+            live_with_annotation,
+            relabeled.resource_version,
+        )
+        .await
+        .expect("advance live metadata before release reaches leader");
+
+        let mut release = (*relabeled.data).clone();
+        release["metadata"]["ownerReferences"] = json!([]);
+        propose_outbox_on_backend_with_watermark(
+            &db,
+            "stale-ownerref-release",
+            OutboxOperation::PodMetadata,
+            outbox_payload(StorageCommand::UpdateResource {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "release-pod".to_string(),
+                data: release,
+                expected_rv: relabeled.resource_version,
+                preconditions: ResourcePreconditions {
+                    uid: Some("release-pod-uid".to_string()),
+                    resource_version: Some(relabeled.resource_version),
+                },
+            }),
+            "worker-a",
+            Some(crate::log_apply::OutboxStreamWatermark {
+                client_id: "worker-client".to_string(),
+                stream_id: 85,
+                stream_seq: 1,
+            }),
+        )
+        .await
+        .expect("stale ownerReferences release must apply against the live Pod");
+
+        let live = db
+            .get_resource("v1", "Pod", Some("default"), "release-pod")
+            .await
+            .unwrap()
+            .expect("live Pod remains");
+        assert_eq!(
+            live.data.pointer("/metadata/ownerReferences"),
+            Some(&json!([])),
+            "release must clear ownerReferences"
+        );
+        assert_eq!(
+            live.data.pointer("/metadata/labels/name"),
+            Some(&json!("not-matching-name")),
+            "release must preserve the relabel that made the Pod no longer match"
+        );
+        assert_eq!(
+            live.data.pointer("/metadata/annotations/live"),
+            Some(&json!("preserve")),
+            "release must preserve newer live metadata"
+        );
+    }
+
+    #[tokio::test]
     async fn watermarked_terminal_event_create_conflict_advances_stream() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_namespace(

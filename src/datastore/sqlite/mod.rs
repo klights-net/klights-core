@@ -100,6 +100,7 @@ const APPLIED_OUTBOX_PLACEHOLDER_RECOVERY_TTL_MS: i64 = 60_000;
 #[derive(Clone)]
 pub struct Datastore {
     executor: DbExecutor,
+    read_executor: DbExecutor,
     node_local: crate::datastore::node_local::SqliteNodeLocalDb,
     watch_bus: std::sync::Arc<WatchBus>,
     pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
@@ -289,6 +290,41 @@ impl Datastore {
                 let live: Value =
                     serde_json::from_slice(&live_data).map_err(serde_to_sqlite_error)?;
                 let mut effective_preconditions = preconditions.clone();
+                let mut pod_metadata_rebased_against_latest = false;
+                if !apply_against_latest
+                    && operation
+                        == crate::kubelet::outbox::payload::OutboxOperation::PodMetadata.as_str()
+                    && api_version == "v1"
+                    && kind == "Pod"
+                    && let Some(expected) = effective_preconditions
+                        .resource_version
+                        .or_else(|| (expected_rv > 0).then_some(expected_rv))
+                    && expected != live_rv
+                    && let Some(base) = Self::resource_snapshot_for_key_at_rv_in_tx(
+                        tx,
+                        &api_version,
+                        &kind,
+                        namespace.as_deref(),
+                        &name,
+                        expected,
+                    )?
+                    && metadata_uid(&base) == Some(live_uid.as_str())
+                {
+                    let uid_preconditions = ResourcePreconditions {
+                        uid: preconditions.uid.clone(),
+                        resource_version: None,
+                    };
+                    validate_resource_preconditions(&uid_preconditions, Some(&live_uid), live_rv)
+                        .map_err(Self::sqlite_conversion_error)?;
+                    if let Some(rebased) =
+                        Self::rebase_stale_pod_metadata_update(&base, &data, &live)
+                    {
+                        data = rebased;
+                        pod_metadata_rebased_against_latest = true;
+                    } else {
+                        return Ok((LogApplyCommit::new(rv, Vec::new()), rv));
+                    }
+                }
                 if apply_against_latest {
                     let uid_preconditions = ResourcePreconditions {
                         uid: preconditions.uid.clone(),
@@ -304,7 +340,7 @@ impl Datastore {
                     {
                         Self::merge_forwarded_lease_with_live(&live, &mut data);
                     }
-                } else {
+                } else if !pod_metadata_rebased_against_latest {
                     effective_preconditions.resource_version = preconditions
                         .resource_version
                         .or_else(|| (expected_rv > 0).then_some(expected_rv));
@@ -345,11 +381,12 @@ impl Datastore {
                 );
                 preserve_server_metadata_fields_from_existing(&mut data, &live);
                 let uid = ensure_metadata_uid(&mut data);
-                let precondition_resource_version = if apply_against_latest {
-                    None
-                } else {
-                    effective_preconditions.resource_version
-                };
+                let precondition_resource_version =
+                    if apply_against_latest || pod_metadata_rebased_against_latest {
+                        None
+                    } else {
+                        effective_preconditions.resource_version
+                    };
                 LogApplyCommit::from_cluster_mutations(
                     rv,
                     vec![ClusterMutation::Resource(ResourceMutation::PutResource(
@@ -1087,6 +1124,18 @@ impl Datastore {
         self.executor.call_raw(query_name, f).await
     }
 
+    pub async fn read_db_call<T, F>(
+        &self,
+        query_name: &'static str,
+        f: F,
+    ) -> tokio_rusqlite::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+    {
+        self.read_executor.call_raw(query_name, f).await
+    }
+
     pub async fn node_db_call<T, F>(
         &self,
         query_name: &'static str,
@@ -1104,7 +1153,7 @@ impl Datastore {
         idempotency_key: &str,
     ) -> Result<Option<AppliedOutboxRecord>> {
         let idempotency_key = idempotency_key.to_string();
-        self.db_call("db_applied_outbox_get", move |conn| {
+        self.read_db_call("db_applied_outbox_get", move |conn| {
             conn.query_row(queries::APPLIED_OUTBOX_GET, [idempotency_key], |row| {
                 Ok(AppliedOutboxRecord {
                     idempotency_key: row.get(0)?,
@@ -1146,7 +1195,7 @@ impl Datastore {
     pub async fn list_outbox_stream_watermarks(
         &self,
     ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
-        self.db_call("db_outbox_stream_watermarks_list_all", move |conn| {
+        self.read_db_call("db_outbox_stream_watermarks_list_all", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT client_id, stream_id, last_seq FROM outbox_stream_watermarks \
                  ORDER BY client_id ASC, stream_id ASC",
@@ -1165,7 +1214,7 @@ impl Datastore {
     }
 
     pub async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
-        self.db_call("db_applied_outbox_list_all", move |conn| {
+        self.read_db_call("db_applied_outbox_list_all", move |conn| {
             let rows = conn
                 .prepare(queries::APPLIED_OUTBOX_LIST_ALL)?
                 .query_map([], |row| {
@@ -1199,7 +1248,7 @@ impl Datastore {
     ) -> Result<Vec<AppliedOutboxRecord>> {
         let after = after_key.unwrap_or("").to_string();
         let limit_i64 = limit.get() as i64;
-        self.db_call("db_applied_outbox_list_all_paged", move |conn| {
+        self.read_db_call("db_applied_outbox_list_all_paged", move |conn| {
             let rows = conn
                 .prepare(queries::APPLIED_OUTBOX_LIST_ALL_PAGED)?
                 .query_map(rusqlite::params![after, limit_i64], |row| {
@@ -1322,7 +1371,7 @@ impl Datastore {
         node_name: &str,
     ) -> Result<Vec<PodCleanupIntent>> {
         let node_name = node_name.to_string();
-        self.db_call("db_list_pod_cleanup_intents_for_node", move |conn| {
+        self.read_db_call("db_list_pod_cleanup_intents_for_node", move |conn| {
             let rows = conn
                 .prepare(queries::POD_CLEANUP_INTENT_LIST_BY_NODE)?
                 .query_map([node_name], |row| {
@@ -1930,6 +1979,118 @@ impl Datastore {
             .map_err(crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error)
     }
 
+    fn rebase_stale_pod_metadata_update(
+        base: &Value,
+        incoming: &Value,
+        live: &Value,
+    ) -> Option<Value> {
+        let mut rebased = live.clone();
+        let mut changed = false;
+
+        changed |=
+            Self::apply_metadata_field_delta(&mut rebased, base, incoming, "ownerReferences");
+        changed |= Self::apply_metadata_map_delta(&mut rebased, base, incoming, "labels");
+        changed |= Self::apply_metadata_map_delta(&mut rebased, base, incoming, "annotations");
+        changed |=
+            Self::apply_metadata_field_delta(&mut rebased, base, incoming, "deletionTimestamp");
+        changed |= Self::apply_metadata_field_delta(
+            &mut rebased,
+            base,
+            incoming,
+            "deletionGracePeriodSeconds",
+        );
+
+        changed.then_some(rebased)
+    }
+
+    fn metadata_field<'a>(data: &'a Value, field: &str) -> Option<&'a Value> {
+        data.get("metadata")
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get(field))
+    }
+
+    fn metadata_object_mut(
+        data: &mut Value,
+    ) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+        let object = data.as_object_mut()?;
+        let metadata = object
+            .entry("metadata".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        metadata.as_object_mut()
+    }
+
+    fn apply_metadata_field_delta(
+        rebased: &mut Value,
+        base: &Value,
+        incoming: &Value,
+        field: &str,
+    ) -> bool {
+        let base_value = Self::metadata_field(base, field);
+        let incoming_value = Self::metadata_field(incoming, field);
+        if base_value == incoming_value {
+            return false;
+        }
+        let Some(metadata) = Self::metadata_object_mut(rebased) else {
+            return false;
+        };
+        match incoming_value {
+            Some(value) => {
+                if metadata.get(field) == Some(value) {
+                    false
+                } else {
+                    metadata.insert(field.to_string(), value.clone());
+                    true
+                }
+            }
+            None => metadata.remove(field).is_some(),
+        }
+    }
+
+    fn apply_metadata_map_delta(
+        rebased: &mut Value,
+        base: &Value,
+        incoming: &Value,
+        field: &str,
+    ) -> bool {
+        let base_value = Self::metadata_field(base, field);
+        let incoming_value = Self::metadata_field(incoming, field);
+        if base_value == incoming_value {
+            return false;
+        }
+        let Some(base_map) = base_value.and_then(Value::as_object) else {
+            return Self::apply_metadata_field_delta(rebased, base, incoming, field);
+        };
+        let Some(incoming_map) = incoming_value.and_then(Value::as_object) else {
+            return Self::apply_metadata_field_delta(rebased, base, incoming, field);
+        };
+        let Some(metadata) = Self::metadata_object_mut(rebased) else {
+            return false;
+        };
+        let entries = metadata
+            .entry(field.to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !entries.is_object() {
+            *entries = serde_json::json!({});
+        }
+        let Some(entries) = entries.as_object_mut() else {
+            return false;
+        };
+
+        let mut changed = false;
+        for key in base_map.keys() {
+            if !incoming_map.contains_key(key) {
+                changed |= entries.remove(key).is_some();
+            }
+        }
+        for (key, value) in incoming_map {
+            if base_map.get(key) != Some(value) && entries.get(key) != Some(value) {
+                entries.insert(key.clone(), value.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn should_apply_outbox_patch_against_latest(
         api_version: &str,
         kind: &str,
@@ -2426,6 +2587,7 @@ impl Datastore {
     /// Shared constructor body called by every public constructor.
     async fn from_executors(
         executor: DbExecutor,
+        read_executor: DbExecutor,
         node_local: crate::datastore::node_local::SqliteNodeLocalDb,
     ) -> Result<Self> {
         let (pod_endpoint_tx, _) = broadcast::channel(POD_ENDPOINT_CHANNEL_BOUND);
@@ -2433,6 +2595,7 @@ impl Datastore {
         // Schema + fingerprint already applied inside DbExecutor::open_with_opts.
         let ds = Self {
             executor,
+            read_executor,
             node_local,
             watch_bus: std::sync::Arc::new(WatchBus::new(1024)),
             pod_endpoint_tx,
@@ -2464,6 +2627,7 @@ impl Datastore {
     }
 
     async fn from_executor(executor: DbExecutor) -> Result<Self> {
+        let read_executor = executor.read_lane_clone();
         let node_local = Self::open_node_local_sqlite(
             None,
             executor.task_supervisor(),
@@ -2471,7 +2635,7 @@ impl Datastore {
             "sqlite:node-local-memory",
         )
         .await?;
-        Self::from_executors(executor, node_local).await
+        Self::from_executors(executor, read_executor, node_local).await
     }
 
     /// Production constructor — open a persistent on-disk database.
@@ -2504,6 +2668,20 @@ impl Datastore {
                     e
                 )
             })?;
+        let read_opts = opener::OpenOpts::disk(db_path.clone()).with_key_file(key_file)?;
+        let read_executor = DbExecutor::open_read_only_with_opts(
+            read_opts,
+            supervisor.clone(),
+            "sqlite:cluster-read",
+        )
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "failed to open read-only cluster datastore at {}: {}",
+                db_path.display(),
+                e
+            )
+        })?;
         let node_local = Self::open_node_local_sqlite(
             Some(node_db_path),
             supervisor,
@@ -2518,7 +2696,7 @@ impl Datastore {
                 e
             )
         })?;
-        let ds = Self::from_executors(executor, node_local).await?;
+        let ds = Self::from_executors(executor, read_executor, node_local).await?;
 
         // Log DB size at startup for operator triage (DSB-05).
         let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -2562,10 +2740,11 @@ impl Datastore {
         ));
         let executor =
             DbExecutor::open_in_memory(supervisor.clone(), "sqlite:memory:cluster").await?;
+        let read_executor = executor.read_lane_clone();
         let node_local =
             Self::open_node_local_sqlite(None, supervisor, None, "sqlite:node-local-memory")
                 .await?;
-        Self::from_executors(executor, node_local).await
+        Self::from_executors(executor, read_executor, node_local).await
     }
 
     /// Shared production + test constructor when an externally-created
@@ -3373,7 +3552,7 @@ impl DatastoreBackend for Datastore {
 
     async fn get_klights_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
         let key = key.to_string();
-        self.db_call("get_klights_meta", move |conn| {
+        self.read_db_call("get_klights_meta", move |conn| {
             use rusqlite::OptionalExtension;
             Ok(conn
                 .query_row(queries::SELECT_KLIGHTS_META, [&key], |row| {

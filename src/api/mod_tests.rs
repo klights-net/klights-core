@@ -5571,6 +5571,7 @@ async fn test_task_supervisor_category_and_task_endpoints() {
         vec![
             "background",
             "db",
+            "db-read",
             "file",
             "network",
             "others",

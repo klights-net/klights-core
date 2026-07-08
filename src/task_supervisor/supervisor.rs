@@ -308,12 +308,49 @@ impl TaskSupervisor {
         T: Send + 'static,
         F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
     {
+        self.call_db_with_category(TaskCategory::Db, query_name, connection_key, connection, f)
+            .await
+    }
+
+    pub async fn call_db_read<T, F>(
+        &self,
+        query_name: impl Into<String>,
+        connection_key: impl Into<String>,
+        connection: tokio_rusqlite::Connection,
+        f: F,
+    ) -> tokio_rusqlite::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+    {
+        self.call_db_with_category(
+            TaskCategory::DbRead,
+            query_name,
+            connection_key,
+            connection,
+            f,
+        )
+        .await
+    }
+
+    async fn call_db_with_category<T, F>(
+        &self,
+        category: TaskCategory,
+        query_name: impl Into<String>,
+        connection_key: impl Into<String>,
+        connection: tokio_rusqlite::Connection,
+        f: F,
+    ) -> tokio_rusqlite::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
+    {
         let query_name: String = query_name.into();
         let connection_key: String = connection_key.into();
-        let permit = self.acquire_permit(TaskCategory::Db).await.map_err(|e| {
+        let permit = self.acquire_permit(category).await.map_err(|e| {
             tokio_rusqlite::Error::Other(Box::new(std::io::Error::other(e.to_string())))
         })?;
-        let task_id = self.start_task(TaskCategory::Db, query_name.clone());
+        let task_id = self.start_task(category, query_name.clone());
 
         // Detach into a task that holds the DB permit for the true duration
         // of the DB call. If the caller future is cancelled, the permit

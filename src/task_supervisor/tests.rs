@@ -10,6 +10,7 @@ fn defaults_match_p0_category_limits() {
     assert_eq!(cfg.background, 0);
     assert_eq!(cfg.file, 3);
     assert_eq!(cfg.db, 1);
+    assert_eq!(cfg.db_read, 1);
     assert_eq!(cfg.timer, 0);
     assert_eq!(cfg.network, 256);
     assert_eq!(cfg.pod_delete_workqueue, 10);
@@ -30,6 +31,10 @@ fn task_category_serializes_to_kebab_case() {
         "\"file\""
     );
     assert_eq!(serde_json::to_string(&TaskCategory::Db).unwrap(), "\"db\"");
+    assert_eq!(
+        serde_json::to_string(&TaskCategory::DbRead).unwrap(),
+        "\"db-read\""
+    );
     assert_eq!(
         serde_json::to_string(&TaskCategory::Timer).unwrap(),
         "\"timer\""
@@ -83,6 +88,7 @@ fn semaphore_presence_matches_category_limits() {
     assert_eq!(supervisor.semaphore_limit(TaskCategory::Others), None);
     assert_eq!(supervisor.semaphore_limit(TaskCategory::File), Some(3));
     assert_eq!(supervisor.semaphore_limit(TaskCategory::Db), Some(1));
+    assert_eq!(supervisor.semaphore_limit(TaskCategory::DbRead), Some(1));
 }
 
 #[tokio::test]

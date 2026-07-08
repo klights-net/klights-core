@@ -97,7 +97,7 @@ impl Datastore {
     /// Get the subnet record for a specific node.
     pub async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
         let node_name = node_name.to_string();
-        self.db_call("db_query", move |conn| {
+        self.read_db_call("db_query", move |conn| {
             conn.query_row(
                 queries::NODE_SUBNET_SELECT_BY_NAME,
                 rusqlite::params![node_name],
@@ -116,7 +116,7 @@ impl Datastore {
     /// routing from the projected `mode`.
     pub async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
         let my_node_name = my_node_name.to_string();
-        self.db_call("db_query", move |conn| {
+        self.read_db_call("db_query", move |conn| {
             let mut stmt = conn.prepare(queries::NODE_SUBNET_LIST_PEERS)?;
             let rows = stmt
                 .query_map(rusqlite::params![my_node_name], row_to_node_subnet)?
@@ -189,7 +189,7 @@ impl Datastore {
         node_name: &str,
     ) -> Result<Option<DataplanePeerMetadata>> {
         let node_name = node_name.to_string();
-        self.db_call("db_query", move |conn| {
+        self.read_db_call("db_query", move |conn| {
             conn.query_row(
                 queries::NODE_DATAPLANE_SELECT_BY_NAME,
                 rusqlite::params![node_name],

@@ -235,7 +235,7 @@ impl Datastore {
         }
 
         let targets = targets.to_vec();
-        self.db_call("list_watch_events_since_checked", move |conn| {
+        self.read_db_call("list_watch_events_since_checked", move |conn| {
             if watch_replay_expired_for_targets(conn, &targets, since_rv)? {
                 return Ok(WatchReplayRead::Expired);
             }
@@ -259,7 +259,7 @@ impl Datastore {
         }
 
         let targets = targets.to_vec();
-        self.db_call("list_watch_events_since_checked_bounded", move |conn| {
+        self.read_db_call("list_watch_events_since_checked_bounded", move |conn| {
             if watch_replay_expired_for_targets(conn, &targets, since_rv)? {
                 return Ok(WatchReplayRead::Expired);
             }

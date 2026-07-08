@@ -303,7 +303,7 @@ impl Datastore {
         let event_compat = needs_event_v1_compat(api_version, kind);
         let result = if use_namespaced_table(api_version, kind, &namespace) {
             let ns = namespace.unwrap_or("default").to_string();
-            self.db_call("db_query", move |conn| {
+            self.read_db_call("db_query", move |conn| {
                 let row_mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Resource> {
                     let data_bytes: Vec<u8> = row.get(7)?;
                     let data: Value = serde_json::from_slice(&data_bytes)
@@ -331,7 +331,7 @@ impl Datastore {
             })
             .await
         } else {
-            self.db_call("db_query", move |conn| {
+            self.read_db_call("db_query", move |conn| {
                 let mut stmt = conn.prepare(queries::CLUSTER_GET)?;
                 Ok(stmt.query_row(rusqlite::params![&av, &k, &n], |row| {
                     let data_bytes: Vec<u8> = row.get(6)?;
@@ -413,7 +413,7 @@ impl Datastore {
             let event_compat = needs_event_v1_compat(api_version, kind);
             let (items, total_after_token, current_rv, pending_reserved_rv) =
                 if use_namespaced_table(api_version, kind, &namespace) {
-                    self.db_call("db_query", move |conn| {
+                    self.read_db_call("db_query", move |conn| {
                         let tx = conn.transaction()?;
                         let conn = &tx;
                         let (where_head, mut params): (&str, Vec<Box<dyn rusqlite::ToSql>>) =
@@ -484,7 +484,7 @@ impl Datastore {
                     })
                     .await?
                 } else {
-                    self.db_call("db_query", move |conn| {
+                    self.read_db_call("db_query", move |conn| {
                         let tx = conn.transaction()?;
                         let conn = &tx;
                         let mut query = queries::CLUSTER_LIST_HEAD.to_string();
@@ -620,7 +620,7 @@ impl Datastore {
                     let batch_size = (lim * selector_index::SELECTOR_RESIDUAL_SCAN_FACTOR)
                         .clamp(128, selector_index::SELECTOR_RESIDUAL_MAX_CANDIDATES);
 
-                    self.db_call("db_query", move |conn| {
+                    self.read_db_call("db_query", move |conn| {
                         let tx = conn.transaction()?;
                         let conn = &tx;
                         // Build base query without cursor / ORDER BY / LIMIT.
@@ -787,7 +787,7 @@ impl Datastore {
                     let pause_limit = limit;
                     #[cfg(test)]
                     let pause_continue_token = token_owned.clone();
-                    self.db_call("db_query", move |conn| {
+                    self.read_db_call("db_query", move |conn| {
                         let tx = conn.transaction()?;
                         let conn = &tx;
                         let (where_head, mut params): (&str, Vec<Box<dyn rusqlite::ToSql>>) =
@@ -902,7 +902,7 @@ impl Datastore {
                     let batch_size = (lim * selector_index::SELECTOR_RESIDUAL_SCAN_FACTOR)
                         .clamp(128, selector_index::SELECTOR_RESIDUAL_MAX_CANDIDATES);
 
-                    self.db_call("db_query", move |conn| {
+                    self.read_db_call("db_query", move |conn| {
                         let tx = conn.transaction()?;
                         let conn = &tx;
                         let mut base_query = "SELECT r.id, r.api_version, r.kind, r.name, r.resource_version, r.uid, r.data \
@@ -1025,7 +1025,7 @@ impl Datastore {
                         base_param_count_with_token,
                         true,
                     );
-                    self.db_call("db_query", move |conn| {
+                    self.read_db_call("db_query", move |conn| {
                         let tx = conn.transaction()?;
                         let conn = &tx;
                         let mut query = "SELECT r.id, r.api_version, r.kind, r.name, r.resource_version, r.uid, r.data \
@@ -1152,7 +1152,7 @@ impl Datastore {
             &namespace,
         ) {
             // Namespaced resources
-            self.db_call("db_query", move |conn| {
+            self.read_db_call("db_query", move |conn| {
                 let tx = conn.transaction()?;
                 let conn = &tx;
                 let (where_head, mut params): (&str, Vec<Box<dyn rusqlite::ToSql>>) =
@@ -1247,7 +1247,7 @@ impl Datastore {
             .await?
         } else {
             // Cluster-scoped resources
-            self.db_call("db_query", move |conn| {
+            self.read_db_call("db_query", move |conn| {
                 let tx = conn.transaction()?;
                 let conn = &tx;
                 // CLUSTER_LIST_HEAD already uses unaliased columns; add `r.`
@@ -1380,7 +1380,7 @@ impl Datastore {
     }
 
     pub async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
-        self.db_call("list_cluster_resources", move |conn| {
+        self.read_db_call("list_cluster_resources", move |conn| {
             let mut stmt = conn.prepare(queries::CLUSTER_LIST_ALL)?;
             let rows = stmt.query_map([], row_to_cluster_resource)?;
             let mut items = Vec::new();
@@ -1402,7 +1402,7 @@ impl Datastore {
         namespaced: bool,
     ) -> Result<Vec<(Option<String>, String)>> {
         if namespaced {
-            self.db_call("db_query", move |conn| {
+            self.read_db_call("db_query", move |conn| {
                 let mut stmt = conn.prepare(queries::NAMESPACED_KEYS_FOR_SCOPE)?;
                 let rows = stmt.query_map([api_version, kind], |row| {
                     Ok((Some(row.get::<_, String>(0)?), row.get::<_, String>(1)?))
@@ -1416,7 +1416,7 @@ impl Datastore {
             .await
             .map_err(|e| anyhow!("Failed to list namespaced resource keys: {}", e))
         } else {
-            self.db_call("db_query", move |conn| {
+            self.read_db_call("db_query", move |conn| {
                 let mut stmt = conn.prepare(queries::CLUSTER_KEYS_FOR_SCOPE)?;
                 let rows = stmt.query_map([api_version, kind], |row| {
                     Ok((None, row.get::<_, String>(0)?))
@@ -1434,7 +1434,7 @@ impl Datastore {
 
     pub async fn get_current_resource_version(&self) -> Result<i64> {
         let rv = self
-            .db_call("db_query", |conn| {
+            .read_db_call("db_query", |conn| {
                 Ok(Self::current_resource_version_in_conn(conn)?)
             })
             .await?;
