@@ -259,6 +259,14 @@ pub fn serialize_watch_status_line(code: u16, reason: &str, message: &str) -> Ve
     json
 }
 
+fn serialize_watch_catch_up_failure_status_line() -> Vec<u8> {
+    serialize_watch_status_line(
+        410,
+        "Expired",
+        "too old resource version: unable to replay watch catch-up; relist required",
+    )
+}
+
 pub async fn spawn_bookmark_tick_stream(
     task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     task_name: impl Into<String>,
@@ -650,46 +658,62 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 }
             };
 
-            if let Ok(missed) = missed {
-                for catchup in missed {
-                    let resource = catchup.resource.clone();
-                    if resource.resource_version <= initial_list_rv {
-                        if catchup.event_type.as_ref() == "ADDED" {
-                            tracing::warn!(
-                                target: "klights::watch_diag",
-                                kind = %kind,
-                                namespace = watch_namespace.as_deref().unwrap_or(""),
-                                name = %resource.name,
-                                added_rv = resource.resource_version,
-                                requested_rv,
-                                initial_list_rv,
-                                "catch-up dropped an ADDED event (rv <= resume floor)"
-                            );
-                        }
-                        continue;
-                    }
-                    initial_list_rv = initial_list_rv.max(resource.resource_version);
-                    let event = CatchUpResource {
-                        resource: catchup.resource,
-                        event_type: catchup.event_type,
-                    }
-                    .into_watch_event();
-                    if !event.matches_filter_parsed(
-                        &kind,
-                        watch_namespace.as_deref(),
-                        parsed_label_selector.as_ref(),
-                    ) || !event.matches_field_selector(field_selector.as_deref()) {
-                        continue;
-                    }
-                    if let Some(rv) = event.resource_version() {
-                        last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
-                    }
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
-                        event,
-                        &kind,
-                        table_format,
-                    ));
+            let missed = match missed {
+                Ok(missed) => missed,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "klights::watch_diag",
+                        kind = %kind,
+                        namespace = watch_namespace.as_deref().unwrap_or(""),
+                        requested_rv,
+                        error = %err,
+                        "watch catch-up replay failed; expiring watch so client relists"
+                    );
+                    yield Ok::<_, std::convert::Infallible>(
+                        serialize_watch_catch_up_failure_status_line(),
+                    );
+                    return;
                 }
+            };
+
+            for catchup in missed {
+                let resource = catchup.resource.clone();
+                if resource.resource_version <= initial_list_rv {
+                    if catchup.event_type.as_ref() == "ADDED" {
+                        tracing::warn!(
+                            target: "klights::watch_diag",
+                            kind = %kind,
+                            namespace = watch_namespace.as_deref().unwrap_or(""),
+                            name = %resource.name,
+                            added_rv = resource.resource_version,
+                            requested_rv,
+                            initial_list_rv,
+                            "catch-up dropped an ADDED event (rv <= resume floor)"
+                        );
+                    }
+                    continue;
+                }
+                initial_list_rv = initial_list_rv.max(resource.resource_version);
+                let event = CatchUpResource {
+                    resource: catchup.resource,
+                    event_type: catchup.event_type,
+                }
+                .into_watch_event();
+                if !event.matches_filter_parsed(
+                    &kind,
+                    watch_namespace.as_deref(),
+                    parsed_label_selector.as_ref(),
+                ) || !event.matches_field_selector(field_selector.as_deref()) {
+                    continue;
+                }
+                if let Some(rv) = event.resource_version() {
+                    last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
+                }
+                yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
+                    event,
+                    &kind,
+                    table_format,
+                ));
             }
         }
 
@@ -1139,6 +1163,16 @@ mod tests {
         assert_eq!(value["object"]["code"], 410);
         assert_eq!(value["object"]["reason"], "Expired");
         assert_eq!(value["object"]["status"], "Failure");
+    }
+
+    #[test]
+    fn catch_up_failure_status_line_forces_client_relist() {
+        let line = serialize_watch_catch_up_failure_status_line();
+        let value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+
+        assert_eq!(value["type"], "ERROR");
+        assert_eq!(value["object"]["code"], 410);
+        assert_eq!(value["object"]["reason"], "Expired");
     }
 
     #[test]
