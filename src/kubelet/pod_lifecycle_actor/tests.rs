@@ -361,6 +361,152 @@ impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
     }
 }
 
+struct FinalizationPendingExecutor {
+    start_seen: tokio::sync::Notify,
+    stop_count: AtomicUsize,
+    finalize_count: AtomicUsize,
+}
+
+impl FinalizationPendingExecutor {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            start_seen: tokio::sync::Notify::new(),
+            stop_count: AtomicUsize::new(0),
+            finalize_count: AtomicUsize::new(0),
+        })
+    }
+
+    async fn wait_for_start(&self) {
+        self.start_seen.notified().await;
+    }
+
+    fn stop_count(&self) -> usize {
+        self.stop_count.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_finalize_count(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if self.finalize_count.load(Ordering::SeqCst) >= expected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("FinalizePodDeletion count did not reach expected value");
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor
+    for FinalizationPendingExecutor
+{
+    async fn dispatch(
+        &self,
+        action: crate::kubelet::pod_lifecycle_core::action::PodAction,
+        reply_to: LifecycleReplyHandle,
+    ) -> Result<(), crate::kubelet::pod_lifecycle_router::executor::ExecutorError> {
+        match action {
+            crate::kubelet::pod_lifecycle_core::action::PodAction::CheckSlotAdmission {
+                key,
+                pod,
+                resource_version,
+                start_after_admit,
+                operation_id,
+                ..
+            } => {
+                let _ = reply_to
+                    .route(LifecycleMessage::SlotAdmissionGranted {
+                        key,
+                        operation_id,
+                        pod,
+                        resource_version,
+                        start_after_admit,
+                    })
+                    .await;
+            }
+            crate::kubelet::pod_lifecycle_core::action::PodAction::ReconcileCriLeftovers {
+                key,
+                operation_id,
+                ..
+            } => {
+                let _ = reply_to
+                    .route(LifecycleMessage::PodWorkCompleted {
+                        key,
+                        operation_id,
+                        kind: super::message::PodLifecycleWorkKind::ReconcileCriLeftovers,
+                        sandbox_id: None,
+                    })
+                    .await;
+            }
+            crate::kubelet::pod_lifecycle_core::action::PodAction::StartPod {
+                key,
+                operation_id,
+                ..
+            } => {
+                self.start_seen.notify_waiters();
+                let _ = reply_to
+                    .route(LifecycleMessage::PodWorkCompleted {
+                        key,
+                        operation_id,
+                        kind: super::message::PodLifecycleWorkKind::StartPod,
+                        sandbox_id: Some("sandbox-a".to_string()),
+                    })
+                    .await;
+            }
+            crate::kubelet::pod_lifecycle_core::action::PodAction::FinalizeStartup {
+                key,
+                operation_id,
+                ..
+            } => {
+                let _ = reply_to
+                    .route(LifecycleMessage::PodWorkCompleted {
+                        key,
+                        operation_id,
+                        kind: super::message::PodLifecycleWorkKind::FinalizeStartup,
+                        sandbox_id: Some("sandbox-a".to_string()),
+                    })
+                    .await;
+            }
+            crate::kubelet::pod_lifecycle_core::action::PodAction::StopPod {
+                key,
+                operation_id,
+                ..
+            } => {
+                self.stop_count.fetch_add(1, Ordering::SeqCst);
+                let _ = reply_to
+                    .route(LifecycleMessage::PodWorkCompleted {
+                        key,
+                        operation_id,
+                        kind: super::message::PodLifecycleWorkKind::StopPod,
+                        sandbox_id: None,
+                    })
+                    .await;
+            }
+            crate::kubelet::pod_lifecycle_core::action::PodAction::FinalizePodDeletion {
+                key,
+                operation_id,
+                ..
+            } => {
+                self.finalize_count.fetch_add(1, Ordering::SeqCst);
+                let _ = reply_to
+                    .route(LifecycleMessage::PodWorkFailed {
+                        key,
+                        operation_id,
+                        kind: super::message::PodLifecycleWorkKind::FinalizePodDeletion,
+                        retryable: true,
+                        failure: super::message::PodLifecycleWorkFailure::FinalizersPending,
+                    })
+                    .await;
+            }
+            crate::kubelet::pod_lifecycle_core::action::PodAction::ScheduleRetry { .. } => {}
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 struct FirstAdmissionReconcileExecutor {
     actions: std::sync::Mutex<Vec<String>>,
     reconcile_seen: tokio::sync::Notify,
@@ -4726,6 +4872,73 @@ async fn actor_self_removes_after_terminated_idle_no_pending() {
         .expect("StopPod should complete");
 
     wait_for_actor_count(&registry, 0).await;
+}
+
+#[tokio::test]
+async fn actor_retains_terminated_state_while_delete_finalization_retry_pending() {
+    let executor = FinalizationPendingExecutor::new();
+    let registry = test_actor_registry_with_executor_and_idle_grace(
+        executor.clone(),
+        Duration::from_millis(20),
+    );
+    let key = PodLifecycleKey::new("default", "pod-a", "uid-a");
+    let sender = registry.sender_for(key.clone()).await.unwrap();
+
+    sender
+        .send(LifecycleMessage::WatchAdded {
+            key: key.clone(),
+            resource_version: Some(1),
+            pod: test_pod("default", "pod-a", "uid-a"),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), executor.wait_for_start())
+        .await
+        .expect("StartPod should complete");
+
+    let mut terminating = test_pod("default", "pod-a", "uid-a");
+    terminating["metadata"]["deletionTimestamp"] = serde_json::json!("2026-07-07T23:15:00Z");
+    sender
+        .send(LifecycleMessage::WatchModified {
+            key: key.clone(),
+            resource_version: Some(2),
+            pod: terminating.clone(),
+        })
+        .await
+        .unwrap();
+    executor.wait_for_finalize_count(1).await;
+    assert_eq!(
+        executor.stop_count(),
+        1,
+        "first terminating watch must stop the pod exactly once"
+    );
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        registry.actor_count().await,
+        1,
+        "actor must stay registered while delete finalization has a pending retry"
+    );
+    let sender_after_idle = registry.sender_for(key.clone()).await.unwrap();
+    assert!(
+        sender.same_channel(&sender_after_idle),
+        "deferred delete wake must route to the existing terminated actor"
+    );
+
+    sender_after_idle
+        .send(LifecycleMessage::WatchModified {
+            key,
+            resource_version: Some(3),
+            pod: terminating,
+        })
+        .await
+        .unwrap();
+    executor.wait_for_finalize_count(2).await;
+    assert_eq!(
+        executor.stop_count(),
+        1,
+        "deferred delete wake after local cleanup must retry finalization, not StopPod"
+    );
 }
 
 #[tokio::test]

@@ -93,6 +93,9 @@ pub struct PodLifecycleState {
     /// If that in-flight finalizer still cannot confirm probe startup, retry
     /// once with the newer watch state instead of waiting for another event.
     pub pending_startup_finalization_retry: bool,
+    /// Delete finalization observed pending finalizers or a transient dispatch
+    /// error and has a retry timer or deferred-delete wake outstanding.
+    pub pending_delete_finalization_retry: bool,
 }
 
 impl Default for PodLifecycleState {
@@ -117,6 +120,7 @@ impl Default for PodLifecycleState {
             pending_runtime_reconcile: false,
             runtime_reconcile_observations: RuntimeReconcileObservations::default(),
             pending_startup_finalization_retry: false,
+            pending_delete_finalization_retry: false,
         }
     }
 }
@@ -152,6 +156,7 @@ impl PodLifecycleState {
         self.pending_runtime_reconcile = false;
         self.runtime_reconcile_observations = RuntimeReconcileObservations::new(uid.to_string());
         self.pending_startup_finalization_retry = false;
+        self.pending_delete_finalization_retry = false;
         self.phase = PodPhase::Created;
     }
 

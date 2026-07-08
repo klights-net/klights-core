@@ -314,6 +314,7 @@ impl PodLifecycleActor {
             && self.state.active_uid.is_none()
             && self.state.pending_replacement.is_none()
             && self.state.pending_start_pod.is_none()
+            && !self.state.pending_delete_finalization_retry
             && !self.state.slot_admission_waiting
             && self.state.in_flight.is_none()
             && Self::mailbox_is_empty(actor_empty, completion_empty)
@@ -731,6 +732,7 @@ impl PodLifecycleActor {
     }
 
     fn finalize_pod_deletion_action(&mut self, key: PodLifecycleKey) -> PodAction {
+        self.state.pending_delete_finalization_retry = false;
         let operation_id =
             self.next_work_operation(&key, PodLifecycleWorkKind::FinalizePodDeletion);
         PodAction::FinalizePodDeletion {
@@ -1548,6 +1550,7 @@ impl PodLifecycleActor {
                     && self.state.in_flight.is_none()
                     && self.state.active_uid.is_none()
                 {
+                    self.state.pending_delete_finalization_retry = false;
                     return self.finalize_pod_deletion_action(key);
                 }
                 if self.state.phase == PodPhase::Stopping
@@ -1741,15 +1744,21 @@ impl PodLifecycleActor {
                         self.state.phase = PodPhase::Stopping;
                         PodAction::Noop
                     }
-                    (PodLifecycleWorkKind::FinalizePodDeletion, true) => PodAction::ScheduleRetry {
-                        key,
-                        delay: if finalizers_pending {
-                            std::time::Duration::from_secs(5)
-                        } else {
-                            std::time::Duration::from_secs(1)
-                        },
-                    },
-                    (PodLifecycleWorkKind::FinalizePodDeletion, false) => PodAction::Noop,
+                    (PodLifecycleWorkKind::FinalizePodDeletion, true) => {
+                        self.state.pending_delete_finalization_retry = true;
+                        PodAction::ScheduleRetry {
+                            key,
+                            delay: if finalizers_pending {
+                                std::time::Duration::from_secs(5)
+                            } else {
+                                std::time::Duration::from_secs(1)
+                            },
+                        }
+                    }
+                    (PodLifecycleWorkKind::FinalizePodDeletion, false) => {
+                        self.state.pending_delete_finalization_retry = false;
+                        PodAction::Noop
+                    }
                     _ => PodAction::Noop,
                 }
             }
