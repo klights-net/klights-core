@@ -14,8 +14,7 @@
 //!     `remove_pod_sandbox`, `db.delete_sandbox`, `db.delete_pod_network`)
 //!     per tick — keeps the event loop snappy under sustained leak pressure.
 //!   * Second pass: `pod_sandboxes` rows whose sandbox_id is not in the CRI
-//!     list get dropped and stale `pod_networks` rows for missing sandbox IDs
-//!     are reclaimed (prevents IPAM exhaustion after partial failures).
+//!     list get dropped, along with their matching `pod_networks` rows.
 
 use crate::datastore::DatastoreHandle;
 use crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup;
@@ -73,6 +72,7 @@ impl SandboxGc {
         let sandboxes = cri.list_pod_sandboxes(None).await?;
 
         let mut live_sandbox_ids: HashSet<String> = HashSet::with_capacity(sandboxes.len());
+        let mut stale_sandbox_row_ids: HashSet<String> = HashSet::new();
         let mut removed = 0usize;
 
         for sandbox in &sandboxes {
@@ -206,6 +206,7 @@ impl SandboxGc {
                         {
                             continue;
                         }
+                        stale_sandbox_row_ids.insert(sb.sandbox_id.clone());
                         if let Err(e) = self
                             .db
                             .delete_sandbox_for_uid(
@@ -243,10 +244,12 @@ impl SandboxGc {
 
         match self.db.list_pod_network_sandbox_ids().await {
             Ok(sandbox_ids) => {
-                for sandbox_id in sandbox_ids {
-                    if !live_ids_for_network_cleanup.contains(&sandbox_id)
-                        && let Err(e) = self.db.delete_pod_network(&sandbox_id).await
-                    {
+                for sandbox_id in pod_network_cleanup_candidates(
+                    sandbox_ids,
+                    &live_ids_for_network_cleanup,
+                    &stale_sandbox_row_ids,
+                ) {
+                    if let Err(e) = self.db.delete_pod_network(&sandbox_id).await {
                         tracing::debug!(
                             sandbox_id = %sandbox_id,
                             error = %e,
@@ -330,6 +333,19 @@ fn pod_network_cleanup_live_ids(
     }
 }
 
+fn pod_network_cleanup_candidates(
+    network_sandbox_ids: Vec<String>,
+    live_sandbox_ids: &HashSet<String>,
+    stale_sandbox_row_ids: &HashSet<String>,
+) -> Vec<String> {
+    network_sandbox_ids
+        .into_iter()
+        .filter(|sandbox_id| {
+            !live_sandbox_ids.contains(sandbox_id) && stale_sandbox_row_ids.contains(sandbox_id)
+        })
+        .collect()
+}
+
 #[async_trait]
 impl super::GcTask for SandboxGc {
     fn name(&self) -> &'static str {
@@ -354,7 +370,7 @@ impl super::GcTask for SandboxGc {
 
 #[cfg(test)]
 mod tests {
-    use super::pod_network_cleanup_live_ids;
+    use super::{pod_network_cleanup_candidates, pod_network_cleanup_live_ids};
     use crate::gc::GcTask;
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
@@ -376,6 +392,26 @@ mod tests {
         let initial = HashSet::from(["sandbox-old".to_string()]);
         let selected = pod_network_cleanup_live_ids(&initial, Err(anyhow!("refresh failed")));
         assert_eq!(selected, initial);
+    }
+
+    #[test]
+    fn pod_network_cleanup_skips_inflight_rows_without_stale_sandbox_record() {
+        let stale_sandbox_rows = HashSet::from(["sandbox-stale".to_string()]);
+        let selected = pod_network_cleanup_candidates(
+            vec![
+                "sandbox-inflight".to_string(),
+                "sandbox-stale".to_string(),
+                "sandbox-live".to_string(),
+            ],
+            &HashSet::from(["sandbox-live".to_string()]),
+            &stale_sandbox_rows,
+        );
+
+        assert_eq!(selected, vec!["sandbox-stale".to_string()]);
+        assert!(
+            !selected.contains(&"sandbox-inflight".to_string()),
+            "network rows created by CNI before RunPodSandbox returns must not be deleted"
+        );
     }
 
     // ---- Event-driven dirty flag ----
