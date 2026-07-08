@@ -8,7 +8,6 @@ use tokio::sync::Mutex;
 use crate::datastore::ResourcePreconditions;
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::command::StorageCommand;
-use crate::datastore::node_local::sqlite::outbox_stream_id;
 use crate::datastore::node_local::{NodeLocalHandle, selector};
 use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
 use crate::kubelet::outbox::{
@@ -78,19 +77,6 @@ fn event_create_command(namespace: &str, name: &str, uid: &str) -> StorageComman
             },
         }),
     }
-}
-
-fn same_stream_event_subject(pod_subject: &str) -> (String, String, String) {
-    let target_stream = outbox_stream_id(pod_subject);
-    for i in 0..10_000 {
-        let name = format!("event-{i}");
-        let uid = format!("event-uid-{i}");
-        let subject = format!("events.k8s.io/v1/Event/default/{name}");
-        if outbox_stream_id(&subject) == target_stream {
-            return (subject, name, uid);
-        }
-    }
-    panic!("failed to find same-stream Event subject for {pod_subject}");
 }
 
 /// A fake apply client that records calls. Responses must be pre-loaded
@@ -583,11 +569,13 @@ async fn batch_claim_leases_only_terminal_delete_when_older_status_is_also_due()
 }
 
 #[tokio::test]
-async fn batch_claim_does_not_deadlock_same_stream_behind_superseded_status() {
+async fn batch_claim_does_not_deadlock_different_subject_behind_superseded_status() {
     let node_db = node_db().await;
     let outbox = Outbox::new(node_db.clone());
     let pod_subject = "v1/Pod/default/web/uid-web";
-    let (event_subject, event_name, event_uid) = same_stream_event_subject(pod_subject);
+    let event_name = "event-after-superseded-status";
+    let event_uid = "event-uid-after-superseded-status";
+    let event_subject = format!("events.k8s.io/v1/Event/default/{event_name}");
 
     outbox
         .enqueue_command(OutboxCommand::new(
@@ -610,13 +598,13 @@ async fn batch_claim_does_not_deadlock_same_stream_behind_superseded_status() {
             "same-stream-event-after-superseded-status",
             OutboxOperation::EventCreate,
             OutboxSubject::new(
-                event_subject,
+                event_subject.clone(),
                 Some("default".to_string()),
-                event_name.clone(),
-                Some(event_uid.clone()),
+                event_name.to_string(),
+                Some(event_uid.to_string()),
             ),
-            &event_uid,
-            event_create_command("default", &event_name, &event_uid),
+            event_uid,
+            event_create_command("default", event_name, event_uid),
             1_001,
         ))
         .await
@@ -647,35 +635,22 @@ async fn batch_claim_does_not_deadlock_same_stream_behind_superseded_status() {
             .iter()
             .map(|row| row.idempotency_key.as_str())
             .collect::<Vec<_>>(),
-        vec!["same-stream-event-after-superseded-status"],
-        "superseded status must not make the whole stream unclaimable"
-    );
-
-    node_db
-        .complete_outbox(claimed[0].id, "event-lease")
-        .await
-        .expect("complete event");
-
-    let claimed = node_db
-        .claim_due_outbox_batch(1_002, 16, 100, "delete-lease")
-        .await
-        .expect("claim delete batch");
-    assert_eq!(
-        claimed
-            .iter()
-            .map(|row| row.idempotency_key.as_str())
-            .collect::<Vec<_>>(),
-        vec!["web-actor-finalize-delete-after-event"],
-        "actor-owned terminal delete must be claimable after the live older stream row completes"
+        vec![
+            "same-stream-event-after-superseded-status",
+            "web-actor-finalize-delete-after-event"
+        ],
+        "superseded status must not block independent subjects"
     );
 }
 
 #[tokio::test]
-async fn batch_claim_keeps_same_stream_blocked_while_superseded_status_is_in_flight() {
+async fn batch_claim_keeps_same_subject_blocked_while_status_is_in_flight() {
     let node_db = node_db().await;
     let outbox = Outbox::new(node_db.clone());
     let pod_subject = "v1/Pod/default/web/uid-web";
-    let (event_subject, event_name, event_uid) = same_stream_event_subject(pod_subject);
+    let event_name = "event-behind-in-flight-status";
+    let event_uid = "event-uid-behind-in-flight-status";
+    let event_subject = format!("events.k8s.io/v1/Event/default/{event_name}");
 
     outbox
         .enqueue_command(OutboxCommand::new(
@@ -708,11 +683,11 @@ async fn batch_claim_keeps_same_stream_blocked_while_superseded_status_is_in_fli
             OutboxSubject::new(
                 event_subject,
                 Some("default".to_string()),
-                event_name.clone(),
-                Some(event_uid.clone()),
+                event_name.to_string(),
+                Some(event_uid.to_string()),
             ),
-            &event_uid,
-            event_create_command("default", &event_name, &event_uid),
+            event_uid,
+            event_create_command("default", event_name, event_uid),
             1_001,
         ))
         .await
@@ -738,9 +713,13 @@ async fn batch_claim_keeps_same_stream_blocked_while_superseded_status_is_in_fli
         .claim_due_outbox_batch(1_002, 16, 100, "blocked-lease")
         .await
         .expect("claim while status is in-flight");
-    assert!(
-        claimed.is_empty(),
-        "same-stream rows must remain blocked while an older status row is still leased"
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|row| row.idempotency_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["same-stream-event-behind-in-flight-status"],
+        "same-subject delete must stay blocked while an older status row is leased, but unrelated subjects may dispatch"
     );
 }
 
@@ -907,6 +886,69 @@ async fn actor_finalize_delete_for_replacement_uid_is_not_blocked_by_old_uid_sta
     assert_eq!(
         claimed.idempotency_key,
         "replacement-web-actor-finalize-delete"
+    );
+}
+
+#[tokio::test]
+async fn batch_claim_does_not_starve_unrelated_pod_status_behind_same_stream_delete() {
+    let node_db = node_db().await;
+    let outbox = Outbox::new(node_db.clone());
+    let old_subject = "v1/Pod/deployment-2293/webserver-deployment-7f5f4087e1-e632e/492035f4-4ad4-4e0d-ba78-76a38ea9400f";
+    let new_subject =
+        "v1/Pod/pod-network-test-7213/netserver-4/8befd8a2-a7cf-4c56-89d6-8512d83031f6";
+
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "old-web-actor-finalize-delete",
+            OutboxOperation::PodMetadata,
+            OutboxSubject::new(
+                old_subject,
+                Some("deployment-2293".to_string()),
+                "webserver-deployment-7f5f4087e1-e632e",
+                Some("492035f4-4ad4-4e0d-ba78-76a38ea9400f".to_string()),
+            ),
+            "492035f4-4ad4-4e0d-ba78-76a38ea9400f",
+            pod_delete_command(
+                "deployment-2293",
+                "webserver-deployment-7f5f4087e1-e632e",
+                "492035f4-4ad4-4e0d-ba78-76a38ea9400f",
+            ),
+            1_000,
+        ))
+        .await
+        .expect("enqueue old terminal delete");
+    outbox
+        .enqueue_command(OutboxCommand::new(
+            "netserver-running-status",
+            OutboxOperation::PodStatus,
+            OutboxSubject::new(
+                new_subject,
+                Some("pod-network-test-7213".to_string()),
+                "netserver-4",
+                Some("8befd8a2-a7cf-4c56-89d6-8512d83031f6".to_string()),
+            ),
+            "8befd8a2-a7cf-4c56-89d6-8512d83031f6",
+            pod_status_command(
+                "pod-network-test-7213",
+                "netserver-4",
+                "8befd8a2-a7cf-4c56-89d6-8512d83031f6",
+            ),
+            1_001,
+        ))
+        .await
+        .expect("enqueue unrelated pod status");
+
+    let claimed = node_db
+        .claim_due_outbox_batch(1_001, 16, 100, "same-stream-lease")
+        .await
+        .expect("claim batch");
+    assert_eq!(
+        claimed
+            .iter()
+            .map(|row| row.idempotency_key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["old-web-actor-finalize-delete", "netserver-running-status"],
+        "unrelated Pod status must not wait behind an older delete for a different subject"
     );
 }
 

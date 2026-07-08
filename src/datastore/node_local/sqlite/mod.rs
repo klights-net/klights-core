@@ -16,7 +16,6 @@ use crate::datastore::{
 
 const POD_ENDPOINT_CHANNEL_BOUND: usize = 4_096;
 const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
-pub const OUTBOX_STREAM_SHARDS: i64 = 64;
 
 #[derive(Clone)]
 pub struct SqliteNodeLocalDb {
@@ -1325,7 +1324,8 @@ pub fn outbox_stream_id(subject_key: &str) -> i64 {
     let mut shard_bytes = [0_u8; 8];
     shard_bytes.copy_from_slice(&digest[..8]);
     let value = u64::from_be_bytes(shard_bytes);
-    1 + (value % OUTBOX_STREAM_SHARDS as u64) as i64
+    let stream_id = (value & i64::MAX as u64) as i64;
+    if stream_id == 0 { 1 } else { stream_id }
 }
 
 fn is_terminal_pod_delete_outbox_row(operation: &str, payload_proto: &[u8]) -> bool {

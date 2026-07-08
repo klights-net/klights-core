@@ -126,14 +126,14 @@ fn node_local_outbox_hash_reserves_zero_for_unsequenced_ops() {
         let subject_key = format!("v1/Pod/default/web-{i}/uid-{i}");
         let stream_id = crate::datastore::node_local::sqlite::outbox_stream_id(&subject_key);
         assert!(
-            (1..=64).contains(&stream_id),
-            "normal hashed subject {subject_key} must use a 1-based stream id, got {stream_id}"
+            stream_id > 0,
+            "normal hashed subject {subject_key} must use a positive stream id, got {stream_id}"
         );
     }
 }
 
 #[tokio::test]
-async fn node_local_outbox_claim_skips_rows_with_stream_in_flight() {
+async fn node_local_outbox_claim_skips_same_subject_rows_with_stream_in_flight() {
     let db = open_node_local_in_memory().await;
     db.enqueue_outbox(test_outbox_insert(
         "inflight-stream-1",
@@ -144,7 +144,7 @@ async fn node_local_outbox_claim_skips_rows_with_stream_in_flight() {
     .unwrap();
     db.enqueue_outbox(test_outbox_insert(
         "inflight-stream-2",
-        "v1/Pod/default/web-3/uid-3",
+        "v1/Pod/default/web-2/uid-2",
         2,
     ))
     .await
