@@ -163,6 +163,7 @@ fn list_response_resource_version(
     current_rv: i64,
     pending_reserved_rv: Option<i64>,
     exact_name_deleted_replay_floor_rv: Option<i64>,
+    returned_item_deleted_replay_floor_rv: Option<i64>,
     _request_had_continue: bool,
     _response_has_continue: bool,
 ) -> i64 {
@@ -183,6 +184,9 @@ fn list_response_resource_version(
         response_rv = response_rv.min(reserved_rv.saturating_sub(1));
     }
     if let Some(floor_rv) = exact_name_deleted_replay_floor_rv.filter(|rv| *rv >= 0) {
+        response_rv = response_rv.min(floor_rv);
+    }
+    if let Some(floor_rv) = returned_item_deleted_replay_floor_rv.filter(|rv| *rv >= 0) {
         response_rv = response_rv.min(floor_rv);
     }
     response_rv
@@ -244,6 +248,14 @@ fn retained_exact_name_delete_rv_in_conn(
     }
 }
 
+struct ReturnedItemDeleteFloorCandidate {
+    api_version: String,
+    kind: String,
+    namespace_key: String,
+    name: String,
+    resource_version: i64,
+}
+
 struct ExactNameDeletedReplayFloorRequest<'a> {
     api_version: &'a str,
     kind: &'a str,
@@ -255,6 +267,71 @@ struct ExactNameDeletedReplayFloorRequest<'a> {
 }
 
 impl Datastore {
+    async fn returned_item_deleted_replay_floor_rv(
+        &self,
+        items: &[Resource],
+        current_rv: i64,
+    ) -> Result<Option<i64>> {
+        if current_rv <= 0 || items.is_empty() {
+            return Ok(None);
+        }
+        let candidates = items
+            .iter()
+            .filter(|item| item.resource_version < current_rv)
+            .map(|item| ReturnedItemDeleteFloorCandidate {
+                api_version: item.api_version.clone(),
+                kind: item.kind.clone(),
+                namespace_key: item
+                    .namespace
+                    .clone()
+                    .unwrap_or_else(|| "#cluster".to_string()),
+                name: item.name.clone(),
+                resource_version: item.resource_version,
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let floor_rv = self
+            .read_db_call("db_query", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT MIN(resource_version) FROM watch_events
+                     WHERE api_version = ?1
+                       AND kind = ?2
+                       AND COALESCE(namespace, '#cluster') = ?3
+                       AND name = ?4
+                       AND event_type = 'DELETED'
+                       AND resource_version > ?5
+                       AND resource_version <= ?6",
+                )?;
+                let mut floor_rv: Option<i64> = None;
+                for candidate in candidates {
+                    let deleted_rv: Option<i64> = stmt.query_row(
+                        rusqlite::params![
+                            candidate.api_version,
+                            candidate.kind,
+                            candidate.namespace_key,
+                            candidate.name,
+                            candidate.resource_version,
+                            current_rv,
+                        ],
+                        |row| row.get(0),
+                    )?;
+                    if let Some(deleted_rv) = deleted_rv {
+                        let candidate_floor = deleted_rv.saturating_sub(1);
+                        floor_rv = Some(
+                            floor_rv
+                                .map_or(candidate_floor, |current| current.min(candidate_floor)),
+                        );
+                    }
+                }
+                Ok(floor_rv)
+            })
+            .await?;
+        Ok(floor_rv)
+    }
+
     async fn exact_name_deleted_replay_floor_rv(
         &self,
         request: ExactNameDeletedReplayFloorRequest<'_>,
@@ -623,11 +700,15 @@ impl Datastore {
                 next_token = items.last().map(|r| r.name.clone());
                 remaining_item_count = Some((total_after_token - lim).max(0));
             }
+            let returned_item_deleted_replay_floor_rv = self
+                .returned_item_deleted_replay_floor_rv(&items, current_rv)
+                .await?;
             let response_rv = list_response_resource_version(
                 &items,
                 current_rv,
                 pending_reserved_rv,
                 None,
+                returned_item_deleted_replay_floor_rv,
                 request_had_continue,
                 next_token.is_some(),
             );
@@ -1197,11 +1278,15 @@ impl Datastore {
                     current_rv,
                 })
                 .await?;
+            let returned_item_deleted_replay_floor_rv = self
+                .returned_item_deleted_replay_floor_rv(&items, current_rv)
+                .await?;
             let response_rv = list_response_resource_version(
                 &items,
                 current_rv,
                 pending_reserved_rv,
                 exact_name_deleted_replay_floor_rv,
+                returned_item_deleted_replay_floor_rv,
                 request_had_continue,
                 next_token.is_some(),
             );
@@ -1451,11 +1536,15 @@ impl Datastore {
                 current_rv,
             })
             .await?;
+        let returned_item_deleted_replay_floor_rv = self
+            .returned_item_deleted_replay_floor_rv(&items, current_rv)
+            .await?;
         let response_rv = list_response_resource_version(
             &items,
             current_rv,
             pending_reserved_rv,
             exact_name_deleted_replay_floor_rv,
+            returned_item_deleted_replay_floor_rv,
             request_had_continue,
             next_token.is_some(),
         );

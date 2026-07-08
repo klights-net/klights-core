@@ -315,6 +315,97 @@ async fn list_resources_response_rv_does_not_advance_past_concurrent_delete_snap
 }
 
 #[tokio::test]
+async fn list_resources_response_rv_caps_before_retained_delete_for_returned_item() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_root = dir.path().join("state");
+    let cluster_db_path = db_root.join("sqlite").join("cluster.db");
+    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
+        crate::task_supervisor::TaskCategoryConfig::default(),
+    ));
+    let db = Datastore::new_persistent(&db_root, supervisor.clone(), None)
+        .await
+        .unwrap();
+
+    let created = db
+        .create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "cm-retained-delete",
+            json!({
+                "metadata": {
+                    "name": "cm-retained-delete",
+                    "namespace": "default",
+                    "labels": {"race": "retained-delete-floor"}
+                },
+                "data": {"k": "v"}
+            }),
+        )
+        .await
+        .unwrap();
+    let delete_payload = serde_json::to_vec(created.data.as_ref()).unwrap();
+
+    let delete_rv = std::thread::spawn(move || -> rusqlite::Result<i64> {
+        let mut conn = rusqlite::Connection::open(cluster_db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE metadata SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) \
+             WHERE key = 'resource_version'",
+            [],
+        )?;
+        let delete_rv: i64 = tx.query_row(
+            "SELECT CAST(value AS INTEGER) FROM metadata WHERE key = 'resource_version'",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO watch_events \
+             (api_version, kind, namespace, name, resource_version, event_type, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'DELETED', ?6)",
+            rusqlite::params![
+                "v1",
+                "ConfigMap",
+                "default",
+                "cm-retained-delete",
+                delete_rv,
+                delete_payload,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(delete_rv)
+    })
+    .join()
+    .expect("raw sqlite retained delete thread panicked")
+    .expect("raw sqlite retained delete insert failed");
+
+    let list = db
+        .list_resources(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            ResourceListQuery::new(Some("race=retained-delete-floor"), None, Some(500), None),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        list.items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cm-retained-delete"],
+        "test setup must return the stale row whose retained delete is visible"
+    );
+    assert_eq!(
+        list.resource_version,
+        delete_rv - 1,
+        "a list that returns cm-retained-delete must not report the retained delete rv; \
+         a watch from the list rv must be able to replay delete rv={delete_rv}"
+    );
+}
+
+#[tokio::test]
 async fn list_resources_response_rv_allows_catch_up_for_post_list_delete() {
     // A delete applied *after* a complete list must be visible to a watch that
     // resumes from the list's resourceVersion. With the list anchored to the
