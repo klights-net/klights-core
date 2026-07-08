@@ -71,6 +71,7 @@ pub struct ControllerDispatcher {
     /// starts; required by the Deployment and ReplicaSet controllers
     /// (they fail-fast at reconcile time if it is missing).
     pod_repository: Arc<Mutex<Option<Arc<PodRepository>>>>,
+    metrics_provider: Arc<Mutex<Option<Arc<dyn crate::metrics::MetricsProvider>>>>,
     active_reconciles: Arc<Mutex<ActiveReconciles>>,
     active_reconciles_changed: Arc<Notify>,
 }
@@ -185,6 +186,7 @@ impl ControllerDispatcher {
             sync_ctx: Arc::new(Mutex::new(None)),
             services: Arc::new(Mutex::new(None)),
             pod_repository: Arc::new(Mutex::new(None)),
+            metrics_provider: Arc::new(Mutex::new(None)),
             active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
             active_reconciles_changed: Arc::new(Notify::new()),
         }
@@ -212,6 +214,17 @@ impl ControllerDispatcher {
 
     pub async fn current_pod_repository(&self) -> Option<Arc<PodRepository>> {
         self.pod_repository.lock().await.clone()
+    }
+
+    pub async fn set_metrics_provider(
+        &self,
+        metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
+    ) {
+        *self.metrics_provider.lock().await = Some(metrics_provider);
+    }
+
+    async fn current_metrics_provider(&self) -> Option<Arc<dyn crate::metrics::MetricsProvider>> {
+        self.metrics_provider.lock().await.clone()
     }
 
     /// Extract the workqueue key from a resource and enqueue it. Producers
@@ -620,6 +633,10 @@ impl ControllerDispatcher {
             };
             let ctx = match self.current_pod_repository().await {
                 Some(pod_repository) => ctx.with_pod_repository(pod_repository),
+                None => ctx,
+            };
+            let ctx = match self.current_metrics_provider().await {
+                Some(metrics_provider) => ctx.with_metrics_provider(metrics_provider),
                 None => ctx,
             };
             controller.reconcile(resource.clone(), ctx).await?;

@@ -59,6 +59,7 @@ message FollowerMessage {
     PodLogResponse pod_log_response = 5;
     NodeExecStreamFrame node_exec_stream_frame = 6;
     ObservedLeaderEndpoint observed_leader_endpoint = 7;
+    NodeMetricsResponse node_metrics_response = 8;
   }
 }
 
@@ -74,6 +75,7 @@ message LeaderMessage {
     NodeExecRequest node_exec_request = 6;
     NodeExecStreamFrame node_exec_stream_frame = 7;
     ObserveLeaderEndpointRequest observe_leader_endpoint_request = 8;
+    NodeMetricsRequest node_metrics_request = 9;
   }
 }
 
@@ -199,6 +201,32 @@ message NodeExecStreamFrame {
   string channel = 2;
   bytes data = 3;
   bool fin = 4;
+}
+
+message NodeMetricsRequest {
+  string request_id = 1;
+  string node_name = 2;
+  repeated string pod_uids = 3;
+}
+
+message NodeMetricsResponse {
+  string request_id = 1;
+  string node_name = 2;
+  repeated NodeMetricsPodSample pods = 3;
+  optional string error = 4;
+}
+
+message NodeMetricsPodSample {
+  string namespace = 1;
+  string name = 2;
+  string uid = 3;
+  repeated NodeMetricsContainerSample containers = 4;
+}
+
+message NodeMetricsContainerSample {
+  string name = 1;
+  uint64 cpu_nanos = 2;
+  uint64 memory_bytes = 3;
 }
 
 message SnapshotRequest {

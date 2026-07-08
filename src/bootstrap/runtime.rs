@@ -109,6 +109,11 @@ async fn start_controlplane_leader_control_stream_if_needed(
             .set_node_exec_sync_handler(exec_handler.clone())
             .await;
         client.set_node_exec_stream_handler(exec_handler).await;
+        client
+            .set_node_metrics_handler(std::sync::Arc::new(
+                crate::replication::grpc::client::CriNodeMetricsHandler::new(cri.clone()),
+            ))
+            .await;
     }
     client
         .set_pod_log_handler(std::sync::Arc::new(
@@ -529,6 +534,11 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
             .set_node_exec_sync_handler(eh.clone())
             .await;
         follower_grpc_client.set_node_exec_stream_handler(eh).await;
+        follower_grpc_client
+            .set_node_metrics_handler(std::sync::Arc::new(
+                crate::replication::grpc::client::CriNodeMetricsHandler::new(cri.clone()),
+            ))
+            .await;
     }
     follower_grpc_client
         .set_pod_log_handler(std::sync::Arc::new(

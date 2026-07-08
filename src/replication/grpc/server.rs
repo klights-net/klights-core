@@ -10,6 +10,9 @@ use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{Resource, ResourcePreconditions, WatchTarget};
+use crate::metrics::{
+    NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResponse,
+};
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use crate::replication::grpc::{JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated};
 use crate::replication::protocol::{
@@ -830,6 +833,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                                         tracing::warn!(node = %joined_node_name, error = %err, "dropped unmatched pod log response");
                                     }
                                 }
+                                Some(generated::follower_message::Payload::NodeMetricsResponse(response)) => {
+                                    if let Err(err) = service.complete_node_metrics(node_metrics_response_from_proto(response)).await {
+                                        tracing::warn!(node = %joined_node_name, error = %err, "dropped unmatched node metrics response");
+                                    }
+                                }
                                 Some(generated::follower_message::Payload::NodeExecStreamFrame(frame)) => {
                                     match node_exec_stream_frame_from_proto(frame) {
                                         Ok(frame) => {
@@ -894,6 +902,13 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                                     yield Ok(generated::LeaderMessage {
                                         payload: Some(generated::leader_message::Payload::PodLogRequest(
                                             pod_log_request_to_proto(request),
+                                        )),
+                                    });
+                                }
+                                FollowerControlMessage::NodeMetrics(request) => {
+                                    yield Ok(generated::LeaderMessage {
+                                        payload: Some(generated::leader_message::Payload::NodeMetricsRequest(
+                                            node_metrics_request_to_proto(request),
                                         )),
                                     });
                                 }
@@ -2226,6 +2241,42 @@ fn pod_log_response_from_proto(response: generated::PodLogResponse) -> PodLogRes
         log_content: response.log_content,
         error: response.error,
         fin: response.fin,
+    }
+}
+
+fn node_metrics_request_to_proto(request: NodeMetricsRequest) -> generated::NodeMetricsRequest {
+    generated::NodeMetricsRequest {
+        request_id: request.request_id,
+        node_name: request.node_name,
+        pod_uids: request.pod_uids,
+    }
+}
+
+fn node_metrics_response_from_proto(
+    response: generated::NodeMetricsResponse,
+) -> NodeMetricsResponse {
+    NodeMetricsResponse {
+        request_id: response.request_id,
+        node_name: response.node_name,
+        pods: response
+            .pods
+            .into_iter()
+            .map(|pod| NodeMetricsPodSample {
+                namespace: pod.namespace,
+                name: pod.name,
+                uid: pod.uid,
+                containers: pod
+                    .containers
+                    .into_iter()
+                    .map(|container| NodeMetricsContainerSample {
+                        name: container.name,
+                        cpu_nanos: container.cpu_nanos,
+                        memory_bytes: container.memory_bytes,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        error: response.error,
     }
 }
 

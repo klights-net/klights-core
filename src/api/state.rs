@@ -45,6 +45,7 @@ pub struct AppState {
     /// build `AppState` directly can still wire it the old way.
     pub nodeport_alloc: std::sync::Arc<crate::controllers::service::NodePortAllocator>,
     pub cri: Option<std::sync::Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
+    pub metrics_provider: std::sync::Arc<dyn crate::metrics::MetricsProvider>,
     pub controller_dispatcher: std::sync::Arc<crate::controller_dispatcher::ControllerDispatcher>,
     /// Centralized post-mutation side-effect dispatch (P3d-1). HTTP mutation
     /// handlers call [`SideEffectRegistry::run_hooks`] after their datastore

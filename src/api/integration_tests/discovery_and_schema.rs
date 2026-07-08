@@ -323,8 +323,17 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
             "spec": {
                 "nodeName": "node-a",
                 "containers": [
-                    {"name": "app", "image": "busybox"},
-                    {"name": "sidecar", "image": "busybox"}
+                    {
+                        "name": "app",
+                        "image": "busybox",
+                        "resources": {"requests": {"cpu": "250m", "memory": "64Mi"}}
+                    },
+                    {
+                        "name": "sidecar",
+                        "image": "busybox",
+                        "resources": {"requests": {"cpu": "100m", "memory": "32Mi"}}
+                    },
+                    {"name": "besteffort", "image": "busybox"}
                 ]
             }
         }),
@@ -356,8 +365,8 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     assert_eq!(node_list["items"][0]["metadata"]["name"], "node-a");
     assert!(node_list["items"][0]["timestamp"].as_str().is_some());
     assert_eq!(node_list["items"][0]["window"], "30s");
-    assert_eq!(node_list["items"][0]["usage"]["cpu"], "0");
-    assert_eq!(node_list["items"][0]["usage"]["memory"], "0");
+    assert_eq!(node_list["items"][0]["usage"]["cpu"], "351m");
+    assert_eq!(node_list["items"][0]["usage"]["memory"], "99328Ki");
 
     let node_get_resp = app
         .clone()
@@ -379,6 +388,8 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     .unwrap();
     assert_eq!(node_get["kind"], "NodeMetrics");
     assert_eq!(node_get["metadata"]["name"], "node-a");
+    assert_eq!(node_get["usage"]["cpu"], "351m");
+    assert_eq!(node_get["usage"]["memory"], "99328Ki");
 
     let pod_list_resp = app
         .clone()
@@ -405,10 +416,26 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     assert_eq!(pod_list["items"][0]["metadata"]["name"], "pod-a");
     assert_eq!(pod_list["items"][0]["containers"][0]["name"], "app");
     assert_eq!(pod_list["items"][0]["containers"][1]["name"], "sidecar");
-    assert_eq!(pod_list["items"][0]["containers"][0]["usage"]["cpu"], "0");
+    assert_eq!(
+        pod_list["items"][0]["containers"][0]["usage"]["cpu"],
+        "250m"
+    );
     assert_eq!(
         pod_list["items"][0]["containers"][0]["usage"]["memory"],
-        "0"
+        "65536Ki"
+    );
+    assert_eq!(
+        pod_list["items"][0]["containers"][1]["usage"]["cpu"],
+        "100m"
+    );
+    assert_eq!(
+        pod_list["items"][0]["containers"][1]["usage"]["memory"],
+        "32768Ki"
+    );
+    assert_eq!(pod_list["items"][0]["containers"][2]["usage"]["cpu"], "1m");
+    assert_eq!(
+        pod_list["items"][0]["containers"][2]["usage"]["memory"],
+        "1024Ki"
     );
 
     let pod_get_resp = app
@@ -430,7 +457,9 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     .unwrap();
     assert_eq!(pod_get["kind"], "PodMetrics");
     assert_eq!(pod_get["metadata"]["name"], "pod-a");
-    assert_eq!(pod_get["containers"].as_array().unwrap().len(), 2);
+    assert_eq!(pod_get["containers"].as_array().unwrap().len(), 3);
+    assert_eq!(pod_get["containers"][0]["usage"]["cpu"], "250m");
+    assert_eq!(pod_get["containers"][2]["usage"]["memory"], "1024Ki");
 }
 
 #[tokio::test]

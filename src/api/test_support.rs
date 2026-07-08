@@ -70,6 +70,7 @@ pub async fn build_test_app_state() -> crate::api::AppState {
         service_ipam,
         nodeport_alloc,
         cri: None,
+        metrics_provider: Arc::new(crate::metrics::FallbackOnlyMetricsProvider),
         controller_dispatcher,
         side_effects,
         metrics,

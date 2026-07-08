@@ -21,6 +21,7 @@ pub mod label_selector;
 pub mod leader_election;
 pub(crate) mod leader_tls_policy;
 pub mod log_apply;
+pub mod metrics;
 pub mod networking;
 pub mod node_admin;
 pub mod node_lease_tracker;

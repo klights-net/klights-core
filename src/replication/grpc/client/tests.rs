@@ -10,10 +10,14 @@ mod cases {
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
+    use crate::metrics::{
+        NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResponse,
+    };
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
     use crate::replication::grpc::client::{
         ChannelLane, GrpcClientConfig, JoinDataplaneMetadata, LocalPodLogHandler,
-        NodeExecStreamHandler, NodeExecSyncHandler, PodLogHandler, ReplicationGrpcClient,
+        NodeExecStreamHandler, NodeExecSyncHandler, NodeMetricsHandler, PodLogHandler,
+        ReplicationGrpcClient,
     };
     use crate::replication::grpc::client::{ConnectDispatchContext, dispatch_leader_message};
     use crate::replication::grpc::generated::{self, follower_message, leader_message};
@@ -152,6 +156,7 @@ mod cases {
             node_exec_stream_handler: Arc::new(tokio::sync::Mutex::new(None)),
             node_exec_inputs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             pod_log_handler: Arc::new(tokio::sync::Mutex::new(None)),
+            node_metrics_handler: Arc::new(tokio::sync::Mutex::new(None)),
             observed_leader_endpoint: Some("10.99.0.10".to_string()),
         };
         let (outbound, mut outbound_rx) = tokio::sync::mpsc::channel(1);
@@ -1584,6 +1589,29 @@ mod cases {
         }
     }
 
+    struct StaticMetricsHandler;
+
+    #[async_trait::async_trait]
+    impl NodeMetricsHandler for StaticMetricsHandler {
+        async fn collect_metrics(&self, request: NodeMetricsRequest) -> NodeMetricsResponse {
+            NodeMetricsResponse {
+                request_id: request.request_id,
+                node_name: request.node_name,
+                pods: vec![NodeMetricsPodSample {
+                    namespace: "default".to_string(),
+                    name: "remote-pod".to_string(),
+                    uid: "remote-uid".to_string(),
+                    containers: vec![NodeMetricsContainerSample {
+                        name: "app".to_string(),
+                        cpu_nanos: 42_000_000,
+                        memory_bytes: 6 * 1024 * 1024,
+                    }],
+                }],
+                error: None,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn client_replies_to_node_exec_sync_requests_on_connect_stream() {
         let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
@@ -1647,6 +1675,65 @@ mod cases {
 
         assert_eq!(response.stdout, b"worker-stdout\n");
         assert_eq!(response.exit_code, 0);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn client_replies_to_node_metrics_requests_on_connect_stream() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+            .await
+            .unwrap();
+        let token = crate::bootstrap::cluster_meta::read_join_token(db.as_ref())
+            .await
+            .unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor.clone()));
+        let app = crate::replication::grpc::server::mount_service(
+            axum::Router::new(),
+            service.clone(),
+            db,
+            default_transport_policy(),
+        );
+        let app = mount_test_service_with_node_cert(app, "worker-1");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: endpoint,
+                token,
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: dataplane(),
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
+        );
+        client
+            .set_node_metrics_handler(Arc::new(StaticMetricsHandler))
+            .await;
+        client.ensure_joined().await.unwrap();
+
+        let response = service
+            .request_node_metrics(NodeMetricsRequest {
+                request_id: String::new(),
+                node_name: "worker-1".to_string(),
+                pod_uids: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.node_name, "worker-1");
+        assert_eq!(response.pods[0].uid, "remote-uid");
+        assert_eq!(response.pods[0].containers[0].cpu_nanos, 42_000_000);
         handle.abort();
     }
 

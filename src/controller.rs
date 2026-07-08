@@ -36,6 +36,9 @@ pub struct Context {
     /// fixtures that exercise non-pod controllers can construct a
     /// Context without wiring a repository.
     pub pod_repository: Option<Arc<PodRepository>>,
+    /// Request-scoped metrics provider used by HPA. Optional so unit tests
+    /// that exercise unrelated controllers do not need metrics wiring.
+    pub metrics_provider: Option<Arc<dyn crate::metrics::MetricsProvider>>,
 }
 
 impl Context {
@@ -46,6 +49,7 @@ impl Context {
             node_name,
             services: None,
             pod_repository: None,
+            metrics_provider: None,
         }
     }
 
@@ -61,6 +65,7 @@ impl Context {
             node_name,
             services: Some(services),
             pod_repository: None,
+            metrics_provider: None,
         }
     }
 
@@ -68,6 +73,14 @@ impl Context {
     /// chaining off `Context::new`/`Context::with_services`.
     pub fn with_pod_repository(mut self, pod_repository: Arc<PodRepository>) -> Self {
         self.pod_repository = Some(pod_repository);
+        self
+    }
+
+    pub fn with_metrics_provider(
+        mut self,
+        metrics_provider: Arc<dyn crate::metrics::MetricsProvider>,
+    ) -> Self {
+        self.metrics_provider = Some(metrics_provider);
         self
     }
 
@@ -89,6 +102,10 @@ impl Context {
     /// Borrow the pod repository if one is attached.
     pub fn pod_repository(&self) -> Option<&Arc<PodRepository>> {
         self.pod_repository.as_ref()
+    }
+
+    pub fn metrics_provider(&self) -> Option<&Arc<dyn crate::metrics::MetricsProvider>> {
+        self.metrics_provider.as_ref()
     }
 }
 

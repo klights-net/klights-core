@@ -21,11 +21,20 @@ impl Controller for HpaController {
                  ControllerDispatcher::set_pod_repository or Context::with_pod_repository"
             )
         })?;
-        hpa_core::reconcile_hpa(
+        let fallback_metrics;
+        let metrics_provider = match ctx.metrics_provider() {
+            Some(provider) => provider.as_ref(),
+            None => {
+                fallback_metrics = crate::metrics::FallbackOnlyMetricsProvider;
+                &fallback_metrics as &dyn crate::metrics::MetricsProvider
+            }
+        };
+        hpa_core::reconcile_hpa_with_metrics(
             ctx.db_handle().as_ref(),
             pod_repository.as_ref(),
             &resource,
             ctx.node_name(),
+            metrics_provider,
         )
         .await
     }

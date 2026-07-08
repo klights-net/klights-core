@@ -26,6 +26,7 @@ use super::protocol::{
 };
 
 use crate::datastore::backend::DatastoreBackend;
+use crate::metrics::{NodeMetricsRequest, NodeMetricsResponse};
 use crate::networking::wireguard::DataplanePeerMetadata;
 use crate::replication::grpc::fanout::FanoutPool;
 use crate::task_supervisor::{TaskCategory, TaskSupervisor};
@@ -34,6 +35,7 @@ const STREAM_FOLLOWER_QUEUE_CAPACITY: usize = 1024;
 const FOLLOWER_CONTROL_QUEUE_CAPACITY: usize = 64;
 const FANOUT_BATCH_SIZE: usize = 64;
 const NODE_EXEC_SYNC_TIMEOUT: Duration = Duration::from_secs(300);
+const NODE_METRICS_TIMEOUT: Duration = Duration::from_secs(15);
 const NODE_EXEC_STREAM_FRAME_QUEUE_CAPACITY: usize = 128;
 const POD_LOG_STREAM_FRAME_QUEUE_CAPACITY: usize = 128;
 
@@ -43,6 +45,8 @@ type PendingPodLogStreams = Arc<Mutex<HashMap<String, (String, mpsc::Sender<PodL
 type PendingNodeExecSync =
     Mutex<HashMap<String, (String, oneshot::Sender<Result<NodeExecSyncResponse>>)>>;
 type PendingPodLogSync = Mutex<HashMap<String, (String, oneshot::Sender<Result<PodLogResponse>>)>>;
+type PendingNodeMetrics =
+    Mutex<HashMap<String, (String, oneshot::Sender<Result<NodeMetricsResponse>>)>>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FollowerMetrics {
@@ -91,6 +95,7 @@ pub struct ReplicationService {
     pending_node_exec_streams: PendingNodeExecStreams,
     pending_pod_log: PendingPodLogSync,
     pending_pod_log_streams: PendingPodLogStreams,
+    pending_node_metrics: PendingNodeMetrics,
     pod_log_timeout: Duration,
     fanout_pool: Mutex<FanoutPool<ReplicationEntry>>,
     fanout_started: AtomicBool,
@@ -194,6 +199,7 @@ impl ReplicationService {
             pending_node_exec_streams: Arc::new(Mutex::new(HashMap::new())),
             pending_pod_log: Mutex::new(HashMap::new()),
             pending_pod_log_streams: Arc::new(Mutex::new(HashMap::new())),
+            pending_node_metrics: Mutex::new(HashMap::new()),
             pod_log_timeout: Duration::from_secs(30),
             fanout_pool: Mutex::new(FanoutPool::new(FANOUT_BATCH_SIZE)),
             fanout_started: AtomicBool::new(false),
@@ -449,8 +455,8 @@ impl ReplicationService {
     /// stream just noticed `control_rx` closing) must not remove the active
     /// replacement follower.
     ///
-    /// Also sweeps all four pending maps (node exec sync, node exec streams,
-    /// pod log, pod log streams) and completes every in-flight request or
+    /// Also sweeps all request/stream pending maps (node exec sync, node exec
+    /// streams, pod log, pod log streams, node metrics) and completes every in-flight request or
     /// stream session targeted at the disconnected node so callers do not
     /// block until timeout.
     pub async fn unregister_follower(&self, node_name: &str, session_id: u64) {
@@ -488,6 +494,21 @@ impl ReplicationService {
         // Sweep pending pod log requests.
         {
             let mut pending = self.pending_pod_log.lock().await;
+            let stale: Vec<String> = pending
+                .iter()
+                .filter(|(_, (n, _))| n.as_str() == node_name)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &stale {
+                if let Some((_, tx)) = pending.remove(id) {
+                    let _ = tx.send(Err(anyhow::anyhow!("{disconnected_err}")));
+                }
+            }
+        }
+
+        // Sweep pending node metrics requests.
+        {
+            let mut pending = self.pending_node_metrics.lock().await;
             let stale: Vec<String> = pending
                 .iter()
                 .filter(|(_, (n, _))| n.as_str() == node_name)
@@ -595,6 +616,84 @@ impl ReplicationService {
         else {
             return Err(anyhow!(
                 "unknown node exec response id '{}'",
+                response.request_id
+            ));
+        };
+        let _ = waiter.send(Ok(response));
+        Ok(())
+    }
+
+    pub async fn request_node_metrics(
+        &self,
+        mut request: NodeMetricsRequest,
+    ) -> Result<NodeMetricsResponse> {
+        if request.request_id.trim().is_empty() {
+            request.request_id = crate::datastore::command::CommandId::new().to_string();
+        }
+        let request_id = request.request_id.clone();
+        let node_name = request.node_name.clone();
+        let control_tx = {
+            let followers = self.followers.read().await;
+            followers
+                .get(&node_name)
+                .map(|state| state.control_tx.clone())
+                .ok_or_else(|| anyhow!("node '{node_name}' is not connected for metrics"))?
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_node_metrics.lock().await;
+            if pending
+                .insert(request_id.clone(), (node_name.clone(), response_tx))
+                .is_some()
+            {
+                return Err(anyhow!("duplicate node metrics request id '{request_id}'"));
+            }
+        }
+
+        if let Err(err) = control_tx
+            .send(FollowerControlMessage::NodeMetrics(request))
+            .await
+        {
+            self.pending_node_metrics.lock().await.remove(&request_id);
+            return Err(anyhow!(
+                "node '{node_name}' metrics stream is closed: {err}"
+            ));
+        }
+
+        match self
+            .supervisor
+            .timeout(
+                "node_metrics_response_timeout",
+                NODE_METRICS_TIMEOUT,
+                response_rx,
+            )
+            .await
+            .context("wait for node metrics response")?
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_closed)) => Err(anyhow!(
+                "node '{node_name}' metrics response channel closed"
+            )),
+            Err(_elapsed) => {
+                self.pending_node_metrics.lock().await.remove(&request_id);
+                Err(anyhow!(
+                    "node '{node_name}' metrics response timed out after {:?}",
+                    NODE_METRICS_TIMEOUT
+                ))
+            }
+        }
+    }
+
+    pub async fn complete_node_metrics(&self, response: NodeMetricsResponse) -> Result<()> {
+        let Some((_node_name, waiter)) = self
+            .pending_node_metrics
+            .lock()
+            .await
+            .remove(&response.request_id)
+        else {
+            return Err(anyhow!(
+                "unknown node metrics response id '{}'",
                 response.request_id
             ));
         };
@@ -1503,6 +1602,13 @@ mod tests {
             .await
             .insert("log-req-1".to_string(), ("test-node".to_string(), log_tx));
 
+        // Manually insert a pending node metrics request for this node.
+        let (metrics_tx, mut metrics_rx) = tokio::sync::oneshot::channel();
+        service.pending_node_metrics.lock().await.insert(
+            "metrics-req-1".to_string(),
+            ("test-node".to_string(), metrics_tx),
+        );
+
         // Also register a request for a DIFFERENT node — it must survive.
         let (other_tx, mut other_rx) = tokio::sync::oneshot::channel();
         service.pending_node_exec.lock().await.insert(
@@ -1533,6 +1639,20 @@ mod tests {
         assert!(
             log_result.unwrap_err().to_string().contains("test-node"),
             "pod log error must mention the disconnected node"
+        );
+        let metrics_result = metrics_rx
+            .try_recv()
+            .expect("node metrics oneshot must be resolved");
+        assert!(
+            metrics_result.is_err(),
+            "pending node metrics must fail on follower disconnect"
+        );
+        assert!(
+            metrics_result
+                .unwrap_err()
+                .to_string()
+                .contains("test-node"),
+            "node metrics error must mention the disconnected node"
         );
 
         // The request for other-node must NOT be affected.
@@ -1566,6 +1686,61 @@ mod tests {
                 .contains_key("log-req-1"),
             "test-node log entry must be removed"
         );
+        assert!(
+            !service
+                .pending_node_metrics
+                .lock()
+                .await
+                .contains_key("metrics-req-1"),
+            "test-node metrics entry must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_node_metrics_sends_control_message_and_completes_response() {
+        let service = Arc::new(test_service().await);
+        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            "worker-1".to_string(),
+            crate::networking::wireguard::DataplaneMode::Root,
+            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            None,
+            Some("127.0.0.1".to_string()),
+            None,
+        )
+        .unwrap();
+        let (mut control_rx, _session_id) = service.register_follower(metadata).await;
+
+        let service_for_request = service.clone();
+        let request_task = tokio::spawn(async move {
+            service_for_request
+                .request_node_metrics(NodeMetricsRequest {
+                    request_id: "metrics-1".to_string(),
+                    node_name: "worker-1".to_string(),
+                    pod_uids: Vec::new(),
+                })
+                .await
+                .unwrap()
+        });
+
+        let Some(FollowerControlMessage::NodeMetrics(request)) = control_rx.recv().await else {
+            panic!("expected node metrics request");
+        };
+        assert_eq!(request.request_id, "metrics-1");
+        assert_eq!(request.node_name, "worker-1");
+
+        service
+            .complete_node_metrics(NodeMetricsResponse {
+                request_id: request.request_id,
+                node_name: "worker-1".to_string(),
+                pods: Vec::new(),
+                error: None,
+            })
+            .await
+            .unwrap();
+
+        let response = request_task.await.unwrap();
+        assert_eq!(response.node_name, "worker-1");
+        assert!(response.error.is_none());
     }
 
     #[tokio::test]

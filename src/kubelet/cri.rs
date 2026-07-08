@@ -5,9 +5,10 @@ use k8s_cri::v1::{
     AttachRequest, AttachResponse, ContainerConfig, ContainerFilter, ContainerStatusRequest,
     ContainerStatusResponse, CreateContainerRequest, ExecRequest, ExecResponse, ExecSyncRequest,
     ExecSyncResponse, GetEventsRequest, ImageSpec, ImageStatusRequest, ListContainersRequest,
-    ListContainersResponse, ListPodSandboxRequest, PodSandboxConfig, PullImageRequest,
-    RemoveContainerRequest, RemovePodSandboxRequest, RunPodSandboxRequest, StartContainerRequest,
-    StopContainerRequest, StopPodSandboxRequest, image_service_client::ImageServiceClient,
+    ListContainersResponse, ListPodSandboxRequest, ListPodSandboxStatsRequest, PodSandboxConfig,
+    PodSandboxStats, PodSandboxStatsFilter, PullImageRequest, RemoveContainerRequest,
+    RemovePodSandboxRequest, RunPodSandboxRequest, StartContainerRequest, StopContainerRequest,
+    StopPodSandboxRequest, image_service_client::ImageServiceClient,
     runtime_service_client::RuntimeServiceClient,
 };
 use tonic::transport::{Channel, Endpoint, Uri};
@@ -195,6 +196,21 @@ impl CriClient {
 
         let response = self.runtime.list_pod_sandbox(request).await?;
         Ok(response.into_inner().items)
+    }
+
+    /// List pod sandbox stats from the local CRI endpoint.
+    ///
+    /// This is intentionally a unary on-demand call. Metrics API handlers use
+    /// it only while serving a metrics.k8s.io request; no sampler or cache
+    /// warmer is started around it.
+    pub async fn list_pod_sandbox_stats(
+        &mut self,
+        filter: Option<PodSandboxStatsFilter>,
+    ) -> Result<Vec<PodSandboxStats>> {
+        let request = tonic::Request::new(ListPodSandboxStatsRequest { filter });
+
+        let response = self.runtime.list_pod_sandbox_stats(request).await?;
+        Ok(response.into_inner().stats)
     }
 
     pub async fn create_container(

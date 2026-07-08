@@ -224,6 +224,16 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         ),
     );
     controller_dispatcher.set_services(services.clone()).await;
+    let metrics_provider: Arc<dyn crate::metrics::MetricsProvider> =
+        Arc::new(crate::metrics::OnDemandMetricsProvider::new(
+            config.node_name.clone(),
+            cri_for_api.clone(),
+            replication_service_for_router.clone(),
+            supervisor.clone(),
+        ));
+    controller_dispatcher
+        .set_metrics_provider(metrics_provider.clone())
+        .await;
 
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = Arc::new(crate::side_effects::default_registry(
@@ -401,6 +411,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         service_ipam,
         nodeport_alloc,
         cri: None,
+        metrics_provider: metrics_provider.clone(),
         controller_dispatcher,
         side_effects,
         metrics,

@@ -13,6 +13,7 @@ use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::types::{
     NodeSubnet, PodSlotAdmissionResult, PodSlotAdmissionState, Resource,
 };
+use crate::metrics::NodeMetricsRequest;
 use crate::networking::{NodeName, PodSubnet};
 
 /// A replication envelope wrapping a command with its metadata.
@@ -243,6 +244,7 @@ pub enum FollowerControlMessage {
     NodeExec(NodeExecRequest),
     NodeExecFrame(NodeExecStreamFrame),
     PodLog(PodLogRequest),
+    NodeMetrics(NodeMetricsRequest),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

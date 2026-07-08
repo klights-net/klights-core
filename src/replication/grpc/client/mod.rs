@@ -30,6 +30,7 @@ use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource};
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
 use crate::leader_tls_policy::{LeaderTlsVerification, LeaderTlsVerificationPolicy};
+use crate::metrics::{NodeMetricsRequest, NodeMetricsResponse};
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use crate::replication::grpc::generated::replication_client::ReplicationClient as TonicClient;
 use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
@@ -65,6 +66,7 @@ type NodeExecStreamHandlerSlot = Arc<Mutex<Option<Arc<dyn NodeExecStreamHandler>
 type NodeExecInputRoutes =
     Arc<Mutex<std::collections::HashMap<String, mpsc::Sender<NodeExecStreamFrame>>>>;
 type PodLogHandlerSlot = Arc<Mutex<Option<Arc<dyn PodLogHandler>>>>;
+type NodeMetricsHandlerSlot = Arc<Mutex<Option<Arc<dyn NodeMetricsHandler>>>>;
 
 #[derive(Debug)]
 struct SkipCaServerCertVerifier {
@@ -133,6 +135,7 @@ struct ConnectDispatchContext {
     node_exec_stream_handler: NodeExecStreamHandlerSlot,
     node_exec_inputs: NodeExecInputRoutes,
     pod_log_handler: PodLogHandlerSlot,
+    node_metrics_handler: NodeMetricsHandlerSlot,
     observed_leader_endpoint: Option<String>,
 }
 
@@ -160,6 +163,11 @@ pub trait PodLogHandler: Send + Sync {
     ) -> Pin<Box<dyn Stream<Item = PodLogResponse> + Send>>;
 }
 
+#[async_trait]
+pub trait NodeMetricsHandler: Send + Sync {
+    async fn collect_metrics(&self, request: NodeMetricsRequest) -> NodeMetricsResponse;
+}
+
 pub struct CriNodeExecSyncHandler {
     cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
     task_supervisor: Arc<TaskSupervisor>,
@@ -174,6 +182,16 @@ impl CriNodeExecSyncHandler {
             cri,
             task_supervisor,
         }
+    }
+}
+
+pub struct CriNodeMetricsHandler {
+    cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
+}
+
+impl CriNodeMetricsHandler {
+    pub fn new(cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>) -> Self {
+        Self { cri }
     }
 }
 
@@ -408,6 +426,24 @@ impl NodeExecStreamHandler for CriNodeExecSyncHandler {
                     format!("remote node exec failed: {err:#}"),
                 ))
                 .await;
+        }
+    }
+}
+
+#[async_trait]
+impl NodeMetricsHandler for CriNodeMetricsHandler {
+    async fn collect_metrics(&self, request: NodeMetricsRequest) -> NodeMetricsResponse {
+        let mut client = {
+            let guard = self.cri.lock().await;
+            guard.clone()
+        };
+        match client.list_pod_sandbox_stats(None).await {
+            Ok(stats) => NodeMetricsResponse::from_pod_sandbox_stats(&request, stats),
+            Err(err) => NodeMetricsResponse::error(
+                request.request_id,
+                request.node_name,
+                format!("{err:#}"),
+            ),
         }
     }
 }
@@ -682,6 +718,7 @@ pub struct ReplicationGrpcClient {
     node_exec_sync_handler: NodeExecSyncHandlerSlot,
     node_exec_stream_handler: NodeExecStreamHandlerSlot,
     pod_log_handler: PodLogHandlerSlot,
+    node_metrics_handler: NodeMetricsHandlerSlot,
     /// T2 step 5: list of all known leader endpoints (from --leader).
     /// When the stream fails, the reconnect loop cycles through these
     /// to find a reachable leader instead of retrying the same fixed
@@ -891,6 +928,7 @@ impl ReplicationGrpcClient {
             node_exec_sync_handler: Arc::new(Mutex::new(None)),
             node_exec_stream_handler: Arc::new(Mutex::new(None)),
             pod_log_handler: Arc::new(Mutex::new(None)),
+            node_metrics_handler: Arc::new(Mutex::new(None)),
             all_leader_endpoints: Arc::new(std::sync::Mutex::new(Vec::new())),
             endpoint_index: Arc::new(std::sync::Mutex::new(0)),
             current_endpoint_override: Arc::new(std::sync::Mutex::new(None)),
@@ -1080,6 +1118,10 @@ impl ReplicationGrpcClient {
 
     pub async fn set_pod_log_handler(&self, handler: Arc<dyn PodLogHandler>) {
         *self.pod_log_handler.lock().await = Some(handler);
+    }
+
+    pub async fn set_node_metrics_handler(&self, handler: Arc<dyn NodeMetricsHandler>) {
+        *self.node_metrics_handler.lock().await = Some(handler);
     }
 
     #[cfg(test)]
@@ -2075,6 +2117,7 @@ impl ReplicationGrpcClient {
             node_exec_stream_handler: self.node_exec_stream_handler.clone(),
             node_exec_inputs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pod_log_handler: self.pod_log_handler.clone(),
+            node_metrics_handler: self.node_metrics_handler.clone(),
             observed_leader_endpoint: self.observed_leader_endpoint_for_report(),
         };
         self.supervisor
@@ -2519,6 +2562,20 @@ async fn dispatch_leader_message(
                     })?;
             }
         }
+        Some(generated::leader_message::Payload::NodeMetricsRequest(request)) => {
+            let response =
+                handle_node_metrics_request(request, &context.node_metrics_handler).await;
+            outbound
+                .send(generated::FollowerMessage {
+                    payload: Some(generated::follower_message::Payload::NodeMetricsResponse(
+                        response,
+                    )),
+                })
+                .await
+                .map_err(|_| {
+                    anyhow!("replication stream closed before node metrics response send")
+                })?;
+        }
         Some(generated::leader_message::Payload::ObserveLeaderEndpointRequest(_)) => {
             if let Some(endpoint) = context.observed_leader_endpoint.as_deref() {
                 outbound
@@ -2672,6 +2729,21 @@ async fn handle_pod_log_request(
         };
     };
     pod_log_response_to_proto(handler.get_logs(request).await)
+}
+
+async fn handle_node_metrics_request(
+    request: generated::NodeMetricsRequest,
+    handler: &NodeMetricsHandlerSlot,
+) -> generated::NodeMetricsResponse {
+    let request = node_metrics_request_from_proto(request);
+    let Some(handler) = handler.lock().await.clone() else {
+        return node_metrics_response_to_proto(NodeMetricsResponse::error(
+            request.request_id,
+            request.node_name,
+            "node metrics handler is not available",
+        ));
+    };
+    node_metrics_response_to_proto(handler.collect_metrics(request).await)
 }
 
 async fn handle_pod_log_follow_request(
@@ -3103,6 +3175,40 @@ fn pod_log_response_to_proto(response: PodLogResponse) -> generated::PodLogRespo
         log_content: response.log_content,
         error: response.error,
         fin: response.fin,
+    }
+}
+
+fn node_metrics_request_from_proto(request: generated::NodeMetricsRequest) -> NodeMetricsRequest {
+    NodeMetricsRequest {
+        request_id: request.request_id,
+        node_name: request.node_name,
+        pod_uids: request.pod_uids,
+    }
+}
+
+fn node_metrics_response_to_proto(response: NodeMetricsResponse) -> generated::NodeMetricsResponse {
+    generated::NodeMetricsResponse {
+        request_id: response.request_id,
+        node_name: response.node_name,
+        pods: response
+            .pods
+            .into_iter()
+            .map(|pod| generated::NodeMetricsPodSample {
+                namespace: pod.namespace,
+                name: pod.name,
+                uid: pod.uid,
+                containers: pod
+                    .containers
+                    .into_iter()
+                    .map(|container| generated::NodeMetricsContainerSample {
+                        name: container.name,
+                        cpu_nanos: container.cpu_nanos,
+                        memory_bytes: container.memory_bytes,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        error: response.error,
     }
 }
 

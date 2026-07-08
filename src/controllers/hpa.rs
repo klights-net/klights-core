@@ -4,6 +4,10 @@ use crate::datastore::{
     DatastoreBackend, PatchKind, Resource, ResourcePatchRequest, ResourcePreconditions,
 };
 use crate::kubelet::pod_repository::{PodReader, PodRepository};
+use crate::metrics::{
+    MetricsProvider, PodMetric, RuntimeMetricsSnapshot, format_resource_quantity,
+    parse_resource_quantity_value, pod_request_for_resource,
+};
 use anyhow::{Context as _, Result, anyhow};
 use serde_json::{Value, json};
 
@@ -14,6 +18,17 @@ pub async fn reconcile_hpa(
     pod_repository: &PodRepository,
     hpa: &Value,
     node_name: &str,
+) -> Result<()> {
+    let metrics_provider = crate::metrics::FallbackOnlyMetricsProvider;
+    reconcile_hpa_with_metrics(db, pod_repository, hpa, node_name, &metrics_provider).await
+}
+
+pub async fn reconcile_hpa_with_metrics(
+    db: &dyn DatastoreBackend,
+    pod_repository: &PodRepository,
+    hpa: &Value,
+    node_name: &str,
+    metrics_provider: &dyn MetricsProvider,
 ) -> Result<()> {
     let api_version = hpa
         .get("apiVersion")
@@ -42,7 +57,14 @@ pub async fn reconcile_hpa(
             .await?
             .context("HPA not found")?;
 
-        let decision = evaluate_hpa(db, pod_repository, &current.data, namespace).await?;
+        let decision = evaluate_hpa(
+            db,
+            pod_repository,
+            metrics_provider,
+            &current.data,
+            namespace,
+        )
+        .await?;
         if decision.scale_active
             && let Some(target) = &decision.target
             && target.spec_replicas != decision.desired_replicas
@@ -106,6 +128,7 @@ struct ScaleTarget {
 struct MetricObservation {
     current_metric: Value,
     desired_replicas: i64,
+    current_utilization: Option<i64>,
 }
 
 struct HpaDecision {
@@ -117,12 +140,14 @@ struct HpaDecision {
     max_replicas: i64,
     scale_active: bool,
     current_metrics: Vec<Value>,
+    current_cpu_utilization: Option<i64>,
     inactive_reason: Option<&'static str>,
 }
 
 async fn evaluate_hpa(
     db: &dyn DatastoreBackend,
     pod_reader: &dyn PodReader,
+    metrics_provider: &dyn MetricsProvider,
     hpa: &Value,
     namespace: &str,
 ) -> Result<HpaDecision> {
@@ -148,11 +173,12 @@ async fn evaluate_hpa(
             max_replicas,
             scale_active: false,
             current_metrics: Vec::new(),
+            current_cpu_utilization: None,
             inactive_reason: Some("FailedGetScale"),
         });
     };
 
-    let observations = observe_metrics(pod_reader, hpa, spec, &target).await?;
+    let observations = observe_metrics(pod_reader, metrics_provider, hpa, spec, &target).await?;
     if observations.is_empty() {
         let current = target.status_replicas;
         return Ok(HpaDecision {
@@ -164,6 +190,7 @@ async fn evaluate_hpa(
             max_replicas,
             scale_active: false,
             current_metrics: Vec::new(),
+            current_cpu_utilization: None,
             inactive_reason: Some("FailedGetResourceMetric"),
         });
     }
@@ -174,6 +201,9 @@ async fn evaluate_hpa(
         .max()
         .unwrap_or(target.status_replicas);
     let desired = raw_desired.clamp(min_replicas, max_replicas);
+    let current_cpu_utilization = observations
+        .iter()
+        .find_map(|metric| metric.current_utilization);
     let current_metrics = observations
         .into_iter()
         .map(|metric| metric.current_metric)
@@ -188,6 +218,7 @@ async fn evaluate_hpa(
         max_replicas,
         scale_active: true,
         current_metrics,
+        current_cpu_utilization,
         inactive_reason: None,
     })
 }
@@ -280,6 +311,7 @@ async fn get_scale_target(
 
 async fn observe_metrics(
     pod_reader: &dyn PodReader,
+    metrics_provider: &dyn MetricsProvider,
     hpa: &Value,
     spec: &Value,
     target: &ScaleTarget,
@@ -287,7 +319,7 @@ async fn observe_metrics(
     let pods = pod_reader
         .list_pods(Some(&target.namespace), None, None, None, None)
         .await?;
-    let matching_ready_pods = pods
+    let matching_ready_pods: Vec<Resource> = pods
         .items
         .iter()
         .filter(|pod| {
@@ -295,11 +327,15 @@ async fn observe_metrics(
                 && target.selector.matches_resource(&pod.data)
                 && crate::controllers::common::is_pod_ready_value(&pod.data)
         })
-        .count() as i64;
+        .cloned()
+        .collect();
 
-    if matching_ready_pods == 0 {
+    if matching_ready_pods.is_empty() {
         return Ok(Vec::new());
     }
+    let runtime = metrics_provider
+        .runtime_snapshot_for_pods(&matching_ready_pods)
+        .await;
 
     if hpa.get("apiVersion").and_then(|v| v.as_str()) == Some("autoscaling/v1") {
         if let Some(target_utilization) = spec
@@ -307,10 +343,16 @@ async fn observe_metrics(
             .and_then(|v| v.as_i64())
             .filter(|value| *value > 0)
         {
-            return Ok(vec![MetricObservation {
-                current_metric: resource_current_metric("cpu", "Utilization"),
-                desired_replicas: desired_from_ratio(target.status_replicas, 0, target_utilization),
-            }]);
+            return Ok(observe_resource_metric(
+                "cpu",
+                "Utilization",
+                target_utilization,
+                target,
+                &matching_ready_pods,
+                &runtime,
+            )
+            .into_iter()
+            .collect());
         }
         return Ok(Vec::new());
     }
@@ -334,54 +376,153 @@ async fn observe_metrics(
         let Some(target_metric) = resource_metric.get("target") else {
             continue;
         };
-        let desired = match target_metric.get("type").and_then(|v| v.as_str()) {
-            Some("Utilization") => target_metric
+        let target_type = target_metric
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Utilization");
+        let target_value = match target_type {
+            "Utilization" => target_metric
                 .get("averageUtilization")
                 .and_then(|v| v.as_i64())
-                .filter(|value| *value > 0)
-                .map(|target_value| desired_from_ratio(target.status_replicas, 0, target_value)),
-            Some("AverageValue") => target_metric
+                .filter(|value| *value > 0),
+            "AverageValue" => target_metric
                 .get("averageValue")
-                .and_then(quantity_milli_value)
-                .filter(|value| *value > 0)
-                .map(|target_value| desired_from_ratio(target.status_replicas, 0, target_value)),
-            Some("Value") => target_metric
+                .and_then(|value| parse_resource_quantity_value(name, value))
+                .and_then(|value| i64::try_from(value).ok())
+                .filter(|value| *value > 0),
+            "Value" => target_metric
                 .get("value")
-                .and_then(quantity_milli_value)
-                .filter(|value| *value > 0)
-                .map(|target_value| desired_from_ratio(target.status_replicas, 0, target_value)),
+                .and_then(|value| parse_resource_quantity_value(name, value))
+                .and_then(|value| i64::try_from(value).ok())
+                .filter(|value| *value > 0),
             _ => None,
         };
 
-        if let Some(desired_replicas) = desired {
-            observations.push(MetricObservation {
-                current_metric: resource_current_metric(
-                    name,
-                    target_metric
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Utilization"),
-                ),
-                desired_replicas,
-            });
+        if let Some(target_value) = target_value
+            && let Some(observation) = observe_resource_metric(
+                name,
+                target_type,
+                target_value,
+                target,
+                &matching_ready_pods,
+                &runtime,
+            )
+        {
+            observations.push(observation);
         }
     }
     Ok(observations)
 }
 
-fn resource_current_metric(name: &str, target_type: &str) -> Value {
-    let current = match target_type {
-        "Value" => json!({"value": "0"}),
-        "AverageValue" => json!({"averageValue": "0"}),
-        _ => json!({"averageUtilization": 0, "averageValue": "0"}),
+fn observe_resource_metric(
+    name: &str,
+    target_type: &str,
+    target_value: i64,
+    target: &ScaleTarget,
+    pods: &[Resource],
+    runtime: &RuntimeMetricsSnapshot,
+) -> Option<MetricObservation> {
+    let summary = ResourceMetricSummary::from_pods(name, pods, runtime)?;
+    let target_value = u64::try_from(target_value).ok()?;
+    let desired_replicas = match target_type {
+        "Utilization" => {
+            let current_utilization = summary.average_utilization?;
+            desired_from_ratio(
+                target.status_replicas,
+                i64::try_from(current_utilization).ok()?,
+                i64::try_from(target_value).ok()?,
+            )
+        }
+        "AverageValue" => desired_from_ratio(
+            target.status_replicas,
+            i64::try_from(summary.average_usage()).ok()?,
+            i64::try_from(target_value).ok()?,
+        ),
+        "Value" => desired_from_ratio(
+            target.status_replicas,
+            i64::try_from(summary.total_usage).ok()?,
+            i64::try_from(target_value).ok()?,
+        ),
+        _ => return None,
     };
-    json!({
+
+    Some(MetricObservation {
+        current_metric: resource_current_metric(name, target_type, &summary).ok()?,
+        desired_replicas,
+        current_utilization: summary
+            .average_utilization
+            .and_then(|value| value.try_into().ok()),
+    })
+}
+
+struct ResourceMetricSummary {
+    pod_count: u64,
+    total_usage: u64,
+    average_utilization: Option<u64>,
+}
+
+impl ResourceMetricSummary {
+    fn from_pods(
+        resource: &str,
+        pods: &[Resource],
+        runtime: &RuntimeMetricsSnapshot,
+    ) -> Option<Self> {
+        let mut pod_count = 0_u64;
+        let mut total_usage = 0_u64;
+        let mut total_request = 0_u64;
+        let mut request_complete = true;
+        for pod in pods {
+            let metric = PodMetric::from_resource(pod, runtime);
+            total_usage = total_usage.saturating_add(metric.usage_for_resource(resource)?);
+            if let Some(request) = pod_request_for_resource(pod, resource) {
+                total_request = total_request.saturating_add(request);
+            } else {
+                request_complete = false;
+            }
+            pod_count += 1;
+        }
+        if pod_count == 0 {
+            return None;
+        }
+        let average_utilization = if request_complete && total_request > 0 {
+            Some(total_usage.saturating_mul(100).div_ceil(total_request))
+        } else {
+            None
+        };
+        Some(Self {
+            pod_count,
+            total_usage,
+            average_utilization,
+        })
+    }
+
+    fn average_usage(&self) -> u64 {
+        self.total_usage.div_ceil(self.pod_count)
+    }
+}
+
+fn resource_current_metric(
+    name: &str,
+    target_type: &str,
+    summary: &ResourceMetricSummary,
+) -> Result<Value> {
+    let current = match target_type {
+        "Value" => json!({"value": format_resource_quantity(name, summary.total_usage)?}),
+        "AverageValue" => {
+            json!({"averageValue": format_resource_quantity(name, summary.average_usage())?})
+        }
+        _ => json!({
+            "averageUtilization": summary.average_utilization.unwrap_or(0),
+            "averageValue": format_resource_quantity(name, summary.average_usage())?
+        }),
+    };
+    Ok(json!({
         "type": "Resource",
         "resource": {
             "name": name,
             "current": current
         }
-    })
+    }))
 }
 
 fn desired_from_ratio(current_replicas: i64, current_value: i64, target_value: i64) -> i64 {
@@ -389,17 +530,6 @@ fn desired_from_ratio(current_replicas: i64, current_value: i64, target_value: i
         return current_replicas;
     }
     ((current_replicas.max(0) * current_value.max(0)) + target_value - 1) / target_value
-}
-
-fn quantity_milli_value(value: &Value) -> Option<i64> {
-    if let Some(number) = value.as_i64() {
-        return Some(number * 1000);
-    }
-    let raw = value.as_str()?.trim();
-    if let Some(milli) = raw.strip_suffix('m') {
-        return milli.parse::<i64>().ok();
-    }
-    raw.parse::<i64>().ok().map(|value| value * 1000)
 }
 
 async fn patch_scale_target(
@@ -493,7 +623,8 @@ fn build_status(hpa: &Value, decision: &HpaDecision) -> Value {
 
     if hpa.get("apiVersion").and_then(|v| v.as_str()) == Some("autoscaling/v1") {
         if decision.scale_active {
-            status["currentCPUUtilizationPercentage"] = json!(0);
+            status["currentCPUUtilizationPercentage"] =
+                json!(decision.current_cpu_utilization.unwrap_or(0));
         }
     } else if !decision.current_metrics.is_empty() {
         status["currentMetrics"] = Value::Array(decision.current_metrics.clone());
@@ -653,7 +784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hpa_v2_resource_metric_scales_deployment_to_min_replicas() {
+    async fn hpa_v2_resource_metric_scales_deployment_from_resource_usage() {
         let db = crate::datastore::test_support::in_memory().await;
         let pod_repository = crate::controllers::test_utils::pod_repository_for_test(&db);
 
@@ -725,7 +856,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(deployment.data.pointer("/spec/replicas"), Some(&json!(2)));
+        assert_eq!(deployment.data.pointer("/spec/replicas"), Some(&json!(8)));
 
         let hpa = db
             .get_resource(
@@ -738,11 +869,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(hpa.data.pointer("/status/currentReplicas"), Some(&json!(4)));
-        assert_eq!(hpa.data.pointer("/status/desiredReplicas"), Some(&json!(2)));
+        assert_eq!(hpa.data.pointer("/status/desiredReplicas"), Some(&json!(8)));
         assert_eq!(
             hpa.data
                 .pointer("/status/currentMetrics/0/resource/current/averageUtilization"),
-            Some(&json!(0))
+            Some(&json!(100))
         );
         assert_eq!(
             hpa.data.pointer("/status/conditions/0/type"),
@@ -757,7 +888,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hpa_v1_cpu_metric_scales_replicationcontroller_to_min_replicas() {
+    async fn hpa_v1_cpu_metric_scales_replicationcontroller_from_resource_usage() {
         let db = crate::datastore::test_support::in_memory().await;
         let pod_repository = crate::controllers::test_utils::pod_repository_for_test(&db);
 
@@ -823,7 +954,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rc.data.pointer("/spec/replicas"), Some(&json!(1)));
+        assert_eq!(rc.data.pointer("/spec/replicas"), Some(&json!(5)));
 
         let hpa = db
             .get_resource(
@@ -836,10 +967,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(hpa.data.pointer("/status/currentReplicas"), Some(&json!(3)));
-        assert_eq!(hpa.data.pointer("/status/desiredReplicas"), Some(&json!(1)));
+        assert_eq!(hpa.data.pointer("/status/desiredReplicas"), Some(&json!(5)));
         assert_eq!(
             hpa.data.pointer("/status/currentCPUUtilizationPercentage"),
-            Some(&json!(0))
+            Some(&json!(100))
         );
     }
 }

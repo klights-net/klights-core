@@ -285,6 +285,7 @@ async fn test_replicationcontroller_scale_subresource() {
         service_ipam,
         nodeport_alloc: std::sync::Arc::new(crate::controllers::service::NodePortAllocator::new()),
         cri: None,
+        metrics_provider: std::sync::Arc::new(crate::metrics::FallbackOnlyMetricsProvider),
         controller_dispatcher,
         side_effects,
         metrics,
