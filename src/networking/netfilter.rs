@@ -32,9 +32,13 @@ pub struct Netfilter {
 }
 
 struct NetfilterInner {
-    socket: Mutex<Socket>,
-    portid: u32,
+    socket: Mutex<NetfilterSocket>,
     task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+}
+
+struct NetfilterSocket {
+    socket: Socket,
+    portid: u32,
 }
 
 // SAFETY: mnl::Socket wraps a raw `*mut mnl_socket`. The pointer itself is not
@@ -44,16 +48,22 @@ struct NetfilterInner {
 unsafe impl Send for NetfilterInner {}
 unsafe impl Sync for NetfilterInner {}
 
+impl NetfilterSocket {
+    fn open() -> Result<Self> {
+        let socket = Socket::new(mnl::Bus::Netfilter).context("open NETLINK_NETFILTER socket")?;
+        let portid = socket.portid();
+        Ok(Self { socket, portid })
+    }
+}
+
 impl Netfilter {
     /// Open a netlink socket to the kernel `nf_tables` subsystem.
     /// Requires `CAP_NET_ADMIN` (i.e. root for klights).
     pub fn new(task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>) -> Result<Self> {
-        let socket = Socket::new(mnl::Bus::Netfilter).context("open NETLINK_NETFILTER socket")?;
-        let portid = socket.portid();
+        let socket = NetfilterSocket::open()?;
         Ok(Self {
             inner: Arc::new(NetfilterInner {
                 socket: Mutex::new(socket),
-                portid,
                 task_supervisor,
             }),
         })
@@ -175,13 +185,34 @@ impl Netfilter {
 impl NetfilterInner {
     fn send_blocking(&self, batch: Batch) -> Result<()> {
         let finalized = batch.into_inner().finalize();
-        let socket = self
+        let mut socket = self
             .socket
             .lock()
             .map_err(|_| anyhow!("netlink socket mutex poisoned"))?;
 
-        socket
-            .send_all(&finalized)
+        let result = Self::send_finalized_batch(&mut socket, &finalized);
+        if result.is_err() {
+            match NetfilterSocket::open() {
+                Ok(replacement) => {
+                    *socket = replacement;
+                }
+                Err(reopen_err) => {
+                    return result.with_context(|| {
+                        format!("reopen NETLINK_NETFILTER socket after batch error: {reopen_err}")
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    fn send_finalized_batch(
+        socket_state: &mut NetfilterSocket,
+        finalized: &nftnl::FinalizedBatch,
+    ) -> Result<()> {
+        socket_state
+            .socket
+            .send_all(finalized)
             .context("send batched nf_tables netlink messages")?;
 
         let mut buffer = vec![0u8; nftnl::nft_nlmsg_maxsize() as usize];
@@ -193,14 +224,18 @@ impl NetfilterInner {
         // exhausted rather than assuming one-recv-per-ACK. Pattern matches
         // the upstream nftnl `add-rules.rs` example.
         while !expected_seqs.is_empty() {
-            let messages = socket.recv(&mut buffer[..]).context("recv nf_tables ACK")?;
+            let messages = socket_state
+                .socket
+                .recv(&mut buffer[..])
+                .context("recv nf_tables ACK")?;
             for message in messages {
                 let message = message.context("decode netlink message")?;
                 let expected_seq = expected_seqs
                     .next()
                     .ok_or_else(|| anyhow!("kernel returned more ACKs than the batch contained"))?;
-                mnl::cb_run(message, expected_seq, self.portid)
-                    .map_err(|e| anyhow!("nf_tables ACK reported error: {e}"))?;
+                mnl::cb_run(message, expected_seq, socket_state.portid).map_err(|e| {
+                    anyhow!("nf_tables ACK reported error for sequence {expected_seq}: {e}")
+                })?;
             }
         }
         Ok(())
@@ -664,6 +699,72 @@ mod integration_tests {
         assert!(
             !remaining.contains(&target_handle),
             "deleted handle {target_handle} should not appear in {remaining:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_netfilter_handle_recovers_after_failed_batch() {
+        let table_name = unique_table_name("klights_it_recover");
+        let _guard = TableGuard {
+            name: table_name.clone(),
+        };
+
+        let nf = Netfilter::new(test_task_supervisor()).expect("Netfilter::new");
+        let table_c = CString::new(table_name.as_str()).unwrap();
+        nf.ensure_table(ProtoFamily::Inet, &table_c)
+            .await
+            .expect("ensure_table");
+
+        let chain_name = CString::new("recover-chain").unwrap();
+        let table = Table::new(&table_c, ProtoFamily::Inet);
+        let chain = Chain::new(&chain_name, &table);
+        let seed = {
+            let mut rule = Rule::new(&chain);
+            rule.add_expr(&nftnl::nft_expr!(verdict accept));
+            rule
+        };
+        nf.replace_chain(&chain, &[seed]).await.expect("seed chain");
+
+        let mut invalid_delete = Rule::new(&chain);
+        invalid_delete.set_handle(u64::MAX);
+        let valid_after_error = {
+            let mut rule = Rule::new(&chain);
+            rule.add_expr(&nftnl::nft_expr!(verdict accept));
+            rule
+        };
+        let mut bad_batch = Batch::new();
+        bad_batch.add(&invalid_delete, MsgType::Del);
+        bad_batch.add(&valid_after_error, MsgType::Add);
+
+        let err = nf
+            .send(bad_batch)
+            .await
+            .expect_err("deleting a nonexistent rule handle must fail");
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("nf_tables ACK reported error"),
+            "failure must come from an nf_tables ACK, got: {err}"
+        );
+
+        let replacement = {
+            let mut rule = Rule::new(&chain);
+            rule.add_expr(&nftnl::nft_expr!(verdict accept));
+            rule
+        };
+        nf.replace_chain_rules(&chain, &[replacement])
+            .await
+            .expect("same netfilter handle must remain usable after a failed batch");
+
+        let listing = Command::new("nft")
+            .args(["list", "chain", "inet", &table_name, "recover-chain"])
+            .output()
+            .expect("nft list chain");
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert_eq!(
+            listing.matches("accept").count(),
+            1,
+            "successful replacement after failed batch must leave exactly one rule:\n{listing}"
         );
     }
 }
