@@ -128,9 +128,26 @@ const OUTBOX_CLAIM_DUE_SELECT_AND_WHERE: &str = "SELECT id FROM outbox candidate
              ) \
        )) ";
 
-const OUTBOX_CLAIM_DUE_ORDER: &str = "ORDER BY CASE candidate.operation \
-           WHEN 'LeaseRenew' THEN 0 \
-           WHEN 'NodeStatus' THEN 1 \
+const OUTBOX_CLAIM_DUE_ORDER: &str = "ORDER BY CASE \
+           WHEN candidate.operation = 'LeaseRenew' THEN 0 \
+           WHEN candidate.operation = 'NodeStatus' THEN 1 \
+           WHEN candidate.operation = 'EventCreate' \
+             AND EXISTS ( \
+                 SELECT 1 FROM outbox status_candidate \
+                 WHERE status_candidate.next_due_ms <= ?1 \
+                   AND (status_candidate.leased_until_ms = 0 OR status_candidate.leased_until_ms <= ?1) \
+                   AND status_candidate.is_terminal_pod_delete = 0 \
+                   AND status_candidate.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
+                       'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM outbox terminal \
+                       WHERE terminal.subject_key = status_candidate.subject_key \
+                         AND terminal.id > status_candidate.id \
+                         AND terminal.is_terminal_pod_delete = 1 \
+                         AND terminal.next_due_ms <= ?1 \
+                         AND (terminal.leased_until_ms = 0 OR terminal.leased_until_ms <= ?1) \
+                   ) \
+             ) THEN 3 \
            ELSE 2 \
        END, candidate.next_due_ms ASC, candidate.id ASC LIMIT ";
 

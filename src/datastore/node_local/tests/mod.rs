@@ -35,6 +35,15 @@ async fn open_sqlite_node_local_backend_handle() -> NodeLocalHandle {
 }
 
 fn test_outbox_insert(key: &str, subject_key: &str, now_ms: i64) -> OutboxInsert {
+    test_outbox_insert_with_operation(key, subject_key, "PodStatus", now_ms)
+}
+
+fn test_outbox_insert_with_operation(
+    key: &str,
+    subject_key: &str,
+    operation: &str,
+    now_ms: i64,
+) -> OutboxInsert {
     OutboxInsert {
         idempotency_key: key.to_string(),
         enqueued_ms: now_ms,
@@ -45,7 +54,7 @@ fn test_outbox_insert(key: &str, subject_key: &str, now_ms: i64) -> OutboxInsert
         subject_name: "web".to_string(),
         subject_uid: Some("pod-uid".to_string()),
         pod_uid: "pod-uid".to_string(),
-        operation: "PodStatus".to_string(),
+        operation: operation.to_string(),
         payload_proto: vec![],
         next_due_ms: now_ms,
     }
@@ -162,6 +171,38 @@ async fn node_local_outbox_claim_skips_same_subject_rows_with_stream_in_flight()
             .unwrap()
             .is_none(),
         "same stream must wait until the earlier leased row completes"
+    );
+}
+
+#[tokio::test]
+async fn node_local_outbox_prioritizes_status_before_older_events() {
+    let db = open_node_local_in_memory().await;
+    db.enqueue_outbox(test_outbox_insert_with_operation(
+        "event-first",
+        "events.k8s.io/v1/Event/default/diagnostic/event-uid",
+        "EventCreate",
+        1,
+    ))
+    .await
+    .unwrap();
+    db.enqueue_outbox(test_outbox_insert_with_operation(
+        "status-second",
+        "v1/Pod/default/web/pod-uid",
+        "PodStatus",
+        2,
+    ))
+    .await
+    .unwrap();
+
+    let claimed = db
+        .claim_next_due_outbox(10, 1000, "lease-status")
+        .await
+        .unwrap()
+        .expect("status row should be claimable");
+
+    assert_eq!(
+        claimed.idempotency_key, "status-second",
+        "readiness-critical Pod status must not wait behind older diagnostic events"
     );
 }
 
