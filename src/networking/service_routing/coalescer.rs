@@ -388,7 +388,7 @@ impl NftServiceRouter {
                                 let next_backoff =
                                     std::cmp::min(backoff.saturating_mul(2), MAX_RETRY_BACKOFF);
                                 tracing::warn!(
-                                    "coalesced routing sync failed (retry in {:?}, next backoff {:?}): {e}",
+                                    "coalesced routing sync failed (retry in {:?}, next backoff {:?}): {e:#}",
                                     backoff,
                                     next_backoff,
                                 );

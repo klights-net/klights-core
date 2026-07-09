@@ -1009,17 +1009,25 @@ impl KlightsTable {
         let rule_count = rules.len();
         // The services chain is referenced by `jump services` from
         // nat-prerouting and nat-output, while service_ct_guard is referenced
-        // from filter-forward. We can't DEL+ADD either chain (EBUSY), so the
-        // two rule sets are flushed in place and repopulated in one kernel
-        // transaction. This keeps the forward guard and DNAT rules from
-        // advancing independently under netlink errors.
+        // from filter-forward. We can't DEL+ADD either chain (EBUSY), so both
+        // chains are flushed in place. Send the guard first so new DNAT rules
+        // are never visible before the forward guard allows their original
+        // ClusterIP/protocol/port tuple. Keeping the two rewrites in separate
+        // batches also avoids oversized netlink transactions during large
+        // conformance Service churn.
+        let mut guard_batch = Batch::new();
+        guard_batch.replace_chain_rules(&service_ct_guard_chain, &service_ct_guard_rules);
+        self.nf
+            .send(guard_batch)
+            .await
+            .context("replace service conntrack guard rules")?;
+
         let mut batch = Batch::new();
         batch.replace_chain_rules(&services_chain, &rules);
-        batch.replace_chain_rules(&service_ct_guard_chain, &service_ct_guard_rules);
         self.nf
             .send(batch)
             .await
-            .context("replace services and service conntrack guard rules")?;
+            .context("replace services chain rules")?;
 
         tracing::debug!(
             "nft services chain replaced: {} services, {} rules",
