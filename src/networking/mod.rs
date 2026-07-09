@@ -15,6 +15,7 @@ pub mod rootless;
 pub mod rootless_plane;
 pub mod service_router;
 pub mod service_routing;
+pub(crate) mod subnet_allocator;
 #[cfg(test)]
 pub mod test_support;
 pub mod types;

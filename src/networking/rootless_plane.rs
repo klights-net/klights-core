@@ -82,15 +82,18 @@ impl RootlessNetworkPlane {
             )
             .await
             .context("failed to spawn rootless network plane rtnetlink connection task")?;
-        let local_subnet = cluster_api
-            .allocate_node_subnet(&cfg.node_name, &cfg.cluster_cidr, node_ip)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to allocate local rootless node subnet for {} at {}",
-                    cfg.node_name, node_ip
-                )
-            })?;
+        let local_subnet = crate::networking::subnet_allocator::NodeSubnetAllocator::new(
+            cluster_api,
+            task_supervisor.clone(),
+        )
+        .allocate(&cfg.node_name, &cfg.cluster_cidr, node_ip)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to allocate local rootless node subnet for {} at {}",
+                cfg.node_name, node_ip
+            )
+        })?;
         let plane = Arc::new(Self {
             node_local,
             rt: handle,

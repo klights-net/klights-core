@@ -116,15 +116,18 @@ impl NetworkPlane {
         let host_ip =
             Ipv4Addr::from_str(node_ip).with_context(|| format!("invalid node ip {}", node_ip))?;
 
-        let local_subnet = cluster_api
-            .allocate_node_subnet(&cfg.node_name, &cfg.cluster_cidr, node_ip)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to allocate local node subnet for {} at {}",
-                    cfg.node_name, node_ip
-                )
-            })?;
+        let local_subnet = crate::networking::subnet_allocator::NodeSubnetAllocator::new(
+            cluster_api,
+            task_supervisor.clone(),
+        )
+        .allocate(&cfg.node_name, &cfg.cluster_cidr, node_ip)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to allocate local node subnet for {} at {}",
+                cfg.node_name, node_ip
+            )
+        })?;
 
         let (conn, handle, _) =
             rtnetlink::new_connection().context("failed to open rtnetlink for network plane")?;
