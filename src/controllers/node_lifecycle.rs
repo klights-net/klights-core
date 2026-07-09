@@ -223,6 +223,69 @@ async fn reconcile_node_lifecycle_once_with_tracker(
     Ok(next_deadline)
 }
 
+async fn cleanup_pods_bound_to_deleted_node_event(
+    db: &dyn DatastoreBackend,
+    pod_repository: &dyn NodeLifecyclePodRepository,
+    side_effects: Option<&crate::side_effects::SideEffectRegistry>,
+    event: &WatchEvent,
+) -> Result<bool> {
+    let Some(node_name) = deleted_node_name(event) else {
+        return Ok(false);
+    };
+    cleanup_pods_bound_to_deleted_node(db, pod_repository, side_effects, node_name).await?;
+    Ok(true)
+}
+
+fn deleted_node_name(event: &WatchEvent) -> Option<&str> {
+    if event.event_type != EventType::Deleted {
+        return None;
+    }
+    if event.object.get("apiVersion").and_then(|v| v.as_str()) != Some("v1")
+        || event.object.get("kind").and_then(|v| v.as_str()) != Some("Node")
+    {
+        return None;
+    }
+    event
+        .object
+        .pointer("/metadata/name")
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.trim().is_empty())
+}
+
+async fn cleanup_pods_bound_to_deleted_node(
+    db: &dyn DatastoreBackend,
+    pod_repository: &dyn NodeLifecyclePodRepository,
+    side_effects: Option<&crate::side_effects::SideEffectRegistry>,
+    node_name: &str,
+) -> Result<()> {
+    let field_selector = format!("spec.nodeName={node_name}");
+    let pods = pod_repository
+        .list_pods(None, None, Some(&field_selector), None, None)
+        .await?;
+    for pod in pods.items {
+        let namespace = pod.namespace.as_deref().unwrap_or("default");
+        db.move_pod_to_cleanup_intent(
+            node_name,
+            namespace,
+            &pod.name,
+            &pod.uid,
+            POD_CLEANUP_REASON_NODE_LOST,
+        )
+        .await?;
+        run_node_lost_pod_cleanup_side_effects(
+            db,
+            side_effects,
+            namespace,
+            &pod.name,
+            &pod.uid,
+            &pod.data,
+        )
+        .await;
+    }
+    db.delete_pod_cleanup_intents_for_node(node_name).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 async fn node_lease_tracker_from_cluster_leases_for_test(
     db: &crate::datastore::sqlite::Datastore,
@@ -305,7 +368,7 @@ pub async fn run_node_lifecycle_controller(
     }
 
     let mut retry_attempt = 0u32;
-    loop {
+    'controller: loop {
         if !*is_leader_rx.borrow() {
             tracing::debug!("node_lifecycle: not leader, waiting before reconcile");
             retry_attempt = 0;
@@ -402,6 +465,34 @@ pub async fn run_node_lifecycle_controller(
                     tracing::warn!(
                         "node_lifecycle: failed to refresh lease from watch event: {err:#}"
                     );
+                }
+                if deleted_node_name(&event).is_some() {
+                    loop {
+                        match cleanup_pods_bound_to_deleted_node_event(
+                            db.as_ref(),
+                            state.pod_repository.as_ref(),
+                            Some(state.side_effects.as_ref()),
+                            &event,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                retry_attempt = 0;
+                                continue 'controller;
+                            }
+                            Ok(false) => break,
+                            Err(err) => {
+                                tracing::warn!(
+                                    "node_lifecycle: failed to cleanup pods for deleted node event: {err:#}"
+                                );
+                                let attempt = retry_attempt;
+                                retry_attempt = retry_attempt.saturating_add(1);
+                                if !wait_for_retry(&state, &cancel, attempt).await {
+                                    break 'controller;
+                                }
+                            }
+                        }
+                    }
                 }
                 if node_lifecycle_event(&event) {
                     continue;
@@ -1817,6 +1908,54 @@ mod tests {
         let pod_data: serde_json::Value = serde_json::from_slice(&cleanup.5).unwrap();
         assert_eq!(pod_data["metadata"]["uid"], "worker-pod-uid");
         assert_eq!(pod_data["spec"]["nodeName"], "worker-a");
+    }
+
+    #[tokio::test]
+    async fn deleted_node_event_moves_bound_pods_to_cleanup_intents() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let pod_repository = crate::controllers::test_utils::pod_repository_for_test(&db);
+        seed_running_pod_on_node(&db, "fake-node-pod", "fake-node-pod-uid", "e2e-fake-node").await;
+        seed_running_pod_on_node(&db, "real-node-pod", "real-node-pod-uid", "real-node").await;
+
+        let event = WatchEvent::deleted(json!({
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "e2e-fake-node"}
+        }));
+
+        let cleaned = super::cleanup_pods_bound_to_deleted_node_event(
+            &db,
+            pod_repository.as_ref(),
+            None,
+            &event,
+        )
+        .await
+        .expect("deleted Node cleanup must succeed");
+
+        assert!(cleaned, "deleted Node event should be handled");
+        assert!(
+            db.get_resource("v1", "Pod", Some("default"), "fake-node-pod")
+                .await
+                .unwrap()
+                .is_none(),
+            "Pods bound to the deleted Node must be removed from the API store"
+        );
+        assert!(
+            db.get_resource("v1", "Pod", Some("default"), "real-node-pod")
+                .await
+                .unwrap()
+                .is_some(),
+            "cleanup must be scoped to the deleted Node name"
+        );
+
+        let cleanup = db
+            .list_pod_cleanup_intents_for_node("e2e-fake-node")
+            .await
+            .unwrap();
+        assert!(
+            cleanup.is_empty(),
+            "cleanup intents for a deleted Node must be cleared because no kubelet owns that node name anymore"
+        );
     }
 
     #[tokio::test]
