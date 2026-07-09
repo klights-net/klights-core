@@ -619,6 +619,13 @@ const SERVICE_ROUTING_WATCH_TARGETS: [ServiceRoutingWatchTarget; 6] = [
     },
 ];
 
+fn service_inventory_watch_target_requires_full_sync(target: ServiceRoutingWatchTarget) -> bool {
+    matches!(
+        (target.api_version, target.kind),
+        ("v1", "Service") | ("v1", "Endpoints") | ("discovery.k8s.io/v1", "EndpointSlice")
+    )
+}
+
 enum ServiceRoutingWatchItem {
     Event {
         target: ServiceRoutingWatchTarget,
@@ -847,6 +854,9 @@ async fn run_service_routing_watch_worker(
                             reconnect_attempt = 0;
                             match apply_service_routing_watch_event_to_inventory(table.as_ref(), target, event) {
                                 Ok(Some(super::inventory::InventoryApply::Applied | super::inventory::InventoryApply::Removed)) => {
+                                    if service_inventory_watch_target_requires_full_sync(target) {
+                                        force_full_sync.store(true, Ordering::Release);
+                                    }
                                     notify.notify_one();
                                 }
                                 Ok(Some(super::inventory::InventoryApply::NoChange)) => {}
@@ -1546,6 +1556,53 @@ mod tests {
             force_full_sync.load(Ordering::SeqCst),
             "external service sync requests must force a fresh API snapshot so missed watch events or stale cached inventory cannot leave nft rules stale"
         );
+    }
+
+    #[test]
+    fn service_inventory_watch_targets_force_fresh_service_snapshot() {
+        for target in [
+            ServiceRoutingWatchTarget {
+                api_version: "v1",
+                kind: "Service",
+            },
+            ServiceRoutingWatchTarget {
+                api_version: "v1",
+                kind: "Endpoints",
+            },
+            ServiceRoutingWatchTarget {
+                api_version: "discovery.k8s.io/v1",
+                kind: "EndpointSlice",
+            },
+        ] {
+            assert!(
+                service_inventory_watch_target_requires_full_sync(target),
+                "{}/{} changes must force a fresh service-route snapshot",
+                target.api_version,
+                target.kind
+            );
+        }
+
+        for target in [
+            ServiceRoutingWatchTarget {
+                api_version: "networking.k8s.io/v1",
+                kind: "NetworkPolicy",
+            },
+            ServiceRoutingWatchTarget {
+                api_version: "v1",
+                kind: "Pod",
+            },
+            ServiceRoutingWatchTarget {
+                api_version: "v1",
+                kind: "Namespace",
+            },
+        ] {
+            assert!(
+                !service_inventory_watch_target_requires_full_sync(target),
+                "{}/{} changes should not force a service inventory re-list",
+                target.api_version,
+                target.kind
+            );
+        }
     }
 
     #[tokio::test]
