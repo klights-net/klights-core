@@ -3919,6 +3919,102 @@ async fn deferred_running_runtime_reconcile_preserves_restart_count_for_fast_onf
 }
 
 #[tokio::test]
+async fn post_sandbox_ip_status_promotes_deferred_running_runtime_snapshot() {
+    use super::PodStatusWriter;
+    let repo = build_repo().await;
+
+    let mut seed = pending_pod("rr-deferred-running-ip");
+    seed["status"] = json!({
+        "phase": "Pending",
+        "conditions": [
+            {"type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-05-17T00:00:00Z"},
+            {"type": "Initialized", "status": "True", "lastTransitionTime": "2026-05-17T00:00:00Z"}
+        ]
+    });
+    let created = repo
+        .store
+        .create("default", "rr-deferred-running-ip", seed)
+        .await
+        .unwrap();
+
+    let deferred = repo
+        .apply_runtime_reconcile_status_for_uid(
+            "default",
+            "rr-deferred-running-ip",
+            &created.uid,
+            super::RuntimeReconcileStatus {
+                phase: "Running".to_string(),
+                container_statuses: vec![json!({
+                    "name": "c",
+                    "containerID": "containerd://confirmed",
+                    "image": "nginx",
+                    "imageID": "nginx@sha256:confirmed",
+                    "ready": true,
+                    "started": true,
+                    "restartCount": 0,
+                    "state": {"running": {"startedAt": "2026-05-17T00:00:01Z"}}
+                })],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        deferred.data["status"]["phase"],
+        json!("Pending"),
+        "runtime reconcile must still avoid Running before podIP is published"
+    );
+
+    let promoted = repo
+        .set_pod_status_for_uid(
+            "default",
+            "rr-deferred-running-ip",
+            &created.uid,
+            super::PodStatusUpdate {
+                phase: "Pending".to_string(),
+                pod_ip: "10.42.0.44".to_string(),
+                host_ip: "10.0.0.10".to_string(),
+                container_statuses: vec![json!({
+                    "name": "c",
+                    "containerID": "containerd://confirmed",
+                    "image": "nginx",
+                    "imageID": "",
+                    "ready": false,
+                    "started": false,
+                    "restartCount": 0,
+                    "state": {"waiting": {"reason": "ContainerCreating"}}
+                })],
+                init_container_statuses: None,
+                qos_class: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let status = &promoted.data["status"];
+    assert_eq!(status["phase"], json!("Running"));
+    assert_eq!(status["podIP"], json!("10.42.0.44"));
+    assert_eq!(
+        status["containerStatuses"][0].pointer("/state/running/startedAt"),
+        Some(&json!("2026-05-17T00:00:01Z"))
+    );
+    assert_eq!(status["containerStatuses"][0]["ready"], json!(true));
+    let ready = status["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|condition| condition["type"] == json!("Ready"))
+        .unwrap();
+    assert_eq!(
+        ready["status"],
+        json!("True"),
+        "post-IP status write should complete the deferred Running transition"
+    );
+}
+
+#[tokio::test]
 async fn apply_runtime_reconcile_status_terminal_phase_marks_pod_not_ready() {
     use super::PodStatusWriter;
     let repo = build_repo().await;

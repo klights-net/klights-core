@@ -294,10 +294,23 @@ impl PodStatusService {
             for status in &mut container_statuses {
                 apply_preserved_restart_fields(status, &preserved);
             }
+            preserve_confirmed_running_statuses_after_network_publish(
+                &mut container_statuses,
+                &pod,
+            );
+            let mut phase = update.phase.clone();
+            if can_promote_pending_network_status_to_running(
+                &phase,
+                update,
+                &pod,
+                &container_statuses,
+            ) {
+                phase = "Running".to_string();
+            }
 
             let now = crate::utils::k8s_timestamp();
             let all_containers_ready = if container_statuses.is_empty() {
-                update.phase == "Running"
+                phase == "Running"
             } else {
                 container_statuses
                     .iter()
@@ -325,7 +338,7 @@ impl PodStatusService {
                 )
             };
             let containers_ready_status = bool_status(all_containers_ready);
-            let ready_status = bool_status(update.phase == "Running" && all_containers_ready);
+            let ready_status = bool_status(phase == "Running" && all_containers_ready);
             // The kubelet rebuilds its owned lifecycle conditions and routes the
             // result through the typed Pod status ownership policy, which
             // preserves by `type` every condition the kubelet runtime does not
@@ -371,7 +384,7 @@ impl PodStatusService {
             };
 
             let mut status_obj = json!({
-                "phase": update.phase,
+                "phase": phase,
                 "podIP": pod_ip,
                 "hostIP": host_ip,
                 "hostIPs": [{ "ip": host_ip }],
@@ -1956,6 +1969,110 @@ fn apply_preserved_restart_fields(
             obj.insert("lastState".to_string(), v.clone());
         }
     }
+}
+
+fn preserve_confirmed_running_statuses_after_network_publish(
+    incoming_statuses: &mut [Value],
+    pod: &Value,
+) {
+    let Some(current_statuses) = pod
+        .pointer("/status/containerStatuses")
+        .and_then(|statuses| statuses.as_array())
+    else {
+        return;
+    };
+
+    for incoming in incoming_statuses {
+        let Some(name) = incoming.get("name").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(current) = current_statuses
+            .iter()
+            .find(|candidate| candidate.get("name").and_then(|value| value.as_str()) == Some(name))
+        else {
+            continue;
+        };
+        if !container_status_is_running(current)
+            || !container_status_is_container_creating(incoming)
+            || !same_or_unreported_container_id(current, incoming)
+            || incoming_has_newer_restart_count(current, incoming)
+        {
+            continue;
+        }
+        *incoming = current.clone();
+    }
+}
+
+fn can_promote_pending_network_status_to_running(
+    phase: &str,
+    update: &PodStatusUpdate,
+    pod: &Value,
+    container_statuses: &[Value],
+) -> bool {
+    if phase != "Pending" || !network_status_is_published(update, pod) {
+        return false;
+    }
+    let Some(spec_containers) = pod
+        .pointer("/spec/containers")
+        .and_then(|value| value.as_array())
+    else {
+        return false;
+    };
+    let names: Vec<&str> = spec_containers
+        .iter()
+        .filter_map(|container| container.get("name").and_then(|value| value.as_str()))
+        .collect();
+    !names.is_empty()
+        && names.iter().all(|name| {
+            container_statuses.iter().any(|status| {
+                status.get("name").and_then(|value| value.as_str()) == Some(*name)
+                    && container_status_is_running(status)
+            })
+        })
+}
+
+fn network_status_is_published(update: &PodStatusUpdate, pod: &Value) -> bool {
+    if !update.pod_ip.trim().is_empty() {
+        return true;
+    }
+    let host_network = pod
+        .pointer("/spec/hostNetwork")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    host_network && !update.host_ip.trim().is_empty()
+}
+
+fn container_status_is_running(status: &Value) -> bool {
+    status.pointer("/state/running").is_some()
+}
+
+fn container_status_is_container_creating(status: &Value) -> bool {
+    status
+        .pointer("/state/waiting/reason")
+        .and_then(|value| value.as_str())
+        == Some("ContainerCreating")
+}
+
+fn same_or_unreported_container_id(current: &Value, incoming: &Value) -> bool {
+    let current_id = current
+        .get("containerID")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let incoming_id = incoming
+        .get("containerID")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    incoming_id.is_empty() || current_id.is_empty() || incoming_id == current_id
+}
+
+fn incoming_has_newer_restart_count(current: &Value, incoming: &Value) -> bool {
+    let Some(current_count) = current.get("restartCount").and_then(|value| value.as_i64()) else {
+        return false;
+    };
+    incoming
+        .get("restartCount")
+        .and_then(|value| value.as_i64())
+        .is_some_and(|incoming_count| incoming_count > current_count)
 }
 
 fn has_create_container_config_error_status(statuses: &[Value]) -> bool {
