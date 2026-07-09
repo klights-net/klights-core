@@ -18,6 +18,21 @@ pub(crate) trait NodeSubnetAllocationClient: Send + Sync {
     ) -> Result<NodeSubnet>;
 }
 
+#[async_trait::async_trait]
+pub(crate) trait NodeSubnetAllocationStore: Send + Sync {
+    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>>;
+}
+
+#[async_trait::async_trait]
+impl<T> NodeSubnetAllocationStore for T
+where
+    T: crate::datastore::DatastoreBackend + ?Sized,
+{
+    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+        crate::datastore::DatastoreBackend::get_node_subnet(self, node_name).await
+    }
+}
+
 struct LeaderApiNodeSubnetAllocationClient {
     inner: Arc<dyn LeaderApiClient>,
 }
@@ -118,6 +133,38 @@ impl NodeSubnetAllocator {
             }
         }
     }
+
+    pub(crate) async fn allocate_or_reuse_existing<S>(
+        &self,
+        store: &S,
+        node_name: &str,
+        cluster_cidr: &str,
+        node_ip: &str,
+    ) -> Result<NodeSubnet>
+    where
+        S: NodeSubnetAllocationStore + ?Sized,
+    {
+        match store.get_node_subnet(node_name).await {
+            Ok(Some(subnet)) => {
+                tracing::info!(
+                    node = node_name,
+                    subnet = %subnet.subnet,
+                    "reusing existing local node subnet allocation"
+                );
+                return Ok(subnet);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    node = node_name,
+                    error = %err,
+                    "failed to read existing local node subnet; falling back to leader allocation"
+                );
+            }
+        }
+
+        self.allocate(node_name, cluster_cidr, node_ip).await
+    }
 }
 
 fn is_retryable_allocation_error(err: &anyhow::Error) -> bool {
@@ -166,6 +213,32 @@ mod tests {
 
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    struct FakeNodeSubnetStore {
+        calls: AtomicUsize,
+        row: Mutex<Option<NodeSubnet>>,
+    }
+
+    impl FakeNodeSubnetStore {
+        fn new(row: Option<NodeSubnet>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                row: Mutex::new(row),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NodeSubnetAllocationStore for FakeNodeSubnetStore {
+        async fn get_node_subnet(&self, _node_name: &str) -> anyhow::Result<Option<NodeSubnet>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.row.lock().expect("row lock").clone())
         }
     }
 
@@ -247,6 +320,22 @@ mod tests {
 
         assert!(err.to_string().contains("invalid cluster cidr"));
         assert_eq!(client.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn reuses_existing_local_subnet_without_leader_rpc() {
+        let client = FakeAllocationClient::new(vec![]);
+        let store = FakeNodeSubnetStore::new(Some(subnet_row()));
+        let allocator = test_allocator(client.clone());
+
+        let row = allocator
+            .allocate_or_reuse_existing(&store, "node-a", "10.50.0.0/16", "192.0.2.10")
+            .await
+            .expect("existing local subnet must be reused");
+
+        assert_eq!(row.node_name.as_str(), "node-a");
+        assert_eq!(store.calls(), 1);
+        assert_eq!(client.calls(), 0);
     }
 
     #[test]

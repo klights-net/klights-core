@@ -57,8 +57,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let network_boot = match networking::NetworkBoot::boot(
         node_mode,
         config,
-        cluster_api.clone(),
-        node_local.clone(),
+        networking::boot::NetworkBootStores::new(cluster_api.clone(), db, node_local.clone()),
         node_ip,
         shutdown_token.clone(),
         supervisor.clone(),

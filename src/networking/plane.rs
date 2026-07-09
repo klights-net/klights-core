@@ -1,4 +1,3 @@
-use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::node_local::NodeLocalHandle;
 use crate::networking::dataplane_health::DataplaneHealth;
 use crate::networking::device_state::{self, LinkKind, LinkState};
@@ -99,14 +98,21 @@ impl NetworkPlane {
     /// prepares the local bridge/CNI datapath, and initializes the selected
     /// cross-node dataplane. WireGuard is the default encrypted dataplane;
     /// explicit direct-route mode installs only kernel routes.
-    pub async fn boot(
+    pub(crate) async fn boot<S>(
         cfg: &crate::KlightsConfig,
-        cluster_api: Arc<dyn LeaderApiClient>,
-        node_local: NodeLocalHandle,
+        stores: crate::networking::boot::NetworkBootStores<'_, S>,
         node_ip: &str,
         cancel: tokio_util::sync::CancellationToken,
         task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<Arc<Self>>
+    where
+        S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
+    {
+        let crate::networking::boot::NetworkBootStores {
+            cluster_api,
+            node_subnet_store,
+            node_local,
+        } = stores;
         let bridge = BridgeName::parse(&cfg.bridge_name)
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("invalid bridge name {}", cfg.bridge_name))?;
@@ -120,7 +126,12 @@ impl NetworkPlane {
             cluster_api,
             task_supervisor.clone(),
         )
-        .allocate(&cfg.node_name, &cfg.cluster_cidr, node_ip)
+        .allocate_or_reuse_existing(
+            node_subnet_store,
+            &cfg.node_name,
+            &cfg.cluster_cidr,
+            node_ip,
+        )
         .await
         .with_context(|| {
             format!(

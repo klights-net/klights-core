@@ -16,7 +16,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
-use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::NodeSubnet;
 use crate::datastore::node_local::NodeLocalHandle;
 use crate::networking::dataplane_health::DataplaneHealth;
@@ -50,14 +49,21 @@ impl RootlessNetworkPlane {
     /// host-network mutation. The bridge is created
     /// lazily on the first non-hostNetwork CNI ADD so unit tests and idle
     /// rootless starts do not require netlink mutations until pods need them.
-    pub async fn boot(
+    pub(crate) async fn boot<S>(
         cfg: &crate::KlightsConfig,
-        cluster_api: Arc<dyn LeaderApiClient>,
-        node_local: NodeLocalHandle,
+        stores: crate::networking::boot::NetworkBootStores<'_, S>,
         node_ip: &str,
         cancel: tokio_util::sync::CancellationToken,
         task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<Arc<Self>>
+    where
+        S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
+    {
+        let crate::networking::boot::NetworkBootStores {
+            cluster_api,
+            node_subnet_store,
+            node_local,
+        } = stores;
         let bridge = BridgeName::parse(&cfg.bridge_name)
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("invalid rootless bridge name {}", cfg.bridge_name))?;
@@ -86,7 +92,12 @@ impl RootlessNetworkPlane {
             cluster_api,
             task_supervisor.clone(),
         )
-        .allocate(&cfg.node_name, &cfg.cluster_cidr, node_ip)
+        .allocate_or_reuse_existing(
+            node_subnet_store,
+            &cfg.node_name,
+            &cfg.cluster_cidr,
+            node_ip,
+        )
         .await
         .with_context(|| {
             format!(
@@ -528,8 +539,11 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let plane = RootlessNetworkPlane::boot(
             &cfg,
-            cluster_api_for_test(db.clone(), &cfg.node_name),
-            node_local,
+            crate::networking::boot::NetworkBootStores::new(
+                cluster_api_for_test(db.clone(), &cfg.node_name),
+                &db,
+                node_local,
+            ),
             "192.168.1.5",
             cancel,
             supervisor,
@@ -561,8 +575,11 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let plane = RootlessNetworkPlane::boot(
             &cfg,
-            cluster_api_for_test(db.clone(), &cfg.node_name),
-            node_local,
+            crate::networking::boot::NetworkBootStores::new(
+                cluster_api_for_test(db.clone(), &cfg.node_name),
+                &db,
+                node_local,
+            ),
             "192.168.77.9",
             cancel,
             supervisor,
@@ -608,8 +625,11 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let plane = RootlessNetworkPlane::boot(
             &cfg,
-            cluster_api_for_test(db, &cfg.node_name),
-            node_local,
+            crate::networking::boot::NetworkBootStores::new(
+                cluster_api_for_test(db.clone(), &cfg.node_name),
+                &db,
+                node_local,
+            ),
             "192.168.1.5",
             cancel,
             supervisor,

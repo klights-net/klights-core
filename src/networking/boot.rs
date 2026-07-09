@@ -17,6 +17,32 @@ use crate::datastore::node_local::NodeLocalHandle;
 use crate::networking::dataplane_health::DataplaneHealth;
 use crate::networking::{NetworkPlane, PodSubnet, RootlessNetworkPlane};
 
+pub(crate) struct NetworkBootStores<'a, S>
+where
+    S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
+{
+    pub(crate) cluster_api: Arc<dyn LeaderApiClient>,
+    pub(crate) node_subnet_store: &'a S,
+    pub(crate) node_local: NodeLocalHandle,
+}
+
+impl<'a, S> NetworkBootStores<'a, S>
+where
+    S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
+{
+    pub(crate) fn new(
+        cluster_api: Arc<dyn LeaderApiClient>,
+        node_subnet_store: &'a S,
+        node_local: NodeLocalHandle,
+    ) -> Self {
+        Self {
+            cluster_api,
+            node_subnet_store,
+            node_local,
+        }
+    }
+}
+
 pub enum NetworkBoot {
     Root(Arc<NetworkPlane>),
     Rootless(Arc<RootlessNetworkPlane>),
@@ -24,38 +50,27 @@ pub enum NetworkBoot {
 
 impl NetworkBoot {
     /// Dispatch on `NodeMode` and run the matching boot path.
-    pub async fn boot(
+    pub(crate) async fn boot<S>(
         node_mode: &NodeMode,
         cfg: &crate::KlightsConfig,
-        cluster_api: Arc<dyn LeaderApiClient>,
-        node_local: NodeLocalHandle,
+        stores: NetworkBootStores<'_, S>,
         node_ip: &str,
         cancel: tokio_util::sync::CancellationToken,
         task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
+    {
         match node_mode {
             NodeMode::Root => {
-                let plane = NetworkPlane::boot(
-                    cfg,
-                    cluster_api,
-                    node_local,
-                    node_ip,
-                    cancel,
-                    task_supervisor,
-                )
-                .await?;
+                let plane =
+                    NetworkPlane::boot(cfg, stores, node_ip, cancel, task_supervisor).await?;
                 Ok(Self::Root(plane))
             }
             NodeMode::Rootless { .. } => {
-                let plane = RootlessNetworkPlane::boot(
-                    cfg,
-                    cluster_api,
-                    node_local,
-                    node_ip,
-                    cancel,
-                    task_supervisor,
-                )
-                .await?;
+                let plane =
+                    RootlessNetworkPlane::boot(cfg, stores, node_ip, cancel, task_supervisor)
+                        .await?;
                 Ok(Self::Rootless(plane))
             }
         }
@@ -194,8 +209,11 @@ mod tests {
         let boot = NetworkBoot::boot(
             &mode,
             &cfg,
-            cluster_api_for_test(db.clone(), &cfg.node_name),
-            node_local,
+            NetworkBootStores::new(
+                cluster_api_for_test(db.clone(), &cfg.node_name),
+                &db,
+                node_local,
+            ),
             "192.168.1.6",
             cancel,
             supervisor,
