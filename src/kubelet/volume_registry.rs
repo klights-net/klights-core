@@ -115,24 +115,6 @@ struct DownwardApiHandler;
 struct ProjectedHandler;
 struct PersistentVolumeClaimHandler;
 
-async fn lookup_node_uid(
-    sources: &dyn crate::kubelet::volume_sources::VolumeSourceReader,
-    node_name: &str,
-) -> Option<String> {
-    sources
-        .node(node_name)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|res| {
-            res.data
-                .pointer("/metadata/uid")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        })
-}
-
 #[async_trait]
 impl VolumeHandler for EmptyDirHandler {
     fn volume_type(&self) -> &'static str {
@@ -383,74 +365,13 @@ impl VolumeHandler for ProjectedHandler {
             .get("sources")
             .ok_or_else(|| anyhow::anyhow!("projected volume missing sources"))?;
 
-        let needs_token = sources
-            .as_array()
-            .map(|arr| arr.iter().any(|s| s.get("serviceAccountToken").is_some()))
-            .unwrap_or(false);
-
-        let mut sources_for_write = sources.clone();
-        if needs_token {
-            let sa_name = ctx
-                .pod
-                .get("spec")
-                .and_then(|s| s.get("serviceAccountName"))
-                .and_then(|n| n.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("default");
-            let pod_uid = ctx
-                .pod
-                .pointer("/metadata/uid")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
-            let node_name = ctx
-                .pod
-                .pointer("/spec/nodeName")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty());
-            let node_uid = if let Some(node_name) = node_name {
-                lookup_node_uid(ctx.sources, node_name).await
-            } else {
-                None
-            };
-            if let Some(arr) = sources_for_write.as_array_mut() {
-                for source in arr {
-                    let Some(sa_token) = source
-                        .get_mut("serviceAccountToken")
-                        .and_then(|v| v.as_object_mut())
-                    else {
-                        continue;
-                    };
-
-                    let audience = sa_token
-                        .get("audience")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("https://kubernetes.default.svc.cluster.local");
-                    let expiration_seconds =
-                        crate::auth::normalize_service_account_token_expiration_seconds(
-                            sa_token.get("expirationSeconds").and_then(|v| v.as_i64()),
-                        );
-
-                    let token = ctx
-                        .sources
-                        .projected_service_account_token(
-                            crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest {
-                                namespace: ctx.namespace.to_string(),
-                                service_account_name: sa_name.to_string(),
-                                audiences: vec![audience.to_string()],
-                                expiration_seconds,
-                                bound_pod_name: Some(ctx.pod_name.to_string()),
-                                bound_pod_uid: pod_uid.map(str::to_string),
-                                bound_node_name: node_name.map(str::to_string),
-                                bound_node_uid: node_uid.clone(),
-                            },
-                        )
-                        .await?
-                        .token;
-                    sa_token.insert("tokenValue".to_string(), Value::String(token));
-                }
-            }
-        }
+        let sources_for_write =
+            crate::kubelet::projected_sa_token_refresh::projected_sources_with_fresh_service_account_token_values(
+                ctx.sources,
+                ctx.pod,
+                sources,
+            )
+            .await?;
 
         let path = volumes::create_projected_volume_ns(volumes::ProjectedVolumeNsRequest {
             source_reader: ctx.sources,

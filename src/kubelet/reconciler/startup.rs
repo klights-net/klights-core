@@ -72,27 +72,32 @@ impl StartupReconciler {
             .context("list CRI pod sandboxes")?;
 
         // B3: reclaim leaked on-disk pod artifact dirs (volumes + root) whose
-        // (namespace, name) slot belongs to no live pod — leader Pod, CRI
-        // sandbox, or node-local runtime row. Safe to delete here because the
-        // full live set is known and no new pods are being created yet.
-        let live_slots: std::collections::HashSet<(String, String)> = runtime_rows
+        // (namespace, name, uid) owner belongs to no live pod — leader Pod,
+        // CRI sandbox, or node-local runtime row. Safe to delete here because
+        // the full live set is known and no new pods are being created yet.
+        let live_owners: std::collections::HashSet<(String, String, String)> = runtime_rows
             .iter()
-            .map(|row| (row.namespace.clone(), row.pod_name.clone()))
-            .chain(
-                sandboxes
-                    .iter()
-                    .map(|s| (s.namespace.clone(), s.name.clone())),
-            )
-            .chain(leader_pods.iter().filter_map(|pod| {
-                let meta = pod.get("metadata")?;
-                let ns = meta.get("namespace")?.as_str()?;
-                let name = meta.get("name")?.as_str()?;
-                Some((ns.to_string(), name.to_string()))
+            .filter_map(|row| {
+                crate::kubelet::reconciler::cri_inventory::pod_artifact_owner(
+                    &row.namespace,
+                    &row.pod_name,
+                    &row.pod_uid,
+                )
+            })
+            .chain(sandboxes.iter().filter_map(|s| {
+                crate::kubelet::reconciler::cri_inventory::pod_artifact_owner(
+                    &s.namespace,
+                    &s.name,
+                    &s.uid,
+                )
             }))
+            .chain(leader_pods.iter().filter_map(
+                crate::kubelet::reconciler::cri_inventory::pod_artifact_owner_from_value,
+            ))
             .collect();
         match crate::kubelet::reconciler::cri_inventory::sweep_orphan_pod_artifacts(
             &self.containerd_ns,
-            &live_slots,
+            &live_owners,
         )
         .await
         {

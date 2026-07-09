@@ -32,6 +32,7 @@ pub use configmap_secret::{
 pub use downward_api::refresh_downward_api_volumes;
 pub use downward_api::{DownwardApiVolumeNsRequest, create_downward_api_volume_ns};
 pub use projected::{ProjectedVolumeNsRequest, create_projected_volume_ns};
+pub(crate) use projected::{ProjectedVolumeRootRequest, create_projected_volume_under_root};
 
 #[cfg(test)]
 pub use basics::parse_mountinfo_entry;

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -34,6 +35,32 @@ pub(crate) enum ProjectedSaTokenRefreshOutcome {
     Stop,
 }
 
+fn projected_service_account_token_ref(
+    volume_name: &str,
+    default_mode: u32,
+    sa_token: &Value,
+) -> ProjectedServiceAccountTokenRef {
+    let token_path = sa_token
+        .get("path")
+        .and_then(|p| p.as_str())
+        .unwrap_or("token");
+    let audience = sa_token
+        .get("audience")
+        .and_then(|a| a.as_str())
+        .filter(|a| !a.is_empty())
+        .unwrap_or(DEFAULT_SERVICE_ACCOUNT_AUDIENCE);
+    let expiration_seconds = crate::auth::normalize_service_account_token_expiration_seconds(
+        sa_token.get("expirationSeconds").and_then(|v| v.as_i64()),
+    );
+    ProjectedServiceAccountTokenRef {
+        volume_name: volume_name.to_string(),
+        token_path: token_path.to_string(),
+        audience: audience.to_string(),
+        expiration_seconds,
+        mode: default_mode,
+    }
+}
+
 fn projected_service_account_token_refs(pod: &Value) -> Vec<ProjectedServiceAccountTokenRef> {
     let mut refs = Vec::new();
     let Some(volumes) = pod.pointer("/spec/volumes").and_then(|v| v.as_array()) else {
@@ -60,30 +87,53 @@ fn projected_service_account_token_refs(pod: &Value) -> Vec<ProjectedServiceAcco
             let Some(sa_token) = source.get("serviceAccountToken") else {
                 continue;
             };
-            let token_path = sa_token
-                .get("path")
-                .and_then(|p| p.as_str())
-                .unwrap_or("token");
-            let audience = sa_token
-                .get("audience")
-                .and_then(|a| a.as_str())
-                .filter(|a| !a.is_empty())
-                .unwrap_or(DEFAULT_SERVICE_ACCOUNT_AUDIENCE);
-            let expiration_seconds =
-                crate::auth::normalize_service_account_token_expiration_seconds(
-                    sa_token.get("expirationSeconds").and_then(|v| v.as_i64()),
-                );
-            refs.push(ProjectedServiceAccountTokenRef {
-                volume_name: volume_name.to_string(),
-                token_path: token_path.to_string(),
-                audience: audience.to_string(),
-                expiration_seconds,
-                mode: default_mode,
-            });
+            refs.push(projected_service_account_token_ref(
+                volume_name,
+                default_mode,
+                sa_token,
+            ));
         }
     }
 
     refs
+}
+
+pub(crate) async fn projected_sources_with_fresh_service_account_token_values(
+    sources: &dyn VolumeSourceReader,
+    pod: &Value,
+    projected_sources: &Value,
+) -> Result<Value> {
+    let Some(source_array) = projected_sources.as_array() else {
+        return Ok(projected_sources.clone());
+    };
+
+    let mut token_values = Vec::new();
+    for (index, source) in source_array.iter().enumerate() {
+        let Some(sa_token) = source.get("serviceAccountToken") else {
+            continue;
+        };
+        let token_ref = projected_service_account_token_ref("", 0o644, sa_token);
+        let token = mint_projected_service_account_token(sources, pod, &token_ref).await?;
+        token_values.push((index, token));
+    }
+
+    if token_values.is_empty() {
+        return Ok(projected_sources.clone());
+    }
+
+    let mut sources_for_write = projected_sources.clone();
+    if let Some(source_array) = sources_for_write.as_array_mut() {
+        for (index, token) in token_values {
+            if let Some(sa_token) = source_array
+                .get_mut(index)
+                .and_then(|source| source.get_mut("serviceAccountToken"))
+                .and_then(|token| token.as_object_mut())
+            {
+                sa_token.insert("tokenValue".to_string(), Value::String(token));
+            }
+        }
+    }
+    Ok(sources_for_write)
 }
 
 pub(crate) fn pod_has_projected_service_account_tokens(pod: &Value) -> bool {
@@ -191,7 +241,7 @@ async fn write_projected_service_account_token_file(
     token_ref: ProjectedServiceAccountTokenRef,
     token: String,
 ) -> Result<()> {
-    if !std::path::Path::new(&volume_path).exists() {
+    if !crate::utils::path_exists_async(&volume_path).await? {
         anyhow::bail!("projected volume path {} no longer exists", volume_path);
     }
     let key = volume_path.clone();
@@ -208,6 +258,60 @@ async fn write_projected_service_account_token_file(
         },
     )
     .await
+}
+
+fn projected_volume_sources_for_name<'a>(
+    pod: &'a Value,
+    volume_name: &str,
+) -> Option<(Option<u32>, &'a Value)> {
+    let volumes = pod.pointer("/spec/volumes").and_then(|v| v.as_array())?;
+    for volume in volumes {
+        if volume.get("name").and_then(|v| v.as_str()) != Some(volume_name) {
+            continue;
+        }
+        let projected = volume.get("projected")?;
+        let default_mode = projected
+            .get("defaultMode")
+            .and_then(|m| m.as_u64())
+            .map(|m| m as u32);
+        let sources = projected.get("sources")?;
+        return Some((default_mode, sources));
+    }
+    None
+}
+
+async fn recreate_projected_service_account_token_volume(
+    request: &ProjectedSaTokenRefreshRequest,
+    pod: &Value,
+    volume_name: &str,
+) -> Result<()> {
+    let (default_mode, sources) =
+        projected_volume_sources_for_name(pod, volume_name).ok_or_else(|| {
+            anyhow::anyhow!("projected volume {} no longer exists in pod", volume_name)
+        })?;
+    let sources_for_write = projected_sources_with_fresh_service_account_token_values(
+        request.sources.as_ref(),
+        pod,
+        sources,
+    )
+    .await?;
+    let pod_dir_id = request.key.volume_dir_id();
+    crate::kubelet::volumes::create_projected_volume_under_root(
+        crate::kubelet::volumes::ProjectedVolumeRootRequest {
+            volumes_root: &request.volumes_root,
+            source_reader: request.sources.as_ref(),
+            namespace: &request.key.namespace,
+            pod_dir_id: &pod_dir_id,
+            pod_db_name: &request.key.name,
+            pod,
+            volume_name,
+            default_mode,
+            sources: &sources_for_write,
+            token: None,
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn refresh_projected_service_account_tokens_once(
@@ -231,13 +335,23 @@ pub(crate) async fn refresh_projected_service_account_tokens_once(
     }
 
     let pod_dir_id = request.key.volume_dir_id();
+    let mut recreated_volumes = HashSet::new();
     for token_ref in refs.iter().cloned() {
-        let token =
-            mint_projected_service_account_token(request.sources.as_ref(), pod, &token_ref).await?;
         let volume_path = format!(
             "{}/{}/volumes/projected/{}",
             request.volumes_root, pod_dir_id, token_ref.volume_name
         );
+        if recreated_volumes.contains(&token_ref.volume_name) {
+            continue;
+        }
+        if !crate::utils::path_exists_async(&volume_path).await? {
+            recreate_projected_service_account_token_volume(&request, pod, &token_ref.volume_name)
+                .await?;
+            recreated_volumes.insert(token_ref.volume_name);
+            continue;
+        }
+        let token =
+            mint_projected_service_account_token(request.sources.as_ref(), pod, &token_ref).await?;
         write_projected_service_account_token_file(volume_path, token_ref, token).await?;
     }
 
@@ -532,5 +646,103 @@ mod tests {
         assert_eq!(requests[0].bound_pod_uid.as_deref(), Some("pod-uid"));
         assert_eq!(requests[0].bound_node_name.as_deref(), Some("node-a"));
         assert_eq!(requests[0].bound_node_uid.as_deref(), Some("node-uid"));
+    }
+
+    #[tokio::test]
+    async fn refresh_once_recreates_missing_projected_serviceaccount_volume() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "kube-system",
+                "name": "coredns",
+                "uid": "pod-uid"
+            },
+            "spec": {
+                "serviceAccountName": "coredns",
+                "nodeName": "node-a",
+                "volumes": [{
+                    "name": "kube-api-access-x",
+                    "projected": {
+                        "defaultMode": 420,
+                        "sources": [
+                            {
+                                "serviceAccountToken": {
+                                    "path": "token",
+                                    "audience": "https://kubernetes.default.svc.cluster.local",
+                                    "expirationSeconds": 7200
+                                }
+                            },
+                            {
+                                "downwardAPI": {
+                                    "items": [{
+                                        "path": "namespace",
+                                        "fieldRef": {
+                                            "apiVersion": "v1",
+                                            "fieldPath": "metadata.namespace"
+                                        }
+                                    }]
+                                }
+                            }
+                        ]
+                    }
+                }]
+            },
+            "status": {"phase": "Running"}
+        });
+        let sources = Arc::new(RefreshSourceReader {
+            pod: resource("v1", "Pod", Some("kube-system"), "coredns", pod),
+            service_account: resource(
+                "v1",
+                "ServiceAccount",
+                Some("kube-system"),
+                "coredns",
+                json!({
+                    "metadata": {
+                        "namespace": "kube-system",
+                        "name": "coredns",
+                        "uid": "sa-uid"
+                    }
+                }),
+            ),
+            node: resource(
+                "v1",
+                "Node",
+                None,
+                "node-a",
+                json!({"metadata": {"name": "node-a", "uid": "node-uid"}}),
+            ),
+            token_requests: Mutex::new(Vec::new()),
+        });
+
+        let volumes_root = temp.path().join("pods");
+        let key = PodRuntimeKey::new("kube-system", "coredns", "pod-uid");
+        let token_dir = volumes_root
+            .join(key.volume_dir_id())
+            .join("volumes/projected/kube-api-access-x");
+
+        let outcome = super::refresh_projected_service_account_tokens_once(
+            super::ProjectedSaTokenRefreshRequest {
+                sources: sources.clone(),
+                volumes_root: volumes_root.to_string_lossy().into_owned(),
+                key,
+            },
+        )
+        .await
+        .expect("refresh must recreate a missing projected volume for a live pod");
+
+        assert_eq!(
+            outcome,
+            super::ProjectedSaTokenRefreshOutcome::Continue {
+                next_delay: std::time::Duration::from_secs(5760)
+            }
+        );
+        let token = std::fs::read_to_string(token_dir.join("token")).expect("read token");
+        assert_eq!(token, "refreshed-from-leader");
+        let namespace =
+            std::fs::read_to_string(token_dir.join("namespace")).expect("read namespace");
+        assert_eq!(namespace, "kube-system");
+        assert_eq!(sources.token_requests.lock().unwrap().len(), 1);
     }
 }

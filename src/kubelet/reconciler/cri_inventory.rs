@@ -145,23 +145,89 @@ pub fn diff_cri_inventory(
     actions
 }
 
-/// Pure: given on-disk pod artifact dir ids (`<namespace>_<name>`) and the set
-/// of live `(namespace, name)` slots, return the dir ids that belong to no live
-/// pod. Dirs whose name does not match the `<ns>_<name>` layout are never
-/// returned (conservative: an unrecognized dir is left untouched). Kubernetes
-/// namespace and pod names cannot contain `_`, so the first `_` unambiguously
-/// separates the two segments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PodArtifactDirId<'a> {
+    namespace: &'a str,
+    name: &'a str,
+    uid: Option<&'a str>,
+}
+
+impl<'a> PodArtifactDirId<'a> {
+    fn parse(id: &'a str) -> Option<Self> {
+        let mut parts = id.split('_');
+        let namespace = parts.next()?;
+        let name = parts.next()?;
+        if namespace.is_empty() || name.is_empty() {
+            return None;
+        }
+
+        match (parts.next(), parts.next()) {
+            (None, None) => Some(Self {
+                namespace,
+                name,
+                uid: None,
+            }),
+            (Some(uid), None) if !uid.is_empty() => Some(Self {
+                namespace,
+                name,
+                uid: Some(uid),
+            }),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) fn pod_artifact_owner(
+    namespace: &str,
+    name: &str,
+    uid: &str,
+) -> Option<(String, String, String)> {
+    (!namespace.is_empty() && !name.is_empty() && !uid.is_empty())
+        .then(|| (namespace.to_string(), name.to_string(), uid.to_string()))
+}
+
+pub(crate) fn pod_artifact_owner_from_value(
+    pod: &serde_json::Value,
+) -> Option<(String, String, String)> {
+    let meta = pod.get("metadata")?;
+    pod_artifact_owner(
+        meta.get("namespace")?.as_str()?,
+        meta.get("name")?.as_str()?,
+        meta.get("uid")?.as_str()?,
+    )
+}
+
+/// Pure: given on-disk pod artifact dir ids (`<namespace>_<name>_<uid>`) and
+/// the set of live `(namespace, name, uid)` owners, return the dir ids that
+/// belong to no live pod. Legacy two-part dirs (`<namespace>_<name>`) are kept
+/// while any live pod still occupies the slot. Dirs whose name does not match a
+/// recognized layout are never returned. Kubernetes namespace and pod names
+/// cannot contain `_`, so `_` cleanly separates the stored fields.
 pub fn orphaned_pod_dir_ids(
     dir_ids: &[String],
-    live_slots: &HashSet<(String, String)>,
+    live_owners: &HashSet<(String, String, String)>,
 ) -> Vec<String> {
+    let live_slots = live_owners
+        .iter()
+        .map(|(namespace, name, _)| (namespace.clone(), name.clone()))
+        .collect::<HashSet<_>>();
+
     dir_ids
         .iter()
-        .filter(|id| match id.split_once('_') {
-            Some((ns, name)) if !ns.is_empty() && !name.is_empty() => {
-                !live_slots.contains(&(ns.to_string(), name.to_string()))
+        .filter(|id| match PodArtifactDirId::parse(id) {
+            Some(PodArtifactDirId {
+                namespace,
+                name,
+                uid: Some(uid),
+            }) => {
+                !live_owners.contains(&(namespace.to_string(), name.to_string(), uid.to_string()))
             }
-            _ => false,
+            Some(PodArtifactDirId {
+                namespace,
+                name,
+                uid: None,
+            }) => !live_slots.contains(&(namespace.to_string(), name.to_string())),
+            None => false,
         })
         .cloned()
         .collect()
@@ -178,12 +244,12 @@ pub fn orphaned_pod_dir_ids(
 /// Returns the number of orphan dirs removed.
 pub async fn sweep_orphan_pod_artifacts(
     containerd_ns: &str,
-    live_slots: &HashSet<(String, String)>,
+    live_owners: &HashSet<(String, String, String)>,
 ) -> anyhow::Result<usize> {
     let pods_root = crate::paths::volumes_root_path(containerd_ns);
     let dir_ids = crate::kubelet::pod_fs::PodFs::list_subdir_names(pods_root.clone()).await?;
 
-    let orphans = orphaned_pod_dir_ids(&dir_ids, live_slots);
+    let orphans = orphaned_pod_dir_ids(&dir_ids, live_owners);
     let mut removed = 0usize;
     for dir_id in &orphans {
         let pod_root = pods_root.join(dir_id);
@@ -278,20 +344,26 @@ pub mod tests {
         // owner (leaked after a crash that lost the CRI identity stamp) while
         // never touching live dirs or dirs whose layout it does not recognize.
         let mut live = HashSet::new();
-        live.insert(("default".to_string(), "web".to_string()));
+        live.insert((
+            "default".to_string(),
+            "web".to_string(),
+            "uid-live".to_string(),
+        ));
         let dirs = vec![
-            "default_web".to_string(),         // live -> kept
-            "default_gone".to_string(),        // orphan
-            "kube-system_coredns".to_string(), // orphan
-            "no-separator".to_string(),        // unrecognized layout -> never touched
+            "default_web_uid-live".to_string(),        // live -> kept
+            "default_web_uid-stale".to_string(),       // stale same-name UID -> orphan
+            "default_gone_uid-gone".to_string(),       // orphan
+            "kube-system_coredns_uid-dns".to_string(), // orphan
+            "no-separator".to_string(),                // unrecognized layout -> never touched
         ];
         let mut orphans = super::orphaned_pod_dir_ids(&dirs, &live);
         orphans.sort();
         assert_eq!(
             orphans,
             vec![
-                "default_gone".to_string(),
-                "kube-system_coredns".to_string()
+                "default_gone_uid-gone".to_string(),
+                "default_web_uid-stale".to_string(),
+                "kube-system_coredns_uid-dns".to_string()
             ]
         );
     }

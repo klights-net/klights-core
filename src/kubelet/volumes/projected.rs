@@ -51,6 +51,19 @@ pub struct ProjectedVolumeNsRequest<'a> {
     pub token: Option<&'a str>,
 }
 
+pub(crate) struct ProjectedVolumeRootRequest<'a> {
+    pub volumes_root: &'a str,
+    pub source_reader: &'a dyn VolumeSourceReader,
+    pub namespace: &'a str,
+    pub pod_dir_id: &'a str,
+    pub pod_db_name: &'a str,
+    pub pod: &'a serde_json::Value,
+    pub volume_name: &'a str,
+    pub default_mode: Option<u32>,
+    pub sources: &'a serde_json::Value,
+    pub token: Option<&'a str>,
+}
+
 #[cfg(test)]
 pub struct ProjectedVolumeAtRequest<'a> {
     pub volumes_root: &'a str,
@@ -404,8 +417,26 @@ async fn create_projected_volume_at_impl(
 /// to avoid cross-namespace volume path collisions.
 pub async fn create_projected_volume_ns(request: ProjectedVolumeNsRequest<'_>) -> Result<String> {
     let volumes_root = volumes_root();
-    create_projected_volume_at_impl(ProjectedVolumePathRequest {
+    create_projected_volume_under_root(ProjectedVolumeRootRequest {
         volumes_root: &volumes_root,
+        source_reader: request.source_reader,
+        namespace: request.namespace,
+        pod_dir_id: request.pod_dir_id,
+        pod_db_name: request.pod_db_name,
+        pod: request.pod,
+        volume_name: request.volume_name,
+        default_mode: request.default_mode,
+        sources: request.sources,
+        token: request.token,
+    })
+    .await
+}
+
+pub(crate) async fn create_projected_volume_under_root(
+    request: ProjectedVolumeRootRequest<'_>,
+) -> Result<String> {
+    create_projected_volume_at_impl(ProjectedVolumePathRequest {
+        volumes_root: request.volumes_root,
         source_reader: request.source_reader,
         namespace: request.namespace,
         pod_dir_id: request.pod_dir_id,
