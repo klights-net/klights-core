@@ -791,15 +791,22 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             }
 
         if let Some(name) = exact_name_empty_baseline {
-            match db.list_deleted_watch_events_since(0).await {
-                Ok(deleted) => {
-                    let retained = deleted
+            let target = match watch_namespace.as_deref() {
+                Some(namespace) => {
+                    WatchTarget::namespaced_in_namespace(api_version.clone(), kind.clone(), namespace)
+                }
+                None => WatchTarget::cluster(api_version.clone(), kind.clone()),
+            };
+            match db.list_watch_events_since(&[target], 0).await {
+                Ok(events) => {
+                    let retained = events
                         .into_iter()
                         .filter(|catchup| {
                             catchup.resource.api_version == api_version
                                 && catchup.resource.kind == kind
                                 && catchup.resource.name == name
                                 && catchup.resource.resource_version <= requested_rv
+                                && catchup.event_type == "DELETED"
                         })
                         .filter(|catchup| {
                             let event = catchup.clone().into_watch_event();
