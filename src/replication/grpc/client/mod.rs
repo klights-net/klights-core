@@ -1338,40 +1338,67 @@ impl ReplicationGrpcClient {
         &self,
         req: WatchRequest,
     ) -> Result<WatchStream<ResourceEvent>> {
-        let mut client = self.tonic_client().await?;
-        let mut request = tonic::Request::new(generated::WatchResourcesRequest {
+        let request = generated::WatchResourcesRequest {
             api_version: req.api_version,
             kind: req.kind,
             namespace: req.namespace,
             field_selector: req.field_selector,
             start_resource_version: req.start_resource_version.unwrap_or(0),
             label_selector: req.label_selector,
-        });
-        self.add_join_token(&mut request)?;
-        let stream = match client.watch_resources(request).await {
-            Ok(stream) => stream,
-            Err(status) => {
-                // Self-heal: a leader restart wedges the Read-lane warm
-                // pool. Evict it so the caller's reconnect loop rebuilds a
-                // fresh channel on the next watch attempt.
-                self.heal_lane_on_transport(ChannelLane::Read, &status)
-                    .await;
-                return Err(anyhow::Error::from(status).context("gRPC WatchResources failed"));
-            }
+        };
+        let mut last_retryable: Option<String> = None;
+        for endpoint in self.leader_endpoint_candidates() {
+            self.set_current_leader_endpoint(Some(endpoint.clone()));
+            let mut client = match self
+                .tonic_client_lane_for_endpoint(ChannelLane::Read, &endpoint)
+                .await
+            {
+                Ok(client) => client,
+                Err(err) => {
+                    last_retryable = Some(err.to_string());
+                    continue;
+                }
+            };
+            let mut grpc_request = tonic::Request::new(request.clone());
+            self.add_join_token(&mut grpc_request)?;
+            let response = match client.watch_resources(grpc_request).await {
+                Ok(stream) => stream,
+                Err(status) if is_not_raft_leader_status(&status) => {
+                    last_retryable = Some(status.to_string());
+                    continue;
+                }
+                Err(status) if is_transport_status(&status) => {
+                    // Self-heal: a leader restart wedges the Read-lane warm
+                    // pool. Evict it so the caller's reconnect loop rebuilds a
+                    // fresh channel on the next watch attempt.
+                    self.heal_lane_on_transport(ChannelLane::Read, &status)
+                        .await;
+                    last_retryable = Some(status.to_string());
+                    continue;
+                }
+                Err(status) => {
+                    return Err(anyhow::Error::from(status).context("gRPC WatchResources failed"));
+                }
+            };
+            let stream = response.into_inner().map(|event| {
+                event
+                    // Preserve the tonic::Status as the error source (rather than
+                    // flattening it into a display string) so the worker reflector
+                    // can detect a replay-window expiration (Code::OutOfRange) and
+                    // relist, matching the K8s "too old resource version" contract.
+                    .map_err(|err| {
+                        anyhow::Error::from(err).context("gRPC WatchResources stream failed")
+                    })
+                    .and_then(resource_event_from_proto)
+            });
+            return Ok(Box::pin(stream));
         }
-        .into_inner()
-        .map(|event| {
-            event
-                // Preserve the tonic::Status as the error source (rather than
-                // flattening it into a display string) so the worker reflector
-                // can detect a replay-window expiration (Code::OutOfRange) and
-                // relist, matching the K8s "too old resource version" contract.
-                .map_err(|err| {
-                    anyhow::Error::from(err).context("gRPC WatchResources stream failed")
-                })
-                .and_then(resource_event_from_proto)
-        });
-        Ok(Box::pin(stream))
+        Err(anyhow!(
+            "{}",
+            last_retryable
+                .unwrap_or_else(|| "no leader endpoint accepted grpc_watch_resources".to_string())
+        )
+        .context("gRPC WatchResources failed"))
     }
 
     pub async fn projected_service_account_token_rpc(
@@ -2218,12 +2245,6 @@ impl ReplicationGrpcClient {
             channel,
             self.policy.max_message_bytes,
         ))
-    }
-
-    /// Read-lane tonic client — the default for cold/control-plane and
-    /// read RPCs.
-    async fn tonic_client(&self) -> Result<TonicClient<Channel>> {
-        self.tonic_client_lane(ChannelLane::Read).await
     }
 
     /// bug-grpc: resolve a pooled channel for `lane`, iterating failover

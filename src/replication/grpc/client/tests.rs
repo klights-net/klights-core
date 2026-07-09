@@ -430,6 +430,43 @@ mod cases {
         )))
     }
 
+    async fn grpc_watch_gate_server(
+        is_leader: bool,
+    ) -> (
+        String,
+        DatastoreHandle,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+            .await
+            .unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let (leader_tx, leader_rx) = tokio::sync::watch::channel(is_leader);
+        let app = crate::replication::grpc::server::mount_service_full(
+            axum::Router::new(),
+            service,
+            db.clone(),
+            None,
+            None,
+            None,
+            None,
+            "",
+            Some(leader_rx),
+            None,
+            default_transport_policy(),
+        );
+        let app = mount_test_service_with_node_cert(app, "worker-1");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (endpoint, db, leader_tx, handle)
+    }
+
     #[tokio::test]
     async fn https_join_without_skip_ca_succeeds_with_trusted_ca() {
         let fixture = TlsGrpcLeaderFixture::start().await;
@@ -527,6 +564,207 @@ mod cases {
         );
         handle.abort();
         let _ = supervisor.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
+    async fn watch_open_tries_next_endpoint_after_not_raft_leader() {
+        let _guard = ENV_LOCK.lock().await;
+        let (stale_endpoint, _stale_db, _stale_leader_tx, stale_handle) =
+            grpc_watch_gate_server(false).await;
+        let (leader_endpoint, leader_db, _leader_tx, leader_handle) =
+            grpc_watch_gate_server(true).await;
+        leader_db
+            .create_namespace(
+                "default",
+                serde_json::json!({"metadata": {"name": "default"}}),
+            )
+            .await
+            .expect("create namespace");
+        let token = crate::bootstrap::cluster_meta::read_join_token(leader_db.as_ref())
+            .await
+            .expect("read token");
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: stale_endpoint.clone(),
+                token,
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: dataplane(),
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            default_transport_policy(),
+        );
+        client.set_all_leader_endpoints(vec![stale_endpoint.clone(), leader_endpoint.clone()]);
+
+        let mut stream = client
+            .watch_resources_rpc(crate::control_plane::client::WatchRequest {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: None,
+                label_selector: None,
+                field_selector: Some("spec.nodeName=worker-1".to_string()),
+                start_resource_version: None,
+            })
+            .await
+            .expect("watch open should fail over to the current leader");
+        assert_eq!(
+            client.current_leader_endpoint(),
+            leader_endpoint,
+            "successful watch open must pin the client to the endpoint that accepted it"
+        );
+
+        leader_db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "scheduled",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "scheduled",
+                        "uid": "uid-scheduled"
+                    },
+                    "spec": {
+                        "nodeName": "worker-1",
+                        "containers": [{"name": "app", "image": "busybox"}]
+                    },
+                    "status": {"phase": "Pending"}
+                }),
+            )
+            .await
+            .expect("create pod");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("watch should receive leader events")
+            .expect("watch stream should stay open")
+            .expect("watch event should decode");
+        assert_eq!(event.event.event_type, crate::watch::EventType::Added);
+        assert_eq!(
+            event
+                .event
+                .object
+                .pointer("/metadata/name")
+                .and_then(|v| v.as_str()),
+            Some("scheduled")
+        );
+
+        stale_handle.abort();
+        leader_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watch_open_failover_preserves_stream_out_of_range_for_relist() {
+        let _guard = ENV_LOCK.lock().await;
+        let (stale_endpoint, _stale_db, _stale_leader_tx, stale_handle) =
+            grpc_watch_gate_server(false).await;
+        let (leader_endpoint, leader_db, _leader_tx, leader_handle) =
+            grpc_watch_gate_server(true).await;
+        leader_db
+            .create_namespace(
+                "default",
+                serde_json::json!({"metadata": {"name": "default"}}),
+            )
+            .await
+            .expect("create namespace");
+        let first = leader_db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "resume-old",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"namespace": "default", "name": "resume-old"},
+                    "data": {"key": "old"}
+                }),
+            )
+            .await
+            .expect("create old configmap");
+        leader_db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "resume-new",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"namespace": "default", "name": "resume-new"},
+                    "data": {"key": "new"}
+                }),
+            )
+            .await
+            .expect("create new configmap");
+        let resume_rv = (first.resource_version - 1).max(1);
+        leader_db
+            .gc_watch_events(1, 1000)
+            .await
+            .expect("trim durable watch window");
+
+        let token = crate::bootstrap::cluster_meta::read_join_token(leader_db.as_ref())
+            .await
+            .expect("read token");
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: stale_endpoint.clone(),
+                token,
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: dataplane(),
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            default_transport_policy(),
+        );
+        client.set_all_leader_endpoints(vec![stale_endpoint.clone(), leader_endpoint.clone()]);
+
+        let mut stream = client
+            .watch_resources_rpc(crate::control_plane::client::WatchRequest {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: None,
+                label_selector: None,
+                field_selector: None,
+                start_resource_version: Some(resume_rv),
+            })
+            .await
+            .expect("watch open should fail over to the current leader");
+        assert_eq!(
+            client.current_leader_endpoint(),
+            leader_endpoint,
+            "successful watch open must pin the accepted leader endpoint"
+        );
+
+        let err = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("expired replay should produce a stream item")
+            .expect("watch stream should yield")
+            .expect_err("expired replay must surface as a stream error");
+        assert!(
+            err.chain().any(|cause| {
+                cause
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == tonic::Code::OutOfRange)
+            }),
+            "worker relist detection depends on preserving the tonic OutOfRange source: {err:#}"
+        );
+
+        stale_handle.abort();
+        leader_handle.abort();
     }
 
     #[test]

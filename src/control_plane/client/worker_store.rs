@@ -226,6 +226,15 @@ impl WorkerStoreAdapter {
                     }
                 }
                 Err(err) => {
+                    if is_watch_window_expired(&err) {
+                        tracing::info!(
+                            error = %err,
+                            "worker store watch mirror open replay window expired; relisting"
+                        );
+                        next_resource_version = None;
+                        reconnect_attempt = 0;
+                        continue;
+                    }
                     tracing::warn!(error = %err, "worker store watch mirror could not open stream");
                 }
             }
@@ -1402,6 +1411,7 @@ mod tests {
     };
     use crate::datastore::DatastoreBackend;
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn is_watch_window_expired_detects_out_of_range_in_error_chain() {
@@ -1630,6 +1640,201 @@ mod tests {
             crate::kubelet::outbox::OutboxApplyError,
         > {
             unreachable!("handoff test does not use apply_outbox")
+        }
+    }
+
+    #[derive(Default)]
+    struct OpenExpiredThenRelistLeaderApi {
+        list_count: AtomicUsize,
+        watch_count: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LeaderApiClient for OpenExpiredThenRelistLeaderApi {
+        async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
+            HandoffLeaderApi.get_resource(key).await
+        }
+
+        async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
+            HandoffLeaderApi.get_resource_fresh(key).await
+        }
+
+        async fn list_resources(&self, req: ListRequest) -> Result<ResourceList> {
+            if req.api_version != "v1" || req.kind != "Pod" {
+                return Ok(ResourceList {
+                    items: Vec::new(),
+                    resource_version: 0,
+                    continue_token: None,
+                    remaining_item_count: None,
+                });
+            }
+            assert_eq!(
+                req.field_selector.as_deref(),
+                Some("spec.nodeName=worker-a")
+            );
+            let attempt = self.list_count.fetch_add(1, Ordering::SeqCst);
+            let items = if attempt == 0 {
+                Vec::new()
+            } else {
+                vec![Resource {
+                    id: 1,
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "scheduled-after-relist".to_string(),
+                    uid: "uid-after-relist".to_string(),
+                    resource_version: 52,
+                    data: Arc::new(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "namespace": "default",
+                            "name": "scheduled-after-relist",
+                            "uid": "uid-after-relist",
+                            "resourceVersion": "52"
+                        },
+                        "spec": {
+                            "nodeName": "worker-a",
+                            "containers": [{"name": "app", "image": "busybox"}]
+                        },
+                        "status": {"phase": "Pending"}
+                    })),
+                }]
+            };
+            Ok(ResourceList {
+                items,
+                resource_version: if attempt == 0 { 41 } else { 52 },
+                continue_token: None,
+                remaining_item_count: None,
+            })
+        }
+
+        async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
+            if req.api_version != "v1" || req.kind != "Pod" {
+                return Ok(Box::pin(futures::stream::pending()));
+            }
+            assert_eq!(
+                req.field_selector.as_deref(),
+                Some("spec.nodeName=worker-a")
+            );
+            let attempt = self.watch_count.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                assert_eq!(req.start_resource_version, Some(41));
+                return Err(anyhow::Error::from(tonic::Status::out_of_range(
+                    "WatchResources replay window expired: resume rv 41 requires relist",
+                ))
+                .context("gRPC WatchResources failed"));
+            }
+            assert_eq!(req.start_resource_version, Some(52));
+            Ok(Box::pin(futures::stream::pending()))
+        }
+
+        async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()> {
+            HandoffLeaderApi.wait_cache_ready(scope).await
+        }
+
+        async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Pod>> {
+            HandoffLeaderApi.get_pod(ns, name).await
+        }
+
+        async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Pod>> {
+            HandoffLeaderApi.get_pod_for_uid(ns, name, uid).await
+        }
+
+        async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Pod>> {
+            HandoffLeaderApi.watch_pods_on_node(node_name).await
+        }
+
+        async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Pod>> {
+            HandoffLeaderApi.list_pods_on_node(node_name).await
+        }
+
+        async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<ConfigMap>> {
+            HandoffLeaderApi.get_configmap(ns, name).await
+        }
+
+        async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
+            HandoffLeaderApi.get_secret(ns, name).await
+        }
+
+        async fn get_node(&self, name: &str) -> Result<Node> {
+            HandoffLeaderApi.get_node(name).await
+        }
+
+        async fn watch_node(&self, name: &str) -> Result<WatchStream<Node>> {
+            HandoffLeaderApi.watch_node(name).await
+        }
+
+        async fn allocate_node_subnet(
+            &self,
+            node_name: &str,
+            cluster_cidr: &str,
+            node_ip: &str,
+        ) -> Result<NodeSubnet> {
+            HandoffLeaderApi
+                .allocate_node_subnet(node_name, cluster_cidr, node_ip)
+                .await
+        }
+
+        async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+            HandoffLeaderApi.get_node_subnet(node_name).await
+        }
+
+        async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
+            HandoffLeaderApi.list_peer_subnets(my_node_name).await
+        }
+
+        async fn get_node_dataplane(
+            &self,
+            node_name: &str,
+        ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+            HandoffLeaderApi.get_node_dataplane(node_name).await
+        }
+
+        async fn list_pod_cleanup_intents_for_node(
+            &self,
+            node_name: &str,
+        ) -> Result<Vec<PodCleanupIntent>> {
+            HandoffLeaderApi
+                .list_pod_cleanup_intents_for_node(node_name)
+                .await
+        }
+
+        async fn delete_pod_cleanup_intent(
+            &self,
+            node_name: &str,
+            namespace: &str,
+            pod_name: &str,
+            pod_uid: &str,
+            reason: &str,
+        ) -> Result<()> {
+            HandoffLeaderApi
+                .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
+                .await
+        }
+
+        async fn apply_outbox(
+            &self,
+            idempotency_key: &str,
+            operation: crate::kubelet::outbox::payload::OutboxOperation,
+            payload: bytes::Bytes,
+            client_id: &str,
+            stream_id: i64,
+            stream_seq: i64,
+        ) -> std::result::Result<
+            crate::kubelet::outbox::OutboxApplyResult,
+            crate::kubelet::outbox::OutboxApplyError,
+        > {
+            HandoffLeaderApi
+                .apply_outbox(
+                    idempotency_key,
+                    operation,
+                    payload,
+                    client_id,
+                    stream_id,
+                    stream_seq,
+                )
+                .await
         }
     }
 
@@ -2320,6 +2525,55 @@ mod tests {
                 .pointer("/metadata/deletionTimestamp")
                 .and_then(|value| value.as_str()),
             Some("2026-05-18T20:06:06Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_mirror_relists_after_open_time_replay_window_expiration() {
+        let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::default());
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor.clone(),
+            None,
+            "sqlite:worker-store-watch-open-expired-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = Arc::new(WorkerStoreAdapter::new(
+            cluster_api.clone(),
+            node_local,
+            "worker-a".to_string(),
+        ));
+        let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Pod"));
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let handles = adapter
+            .start_watch_mirrors(supervisor.clone(), cancel.clone())
+            .await
+            .expect("start watch mirrors");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), watch_rx.recv())
+            .await
+            .expect("mirror should relist and publish the scheduled pod")
+            .expect("watch channel should remain open");
+        cancel.cancel();
+        for handle in handles {
+            let _ = handle.join().await;
+        }
+
+        assert_eq!(event.event_type, crate::watch::EventType::Added);
+        assert_eq!(
+            event
+                .object
+                .pointer("/metadata/name")
+                .and_then(|v| v.as_str()),
+            Some("scheduled-after-relist")
+        );
+        assert!(
+            cluster_api.list_count.load(Ordering::SeqCst) >= 2,
+            "open-time OutOfRange must force a fresh LIST"
         );
     }
 
