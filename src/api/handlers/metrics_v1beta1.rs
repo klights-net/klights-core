@@ -1,8 +1,5 @@
 use crate::api::*;
-use crate::datastore::ResourceList;
-use crate::metrics::{
-    METRICS_API_VERSION, MetricsObjectBuilder, MetricsSnapshot, PodMetric, RuntimeMetricsSnapshot,
-};
+use crate::metrics::{METRICS_API_VERSION, MetricsObjectBuilder, MetricsSnapshot, PodMetric};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -37,13 +34,19 @@ async fn list_node_metrics(
             ),
         )
         .await?;
-    let (pod_list, runtime) = all_pods_and_runtime_snapshot(&state).await?;
-    let snapshot = MetricsSnapshot::from_pods(pod_list.items.iter(), &runtime);
+    let runtime =
+        runtime_snapshot_for_nodes(&state, list.items.iter().map(|node| node.name.as_str()))
+            .await?;
+    let snapshot = MetricsSnapshot::from_runtime_nodes(&runtime);
     let builder = MetricsObjectBuilder::new(crate::utils::k8s_timestamp());
     let items: Vec<Value> = list
         .items
         .iter()
-        .map(|node| builder.node_metrics_object(&node.name, snapshot.node_usage(&node.name)))
+        .filter_map(|node| {
+            snapshot
+                .available_node_usage(&node.name)
+                .map(|usage| builder.node_metrics_object(&node.name, usage))
+        })
         .collect();
 
     Ok(Json(json!({
@@ -63,27 +66,17 @@ async fn get_node_metrics(
         .get_resource("v1", "Node", None, &name)
         .await?
         .ok_or_else(|| AppError::not_found(METRICS_API_VERSION, "NodeMetrics", &name))?;
-    let field_selector = format!("spec.nodeName={}", node.name);
-    let pod_list = crate::kubelet::pod_repository::PodReader::list_pods(
-        state.pod_repository.as_ref(),
-        None,
-        None,
-        Some(&field_selector),
-        None,
-        None,
-    )
-    .await
-    .map_err(AppError::from)?;
+    let node_probe = node_probe_pod(&node.name);
     let runtime = state
         .metrics_provider
-        .runtime_snapshot_for_pods(&pod_list.items)
+        .runtime_snapshot_for_pods(std::slice::from_ref(&node_probe))
         .await;
-    let snapshot = MetricsSnapshot::from_pods(pod_list.items.iter(), &runtime);
+    let snapshot = MetricsSnapshot::from_runtime_nodes(&runtime);
+    let usage = snapshot.available_node_usage(&node.name).ok_or_else(|| {
+        AppError::ServiceUnavailable(format!("NodeMetrics \"{}\" is unavailable", node.name))
+    })?;
     let builder = MetricsObjectBuilder::new(crate::utils::k8s_timestamp());
-    Ok(Json(builder.node_metrics_object(
-        &node.name,
-        snapshot.node_usage(&node.name),
-    )))
+    Ok(Json(builder.node_metrics_object(&node.name, usage)))
 }
 
 async fn list_all_pod_metrics(
@@ -124,9 +117,9 @@ async fn list_pod_metrics_for_namespace(
     let items: Vec<Value> = list
         .items
         .iter()
-        .map(|pod| {
-            let metric = PodMetric::from_resource(pod, &runtime);
-            builder.pod_metrics_object(&metric)
+        .filter_map(|pod| {
+            PodMetric::from_resource(pod, &runtime)
+                .map(|metric| builder.pod_metrics_object(&metric))
         })
         .collect();
 
@@ -155,7 +148,9 @@ async fn get_pod_metrics(
         .runtime_snapshot_for_pods(std::slice::from_ref(&pod))
         .await;
     let builder = MetricsObjectBuilder::new(crate::utils::k8s_timestamp());
-    let metric = PodMetric::from_resource(&pod, &runtime);
+    let metric = PodMetric::from_resource(&pod, &runtime).ok_or_else(|| {
+        AppError::ServiceUnavailable(format!("PodMetrics \"{}\" is unavailable", pod.name))
+    })?;
     Ok(Json(builder.pod_metrics_object(&metric)))
 }
 
@@ -176,22 +171,39 @@ fn list_metadata(
     metadata
 }
 
-async fn all_pods_and_runtime_snapshot(
+async fn runtime_snapshot_for_nodes<'a>(
     state: &Arc<AppState>,
-) -> Result<(ResourceList, RuntimeMetricsSnapshot), AppError> {
-    let pod_list = crate::kubelet::pod_repository::PodReader::list_pods(
-        state.pod_repository.as_ref(),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .map_err(AppError::from)?;
+    node_names: impl IntoIterator<Item = &'a str>,
+) -> Result<crate::metrics::RuntimeMetricsSnapshot, AppError> {
+    let probes: Vec<crate::datastore::Resource> =
+        node_names.into_iter().map(node_probe_pod).collect();
     let runtime = state
         .metrics_provider
-        .runtime_snapshot_for_pods(&pod_list.items)
+        .runtime_snapshot_for_pods(&probes)
         .await;
-    Ok((pod_list, runtime))
+    Ok(runtime)
+}
+
+fn node_probe_pod(node_name: &str) -> crate::datastore::Resource {
+    crate::datastore::Resource {
+        id: 0,
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("kube-system".to_string()),
+        name: format!("node-metrics-probe-{node_name}"),
+        uid: String::new(),
+        resource_version: 0,
+        data: Arc::new(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": format!("node-metrics-probe-{node_name}"),
+                "namespace": "kube-system"
+            },
+            "spec": {
+                "nodeName": node_name,
+                "containers": [{"name": "probe"}]
+            }
+        })),
+    }
 }

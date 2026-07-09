@@ -472,7 +472,7 @@ impl ResourceMetricSummary {
         let mut total_request = 0_u64;
         let mut request_complete = true;
         for pod in pods {
-            let metric = PodMetric::from_resource(pod, runtime);
+            let metric = PodMetric::from_resource(pod, runtime)?;
             total_usage = total_usage.saturating_add(metric.usage_for_resource(resource)?);
             if let Some(request) = pod_request_for_resource(pod, resource) {
                 total_request = total_request.saturating_add(request);
@@ -744,6 +744,7 @@ fn existing_transition_time(
 mod tests {
     use super::*;
     use crate::datastore::DatastoreBackend;
+    use crate::metrics::{NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsResponse};
     use serde_json::json;
 
     async fn create_ready_pod(
@@ -781,6 +782,45 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[derive(Clone)]
+    struct StaticMetricsProvider {
+        runtime: RuntimeMetricsSnapshot,
+    }
+
+    #[async_trait::async_trait]
+    impl MetricsProvider for StaticMetricsProvider {
+        async fn runtime_snapshot_for_pods(&self, _pods: &[Resource]) -> RuntimeMetricsSnapshot {
+            self.runtime.clone()
+        }
+    }
+
+    fn runtime_metrics_for_pods<'a>(
+        namespace: &str,
+        pod_names: impl IntoIterator<Item = &'a str>,
+        cpu_nanos: u64,
+        memory_bytes: u64,
+    ) -> RuntimeMetricsSnapshot {
+        RuntimeMetricsSnapshot::from_node_metrics_responses([NodeMetricsResponse {
+            request_id: "test-runtime-metrics".to_string(),
+            node_name: "node-a".to_string(),
+            node: None,
+            pods: pod_names
+                .into_iter()
+                .map(|name| NodeMetricsPodSample {
+                    namespace: namespace.to_string(),
+                    name: name.to_string(),
+                    uid: String::new(),
+                    containers: vec![NodeMetricsContainerSample {
+                        name: "app".to_string(),
+                        cpu_nanos,
+                        memory_bytes,
+                    }],
+                })
+                .collect(),
+            error: None,
+        }])
     }
 
     #[tokio::test]
@@ -847,9 +887,25 @@ mod tests {
         )
         .await;
 
-        reconcile_hpa(&db, pod_repository.as_ref(), &hpa, "node-a")
-            .await
-            .unwrap();
+        let pod_names: Vec<String> = (0..4).map(|index| format!("web-{index}")).collect();
+        let pod_name_refs: Vec<&str> = pod_names.iter().map(String::as_str).collect();
+        let metrics_provider = StaticMetricsProvider {
+            runtime: runtime_metrics_for_pods(
+                "default",
+                pod_name_refs.iter().copied(),
+                100_000_000,
+                64 * 1024 * 1024,
+            ),
+        };
+        reconcile_hpa_with_metrics(
+            &db,
+            pod_repository.as_ref(),
+            &hpa,
+            "node-a",
+            &metrics_provider,
+        )
+        .await
+        .unwrap();
 
         let deployment = db
             .get_resource("apps/v1", "Deployment", Some("default"), "web")
@@ -945,9 +1001,25 @@ mod tests {
         )
         .await;
 
-        reconcile_hpa(&db, pod_repository.as_ref(), &hpa, "node-a")
-            .await
-            .unwrap();
+        let pod_names: Vec<String> = (0..3).map(|index| format!("legacy-{index}")).collect();
+        let pod_name_refs: Vec<&str> = pod_names.iter().map(String::as_str).collect();
+        let metrics_provider = StaticMetricsProvider {
+            runtime: runtime_metrics_for_pods(
+                "default",
+                pod_name_refs.iter().copied(),
+                100_000_000,
+                64 * 1024 * 1024,
+            ),
+        };
+        reconcile_hpa_with_metrics(
+            &db,
+            pod_repository.as_ref(),
+            &hpa,
+            "node-a",
+            &metrics_provider,
+        )
+        .await
+        .unwrap();
 
         let rc = db
             .get_resource("v1", "ReplicationController", Some("default"), "legacy")
@@ -972,5 +1044,99 @@ mod tests {
             hpa.data.pointer("/status/currentCPUUtilizationPercentage"),
             Some(&json!(100))
         );
+    }
+
+    #[tokio::test]
+    async fn hpa_does_not_scale_when_runtime_metrics_are_unavailable() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let pod_repository = crate::controllers::test_utils::pod_repository_for_test(&db);
+
+        let _deployment = crate::controllers::test_utils::store_and_prepare(
+            &db,
+            "apps/v1",
+            "Deployment",
+            Some("default"),
+            "web",
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "web", "namespace": "default", "uid": "deploy-web"},
+                "spec": {
+                    "replicas": 4,
+                    "selector": {"matchLabels": {"app": "web"}},
+                    "template": {
+                        "metadata": {"labels": {"app": "web"}},
+                        "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+                    }
+                },
+                "status": {"replicas": 4, "readyReplicas": 4}
+            }),
+        )
+        .await;
+
+        for index in 0..4 {
+            create_ready_pod(
+                &db,
+                "default",
+                &format!("web-{index}"),
+                json!({"app": "web"}),
+            )
+            .await;
+        }
+
+        let hpa = crate::controllers::test_utils::store_and_prepare(
+            &db,
+            "autoscaling/v2",
+            "HorizontalPodAutoscaler",
+            Some("default"),
+            "web",
+            json!({
+                "apiVersion": "autoscaling/v2",
+                "kind": "HorizontalPodAutoscaler",
+                "metadata": {"name": "web", "namespace": "default", "uid": "hpa-web", "generation": 1},
+                "spec": {
+                    "scaleTargetRef": {"apiVersion": "apps/v1", "kind": "Deployment", "name": "web"},
+                    "minReplicas": 2,
+                    "maxReplicas": 8,
+                    "metrics": [{
+                        "type": "Resource",
+                        "resource": {
+                            "name": "cpu",
+                            "target": {"type": "Utilization", "averageUtilization": 50}
+                        }
+                    }]
+                }
+            }),
+        )
+        .await;
+
+        reconcile_hpa(&db, pod_repository.as_ref(), &hpa, "node-a")
+            .await
+            .unwrap();
+
+        let deployment = db
+            .get_resource("apps/v1", "Deployment", Some("default"), "web")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deployment.data.pointer("/spec/replicas"), Some(&json!(4)));
+
+        let hpa = db
+            .get_resource(
+                "autoscaling/v2",
+                "HorizontalPodAutoscaler",
+                Some("default"),
+                "web",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hpa.data.pointer("/status/currentReplicas"), Some(&json!(4)));
+        assert_eq!(hpa.data.pointer("/status/desiredReplicas"), Some(&json!(4)));
+        assert_eq!(
+            hpa.data.pointer("/status/conditions/1/reason"),
+            Some(&json!("FailedGetResourceMetric"))
+        );
+        assert!(hpa.data.pointer("/status/currentMetrics").is_none());
     }
 }

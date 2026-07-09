@@ -1597,6 +1597,10 @@ mod cases {
             NodeMetricsResponse {
                 request_id: request.request_id,
                 node_name: request.node_name,
+                node: Some(crate::metrics::NodeMetricsNodeSample {
+                    cpu_nanos: 7_000_000,
+                    memory_bytes: 11 * 1024 * 1024,
+                }),
                 pods: vec![NodeMetricsPodSample {
                     namespace: "default".to_string(),
                     name: "remote-pod".to_string(),

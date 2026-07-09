@@ -1732,6 +1732,7 @@ mod tests {
             .complete_node_metrics(NodeMetricsResponse {
                 request_id: request.request_id,
                 node_name: "worker-1".to_string(),
+                node: None,
                 pods: Vec::new(),
                 error: None,
             })

@@ -2258,6 +2258,12 @@ fn node_metrics_response_from_proto(
     NodeMetricsResponse {
         request_id: response.request_id,
         node_name: response.node_name,
+        node: response
+            .node
+            .map(|node| crate::metrics::NodeMetricsNodeSample {
+                cpu_nanos: node.cpu_nanos,
+                memory_bytes: node.memory_bytes,
+            }),
         pods: response
             .pods
             .into_iter()

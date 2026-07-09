@@ -30,7 +30,7 @@ use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource};
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
 use crate::leader_tls_policy::{LeaderTlsVerification, LeaderTlsVerificationPolicy};
-use crate::metrics::{NodeMetricsRequest, NodeMetricsResponse};
+use crate::metrics::{NodeMetricsRequest, NodeMetricsResponse, NodeMetricsSampler};
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use crate::replication::grpc::generated::replication_client::ReplicationClient as TonicClient;
 use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
@@ -187,11 +187,18 @@ impl CriNodeExecSyncHandler {
 
 pub struct CriNodeMetricsHandler {
     cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
+    task_supervisor: Arc<TaskSupervisor>,
 }
 
 impl CriNodeMetricsHandler {
-    pub fn new(cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>) -> Self {
-        Self { cri }
+    pub fn new(
+        cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
+        task_supervisor: Arc<TaskSupervisor>,
+    ) -> Self {
+        Self {
+            cri,
+            task_supervisor,
+        }
     }
 }
 
@@ -433,17 +440,39 @@ impl NodeExecStreamHandler for CriNodeExecSyncHandler {
 #[async_trait]
 impl NodeMetricsHandler for CriNodeMetricsHandler {
     async fn collect_metrics(&self, request: NodeMetricsRequest) -> NodeMetricsResponse {
+        let node =
+            match crate::metrics::LinuxProcNodeMetricsSampler::new(self.task_supervisor.clone())
+                .sample_node()
+                .await
+            {
+                Ok(sample) => Some(sample),
+                Err(error) => {
+                    tracing::debug!(%error, "node resource metrics unavailable");
+                    None
+                }
+            };
         let mut client = {
             let guard = self.cri.lock().await;
             guard.clone()
         };
         match client.list_pod_sandbox_stats(None).await {
-            Ok(stats) => NodeMetricsResponse::from_pod_sandbox_stats(&request, stats),
-            Err(err) => NodeMetricsResponse::error(
-                request.request_id,
-                request.node_name,
-                format!("{err:#}"),
-            ),
+            Ok(stats) => NodeMetricsResponse::from_pod_sandbox_stats(&request, node, stats),
+            Err(err) => {
+                tracing::debug!(error = %err, "CRI pod sandbox metrics unavailable");
+                if let Some(node) = node {
+                    NodeMetricsResponse::from_node_sample(
+                        request.request_id,
+                        request.node_name,
+                        node,
+                    )
+                } else {
+                    NodeMetricsResponse::error(
+                        request.request_id,
+                        request.node_name,
+                        format!("{err:#}"),
+                    )
+                }
+            }
         }
     }
 }
@@ -3190,6 +3219,10 @@ fn node_metrics_response_to_proto(response: NodeMetricsResponse) -> generated::N
     generated::NodeMetricsResponse {
         request_id: response.request_id,
         node_name: response.node_name,
+        node: response.node.map(|node| generated::NodeMetricsNodeSample {
+            cpu_nanos: node.cpu_nanos,
+            memory_bytes: node.memory_bytes,
+        }),
         pods: response
             .pods
             .into_iter()

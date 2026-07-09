@@ -1,19 +1,19 @@
 use crate::datastore::Resource;
 use crate::kubelet::pod_resources::{parse_cpu_resource, parse_memory_resource};
-use anyhow::anyhow;
+use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 
 pub const METRICS_API_VERSION: &str = "metrics.k8s.io/v1beta1";
 pub const METRICS_WINDOW: &str = "30s";
 
-const DEFAULT_CONTAINER_CPU_NANOS: u64 = 1_000_000;
-const DEFAULT_CONTAINER_MEMORY_BYTES: u64 = 1024 * 1024;
+const NODE_CPU_SAMPLE_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeMetricsRequest {
@@ -26,6 +26,7 @@ pub struct NodeMetricsRequest {
 pub struct NodeMetricsResponse {
     pub request_id: String,
     pub node_name: String,
+    pub node: Option<NodeMetricsNodeSample>,
     pub pods: Vec<NodeMetricsPodSample>,
     pub error: Option<String>,
 }
@@ -35,13 +36,29 @@ impl NodeMetricsResponse {
         Self {
             request_id,
             node_name,
+            node: None,
             pods: Vec::new(),
             error: Some(error.into()),
         }
     }
 
+    pub fn from_node_sample(
+        request_id: String,
+        node_name: String,
+        node: NodeMetricsNodeSample,
+    ) -> Self {
+        Self {
+            request_id,
+            node_name,
+            node: Some(node),
+            pods: Vec::new(),
+            error: None,
+        }
+    }
+
     pub fn from_pod_sandbox_stats(
         request: &NodeMetricsRequest,
+        node: Option<NodeMetricsNodeSample>,
         stats: Vec<k8s_cri::v1::PodSandboxStats>,
     ) -> Self {
         let wanted_uids: BTreeSet<&str> = request
@@ -60,9 +77,22 @@ impl NodeMetricsResponse {
         Self {
             request_id: request.request_id.clone(),
             node_name: request.node_name.clone(),
+            node,
             pods,
             error: None,
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeMetricsNodeSample {
+    pub cpu_nanos: u64,
+    pub memory_bytes: u64,
+}
+
+impl From<NodeMetricsNodeSample> for ResourceUsage {
+    fn from(sample: NodeMetricsNodeSample) -> Self {
+        Self::new(sample.cpu_nanos, sample.memory_bytes)
     }
 }
 
@@ -185,32 +215,19 @@ pub struct MetricsSnapshot {
 }
 
 impl MetricsSnapshot {
-    pub fn from_pods<'a>(
-        pods: impl IntoIterator<Item = &'a Resource>,
-        runtime: &RuntimeMetricsSnapshot,
-    ) -> Self {
-        let mut node_usage: BTreeMap<String, ResourceUsage> = BTreeMap::new();
-        for pod in pods {
-            if pod_is_terminal(pod.data.as_ref()) {
-                continue;
-            }
-            let metric = PodMetric::from_resource(pod, runtime);
-            let Some(node_name) = metric.node_name() else {
-                continue;
-            };
-            let entry = node_usage.entry(node_name.to_string()).or_default();
-            entry.add_assign(metric.usage());
+    pub fn from_runtime_nodes(runtime: &RuntimeMetricsSnapshot) -> Self {
+        Self {
+            node_usage: runtime.node_usage.clone(),
         }
-        Self { node_usage }
     }
 
-    pub fn node_usage(&self, node_name: &str) -> ResourceUsage {
-        self.node_usage.get(node_name).copied().unwrap_or_default()
+    pub fn available_node_usage(&self, node_name: &str) -> Option<ResourceUsage> {
+        self.node_usage.get(node_name).copied()
     }
 }
 
 impl PodMetric {
-    pub fn from_resource(pod: &Resource, runtime: &RuntimeMetricsSnapshot) -> Self {
+    pub fn from_resource(pod: &Resource, runtime: &RuntimeMetricsSnapshot) -> Option<Self> {
         let namespace = pod_namespace(pod);
         let name = pod.name.clone();
         let node_name = pod
@@ -225,61 +242,32 @@ impl PodMetric {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter_map(|container| {
+            .map(|container| {
                 let name = container.get("name").and_then(Value::as_str)?;
-                let usage = runtime
-                    .container_usage(pod, name)
-                    .unwrap_or_else(|| ResourceUsage::from_container_spec(container));
+                let usage = runtime.container_usage(pod, name)?;
                 Some(ContainerMetric {
                     name: name.to_string(),
                     usage,
                 })
             })
-            .collect();
+            .collect::<Option<Vec<_>>>()?;
 
-        Self {
+        if containers.is_empty() {
+            return None;
+        }
+
+        Some(Self {
             name,
             namespace,
             node_name,
             containers,
-        }
-    }
-}
-
-impl ResourceUsage {
-    fn from_container_spec(container: &Value) -> Self {
-        let cpu_nanos = container
-            .pointer("/resources/requests/cpu")
-            .and_then(Value::as_str)
-            .and_then(parse_cpu_resource)
-            .or_else(|| {
-                container
-                    .pointer("/resources/limits/cpu")
-                    .and_then(Value::as_str)
-                    .and_then(parse_cpu_resource)
-            })
-            .and_then(|value| u64::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_CONTAINER_CPU_NANOS);
-        let memory_bytes = container
-            .pointer("/resources/requests/memory")
-            .and_then(Value::as_str)
-            .and_then(parse_memory_resource)
-            .or_else(|| {
-                container
-                    .pointer("/resources/limits/memory")
-                    .and_then(Value::as_str)
-                    .and_then(parse_memory_resource)
-            })
-            .and_then(|value| u64::try_from(value).ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_CONTAINER_MEMORY_BYTES);
-        Self::new(cpu_nanos, memory_bytes)
+        })
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeMetricsSnapshot {
+    node_usage: BTreeMap<String, ResourceUsage>,
     by_uid: BTreeMap<String, RuntimePodSample>,
     by_namespace_name: BTreeMap<(String, String), RuntimePodSample>,
 }
@@ -342,6 +330,11 @@ impl RuntimeMetricsSnapshot {
                     "node runtime metrics unavailable"
                 );
                 continue;
+            }
+            if let Some(node) = response.node {
+                snapshot
+                    .node_usage
+                    .insert(response.node_name.clone(), ResourceUsage::from(node));
             }
             for sample in response.pods {
                 snapshot.insert_sample(RuntimePodSample::from(sample));
@@ -545,10 +538,12 @@ impl OnDemandMetricsProvider {
         let cri = self.cri.clone();
         let replication = self.replication.clone();
         let request_node_name = node_name.clone();
+        let supervisor = self.supervisor.clone();
+        let fetch_supervisor = supervisor.clone();
         self.coalescer
-            .get_or_spawn(node_name.clone(), self.supervisor.clone(), async move {
+            .get_or_spawn(node_name.clone(), supervisor, async move {
                 if request_node_name == local_node_name {
-                    collect_local_cri_node_metrics(cri, request_node_name).await
+                    collect_local_cri_node_metrics(cri, request_node_name, fetch_supervisor).await
                 } else if let Some(replication) = replication {
                     let request = NodeMetricsRequest {
                         request_id: String::new(),
@@ -596,13 +591,27 @@ impl MetricsProvider for OnDemandMetricsProvider {
 async fn collect_local_cri_node_metrics(
     cri: Option<Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
     node_name: String,
+    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
 ) -> NodeMetricsResponse {
     let request = NodeMetricsRequest {
         request_id: String::new(),
         node_name: node_name.clone(),
         pod_uids: Vec::new(),
     };
+    let node = match LinuxProcNodeMetricsSampler::new(supervisor)
+        .sample_node()
+        .await
+    {
+        Ok(sample) => Some(sample),
+        Err(error) => {
+            tracing::debug!(%error, "node resource metrics unavailable");
+            None
+        }
+    };
     let Some(cri) = cri else {
+        if let Some(node) = node {
+            return NodeMetricsResponse::from_node_sample(String::new(), node_name, node);
+        }
         return NodeMetricsResponse::error(
             String::new(),
             node_name,
@@ -614,9 +623,131 @@ async fn collect_local_cri_node_metrics(
         guard.clone()
     };
     match client.list_pod_sandbox_stats(None).await {
-        Ok(stats) => NodeMetricsResponse::from_pod_sandbox_stats(&request, stats),
-        Err(error) => NodeMetricsResponse::error(String::new(), node_name, format!("{error:#}")),
+        Ok(stats) => NodeMetricsResponse::from_pod_sandbox_stats(&request, node, stats),
+        Err(error) => {
+            tracing::debug!(%error, "CRI pod sandbox metrics unavailable");
+            if let Some(node) = node {
+                NodeMetricsResponse::from_node_sample(String::new(), node_name, node)
+            } else {
+                NodeMetricsResponse::error(String::new(), node_name, format!("{error:#}"))
+            }
+        }
     }
+}
+
+#[async_trait]
+pub trait NodeMetricsSampler: Send + Sync {
+    async fn sample_node(&self) -> anyhow::Result<NodeMetricsNodeSample>;
+}
+
+pub struct LinuxProcNodeMetricsSampler {
+    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+}
+
+impl LinuxProcNodeMetricsSampler {
+    pub fn new(supervisor: Arc<crate::task_supervisor::TaskSupervisor>) -> Self {
+        Self { supervisor }
+    }
+}
+
+#[async_trait]
+impl NodeMetricsSampler for LinuxProcNodeMetricsSampler {
+    async fn sample_node(&self) -> anyhow::Result<NodeMetricsNodeSample> {
+        let first = read_proc_node_usage(self.supervisor.clone()).await?;
+        self.supervisor
+            .sleep("node_metrics_cpu_sample_delay", NODE_CPU_SAMPLE_DELAY)
+            .await?;
+        let second = read_proc_node_usage(self.supervisor.clone()).await?;
+        let elapsed_jiffies = second
+            .cpu_total_jiffies
+            .checked_sub(first.cpu_total_jiffies)
+            .ok_or_else(|| anyhow!("node CPU counter moved backwards"))?;
+        let idle_jiffies = second
+            .cpu_idle_jiffies
+            .checked_sub(first.cpu_idle_jiffies)
+            .ok_or_else(|| anyhow!("node idle CPU counter moved backwards"))?;
+        let active_jiffies = elapsed_jiffies.saturating_sub(idle_jiffies);
+        let cpu_nanos = if elapsed_jiffies == 0 {
+            0
+        } else {
+            active_jiffies
+                .saturating_mul(1_000_000_000)
+                .div_ceil(elapsed_jiffies)
+        };
+
+        Ok(NodeMetricsNodeSample {
+            cpu_nanos,
+            memory_bytes: second.memory_used_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcNodeUsage {
+    cpu_total_jiffies: u64,
+    cpu_idle_jiffies: u64,
+    memory_used_bytes: u64,
+}
+
+async fn read_proc_node_usage(
+    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+) -> anyhow::Result<ProcNodeUsage> {
+    supervisor
+        .run_blocking_file("node_metrics_read_proc", read_proc_node_usage_blocking)
+        .await?
+}
+
+fn read_proc_node_usage_blocking() -> anyhow::Result<ProcNodeUsage> {
+    let stat = crate::utils::read_utf8_file("/proc/stat").context("read /proc/stat")?;
+    let meminfo = crate::utils::read_utf8_file("/proc/meminfo").context("read /proc/meminfo")?;
+    parse_proc_node_usage(&stat, &meminfo)
+}
+
+fn parse_proc_node_usage(stat: &str, meminfo: &str) -> anyhow::Result<ProcNodeUsage> {
+    let cpu_line = stat
+        .lines()
+        .find(|line| line.starts_with("cpu "))
+        .ok_or_else(|| anyhow!("missing aggregate cpu line in /proc/stat"))?;
+    let fields: Vec<u64> = cpu_line
+        .split_whitespace()
+        .skip(1)
+        .map(|field| {
+            field
+                .parse::<u64>()
+                .with_context(|| format!("invalid /proc/stat cpu field '{field}'"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    if fields.len() < 5 {
+        return Err(anyhow!("aggregate cpu line has too few fields"));
+    }
+    let idle_jiffies = fields[3].saturating_add(fields[4]);
+    let total_jiffies = fields
+        .iter()
+        .copied()
+        .fold(0_u64, |total, value| total.saturating_add(value));
+
+    let mem_total = parse_meminfo_kib(meminfo, "MemTotal")?;
+    let mem_available = parse_meminfo_kib(meminfo, "MemAvailable")?;
+    let memory_used_bytes = mem_total.saturating_sub(mem_available).saturating_mul(1024);
+
+    Ok(ProcNodeUsage {
+        cpu_total_jiffies: total_jiffies,
+        cpu_idle_jiffies: idle_jiffies,
+        memory_used_bytes,
+    })
+}
+
+fn parse_meminfo_kib(meminfo: &str, key: &str) -> anyhow::Result<u64> {
+    let prefix = format!("{key}:");
+    let line = meminfo
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .ok_or_else(|| anyhow!("missing {key} in /proc/meminfo"))?;
+    line.split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow!("missing {key} value in /proc/meminfo"))?
+        .parse::<u64>()
+        .with_context(|| format!("invalid {key} value in /proc/meminfo"))
 }
 
 fn metric_nodes_for_pods(pods: &[Resource]) -> Vec<String> {
@@ -812,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn pod_metric_uses_requests_and_defaults_without_runtime_sample() {
+    fn pod_metric_is_unavailable_without_runtime_sample() {
         let pod = pod_resource(json!({
             "metadata": {"name": "pod-a", "namespace": "default", "uid": "uid-a"},
             "spec": {
@@ -824,14 +955,7 @@ mod tests {
             }
         }));
 
-        let metric = PodMetric::from_resource(&pod, &RuntimeMetricsSnapshot::default());
-        let builder = MetricsObjectBuilder::new("2026-01-01T00:00:00Z".to_string());
-        let object = builder.pod_metrics_object(&metric);
-
-        assert_eq!(object["containers"][0]["usage"]["cpu"], "250m");
-        assert_eq!(object["containers"][0]["usage"]["memory"], "65536Ki");
-        assert_eq!(object["containers"][1]["usage"]["cpu"], "1m");
-        assert_eq!(object["containers"][1]["usage"]["memory"], "1024Ki");
+        assert!(PodMetric::from_resource(&pod, &RuntimeMetricsSnapshot::default()).is_none());
     }
 
     #[test]
@@ -881,7 +1005,7 @@ mod tests {
             }
         }));
 
-        let metric = PodMetric::from_resource(&pod, &runtime);
+        let metric = PodMetric::from_resource(&pod, &runtime).unwrap();
         let object = MetricsObjectBuilder::new("2026-01-01T00:00:00Z".to_string())
             .pod_metrics_object(&metric);
 
@@ -894,6 +1018,10 @@ mod tests {
         let runtime = RuntimeMetricsSnapshot::from_node_metrics_responses([NodeMetricsResponse {
             request_id: "metrics-1".to_string(),
             node_name: "node-b".to_string(),
+            node: Some(NodeMetricsNodeSample {
+                cpu_nanos: 222_000_000,
+                memory_bytes: 99 * 1024 * 1024,
+            }),
             pods: vec![NodeMetricsPodSample {
                 namespace: "default".to_string(),
                 name: "pod-a".to_string(),
@@ -906,6 +1034,11 @@ mod tests {
             }],
             error: None,
         }]);
+        let snapshot = MetricsSnapshot::from_runtime_nodes(&runtime);
+        assert_eq!(
+            snapshot.available_node_usage("node-b"),
+            Some(ResourceUsage::new(222_000_000, 99 * 1024 * 1024))
+        );
         let pod = pod_resource(json!({
             "metadata": {"name": "pod-a", "namespace": "default", "uid": "uid-a"},
             "spec": {
@@ -916,12 +1049,25 @@ mod tests {
             }
         }));
 
-        let metric = PodMetric::from_resource(&pod, &runtime);
+        let metric = PodMetric::from_resource(&pod, &runtime).unwrap();
         let object = MetricsObjectBuilder::new("2026-01-01T00:00:00Z".to_string())
             .pod_metrics_object(&metric);
 
         assert_eq!(object["containers"][0]["usage"]["cpu"], "88m");
         assert_eq!(object["containers"][0]["usage"]["memory"], "7168Ki");
+    }
+
+    #[test]
+    fn proc_node_usage_parser_reports_used_memory_and_cpu_counters() {
+        let usage = parse_proc_node_usage(
+            "cpu 10 20 30 100 5 2 3 0 0 0\ncpu0 1 2 3 4 5 6 7 0 0 0\n",
+            "MemTotal:       1024 kB\nMemAvailable:    256 kB\n",
+        )
+        .unwrap();
+
+        assert_eq!(usage.cpu_total_jiffies, 170);
+        assert_eq!(usage.cpu_idle_jiffies, 105);
+        assert_eq!(usage.memory_used_bytes, 768 * 1024);
     }
 
     #[tokio::test]
@@ -949,6 +1095,7 @@ mod tests {
                         NodeMetricsResponse {
                             request_id: "first".to_string(),
                             node_name: "node-a".to_string(),
+                            node: None,
                             pods: Vec::new(),
                             error: None,
                         }

@@ -111,7 +111,10 @@ async fn start_controlplane_leader_control_stream_if_needed(
         client.set_node_exec_stream_handler(exec_handler).await;
         client
             .set_node_metrics_handler(std::sync::Arc::new(
-                crate::replication::grpc::client::CriNodeMetricsHandler::new(cri.clone()),
+                crate::replication::grpc::client::CriNodeMetricsHandler::new(
+                    cri.clone(),
+                    task_supervisor.clone(),
+                ),
             ))
             .await;
     }
@@ -536,7 +539,10 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
         follower_grpc_client.set_node_exec_stream_handler(eh).await;
         follower_grpc_client
             .set_node_metrics_handler(std::sync::Arc::new(
-                crate::replication::grpc::client::CriNodeMetricsHandler::new(cri.clone()),
+                crate::replication::grpc::client::CriNodeMetricsHandler::new(
+                    cri.clone(),
+                    task_supervisor.clone(),
+                ),
             ))
             .await;
     }

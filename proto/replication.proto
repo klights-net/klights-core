@@ -214,6 +214,12 @@ message NodeMetricsResponse {
   string node_name = 2;
   repeated NodeMetricsPodSample pods = 3;
   optional string error = 4;
+  optional NodeMetricsNodeSample node = 5;
+}
+
+message NodeMetricsNodeSample {
+  uint64 cpu_nanos = 1;
+  uint64 memory_bytes = 2;
 }
 
 message NodeMetricsPodSample {

@@ -523,7 +523,7 @@ impl SqliteNodeLocalDb {
         self.db_call("node_local:outbox_claim_next_due", move |conn| {
             let tx = conn.transaction()?;
             let id: Option<i64> = tx
-                .query_row(queries::OUTBOX_CLAIM_NEXT_DUE, [now_ms], |row| row.get(0))
+                .query_row(queries::outbox_claim_next_due(), [now_ms], |row| row.get(0))
                 .optional()?;
             let Some(id) = id else {
                 tx.commit()?;
@@ -610,7 +610,7 @@ impl SqliteNodeLocalDb {
         // one dispatcher; any concurrent insert will be caught in the next batch).
         let ids: Vec<i64> = self
             .db_call("node_local:outbox_claim_batch_find", move |conn| {
-                let mut stmt = conn.prepare(queries::OUTBOX_CLAIM_DUE_BATCH)?;
+                let mut stmt = conn.prepare(queries::outbox_claim_due_batch())?;
                 let rows =
                     stmt.query_map(rusqlite::params![now_ms, limit_i64], |row| row.get(0))?;
                 let result = rows.collect::<rusqlite::Result<Vec<i64>>>()?;

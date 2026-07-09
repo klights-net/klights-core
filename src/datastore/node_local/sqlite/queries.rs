@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 pub(super) const META_GET: &str = "SELECT value FROM _node_meta WHERE key = ?1";
 pub(super) const META_SET: &str = "INSERT INTO _node_meta (key, value) VALUES (?1, ?2) \
      ON CONFLICT(key) DO UPDATE SET value = excluded.value";
@@ -61,7 +63,16 @@ pub(super) const OUTBOX_ROW_SELECT: &str = "SELECT id, client_id, idempotency_ke
      subject_uid, pod_uid, operation, is_terminal_pod_delete, stream_id, stream_seq, \
      payload_proto, attempt, next_due_ms, leased_until_ms, lease_token, last_error \
      FROM outbox WHERE id = ?1";
-pub(super) const OUTBOX_CLAIM_NEXT_DUE: &str = "SELECT id FROM outbox candidate \
+// Strict per-subject single-in-flight: a candidate is excluded if ANY older
+// same-subject row exists, regardless of whether that older row is currently
+// due or leased. The single-row and batch claim queries both use this one
+// predicate, so they cannot drift into different FIFO policies. Without it, a
+// younger same-subject row would be claimable while an older retry is
+// leased/in-flight, putting two snapshots of one Pod in flight concurrently;
+// they can then apply in raft order != stamp order and clobber the newer status.
+// Cross-subject pipelining is preserved because the exclusion only ever fires
+// for the SAME subject_key.
+const OUTBOX_CLAIM_DUE_SELECT_AND_WHERE: &str = "SELECT id FROM outbox candidate \
      WHERE candidate.next_due_ms <= ?1 \
        AND (candidate.leased_until_ms = 0 OR candidate.leased_until_ms <= ?1) \
        AND NOT ( \
@@ -115,12 +126,34 @@ pub(super) const OUTBOX_CLAIM_NEXT_DUE: &str = "SELECT id FROM outbox candidate 
                        AND (superseding_terminal.leased_until_ms = 0 OR superseding_terminal.leased_until_ms <= ?1) \
                  ) \
              ) \
-       )) \
-     ORDER BY CASE candidate.operation \
+       )) ";
+
+const OUTBOX_CLAIM_DUE_ORDER: &str = "ORDER BY CASE candidate.operation \
            WHEN 'LeaseRenew' THEN 0 \
            WHEN 'NodeStatus' THEN 1 \
            ELSE 2 \
-       END, candidate.next_due_ms ASC, candidate.id ASC LIMIT 1";
+       END, candidate.next_due_ms ASC, candidate.id ASC LIMIT ";
+
+static OUTBOX_CLAIM_NEXT_DUE_SQL: LazyLock<String> = LazyLock::new(|| outbox_claim_due_sql("1"));
+static OUTBOX_CLAIM_DUE_BATCH_SQL: LazyLock<String> = LazyLock::new(|| outbox_claim_due_sql("?2"));
+
+fn outbox_claim_due_sql(limit: &str) -> String {
+    let mut sql = String::with_capacity(
+        OUTBOX_CLAIM_DUE_SELECT_AND_WHERE.len() + OUTBOX_CLAIM_DUE_ORDER.len() + limit.len(),
+    );
+    sql.push_str(OUTBOX_CLAIM_DUE_SELECT_AND_WHERE);
+    sql.push_str(OUTBOX_CLAIM_DUE_ORDER);
+    sql.push_str(limit);
+    sql
+}
+
+pub(super) fn outbox_claim_next_due() -> &'static str {
+    OUTBOX_CLAIM_NEXT_DUE_SQL.as_str()
+}
+
+pub(super) fn outbox_claim_due_batch() -> &'static str {
+    OUTBOX_CLAIM_DUE_BATCH_SQL.as_str()
+}
 pub(super) const OUTBOX_SET_LEASE: &str =
     "UPDATE outbox SET leased_until_ms = ?2, lease_token = ?3 WHERE id = ?1";
 pub(super) const OUTBOX_RENEW_LEASE: &str = "UPDATE outbox \
@@ -133,75 +166,6 @@ pub(super) const OUTBOX_COMPLETE_SUPERSEDED_TERMINAL_POD_DELETE_STATUS: &str = "
      AND is_terminal_pod_delete = 0 \
      AND operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
          'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses')";
-// Strict per-subject single-in-flight: a candidate is excluded if ANY older
-// same-subject row exists, regardless of whether that older row is currently
-// due or leased. This matches OUTBOX_CLAIM_NEXT_DUE exactly so the batch and
-// single-row claim share one per-subject FIFO invariant. Without it, a younger
-// same-subject row would be claimable while an older retry is leased/in-flight,
-// putting two snapshots of one Pod in flight concurrently — they can then apply
-// in raft order != stamp order and clobber the newer status (lost update under
-// WAN latency / packet loss). Cross-subject pipelining is preserved because the
-// exclusion only ever fires for the SAME subject_key.
-pub(super) const OUTBOX_CLAIM_DUE_BATCH: &str = "SELECT id FROM outbox candidate \
-     WHERE candidate.next_due_ms <= ?1 \
-       AND (candidate.leased_until_ms = 0 OR candidate.leased_until_ms <= ?1) \
-       AND NOT ( \
-           candidate.is_terminal_pod_delete = 0 \
-           AND candidate.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
-               'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
-           AND EXISTS ( \
-               SELECT 1 FROM outbox terminal \
-               WHERE terminal.subject_key = candidate.subject_key \
-                 AND terminal.id > candidate.id \
-                 AND terminal.is_terminal_pod_delete = 1 \
-                 AND terminal.next_due_ms <= ?1 \
-                 AND (terminal.leased_until_ms = 0 OR terminal.leased_until_ms <= ?1) \
-           ) \
-       ) \
-       AND NOT EXISTS ( \
-           SELECT 1 FROM outbox older \
-           WHERE older.subject_key = candidate.subject_key \
-             AND older.id < candidate.id \
-             AND NOT ( \
-                 candidate.is_terminal_pod_delete = 1 \
-                 AND older.is_terminal_pod_delete = 0 \
-                 AND older.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
-                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
-                 AND (older.leased_until_ms = 0 OR older.leased_until_ms <= ?1) \
-             ) \
-       ) \
-       AND (candidate.stream_id = 0 OR NOT EXISTS ( \
-           SELECT 1 FROM outbox older_stream \
-           WHERE older_stream.stream_id = candidate.stream_id \
-             AND older_stream.id < candidate.id \
-             AND NOT ( \
-                 candidate.is_terminal_pod_delete = 1 \
-                 AND older_stream.subject_key = candidate.subject_key \
-                 AND older_stream.is_terminal_pod_delete = 0 \
-                 AND older_stream.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
-                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
-                 AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
-             ) \
-             AND NOT ( \
-                 older_stream.is_terminal_pod_delete = 0 \
-                 AND older_stream.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
-                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
-                 AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
-                 AND EXISTS ( \
-                     SELECT 1 FROM outbox superseding_terminal \
-                     WHERE superseding_terminal.subject_key = older_stream.subject_key \
-                       AND superseding_terminal.id > older_stream.id \
-                       AND superseding_terminal.is_terminal_pod_delete = 1 \
-                       AND superseding_terminal.next_due_ms <= ?1 \
-                       AND (superseding_terminal.leased_until_ms = 0 OR superseding_terminal.leased_until_ms <= ?1) \
-                 ) \
-             ) \
-       )) \
-     ORDER BY CASE candidate.operation \
-           WHEN 'LeaseRenew' THEN 0 \
-           WHEN 'NodeStatus' THEN 1 \
-           ELSE 2 \
-       END, candidate.next_due_ms ASC, candidate.id ASC LIMIT ?2";
 pub(super) const OUTBOX_REQUEUE_EXPIRED: &str = "UPDATE outbox SET leased_until_ms = 0, lease_token = NULL WHERE leased_until_ms > 0 AND leased_until_ms <= ?1";
 pub(super) const OUTBOX_NEXT_WAKE: &str = "SELECT MIN(CASE WHEN leased_until_ms > ?1 THEN leased_until_ms ELSE next_due_ms END) FROM outbox";
 
@@ -228,6 +192,23 @@ pub(super) const REPLICATION_CHECKPOINT_SET: &str = "INSERT INTO replication_che
 
 // T3: LOG_APPLY_* query constants removed — the `log_apply_entries`
 // table is gone. Raft `raft_log_entries` is the sole durable log.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbox_single_and_batch_claim_queries_share_one_policy() {
+        let single = outbox_claim_next_due();
+        let batch = outbox_claim_due_batch();
+
+        assert_eq!(
+            single.strip_suffix("1"),
+            batch.strip_suffix("?2"),
+            "single and batch outbox claim SQL must differ only by LIMIT"
+        );
+    }
+}
 
 // --- Phase 3 Raft (openraft storage-v2) ------------------------------------
 // raft_log_entries: serialized openraft::Entry<TypeConfig> blob, keyed by

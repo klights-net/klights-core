@@ -284,7 +284,58 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    let (app, db) = build_test_router_with_db().await;
+    #[derive(Clone)]
+    struct StaticMetricsProvider {
+        runtime: crate::metrics::RuntimeMetricsSnapshot,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::metrics::MetricsProvider for StaticMetricsProvider {
+        async fn runtime_snapshot_for_pods(
+            &self,
+            _pods: &[crate::datastore::Resource],
+        ) -> crate::metrics::RuntimeMetricsSnapshot {
+            self.runtime.clone()
+        }
+    }
+
+    let runtime = crate::metrics::RuntimeMetricsSnapshot::from_node_metrics_responses([
+        crate::metrics::NodeMetricsResponse {
+            request_id: "metrics-test".to_string(),
+            node_name: "node-a".to_string(),
+            node: Some(crate::metrics::NodeMetricsNodeSample {
+                cpu_nanos: 777_000_000,
+                memory_bytes: 256 * 1024 * 1024,
+            }),
+            pods: vec![crate::metrics::NodeMetricsPodSample {
+                namespace: "metrics-ns".to_string(),
+                name: "pod-a".to_string(),
+                uid: String::new(),
+                containers: vec![
+                    crate::metrics::NodeMetricsContainerSample {
+                        name: "app".to_string(),
+                        cpu_nanos: 123_000_000,
+                        memory_bytes: 9 * 1024 * 1024,
+                    },
+                    crate::metrics::NodeMetricsContainerSample {
+                        name: "sidecar".to_string(),
+                        cpu_nanos: 45_000_000,
+                        memory_bytes: 5 * 1024 * 1024,
+                    },
+                    crate::metrics::NodeMetricsContainerSample {
+                        name: "besteffort".to_string(),
+                        cpu_nanos: 1_000_000,
+                        memory_bytes: 1024 * 1024,
+                    },
+                ],
+            }],
+            error: None,
+        },
+    ]);
+    let mut state = build_test_app_state().await;
+    state.metrics_provider = std::sync::Arc::new(StaticMetricsProvider { runtime });
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
     db.create_resource(
         "v1",
         "Node",
@@ -365,8 +416,8 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     assert_eq!(node_list["items"][0]["metadata"]["name"], "node-a");
     assert!(node_list["items"][0]["timestamp"].as_str().is_some());
     assert_eq!(node_list["items"][0]["window"], "30s");
-    assert_eq!(node_list["items"][0]["usage"]["cpu"], "351m");
-    assert_eq!(node_list["items"][0]["usage"]["memory"], "99328Ki");
+    assert_eq!(node_list["items"][0]["usage"]["cpu"], "777m");
+    assert_eq!(node_list["items"][0]["usage"]["memory"], "262144Ki");
 
     let node_get_resp = app
         .clone()
@@ -388,8 +439,8 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     .unwrap();
     assert_eq!(node_get["kind"], "NodeMetrics");
     assert_eq!(node_get["metadata"]["name"], "node-a");
-    assert_eq!(node_get["usage"]["cpu"], "351m");
-    assert_eq!(node_get["usage"]["memory"], "99328Ki");
+    assert_eq!(node_get["usage"]["cpu"], "777m");
+    assert_eq!(node_get["usage"]["memory"], "262144Ki");
 
     let pod_list_resp = app
         .clone()
@@ -418,19 +469,16 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     assert_eq!(pod_list["items"][0]["containers"][1]["name"], "sidecar");
     assert_eq!(
         pod_list["items"][0]["containers"][0]["usage"]["cpu"],
-        "250m"
+        "123m"
     );
     assert_eq!(
         pod_list["items"][0]["containers"][0]["usage"]["memory"],
-        "65536Ki"
+        "9216Ki"
     );
-    assert_eq!(
-        pod_list["items"][0]["containers"][1]["usage"]["cpu"],
-        "100m"
-    );
+    assert_eq!(pod_list["items"][0]["containers"][1]["usage"]["cpu"], "45m");
     assert_eq!(
         pod_list["items"][0]["containers"][1]["usage"]["memory"],
-        "32768Ki"
+        "5120Ki"
     );
     assert_eq!(pod_list["items"][0]["containers"][2]["usage"]["cpu"], "1m");
     assert_eq!(
@@ -458,7 +506,7 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
     assert_eq!(pod_get["kind"], "PodMetrics");
     assert_eq!(pod_get["metadata"]["name"], "pod-a");
     assert_eq!(pod_get["containers"].as_array().unwrap().len(), 3);
-    assert_eq!(pod_get["containers"][0]["usage"]["cpu"], "250m");
+    assert_eq!(pod_get["containers"][0]["usage"]["cpu"], "123m");
     assert_eq!(pod_get["containers"][2]["usage"]["memory"], "1024Ki");
 }
 

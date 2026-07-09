@@ -358,9 +358,13 @@ impl PodDeleteCoordinator {
             tracing::error!(
                 namespace = %ns,
                 name = %name,
+                uid = %uid,
                 error = %e,
                 "failed to enqueue pod deferred delete"
             );
+            return Err(AppError::Internal(format!(
+                "failed to enqueue pod deferred delete for {ns}/{name} uid {uid}: {e:#}"
+            )));
         }
 
         Ok(PodDeleteMarkOutcome {
@@ -498,4 +502,172 @@ pub(super) fn pod_target_node_from_pod_data(pod: &Value) -> Option<String> {
         .and_then(|node| node.as_str())
         .filter(|node| !node.trim().is_empty())
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Mutex;
+
+    struct FakeDeleteStore {
+        current: Mutex<Resource>,
+    }
+
+    impl FakeDeleteStore {
+        fn new(resource: Resource) -> Self {
+            Self {
+                current: Mutex::new(resource),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PodDeleteStorePort for FakeDeleteStore {
+        async fn get(&self, _ns: &str, _name: &str) -> Result<Option<Resource>> {
+            Ok(Some(self.current.lock().await.clone()))
+        }
+
+        async fn mark_deleting_latest(
+            &self,
+            _ns: &str,
+            _name: &str,
+            _uid: &str,
+            body: &Value,
+        ) -> Result<Resource> {
+            let mut guard = self.current.lock().await;
+            let mut updated = guard.clone();
+            updated.resource_version += 1;
+            updated.data = Arc::new(body.clone());
+            *guard = updated.clone();
+            Ok(updated)
+        }
+
+        async fn mark_deleting_at_resource_version(
+            &self,
+            ns: &str,
+            name: &str,
+            uid: &str,
+            body: Value,
+            _expected_rv: i64,
+        ) -> Result<Resource> {
+            self.mark_deleting_latest(ns, name, uid, &body).await
+        }
+
+        async fn delete_unscheduled_with_uid(
+            &self,
+            _ns: &str,
+            _name: &str,
+            _uid: &str,
+        ) -> Result<UnscheduledPodDeleteOutcome> {
+            Ok(UnscheduledPodDeleteOutcome::Removed)
+        }
+    }
+
+    struct FailingDeleteQueue {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl PodDeleteQueuePort for FailingDeleteQueue {
+        async fn enqueue_deferred_delete_with_target_node(
+            &self,
+            _ns: String,
+            _name: String,
+            _uid: String,
+            _run_after: Duration,
+            _target_node: Option<String>,
+        ) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("node-local workqueue write failed"))
+        }
+
+        async fn enqueue_namespace_termination_pod(
+            &self,
+            _ns: String,
+            _name: String,
+            _uid: String,
+            _target_node: Option<String>,
+        ) -> Result<()> {
+            unreachable!("not used by this test")
+        }
+    }
+
+    struct NoopDeleteSleeper;
+
+    #[async_trait]
+    impl PodDeleteSleeperPort for NoopDeleteSleeper {
+        async fn sleep(&self, _name: &'static str, _duration: Duration) {}
+    }
+
+    fn pod_resource() -> Resource {
+        Resource {
+            id: 1,
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "pod-a".to_string(),
+            uid: "uid-a".to_string(),
+            resource_version: 7,
+            data: Arc::new(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "pod-a",
+                    "namespace": "default",
+                    "uid": "uid-a"
+                },
+                "spec": {
+                    "nodeName": "node-a",
+                    "terminationGracePeriodSeconds": 0,
+                    "containers": [{"name": "app", "image": "busybox"}]
+                }
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_delete_mark_returns_error_when_durable_retry_enqueue_fails() {
+        let store = Arc::new(FakeDeleteStore::new(pod_resource()));
+        let queue = Arc::new(FailingDeleteQueue {
+            calls: AtomicUsize::new(0),
+        });
+        let metrics = SideEffectMetrics::new();
+        let coordinator = PodDeleteCoordinator::new_with_ports(
+            store.clone(),
+            queue.clone(),
+            Arc::new(NoopDeleteSleeper),
+            metrics.clone(),
+        );
+
+        let err = coordinator
+            .mark_and_queue_api_delete(
+                "default",
+                "pod-a",
+                &DeleteOptions::default(),
+                &ResourcePreconditions::default(),
+                pod_resource(),
+            )
+            .await
+            .expect_err("enqueue failure must fail the API delete");
+
+        assert!(matches!(err, AppError::Internal(_)));
+        assert_eq!(queue.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            metrics
+                .cascade_delete_failures_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            store
+                .current
+                .lock()
+                .await
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .is_some(),
+            "pod may be marked, but the caller must see failure and can retry durable enqueue"
+        );
+    }
 }
