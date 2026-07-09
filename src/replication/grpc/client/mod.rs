@@ -1752,6 +1752,7 @@ impl ReplicationGrpcClient {
             dataplane_mode: self.config.dataplane.mode.as_str().to_string(),
             dataplane_encryption: self.config.dataplane.encryption.as_str().to_string(),
             node_internal_ip: node_internal_ip.to_string(),
+            node_git_commit: crate::version::GIT_COMMIT_SHORT.to_string(),
         };
         let join_token = self.controlplane_join_token_value()?;
         let response = self

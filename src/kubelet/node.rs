@@ -555,11 +555,46 @@ pub(crate) async fn register_node_impl_opts(
     override_node_ip: Option<String>,
     grpc_port: Option<u16>,
 ) -> Result<()> {
+    register_node_impl_opts_with_git_commit(
+        db,
+        outbox,
+        cluster_api,
+        node_name,
+        node_mode,
+        node_role,
+        dataplane_health,
+        dataplane_external_ip,
+        raft_shape,
+        override_node_ip,
+        grpc_port,
+        None,
+    )
+    .await
+}
+
+/// Like `register_node_impl_opts` but allows a leader to register a remote
+/// node with the remote node's build commit instead of the leader's commit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn register_node_impl_opts_with_git_commit(
+    db: &dyn DatastoreBackend,
+    outbox: Option<&Outbox>,
+    cluster_api: Option<std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+    node_name: &str,
+    node_mode: &crate::bootstrap::NodeMode,
+    node_role: &crate::bootstrap::NodeRole,
+    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
+    dataplane_external_ip: Option<&str>,
+    raft_shape: Option<&crate::datastore::raft::types::RaftShape>,
+    override_node_ip: Option<String>,
+    grpc_port: Option<u16>,
+    node_git_commit: Option<&str>,
+) -> Result<()> {
     use crate::controllers::annotations::{
         GIT_COMMIT_ANNOTATION, GRPC_PORT_ANNOTATION, HOSTPORT_RANGE_ANNOTATION,
         NODE_MODE_ANNOTATION, hostport_range_for_local_node, node_mode_to_annotation,
     };
     tracing::info!("Registering node: {}", node_name);
+    let git_commit = node_git_commit_for_registration(node_git_commit);
     let node_ip = if let Some(ip) = override_node_ip {
         ip
     } else {
@@ -604,7 +639,7 @@ pub(crate) async fn register_node_impl_opts(
             "annotations": {
                 NODE_MODE_ANNOTATION: node_mode_to_annotation(node_mode),
                 HOSTPORT_RANGE_ANNOTATION: hostport_range_for_local_node(node_mode),
-                GIT_COMMIT_ANNOTATION: crate::version::GIT_COMMIT_SHORT,
+                GIT_COMMIT_ANNOTATION: git_commit,
             }
         },
         "spec": {
@@ -825,6 +860,60 @@ pub(crate) async fn register_node_impl_opts(
         .await
         .context("Failed to create Node resource")?;
     Ok(())
+}
+
+pub async fn refresh_current_git_commit_annotation_via_leader(
+    cluster_api: &dyn crate::control_plane::client::LeaderApiClient,
+    node_name: &str,
+) -> Result<()> {
+    let command = current_git_commit_annotation_patch_command(node_name);
+    let payload = OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .context("Failed to encode Node git-commit annotation patch")?;
+    let idempotency_key = format!(
+        "NodeGitCommitRefresh:v1/Node/{node_name}:{}:{}",
+        crate::version::GIT_COMMIT_SHORT,
+        uuid::Uuid::new_v4()
+    );
+    cluster_api
+        .apply_outbox(
+            &idempotency_key,
+            OutboxOperation::NodeStatus,
+            bytes::Bytes::from(payload),
+            node_name,
+            0,
+            0,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("leader rejected Node git-commit annotation patch: {err}"))
+}
+
+fn current_git_commit_annotation_patch_command(node_name: &str) -> StorageCommand {
+    use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
+    StorageCommand::PatchResource {
+        api_version: "v1".to_string(),
+        kind: "Node".to_string(),
+        namespace: None,
+        name: node_name.to_string(),
+        patch_kind: crate::datastore::types::PatchKind::Merge,
+        patch: serde_json::json!({
+            "metadata": {
+                "annotations": {
+                    GIT_COMMIT_ANNOTATION: crate::version::GIT_COMMIT_SHORT,
+                }
+            }
+        }),
+        preconditions: ResourcePreconditions::default(),
+        strict_resource_version: false,
+    }
+}
+
+fn node_git_commit_for_registration(explicit: Option<&str>) -> &str {
+    explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(crate::version::GIT_COMMIT_SHORT)
 }
 
 async fn send_node_command(
@@ -2234,6 +2323,56 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some(crate::version::GIT_COMMIT_SHORT),
             "network status refresh must not forward a stale build commit from the local Node cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_commit_refresh_via_leader_patches_existing_node_annotation() {
+        use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
+
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            "node-a",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {
+                    "name": "node-a",
+                    "annotations": {
+                        GIT_COMMIT_ANNOTATION: "oldcommit"
+                    }
+                },
+                "status": {
+                    "conditions": []
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let client = crate::control_plane::client::local::LocalApiClient::new(
+            std::sync::Arc::new(db.clone()),
+            "node-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        );
+
+        refresh_current_git_commit_annotation_via_leader(&client, "node-a")
+            .await
+            .unwrap();
+
+        let node = db
+            .get_resource("v1", "Node", None, "node-a")
+            .await
+            .unwrap()
+            .expect("Node must still exist");
+        assert_eq!(
+            node.data
+                .pointer("/metadata/annotations/klights.io~1git-commit")
+                .and_then(|value| value.as_str()),
+            Some(crate::version::GIT_COMMIT_SHORT),
+            "leader-applied self patch must publish the caller's current build commit"
         );
     }
 

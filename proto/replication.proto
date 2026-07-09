@@ -527,6 +527,7 @@ message JoinAsControlplaneRequest {
   string dataplane_mode = 8;
   string dataplane_encryption = 9;
   string node_internal_ip = 10;
+  string node_git_commit = 11;
 }
 
 message JoinAsControlplaneResponse {

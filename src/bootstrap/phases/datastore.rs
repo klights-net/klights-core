@@ -389,6 +389,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 // RaftProposer to the datastore wrapper on success.
                 let join_raft = raft.clone();
                 let join_db_handle = db_handle.clone();
+                let join_cluster_api = cluster_api.clone();
                 supervisor
                     .spawn_delay(
                         "controlplane_join_task",
@@ -482,6 +483,19 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                             if let Err(e) = std::fs::write(&ca_cert_path, &ca_cert_pem) {
                                                 tracing::warn!(error = %e, "failed to write ca.crt from join response");
                                             }
+                                        }
+                                        if let Err(err) =
+                                            crate::kubelet::node::refresh_current_git_commit_annotation_via_leader(
+                                                join_cluster_api.as_ref(),
+                                                &node_name,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                error = %err,
+                                                node = %node_name,
+                                                "controlplane_join_task: failed to refresh Node git-commit annotation"
+                                            );
                                         }
                                         let _ = (join_raft, join_db_handle);
                                         return;

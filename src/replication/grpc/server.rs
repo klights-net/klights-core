@@ -1670,6 +1670,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 req.node_name,
                 req.as_learner,
                 Some(req.node_internal_ip).filter(|value| !value.trim().is_empty()),
+                Some(req.node_git_commit).filter(|value| !value.trim().is_empty()),
             )
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
@@ -3125,6 +3126,7 @@ mod tests {
             _node_name: String,
             as_learner: bool,
             _node_internal_ip: Option<String>,
+            _node_git_commit: Option<String>,
         ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError> {
             Ok(ControlplaneJoinOutcome::Accepted {
                 voter_count_after: if as_learner { 1 } else { 2 },
@@ -3157,6 +3159,7 @@ mod tests {
             _node_name: String,
             as_learner: bool,
             _node_internal_ip: Option<String>,
+            _node_git_commit: Option<String>,
         ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError> {
             Ok(ControlplaneJoinOutcome::Accepted {
                 voter_count_after: if as_learner { 1 } else { 2 },
@@ -3179,6 +3182,7 @@ mod tests {
         node_name: String,
         as_learner: bool,
         node_internal_ip: Option<String>,
+        node_git_commit: Option<String>,
     }
 
     #[derive(Default)]
@@ -3204,6 +3208,7 @@ mod tests {
             node_name: String,
             as_learner: bool,
             node_internal_ip: Option<String>,
+            node_git_commit: Option<String>,
         ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError> {
             self.calls
                 .lock()
@@ -3214,6 +3219,7 @@ mod tests {
                     node_name,
                     as_learner,
                     node_internal_ip,
+                    node_git_commit,
                 });
             Ok(ControlplaneJoinOutcome::Accepted {
                 voter_count_after: if as_learner { 1 } else { 2 },
@@ -4171,6 +4177,7 @@ mod tests {
                 dataplane_mode: "root".to_string(),
                 dataplane_encryption: "enabled".to_string(),
                 node_internal_ip: "172.31.50.2".to_string(),
+                node_git_commit: "testhash1".to_string(),
             },
             "worker-1",
         );
@@ -4215,6 +4222,7 @@ mod tests {
                 dataplane_mode: "root".to_string(),
                 dataplane_encryption: "enabled".to_string(),
                 node_internal_ip: "172.31.20.2".to_string(),
+                node_git_commit: "testhash2".to_string(),
             },
             "mn-controlplane2",
         );
@@ -4542,6 +4550,7 @@ mod tests {
             dataplane_mode: "root".to_string(),
             dataplane_encryption: "enabled".to_string(),
             node_internal_ip: "172.31.20.2".to_string(),
+            node_git_commit: "testhash3".to_string(),
         });
 
         let response = client
@@ -4596,6 +4605,7 @@ mod tests {
             dataplane_mode: "root".to_string(),
             dataplane_encryption: "enabled".to_string(),
             node_internal_ip: "172.31.14.2".to_string(),
+            node_git_commit: "joinhash1".to_string(),
         });
 
         let response = client
@@ -4619,6 +4629,7 @@ mod tests {
                 node_name: "mn-controlplane2".to_string(),
                 as_learner: false,
                 node_internal_ip: Some("172.31.14.2".to_string()),
+                node_git_commit: Some("joinhash1".to_string()),
             }],
             "raft membership must use the externally observed peer address"
         );

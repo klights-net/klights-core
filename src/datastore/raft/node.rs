@@ -826,6 +826,7 @@ impl RaftNodeJoinHandler {
         addr: &str,
         as_learner: bool,
         node_internal_ip: Option<String>,
+        node_git_commit: Option<String>,
     ) -> anyhow::Result<()> {
         use crate::kubelet::node::NodeRegistrationAddresses;
         // Extract the joiner's IP from the gRPC address
@@ -863,7 +864,7 @@ impl RaftNodeJoinHandler {
             node_internal_ip.unwrap_or_else(|| joiner_ip.clone()),
             Some(joiner_ip),
         );
-        crate::kubelet::node::register_node_impl_opts(
+        crate::kubelet::node::register_node_impl_opts_with_git_commit(
             self.db.as_ref(),
             None,
             None,
@@ -875,6 +876,7 @@ impl RaftNodeJoinHandler {
             Some(&joiner_shape),
             Some(registration_addresses.internal_ip().to_string()),
             joiner_grpc_port,
+            node_git_commit.as_deref(),
         )
         .await
     }
@@ -959,6 +961,7 @@ impl crate::replication::grpc::raft_rpc::ControlplaneJoinHandler for RaftNodeJoi
         node_name: String,
         as_learner: bool,
         node_internal_ip: Option<String>,
+        node_git_commit: Option<String>,
     ) -> std::result::Result<
         crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome,
         crate::replication::grpc::raft_rpc::RaftRpcRouterError,
@@ -1011,14 +1014,18 @@ impl crate::replication::grpc::raft_rpc::ControlplaneJoinHandler for RaftNodeJoi
         // during bootstrap, so this is the only path that creates the
         // Node row. (Learners need a Node row too — they serve reads.)
         if let Err(err) = self
-            .register_voter_node(&node_name, &addr, as_learner, node_internal_ip)
+            .register_voter_node(
+                &node_name,
+                &addr,
+                as_learner,
+                node_internal_ip,
+                node_git_commit,
+            )
             .await
         {
-            tracing::warn!(
-                joining_node_name = %node_name,
-                error = %err,
-                "JoinAsControlplane: failed to register joining Node row"
-            );
+            return Err(RaftRpcRouterError::Dispatch(format!(
+                "register joining Node row for {node_name}: {err}"
+            )));
         }
         let voter_count_after = {
             // T4: read fresh metrics — a learner join may have demoted
@@ -2027,6 +2034,7 @@ mod tests {
                 "n51".into(),
                 false,
                 None,
+                Some("joinerhash1".to_string()),
             )
             .await
             .expect("leader runs add_voter");
@@ -2044,6 +2052,21 @@ mod tests {
             }
             other => panic!("expected Accepted, got {other:?}"),
         }
+        let node = handler
+            .db
+            .get_resource("v1", "Node", None, "n51")
+            .await
+            .expect("read Node row")
+            .expect("Node row must be created by register_voter_node");
+        let git_commit = node
+            .data
+            .pointer("/metadata/annotations/klights.io~1git-commit")
+            .and_then(|value| value.as_str());
+        assert_eq!(
+            git_commit,
+            Some("joinerhash1"),
+            "leader-side Node registration must stamp the joining node's git commit"
+        );
     }
 
     #[tokio::test]
@@ -2082,6 +2105,7 @@ mod tests {
                 "https://10.99.0.53:7679".into(),
                 "mn-controlplane2".into(),
                 false,
+                None,
                 None,
             )
             .await
@@ -2123,6 +2147,7 @@ mod tests {
                 "n61".into(),
                 false,
                 None,
+                None,
             )
             .await
             .expect("handler returns Denied not error");
@@ -2159,6 +2184,7 @@ mod tests {
                 "https://10.99.0.71:7679".into(),
                 "n71".into(),
                 true,
+                None,
                 None,
             )
             .await
@@ -2232,6 +2258,7 @@ mod tests {
                 "n73".into(),
                 true,
                 None,
+                None,
             )
             .await
             .expect("learner admission succeeds");
@@ -2292,6 +2319,7 @@ mod tests {
                 "n81".into(),
                 false,
                 Some("172.31.81.2".to_string()),
+                None,
             )
             .await
             .expect("voter admission succeeds");

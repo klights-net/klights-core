@@ -78,6 +78,7 @@ pub trait ControlplaneJoinHandler: Send + Sync {
         node_name: String,
         as_learner: bool,
         node_internal_ip: Option<String>,
+        node_git_commit: Option<String>,
     ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError>;
 
     /// Whether `node_name` is a current raft member (voter or learner) of this
