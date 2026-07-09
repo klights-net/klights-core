@@ -5143,6 +5143,46 @@ async fn test_exact_name_empty_list_watch_handoff_replays_retained_delete() {
         .await
         .unwrap();
     assert_eq!(delete_resp.status(), StatusCode::OK);
+    let delete_body = axum::body::to_bytes(delete_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let deleted: serde_json::Value = serde_json::from_slice(&delete_body).unwrap();
+    let delete_rv = deleted
+        .pointer("/metadata/resourceVersion")
+        .and_then(|rv| rv.as_str())
+        .and_then(|rv| rv.parse::<i64>().ok())
+        .expect("delete response must carry a resourceVersion");
+    let unrelated = json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": "unrelated", "namespace": ns}
+    });
+    let unrelated_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/namespaces/{ns}/configmaps"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&unrelated).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unrelated_resp.status(), StatusCode::CREATED);
+    let unrelated_body = axum::body::to_bytes(unrelated_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let unrelated_created: serde_json::Value = serde_json::from_slice(&unrelated_body).unwrap();
+    let inflated_rv = unrelated_created
+        .pointer("/metadata/resourceVersion")
+        .and_then(|rv| rv.as_str())
+        .and_then(|rv| rv.parse::<i64>().ok())
+        .expect("unrelated create response must carry a resourceVersion");
+    assert!(
+        inflated_rv > delete_rv,
+        "test setup requires an empty exact-name list RV newer than the retained delete"
+    );
 
     let list_resp = app
         .clone()
@@ -5169,10 +5209,11 @@ async fn test_exact_name_empty_list_watch_handoff_replays_retained_delete() {
         Some(0),
         "exact-name list must observe the object as gone"
     );
-    let list_rv = list
+    let _list_rv = list
         .pointer("/metadata/resourceVersion")
         .and_then(|rv| rv.as_str())
         .expect("list must carry a resourceVersion");
+    let watch_rv = inflated_rv.to_string();
 
     let watch_resp = app
         .clone()
@@ -5180,7 +5221,7 @@ async fn test_exact_name_empty_list_watch_handoff_replays_retained_delete() {
             Request::builder()
                 .method("GET")
                 .uri(format!(
-                    "/api/v1/namespaces/{ns}/configmaps?watch=true&resourceVersion={list_rv}&fieldSelector=metadata.name%3D{name}&allowWatchBookmarks=true&timeoutSeconds=1"
+                    "/api/v1/namespaces/{ns}/configmaps?watch=true&resourceVersion={watch_rv}&fieldSelector=metadata.name%3D{name}&allowWatchBookmarks=true&timeoutSeconds=1"
                 ))
                 .body(Body::empty())
                 .unwrap(),
