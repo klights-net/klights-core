@@ -276,6 +276,15 @@ use crate::task_supervisor::TaskSupervisor;
 const INIT_CONTAINER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const INIT_CONTAINER_FAST_EXIT_RECHECK_DELAY: std::time::Duration =
     std::time::Duration::from_millis(50);
+#[cfg(not(test))]
+const POST_SANDBOX_HOSTPORT_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const POST_SANDBOX_HOSTPORT_SETUP_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(50);
+#[cfg(not(test))]
+const POST_SANDBOX_VOLUME_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const POST_SANDBOX_VOLUME_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
 struct ContainerConfigBuildRequest<'a> {
     key: &'a PodRuntimeKey,
@@ -1807,14 +1816,65 @@ impl PodRuntimeService for RealPodRuntimeService {
         }
 
         // HostPort rules.
-        if let Err(e) = self.hostports.add_host_ports(&key, &pod).await {
-            tracing::warn!(
-                namespace = key.namespace,
-                name = key.name,
-                uid = key.uid,
-                "Failed to add hostPort rules: {}",
-                e
-            );
+        let hostport_result = self
+            .supervisor
+            .timeout(
+                "pod_start_add_hostports",
+                POST_SANDBOX_HOSTPORT_SETUP_TIMEOUT,
+                self.hostports.add_host_ports(&key, &pod),
+            )
+            .await?;
+        match hostport_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let message = format!("Failed to add hostPort rules: {e:#}");
+                tracing::warn!(
+                    namespace = key.namespace,
+                    name = key.name,
+                    uid = key.uid,
+                    "{message}"
+                );
+                self.rollback_partial_pod_start(&key, &sandbox_id, "hostPort setup failed")
+                    .await;
+                let _ = self
+                    .events
+                    .emit_pod_event(
+                        &key,
+                        "Warning",
+                        "Failed",
+                        &message,
+                        "klights-kubelet",
+                        &self.config.node_name,
+                    )
+                    .await;
+                return Ok(PodStartResult::Failed(message));
+            }
+            Err(_) => {
+                let message = format!(
+                    "Timed out adding hostPort rules after {:?}",
+                    POST_SANDBOX_HOSTPORT_SETUP_TIMEOUT
+                );
+                tracing::warn!(
+                    namespace = key.namespace,
+                    name = key.name,
+                    uid = key.uid,
+                    "{message}"
+                );
+                self.rollback_partial_pod_start(&key, &sandbox_id, "hostPort setup timed out")
+                    .await;
+                let _ = self
+                    .events
+                    .emit_pod_event(
+                        &key,
+                        "Warning",
+                        "Failed",
+                        &message,
+                        "klights-kubelet",
+                        &self.config.node_name,
+                    )
+                    .await;
+                return Ok(PodStartResult::Failed(message));
+            }
         }
 
         // Filesystem: write /etc/hosts and create log directories.
@@ -1838,9 +1898,17 @@ impl PodRuntimeService for RealPodRuntimeService {
         }
 
         // Volumes.
-        let volume_paths = match self.volumes.process_volumes(&key, &pod).await {
-            Ok(paths) => paths,
-            Err(e) => {
+        let volume_result = self
+            .supervisor
+            .timeout(
+                "pod_start_process_volumes",
+                POST_SANDBOX_VOLUME_SETUP_TIMEOUT,
+                self.volumes.process_volumes(&key, &pod),
+            )
+            .await?;
+        let volume_paths = match volume_result {
+            Ok(Ok(paths)) => paths,
+            Ok(Err(e)) => {
                 let message = format!("Failed to process volumes: {e:#}");
                 tracing::warn!(
                     namespace = key.namespace,
@@ -1850,6 +1918,33 @@ impl PodRuntimeService for RealPodRuntimeService {
                 );
                 let _ = self.hostports.remove_host_ports(&key, &pod).await;
                 self.rollback_partial_pod_start(&key, &sandbox_id, "volume processing failed")
+                    .await;
+                let _ = self
+                    .events
+                    .emit_pod_event(
+                        &key,
+                        "Warning",
+                        "Failed",
+                        &message,
+                        "klights-kubelet",
+                        &self.config.node_name,
+                    )
+                    .await;
+                return Ok(PodStartResult::Failed(message));
+            }
+            Err(_) => {
+                let message = format!(
+                    "Timed out processing volumes after {:?}",
+                    POST_SANDBOX_VOLUME_SETUP_TIMEOUT
+                );
+                tracing::warn!(
+                    namespace = key.namespace,
+                    name = key.name,
+                    uid = key.uid,
+                    "{message}"
+                );
+                let _ = self.hostports.remove_host_ports(&key, &pod).await;
+                self.rollback_partial_pod_start(&key, &sandbox_id, "volume processing timed out")
                     .await;
                 let _ = self
                     .events

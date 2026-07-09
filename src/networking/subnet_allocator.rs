@@ -158,8 +158,11 @@ impl NodeSubnetAllocator {
                 tracing::warn!(
                     node = node_name,
                     error = %err,
-                    "failed to read existing local node subnet; falling back to leader allocation"
+                    "failed to read existing local node subnet; refusing to allocate a second subnet"
                 );
+                return Err(err).with_context(|| {
+                    format!("failed to read existing local node subnet for {node_name}")
+                });
             }
         }
 
@@ -219,6 +222,7 @@ mod tests {
     struct FakeNodeSubnetStore {
         calls: AtomicUsize,
         row: Mutex<Option<NodeSubnet>>,
+        error: Option<&'static str>,
     }
 
     impl FakeNodeSubnetStore {
@@ -226,6 +230,15 @@ mod tests {
             Self {
                 calls: AtomicUsize::new(0),
                 row: Mutex::new(row),
+                error: None,
+            }
+        }
+
+        fn new_error(error: &'static str) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                row: Mutex::new(None),
+                error: Some(error),
             }
         }
 
@@ -238,6 +251,9 @@ mod tests {
     impl NodeSubnetAllocationStore for FakeNodeSubnetStore {
         async fn get_node_subnet(&self, _node_name: &str) -> anyhow::Result<Option<NodeSubnet>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.error {
+                anyhow::bail!("{error}");
+            }
             Ok(self.row.lock().expect("row lock").clone())
         }
     }
@@ -334,6 +350,26 @@ mod tests {
             .expect("existing local subnet must be reused");
 
         assert_eq!(row.node_name.as_str(), "node-a");
+        assert_eq!(store.calls(), 1);
+        assert_eq!(client.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_subnet_read_errors_fail_closed_without_leader_rpc() {
+        let client = FakeAllocationClient::new(vec![Outcome::Ok(subnet_row())]);
+        let store = FakeNodeSubnetStore::new_error("node subnet store unavailable");
+        let allocator = test_allocator(client.clone());
+
+        let err = allocator
+            .allocate_or_reuse_existing(&store, "node-a", "10.50.0.0/16", "192.0.2.10")
+            .await
+            .expect_err("local subnet read errors must not allocate a second subnet");
+
+        assert!(
+            err.to_string()
+                .contains("failed to read existing local node subnet for node-a"),
+            "{err:#}"
+        );
         assert_eq!(store.calls(), 1);
         assert_eq!(client.calls(), 0);
     }

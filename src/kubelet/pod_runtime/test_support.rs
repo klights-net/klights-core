@@ -1088,6 +1088,7 @@ impl crate::kubelet::pod_runtime::filesystem::PodFilesystem for MockPodFilesyste
 pub struct MockPodVolumeRuntime {
     calls: Mutex<Vec<String>>,
     process_error: Mutex<Option<String>>,
+    hang_process: Mutex<bool>,
 }
 
 impl Default for MockPodVolumeRuntime {
@@ -1101,6 +1102,7 @@ impl MockPodVolumeRuntime {
         Self {
             calls: Mutex::new(Vec::new()),
             process_error: Mutex::new(None),
+            hang_process: Mutex::new(false),
         }
     }
 
@@ -1110,6 +1112,10 @@ impl MockPodVolumeRuntime {
 
     pub fn fail_process_volumes(&self, message: impl Into<String>) {
         *self.process_error.lock().unwrap() = Some(message.into());
+    }
+
+    pub fn hang_process_volumes(&self) {
+        *self.hang_process.lock().unwrap() = true;
     }
 
     pub fn recorded_calls(&self) -> Vec<String> {
@@ -1130,6 +1136,10 @@ impl crate::kubelet::pod_runtime::volumes::PodVolumeRuntime for MockPodVolumeRun
         ));
         if let Some(message) = self.process_error.lock().unwrap().take() {
             anyhow::bail!("{message}");
+        }
+        let should_hang = *self.hang_process.lock().unwrap();
+        if should_hang {
+            std::future::pending::<()>().await;
         }
         Ok(std::collections::HashMap::new())
     }
@@ -1315,6 +1325,8 @@ pub enum MockHostPortOp {
 pub struct MockHostPortRuntime {
     calls: Mutex<Vec<MockHostPortOp>>,
     check_error: Mutex<Option<String>>,
+    add_error: Mutex<Option<String>>,
+    hang_add: Mutex<bool>,
 }
 
 impl Default for MockHostPortRuntime {
@@ -1328,6 +1340,8 @@ impl MockHostPortRuntime {
         Self {
             calls: Mutex::new(Vec::new()),
             check_error: Mutex::new(None),
+            add_error: Mutex::new(None),
+            hang_add: Mutex::new(false),
         }
     }
 
@@ -1341,6 +1355,14 @@ impl MockHostPortRuntime {
 
     pub fn reject_next_check(&self, message: &str) {
         *self.check_error.lock().unwrap() = Some(message.to_string());
+    }
+
+    pub fn reject_next_add(&self, message: &str) {
+        *self.add_error.lock().unwrap() = Some(message.to_string());
+    }
+
+    pub fn hang_add_host_ports(&self) {
+        *self.hang_add.lock().unwrap() = true;
     }
 }
 
@@ -1356,6 +1378,13 @@ impl crate::kubelet::pod_runtime::hostports::HostPortRuntime for MockHostPortRun
             name: key.name.clone(),
             uid: key.uid.clone(),
         });
+        if let Some(message) = self.add_error.lock().unwrap().take() {
+            anyhow::bail!("{message}");
+        }
+        let should_hang = *self.hang_add.lock().unwrap();
+        if should_hang {
+            std::future::pending::<()>().await;
+        }
         Ok(())
     }
 

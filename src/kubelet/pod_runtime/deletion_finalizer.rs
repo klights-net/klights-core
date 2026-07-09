@@ -237,17 +237,9 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
             return Ok(PodDeletionFinalizeResult::DeletedOrAlreadyGone);
         }
 
-        if live.data.pointer("/metadata/deletionTimestamp").is_none() {
-            if pod_is_node_lost_terminal(live.data.as_ref()) {
-                tracing::warn!(
-                    namespace = %ns,
-                    pod = %name,
-                    uid = %uid,
-                    "actor-owned Pod finalization treated NodeLost terminal Pod as local cleanup"
-                );
-                self.delete_status_checkpoint_after_finalization(uid).await;
-                return Ok(PodDeletionFinalizeResult::DeletedOrAlreadyGone);
-            }
+        if live.data.pointer("/metadata/deletionTimestamp").is_none()
+            && !pod_is_node_lost_terminal(live.data.as_ref())
+        {
             tracing::warn!(
                 namespace = %ns,
                 pod = %name,

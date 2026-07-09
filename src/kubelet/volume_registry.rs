@@ -369,6 +369,7 @@ impl VolumeHandler for ProjectedHandler {
             crate::kubelet::projected_sa_token_refresh::projected_sources_with_fresh_service_account_token_values(
                 ctx.sources,
                 ctx.pod,
+                default_mode,
                 sources,
             )
             .await?;

@@ -11116,7 +11116,7 @@ async fn deletion_finalizer_reissues_uid_delete_when_same_uid_lacks_delete_mark(
 }
 
 #[tokio::test]
-async fn deletion_finalizer_leaves_node_lost_terminal_without_delete_mark() {
+async fn deletion_finalizer_deletes_node_lost_terminal_with_uid_after_actor_cleanup() {
     let repo = build_repo().await;
     repo.store
         .create(
@@ -11148,17 +11148,15 @@ async fn deletion_finalizer_leaves_node_lost_terminal_without_delete_mark() {
 
     assert!(
         finalized,
-        "NodeLost terminal cleanup without deletionTimestamp is local cleanup, not API deletion"
+        "NodeLost terminal cleanup without deletionTimestamp should complete actor-owned finalization"
     );
-    let after = repo
-        .store
-        .get("default", "node-lost-local-cleanup")
-        .await
-        .unwrap()
-        .expect("NodeLost terminal pod should remain API-visible");
     assert!(
-        after.data.pointer("/metadata/deletionTimestamp").is_none(),
-        "NodeLost terminal local cleanup must not synthesize a delete mark"
+        repo.store
+            .get("default", "node-lost-local-cleanup")
+            .await
+            .unwrap()
+            .is_none(),
+        "actor-owned NodeLost finalization must remove the same UID row"
     );
 }
 

@@ -659,6 +659,8 @@ struct FreshServiceInventoryClient {
     filtered_endpointslice_list_calls: std::sync::atomic::AtomicUsize,
     legacy_endpoints_empty: bool,
     legacy_endpoints_partial: bool,
+    legacy_endpoint_ips: Option<Vec<String>>,
+    endpointslice_endpoint_ips: Option<Vec<String>>,
     service_ports: Option<Vec<serde_json::Value>>,
     endpoints_ports: Option<Vec<serde_json::Value>>,
     endpointslice_ports: Option<Vec<serde_json::Value>>,
@@ -690,6 +692,34 @@ impl FreshServiceInventoryClient {
                 json!({"name": "dns-tcp", "port": 53, "protocol": "TCP"}),
             ]
         })
+    }
+
+    fn endpointslice_endpoints(&self) -> Vec<serde_json::Value> {
+        self.endpointslice_endpoint_ips
+            .as_ref()
+            .map(|ips| {
+                ips.iter()
+                    .map(|ip| {
+                        json!({
+                            "addresses": [ip],
+                            "conditions": {"ready": true}
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                vec![json!({
+                    "addresses": ["10.50.0.20"],
+                    "conditions": {"ready": true}
+                })]
+            })
+    }
+
+    fn legacy_endpoint_addresses(&self) -> Vec<serde_json::Value> {
+        self.legacy_endpoint_ips
+            .as_ref()
+            .map(|ips| ips.iter().map(|ip| json!({"ip": ip})).collect())
+            .unwrap_or_else(|| vec![json!({"ip": "10.50.0.2"})])
     }
 }
 
@@ -750,6 +780,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             let ports = self.endpointslice_ports();
+            let endpoints = self.endpointslice_endpoints();
             return Ok(crate::datastore::ResourceList {
                 items: if self.legacy_endpoints_empty || self.legacy_endpoints_partial {
                     vec![inventory_resource(
@@ -770,10 +801,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                             },
                             "addressType": "IPv4",
                             "ports": ports,
-                            "endpoints": [{
-                                "addresses": ["10.50.0.20"],
-                                "conditions": {"ready": true}
-                            }]
+                            "endpoints": endpoints
                         }),
                     )]
                 } else {
@@ -788,6 +816,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
         if req.api_version == "v1" && req.kind == "Endpoints" {
             self.endpoints_list_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let legacy_addresses = self.legacy_endpoint_addresses();
             return Ok(crate::datastore::ResourceList {
                 items: vec![inventory_resource(
                     "v1",
@@ -807,12 +836,12 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                             json!([])
                         } else if self.legacy_endpoints_partial {
                             json!([{
-                                "addresses": [{"ip": "10.50.0.2"}],
+                                "addresses": legacy_addresses,
                                 "ports": self.endpoints_ports()
                             }])
                         } else {
                             json!([{
-                                "addresses": [{"ip": "10.50.0.2"}],
+                                "addresses": legacy_addresses,
                                 "ports": self.endpoints_ports()
                             }])
                         }
@@ -1118,6 +1147,53 @@ async fn service_specs_from_api_uses_bounded_bulk_fresh_inventory() {
             .load(std::sync::atomic::Ordering::SeqCst),
         0,
         "routing snapshots must not issue one fresh Endpoints get per Service"
+    );
+}
+
+#[tokio::test]
+async fn service_specs_from_api_uses_legacy_endpoints_when_endpointslice_snapshot_is_partial() {
+    let api = FreshServiceInventoryClient {
+        legacy_endpoints_partial: true,
+        legacy_endpoint_ips: Some(vec!["10.50.0.2".to_string(), "10.50.0.3".to_string()]),
+        endpointslice_endpoint_ips: Some(vec!["10.50.0.20".to_string()]),
+        ..Default::default()
+    };
+
+    let specs = service_specs_from_api(&api)
+        .await
+        .expect("service specs should build from the fuller endpoint source");
+
+    assert_eq!(specs.len(), 1);
+    let mut tuples: Vec<_> = specs[0]
+        .ports
+        .iter()
+        .map(|port| {
+            (
+                port.protocol,
+                port.service_port,
+                port.target_port,
+                port.endpoints.clone(),
+            )
+        })
+        .collect();
+    tuples.sort_by_key(|(protocol, service_port, _, _)| (*protocol, *service_port));
+    assert_eq!(
+        tuples,
+        vec![
+            (
+                Protocol::Tcp,
+                53,
+                53,
+                vec![Ipv4Addr::new(10, 50, 0, 2), Ipv4Addr::new(10, 50, 0, 3)]
+            ),
+            (
+                Protocol::Udp,
+                53,
+                53,
+                vec![Ipv4Addr::new(10, 50, 0, 2), Ipv4Addr::new(10, 50, 0, 3)]
+            ),
+        ],
+        "a partial EndpointSlice snapshot must not shadow the fuller legacy Endpoints view during routing churn"
     );
 }
 

@@ -1936,6 +1936,61 @@ async fn start_pod_recovery_returns_failed_when_volume_reconcile_fails() {
     );
 }
 
+fn assert_partial_start_rolled_back(
+    harness: &PodRuntimeHarness,
+    key: &PodRuntimeKey,
+    sandbox_id: &str,
+) {
+    let cri_calls = harness.cri.recorded_calls();
+    assert!(
+        cri_calls.iter().any(|call| matches!(
+            call.operation,
+            MockCriOperation::StopPodSandbox(ref id) if id == sandbox_id
+        )),
+        "partial rollback must stop the sandbox; calls={cri_calls:?}"
+    );
+    assert!(
+        cri_calls.iter().any(|call| matches!(
+            call.operation,
+            MockCriOperation::RemovePodSandbox(ref id) if id == sandbox_id
+        )),
+        "partial rollback must remove the sandbox; calls={cri_calls:?}"
+    );
+    assert!(
+        !cri_calls
+            .iter()
+            .any(|call| matches!(call.operation, MockCriOperation::CreateContainer { .. })),
+        "partial rollback must stop before creating containers; calls={cri_calls:?}"
+    );
+
+    let net_calls = harness.network.recorded_calls();
+    assert!(
+        net_calls.iter().any(|call| matches!(
+            call,
+            MockNetworkOp::ReleaseSandboxNetwork {
+                uid,
+                sandbox_id: released,
+                ..
+            } if uid == &key.uid && released == sandbox_id
+        )),
+        "partial rollback must release the sandbox network; calls={net_calls:?}"
+    );
+
+    let store_calls = harness.store.recorded_calls();
+    let expected_delete = format!("delete_sandbox:{}/{}/{}", key.namespace, key.name, key.uid);
+    assert!(
+        store_calls.iter().any(|call| call == &expected_delete),
+        "partial rollback must clear the UID-bound sandbox row; calls={store_calls:?}"
+    );
+
+    let fs_calls = harness.filesystem.recorded_calls();
+    let expected_cleanup = format!("cleanup_fs:{}/{}/{}", key.namespace, key.name, key.uid);
+    assert!(
+        fs_calls.iter().any(|call| call == &expected_cleanup),
+        "partial rollback must remove pod filesystem artifacts; calls={fs_calls:?}"
+    );
+}
+
 #[tokio::test]
 async fn network_assignment_timeout_rolls_back_sandbox_with_parity() {
     let harness = PodRuntimeHarness::new().await;
@@ -1994,6 +2049,80 @@ async fn network_assignment_timeout_rolls_back_sandbox_with_parity() {
             .any(|call| call == "delete_sandbox:ns/net-timeout/uid-net-timeout"),
         "network assignment timeout must clear the sandbox row so retry creates a fresh sandbox; calls={store_calls:?}"
     );
+}
+
+#[tokio::test]
+async fn hung_hostport_setup_times_out_and_rolls_back_sandbox() {
+    let harness = PodRuntimeHarness::new().await;
+    let mut pod =
+        pod_with_pull_policy("ns", "hostport-hang", "uid-hostport-hang", "nginx", "Never");
+    pod["spec"]["containers"][0]["ports"] = json!([{
+        "containerPort": 80,
+        "hostPort": 18080,
+        "protocol": "TCP"
+    }]);
+    harness
+        .repo
+        .create_controller_pod("ns", "hostport-hang", "test-node", pod.clone())
+        .await
+        .unwrap();
+    harness.hostports.hang_add_host_ports();
+
+    let key = PodRuntimeKey::new("ns", "hostport-hang", "uid-hostport-hang");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        harness
+            .runtime
+            .start_pod(key.clone(), Some(pod), CancellationToken::new()),
+    )
+    .await
+    .expect("hung hostPort setup must be bounded by the runtime")
+    .expect("hostPort setup timeout should be reported as a pod start result");
+
+    match result {
+        PodStartResult::Failed(message) => {
+            assert!(
+                message.contains("Timed out adding hostPort rules"),
+                "timeout should describe hostPort setup: {message}"
+            );
+        }
+        other => panic!("expected retryable hostPort setup failure, got {other:?}"),
+    }
+    assert_partial_start_rolled_back(&harness, &key, "sandbox-0001");
+}
+
+#[tokio::test]
+async fn hung_volume_setup_times_out_and_rolls_back_sandbox() {
+    let harness = PodRuntimeHarness::new().await;
+    let pod = pod_with_pull_policy("ns", "volume-hang", "uid-volume-hang", "nginx", "Never");
+    harness
+        .repo
+        .create_controller_pod("ns", "volume-hang", "test-node", pod.clone())
+        .await
+        .unwrap();
+    harness.volumes.hang_process_volumes();
+
+    let key = PodRuntimeKey::new("ns", "volume-hang", "uid-volume-hang");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        harness
+            .runtime
+            .start_pod(key.clone(), Some(pod), CancellationToken::new()),
+    )
+    .await
+    .expect("hung volume setup must be bounded by the runtime")
+    .expect("volume setup timeout should be reported as a pod start result");
+
+    match result {
+        PodStartResult::Failed(message) => {
+            assert!(
+                message.contains("Timed out processing volumes"),
+                "timeout should describe volume setup: {message}"
+            );
+        }
+        other => panic!("expected retryable volume setup failure, got {other:?}"),
+    }
+    assert_partial_start_rolled_back(&harness, &key, "sandbox-0001");
 }
 
 #[tokio::test]

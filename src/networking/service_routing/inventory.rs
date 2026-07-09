@@ -14,7 +14,7 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
-use super::service_rules::ServiceSpec;
+use super::service_rules::{ServiceSpec, select_service_spec_with_fullest_endpoints};
 
 /// Per-Service inventory entry. `endpoint_slices` is keyed by EndpointSlice
 /// name so updates and deletes are O(1).
@@ -226,19 +226,19 @@ impl ServiceRouteInventory {
                 continue;
             };
             let slice_refs: Vec<&Value> = entry.endpoint_slices.values().map(|s| &s.data).collect();
-            let spec = if !slice_refs.is_empty() {
-                ServiceSpec::from_service_and_endpointslices(service, &slice_refs).or_else(|| {
-                    entry
-                        .endpoints
-                        .as_ref()
-                        .and_then(|eps| ServiceSpec::from_service_and_endpoints(service, Some(eps)))
-                })
+            let endpointslice_spec = if slice_refs.is_empty() {
+                None
             } else {
-                entry
-                    .endpoints
-                    .as_ref()
-                    .and_then(|eps| ServiceSpec::from_service_and_endpoints(service, Some(eps)))
+                ServiceSpec::from_service_and_endpointslices(service, &slice_refs)
             };
+            let legacy_endpoints_spec = entry
+                .endpoints
+                .as_ref()
+                .and_then(|eps| ServiceSpec::from_service_and_endpoints(service, Some(eps)));
+            let spec = select_service_spec_with_fullest_endpoints(
+                endpointslice_spec,
+                legacy_endpoints_spec,
+            );
             if let Some(spec) = spec {
                 specs.push(spec);
             }
@@ -264,11 +264,16 @@ mod tests {
     }
 
     fn dns_endpoints(ip: &str) -> Value {
+        dns_endpoints_with_ips(&[ip])
+    }
+
+    fn dns_endpoints_with_ips(ips: &[&str]) -> Value {
+        let addresses: Vec<Value> = ips.iter().map(|ip| json!({"ip": ip})).collect();
         json!({
             "apiVersion": "v1", "kind": "Endpoints",
             "metadata": {"namespace": "kube-system", "name": "kube-dns"},
             "subsets": [{
-                "addresses": [{"ip": ip}],
+                "addresses": addresses,
                 "ports": [{"name": "dns", "port": 53, "protocol": "UDP"}]
             }]
         })
@@ -365,6 +370,48 @@ mod tests {
             InventoryApply::Removed
         );
         assert!(inv.to_specs().is_empty());
+    }
+
+    #[test]
+    fn route_inventory_prefers_fuller_legacy_endpoints_over_partial_slice_snapshot() {
+        let mut inv = ServiceRouteInventory::new();
+
+        assert_eq!(
+            inv.apply_service_event("kube-system", "kube-dns", 1, false, Some(dns_service())),
+            InventoryApply::Applied
+        );
+        assert_eq!(
+            inv.apply_endpoints_event(
+                "kube-system",
+                "kube-dns",
+                2,
+                false,
+                Some(dns_endpoints_with_ips(&["10.50.0.20", "10.50.0.21"]))
+            ),
+            InventoryApply::Applied
+        );
+        assert_eq!(
+            inv.apply_endpoint_slice_event(
+                "kube-system",
+                "kube-dns",
+                "kube-dns-1",
+                3,
+                false,
+                Some(dns_slice("kube-dns-1", "10.50.0.30"))
+            ),
+            InventoryApply::Applied
+        );
+
+        let specs = inv.to_specs();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].ports[0].endpoints,
+            vec![
+                "10.50.0.20".parse::<std::net::Ipv4Addr>().unwrap(),
+                "10.50.0.21".parse::<std::net::Ipv4Addr>().unwrap()
+            ],
+            "a partial EndpointSlice watch snapshot must not shadow the fuller legacy Endpoints view"
+        );
     }
 
     #[test]

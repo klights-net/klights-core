@@ -214,6 +214,34 @@ pub fn service_ct_guard_tuples(services: &[ServiceSpec]) -> Vec<ServiceCtTuple> 
     tuples
 }
 
+fn service_spec_endpoint_coverage(spec: &ServiceSpec) -> (usize, usize) {
+    let covered_ports = spec
+        .ports
+        .iter()
+        .filter(|port| !port.endpoints.is_empty())
+        .count();
+    let endpoint_mappings = spec.ports.iter().map(|port| port.endpoints.len()).sum();
+    (covered_ports, endpoint_mappings)
+}
+
+pub(super) fn select_service_spec_with_fullest_endpoints(
+    endpointslice_spec: Option<ServiceSpec>,
+    legacy_endpoints_spec: Option<ServiceSpec>,
+) -> Option<ServiceSpec> {
+    match (endpointslice_spec, legacy_endpoints_spec) {
+        (Some(slice), Some(legacy)) => {
+            if service_spec_endpoint_coverage(&legacy) > service_spec_endpoint_coverage(&slice) {
+                Some(legacy)
+            } else {
+                Some(slice)
+            }
+        }
+        (Some(slice), None) => Some(slice),
+        (None, Some(legacy)) => Some(legacy),
+        (None, None) => None,
+    }
+}
+
 #[cfg(test)]
 pub fn service_ct_guard_applies_to_forward_packet(
     bridge_ifname: &str,

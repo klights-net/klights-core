@@ -101,6 +101,7 @@ fn projected_service_account_token_refs(pod: &Value) -> Vec<ProjectedServiceAcco
 pub(crate) async fn projected_sources_with_fresh_service_account_token_values(
     sources: &dyn VolumeSourceReader,
     pod: &Value,
+    default_mode: Option<u32>,
     projected_sources: &Value,
 ) -> Result<Value> {
     let Some(source_array) = projected_sources.as_array() else {
@@ -112,7 +113,8 @@ pub(crate) async fn projected_sources_with_fresh_service_account_token_values(
         let Some(sa_token) = source.get("serviceAccountToken") else {
             continue;
         };
-        let token_ref = projected_service_account_token_ref("", 0o644, sa_token);
+        let token_ref =
+            projected_service_account_token_ref("", default_mode.unwrap_or(0o644), sa_token);
         let token = mint_projected_service_account_token(sources, pod, &token_ref).await?;
         token_values.push((index, token));
     }
@@ -292,6 +294,7 @@ async fn recreate_projected_service_account_token_volume(
     let sources_for_write = projected_sources_with_fresh_service_account_token_values(
         request.sources.as_ref(),
         pod,
+        default_mode,
         sources,
     )
     .await?;
@@ -450,6 +453,7 @@ mod tests {
     use crate::datastore::Resource;
     use crate::kubelet::pod_runtime::service::PodRuntimeKey;
     use crate::kubelet::volume_sources::VolumeSourceReader;
+    use std::os::unix::fs::PermissionsExt;
 
     fn resource(
         api_version: &str,
@@ -665,7 +669,7 @@ mod tests {
                 "volumes": [{
                     "name": "kube-api-access-x",
                     "projected": {
-                        "defaultMode": 420,
+                        "defaultMode": 256,
                         "sources": [
                             {
                                 "serviceAccountToken": {
@@ -740,6 +744,12 @@ mod tests {
         );
         let token = std::fs::read_to_string(token_dir.join("token")).expect("read token");
         assert_eq!(token, "refreshed-from-leader");
+        let token_mode = std::fs::metadata(token_dir.join("token"))
+            .expect("token metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(token_mode, 0o400);
         let namespace =
             std::fs::read_to_string(token_dir.join("namespace")).expect("read namespace");
         assert_eq!(namespace, "kube-system");

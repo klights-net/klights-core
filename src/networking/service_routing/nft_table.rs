@@ -4,6 +4,7 @@ use super::network_policy::{
     Ipv4CidrMatch, NetworkPolicyDirection, NetworkPolicyPeerMatch, NetworkPolicyPlan,
 };
 use super::prelude::*;
+use super::service_rules::select_service_spec_with_fullest_endpoints;
 use super::*;
 use crate::utils::lock_recover;
 use nftnl::expr::Expression;
@@ -435,13 +436,14 @@ where
         .into_iter()
         .map(|r| r.data.as_ref())
         .collect();
-    if !slice_refs.is_empty()
-        && let Some(spec) = ServiceSpec::from_service_and_endpointslices(service, &slice_refs)
-    {
-        return Some(spec);
-    }
-
-    endpoints.and_then(|eps| ServiceSpec::from_service_and_endpoints(service, Some(&eps.data)))
+    let endpointslice_spec = if slice_refs.is_empty() {
+        None
+    } else {
+        ServiceSpec::from_service_and_endpointslices(service, &slice_refs)
+    };
+    let legacy_endpoints_spec =
+        endpoints.and_then(|eps| ServiceSpec::from_service_and_endpoints(service, Some(&eps.data)));
+    select_service_spec_with_fullest_endpoints(endpointslice_spec, legacy_endpoints_spec)
 }
 
 impl KlightsTable {
