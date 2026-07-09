@@ -214,14 +214,42 @@ pub fn service_ct_guard_tuples(services: &[ServiceSpec]) -> Vec<ServiceCtTuple> 
     tuples
 }
 
-fn service_spec_endpoint_coverage(spec: &ServiceSpec) -> (usize, usize) {
-    let covered_ports = spec
-        .ports
-        .iter()
-        .filter(|port| !port.endpoints.is_empty())
-        .count();
-    let endpoint_mappings = spec.ports.iter().map(|port| port.endpoints.len()).sum();
-    (covered_ports, endpoint_mappings)
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct PortSpecKey {
+    protocol: Protocol,
+    service_port: u16,
+    target_port: u16,
+    node_port: Option<u16>,
+}
+
+impl From<&PortSpec> for PortSpecKey {
+    fn from(port: &PortSpec) -> Self {
+        Self {
+            protocol: port.protocol,
+            service_port: port.service_port,
+            target_port: port.target_port,
+            node_port: port.node_port,
+        }
+    }
+}
+
+fn normalize_service_ports(mut spec: ServiceSpec) -> ServiceSpec {
+    let mut ports_by_key = std::collections::BTreeMap::<PortSpecKey, PortSpec>::new();
+    for mut port in spec.ports.drain(..) {
+        port.endpoints.sort();
+        port.endpoints.dedup();
+        let key = PortSpecKey::from(&port);
+        ports_by_key
+            .entry(key)
+            .and_modify(|existing| {
+                existing.endpoints.extend(port.endpoints.iter().copied());
+                existing.endpoints.sort();
+                existing.endpoints.dedup();
+            })
+            .or_insert(port);
+    }
+    spec.ports = ports_by_key.into_values().collect();
+    spec
 }
 
 pub(super) fn select_service_spec_with_fullest_endpoints(
@@ -230,14 +258,28 @@ pub(super) fn select_service_spec_with_fullest_endpoints(
 ) -> Option<ServiceSpec> {
     match (endpointslice_spec, legacy_endpoints_spec) {
         (Some(slice), Some(legacy)) => {
-            if service_spec_endpoint_coverage(&legacy) > service_spec_endpoint_coverage(&slice) {
-                Some(legacy)
-            } else {
-                Some(slice)
+            let mut slice = normalize_service_ports(slice);
+            let legacy = normalize_service_ports(legacy);
+            let mut ports_by_key = std::collections::BTreeMap::<PortSpecKey, PortSpec>::new();
+            for port in slice.ports.drain(..) {
+                ports_by_key.insert(PortSpecKey::from(&port), port);
             }
+            for port in legacy.ports {
+                let key = PortSpecKey::from(&port);
+                ports_by_key
+                    .entry(key)
+                    .and_modify(|existing| {
+                        if port.endpoints.len() > existing.endpoints.len() {
+                            *existing = port.clone();
+                        }
+                    })
+                    .or_insert(port);
+            }
+            slice.ports = ports_by_key.into_values().collect();
+            Some(slice)
         }
-        (Some(slice), None) => Some(slice),
-        (None, Some(legacy)) => Some(legacy),
+        (Some(slice), None) => Some(normalize_service_ports(slice)),
+        (None, Some(legacy)) => Some(normalize_service_ports(legacy)),
         (None, None) => None,
     }
 }

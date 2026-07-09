@@ -1268,6 +1268,53 @@ async fn service_specs_from_api_prefers_complete_endpointslices_over_partial_leg
 }
 
 #[tokio::test]
+async fn service_specs_from_api_merges_protocol_ports_from_partial_endpoint_sources() {
+    let api = FreshServiceInventoryClient {
+        legacy_endpoints_partial: true,
+        legacy_endpoint_ips: Some(vec!["10.50.0.2".to_string()]),
+        endpointslice_endpoint_ips: Some(vec!["10.50.0.20".to_string()]),
+        service_ports: Some(vec![
+            json!({"name": "tcp-port", "port": 80, "targetPort": 80, "protocol": "TCP"}),
+            json!({"name": "udp-port", "port": 80, "targetPort": 80, "protocol": "UDP"}),
+        ]),
+        endpoints_ports: Some(vec![
+            json!({"name": "udp-port", "port": 80, "protocol": "UDP"}),
+        ]),
+        endpointslice_ports: Some(vec![
+            json!({"name": "tcp-port", "port": 80, "protocol": "TCP"}),
+        ]),
+        ..Default::default()
+    };
+
+    let specs = service_specs_from_api(&api)
+        .await
+        .expect("service specs should build from both endpoint sources");
+
+    assert_eq!(specs.len(), 1);
+    let mut tuples: Vec<_> = specs[0]
+        .ports
+        .iter()
+        .map(|port| {
+            (
+                port.protocol,
+                port.service_port,
+                port.target_port,
+                port.endpoints.clone(),
+            )
+        })
+        .collect();
+    tuples.sort_by_key(|(protocol, service_port, _, _)| (*protocol, *service_port));
+    assert_eq!(
+        tuples,
+        vec![
+            (Protocol::Tcp, 80, 80, vec![Ipv4Addr::new(10, 50, 0, 20)]),
+            (Protocol::Udp, 80, 80, vec![Ipv4Addr::new(10, 50, 0, 2)]),
+        ],
+        "routing must retain both protocols when EndpointSlice and legacy Endpoints are each briefly partial"
+    );
+}
+
+#[tokio::test]
 async fn service_specs_from_api_preserves_sctp_endpointslice_ports() {
     let api = FreshServiceInventoryClient {
         legacy_endpoints_empty: true,
