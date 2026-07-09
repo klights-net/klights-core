@@ -121,7 +121,11 @@ impl NodeSubnetAllocator {
 }
 
 fn is_retryable_allocation_error(err: &anyhow::Error) -> bool {
-    let message = err.to_string().to_ascii_lowercase();
+    err.chain().any(is_retryable_allocation_message)
+}
+
+fn is_retryable_allocation_message(cause: &(dyn std::error::Error + 'static)) -> bool {
+    let message = cause.to_string().to_ascii_lowercase();
     message.contains("retryable unary rpc error")
         || message.contains("deadline exceeded")
         || message.contains("not raft leader")
@@ -243,5 +247,15 @@ mod tests {
 
         assert!(err.to_string().contains("invalid cluster cidr"));
         assert_eq!(client.calls(), 1);
+    }
+
+    #[test]
+    fn retryable_detection_walks_wrapped_error_chain() {
+        let err = anyhow::anyhow!(
+            "retryable unary RPC error: grpc_allocate_node_subnet deadline exceeded after 15s"
+        )
+        .context("gRPC AllocateNodeSubnet failed");
+
+        assert!(is_retryable_allocation_error(&err));
     }
 }
