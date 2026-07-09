@@ -62,8 +62,8 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
         self.core.mark_delivered(rv);
     }
 
-    pub fn mark_filtered(&mut self, rv: i64) {
-        self.core.mark_filtered(rv);
+    pub fn mark_filtered_for_key(&mut self, namespace: Option<String>, name: String, rv: i64) {
+        self.core.mark_filtered_for_key(namespace, name, rv);
     }
 
     pub fn allow_low_rv_for_key(&mut self, namespace: Option<String>, name: String, after_rv: i64) {

@@ -1227,13 +1227,16 @@ async fn list_cr_inner(
                             parsed_label_selector.as_ref(),
                         ) && event.matches_field_selector(field_selector.as_deref());
                         let event_rv = event.resource_version();
+                        let filtered_key = crate::api::watch_stream::watch_event_key(&event);
                         let Some(event) = apply_selector_transition_event(
                             event,
                             matches_selector,
                             &mut matched_selector_keys,
                         ) else {
-                            if let Some(rv) = event_rv {
-                                cursor.mark_filtered(rv);
+                            if let Some(rv) = event_rv
+                                && let Some((namespace, name)) = filtered_key
+                            {
+                                cursor.mark_filtered_for_key(namespace, name, rv);
                             }
                             continue;
                         };

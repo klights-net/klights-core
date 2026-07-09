@@ -19,6 +19,12 @@ pub trait ReplayCursorEvent: Clone + Send + Sync + 'static {
     fn key(&self) -> Option<(Option<String>, String)>;
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ReplayEventMarker {
+    rv: i64,
+    key: Option<(Option<String>, String)>,
+}
+
 #[async_trait::async_trait]
 pub trait SignalReplayCursorSource<E>: Send + Sync
 where
@@ -59,9 +65,13 @@ where
     window: WindowPolicy,
     replay_needed: bool,
     replay_resume_rv: Option<i64>,
-    seen_rvs: HashSet<i64>,
-    seen_order: VecDeque<i64>,
+    seen_events: HashSet<ReplayEventMarker>,
+    seen_order: VecDeque<ReplayEventMarker>,
+    // Baseline initial-state emission is RV-wide because its caller only has
+    // the already emitted list item RV. Selector-filtered events are tracked
+    // by object identity through `non_advancing_seen_events`.
     non_advancing_seen_rvs: HashSet<i64>,
+    non_advancing_seen_events: HashSet<ReplayEventMarker>,
     low_rv_allowlist: HashMap<(Option<String>, String), i64>,
 }
 
@@ -88,9 +98,10 @@ where
             window,
             replay_needed: false,
             replay_resume_rv: None,
-            seen_rvs: HashSet::new(),
+            seen_events: HashSet::new(),
             seen_order: VecDeque::new(),
             non_advancing_seen_rvs: HashSet::new(),
+            non_advancing_seen_events: HashSet::new(),
             low_rv_allowlist: HashMap::new(),
         }
     }
@@ -104,11 +115,17 @@ where
     }
 
     pub fn mark_delivered(&mut self, rv: i64) {
-        self.record_non_advancing_seen(rv);
+        self.record_non_advancing_seen_rv(rv);
     }
 
-    pub fn mark_filtered(&mut self, rv: i64) {
-        self.record_non_advancing_seen(rv);
+    pub fn mark_filtered_for_key(&mut self, namespace: Option<String>, name: String, rv: i64) {
+        if rv <= 0 {
+            return;
+        }
+        self.record_non_advancing_seen_event(ReplayEventMarker {
+            rv,
+            key: Some((namespace, name)),
+        });
     }
 
     pub fn allow_low_rv_for_key(&mut self, namespace: Option<String>, name: String, after_rv: i64) {
@@ -177,25 +194,29 @@ where
             let Some(rv) = event.resource_version() else {
                 continue;
             };
-            if rv <= self.accepted_rv {
-                if self.seen_rvs.contains(&rv) {
+            let marker = Self::event_marker(&event, rv);
+            if rv < self.accepted_rv {
+                if self.event_was_seen(&marker) {
                     continue;
                 }
                 if !self.low_rv_allowed(&event, rv) {
                     continue;
                 }
             }
-            if self.seen_rvs.contains(&rv) {
-                if !self.non_advancing_seen_rvs.contains(&rv) {
+            if self.event_was_seen(&marker) {
+                if !self.non_advancing_seen_events.contains(&marker) {
                     self.advance_processed_rv(rv);
                 }
+                continue;
+            }
+            if self.non_advancing_seen_rvs.contains(&rv) {
                 continue;
             }
             if !self.event_matches(&event) {
                 self.advance_processed_rv(rv);
                 continue;
             }
-            self.record_seen(rv);
+            self.record_seen_event(marker);
             return Some(event);
         }
         None
@@ -248,31 +269,45 @@ where
 
     fn advance_processed_rv(&mut self, rv: i64) {
         self.non_advancing_seen_rvs.remove(&rv);
-        self.record_seen(rv);
         if rv > self.accepted_rv {
             self.accepted_rv = rv;
         }
     }
 
-    fn record_non_advancing_seen(&mut self, rv: i64) {
-        self.record_seen(rv);
+    fn record_non_advancing_seen_rv(&mut self, rv: i64) {
         if rv > 0 {
             self.non_advancing_seen_rvs.insert(rv);
         }
     }
 
-    fn record_seen(&mut self, rv: i64) {
-        if rv <= 0 {
+    fn record_non_advancing_seen_event(&mut self, marker: ReplayEventMarker) {
+        self.record_seen_event(marker.clone());
+        self.non_advancing_seen_events.insert(marker);
+    }
+
+    fn record_seen_event(&mut self, marker: ReplayEventMarker) {
+        if marker.rv <= 0 {
             return;
         }
-        if self.seen_rvs.insert(rv) {
-            self.seen_order.push_back(rv);
+        if self.seen_events.insert(marker.clone()) {
+            self.seen_order.push_back(marker);
             while self.seen_order.len() > RECENT_SIGNAL_SEEN_RV_CAPACITY {
                 if let Some(oldest) = self.seen_order.pop_front() {
-                    self.seen_rvs.remove(&oldest);
-                    self.non_advancing_seen_rvs.remove(&oldest);
+                    self.seen_events.remove(&oldest);
+                    self.non_advancing_seen_events.remove(&oldest);
                 }
             }
+        }
+    }
+
+    fn event_was_seen(&self, marker: &ReplayEventMarker) -> bool {
+        self.seen_events.contains(marker)
+    }
+
+    fn event_marker(event: &E, rv: i64) -> ReplayEventMarker {
+        ReplayEventMarker {
+            rv,
+            key: event.key(),
         }
     }
 }

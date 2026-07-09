@@ -470,7 +470,7 @@ async fn signal_cursor_filtered_event_does_not_advance_past_late_lower_rv() {
     tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
     let filtered = cursor.next_event().await.unwrap();
     assert_eq!(filtered.resource_version(), Some(50));
-    cursor.mark_filtered(50);
+    cursor.mark_filtered_for_key(Some("default".into()), "unmatched".into(), 50);
     assert_eq!(
         cursor.accepted_rv(),
         10,
@@ -485,6 +485,37 @@ async fn signal_cursor_filtered_event_does_not_advance_past_late_lower_rv() {
         .unwrap();
 
     assert_eq!(delivered.resource_version(), Some(14));
+    assert_eq!(delivered.object["metadata"]["name"], "frontend");
+}
+
+#[tokio::test]
+async fn signal_cursor_filtered_same_rv_event_does_not_hide_matching_resource() {
+    let (tx, rx) = broadcast::channel(4);
+    let source = MutableSignalCursorReplaySource::new(vec![
+        signal_cursor_pod("default", "unmatched", 50),
+        signal_cursor_pod("default", "frontend", 50),
+    ]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
+    let filtered = cursor.next_event().await.unwrap();
+    assert_eq!(filtered.resource_version(), Some(50));
+    assert_eq!(filtered.object["metadata"]["name"], "unmatched");
+    cursor.mark_filtered_for_key(Some("default".into()), "unmatched".into(), 50);
+
+    let delivered = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
+        .await
+        .expect("same-RV matching resource must not be hidden by filtered selector noise")
+        .unwrap();
+
+    assert_eq!(delivered.resource_version(), Some(50));
     assert_eq!(delivered.object["metadata"]["name"], "frontend");
 }
 

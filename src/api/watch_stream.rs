@@ -1140,6 +1140,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         .then(|| watch_event_key(&event))
                         .flatten();
                         let event_rv = event.resource_version();
+                        let filtered_key = watch_event_key(&event);
                         if let Some(transitioned) = apply_selector_transition_event(
                             event,
                             matches,
@@ -1174,8 +1175,10 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                                 cursor.accept_event(rv);
                                 last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
                             }
-                        } else if let Some(rv) = event_rv {
-                            cursor.mark_filtered(rv);
+                        } else if let Some(rv) = event_rv
+                            && let Some((namespace, name)) = filtered_key
+                        {
+                            cursor.mark_filtered_for_key(namespace, name, rv);
                         }
                     } else if event.matches_filter_parsed(&kind, watch_namespace.as_deref(), parsed_label_selector.as_ref())
                         && event.matches_field_selector(field_selector.as_deref()) {
