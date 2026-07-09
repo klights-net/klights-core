@@ -248,6 +248,7 @@ pub struct NftServiceRouter {
     table: std::sync::Arc<KlightsTable>,
     cluster_api: std::sync::Arc<dyn LeaderApiClient>,
     notify: std::sync::Arc<tokio::sync::Notify>,
+    force_full_sync: std::sync::Arc<AtomicBool>,
     /// Cancellation token observed by the coalescer worker. Cancelled
     /// by `cleanup` so the worker exits its `tokio::select!` arms
     /// cleanly instead of being aborted mid-batch.
@@ -460,6 +461,7 @@ impl NftServiceRouter {
             table,
             cluster_api,
             notify,
+            force_full_sync,
             cancel,
             worker: tokio::sync::Mutex::new(Some(worker)),
             service_watch_worker: tokio::sync::Mutex::new(Some(service_watch_worker)),
@@ -492,6 +494,7 @@ impl NftServiceRouter {
 #[async_trait]
 impl ServiceRouter for NftServiceRouter {
     fn request_services_sync(&self) {
+        self.force_full_sync.store(true, Ordering::Release);
         self.notify.notify_one();
     }
 
@@ -1515,6 +1518,33 @@ mod tests {
                 .lock()
                 .expect("watch target record lock not poisoned"),
             expected_service_routing_watch_targets()
+        );
+    }
+
+    #[test]
+    fn request_services_sync_marks_next_coalesced_pass_as_full_sync() {
+        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let force_full_sync = Arc::new(AtomicBool::new(false));
+        let router = NftServiceRouter {
+            table: test_service_table(supervisor.clone()),
+            cluster_api: Arc::new(WatchOnlyLeaderApiClient::default()),
+            notify: Arc::new(Notify::new()),
+            force_full_sync: force_full_sync.clone(),
+            cancel: CancellationToken::new(),
+            worker: tokio::sync::Mutex::new(None),
+            service_watch_worker: tokio::sync::Mutex::new(None),
+            remote_endpoint_worker: tokio::sync::Mutex::new(None),
+            task_supervisor: supervisor,
+            table_name_str: "klights-test-watch".to_string(),
+        };
+
+        router.request_services_sync();
+
+        assert!(
+            force_full_sync.load(Ordering::SeqCst),
+            "external service sync requests must force a fresh API snapshot so missed watch events or stale cached inventory cannot leave nft rules stale"
         );
     }
 

@@ -116,14 +116,7 @@ impl Netfilter {
     /// `replace_chain` of the chain definition).
     pub async fn replace_chain_rules(&self, chain: &Chain<'_>, rules: &[Rule<'_>]) -> Result<()> {
         let mut batch = Batch::new();
-        // A handleless Rule serializes to NFTA_RULE_TABLE+NFTA_RULE_CHAIN
-        // with no NFTA_RULE_HANDLE; kernel treats that as "flush rules
-        // matching the chain".
-        let flush_marker = Rule::new(chain);
-        batch.add(&flush_marker, MsgType::Del);
-        for rule in rules {
-            batch.add(rule, MsgType::Add);
-        }
+        batch.replace_chain_rules(chain, rules);
         self.send(batch).await
     }
 
@@ -240,6 +233,19 @@ impl Batch {
     pub fn add<T: NlMsg>(&mut self, obj: &T, msg: MsgType) {
         self.inner.add(obj, msg);
         self.op_count += 1;
+    }
+
+    /// Append the atomic "flush existing rules, then add replacement rules"
+    /// sequence for an existing chain to this batch.
+    pub fn replace_chain_rules(&mut self, chain: &Chain<'_>, rules: &[Rule<'_>]) {
+        // A handleless Rule serializes to NFTA_RULE_TABLE+NFTA_RULE_CHAIN
+        // with no NFTA_RULE_HANDLE; kernel treats that as "flush rules
+        // matching the chain".
+        let flush_marker = Rule::new(chain);
+        self.add(&flush_marker, MsgType::Del);
+        for rule in rules {
+            self.add(rule, MsgType::Add);
+        }
     }
 
     /// Number of caller-added operations in this batch (excludes the
@@ -405,6 +411,25 @@ mod tests {
         batch.add(&table, MsgType::Del);
 
         assert_eq!(batch.len(), 2, "Add + Del should yield op_count 2");
+    }
+
+    #[test]
+    fn test_batch_replace_chain_rules_counts_flush_marker_and_rules() {
+        let table_name = CString::new("klights-test").unwrap();
+        let chain_name = CString::new("services").unwrap();
+        let table = Table::new(&table_name, ProtoFamily::Inet);
+        let chain = Chain::new(&chain_name, &table);
+        let rule_a = Rule::new(&chain);
+        let rule_b = Rule::new(&chain);
+
+        let mut batch = Batch::new();
+        batch.replace_chain_rules(&chain, &[rule_a, rule_b]);
+
+        assert_eq!(
+            batch.len(),
+            3,
+            "chain-rule replacement must batch one flush marker plus each replacement rule"
+        );
     }
 }
 

@@ -996,28 +996,28 @@ impl KlightsTable {
 
         let table = self.table();
         let services_chain = Chain::new(SERVICES_CHAIN, &table);
+        let service_ct_guard_chain = Chain::new(SERVICE_CT_GUARD_CHAIN, &table);
 
         let mut rules: Vec<Rule<'_>> = Vec::new();
         for svc in services {
             self.append_service_rules(&services_chain, svc, &mut rules);
         }
+        let service_ct_guard_rules = self.service_ct_guard_rules(&service_ct_guard_chain, services);
 
         let rule_count = rules.len();
-        // Update the conntrack guard before removing DNAT rules. For removed
-        // UDP ports this closes the stale-flow window immediately: old
-        // conntracked packets may still DNAT, but the forward guard no longer
-        // returns them as active service tuples.
-        self.replace_service_ct_guard(services).await?;
-
         // The services chain is referenced by `jump services` from
-        // nat-prerouting and nat-output. We can't DEL+ADD it (EBUSY);
-        // we flush its rules in place instead. replace_chain_rules
-        // sends a handleless DELRULE (kernel: flush chain) followed by
-        // NEWRULE for each new rule, all in one atomic batch.
+        // nat-prerouting and nat-output, while service_ct_guard is referenced
+        // from filter-forward. We can't DEL+ADD either chain (EBUSY), so the
+        // two rule sets are flushed in place and repopulated in one kernel
+        // transaction. This keeps the forward guard and DNAT rules from
+        // advancing independently under netlink errors.
+        let mut batch = Batch::new();
+        batch.replace_chain_rules(&services_chain, &rules);
+        batch.replace_chain_rules(&service_ct_guard_chain, &service_ct_guard_rules);
         self.nf
-            .replace_chain_rules(&services_chain, &rules)
+            .send(batch)
             .await
-            .context("replace services chain rules")?;
+            .context("replace services and service conntrack guard rules")?;
 
         tracing::debug!(
             "nft services chain replaced: {} services, {} rules",
