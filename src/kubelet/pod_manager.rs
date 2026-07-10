@@ -22,7 +22,7 @@ use crate::kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_
 use crate::kubelet::pod_watch_handlers::{handle_pv_event, handle_pvc_event};
 use crate::watch::{
     EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
-    WatchEventFilter, WatchReplaySource, WatchSignalReceiver, WatchTopic, WindowPolicy,
+    WatchEventFilter, WatchSignalReceiver, WatchTopic, WindowPolicy,
 };
 use anyhow::Result;
 #[cfg(test)]
@@ -135,30 +135,6 @@ fn pod_watcher_node_event_filter(node_name: &str) -> WatchEventFilter {
         "Pod",
         pod_watcher_node_field_selector(node_name),
     )
-}
-
-fn record_pod_watcher_filtered_event<S>(
-    cursor: &mut SignalWatchCursor<S>,
-    event: &WatchEvent,
-    event_rv: i64,
-) where
-    S: WatchReplaySource,
-{
-    let namespace = event
-        .object
-        .pointer("/metadata/namespace")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    if let Some(name) = event
-        .object
-        .pointer("/metadata/name")
-        .and_then(Value::as_str)
-        .filter(|name| !name.is_empty())
-    {
-        cursor.mark_filtered_for_key(namespace, name.to_string(), event_rv);
-    } else {
-        cursor.accept_event(event_rv);
-    }
 }
 
 fn pod_watcher_watch_topics() -> Vec<WatchTopic> {
@@ -414,7 +390,8 @@ async fn run_pod_watcher_with_runtime(
         WatchDeliveryScope::All,
         db.get_current_resource_version().await.unwrap_or(0),
         WindowPolicy::default_watch_delivery(),
-    );
+    )
+    .with_event_filter(event_filter);
 
     {
         let mut pod_recovery = PodRecovery::new(
@@ -508,10 +485,6 @@ async fn run_pod_watcher_with_runtime(
                     }
                 };
                 let event_rv = event.resource_version().unwrap_or(0);
-                if !event_filter.matches(&event) {
-                    record_pod_watcher_filtered_event(&mut cursor, &event, event_rv);
-                    continue;
-                }
                 // Fire-and-forget lifecycle trace message: spawn through the
                 // supervisor so actor sends never block event processing.
                 // handle_watch_event must always run regardless of actor state.

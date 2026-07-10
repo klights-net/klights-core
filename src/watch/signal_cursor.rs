@@ -1,7 +1,7 @@
 use super::signal_replay_cursor_core::SignalReplayCursorCore;
 use super::{
-    WatchCursorError, WatchDeliveryScope, WatchEvent, WatchReplaySource, WatchSignalReceiver,
-    WatchTopic, WindowPolicy,
+    WatchCursorError, WatchDeliveryScope, WatchEvent, WatchEventFilter, WatchReplaySource,
+    WatchSignalReceiver, WatchTopic, WindowPolicy,
 };
 
 pub struct SignalWatchCursor<S>
@@ -9,6 +9,7 @@ where
     S: WatchReplaySource,
 {
     core: SignalReplayCursorCore<WatchEvent, S>,
+    event_filter: WatchEventFilter,
 }
 
 impl<S: WatchReplaySource> SignalWatchCursor<S> {
@@ -47,7 +48,13 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
                 accepted_rv,
                 window,
             ),
+            event_filter: WatchEventFilter::new(),
         }
+    }
+
+    pub fn with_event_filter(mut self, event_filter: WatchEventFilter) -> Self {
+        self.event_filter = event_filter;
+        self
     }
 
     pub fn accepted_rv(&self) -> i64 {
@@ -75,6 +82,29 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
     }
 
     pub async fn next_event(&mut self) -> Result<WatchEvent, WatchCursorError> {
-        self.core.next_event().await
+        loop {
+            let event = self.core.next_event().await?;
+            if self.event_filter.matches(&event) {
+                return Ok(event);
+            }
+            self.mark_filtered_event(&event);
+        }
+    }
+
+    fn mark_filtered_event(&mut self, event: &WatchEvent) {
+        let Some(rv) = event.resource_version() else {
+            return;
+        };
+        let Some(metadata) = event.object.get("metadata") else {
+            return;
+        };
+        let Some(name) = metadata.get("name").and_then(|name| name.as_str()) else {
+            return;
+        };
+        let namespace = metadata
+            .get("namespace")
+            .and_then(|namespace| namespace.as_str())
+            .map(str::to_string);
+        self.mark_filtered_for_key(namespace, name.to_string(), rv);
     }
 }

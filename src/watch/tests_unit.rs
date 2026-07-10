@@ -331,11 +331,25 @@ fn signal_cursor_pod(namespace: &str, name: &str, rv: i64) -> WatchEvent {
     }))
 }
 
+fn signal_cursor_pod_on_node(namespace: &str, name: &str, rv: i64, node_name: &str) -> WatchEvent {
+    WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "namespace": namespace,
+            "name": name,
+            "resourceVersion": rv.to_string(),
+        },
+        "spec": {"nodeName": node_name}
+    }))
+}
+
 fn signal_cursor_signal(namespace: Option<&str>, high_rv: i64) -> WatchSignal {
     WatchSignal {
         topic: signal_cursor_topic(),
         advances: vec![WatchAdvance {
             namespace: namespace.map(str::to_string),
+            low_rv: high_rv,
             high_rv,
         }],
     }
@@ -486,6 +500,86 @@ async fn signal_cursor_filtered_event_does_not_advance_past_late_lower_rv() {
 
     assert_eq!(delivered.resource_version(), Some(14));
     assert_eq!(delivered.object["metadata"]["name"], "frontend");
+}
+
+#[tokio::test]
+async fn signal_cursor_replays_late_lower_rv_signal_after_higher_match() {
+    let (tx, rx) = broadcast::channel(4);
+    let source = MutableSignalCursorReplaySource::new(vec![signal_cursor_pod_on_node(
+        "default",
+        "fast-local",
+        50,
+        "node-a",
+    )]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
+    let first = cursor.next_event().await.unwrap();
+    assert_eq!(first.resource_version(), Some(50));
+    cursor.accept_event(50);
+
+    source.push(signal_cursor_pod_on_node(
+        "default",
+        "late-local",
+        14,
+        "node-a",
+    ));
+    tx.send(signal_cursor_signal(Some("default"), 14)).unwrap();
+    let delivered = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
+        .await
+        .expect("lower-RV signal must replay the newly visible event")
+        .unwrap();
+
+    assert_eq!(delivered.resource_version(), Some(14));
+    assert_eq!(delivered.object["metadata"]["name"], "late-local");
+}
+
+#[tokio::test]
+async fn signal_cursor_event_filter_does_not_accept_high_rv_pod_noise() {
+    let (tx, rx) = broadcast::channel(4);
+    let source = MutableSignalCursorReplaySource::new(vec![signal_cursor_pod_on_node(
+        "default",
+        "other-node",
+        50,
+        "node-b",
+    )]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    )
+    .with_event_filter(WatchEventFilter::new().with_field_selector(
+        "v1",
+        "Pod",
+        "spec.nodeName=node-a",
+    ));
+
+    tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
+    source.push(signal_cursor_pod_on_node(
+        "default",
+        "late-local",
+        14,
+        "node-a",
+    ));
+    tx.send(signal_cursor_signal(Some("default"), 14)).unwrap();
+
+    let delivered = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
+        .await
+        .expect("filtered high-RV noise must not hide the lower-RV local pod")
+        .unwrap();
+
+    assert_eq!(delivered.resource_version(), Some(14));
+    assert_eq!(delivered.object["metadata"]["name"], "late-local");
 }
 
 #[tokio::test]

@@ -60,7 +60,7 @@ where
     I: IntoIterator<Item = P>,
     P: std::borrow::Borrow<PendingWatchEvent>,
 {
-    let mut grouped: HashMap<WatchTopic, HashMap<Option<String>, i64>> = HashMap::new();
+    let mut grouped: HashMap<WatchTopic, HashMap<Option<String>, (i64, i64)>> = HashMap::new();
 
     for pending in pending {
         let pending = pending.borrow();
@@ -71,15 +71,22 @@ where
         let topic_advances = grouped.entry(topic).or_default();
         let entry = topic_advances
             .entry(pending.namespace.clone())
-            .or_insert(pending.resource_version);
-        *entry = (*entry).max(pending.resource_version);
+            .or_insert((pending.resource_version, pending.resource_version));
+        entry.0 = entry.0.min(pending.resource_version);
+        entry.1 = entry.1.max(pending.resource_version);
     }
 
     let mut signals = Vec::new();
     for (topic, namespace_rvs) in grouped {
         let mut advances = namespace_rvs
             .into_iter()
-            .map(|(namespace, high_rv)| crate::watch::WatchAdvance { namespace, high_rv })
+            .map(
+                |(namespace, (low_rv, high_rv))| crate::watch::WatchAdvance {
+                    namespace,
+                    low_rv,
+                    high_rv,
+                },
+            )
             .collect::<Vec<_>>();
         advances.sort_by(|left, right| left.namespace.cmp(&right.namespace));
 
@@ -619,10 +626,12 @@ mod tests {
         assert_eq!(signal.advances.len(), 2);
         assert!(signal.advances.contains(&WatchAdvance {
             namespace: Some("default".to_string()),
+            low_rv: 10,
             high_rv: 12,
         }));
         assert!(signal.advances.contains(&WatchAdvance {
             namespace: Some("kube-system".to_string()),
+            low_rv: 11,
             high_rv: 11,
         }));
     }
@@ -642,10 +651,12 @@ mod tests {
         assert_eq!(signals[0].advances.len(), 2);
         assert!(signals[0].advances.contains(&WatchAdvance {
             namespace: Some("default".to_string()),
+            low_rv: 10,
             high_rv: 12,
         }));
         assert!(signals[0].advances.contains(&WatchAdvance {
             namespace: Some("kube-system".to_string()),
+            low_rv: 11,
             high_rv: 11,
         }));
     }

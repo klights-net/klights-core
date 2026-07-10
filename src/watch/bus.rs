@@ -77,6 +77,7 @@ pub struct WatchBus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WatchAdvance {
     pub namespace: Option<String>,
+    pub low_rv: i64,
     pub high_rv: i64,
 }
 
@@ -96,15 +97,15 @@ impl WatchSignal {
     /// Build grouped watch signals from a batch of events.
     ///
     /// Events for the same `(apiVersion, kind)` topic and the same namespace
-    /// collapse into a single `WatchAdvance` carrying the highest resource
-    /// version seen for that namespace, so a post-commit batch publishes one
+    /// collapse into a single `WatchAdvance` carrying the low/high resource
+    /// version range for that namespace, so a post-commit batch publishes one
     /// replay hint per (topic, namespace) rather than one per event. When a
     /// topic's distinct namespaces exceed `DEFAULT_WATCH_ADVANCE_GROUP_LIMIT`,
     /// the advances are chunked into multiple signals so no single signal
     /// grows unbounded. This is the single source of truth for grouped signal
     /// construction; single-event callers reuse it through `from_event`.
     pub fn from_events<'a>(events: impl IntoIterator<Item = &'a WatchEvent>) -> Vec<Self> {
-        let mut grouped: HashMap<WatchTopic, HashMap<Option<String>, i64>> = HashMap::new();
+        let mut grouped: HashMap<WatchTopic, HashMap<Option<String>, (i64, i64)>> = HashMap::new();
 
         for event in events {
             let Some(topic) = WatchTopic::of_event(event) else {
@@ -124,15 +125,22 @@ impl WatchSignal {
                 .map(str::to_string);
 
             let topic_advances = grouped.entry(topic).or_default();
-            let entry = topic_advances.entry(namespace).or_insert(high_rv);
-            *entry = (*entry).max(high_rv);
+            let entry = topic_advances
+                .entry(namespace)
+                .or_insert((high_rv, high_rv));
+            entry.0 = entry.0.min(high_rv);
+            entry.1 = entry.1.max(high_rv);
         }
 
         let mut signals = Vec::new();
         for (topic, namespace_rvs) in grouped {
             let mut advances = namespace_rvs
                 .into_iter()
-                .map(|(namespace, high_rv)| WatchAdvance { namespace, high_rv })
+                .map(|(namespace, (low_rv, high_rv))| WatchAdvance {
+                    namespace,
+                    low_rv,
+                    high_rv,
+                })
                 .collect::<Vec<_>>();
             advances.sort_by(|left, right| left.namespace.cmp(&right.namespace));
 
@@ -438,6 +446,7 @@ mod tests {
             topic,
             advances: vec![WatchAdvance {
                 namespace: Some("default".to_string()),
+                low_rv: 42,
                 high_rv: 42,
             }],
         });
@@ -456,6 +465,7 @@ mod tests {
             topic: WatchTopic::new("v1", "Pod"),
             advances: vec![WatchAdvance {
                 namespace: Some("default".to_string()),
+                low_rv: 42,
                 high_rv: 42,
             }],
         });
@@ -517,10 +527,12 @@ mod tests {
         assert_eq!(pod_signal.advances.len(), 2);
         assert!(pod_signal.advances.contains(&WatchAdvance {
             namespace: Some("default".to_string()),
+            low_rv: 10,
             high_rv: 12,
         }));
         assert!(pod_signal.advances.contains(&WatchAdvance {
             namespace: Some("kube-system".to_string()),
+            low_rv: 11,
             high_rv: 11,
         }));
 
@@ -532,6 +544,7 @@ mod tests {
             cm_signal.advances,
             vec![WatchAdvance {
                 namespace: Some("default".to_string()),
+                low_rv: 13,
                 high_rv: 13,
             }]
         );

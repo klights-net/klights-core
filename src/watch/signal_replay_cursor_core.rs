@@ -73,6 +73,7 @@ where
     non_advancing_seen_rvs: HashSet<i64>,
     non_advancing_seen_events: HashSet<ReplayEventMarker>,
     low_rv_allowlist: HashMap<(Option<String>, String), i64>,
+    low_rv_signal_ranges: VecDeque<(i64, i64)>,
 }
 
 impl<E, S> SignalReplayCursorCore<E, S>
@@ -103,6 +104,7 @@ where
             non_advancing_seen_rvs: HashSet::new(),
             non_advancing_seen_events: HashSet::new(),
             low_rv_allowlist: HashMap::new(),
+            low_rv_signal_ranges: VecDeque::new(),
         }
     }
 
@@ -199,7 +201,7 @@ where
                 if self.event_was_seen(&marker) {
                     continue;
                 }
-                if !self.low_rv_allowed(&event, rv) {
+                if !self.low_rv_allowed(&event, rv) && !self.low_rv_signal_allowed(rv) {
                     continue;
                 }
             }
@@ -222,7 +224,7 @@ where
         None
     }
 
-    fn matching_signal_replay_since(&self, signal: &WatchSignal) -> Option<i64> {
+    fn matching_signal_replay_since(&mut self, signal: &WatchSignal) -> Option<i64> {
         if !self.topics.contains(&signal.topic) {
             return None;
         }
@@ -231,10 +233,24 @@ where
             if !self.scope.matches_namespace(advance.namespace.as_deref()) {
                 continue;
             }
+            if advance.low_rv <= 0 || advance.high_rv <= 0 {
+                continue;
+            }
             let since = if advance.high_rv > self.accepted_rv {
-                Some(self.accepted_rv)
+                if advance.low_rv <= self.accepted_rv {
+                    self.record_low_rv_signal_range(advance.low_rv, self.accepted_rv);
+                    Some(advance.low_rv.saturating_sub(1))
+                } else {
+                    Some(self.accepted_rv)
+                }
             } else {
-                self.low_rv_replay_floor(advance.high_rv)
+                self.record_low_rv_signal_range(advance.low_rv, advance.high_rv);
+                Some(
+                    self.low_rv_replay_floor(advance.high_rv)
+                        .map_or(advance.low_rv.saturating_sub(1), |floor| {
+                            floor.min(advance.low_rv.saturating_sub(1))
+                        }),
+                )
             };
             if let Some(since) = since {
                 replay_since = Some(replay_since.map_or(since, |current| current.min(since)));
@@ -267,6 +283,12 @@ where
             .is_some_and(|after_rv| rv > *after_rv)
     }
 
+    fn low_rv_signal_allowed(&self, rv: i64) -> bool {
+        self.low_rv_signal_ranges
+            .iter()
+            .any(|(low_rv, high_rv)| rv >= *low_rv && rv <= *high_rv)
+    }
+
     fn advance_processed_rv(&mut self, rv: i64) {
         self.non_advancing_seen_rvs.remove(&rv);
         if rv > self.accepted_rv {
@@ -297,6 +319,16 @@ where
                     self.non_advancing_seen_events.remove(&oldest);
                 }
             }
+        }
+    }
+
+    fn record_low_rv_signal_range(&mut self, low_rv: i64, high_rv: i64) {
+        if low_rv <= 0 || high_rv < low_rv {
+            return;
+        }
+        self.low_rv_signal_ranges.push_back((low_rv, high_rv));
+        while self.low_rv_signal_ranges.len() > RECENT_SIGNAL_SEEN_RV_CAPACITY {
+            self.low_rv_signal_ranges.pop_front();
         }
     }
 

@@ -49,8 +49,8 @@ fn pod_watcher_node_event_filter_matches_only_local_pods() {
 
 #[tokio::test]
 async fn pod_watcher_filtered_pod_event_does_not_advance_signal_cursor() {
-    let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    let (_tx, rx) = tokio::sync::broadcast::channel(4);
+    let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (tx, rx) = tokio::sync::broadcast::channel(4);
     let mut cursor = SignalWatchCursor::new(
         rx,
         DatastoreWatchReplaySource::new(
@@ -59,25 +59,51 @@ async fn pod_watcher_filtered_pod_event_does_not_advance_signal_cursor() {
         ),
         WatchTopic::new("v1", "Pod"),
         WatchDeliveryScope::Namespaced("default".to_string()),
-        10,
+        0,
         WindowPolicy::default_watch_delivery(),
+    )
+    .with_event_filter(pod_watcher_node_event_filter("node-a"));
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "remote-pod",
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "remote-pod",
+                "namespace": "default"
+            },
+            "spec": {"nodeName": "node-b"}
+        }),
+    )
+    .await
+    .expect("create remote pod");
+    let remote_rv = db
+        .get_current_resource_version()
+        .await
+        .expect("current rv after remote pod create");
+
+    tx.send(crate::watch::WatchSignal {
+        topic: WatchTopic::new("v1", "Pod"),
+        advances: vec![crate::watch::WatchAdvance {
+            namespace: Some("default".to_string()),
+            low_rv: remote_rv,
+            high_rv: remote_rv,
+        }],
+    })
+    .expect("send remote pod signal");
+    let result =
+        tokio::time::timeout(std::time::Duration::from_millis(100), cursor.next_event()).await;
+
+    assert!(
+        result.is_err(),
+        "node-selector-filtered Pod events must not be emitted by the cursor"
     );
-    let event = crate::watch::WatchEvent::modified(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "Pod",
-        "metadata": {
-            "name": "remote-pod",
-            "namespace": "default",
-            "resourceVersion": "50"
-        },
-        "spec": {"nodeName": "node-b"}
-    }));
-
-    record_pod_watcher_filtered_event(&mut cursor, &event, 50);
-
     assert_eq!(
         cursor.accepted_rv(),
-        10,
+        0,
         "node-selector-filtered Pod events must not move the cursor past unseen lower-RV local Pod updates"
     );
 }
