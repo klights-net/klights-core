@@ -3918,6 +3918,57 @@ async fn deferred_running_runtime_reconcile_preserves_restart_count_for_fast_onf
     );
 }
 
+fn deferred_running_status(
+    container_name: &str,
+    container_id: Option<&str>,
+    restart_count: u64,
+    started_at: &str,
+) -> serde_json::Value {
+    let mut status = json!({
+        "name": container_name,
+        "ready": true,
+        "started": true,
+        "restartCount": restart_count,
+        "state": {"running": {"startedAt": started_at}}
+    });
+    if let Some(container_id) = container_id {
+        status["containerID"] = json!(container_id);
+    }
+    status
+}
+
+fn container_creating_status(
+    container_name: &str,
+    container_id: Option<&str>,
+    restart_count: u64,
+) -> serde_json::Value {
+    let mut status = json!({
+        "name": container_name,
+        "ready": false,
+        "started": false,
+        "restartCount": restart_count,
+        "state": {"waiting": {"reason": "ContainerCreating"}}
+    });
+    if let Some(container_id) = container_id {
+        status["containerID"] = json!(container_id);
+    }
+    status
+}
+
+fn published_network_status(
+    pod_ip: &str,
+    container_statuses: Vec<serde_json::Value>,
+) -> super::PodStatusUpdate {
+    super::PodStatusUpdate {
+        phase: "Pending".to_string(),
+        pod_ip: pod_ip.to_string(),
+        host_ip: "10.0.0.10".to_string(),
+        container_statuses,
+        init_container_statuses: None,
+        qos_class: None,
+    }
+}
+
 #[tokio::test]
 async fn post_sandbox_ip_status_promotes_deferred_running_runtime_snapshot() {
     use super::PodStatusWriter;
@@ -3944,16 +3995,12 @@ async fn post_sandbox_ip_status_promotes_deferred_running_runtime_snapshot() {
             &created.uid,
             super::RuntimeReconcileStatus {
                 phase: "Running".to_string(),
-                container_statuses: vec![json!({
-                    "name": "c",
-                    "containerID": "containerd://confirmed",
-                    "image": "nginx",
-                    "imageID": "nginx@sha256:confirmed",
-                    "ready": true,
-                    "started": true,
-                    "restartCount": 0,
-                    "state": {"running": {"startedAt": "2026-05-17T00:00:01Z"}}
-                })],
+                container_statuses: vec![deferred_running_status(
+                    "c",
+                    Some("containerd://confirmed"),
+                    0,
+                    "2026-05-17T00:00:01Z",
+                )],
             },
             None,
         )
@@ -3971,23 +4018,14 @@ async fn post_sandbox_ip_status_promotes_deferred_running_runtime_snapshot() {
             "default",
             "rr-deferred-running-ip",
             &created.uid,
-            super::PodStatusUpdate {
-                phase: "Pending".to_string(),
-                pod_ip: "10.42.0.44".to_string(),
-                host_ip: "10.0.0.10".to_string(),
-                container_statuses: vec![json!({
-                    "name": "c",
-                    "containerID": "containerd://confirmed",
-                    "image": "nginx",
-                    "imageID": "",
-                    "ready": false,
-                    "started": false,
-                    "restartCount": 0,
-                    "state": {"waiting": {"reason": "ContainerCreating"}}
-                })],
-                init_container_statuses: None,
-                qos_class: None,
-            },
+            published_network_status(
+                "10.42.0.44",
+                vec![container_creating_status(
+                    "c",
+                    Some("containerd://confirmed"),
+                    0,
+                )],
+            ),
             None,
         )
         .await
@@ -4011,6 +4049,349 @@ async fn post_sandbox_ip_status_promotes_deferred_running_runtime_snapshot() {
         ready["status"],
         json!("True"),
         "post-IP status write should complete the deferred Running transition"
+    );
+}
+
+#[tokio::test]
+async fn post_sandbox_ip_status_does_not_promote_unproven_deferred_runtime_identity() {
+    use super::PodStatusWriter;
+
+    struct Case {
+        name: &'static str,
+        runtime_container_id: Option<&'static str>,
+        network_container_id: Option<&'static str>,
+        runtime_restart_count: u64,
+        network_restart_count: u64,
+    }
+
+    let cases = [
+        Case {
+            name: "runtime-id-missing",
+            runtime_container_id: None,
+            network_container_id: Some("containerd://current"),
+            runtime_restart_count: 0,
+            network_restart_count: 0,
+        },
+        Case {
+            name: "network-id-missing",
+            runtime_container_id: Some("containerd://current"),
+            network_container_id: None,
+            runtime_restart_count: 0,
+            network_restart_count: 0,
+        },
+        Case {
+            name: "different-container-id",
+            runtime_container_id: Some("containerd://old"),
+            network_container_id: Some("containerd://new"),
+            runtime_restart_count: 0,
+            network_restart_count: 0,
+        },
+        Case {
+            name: "newer-restart-generation",
+            runtime_container_id: Some("containerd://same"),
+            network_container_id: Some("containerd://same"),
+            runtime_restart_count: 0,
+            network_restart_count: 1,
+        },
+    ];
+
+    for case in cases {
+        let repo = build_repo().await;
+        let mut seed = pending_pod(case.name);
+        seed["status"] = json!({"phase": "Pending"});
+        let created = repo.store.create("default", case.name, seed).await.unwrap();
+
+        repo.apply_runtime_reconcile_status_for_uid(
+            "default",
+            case.name,
+            &created.uid,
+            super::RuntimeReconcileStatus {
+                phase: "Running".to_string(),
+                container_statuses: vec![deferred_running_status(
+                    "c",
+                    case.runtime_container_id,
+                    case.runtime_restart_count,
+                    "2026-05-17T00:00:01Z",
+                )],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let updated = repo
+            .set_pod_status_for_uid(
+                "default",
+                case.name,
+                &created.uid,
+                published_network_status(
+                    "10.42.0.45",
+                    vec![container_creating_status(
+                        "c",
+                        case.network_container_id,
+                        case.network_restart_count,
+                    )],
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated.data["status"]["phase"],
+            json!("Pending"),
+            "{} must not promote an unproven deferred runtime identity",
+            case.name
+        );
+        assert!(
+            updated.data["status"]["containerStatuses"][0]
+                .pointer("/state/running")
+                .is_none(),
+            "{} must not resurrect the deferred Running state",
+            case.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_runtime_before_pod_ip_cancels_deferred_running_promotion() {
+    use super::PodStatusWriter;
+    let repo = build_repo().await;
+    let mut seed = pending_pod("terminal-before-ip");
+    seed["status"] = json!({"phase": "Pending"});
+    let created = repo
+        .store
+        .create("default", "terminal-before-ip", seed)
+        .await
+        .unwrap();
+
+    repo.apply_runtime_reconcile_status_for_uid(
+        "default",
+        "terminal-before-ip",
+        &created.uid,
+        super::RuntimeReconcileStatus {
+            phase: "Running".to_string(),
+            container_statuses: vec![deferred_running_status(
+                "c",
+                Some("containerd://same"),
+                0,
+                "2026-05-17T00:00:01Z",
+            )],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    repo.apply_runtime_reconcile_status_for_uid(
+        "default",
+        "terminal-before-ip",
+        &created.uid,
+        super::RuntimeReconcileStatus {
+            phase: "Succeeded".to_string(),
+            container_statuses: vec![json!({
+                "name": "c",
+                "containerID": "containerd://same",
+                "ready": false,
+                "started": false,
+                "restartCount": 0,
+                "state": {"terminated": {"exitCode": 0, "reason": "Completed"}}
+            })],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    // A delayed duplicate Running observation from before completion must not
+    // re-arm promotion after the terminal generation has won.
+    let delayed_running = repo
+        .apply_runtime_reconcile_status_for_uid(
+            "default",
+            "terminal-before-ip",
+            &created.uid,
+            super::RuntimeReconcileStatus {
+                phase: "Running".to_string(),
+                container_statuses: vec![deferred_running_status(
+                    "c",
+                    Some("containerd://same"),
+                    0,
+                    "2026-05-17T00:00:01Z",
+                )],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        delayed_running.data["status"]["phase"],
+        json!("Succeeded"),
+        "terminal phase must bypass the IP-gated deferred Running path"
+    );
+    assert_eq!(
+        delayed_running.data["status"]["containerStatuses"][0]
+            .pointer("/state/terminated/exitCode"),
+        Some(&json!(0)),
+        "a delayed Running observation must not overwrite terminal runtime state"
+    );
+
+    let updated = repo
+        .set_pod_status_for_uid(
+            "default",
+            "terminal-before-ip",
+            &created.uid,
+            published_network_status(
+                "10.42.0.46",
+                vec![container_creating_status("c", Some("containerd://same"), 0)],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        updated.data["status"]["phase"],
+        json!("Succeeded"),
+        "network publication must not regress a terminal runtime phase"
+    );
+    assert!(
+        updated.data["status"]["containerStatuses"][0]
+            .pointer("/state/running")
+            .is_none(),
+        "a terminal runtime observation must cancel deferred Running promotion"
+    );
+    assert_eq!(
+        updated.data["status"]["containerStatuses"][0].pointer("/state/terminated/exitCode"),
+        Some(&json!(0)),
+        "network publication must preserve runtime-owned terminal status"
+    );
+}
+
+#[tokio::test]
+async fn deferred_runtime_reducer_keeps_latest_restart_generation_after_stale_network_snapshot() {
+    use super::PodStatusWriter;
+    let repo = build_repo().await;
+    let mut seed = pending_pod("deferred-restart-generation");
+    seed["status"] = json!({"phase": "Pending"});
+    let created = repo
+        .store
+        .create("default", "deferred-restart-generation", seed)
+        .await
+        .unwrap();
+
+    for (container_id, restart_count, started_at) in [
+        ("containerd://old", 0, "2026-05-17T00:00:01Z"),
+        ("containerd://new", 1, "2026-05-17T00:00:02Z"),
+    ] {
+        repo.apply_runtime_reconcile_status_for_uid(
+            "default",
+            "deferred-restart-generation",
+            &created.uid,
+            super::RuntimeReconcileStatus {
+                phase: "Running".to_string(),
+                container_statuses: vec![deferred_running_status(
+                    "c",
+                    Some(container_id),
+                    restart_count,
+                    started_at,
+                )],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let stale = repo
+        .set_pod_status_for_uid(
+            "default",
+            "deferred-restart-generation",
+            &created.uid,
+            published_network_status(
+                "10.42.0.48",
+                vec![container_creating_status("c", Some("containerd://old"), 0)],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.data["status"]["phase"], json!("Pending"));
+
+    let promoted = repo
+        .set_pod_status_for_uid(
+            "default",
+            "deferred-restart-generation",
+            &created.uid,
+            published_network_status(
+                "10.42.0.48",
+                vec![container_creating_status("c", Some("containerd://new"), 1)],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(promoted.data["status"]["phase"], json!("Running"));
+    assert_eq!(
+        promoted.data["status"]["containerStatuses"][0].pointer("/state/running/startedAt"),
+        Some(&json!("2026-05-17T00:00:02Z")),
+        "only the latest explicitly deferred runtime generation may be promoted"
+    );
+}
+
+#[tokio::test]
+async fn partial_multicontainer_runtime_observation_is_not_promotable_after_pod_ip() {
+    use super::PodStatusWriter;
+    let repo = build_repo().await;
+    let mut seed = pending_pod("partial-multicontainer-before-ip");
+    seed["spec"]["containers"] = json!([
+        {"name": "c", "image": "nginx"},
+        {"name": "sidecar", "image": "busybox"}
+    ]);
+    seed["status"] = json!({"phase": "Pending"});
+    let created = repo
+        .store
+        .create("default", "partial-multicontainer-before-ip", seed)
+        .await
+        .unwrap();
+
+    repo.apply_runtime_reconcile_status_for_uid(
+        "default",
+        "partial-multicontainer-before-ip",
+        &created.uid,
+        super::RuntimeReconcileStatus {
+            phase: "Running".to_string(),
+            container_statuses: vec![deferred_running_status(
+                "c",
+                Some("containerd://c"),
+                0,
+                "2026-05-17T00:00:01Z",
+            )],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+
+    let updated = repo
+        .set_pod_status_for_uid(
+            "default",
+            "partial-multicontainer-before-ip",
+            &created.uid,
+            published_network_status(
+                "10.42.0.47",
+                vec![container_creating_status("c", Some("containerd://c"), 0)],
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.data["status"]["phase"], json!("Pending"));
+    assert!(
+        updated.data["status"]["containerStatuses"][0]
+            .pointer("/state/running")
+            .is_none(),
+        "a partial runtime observation must not promote a multi-container Pod"
     );
 }
 

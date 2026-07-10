@@ -4,7 +4,8 @@
 //! Holds `Arc<PodStore>` only — does not hold a `DatastoreHandle`.
 //! Implementations land in Tasks 4, 5, 7, 8.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
@@ -30,6 +31,81 @@ pub(super) struct PodStatusService {
     controller_dispatcher: ControllerDispatcherSlot,
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderApiClient>>,
+    deferred_runtime: Mutex<DeferredRuntimeReducer>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DeferredContainerGeneration {
+    container_id: String,
+    restart_count: u64,
+}
+
+/// Runtime-owned state that was observed after the container started but before
+/// pod networking was publishable. This is deliberately repository-private:
+/// public Pod JSON remains K8s-shaped and network status writers cannot infer
+/// runtime truth from whichever whole-status snapshot happens to be current.
+#[derive(Clone, Debug, PartialEq)]
+struct DeferredRunningObservation {
+    containers: BTreeMap<String, DeferredContainerGeneration>,
+    container_statuses: Vec<Value>,
+}
+
+/// Per-Pod reducer for the short Running-before-podIP race. Observations are
+/// keyed by immutable UID and replaced as a unit when a newer runtime generation
+/// arrives. A network publication may consume one only after every regular
+/// container reports the exact same nonempty container ID and restart count.
+#[derive(Default)]
+struct DeferredRuntimeReducer {
+    by_pod_uid: HashMap<String, DeferredRunningObservation>,
+}
+
+impl DeferredRuntimeReducer {
+    fn observe_deferred_running(
+        &mut self,
+        pod_uid: &str,
+        pod: &Value,
+        container_statuses: &[Value],
+    ) {
+        let Some(containers) = confirmed_running_container_generations(pod, container_statuses)
+        else {
+            self.by_pod_uid.remove(pod_uid);
+            return;
+        };
+        self.by_pod_uid.insert(
+            pod_uid.to_string(),
+            DeferredRunningObservation {
+                containers,
+                container_statuses: container_statuses.to_vec(),
+            },
+        );
+    }
+
+    fn clear(&mut self, pod_uid: &str) {
+        self.by_pod_uid.remove(pod_uid);
+    }
+
+    fn promotable_observation(
+        &self,
+        pod_uid: &str,
+        pod: &Value,
+        incoming_statuses: &[Value],
+    ) -> Option<DeferredRunningObservation> {
+        let observation = self.by_pod_uid.get(pod_uid)?;
+        if !incoming_container_generations_match(pod, incoming_statuses, &observation.containers) {
+            return None;
+        }
+        Some(observation.clone())
+    }
+
+    fn consume_if_current(&mut self, pod_uid: &str, promoted: &DeferredRunningObservation) {
+        if self
+            .by_pod_uid
+            .get(pod_uid)
+            .is_some_and(|observation| observation == promoted)
+        {
+            self.by_pod_uid.remove(pod_uid);
+        }
+    }
 }
 
 pub(super) struct PodStatusWriteResult {
@@ -62,7 +138,14 @@ impl PodStatusService {
             controller_dispatcher,
             outbox,
             cluster_api,
+            deferred_runtime: Mutex::new(DeferredRuntimeReducer::default()),
         }
+    }
+
+    fn lock_deferred_runtime(&self) -> std::sync::MutexGuard<'_, DeferredRuntimeReducer> {
+        self.deferred_runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     async fn send_status_command(&self, command: OutboxCommand) -> Result<bool> {
@@ -270,6 +353,7 @@ impl PodStatusService {
             let pod_resource = self.read_current_pod(ns, name, expected_uid).await?;
             let cas_rv = expected_rv.unwrap_or(pod_resource.resource_version);
             let pod = pod_resource.data.clone();
+            let stored_terminal_phase = pod_terminal_phase(&pod);
 
             let existing_conditions = pod
                 .get("status")
@@ -278,103 +362,125 @@ impl PodStatusService {
                 .cloned()
                 .unwrap_or_default();
 
-            let init_container_statuses =
+            let init_container_statuses = if stored_terminal_phase.is_some() {
+                pod.pointer("/status/initContainerStatuses")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
                 update.init_container_statuses.clone().unwrap_or_else(|| {
                     pod.get("status")
                         .and_then(|s| s.get("initContainerStatuses"))
                         .and_then(|s| s.as_array())
                         .cloned()
                         .unwrap_or_default()
-                });
-            let (init_initialized, init_not_ready_message) =
-                compute_initialized_condition(&pod, &init_container_statuses);
-
+                })
+            };
             let preserved = preserve_restart_fields(&pod);
-            let mut container_statuses = update.container_statuses.clone();
+            let mut container_statuses = if stored_terminal_phase.is_some() {
+                pod.pointer("/status/containerStatuses")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                update.container_statuses.clone()
+            };
             for status in &mut container_statuses {
                 apply_preserved_restart_fields(status, &preserved);
             }
-            preserve_confirmed_running_statuses_after_network_publish(
-                &mut container_statuses,
-                &pod,
-            );
-            let mut phase = update.phase.clone();
-            if can_promote_pending_network_status_to_running(
-                &phase,
-                update,
-                &pod,
-                &container_statuses,
-            ) {
+            let mut phase = stored_terminal_phase.unwrap_or(&update.phase).to_string();
+            if matches!(phase.as_str(), "Succeeded" | "Failed") {
+                self.lock_deferred_runtime().clear(&pod_resource.uid);
+            }
+            let promoted_observation = if stored_terminal_phase.is_none()
+                && phase == "Pending"
+                && network_status_is_published(update, &pod)
+            {
+                self.lock_deferred_runtime().promotable_observation(
+                    &pod_resource.uid,
+                    &pod,
+                    &update.container_statuses,
+                )
+            } else {
+                None
+            };
+            if let Some(observation) = &promoted_observation {
+                container_statuses.clone_from(&observation.container_statuses);
                 phase = "Running".to_string();
             }
 
-            let now = crate::utils::k8s_timestamp();
-            let all_containers_ready = if container_statuses.is_empty() {
-                phase == "Running"
+            let conditions = if stored_terminal_phase.is_some() {
+                existing_conditions.clone()
             } else {
-                container_statuses
-                    .iter()
-                    .all(|c| c.get("ready").and_then(|r| r.as_bool()).unwrap_or(false))
-            };
-            let bool_status = |b: bool| if b { "True" } else { "False" };
-
-            let initialized_condition = if init_initialized {
-                build_pod_condition(
-                    &existing_conditions,
-                    &now,
-                    "Initialized",
-                    "True",
-                    None,
-                    None,
-                )
-            } else {
-                build_pod_condition(
-                    &existing_conditions,
-                    &now,
-                    "Initialized",
-                    "False",
-                    Some("ContainersNotInitialized"),
-                    Some(init_not_ready_message.as_deref().unwrap_or("")),
-                )
-            };
-            let containers_ready_status = bool_status(all_containers_ready);
-            let ready_status = bool_status(phase == "Running" && all_containers_ready);
-            // The kubelet rebuilds its owned lifecycle conditions and routes the
-            // result through the typed Pod status ownership policy, which
-            // preserves by `type` every condition the kubelet runtime does not
-            // own (e.g. the scheduler's DisruptionTarget). Ownership is decided
-            // by PodStatusOwner, not by an ad hoc condition-type heuristic here.
-            let conditions = crate::pod_status_merge::merge_owned_and_preserved_conditions(
-                crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
-                vec![
+                let now = crate::utils::k8s_timestamp();
+                let all_containers_ready = if container_statuses.is_empty() {
+                    phase == "Running"
+                } else {
+                    container_statuses
+                        .iter()
+                        .all(|c| c.get("ready").and_then(|r| r.as_bool()).unwrap_or(false))
+                };
+                let bool_status = |ready| if ready { "True" } else { "False" };
+                let (init_initialized, init_not_ready_message) =
+                    compute_initialized_condition(&pod, &init_container_statuses);
+                let initialized_condition = if init_initialized {
                     build_pod_condition(
                         &existing_conditions,
                         &now,
-                        "PodScheduled",
+                        "Initialized",
                         "True",
-                        Some("PodScheduled"),
                         None,
-                    ),
-                    initialized_condition,
+                        None,
+                    )
+                } else {
                     build_pod_condition(
                         &existing_conditions,
                         &now,
-                        "ContainersReady",
-                        containers_ready_status,
-                        None,
-                        None,
-                    ),
-                    build_pod_condition(
-                        &existing_conditions,
-                        &now,
-                        "Ready",
-                        ready_status,
-                        None,
-                        None,
-                    ),
-                ],
-                &existing_conditions,
-            );
+                        "Initialized",
+                        "False",
+                        Some("ContainersNotInitialized"),
+                        Some(init_not_ready_message.as_deref().unwrap_or("")),
+                    )
+                };
+                let containers_ready_status = bool_status(all_containers_ready);
+                let ready_status = bool_status(phase == "Running" && all_containers_ready);
+                // The kubelet rebuilds its owned lifecycle conditions and routes the
+                // result through the typed Pod status ownership policy, which
+                // preserves by `type` every condition the kubelet runtime does not
+                // own (e.g. the scheduler's DisruptionTarget). Ownership is decided
+                // by PodStatusOwner, not by an ad hoc condition-type heuristic here.
+                crate::pod_status_merge::merge_owned_and_preserved_conditions(
+                    crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
+                    vec![
+                        build_pod_condition(
+                            &existing_conditions,
+                            &now,
+                            "PodScheduled",
+                            "True",
+                            Some("PodScheduled"),
+                            None,
+                        ),
+                        initialized_condition,
+                        build_pod_condition(
+                            &existing_conditions,
+                            &now,
+                            "ContainersReady",
+                            containers_ready_status,
+                            None,
+                            None,
+                        ),
+                        build_pod_condition(
+                            &existing_conditions,
+                            &now,
+                            "Ready",
+                            ready_status,
+                            None,
+                            None,
+                        ),
+                    ],
+                    &existing_conditions,
+                )
+            };
 
             let pod_ip = update.pod_ip.clone();
             let host_ip = if update.host_ip.is_empty() {
@@ -422,6 +528,10 @@ impl PodStatusService {
                 )
                 .await?
             {
+                if let Some(observation) = promoted_observation {
+                    self.lock_deferred_runtime()
+                        .consume_if_current(&pod_resource.uid, &observation);
+                }
                 return Ok(PodStatusWriteResult {
                     resource,
                     changed: false,
@@ -435,6 +545,10 @@ impl PodStatusService {
                 .await
             {
                 Ok(updated) => {
+                    if let Some(observation) = promoted_observation {
+                        self.lock_deferred_runtime()
+                            .consume_if_current(&pod_resource.uid, &observation);
+                    }
                     let changed = log_pod_status_write_result(
                         "set-pod-status",
                         ns,
@@ -619,6 +733,7 @@ impl PodStatusService {
             // Pending/no IP --sandbox status--> Pending/podIP
             // Pending/podIP --CRI running--> Running/podIP
             // Pending/no IP --CRI running--> Pending/no IP (defer)
+            let stored_terminal_phase = pod_terminal_phase(&pod_resource.data);
             let mut phase_override = None;
             if expected_rv.is_none() {
                 let current_pod_ip = pod_resource
@@ -669,7 +784,16 @@ impl PodStatusService {
             }
             if let Some(obj) = status.as_object_mut() {
                 let preserved = preserve_restart_fields(&pod_resource.data);
-                let mut container_statuses = update.container_statuses.clone();
+                let mut container_statuses = if stored_terminal_phase.is_some() {
+                    pod_resource
+                        .data
+                        .pointer("/status/containerStatuses")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    update.container_statuses.clone()
+                };
                 if container_statuses.is_empty() {
                     if let Some(existing_config_error_statuses) = pod_resource
                         .data
@@ -705,7 +829,9 @@ impl PodStatusService {
                     apply_preserved_restart_fields(status, &preserved);
                 }
 
-                let phase = phase_override.as_deref().unwrap_or(&update.phase);
+                let phase = stored_terminal_phase
+                    .or(phase_override.as_deref())
+                    .unwrap_or(&update.phase);
                 obj.insert("phase".to_string(), json!(phase));
                 obj.insert("containerStatuses".to_string(), json!(container_statuses));
 
@@ -719,6 +845,30 @@ impl PodStatusService {
                 repair_scalar_and_list_ip_fields(obj, "hostIP", "hostIPs");
 
                 apply_runtime_readiness_conditions(obj);
+            }
+
+            {
+                let mut reducer = self.lock_deferred_runtime();
+                if phase_override.is_some()
+                    && update.phase == "Running"
+                    && stored_terminal_phase.is_none()
+                {
+                    let container_statuses = status
+                        .pointer("/containerStatuses")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    reducer.observe_deferred_running(
+                        &pod_resource.uid,
+                        &pod_resource.data,
+                        container_statuses,
+                    );
+                } else {
+                    // A runtime observation with a publishable phase (including
+                    // terminal state) supersedes any earlier Running observation
+                    // that was waiting only for pod networking.
+                    reducer.clear(&pod_resource.uid);
+                }
             }
 
             // Dedup gate intentionally removed for the runtime-reconcile path
@@ -1971,64 +2121,77 @@ fn apply_preserved_restart_fields(
     }
 }
 
-fn preserve_confirmed_running_statuses_after_network_publish(
-    incoming_statuses: &mut [Value],
-    pod: &Value,
-) {
-    let Some(current_statuses) = pod
-        .pointer("/status/containerStatuses")
-        .and_then(|statuses| statuses.as_array())
-    else {
-        return;
-    };
-
-    for incoming in incoming_statuses {
-        let Some(name) = incoming.get("name").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let Some(current) = current_statuses
-            .iter()
-            .find(|candidate| candidate.get("name").and_then(|value| value.as_str()) == Some(name))
-        else {
-            continue;
-        };
-        if !container_status_is_running(current)
-            || !container_status_is_container_creating(incoming)
-            || !same_or_unreported_container_id(current, incoming)
-            || incoming_has_newer_restart_count(current, incoming)
-        {
-            continue;
-        }
-        *incoming = current.clone();
-    }
-}
-
-fn can_promote_pending_network_status_to_running(
-    phase: &str,
-    update: &PodStatusUpdate,
+fn confirmed_running_container_generations(
     pod: &Value,
     container_statuses: &[Value],
-) -> bool {
-    if phase != "Pending" || !network_status_is_published(update, pod) {
-        return false;
+) -> Option<BTreeMap<String, DeferredContainerGeneration>> {
+    let spec_containers = pod.pointer("/spec/containers").and_then(Value::as_array)?;
+    if spec_containers.is_empty() || container_statuses.len() != spec_containers.len() {
+        return None;
     }
-    let Some(spec_containers) = pod
-        .pointer("/spec/containers")
-        .and_then(|value| value.as_array())
-    else {
+
+    let mut generations = BTreeMap::new();
+    for container in spec_containers {
+        let name = container.get("name").and_then(Value::as_str)?;
+        if name.is_empty() || generations.contains_key(name) {
+            return None;
+        }
+        let status = container_statuses
+            .iter()
+            .find(|status| status.get("name").and_then(Value::as_str) == Some(name))?;
+        status
+            .pointer("/state/running")
+            .and_then(Value::as_object)?;
+        let container_id = status
+            .get("containerID")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())?;
+        let restart_count = status.get("restartCount").and_then(Value::as_u64)?;
+        generations.insert(
+            name.to_string(),
+            DeferredContainerGeneration {
+                container_id: container_id.to_string(),
+                restart_count,
+            },
+        );
+    }
+    Some(generations)
+}
+
+fn incoming_container_generations_match(
+    pod: &Value,
+    incoming_statuses: &[Value],
+    expected: &BTreeMap<String, DeferredContainerGeneration>,
+) -> bool {
+    let Some(spec_containers) = pod.pointer("/spec/containers").and_then(Value::as_array) else {
         return false;
     };
-    let names: Vec<&str> = spec_containers
-        .iter()
-        .filter_map(|container| container.get("name").and_then(|value| value.as_str()))
-        .collect();
-    !names.is_empty()
-        && names.iter().all(|name| {
-            container_statuses.iter().any(|status| {
-                status.get("name").and_then(|value| value.as_str()) == Some(*name)
-                    && container_status_is_running(status)
-            })
+    if spec_containers.len() != expected.len() || incoming_statuses.len() != expected.len() {
+        return false;
+    }
+
+    spec_containers.iter().all(|container| {
+        let Some(name) = container.get("name").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(expected_generation) = expected.get(name) else {
+            return false;
+        };
+        incoming_statuses.iter().any(|status| {
+            status.get("name").and_then(Value::as_str) == Some(name)
+                && status
+                    .pointer("/state/waiting/reason")
+                    .and_then(Value::as_str)
+                    == Some("ContainerCreating")
+                && status
+                    .get("containerID")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    == Some(expected_generation.container_id.as_str())
+                && status.get("restartCount").and_then(Value::as_u64)
+                    == Some(expected_generation.restart_count)
         })
+    })
 }
 
 fn network_status_is_published(update: &PodStatusUpdate, pod: &Value) -> bool {
@@ -2040,39 +2203,6 @@ fn network_status_is_published(update: &PodStatusUpdate, pod: &Value) -> bool {
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
     host_network && !update.host_ip.trim().is_empty()
-}
-
-fn container_status_is_running(status: &Value) -> bool {
-    status.pointer("/state/running").is_some()
-}
-
-fn container_status_is_container_creating(status: &Value) -> bool {
-    status
-        .pointer("/state/waiting/reason")
-        .and_then(|value| value.as_str())
-        == Some("ContainerCreating")
-}
-
-fn same_or_unreported_container_id(current: &Value, incoming: &Value) -> bool {
-    let current_id = current
-        .get("containerID")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    let incoming_id = incoming
-        .get("containerID")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-    incoming_id.is_empty() || current_id.is_empty() || incoming_id == current_id
-}
-
-fn incoming_has_newer_restart_count(current: &Value, incoming: &Value) -> bool {
-    let Some(current_count) = current.get("restartCount").and_then(|value| value.as_i64()) else {
-        return false;
-    };
-    incoming
-        .get("restartCount")
-        .and_then(|value| value.as_i64())
-        .is_some_and(|incoming_count| incoming_count > current_count)
 }
 
 fn has_create_container_config_error_status(statuses: &[Value]) -> bool {
