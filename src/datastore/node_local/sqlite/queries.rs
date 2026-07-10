@@ -56,8 +56,9 @@ pub(super) const RUNTIME_OBSERVATION_CHECKPOINT_DELETE_UID: &str =
 pub(super) const OUTBOX_INSERT: &str = "INSERT INTO outbox \
      (client_id, idempotency_key, enqueued_ms, subject_key, subject_api_version, subject_kind, \
       subject_namespace, subject_name, subject_uid, pod_uid, operation, \
-      is_terminal_pod_delete, stream_id, stream_seq, payload_proto, next_due_ms) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)";
+      priority_class, supersedable_pod_status, is_terminal_pod_delete, \
+      stream_id, stream_seq, payload_proto, next_due_ms) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
 pub(super) const OUTBOX_ROW_SELECT: &str = "SELECT id, client_id, idempotency_key, enqueued_ms, \
      subject_key, subject_api_version, subject_kind, subject_namespace, subject_name, \
      subject_uid, pod_uid, operation, is_terminal_pod_delete, stream_id, stream_seq, \
@@ -72,13 +73,15 @@ pub(super) const OUTBOX_ROW_SELECT: &str = "SELECT id, client_id, idempotency_ke
 // they can then apply in raft order != stamp order and clobber the newer status.
 // Cross-subject pipelining is preserved because the exclusion only ever fires
 // for the SAME subject_key.
-const OUTBOX_CLAIM_DUE_SELECT_AND_WHERE: &str = "SELECT id FROM outbox candidate \
+const OUTBOX_CLAIM_DUE_SELECT_AND_WHERE: &str = "WITH eligible AS ( \
+     SELECT candidate.id, candidate.priority_class, candidate.enqueued_ms, \
+            candidate.is_terminal_pod_delete, candidate.supersedable_pod_status \
+     FROM outbox candidate \
      WHERE candidate.next_due_ms <= ?1 \
        AND (candidate.leased_until_ms = 0 OR candidate.leased_until_ms <= ?1) \
        AND NOT ( \
            candidate.is_terminal_pod_delete = 0 \
-           AND candidate.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
-               'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+           AND candidate.supersedable_pod_status = 1 \
            AND EXISTS ( \
                SELECT 1 FROM outbox terminal \
                WHERE terminal.subject_key = candidate.subject_key \
@@ -95,8 +98,7 @@ const OUTBOX_CLAIM_DUE_SELECT_AND_WHERE: &str = "SELECT id FROM outbox candidate
              AND NOT ( \
                  candidate.is_terminal_pod_delete = 1 \
                  AND older.is_terminal_pod_delete = 0 \
-                 AND older.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
-                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+                 AND older.supersedable_pod_status = 1 \
                  AND (older.leased_until_ms = 0 OR older.leased_until_ms <= ?1) \
              ) \
        ) \
@@ -108,14 +110,12 @@ const OUTBOX_CLAIM_DUE_SELECT_AND_WHERE: &str = "SELECT id FROM outbox candidate
                  candidate.is_terminal_pod_delete = 1 \
                  AND older_stream.subject_key = candidate.subject_key \
                  AND older_stream.is_terminal_pod_delete = 0 \
-                 AND older_stream.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
-                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+                 AND older_stream.supersedable_pod_status = 1 \
                  AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
              ) \
              AND NOT ( \
                  older_stream.is_terminal_pod_delete = 0 \
-                 AND older_stream.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
-                     'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
+                 AND older_stream.supersedable_pod_status = 1 \
                  AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
                  AND EXISTS ( \
                      SELECT 1 FROM outbox superseding_terminal \
@@ -126,42 +126,29 @@ const OUTBOX_CLAIM_DUE_SELECT_AND_WHERE: &str = "SELECT id FROM outbox candidate
                        AND (superseding_terminal.leased_until_ms = 0 OR superseding_terminal.leased_until_ms <= ?1) \
                  ) \
              ) \
-       )) ";
-
-const OUTBOX_CLAIM_DUE_ORDER: &str = "ORDER BY CASE \
-           WHEN candidate.operation = 'LeaseRenew' THEN 0 \
-           WHEN candidate.operation = 'NodeStatus' THEN 1 \
-           WHEN candidate.operation = 'EventCreate' \
-             AND EXISTS ( \
-                 SELECT 1 FROM outbox status_candidate \
-                 WHERE status_candidate.next_due_ms <= ?1 \
-                   AND (status_candidate.leased_until_ms = 0 OR status_candidate.leased_until_ms <= ?1) \
-                   AND status_candidate.is_terminal_pod_delete = 0 \
-                   AND status_candidate.operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
-                       'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses') \
-                   AND NOT EXISTS ( \
-                       SELECT 1 FROM outbox terminal \
-                       WHERE terminal.subject_key = status_candidate.subject_key \
-                         AND terminal.id > status_candidate.id \
-                         AND terminal.is_terminal_pod_delete = 1 \
-                         AND terminal.next_due_ms <= ?1 \
-                         AND (terminal.leased_until_ms = 0 OR terminal.leased_until_ms <= ?1) \
-                   ) \
-             ) THEN 3 \
-           ELSE 2 \
-       END, candidate.next_due_ms ASC, candidate.id ASC LIMIT ";
+       )) \
+     ) SELECT id FROM eligible candidate ";
 
 static OUTBOX_CLAIM_NEXT_DUE_SQL: LazyLock<String> = LazyLock::new(|| outbox_claim_due_sql("1"));
 static OUTBOX_CLAIM_DUE_BATCH_SQL: LazyLock<String> = LazyLock::new(|| outbox_claim_due_sql("?2"));
 
 fn outbox_claim_due_sql(limit: &str) -> String {
-    let mut sql = String::with_capacity(
-        OUTBOX_CLAIM_DUE_SELECT_AND_WHERE.len() + OUTBOX_CLAIM_DUE_ORDER.len() + limit.len(),
-    );
-    sql.push_str(OUTBOX_CLAIM_DUE_SELECT_AND_WHERE);
-    sql.push_str(OUTBOX_CLAIM_DUE_ORDER);
-    sql.push_str(limit);
-    sql
+    use crate::kubelet::outbox::payload::{OUTBOX_DIAGNOSTIC_AGING_MS, OutboxPriorityClass};
+
+    format!(
+        "{OUTBOX_CLAIM_DUE_SELECT_AND_WHERE}ORDER BY CASE \
+         WHEN candidate.priority_class = {diagnostic} THEN CASE \
+           WHEN candidate.enqueued_ms <= (?1 - {aging_ms}) THEN {workload} \
+           WHEN EXISTS (SELECT 1 FROM eligible status_candidate \
+                        WHERE status_candidate.is_terminal_pod_delete = 0 \
+                          AND status_candidate.supersedable_pod_status = 1) \
+           THEN {diagnostic} ELSE {workload} END \
+         ELSE candidate.priority_class END, \
+         candidate.enqueued_ms ASC, candidate.id ASC LIMIT {limit}",
+        diagnostic = OutboxPriorityClass::Diagnostic.persisted_value(),
+        workload = OutboxPriorityClass::Workload.persisted_value(),
+        aging_ms = OUTBOX_DIAGNOSTIC_AGING_MS,
+    )
 }
 
 pub(super) fn outbox_claim_next_due() -> &'static str {
@@ -181,8 +168,7 @@ pub(super) const OUTBOX_MARK_FAILED: &str = "UPDATE outbox \
 pub(super) const OUTBOX_COMPLETE: &str = "DELETE FROM outbox WHERE id = ?1 AND lease_token = ?2";
 pub(super) const OUTBOX_COMPLETE_SUPERSEDED_TERMINAL_POD_DELETE_STATUS: &str = "DELETE FROM outbox WHERE subject_key = ?1 AND id < ?2 \
      AND is_terminal_pod_delete = 0 \
-     AND operation IN ('PodStatus', 'RuntimeReconcile', 'ProbeReadiness', \
-         'DeadlineExceeded', 'ContainerStatusSnapshot', 'EphemeralContainerStatuses')";
+     AND supersedable_pod_status = 1";
 pub(super) const OUTBOX_REQUEUE_EXPIRED: &str = "UPDATE outbox SET leased_until_ms = 0, lease_token = NULL WHERE leased_until_ms > 0 AND leased_until_ms <= ?1";
 pub(super) const OUTBOX_NEXT_WAKE: &str = "SELECT MIN(CASE WHEN leased_until_ms > ?1 THEN leased_until_ms ELSE next_due_ms END) FROM outbox";
 
@@ -224,6 +210,22 @@ mod tests {
             batch.strip_suffix("?2"),
             "single and batch outbox claim SQL must differ only by LIMIT"
         );
+        for operation in [
+            "PodStatus",
+            "RuntimeReconcile",
+            "ProbeReadiness",
+            "DeadlineExceeded",
+            "ContainerStatusSnapshot",
+            "EphemeralContainerStatuses",
+            "LeaseRenew",
+            "NodeStatus",
+            "EventCreate",
+        ] {
+            assert!(
+                !single.contains(operation),
+                "claim policy must use persisted typed classification, not operation name {operation}"
+            );
+        }
     }
 }
 

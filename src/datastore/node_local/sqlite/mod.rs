@@ -472,13 +472,15 @@ impl SqliteNodeLocalDb {
     }
 
     pub async fn enqueue_outbox(&self, row: OutboxInsert) -> Result<()> {
+        let (operation, priority_class, supersedable_pod_status) =
+            persisted_outbox_classification(row.operation.as_str())?;
         let is_terminal_pod_delete =
             is_terminal_pod_delete_outbox_row(row.operation.as_str(), row.payload_proto.as_slice());
         self.db_call("node_local:outbox_enqueue", move |conn| {
             let tx = conn.transaction()?;
             let client_id = ensure_outbox_client_id_in_tx(&tx)?;
-            let sequenced = row.operation
-                != crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str();
+            let sequenced =
+                operation != crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew;
             let stream_id = if sequenced {
                 outbox_stream_id(&row.subject_key)
             } else {
@@ -499,6 +501,8 @@ impl SqliteNodeLocalDb {
                     row.subject_uid,
                     row.pod_uid,
                     row.operation,
+                    priority_class,
+                    supersedable_pod_status,
                     if is_terminal_pod_delete { 1_i64 } else { 0_i64 },
                     stream_id,
                     stream_seq,
@@ -804,14 +808,16 @@ impl SqliteNodeLocalDb {
         let Some(row) = row else {
             return Ok(false);
         };
+        let (operation, priority_class, supersedable_pod_status) =
+            persisted_outbox_classification(row.operation.as_str())?;
         let is_terminal_pod_delete =
             is_terminal_pod_delete_outbox_row(row.operation.as_str(), row.payload_proto.as_slice());
 
         self.db_call("node_local:outbox_dead_letter_replay", move |conn| {
             let tx = conn.transaction()?;
             let client_id = ensure_outbox_client_id_in_tx(&tx)?;
-            let sequenced = row.operation
-                != crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str();
+            let sequenced =
+                operation != crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew;
             let stream_id = if sequenced {
                 outbox_stream_id(&row.subject_key)
             } else {
@@ -832,6 +838,8 @@ impl SqliteNodeLocalDb {
                     row.subject_uid,
                     row.pod_uid,
                     row.operation,
+                    priority_class,
+                    supersedable_pod_status,
                     if is_terminal_pod_delete { 1_i64 } else { 0_i64 },
                     stream_id,
                     stream_seq,
@@ -1246,6 +1254,17 @@ fn ensure_outbox_client_id_in_tx(tx: &rusqlite::Transaction<'_>) -> rusqlite::Re
     let client_id = format!("outbox-{}", uuid::Uuid::new_v4());
     tx.execute(queries::META_SET, rusqlite::params![KEY, &client_id])?;
     Ok(client_id)
+}
+
+fn persisted_outbox_classification(
+    operation: &str,
+) -> Result<(crate::kubelet::outbox::payload::OutboxOperation, i64, i64)> {
+    let operation = crate::kubelet::outbox::payload::OutboxOperation::try_from(operation)?;
+    Ok((
+        operation,
+        operation.priority_class().persisted_value(),
+        i64::from(operation.supersedable_pod_status()),
+    ))
 }
 
 fn assign_outbox_stream_seq_if_needed(

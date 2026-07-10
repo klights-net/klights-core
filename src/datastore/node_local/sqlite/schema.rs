@@ -35,6 +35,8 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
                 'LeaseRenew',
                 'EventCreate'
             )),
+            priority_class      INTEGER NOT NULL DEFAULT 2 CHECK(priority_class BETWEEN 0 AND 3),
+            supersedable_pod_status INTEGER NOT NULL DEFAULT 0 CHECK(supersedable_pod_status IN (0, 1)),
             is_terminal_pod_delete INTEGER NOT NULL DEFAULT 0 CHECK(is_terminal_pod_delete IN (0, 1)),
             stream_id           INTEGER NOT NULL DEFAULT 0,
             stream_seq          INTEGER NOT NULL DEFAULT 0,
@@ -211,6 +213,7 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
     )?;
 
     migrate_outbox_stream_fields(conn)?;
+    migrate_outbox_operation_classification(conn)?;
     migrate_pod_endpoint_encrypted_direct_mode(conn)
 }
 
@@ -255,6 +258,59 @@ fn migrate_outbox_stream_fields(conn: &mut rusqlite::Connection) -> rusqlite::Re
             stream_id INTEGER PRIMARY KEY,
             last_seq  INTEGER NOT NULL
         ) WITHOUT ROWID",
+        [],
+    )?;
+    Ok(())
+}
+
+fn migrate_outbox_operation_classification(
+    conn: &mut rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    let mut needs_backfill = false;
+    if !outbox_has_column(conn, "priority_class")? {
+        conn.execute(
+            "ALTER TABLE outbox ADD COLUMN priority_class INTEGER NOT NULL DEFAULT 2 \
+             CHECK(priority_class BETWEEN 0 AND 3)",
+            [],
+        )?;
+        needs_backfill = true;
+    }
+    if !outbox_has_column(conn, "supersedable_pod_status")? {
+        conn.execute(
+            "ALTER TABLE outbox ADD COLUMN supersedable_pod_status INTEGER NOT NULL DEFAULT 0 \
+             CHECK(supersedable_pod_status IN (0, 1))",
+            [],
+        )?;
+        needs_backfill = true;
+    }
+
+    if needs_backfill {
+        for operation in crate::kubelet::outbox::payload::OutboxOperation::ALL {
+            conn.execute(
+                "UPDATE outbox SET priority_class = ?2, supersedable_pod_status = ?3 \
+                 WHERE operation = ?1",
+                rusqlite::params![
+                    operation.as_str(),
+                    operation.priority_class().persisted_value(),
+                    i64::from(operation.supersedable_pod_status()),
+                ],
+            )?;
+        }
+        let fingerprint = compute_fingerprint(conn)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO _node_meta (key, value) VALUES ('schema_fingerprint', ?1)",
+            [&fingerprint],
+        )?;
+    }
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outbox_priority_age \
+         ON outbox(priority_class, enqueued_ms, id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_outbox_supersedable_subject \
+         ON outbox(subject_key, id) WHERE supersedable_pod_status = 1",
         [],
     )?;
     Ok(())
@@ -407,6 +463,71 @@ fn compute_fingerprint(conn: &rusqlite::Connection) -> rusqlite::Result<String> 
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn init_schema_backfills_outbox_operation_classification_columns() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL UNIQUE,
+                enqueued_ms INTEGER NOT NULL,
+                subject_key TEXT NOT NULL,
+                subject_api_version TEXT NOT NULL,
+                subject_kind TEXT NOT NULL,
+                subject_namespace TEXT,
+                subject_name TEXT NOT NULL,
+                subject_uid TEXT,
+                pod_uid TEXT NOT NULL DEFAULT '',
+                operation TEXT NOT NULL,
+                is_terminal_pod_delete INTEGER NOT NULL DEFAULT 0,
+                stream_id INTEGER NOT NULL DEFAULT 0,
+                stream_seq INTEGER NOT NULL DEFAULT 0,
+                payload_proto BLOB NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                next_due_ms INTEGER NOT NULL,
+                leased_until_ms INTEGER NOT NULL DEFAULT 0,
+                lease_token TEXT,
+                last_error TEXT
+            );
+            CREATE TABLE _node_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO _node_meta (key, value) VALUES ('schema_fingerprint', 'legacy');
+            INSERT INTO outbox (
+                idempotency_key, enqueued_ms, subject_key, subject_api_version,
+                subject_kind, subject_name, pod_uid, operation, payload_proto, next_due_ms
+            ) VALUES
+                ('legacy-status', 1, 'pod', 'v1', 'Pod', 'pod', 'uid', 'PodStatus', X'', 1),
+                ('legacy-event', 2, 'event', 'events.k8s.io/v1', 'Event', 'event', '', 'EventCreate', X'', 2);
+            ",
+        )
+        .unwrap();
+
+        init_schema_in_conn(&mut conn).unwrap();
+        check_or_init_fingerprint(&conn, Path::new("node.db")).unwrap();
+
+        let status: (i64, i64) = conn
+            .query_row(
+                "SELECT priority_class, supersedable_pod_status FROM outbox WHERE idempotency_key = 'legacy-status'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let event: (i64, i64) = conn
+            .query_row(
+                "SELECT priority_class, supersedable_pod_status FROM outbox WHERE idempotency_key = 'legacy-event'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(status, (2, 1));
+        assert_eq!(event, (3, 0));
+    }
 
     #[test]
     fn init_schema_migrates_old_pod_endpoint_mode_label() {

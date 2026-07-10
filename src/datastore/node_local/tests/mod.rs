@@ -207,6 +207,74 @@ async fn node_local_outbox_prioritizes_status_before_older_events() {
 }
 
 #[tokio::test]
+async fn node_local_outbox_ages_diagnostic_events_into_fair_service() {
+    let db = open_node_local_in_memory().await;
+    db.enqueue_outbox(test_outbox_insert_with_operation(
+        "aged-event",
+        "events.k8s.io/v1/Event/default/diagnostic/event-uid",
+        "EventCreate",
+        1,
+    ))
+    .await
+    .unwrap();
+    db.enqueue_outbox(test_outbox_insert_with_operation(
+        "fresh-status",
+        "v1/Pod/default/web/pod-uid",
+        "PodStatus",
+        crate::kubelet::outbox::payload::OUTBOX_DIAGNOSTIC_AGING_MS + 2,
+    ))
+    .await
+    .unwrap();
+
+    let claimed = db
+        .claim_next_due_outbox(
+            crate::kubelet::outbox::payload::OUTBOX_DIAGNOSTIC_AGING_MS + 2,
+            1_000,
+            "lease-aged-event",
+        )
+        .await
+        .unwrap()
+        .expect("aged event should be claimable");
+
+    assert_eq!(
+        claimed.idempotency_key, "aged-event",
+        "diagnostic events must receive bounded service under continuous status traffic"
+    );
+}
+
+#[tokio::test]
+async fn node_local_outbox_keeps_lease_then_node_status_ahead_of_workload_status() {
+    let db = open_node_local_in_memory().await;
+    for (key, operation) in [
+        ("pod-status", "PodStatus"),
+        ("node-status", "NodeStatus"),
+        ("lease-renew", "LeaseRenew"),
+    ] {
+        db.enqueue_outbox(test_outbox_insert_with_operation(
+            key,
+            &format!("subject/{key}"),
+            operation,
+            1,
+        ))
+        .await
+        .unwrap();
+    }
+
+    let mut order = Vec::new();
+    for index in 0..3 {
+        let token = format!("priority-lease-{index}");
+        let row = db
+            .claim_next_due_outbox(10, 1_000, &token)
+            .await
+            .unwrap()
+            .expect("priority row");
+        order.push(row.idempotency_key.clone());
+        db.complete_outbox(row.id, &token).await.unwrap();
+    }
+    assert_eq!(order, ["lease-renew", "node-status", "pod-status"]);
+}
+
+#[tokio::test]
 async fn node_local_schema_has_only_slim_uid_bound_tables() {
     let db = open_node_local_in_memory().await;
 

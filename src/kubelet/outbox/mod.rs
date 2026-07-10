@@ -960,8 +960,7 @@ impl OutboxDispatcher {
             }
         };
 
-        let records_checkpoint =
-            outbox_operation_records_pod_status_checkpoint(operation) && !row.pod_uid.is_empty();
+        let records_checkpoint = operation.supersedable_pod_status() && !row.pod_uid.is_empty();
         if records_checkpoint {
             tracing::info!(
                 target: "klights::outbox_dispatch",
@@ -1264,18 +1263,6 @@ fn actor_owned_pod_delete_needs_dead_letter(row: &OutboxRow, err: &OutboxApplyEr
         }
         _ => false,
     }
-}
-
-fn outbox_operation_records_pod_status_checkpoint(operation: OutboxOperation) -> bool {
-    matches!(
-        operation,
-        OutboxOperation::PodStatus
-            | OutboxOperation::RuntimeReconcile
-            | OutboxOperation::ProbeReadiness
-            | OutboxOperation::DeadlineExceeded
-            | OutboxOperation::ContainerStatusSnapshot
-            | OutboxOperation::EphemeralContainerStatuses
-    )
 }
 
 fn now_ms() -> i64 {

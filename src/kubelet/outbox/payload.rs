@@ -20,7 +20,43 @@ pub enum OutboxOperation {
     EventCreate,
 }
 
+/// Persisted scheduling class for node-local outbox rows. Lower values are
+/// more urgent; the stable integer representation is part of node.db schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+pub enum OutboxPriorityClass {
+    Lease = 0,
+    NodeHealth = 1,
+    Workload = 2,
+    Diagnostic = 3,
+}
+
+impl OutboxPriorityClass {
+    pub const fn persisted_value(self) -> i64 {
+        self as i64
+    }
+}
+
+/// Once diagnostic work reaches this age it joins the workload scheduling
+/// class, bounding starvation without delaying leader-health traffic.
+pub const OUTBOX_DIAGNOSTIC_AGING_MS: i64 = 30_000;
+
 impl OutboxOperation {
+    pub const ALL: [Self; 12] = [
+        Self::PodStatus,
+        Self::RuntimeReconcile,
+        Self::ProbeReadiness,
+        Self::DeadlineExceeded,
+        Self::ContainerStatusSnapshot,
+        Self::EphemeralContainerStatuses,
+        Self::PodMetadata,
+        Self::NodeRegistration,
+        Self::NodeDataplane,
+        Self::NodeStatus,
+        Self::LeaseRenew,
+        Self::EventCreate,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PodStatus => "PodStatus",
@@ -52,6 +88,35 @@ impl OutboxOperation {
             | Self::PodMetadata => ("v1", "Pod"),
         }
     }
+
+    pub const fn priority_class(self) -> OutboxPriorityClass {
+        match self {
+            Self::LeaseRenew => OutboxPriorityClass::Lease,
+            Self::NodeStatus => OutboxPriorityClass::NodeHealth,
+            Self::EventCreate => OutboxPriorityClass::Diagnostic,
+            Self::PodStatus
+            | Self::RuntimeReconcile
+            | Self::ProbeReadiness
+            | Self::DeadlineExceeded
+            | Self::ContainerStatusSnapshot
+            | Self::EphemeralContainerStatuses
+            | Self::PodMetadata
+            | Self::NodeRegistration
+            | Self::NodeDataplane => OutboxPriorityClass::Workload,
+        }
+    }
+
+    pub const fn supersedable_pod_status(self) -> bool {
+        matches!(
+            self,
+            Self::PodStatus
+                | Self::RuntimeReconcile
+                | Self::ProbeReadiness
+                | Self::DeadlineExceeded
+                | Self::ContainerStatusSnapshot
+                | Self::EphemeralContainerStatuses
+        )
+    }
 }
 
 impl fmt::Display for OutboxOperation {
@@ -78,6 +143,60 @@ impl TryFrom<&str> for OutboxOperation {
             "LeaseRenew" => Ok(Self::LeaseRenew),
             "EventCreate" => Ok(Self::EventCreate),
             other => Err(anyhow!("unknown outbox operation: {other}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+
+    #[test]
+    fn operation_owns_persisted_priority_and_supersedable_semantics() {
+        assert_eq!(
+            OutboxOperation::LeaseRenew
+                .priority_class()
+                .persisted_value(),
+            0
+        );
+        assert_eq!(
+            OutboxOperation::NodeStatus
+                .priority_class()
+                .persisted_value(),
+            1
+        );
+        assert_eq!(
+            OutboxOperation::PodStatus
+                .priority_class()
+                .persisted_value(),
+            2
+        );
+        assert_eq!(
+            OutboxOperation::EventCreate
+                .priority_class()
+                .persisted_value(),
+            3
+        );
+
+        for operation in [
+            OutboxOperation::PodStatus,
+            OutboxOperation::RuntimeReconcile,
+            OutboxOperation::ProbeReadiness,
+            OutboxOperation::DeadlineExceeded,
+            OutboxOperation::ContainerStatusSnapshot,
+            OutboxOperation::EphemeralContainerStatuses,
+        ] {
+            assert!(operation.supersedable_pod_status(), "{operation}");
+        }
+        for operation in [
+            OutboxOperation::PodMetadata,
+            OutboxOperation::NodeRegistration,
+            OutboxOperation::NodeDataplane,
+            OutboxOperation::NodeStatus,
+            OutboxOperation::LeaseRenew,
+            OutboxOperation::EventCreate,
+        ] {
+            assert!(!operation.supersedable_pod_status(), "{operation}");
         }
     }
 }
