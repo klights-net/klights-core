@@ -424,7 +424,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
         let rows = db
             .db_call("family-fingerprint-watch-replay-floors", |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT api_version, kind, namespace_key, floor_rv FROM watch_replay_floors \
+                    "SELECT api_version, kind, namespace_key, floor_rv, floor_event_id FROM watch_replay_floors \
                      ORDER BY api_version, kind, namespace_key",
                 )?;
                 let rows = stmt
@@ -434,6 +434,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
                             row.get::<_, String>(1)?,
                             row.get::<_, String>(2)?,
                             row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -449,6 +450,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
             hash_str(hasher, &row.1);
             hash_str(hasher, &row.2);
             hash_i64(hasher, row.3);
+            hash_i64(hasher, row.4);
         }
         Ok(())
     }

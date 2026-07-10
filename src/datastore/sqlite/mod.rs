@@ -58,9 +58,10 @@ pub use super::types::{
     AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PatchKind,
     PendingWatchEvent, PodCleanupIntent, PodEndpointEvent, PodEndpointMode, PodEndpointRow,
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState,
-    PodWorkqueueEntry, PodWorkqueueKind, RawWatchEvent, ReplicatedCreateOptions,
-    ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation, ResourceList, ResourceListQuery,
-    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchTarget,
+    PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplay, PositionedWatchReplayRead,
+    RawWatchEvent, ReplicatedCreateOptions, ReplicatedSnapshotMetadata, Resource,
+    ResourceBatchOperation, ResourceList, ResourceListQuery, ResourcePatchRequest,
+    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayPosition, WatchTarget,
     WatchTargetScope,
 };
 
@@ -3307,6 +3308,16 @@ impl DatastoreBackend for Datastore {
         Datastore::list_watch_events_since_checked_bounded(self, targets, since_rv, limit).await
     }
 
+    async fn list_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        Datastore::list_watch_events_after_position_checked_bounded(self, targets, position, limit)
+            .await
+    }
+
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
         targets: &[WatchTarget],
@@ -3314,6 +3325,18 @@ impl DatastoreBackend for Datastore {
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead<RawWatchEvent>> {
         Datastore::list_raw_watch_events_since_checked_bounded(self, targets, since_rv, limit).await
+    }
+
+    async fn list_raw_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+        Datastore::list_raw_watch_events_after_position_checked_bounded(
+            self, targets, position, limit,
+        )
+        .await
     }
 
     async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {

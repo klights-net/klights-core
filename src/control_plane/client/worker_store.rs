@@ -17,8 +17,9 @@ use crate::datastore::{
     PodCleanupIntent, PodEndpointEvent, PodEndpointRow, PodNetworkAllocationLink,
     PodNetworkAllocationPod, PodNetworkAllocationRequest, PodNetworkAllocationSubnet,
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodWorkqueueEntry,
-    PodWorkqueueKind, RawWatchEvent, Resource, ResourceList, ResourcePatchRequest,
-    ResourcePreconditions, SandboxRef, WatchReplayRead, WatchTarget, WatchTargetScope,
+    PodWorkqueueKind, PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead,
+    RawWatchEvent, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions, SandboxRef,
+    WatchReplayPosition, WatchReplayRead, WatchTarget, WatchTargetScope,
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
@@ -172,6 +173,12 @@ fn object_at_resource_version(object: &Arc<Value>, resource_version: i64) -> Arc
     Arc::new(object)
 }
 
+#[derive(Default)]
+struct WorkerWatchHistory {
+    events: VecDeque<(i64, WatchEvent)>,
+    floors: HashMap<(WatchTopic, Option<String>), i64>,
+}
+
 /// Worker-local compatibility store for legacy kubelet call sites.
 ///
 /// This type deliberately does not open or own `cluster.db`. Cluster resource
@@ -183,7 +190,8 @@ pub struct WorkerStoreAdapter {
     watch_bus: Arc<WatchBus>,
     node_name: String,
     current_rv: AtomicI64,
-    event_history: Mutex<VecDeque<WatchEvent>>,
+    event_history: Mutex<WorkerWatchHistory>,
+    next_event_id: AtomicI64,
     pod_lifecycle_router: Mutex<Option<Arc<PodLifecycleRouter>>>,
 }
 
@@ -199,7 +207,8 @@ impl WorkerStoreAdapter {
             watch_bus: Arc::new(WatchBus::new(1024)),
             node_name,
             current_rv: AtomicI64::new(0),
-            event_history: Mutex::new(VecDeque::new()),
+            event_history: Mutex::new(WorkerWatchHistory::default()),
+            next_event_id: AtomicI64::new(1),
             pod_lifecycle_router: Mutex::new(None),
         }
     }
@@ -515,9 +524,23 @@ impl WorkerStoreAdapter {
             .event_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        history.push_back(event);
-        while history.len() > WORKER_WATCH_EVENT_HISTORY_CAPACITY {
-            history.pop_front();
+        let event_id = self.next_event_id.fetch_add(1, Ordering::Relaxed);
+        history.events.push_back((event_id, event));
+        while history.events.len() > WORKER_WATCH_EVENT_HISTORY_CAPACITY {
+            if let Some((removed_id, removed)) = history.events.pop_front()
+                && let Some(topic) = watch_event_topic(&removed)
+            {
+                let namespace = removed
+                    .object
+                    .pointer("/metadata/namespace")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                history
+                    .floors
+                    .entry((topic, namespace))
+                    .and_modify(|floor| *floor = (*floor).max(removed_id))
+                    .or_insert(removed_id);
+            }
         }
     }
 
@@ -531,8 +554,9 @@ impl WorkerStoreAdapter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         history
+            .events
             .iter()
-            .filter_map(|event| {
+            .filter_map(|(_, event)| {
                 let rv = event.resource_version()?;
                 if rv <= since_rv || !watch_event_matches_targets(event, targets) {
                     return None;
@@ -650,6 +674,13 @@ fn is_watch_window_expired(err: &anyhow::Error) -> bool {
             .downcast_ref::<tonic::Status>()
             .is_some_and(|s| s.code() == tonic::Code::OutOfRange)
     })
+}
+
+fn watch_event_topic(event: &WatchEvent) -> Option<WatchTopic> {
+    Some(WatchTopic::new(
+        event.object.get("apiVersion")?.as_str()?,
+        event.object.get("kind")?.as_str()?,
+    ))
 }
 
 fn watch_event_matches_targets(event: &WatchEvent, targets: &[WatchTarget]) -> bool {
@@ -1252,6 +1283,77 @@ impl DatastoreBackend for WorkerStoreAdapter {
         }
         events.sort_by_key(|event| event.resource.resource_version);
         Ok(events)
+    }
+
+    async fn list_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        let high_water_event_id = self.next_event_id.load(Ordering::Relaxed).saturating_sub(1);
+        let history = self
+            .event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if position.event_id > 0
+            && targets.iter().any(|target| {
+                let topic = WatchTopic::new(&target.api_version, &target.kind);
+                match &target.scope {
+                    WatchTargetScope::Cluster => history
+                        .floors
+                        .get(&(topic, None))
+                        .is_some_and(|floor| position.event_id < *floor),
+                    WatchTargetScope::Namespaced(Some(namespace)) => history
+                        .floors
+                        .get(&(topic, Some(namespace.clone())))
+                        .is_some_and(|floor| position.event_id < *floor),
+                    WatchTargetScope::Namespaced(None) => {
+                        history
+                            .floors
+                            .iter()
+                            .any(|((floor_topic, namespace), floor)| {
+                                floor_topic == &topic
+                                    && namespace.is_some()
+                                    && position.event_id < *floor
+                            })
+                    }
+                }
+            })
+        {
+            return Ok(PositionedWatchReplayRead::Expired);
+        }
+        let events: Vec<_> = history
+            .events
+            .iter()
+            .filter(|(event_id, event)| {
+                if position.event_id == 0 {
+                    event
+                        .resource_version()
+                        .is_some_and(|rv| rv > position.resource_version)
+                } else {
+                    *event_id > position.event_id
+                }
+            })
+            .filter(|(_, event)| watch_event_matches_targets(event, targets))
+            .filter_map(|(event_id, event)| {
+                let resource_version = event.resource_version()?;
+                Some(PositionedWatchEvent {
+                    position: WatchReplayPosition {
+                        resource_version,
+                        event_id: *event_id,
+                    },
+                    event: catchup_resource_from_watch_event(event)?,
+                })
+            })
+            .take(limit.get())
+            .collect();
+        let next_position =
+            WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
+        Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+            events,
+            next_position,
+        }))
     }
 
     async fn list_raw_watch_events_since_checked_bounded(

@@ -1,9 +1,11 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use anyhow::Result;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::datastore::{RawWatchEvent, WatchReplayRead};
+use crate::datastore::{
+    PositionedWatchEvent, PositionedWatchReplayRead, RawWatchEvent, WatchReplayPosition,
+};
 
 use super::{
     WatchCursorError, WatchDeliveryScope, WatchEvent, WatchReplaySource, WatchSignal,
@@ -22,6 +24,7 @@ pub trait ReplayCursorEvent: Clone + Send + Sync + 'static {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ReplayEventMarker {
     rv: i64,
+    topic: Option<WatchTopic>,
     key: Option<(Option<String>, String)>,
 }
 
@@ -30,11 +33,11 @@ pub trait SignalReplayCursorSource<E>: Send + Sync
 where
     E: ReplayCursorEvent,
 {
-    async fn replay_since_checked(
+    async fn replay_after_checked(
         &self,
-        since_rv: i64,
+        position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<E>>;
+    ) -> Result<PositionedWatchReplayRead<E>>;
 }
 
 #[async_trait::async_trait]
@@ -42,12 +45,12 @@ impl<S> SignalReplayCursorSource<WatchEvent> for S
 where
     S: WatchReplaySource,
 {
-    async fn replay_since_checked(
+    async fn replay_after_checked(
         &self,
-        since_rv: i64,
+        position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<WatchEvent>> {
-        WatchReplaySource::replay_since_checked(self, since_rv, limit).await
+    ) -> Result<PositionedWatchReplayRead<WatchEvent>> {
+        WatchReplaySource::replay_after_checked(self, position, limit).await
     }
 }
 
@@ -61,10 +64,10 @@ where
     topics: HashSet<WatchTopic>,
     scope: WatchDeliveryScope,
     accepted_rv: i64,
-    pending: VecDeque<E>,
+    replay_position: WatchReplayPosition,
+    pending: VecDeque<PositionedWatchEvent<E>>,
     window: WindowPolicy,
     replay_needed: bool,
-    replay_resume_rv: Option<i64>,
     seen_events: HashSet<ReplayEventMarker>,
     seen_order: VecDeque<ReplayEventMarker>,
     // Baseline initial-state emission is RV-wide because its caller only has
@@ -72,8 +75,6 @@ where
     // by object identity through `non_advancing_seen_events`.
     non_advancing_seen_rvs: HashSet<i64>,
     non_advancing_seen_events: HashSet<ReplayEventMarker>,
-    low_rv_allowlist: HashMap<(Option<String>, String), i64>,
-    low_rv_signal_ranges: VecDeque<(i64, i64)>,
 }
 
 impl<E, S> SignalReplayCursorCore<E, S>
@@ -95,16 +96,14 @@ where
             topics: topics.into_iter().collect(),
             scope,
             accepted_rv,
+            replay_position: WatchReplayPosition::from_resource_version(accepted_rv),
             pending: VecDeque::new(),
             window,
             replay_needed: false,
-            replay_resume_rv: None,
             seen_events: HashSet::new(),
             seen_order: VecDeque::new(),
             non_advancing_seen_rvs: HashSet::new(),
             non_advancing_seen_events: HashSet::new(),
-            low_rv_allowlist: HashMap::new(),
-            low_rv_signal_ranges: VecDeque::new(),
         }
     }
 
@@ -126,19 +125,26 @@ where
         }
         self.record_non_advancing_seen_event(ReplayEventMarker {
             rv,
+            topic: (self.topics.len() == 1)
+                .then(|| self.topics.iter().next().cloned())
+                .flatten(),
             key: Some((namespace, name)),
         });
     }
 
-    pub fn allow_low_rv_for_key(&mut self, namespace: Option<String>, name: String, after_rv: i64) {
-        if after_rv <= 0 {
-            return;
-        }
-        self.low_rv_allowlist.insert((namespace, name), after_rv);
+    pub fn allow_low_rv_for_key(
+        &mut self,
+        _namespace: Option<String>,
+        _name: String,
+        _after_rv: i64,
+    ) {
+        // Kept as a compatibility no-op while callers shed the old
+        // resourceVersion exception. Durable insertion position now makes
+        // later-applied lower-RV rows visible without per-key allowlists.
     }
 
     pub async fn prime_replay_or_expired(&mut self) -> Result<usize, WatchCursorError> {
-        self.replay_once_from(self.accepted_rv).await
+        self.replay_once().await
     }
 
     pub async fn next_event(&mut self) -> Result<E, WatchCursorError> {
@@ -149,15 +155,14 @@ where
 
             if self.replay_needed {
                 self.replay_needed = false;
-                let since_rv = self.replay_resume_rv.take().unwrap_or(self.accepted_rv);
-                self.replay_once_from(since_rv).await?;
+                self.replay_once().await?;
                 continue;
             }
 
             match self.signal_rx.recv().await {
                 Ok(signal) => {
-                    if let Some(since_rv) = self.matching_signal_replay_since(&signal) {
-                        self.replay_once_from(since_rv).await?;
+                    if self.signal_matches(&signal) {
+                        self.replay_once().await?;
                     }
                 }
                 Err(RecvError::Lagged(_)) => {
@@ -168,43 +173,32 @@ where
         }
     }
 
-    async fn replay_once_from(&mut self, since_rv: i64) -> Result<usize, WatchCursorError> {
+    async fn replay_once(&mut self) -> Result<usize, WatchCursorError> {
         let limit = self.window.limit();
         let replay = self
             .replay_source
-            .replay_since_checked(since_rv, limit)
+            .replay_after_checked(self.replay_position, limit)
             .await
             .map_err(WatchCursorError::Replay)?;
         match replay {
-            WatchReplayRead::Events(events) => {
-                let event_count = events.len();
-                let max_rv = events
-                    .iter()
-                    .filter_map(ReplayCursorEvent::resource_version)
-                    .max();
+            PositionedWatchReplayRead::Events(replay) => {
+                let event_count = replay.events.len();
+                self.replay_position = replay.next_position;
                 self.replay_needed = event_count == limit.get();
-                self.replay_resume_rv = self.replay_needed.then_some(max_rv.unwrap_or(since_rv));
-                self.pending.extend(events);
+                self.pending.extend(replay.events);
                 Ok(event_count)
             }
-            WatchReplayRead::Expired => Err(WatchCursorError::Expired),
+            PositionedWatchReplayRead::Expired => Err(WatchCursorError::Expired),
         }
     }
 
     fn pop_pending_event(&mut self) -> Option<E> {
-        while let Some(event) = self.pending.pop_front() {
+        while let Some(positioned) = self.pending.pop_front() {
+            let event = positioned.event;
             let Some(rv) = event.resource_version() else {
                 continue;
             };
             let marker = Self::event_marker(&event, rv);
-            if rv < self.accepted_rv {
-                if self.event_was_seen(&marker) {
-                    continue;
-                }
-                if !self.low_rv_allowed(&event, rv) && !self.low_rv_signal_allowed(rv) {
-                    continue;
-                }
-            }
             if self.event_was_seen(&marker) {
                 if !self.non_advancing_seen_events.contains(&marker) {
                     self.advance_processed_rv(rv);
@@ -224,39 +218,13 @@ where
         None
     }
 
-    fn matching_signal_replay_since(&mut self, signal: &WatchSignal) -> Option<i64> {
+    fn signal_matches(&self, signal: &WatchSignal) -> bool {
         if !self.topics.contains(&signal.topic) {
-            return None;
+            return false;
         }
-        let mut replay_since: Option<i64> = None;
-        for advance in &signal.advances {
-            if !self.scope.matches_namespace(advance.namespace.as_deref()) {
-                continue;
-            }
-            if advance.low_rv <= 0 || advance.high_rv <= 0 {
-                continue;
-            }
-            let since = if advance.high_rv > self.accepted_rv {
-                if advance.low_rv <= self.accepted_rv {
-                    self.record_low_rv_signal_range(advance.low_rv, self.accepted_rv);
-                    Some(advance.low_rv.saturating_sub(1))
-                } else {
-                    Some(self.accepted_rv)
-                }
-            } else {
-                self.record_low_rv_signal_range(advance.low_rv, advance.high_rv);
-                Some(
-                    self.low_rv_replay_floor(advance.high_rv)
-                        .map_or(advance.low_rv.saturating_sub(1), |floor| {
-                            floor.min(advance.low_rv.saturating_sub(1))
-                        }),
-                )
-            };
-            if let Some(since) = since {
-                replay_since = Some(replay_since.map_or(since, |current| current.min(since)));
-            }
-        }
-        replay_since
+        signal.advances.iter().any(|advance| {
+            self.scope.matches_namespace(advance.namespace.as_deref()) && advance.high_rv > 0
+        })
     }
 
     fn event_matches(&self, event: &E) -> bool {
@@ -264,29 +232,6 @@ where
             return false;
         };
         self.topics.contains(&topic) && self.scope.matches_namespace(event.namespace())
-    }
-
-    fn low_rv_replay_floor(&self, high_rv: i64) -> Option<i64> {
-        self.low_rv_allowlist
-            .values()
-            .filter(|after_rv| high_rv > **after_rv)
-            .copied()
-            .min()
-    }
-
-    fn low_rv_allowed(&self, event: &E, rv: i64) -> bool {
-        let Some(key) = event.key() else {
-            return false;
-        };
-        self.low_rv_allowlist
-            .get(&key)
-            .is_some_and(|after_rv| rv > *after_rv)
-    }
-
-    fn low_rv_signal_allowed(&self, rv: i64) -> bool {
-        self.low_rv_signal_ranges
-            .iter()
-            .any(|(low_rv, high_rv)| rv >= *low_rv && rv <= *high_rv)
     }
 
     fn advance_processed_rv(&mut self, rv: i64) {
@@ -322,16 +267,6 @@ where
         }
     }
 
-    fn record_low_rv_signal_range(&mut self, low_rv: i64, high_rv: i64) {
-        if low_rv <= 0 || high_rv < low_rv {
-            return;
-        }
-        self.low_rv_signal_ranges.push_back((low_rv, high_rv));
-        while self.low_rv_signal_ranges.len() > RECENT_SIGNAL_SEEN_RV_CAPACITY {
-            self.low_rv_signal_ranges.pop_front();
-        }
-    }
-
     fn event_was_seen(&self, marker: &ReplayEventMarker) -> bool {
         self.seen_events.contains(marker)
     }
@@ -339,6 +274,7 @@ where
     fn event_marker(event: &E, rv: i64) -> ReplayEventMarker {
         ReplayEventMarker {
             rv,
+            topic: event.topic(),
             key: event.key(),
         }
     }

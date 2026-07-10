@@ -655,6 +655,17 @@ impl DatastoreBackend for ReplicatedDatastore {
             .await
     }
 
+    async fn list_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        self.inner
+            .list_watch_events_after_position_checked_bounded(targets, position, limit)
+            .await
+    }
+
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
         targets: &[WatchTarget],
@@ -663,6 +674,17 @@ impl DatastoreBackend for ReplicatedDatastore {
     ) -> Result<WatchReplayRead<RawWatchEvent>> {
         self.inner
             .list_raw_watch_events_since_checked_bounded(targets, since_rv, limit)
+            .await
+    }
+
+    async fn list_raw_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+        self.inner
+            .list_raw_watch_events_after_position_checked_bounded(targets, position, limit)
             .await
     }
 

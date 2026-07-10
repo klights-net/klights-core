@@ -224,10 +224,12 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
             kind          TEXT NOT NULL,
             namespace_key TEXT NOT NULL,
             floor_rv      INTEGER NOT NULL,
+            floor_event_id INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(api_version, kind, namespace_key)
         )",
         [],
     )?;
+    migrate_watch_replay_floor_event_id(conn)?;
 
     // Applied outbox idempotency ledger. Leader-side outbox apply stores one
     // row in the same cluster datastore that owns the corresponding mutation,
@@ -409,6 +411,28 @@ fn migrate_applied_outbox_reserved_rv(conn: &mut rusqlite::Connection) -> rusqli
     if !has_reserved_rv {
         conn.execute(
             "ALTER TABLE applied_outbox ADD COLUMN reserved_rv INTEGER",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_watch_replay_floor_event_id(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_floor_event_id = {
+        let mut stmt = conn.prepare("PRAGMA table_info(watch_replay_floors)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for row in rows {
+            if row? == "floor_event_id" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_floor_event_id {
+        conn.execute(
+            "ALTER TABLE watch_replay_floors ADD COLUMN floor_event_id INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }

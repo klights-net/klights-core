@@ -3,7 +3,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use ::redb::Database;
+use ::redb::{Database, ReadableTable, ReadableTableMetadata};
 
 use crate::datastore::errors::OpenError;
 use crate::task_supervisor::TaskSupervisor;
@@ -148,8 +148,10 @@ fn initialize_tables(db: &Database) -> anyhow::Result<()> {
         let _ = w.open_table(tables::RES_CLUSTER);
         let _ = w.open_table(tables::RES_NS);
         let _ = w.open_table(tables::NAMESPACES);
+        let _ = w.open_table(tables::WATCH_EVENTS_LEGACY);
         let _ = w.open_table(tables::WATCH_EVENTS);
         let _ = w.open_table(tables::WATCH_REPLAY_FLOORS);
+        let _ = w.open_table(tables::WATCH_REPLAY_POSITION_FLOORS);
         let _ = w.open_table(tables::APPLIED_OUTBOX);
         let _ = w.open_table(tables::RESOURCES_BY_OWNER);
         let _ = w.open_table(tables::RV_TO_KEY);
@@ -162,7 +164,44 @@ fn initialize_tables(db: &Database) -> anyhow::Result<()> {
         let _ = w.open_table(tables::META);
         let _ = w.open_table(tables::KLIGHTS_META);
     }
+    migrate_watch_events_v2(&w)?;
     w.commit()?;
+    Ok(())
+}
+
+fn migrate_watch_events_v2(w: &redb::WriteTransaction) -> anyhow::Result<()> {
+    let new_is_empty = w.open_table(tables::WATCH_EVENTS)?.is_empty()?;
+    if !new_is_empty {
+        return Ok(());
+    }
+    let legacy_rows: Vec<(u64, Vec<u8>)> = {
+        let legacy = w.open_table(tables::WATCH_EVENTS_LEGACY)?;
+        legacy
+            .iter()?
+            .map(|entry| entry.map(|(rv, value)| (rv.value(), value.value().to_vec())))
+            .collect::<Result<_, _>>()?
+    };
+    if legacy_rows.is_empty() {
+        return Ok(());
+    }
+    let mut next_id = 0_u64;
+    {
+        let mut current = w.open_table(tables::WATCH_EVENTS)?;
+        for (resource_version, value) in legacy_rows {
+            next_id += 1;
+            let mut event: serde_json::Value = serde_json::from_slice(&value)?;
+            if let Some(object) = event.as_object_mut() {
+                object.insert(
+                    "resourceVersion".to_string(),
+                    serde_json::Value::from(resource_version),
+                );
+            }
+            let encoded = serde_json::to_vec(&event)?;
+            current.insert(next_id, encoded.as_slice())?;
+        }
+    }
+    let mut meta = w.open_table(tables::META)?;
+    meta.insert("watch_event_id", next_id.to_string().as_bytes())?;
     Ok(())
 }
 
@@ -185,4 +224,56 @@ fn attach_path(opts: &RedbOpenOpts, err: OpenError) -> OpenError {
 
 fn is_retryable_already_open(err: &OpenError) -> bool {
     err.to_string().contains("already open")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use redb::ReadableDatabase;
+
+    #[test]
+    fn migrates_legacy_rv_key_and_allows_same_rv_sibling() {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .unwrap();
+        let legacy_event = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "namespace": "default",
+            "name": "legacy",
+            "eventType": "ADDED",
+            "data": {}
+        });
+        let write = db.begin_write().unwrap();
+        {
+            let mut legacy = write.open_table(tables::WATCH_EVENTS_LEGACY).unwrap();
+            let encoded = serde_json::to_vec(&legacy_event).unwrap();
+            legacy.insert(7, encoded.as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+
+        initialize_tables(&db).unwrap();
+        let write = db.begin_write().unwrap();
+        crate::datastore::redb::helpers::watch_insert(
+            &write,
+            7,
+            &serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "namespace": "default",
+                "name": "sibling",
+                "eventType": "ADDED",
+                "data": {}
+            }),
+        )
+        .unwrap();
+        write.commit().unwrap();
+
+        let read = db.begin_read().unwrap();
+        let table = read.open_table(tables::WATCH_EVENTS).unwrap();
+        let rows: Vec<_> = table.iter().unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(rows.len(), 2);
+        let legacy: serde_json::Value = serde_json::from_slice(rows[0].1.value()).unwrap();
+        assert_eq!(legacy["resourceVersion"], 7);
+    }
 }

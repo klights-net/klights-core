@@ -25,6 +25,7 @@ const SNAPSHOT_TABLES: &[&str] = &[
     "res_ns",
     "namespaces",
     "watch_events",
+    "watch_replay_position_floors",
     "resources_by_owner",
     "rv_to_key",
     "node_subnets",
@@ -128,6 +129,23 @@ impl DatastoreSnapshotter for RedbDatastore {
             });
         }
 
+        // --- WATCH_REPLAY_POSITION_FLOORS ---
+        {
+            let tbl = r.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
+            let mut entries = Vec::new();
+            for e in tbl.iter()? {
+                let (k, v) = e?;
+                entries.push(SnapshotEntry {
+                    key: k.value().to_vec(),
+                    value: v.value().to_vec(),
+                });
+            }
+            tables.push(SnapshotTable {
+                name: "watch_replay_position_floors".into(),
+                entries,
+            });
+        }
+
         // --- RESOURCES_BY_OWNER ---
         {
             let tbl = r.open_table(tables::RESOURCES_BY_OWNER)?;
@@ -193,6 +211,12 @@ impl DatastoreSnapshotter for RedbDatastore {
                         value: g.value().to_vec(),
                     });
                 }
+                if let Some(g) = tbl.get("watch_event_id")? {
+                    entries.push(SnapshotEntry {
+                        key: b"watch_event_id".to_vec(),
+                        value: g.value().to_vec(),
+                    });
+                }
             }
             if !entries.is_empty() {
                 tables.push(SnapshotTable {
@@ -251,6 +275,12 @@ impl DatastoreSnapshotter for RedbDatastore {
                                 .map_err(|_| anyhow::anyhow!("bad watch event key len"))?,
                         );
                         tbl.insert(rv, entry.value.as_slice())?;
+                    }
+                }
+                "watch_replay_position_floors" => {
+                    let mut tbl = w.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
+                    for entry in &table.entries {
+                        tbl.insert(entry.key.as_slice(), entry.value.as_slice())?;
                     }
                 }
                 "resources_by_owner" => {

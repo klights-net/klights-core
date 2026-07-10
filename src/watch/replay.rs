@@ -16,6 +16,20 @@ pub trait WatchReplaySource: Send + Sync {
         Ok(crate::datastore::WatchReplayRead::Events(events))
     }
 
+    /// Replay after a durable watch-log position. Durable datastore sources
+    /// override this with insertion-id keyset pagination. The fallback keeps
+    /// non-datastore adapters source-compatible, but cannot recover same-RV
+    /// pages and therefore must not be used by durable production sources.
+    async fn replay_after_checked(
+        &self,
+        _position: crate::datastore::WatchReplayPosition,
+        _limit: std::num::NonZeroUsize,
+    ) -> Result<crate::datastore::PositionedWatchReplayRead<super::events::WatchEvent>> {
+        Err(anyhow::anyhow!(
+            "watch replay source does not implement durable positioned replay"
+        ))
+    }
+
     /// Lowest `resourceVersion` still retained in the durable watch-event
     /// window, or `None` when no events are retained. Used to detect when a
     /// requested resume point predates the window so the watch can return a

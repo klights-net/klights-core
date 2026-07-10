@@ -6922,6 +6922,177 @@ async fn checked_watch_replay_bounded_limits_events() {
     }
 }
 
+#[tokio::test]
+async fn positioned_watch_replay_pages_one_hundred_same_revision_rows() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let start_rv = db.get_current_resource_version().await.unwrap();
+    let operations = (0..100)
+        .map(|index| ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: format!("same-rv-{index}"),
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": format!("same-rv-{index}"), "namespace": "default"}
+            }),
+            mode: ResourceBatchPutMode::Create,
+            preconditions: ResourcePreconditions::default(),
+        })
+        .collect();
+    db.apply_resource_batch(operations).await.unwrap();
+
+    let targets = [crate::datastore::WatchTarget::namespaced_in_namespace(
+        "v1",
+        "ConfigMap",
+        "default",
+    )];
+    let mut position = crate::datastore::WatchReplayPosition::from_resource_version(start_rv);
+    let mut names = Vec::new();
+    loop {
+        let replay = db
+            .list_watch_events_after_position_checked_bounded(
+                &targets,
+                position,
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )
+            .await
+            .unwrap();
+        let crate::datastore::PositionedWatchReplayRead::Events(replay) = replay else {
+            panic!("fresh positioned replay must not expire");
+        };
+        position = replay.next_position;
+        let count = replay.events.len();
+        names.extend(
+            replay
+                .events
+                .into_iter()
+                .map(|event| event.event.resource.name),
+        );
+        if count < 3 {
+            break;
+        }
+    }
+
+    assert_eq!(names.len(), 100);
+    let unique: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(
+        unique.len(),
+        100,
+        "every same-RV row must be delivered once"
+    );
+}
+
+#[tokio::test]
+async fn positioned_watch_replay_ignores_unrelated_scope_gc_floor() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+        "v1", "Secret", "quiet",
+    )];
+    let start = crate::datastore::WatchReplayPosition::from_resource_version(
+        db.get_current_resource_version().await.unwrap(),
+    );
+    let crate::datastore::PositionedWatchReplayRead::Events(initial) = db
+        .list_watch_events_after_position_checked_bounded(
+            &target,
+            start,
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("fresh quiet-scope replay must not expire");
+    };
+
+    for index in 0..20 {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("noisy"),
+            &format!("churn-{index}"),
+            json!({"metadata": {"name": format!("churn-{index}"), "namespace": "noisy"}}),
+        )
+        .await
+        .unwrap();
+    }
+    db.gc_watch_events(1, 1_000).await.unwrap();
+
+    match db
+        .list_watch_events_after_position_checked_bounded(
+            &target,
+            initial.next_position,
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap()
+    {
+        crate::datastore::PositionedWatchReplayRead::Events(replay) => {
+            assert!(replay.events.is_empty());
+        }
+        crate::datastore::PositionedWatchReplayRead::Expired => {
+            panic!("unrelated-scope GC must not expire a quiet scope");
+        }
+    }
+}
+
+#[tokio::test]
+async fn positioned_watch_replay_expires_after_its_scope_position_is_pruned() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.create_resource(
+        "v1",
+        "Secret",
+        Some("seed"),
+        "anchor",
+        json!({"metadata": {"name": "anchor", "namespace": "seed"}}),
+    )
+    .await
+    .unwrap();
+    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+        "v1",
+        "ConfigMap",
+        "target",
+    )];
+    let start = crate::datastore::WatchReplayPosition::from_resource_version(
+        db.get_current_resource_version().await.unwrap(),
+    );
+    let crate::datastore::PositionedWatchReplayRead::Events(initial) = db
+        .list_watch_events_after_position_checked_bounded(
+            &target,
+            start,
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("fresh target replay must not expire");
+    };
+
+    for index in 0..5 {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("target"),
+            &format!("item-{index}"),
+            json!({"metadata": {"name": format!("item-{index}"), "namespace": "target"}}),
+        )
+        .await
+        .unwrap();
+    }
+    db.gc_watch_events(1, 1_000).await.unwrap();
+
+    assert!(matches!(
+        db.list_watch_events_after_position_checked_bounded(
+            &target,
+            initial.next_position,
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap(),
+        crate::datastore::PositionedWatchReplayRead::Expired
+    ));
+}
+
 // -----------------------------------------------------------------------
 // DSB-05 — restart-recovery and retention tests
 // -----------------------------------------------------------------------

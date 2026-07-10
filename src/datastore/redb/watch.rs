@@ -25,6 +25,8 @@ struct StoredRawWatchEvent<'a> {
     name: Option<&'a str>,
     #[serde(rename = "eventType")]
     event_type: Option<&'a str>,
+    #[serde(rename = "resourceVersion")]
+    resource_version: Option<i64>,
     #[serde(borrow)]
     data: Option<&'a RawValue>,
 }
@@ -157,6 +159,179 @@ impl RedbWatchStore {
         .await
     }
 
+    pub async fn watch_list_positioned_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        let targets = targets.to_vec();
+        self.db_call("watch_list_positioned", move |db| {
+            let read = db.begin_read()?;
+            if position.event_id == 0 {
+                for target in &targets {
+                    if target_floor(&read, target)?
+                        .is_some_and(|floor| position.resource_version < floor)
+                    {
+                        return Ok(PositionedWatchReplayRead::Expired);
+                    }
+                }
+            } else if position_expired_for_targets(&read, &targets, position.event_id)? {
+                return Ok(PositionedWatchReplayRead::Expired);
+            }
+            let table = read.open_table(tables::WATCH_EVENTS)?;
+            let high_water_event_id = table.last()?.map_or(0, |(key, _)| key.value()) as i64;
+            let start_id = if position.event_id == 0 {
+                0
+            } else {
+                position.event_id.saturating_add(1).max(0) as u64
+            };
+            let mut events = Vec::with_capacity(limit.get());
+            for entry in table.range(start_id..=high_water_event_id.max(0) as u64)? {
+                let (id, value) = entry?;
+                let event_id = id.value() as i64;
+                let body = value.value().to_vec();
+                let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let rv = event
+                    .get("resourceVersion")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                if position.event_id == 0 && rv <= position.resource_version {
+                    continue;
+                }
+                let av = event
+                    .get("apiVersion")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+                let namespace = event.get("namespace").and_then(Value::as_str);
+                if !targets
+                    .iter()
+                    .any(|target| watch_event_matches_target(target, av, kind, namespace))
+                {
+                    continue;
+                }
+                let data = event.get("data").cloned().unwrap_or(Value::Null);
+                let name = event.get("name").and_then(Value::as_str).unwrap_or("");
+                let event_type = event
+                    .get("eventType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                events.push(PositionedWatchEvent {
+                    position: WatchReplayPosition {
+                        resource_version: rv,
+                        event_id,
+                    },
+                    event: CatchUpResource {
+                        resource: Resource {
+                            id: 0,
+                            api_version: av.to_string(),
+                            kind: kind.to_string(),
+                            namespace: namespace.map(str::to_string),
+                            name: name.to_string(),
+                            uid: Resource::uid_from_data(&data),
+                            resource_version: rv,
+                            data: Arc::new(data),
+                        },
+                        event_type: std::borrow::Cow::Owned(event_type),
+                    },
+                });
+                if events.len() == limit.get() {
+                    break;
+                }
+            }
+            let next_position =
+                WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
+            Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                events,
+                next_position,
+            }))
+        })
+        .await
+    }
+
+    pub async fn watch_list_raw_positioned_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+        let targets = targets.to_vec();
+        self.db_call("watch_list_raw_positioned", move |db| {
+            let read = db.begin_read()?;
+            if position.event_id == 0 {
+                for target in &targets {
+                    if target_floor(&read, target)?
+                        .is_some_and(|floor| position.resource_version < floor)
+                    {
+                        return Ok(PositionedWatchReplayRead::Expired);
+                    }
+                }
+            } else if position_expired_for_targets(&read, &targets, position.event_id)? {
+                return Ok(PositionedWatchReplayRead::Expired);
+            }
+            let table = read.open_table(tables::WATCH_EVENTS)?;
+            let high_water_event_id = table.last()?.map_or(0, |(key, _)| key.value()) as i64;
+            let start_id = if position.event_id == 0 {
+                0
+            } else {
+                position.event_id.saturating_add(1).max(0) as u64
+            };
+            let mut events = Vec::with_capacity(limit.get());
+            for entry in table.range(start_id..=high_water_event_id.max(0) as u64)? {
+                let (id, value) = entry?;
+                let event_id = id.value() as i64;
+                let Ok(event) = serde_json::from_slice::<StoredRawWatchEvent<'_>>(value.value())
+                else {
+                    continue;
+                };
+                let rv = event.resource_version.unwrap_or_default();
+                if position.event_id == 0 && rv <= position.resource_version {
+                    continue;
+                }
+                let av = event.api_version.unwrap_or("");
+                let kind = event.kind.unwrap_or("");
+                if !targets
+                    .iter()
+                    .any(|target| watch_event_matches_target(target, av, kind, event.namespace))
+                {
+                    continue;
+                }
+                events.push(PositionedWatchEvent {
+                    position: WatchReplayPosition {
+                        resource_version: rv,
+                        event_id,
+                    },
+                    event: RawWatchEvent {
+                        api_version: av.to_string(),
+                        kind: kind.to_string(),
+                        namespace: event.namespace.map(str::to_string),
+                        name: event.name.unwrap_or("").to_string(),
+                        resource_version: rv,
+                        event_type: std::borrow::Cow::Owned(
+                            event.event_type.unwrap_or("").to_string(),
+                        ),
+                        object_json: event.data.map_or_else(
+                            || Bytes::from_static(b"null"),
+                            |data| Bytes::copy_from_slice(data.get().as_bytes()),
+                        ),
+                    },
+                });
+                if events.len() == limit.get() {
+                    break;
+                }
+            }
+            let next_position =
+                WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
+            Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                events,
+                next_position,
+            }))
+        })
+        .await
+    }
+
     fn watch_list_raw_in_read(
         read_txn: &::redb::ReadTransaction,
         targets: &[WatchTarget],
@@ -165,14 +340,16 @@ impl RedbWatchStore {
     ) -> Result<Vec<RawWatchEvent>> {
         let tbl = read_txn.open_table(tables::WATCH_EVENTS)?;
         let mut result = Vec::new();
-        let start = (since_rv + 1).max(0) as u64;
-        for e in tbl.range(start..)? {
-            let (rv_guard, event_ref) = e?;
-            let rv = rv_guard.value() as i64;
+        for e in tbl.iter()? {
+            let (_, event_ref) = e?;
             let Ok(event) = serde_json::from_slice::<StoredRawWatchEvent<'_>>(event_ref.value())
             else {
                 continue;
             };
+            let rv = event.resource_version.unwrap_or_default();
+            if rv <= since_rv {
+                continue;
+            }
             let ev_av = event.api_version.unwrap_or("");
             let ev_kind = event.kind.unwrap_or("");
             let ev_ns = event.namespace;
@@ -209,12 +386,17 @@ impl RedbWatchStore {
     ) -> Result<Vec<CatchUpResource>> {
         let tbl = read_txn.open_table(tables::WATCH_EVENTS)?;
         let mut result = Vec::new();
-        let start = (since_rv + 1).max(0) as u64;
-        for e in tbl.range(start..)? {
-            let (rv_guard, event_ref) = e?;
-            let rv = rv_guard.value() as i64;
+        for e in tbl.iter()? {
+            let (_, event_ref) = e?;
             let body = event_ref.value().to_vec();
             let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let rv = event
+                .get("resourceVersion")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            if rv <= since_rv {
+                continue;
+            }
             let ev_av = event
                 .get("apiVersion")
                 .and_then(|v| v.as_str())
@@ -256,12 +438,17 @@ impl RedbWatchStore {
             let r = db.begin_read()?;
             let tbl = r.open_table(tables::WATCH_EVENTS)?;
             let mut result = Vec::new();
-            let start = (since_rv + 1).max(0) as u64;
-            for e in tbl.range(start..)? {
-                let (rv_guard, event_ref) = e?;
-                let rv = rv_guard.value() as i64;
+            for e in tbl.iter()? {
+                let (_, event_ref) = e?;
                 let body = event_ref.value().to_vec();
                 let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let rv = event
+                    .get("resourceVersion")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                if rv <= since_rv {
+                    continue;
+                }
                 let ev_type = event
                     .get("eventType")
                     .and_then(|v| v.as_str())
@@ -301,12 +488,17 @@ impl RedbWatchStore {
             let r = db.begin_read()?;
             let tbl = r.open_table(tables::WATCH_EVENTS)?;
             let mut result = Vec::new();
-            let start = (since_rv + 1).max(0) as u64;
-            for e in tbl.range(start..)? {
-                let (rv_guard, event_ref) = e?;
-                let rv = rv_guard.value() as i64;
+            for e in tbl.iter()? {
+                let (_, event_ref) = e?;
                 let body = event_ref.value().to_vec();
                 let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let rv = event
+                    .get("resourceVersion")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                if rv <= since_rv {
+                    continue;
+                }
                 let ev_av = event
                     .get("apiVersion")
                     .and_then(|v| v.as_str())
@@ -341,8 +533,8 @@ impl RedbWatchStore {
     pub async fn watch_list_all_since_paged(
         &self,
         since_rv: i64,
-        after_resource_version: i64,
-        _after_id: i64,
+        _after_resource_version: i64,
+        after_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>> {
         self.db_call("watch_list_all_since_paged", move |db| {
@@ -350,15 +542,19 @@ impl RedbWatchStore {
             let tbl = r.open_table(tables::WATCH_EVENTS)?;
             let limit = limit.get();
             let mut result = Vec::with_capacity(limit);
-            let start = since_rv
-                .max(after_resource_version)
-                .saturating_add(1)
-                .max(0) as u64;
+            let start = after_id.saturating_add(1).max(0) as u64;
             for e in tbl.range(start..)? {
-                let (rv_guard, event_ref) = e?;
-                let rv = rv_guard.value() as i64;
+                let (id_guard, event_ref) = e?;
+                let event_id = id_guard.value() as i64;
                 let body = event_ref.value().to_vec();
                 let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let rv = event
+                    .get("resourceVersion")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default();
+                if rv <= since_rv {
+                    continue;
+                }
                 let ev_av = event
                     .get("apiVersion")
                     .and_then(|v| v.as_str())
@@ -372,7 +568,7 @@ impl RedbWatchStore {
                 let ev_ns = event.get("namespace").and_then(|v| v.as_str());
                 let ev_name = event.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 result.push((
-                    rv,
+                    event_id,
                     CatchUpResource {
                         resource: Resource {
                             id: 0,
@@ -419,15 +615,19 @@ impl RedbWatchStore {
     pub async fn gc_watch(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
         self.db_call("gc_watch", move |db| {
             let w = db.begin_write()?;
-            let entries: Vec<(u64, Option<Vec<u8>>)> = {
+            let entries: Vec<(u64, u64, Option<Vec<u8>>)> = {
                 let tbl = w.open_table(tables::WATCH_EVENTS)?;
                 let mut entries = Vec::new();
                 for entry in tbl.iter()? {
                     let (key, event_ref) = entry?;
-                    let rv = key.value();
+                    let event_id = key.value();
                     let body = event_ref.value().to_vec();
                     let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                    entries.push((rv, floor_key_for_event(&event)));
+                    let rv = event
+                        .get("resourceVersion")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default();
+                    entries.push((event_id, rv, floor_key_for_event(&event)));
                 }
                 entries
             };
@@ -438,24 +638,36 @@ impl RedbWatchStore {
             }
 
             let mut keys_to_remove = Vec::with_capacity(candidates.len());
-            let mut floor_updates: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
-            for (rv, floor_key) in candidates {
+            let mut floor_updates: BTreeMap<Vec<u8>, (u64, u64)> = BTreeMap::new();
+            for (event_id, rv, floor_key) in candidates {
                 if let Some(key) = floor_key {
                     floor_updates
                         .entry(key)
-                        .and_modify(|floor| *floor = (*floor).max(rv))
-                        .or_insert(rv);
+                        .and_modify(|floor| {
+                            floor.0 = floor.0.max(rv);
+                            floor.1 = floor.1.max(event_id);
+                        })
+                        .or_insert((rv, event_id));
                 }
-                keys_to_remove.push(rv);
+                keys_to_remove.push(event_id);
             }
 
             {
-                let mut floors = w.open_table(tables::WATCH_REPLAY_FLOORS)?;
-                for (key, floor_rv) in floor_updates {
-                    let existing = floors.get(key.as_slice())?.map(|guard| guard.value());
+                let mut rv_floors = w.open_table(tables::WATCH_REPLAY_FLOORS)?;
+                let mut position_floors = w.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
+                for (key, (floor_rv, floor_event_id)) in floor_updates {
+                    let existing = rv_floors.get(key.as_slice())?.map(|guard| guard.value());
                     if existing.is_none_or(|current| floor_rv > current) {
-                        floors.insert(key.as_slice(), floor_rv)?;
+                        rv_floors.insert(key.as_slice(), floor_rv)?;
                     }
+                    let (floor_rv, floor_event_id) = position_floors
+                        .get(key.as_slice())?
+                        .and_then(|value| decode_position_floor(value.value()))
+                        .map_or((floor_rv, floor_event_id), |existing| {
+                            (existing.0.max(floor_rv), existing.1.max(floor_event_id))
+                        });
+                    let encoded = encode_position_floor(floor_rv, floor_event_id);
+                    position_floors.insert(key.as_slice(), encoded.as_slice())?;
                 }
             }
             let removed = {
@@ -479,10 +691,14 @@ impl RedbWatchStore {
             let mut entries = Vec::new();
             for entry in tbl.iter()? {
                 let (key, event_ref) = entry?;
-                let rv = key.value();
+                let event_id = key.value();
                 let body = event_ref.value().to_vec();
                 let event: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                entries.push((rv, floor_key_for_event(&event)));
+                let rv = event
+                    .get("resourceVersion")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                entries.push((event_id, rv, floor_key_for_event(&event)));
             }
             Ok(watch_gc_candidates(&entries, max_rows, batch_cap).len())
         })
@@ -491,10 +707,10 @@ impl RedbWatchStore {
 }
 
 fn watch_gc_candidates(
-    entries: &[(u64, Option<Vec<u8>>)],
+    entries: &[(u64, u64, Option<Vec<u8>>)],
     max_rows: i64,
     batch_cap: i64,
-) -> Vec<(u64, Option<Vec<u8>>)> {
+) -> Vec<(u64, u64, Option<Vec<u8>>)> {
     let max_rows = watch_events_max_rows(max_rows);
     if entries.len() <= max_rows {
         return Vec::new();
@@ -503,7 +719,7 @@ fn watch_gc_candidates(
     let global_prunable = entries.len() - max_rows;
     let batch_cap = watch_events_batch_cap(batch_cap);
     let mut scope_totals: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
-    for (_, floor_key) in entries {
+    for (_, _, floor_key) in entries {
         if let Some(key) = floor_key {
             *scope_totals.entry(key.clone()).or_default() += 1;
         }
@@ -512,7 +728,7 @@ fn watch_gc_candidates(
 
     let mut seen_by_scope: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let mut candidates = Vec::new();
-    for (idx, (rv, floor_key)) in entries.iter().enumerate() {
+    for (idx, (event_id, rv, floor_key)) in entries.iter().enumerate() {
         if idx >= global_prunable || candidates.len() >= batch_cap {
             break;
         }
@@ -526,7 +742,7 @@ fn watch_gc_candidates(
             }
         }
 
-        candidates.push((*rv, floor_key.clone()));
+        candidates.push((*event_id, *rv, floor_key.clone()));
     }
     candidates
 }
@@ -562,6 +778,87 @@ fn target_floor(read_txn: &::redb::ReadTransaction, target: &WatchTarget) -> Res
             read_namespaced_all_floor(read_txn, &target.api_version, &target.kind)
         }
     }
+}
+
+fn position_expired_for_targets(
+    read_txn: &::redb::ReadTransaction,
+    targets: &[WatchTarget],
+    event_id: i64,
+) -> Result<bool> {
+    for target in targets {
+        let floor = match &target.scope {
+            WatchTargetScope::Cluster => read_position_floor(
+                read_txn,
+                &target.api_version,
+                &target.kind,
+                CLUSTER_NAMESPACE_KEY,
+            )?,
+            WatchTargetScope::Namespaced(Some(namespace)) => {
+                read_position_floor(read_txn, &target.api_version, &target.kind, namespace)?
+            }
+            WatchTargetScope::Namespaced(None) => {
+                read_namespaced_all_position_floor(read_txn, &target.api_version, &target.kind)?
+            }
+        };
+        if floor.is_some_and(|floor| event_id < floor) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn encode_position_floor(resource_version: u64, event_id: u64) -> [u8; 16] {
+    let mut encoded = [0_u8; 16];
+    encoded[..8].copy_from_slice(&resource_version.to_be_bytes());
+    encoded[8..].copy_from_slice(&event_id.to_be_bytes());
+    encoded
+}
+
+fn decode_position_floor(encoded: &[u8]) -> Option<(u64, u64)> {
+    if encoded.len() != 16 {
+        return None;
+    }
+    Some((
+        u64::from_be_bytes(encoded[..8].try_into().ok()?),
+        u64::from_be_bytes(encoded[8..].try_into().ok()?),
+    ))
+}
+
+fn read_position_floor(
+    read_txn: &::redb::ReadTransaction,
+    api_version: &str,
+    kind: &str,
+    namespace_key: &str,
+) -> Result<Option<i64>> {
+    let floors = read_txn.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
+    let key = floor_key(api_version, kind, namespace_key);
+    Ok(floors
+        .get(key.as_slice())?
+        .and_then(|floor| decode_position_floor(floor.value()).map(|(_, id)| id as i64)))
+}
+
+fn read_namespaced_all_position_floor(
+    read_txn: &::redb::ReadTransaction,
+    api_version: &str,
+    kind: &str,
+) -> Result<Option<i64>> {
+    let floors = read_txn.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
+    let prefix = floor_key_prefix(api_version, kind);
+    let mut floor = None;
+    for entry in floors.iter()? {
+        let (key, value) = entry?;
+        let Some(namespace_key) = key.value().strip_prefix(prefix.as_slice()) else {
+            continue;
+        };
+        if namespace_key.is_empty() || namespace_key == CLUSTER_NAMESPACE_KEY.as_bytes() {
+            continue;
+        }
+        let Some((_, event_id)) = decode_position_floor(value.value()) else {
+            continue;
+        };
+        floor = Some(floor.map_or(event_id as i64, |current: i64| current.max(event_id as i64)));
+    }
+    Ok(floor)
 }
 
 fn read_floor(
@@ -738,6 +1035,116 @@ mod tests {
             page2.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![4, 5]
         );
+    }
+
+    #[tokio::test]
+    async fn positioned_replay_preserves_one_hundred_same_revision_siblings() {
+        let s = store();
+        for index in 0..100 {
+            insert_watch_event(
+                &s,
+                7,
+                "v1",
+                "Pod",
+                Some("ns"),
+                &format!("same-rv-{index}"),
+                "ADDED",
+            );
+        }
+        let targets = [WatchTarget::namespaced_in_namespace("v1", "Pod", "ns")];
+        let limit = std::num::NonZeroUsize::new(3).unwrap();
+        let mut position = WatchReplayPosition::from_resource_version(6);
+        let mut delivered = Vec::new();
+        loop {
+            let PositionedWatchReplayRead::Events(replay) = s
+                .watch_list_positioned_checked_bounded(&targets, position, limit)
+                .await
+                .unwrap()
+            else {
+                panic!("fresh redb replay must not expire");
+            };
+            position = replay.next_position;
+            let count = replay.events.len();
+            delivered.extend(
+                replay
+                    .events
+                    .into_iter()
+                    .map(|event| event.event.resource.name),
+            );
+            if count < limit.get() {
+                break;
+            }
+        }
+        assert_eq!(delivered.len(), 100);
+        assert_eq!(
+            delivered
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn positioned_replay_gc_expiry_is_scope_specific() {
+        let s = store();
+        insert_watch_event(&s, 1, "v1", "Secret", Some("seed"), "anchor", "ADDED");
+        let target = [WatchTarget::namespaced_in_namespace(
+            "v1",
+            "ConfigMap",
+            "target",
+        )];
+        let quiet = [WatchTarget::namespaced_in_namespace(
+            "v1", "Secret", "quiet",
+        )];
+        let limit = std::num::NonZeroUsize::new(3).unwrap();
+        let PositionedWatchReplayRead::Events(target_start) = s
+            .watch_list_positioned_checked_bounded(
+                &target,
+                WatchReplayPosition::from_resource_version(1),
+                limit,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("fresh target position must not expire");
+        };
+        let PositionedWatchReplayRead::Events(quiet_start) = s
+            .watch_list_positioned_checked_bounded(
+                &quiet,
+                WatchReplayPosition::from_resource_version(1),
+                limit,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("fresh quiet position must not expire");
+        };
+        for index in 0..5 {
+            insert_watch_event(
+                &s,
+                2 + index,
+                "v1",
+                "ConfigMap",
+                Some("target"),
+                &format!("item-{index}"),
+                "ADDED",
+            );
+        }
+        s.gc_watch(1, 100).await.unwrap();
+
+        assert!(matches!(
+            s.watch_list_positioned_checked_bounded(&target, target_start.next_position, limit,)
+                .await
+                .unwrap(),
+            PositionedWatchReplayRead::Expired
+        ));
+        assert!(matches!(
+            s.watch_list_positioned_checked_bounded(&quiet, quiet_start.next_position, limit,)
+                .await
+                .unwrap(),
+            PositionedWatchReplayRead::Events(_)
+        ));
     }
 
     #[tokio::test]

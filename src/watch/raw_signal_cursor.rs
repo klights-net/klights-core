@@ -1,6 +1,8 @@
 use anyhow::Result;
 
-use crate::datastore::{DatastoreHandle, RawWatchEvent, WatchReplayRead, WatchTarget};
+use crate::datastore::{
+    DatastoreHandle, PositionedWatchReplayRead, RawWatchEvent, WatchReplayPosition, WatchTarget,
+};
 
 use super::signal_replay_cursor_core::{SignalReplayCursorCore, SignalReplayCursorSource};
 use super::{WatchCursorError, WatchDeliveryScope, WatchSignalReceiver, WatchTopic, WindowPolicy};
@@ -58,13 +60,13 @@ struct RawWatchReplaySource {
 
 #[async_trait::async_trait]
 impl SignalReplayCursorSource<RawWatchEvent> for RawWatchReplaySource {
-    async fn replay_since_checked(
+    async fn replay_after_checked(
         &self,
-        since_rv: i64,
+        position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead<RawWatchEvent>> {
+    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
         self.db
-            .list_raw_watch_events_since_checked_bounded(&self.targets, since_rv, limit)
+            .list_raw_watch_events_after_position_checked_bounded(&self.targets, position, limit)
             .await
     }
 }

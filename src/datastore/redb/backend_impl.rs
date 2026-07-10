@@ -487,6 +487,16 @@ impl DatastoreBackend for RedbDatastore {
             .watch_list_checked_bounded(t, s, limit)
             .await
     }
+    async fn list_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        self.watch_store
+            .watch_list_positioned_checked_bounded(targets, position, limit)
+            .await
+    }
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
         t: &[WatchTarget],
@@ -495,6 +505,16 @@ impl DatastoreBackend for RedbDatastore {
     ) -> Result<WatchReplayRead<RawWatchEvent>> {
         self.watch_store
             .watch_list_raw_checked_bounded(t, s, limit)
+            .await
+    }
+    async fn list_raw_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+        self.watch_store
+            .watch_list_raw_positioned_checked_bounded(targets, position, limit)
             .await
     }
     async fn list_all_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {

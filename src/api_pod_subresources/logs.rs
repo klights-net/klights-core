@@ -743,7 +743,7 @@ impl PodLogFollowTermination {
         terminate_after_initial: bool,
     ) -> Self {
         Self {
-            pod_events: PodLogEventSource::Signal(pod_events),
+            pod_events: PodLogEventSource::Signal(Box::new(pod_events)),
             namespace,
             name,
             uid,
@@ -777,7 +777,7 @@ impl PodLogFollowTermination {
 }
 
 enum PodLogEventSource {
-    Signal(SignalWatchCursor<crate::datastore::sqlite::DatastoreWatchReplaySource>),
+    Signal(Box<SignalWatchCursor<crate::datastore::sqlite::DatastoreWatchReplaySource>>),
     #[cfg(test)]
     Broadcast(broadcast::Receiver<WatchEvent>),
 }

@@ -5,6 +5,9 @@ use async_trait::async_trait;
 use crate::watch::{WatchEvent, WatchReplaySource};
 
 use super::{CatchUpResource, DatastoreHandle, WatchReplayRead, WatchTarget};
+use crate::datastore::{
+    PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead, WatchReplayPosition,
+};
 
 pub struct DatastoreWatchReplaySource {
     db: DatastoreHandle,
@@ -47,6 +50,33 @@ impl WatchReplaySource for DatastoreWatchReplaySource {
                     .collect(),
             )),
             WatchReplayRead::Expired => Ok(WatchReplayRead::Expired),
+        }
+    }
+
+    async fn replay_after_checked(
+        &self,
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<WatchEvent>> {
+        match self
+            .db
+            .list_watch_events_after_position_checked_bounded(&self.targets, position, limit)
+            .await?
+        {
+            PositionedWatchReplayRead::Events(replay) => {
+                Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                    next_position: replay.next_position,
+                    events: replay
+                        .events
+                        .into_iter()
+                        .map(|positioned| PositionedWatchEvent {
+                            position: positioned.position,
+                            event: positioned.event.into_watch_event(),
+                        })
+                        .collect(),
+                }))
+            }
+            PositionedWatchReplayRead::Expired => Ok(PositionedWatchReplayRead::Expired),
         }
     }
 

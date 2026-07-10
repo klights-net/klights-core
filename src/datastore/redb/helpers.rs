@@ -236,8 +236,22 @@ pub fn incr_rv(w: &::redb::WriteTransaction) -> Result<i64> {
 
 /// Append a watch event to the watch-event table.
 pub fn watch_insert(w: &::redb::WriteTransaction, rv: i64, event: &Value) -> Result<()> {
+    let event_id = {
+        let mut meta = w.open_table(tables::META)?;
+        let current = meta
+            .get("watch_event_id")?
+            .and_then(|value| std::str::from_utf8(value.value()).ok()?.parse::<u64>().ok())
+            .unwrap_or(0);
+        let next = current.saturating_add(1);
+        meta.insert("watch_event_id", next.to_string().as_bytes())?;
+        next
+    };
+    let mut stored = event.clone();
+    if let Some(object) = stored.as_object_mut() {
+        object.insert("resourceVersion".to_string(), Value::from(rv));
+    }
     let mut we = w.open_table(tables::WATCH_EVENTS)?;
-    we.insert(rv as u64, serde_json::to_vec(event)?.as_slice())?;
+    we.insert(event_id, serde_json::to_vec(&stored)?.as_slice())?;
     Ok(())
 }
 

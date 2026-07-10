@@ -1,6 +1,9 @@
 use super::queries;
 use super::*;
-use crate::datastore::WatchReplayRead;
+use crate::datastore::{
+    PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead, WatchReplayPosition,
+    WatchReplayRead,
+};
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -275,6 +278,56 @@ impl Datastore {
         .map_err(|e| anyhow::anyhow!("Failed to bounded checked-list watch_events: {}", e))
     }
 
+    pub async fn list_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        if targets.is_empty() {
+            return Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                events: Vec::new(),
+                next_position: position,
+            }));
+        }
+        let targets = targets.to_vec();
+        self.read_db_call("list_watch_events_after_position", move |conn| {
+            if position.event_id == 0
+                && watch_replay_expired_for_targets(conn, &targets, position.resource_version)?
+            {
+                return Ok(PositionedWatchReplayRead::Expired);
+            }
+            if position.event_id > 0
+                && watch_position_expired_for_targets(conn, &targets, position.event_id)?
+            {
+                return Ok(PositionedWatchReplayRead::Expired);
+            }
+            let high_water_event_id: i64 =
+                conn.query_row("SELECT COALESCE(MAX(id), 0) FROM watch_events", [], |row| {
+                    row.get(0)
+                })?;
+            let rows = Self::list_positioned_watch_events_in_conn(
+                conn,
+                &targets,
+                position,
+                high_water_event_id,
+                limit,
+            )?;
+            let events: Vec<_> = rows
+                .into_iter()
+                .map(|(position, event)| PositionedWatchEvent { position, event })
+                .collect();
+            let next_position =
+                WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
+            Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                events,
+                next_position,
+            }))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to position-list watch_events: {}", e))
+    }
+
     pub async fn list_raw_watch_events_since_checked_bounded(
         &self,
         targets: &[WatchTarget],
@@ -300,6 +353,154 @@ impl Datastore {
         })
         .await
         .map_err(|e| anyhow::anyhow!("Failed to raw bounded checked-list watch_events: {}", e))
+    }
+
+    pub async fn list_raw_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+        if targets.is_empty() {
+            return Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                events: Vec::new(),
+                next_position: position,
+            }));
+        }
+        let targets = targets.to_vec();
+        self.read_db_call("list_raw_watch_events_after_position", move |conn| {
+            if position.event_id == 0
+                && watch_replay_expired_for_targets(conn, &targets, position.resource_version)?
+            {
+                return Ok(PositionedWatchReplayRead::Expired);
+            }
+            if position.event_id > 0
+                && watch_position_expired_for_targets(conn, &targets, position.event_id)?
+            {
+                return Ok(PositionedWatchReplayRead::Expired);
+            }
+            let high_water_event_id: i64 =
+                conn.query_row("SELECT COALESCE(MAX(id), 0) FROM watch_events", [], |row| {
+                    row.get(0)
+                })?;
+            let rows = Self::list_positioned_raw_watch_events_in_conn(
+                conn,
+                &targets,
+                position,
+                high_water_event_id,
+                limit,
+            )?;
+            let events: Vec<_> = rows
+                .into_iter()
+                .map(|(position, event)| PositionedWatchEvent { position, event })
+                .collect();
+            let next_position =
+                WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
+            Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+                events,
+                next_position,
+            }))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to raw position-list watch_events: {}", e))
+    }
+
+    fn positioned_watch_query(
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        high_water_event_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+        let mut query = "SELECT api_version, kind, namespace, name, resource_version, event_type, data, id FROM watch_events WHERE ".to_string();
+        let boundary = if position.event_id == 0 {
+            position.resource_version
+        } else {
+            position.event_id
+        };
+        query.push_str(if position.event_id == 0 {
+            "resource_version > ?1 AND id <= ?2 AND ("
+        } else {
+            "id > ?1 AND id <= ?2 AND ("
+        });
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(boundary), Box::new(high_water_event_id)];
+        for (idx, target) in targets.iter().enumerate() {
+            if idx > 0 {
+                query.push_str(" OR ");
+            }
+            query.push('(');
+            query.push_str(&format!(
+                "api_version = ?{} AND kind = ?{}",
+                params.len() + 1,
+                params.len() + 2
+            ));
+            params.push(Box::new(target.api_version.clone()));
+            params.push(Box::new(target.kind.clone()));
+            match &target.scope {
+                WatchTargetScope::Cluster => query.push_str(" AND namespace IS NULL"),
+                WatchTargetScope::Namespaced(Some(namespace)) => {
+                    query.push_str(&format!(" AND namespace = ?{}", params.len() + 1));
+                    params.push(Box::new(namespace.clone()));
+                }
+                WatchTargetScope::Namespaced(None) => {
+                    query.push_str(" AND namespace IS NOT NULL");
+                }
+            }
+            query.push(')');
+        }
+        query.push_str(&format!(") ORDER BY id ASC LIMIT ?{}", params.len() + 1));
+        params.push(Box::new(limit.get() as i64));
+        (query, params)
+    }
+
+    fn list_positioned_watch_events_in_conn(
+        conn: &rusqlite::Connection,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        high_water_event_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> rusqlite::Result<Vec<(WatchReplayPosition, CatchUpResource)>> {
+        let (query, params) =
+            Self::positioned_watch_query(targets, position, high_water_event_id, limit);
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&query)?;
+        stmt.query_map(&refs[..], |row| {
+            let event_id = row.get(7)?;
+            let event = Self::watch_row_to_catchup_resource(row)?;
+            Ok((
+                WatchReplayPosition {
+                    resource_version: event.resource.resource_version,
+                    event_id,
+                },
+                event,
+            ))
+        })?
+        .collect()
+    }
+
+    fn list_positioned_raw_watch_events_in_conn(
+        conn: &rusqlite::Connection,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        high_water_event_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> rusqlite::Result<Vec<(WatchReplayPosition, RawWatchEvent)>> {
+        let (query, params) =
+            Self::positioned_watch_query(targets, position, high_water_event_id, limit);
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&query)?;
+        stmt.query_map(&refs[..], |row| {
+            let event_id = row.get(7)?;
+            let event = Self::watch_row_to_raw_watch_event(row)?;
+            Ok((
+                WatchReplayPosition {
+                    resource_version: event.resource_version,
+                    event_id,
+                },
+                event,
+            ))
+        })?
+        .collect()
     }
 
     fn list_watch_events_since_in_conn(
@@ -509,22 +710,25 @@ pub(super) fn gc_watch_events_in_tx(
         )?;
 
         let mut ids = Vec::new();
-        let mut floors: HashMap<(String, String, String), i64> = HashMap::new();
+        let mut floors: HashMap<(String, String, String), (i64, i64)> = HashMap::new();
         for row in rows {
             let (id, api_version, kind, namespace_key, resource_version) = row?;
             ids.push(id);
             floors
                 .entry((api_version, kind, namespace_key))
-                .and_modify(|floor| *floor = (*floor).max(resource_version))
-                .or_insert(resource_version);
+                .and_modify(|floor| {
+                    floor.0 = floor.0.max(resource_version);
+                    floor.1 = floor.1.max(id);
+                })
+                .or_insert((resource_version, id));
         }
         (ids, floors)
     };
 
-    for ((api_version, kind, namespace_key), floor_rv) in floors {
+    for ((api_version, kind, namespace_key), (floor_rv, floor_event_id)) in floors {
         tx.execute(
             queries::WATCH_REPLAY_FLOOR_UPSERT,
-            rusqlite::params![api_version, kind, namespace_key, floor_rv],
+            rusqlite::params![api_version, kind, namespace_key, floor_rv, floor_event_id],
         )?;
     }
 
@@ -559,6 +763,57 @@ fn watch_replay_expired_for_targets(
         }
     }
     Ok(false)
+}
+
+fn watch_position_expired_for_targets(
+    conn: &rusqlite::Connection,
+    targets: &[WatchTarget],
+    event_id: i64,
+) -> rusqlite::Result<bool> {
+    for target in targets {
+        if let Some(floor_event_id) = target_event_floor(conn, target)?
+            && event_id < floor_event_id
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn target_event_floor(
+    conn: &rusqlite::Connection,
+    target: &WatchTarget,
+) -> rusqlite::Result<Option<i64>> {
+    match &target.scope {
+        WatchTargetScope::Cluster => read_event_floor(
+            conn,
+            &target.api_version,
+            &target.kind,
+            CLUSTER_NAMESPACE_KEY,
+        ),
+        WatchTargetScope::Namespaced(Some(namespace)) => {
+            read_event_floor(conn, &target.api_version, &target.kind, namespace)
+        }
+        WatchTargetScope::Namespaced(None) => conn.query_row(
+            queries::WATCH_REPLAY_EVENT_FLOOR_FOR_NAMESPACED_ALL,
+            rusqlite::params![target.api_version, target.kind],
+            |row| row.get::<_, Option<i64>>(0),
+        ),
+    }
+}
+
+fn read_event_floor(
+    conn: &rusqlite::Connection,
+    api_version: &str,
+    kind: &str,
+    namespace_key: &str,
+) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        queries::WATCH_REPLAY_EVENT_FLOOR_FOR_SCOPE,
+        rusqlite::params![api_version, kind, namespace_key],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
 }
 
 fn target_floor(

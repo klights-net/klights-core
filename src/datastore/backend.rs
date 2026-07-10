@@ -22,10 +22,10 @@ use super::types::ReplicatedCreateOptions;
 use super::types::{
     AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PatchKind, PodCleanupIntent,
     PodEndpointEvent, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
-    PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, RawWatchEvent,
-    ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation, ResourceList, ResourceListQuery,
-    ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayRead,
-    WatchTarget,
+    PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplayRead,
+    RawWatchEvent, ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation, ResourceList,
+    ResourceListQuery, ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv,
+    WatchReplayPosition, WatchReplayRead, WatchTarget,
 };
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
@@ -557,6 +557,17 @@ pub trait DatastoreBackend: Send + Sync {
         }
     }
 
+    async fn list_watch_events_after_position_checked_bounded(
+        &self,
+        _targets: &[WatchTarget],
+        _position: WatchReplayPosition,
+        _limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        Err(anyhow::anyhow!(
+            "datastore backend does not implement durable positioned watch replay"
+        ))
+    }
+
     /// Replay durable watch rows with routing/cursor metadata carried in typed
     /// fields and the original object JSON left as bytes.
     async fn list_raw_watch_events_since_checked_bounded(
@@ -565,6 +576,17 @@ pub trait DatastoreBackend: Send + Sync {
         since_rv: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead<RawWatchEvent>>;
+
+    async fn list_raw_watch_events_after_position_checked_bounded(
+        &self,
+        _targets: &[WatchTarget],
+        _position: WatchReplayPosition,
+        _limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+        Err(anyhow::anyhow!(
+            "datastore backend does not implement durable raw positioned watch replay"
+        ))
+    }
 
     /// Lowest `resourceVersion` still retained in the durable `watch_events`
     /// window, or `None` when the window is empty. A watch whose requested /

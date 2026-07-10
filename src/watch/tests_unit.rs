@@ -275,6 +275,52 @@ impl WatchReplaySource for SignalCursorReplaySource {
                 .collect(),
         ))
     }
+
+    async fn replay_after_checked(
+        &self,
+        position: crate::datastore::WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<WatchEvent>> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((position.resource_version, limit.get()));
+        if self.expired {
+            return Ok(crate::datastore::PositionedWatchReplayRead::Expired);
+        }
+        let events: Vec<_> = self
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(index, event)| {
+                if position.event_id == 0 {
+                    event.resource_version().unwrap_or_default() > position.resource_version
+                } else {
+                    *index as i64 + 1 > position.event_id
+                }
+            })
+            .take(limit.get())
+            .map(|(index, event)| crate::datastore::PositionedWatchEvent {
+                position: crate::datastore::WatchReplayPosition {
+                    resource_version: event.resource_version().unwrap_or_default(),
+                    event_id: index as i64 + 1,
+                },
+                event: event.clone(),
+            })
+            .collect();
+        let next_position = crate::datastore::WatchReplayPosition::after_page(
+            position,
+            &events,
+            self.events.len() as i64,
+            limit,
+        );
+        Ok(crate::datastore::PositionedWatchReplayRead::Events(
+            crate::datastore::PositionedWatchReplay {
+                events,
+                next_position,
+            },
+        ))
+    }
 }
 
 #[async_trait::async_trait]
@@ -311,6 +357,53 @@ impl WatchReplaySource for MutableSignalCursorReplaySource {
                 .take(limit.get())
                 .cloned()
                 .collect(),
+        ))
+    }
+
+    async fn replay_after_checked(
+        &self,
+        position: crate::datastore::WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<WatchEvent>> {
+        self.calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((position.resource_version, limit.get()));
+        let events = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let positioned: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(index, event)| {
+                if position.event_id == 0 {
+                    event.resource_version().unwrap_or_default() > position.resource_version
+                } else {
+                    *index as i64 + 1 > position.event_id
+                }
+            })
+            .take(limit.get())
+            .map(|(index, event)| crate::datastore::PositionedWatchEvent {
+                position: crate::datastore::WatchReplayPosition {
+                    resource_version: event.resource_version().unwrap_or_default(),
+                    event_id: index as i64 + 1,
+                },
+                event: event.clone(),
+            })
+            .collect();
+        let high_water_event_id = events.len() as i64;
+        let next_position = crate::datastore::WatchReplayPosition::after_page(
+            position,
+            &positioned,
+            high_water_event_id,
+            limit,
+        );
+        Ok(crate::datastore::PositionedWatchReplayRead::Events(
+            crate::datastore::PositionedWatchReplay {
+                events: positioned,
+                next_position,
+            },
         ))
     }
 }
@@ -406,6 +499,122 @@ async fn signal_cursor_default_window_three_delivers_two_events_without_waiting_
     cursor.accept_event(12);
     assert_eq!(cursor.accepted_rv(), 12);
     assert_eq!(source.calls(), vec![(10, 3)]);
+}
+
+#[tokio::test]
+async fn signal_cursor_pages_every_same_revision_event_without_loss() {
+    for count in [1_usize, 3, 4, 100] {
+        let (tx, rx) = broadcast::channel(4);
+        let source = SignalCursorReplaySource::events(
+            (0..count)
+                .map(|index| signal_cursor_pod("default", &format!("pod-{index}"), 11))
+                .collect(),
+        );
+        let mut cursor = SignalWatchCursor::new(
+            rx,
+            source,
+            signal_cursor_topic(),
+            WatchDeliveryScope::Namespaced("default".to_string()),
+            10,
+            WindowPolicy::default_watch_delivery(),
+        );
+
+        tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+
+        let mut delivered = Vec::with_capacity(count);
+        for _ in 0..count {
+            let event = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "same-RV replay stalled after {} of {count}",
+                        delivered.len()
+                    )
+                })
+                .unwrap();
+            delivered.push(
+                event.object["metadata"]["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+            cursor.accept_event(11);
+        }
+        assert_eq!(delivered.len(), count, "same-RV fixture size {count}");
+    }
+}
+
+#[tokio::test]
+async fn signal_cursor_identity_includes_topic_for_same_name_and_revision() {
+    let (tx, rx) = broadcast::channel(4);
+    let pod = signal_cursor_pod("default", "shared", 11);
+    let config_map = WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "namespace": "default",
+            "name": "shared",
+            "resourceVersion": "11"
+        }
+    }));
+    let source = SignalCursorReplaySource::events(vec![pod, config_map]);
+    let config_map_topic = WatchTopic::new("v1", "ConfigMap");
+    let mut cursor = SignalWatchCursor::new_many(
+        rx,
+        source,
+        vec![signal_cursor_topic(), config_map_topic.clone()],
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    let first = cursor.next_event().await.unwrap();
+    cursor.accept_event(11);
+    let second = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
+        .await
+        .expect("same-name event from another topic must not be deduplicated")
+        .unwrap();
+
+    let kinds = [
+        first.object["kind"].as_str(),
+        second.object["kind"].as_str(),
+    ];
+    assert!(kinds.contains(&Some("Pod")));
+    assert!(kinds.contains(&Some("ConfigMap")));
+}
+
+#[tokio::test]
+async fn signal_cursor_lag_replays_late_lower_revision_without_its_signal() {
+    let (tx, rx) = broadcast::channel(2);
+    let source =
+        MutableSignalCursorReplaySource::new(vec![signal_cursor_pod("default", "first", 50)]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
+    let first = cursor.next_event().await.unwrap();
+    cursor.accept_event(first.resource_version().unwrap());
+
+    source.push(signal_cursor_pod("default", "late", 14));
+    // The only signal that identifies RV 14 is overwritten before recv. A
+    // lag recovery must use durable insertion position, not accepted RV.
+    tx.send(signal_cursor_signal(Some("default"), 14)).unwrap();
+    tx.send(signal_cursor_signal(Some("default"), 51)).unwrap();
+    tx.send(signal_cursor_signal(Some("default"), 52)).unwrap();
+
+    let late = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
+        .await
+        .expect("lag recovery must replay the late lower-RV durable row")
+        .unwrap();
+    assert_eq!(late.object["metadata"]["name"], "late");
+    assert_eq!(late.resource_version(), Some(14));
 }
 
 #[tokio::test]

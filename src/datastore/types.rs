@@ -498,6 +498,62 @@ pub enum WatchReplayRead<T = CatchUpResource> {
     Expired,
 }
 
+/// Lossless durable watch-log cursor. `event_id == 0` denotes an external
+/// Kubernetes resourceVersion boundary; once replay starts, `event_id` is the
+/// authoritative insertion/apply-order position and permits later-applied rows
+/// whose resourceVersion is lower than an already observed row.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WatchReplayPosition {
+    pub resource_version: i64,
+    pub event_id: i64,
+}
+
+impl WatchReplayPosition {
+    pub const fn from_resource_version(resource_version: i64) -> Self {
+        Self {
+            resource_version,
+            event_id: 0,
+        }
+    }
+
+    pub fn after_page<T>(
+        current: Self,
+        events: &[PositionedWatchEvent<T>],
+        high_water_event_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Self {
+        if events.len() == limit.get() {
+            return events.last().map_or(current, |event| event.position);
+        }
+        Self {
+            resource_version: events.last().map_or(current.resource_version, |event| {
+                event.position.resource_version
+            }),
+            event_id: high_water_event_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PositionedWatchEvent<T> {
+    pub position: WatchReplayPosition,
+    pub event: T,
+}
+
+#[derive(Clone, Debug)]
+pub struct PositionedWatchReplay<T> {
+    pub events: Vec<PositionedWatchEvent<T>>,
+    /// Position covered by the read snapshot. This advances even for an empty
+    /// matching page, anchoring the cursor before a later lower-RV row lands.
+    pub next_position: WatchReplayPosition,
+}
+
+#[derive(Clone, Debug)]
+pub enum PositionedWatchReplayRead<T> {
+    Events(PositionedWatchReplay<T>),
+    Expired,
+}
+
 impl CatchUpResource {
     pub fn added(resource: Resource) -> Self {
         Self {
