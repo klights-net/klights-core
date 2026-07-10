@@ -1,5 +1,16 @@
 use super::*;
 use serde_json::json;
+
+static LIST_RESOURCES_SNAPSHOT_PAUSE_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
+async fn list_resources_snapshot_pause_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    LIST_RESOURCES_SNAPSHOT_PAUSE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
+
 #[tokio::test]
 async fn test_mixed_watch_replay_orders_events_across_kinds() {
     let db = Datastore::new_in_memory().await.unwrap();
@@ -138,6 +149,7 @@ async fn test_live_watch_events_remain_monotonic_under_concurrent_creates() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_resources_response_rv_covers_items_when_mutation_races_with_selector_page() {
+    let _pause_guard = list_resources_snapshot_pause_test_guard().await;
     let db = Datastore::new_in_memory().await.unwrap();
 
     db.create_resource(
@@ -178,7 +190,9 @@ async fn list_resources_response_rv_covers_items_when_mutation_races_with_select
             .unwrap()
     });
 
-    pause.wait_for_hit().await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), pause.wait_for_hit())
+        .await
+        .expect("list_resources before-query pause was not reached");
     let raced = db
         .create_resource(
             "v1",
@@ -216,6 +230,7 @@ async fn list_resources_response_rv_covers_items_when_mutation_races_with_select
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_resources_response_rv_does_not_advance_past_concurrent_delete_snapshot() {
+    let _pause_guard = list_resources_snapshot_pause_test_guard().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let db_root = dir.path().join("state");
     let cluster_db_path = db_root.join("sqlite").join("cluster.db");
