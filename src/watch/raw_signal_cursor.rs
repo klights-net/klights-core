@@ -44,6 +44,10 @@ impl RawSignalWatchCursor {
         self.core.mark_delivered(rv);
     }
 
+    pub fn mark_delivered_for_key(&mut self, namespace: Option<String>, name: String, rv: i64) {
+        self.core.mark_delivered_for_key(namespace, name, rv);
+    }
+
     pub async fn prime_replay_or_expired(&mut self) -> Result<usize, WatchCursorError> {
         self.core.prime_replay_or_expired().await
     }

@@ -697,23 +697,10 @@ async fn list_cr_inner(
         let has_scope_filter = watch_ns.is_some() || has_selector;
 
         let stream = async_stream::stream! {
-            let mut initial_list_rv = requested_rv;
-            // Highest RV this watch has actually emitted for its scope. A scoped
-            // watch BOOKMARK must never advertise an RV beyond this, or client-go
-            // resuming from it skips still-undelivered in-scope events.
-            let mut last_delivered_scoped_rv = requested_rv;
-            let mut matched_selector_keys: std::collections::HashSet<(Option<String>, String)> =
-                std::collections::HashSet::new();
-
-            // rvs already emitted to the client as ADDED from the rv-less
-            // selector baseline list below; used to seed the cursor so the
-            // (intentionally low) live floor does not re-deliver them.
-            let mut baseline_delivered_rvs: Vec<i64> = Vec::new();
-            // Per-key low-rv exceptions for the current selector members of a
-            // resourceVersion>0 watch; seeds the cursor so a below-floor live
-            // transition (e.g. a replicated DELETED tombstone) still reaches the
-            // client. Mirrors `build_label_selector_watch_stream`.
-            let mut baseline_low_rv_allowlist: Vec<((Option<String>, String), i64)> = Vec::new();
+            let mut session_bootstrap = WatchSessionBootstrap::new(WatchSessionConfig {
+                requested_rv,
+                has_selector,
+            });
 
             // Read-freshness: a follower can receive a WATCH whose resume RV was
             // minted on the leader; serving the catch-up below against
@@ -796,17 +783,13 @@ async fn list_cr_inner(
                                         watch_ns.as_deref(),
                                         parsed_label_selector.as_ref(),
                                     ) && event.matches_field_selector(field_selector.as_deref());
-                                    let Some(event) = apply_selector_transition_event(
-                                        event,
-                                        matches_selector,
-                                        &mut matched_selector_keys,
-                                    ) else {
+                                    let Some(event) = session_bootstrap
+                                        .classify_event(event, matches_selector)
+                                        .into_deliverable()
+                                    else {
                                         continue;
                                     };
-                                    if let Some(delivered_rv) = event.resource_version() {
-                                        last_delivered_scoped_rv =
-                                            last_delivered_scoped_rv.max(delivered_rv);
-                                    }
+                                    session_bootstrap.observe_delivered_event(&event);
                                     let mut json = serde_json::to_vec(&event).unwrap_or_default();
                                     json.push(b'\n');
                                     yield Ok::<_, std::convert::Infallible>(json);
@@ -823,7 +806,7 @@ async fn list_cr_inner(
                             }
                         }
                         let snap = snapshot_rv.max(last_rv);
-                        initial_list_rv = initial_list_rv.max(snap);
+                        session_bootstrap.observe_catch_up_frontier(snap);
                         send_initial_snapshot_rv = send_initial_snapshot_rv.max(snap);
                     }
                 } else {
@@ -838,23 +821,19 @@ async fn list_cr_inner(
                                 watch_ns.as_deref(),
                                 parsed_label_selector.as_ref(),
                             ) && event.matches_field_selector(field_selector.as_deref());
-                            let Some(event) = apply_selector_transition_event(
-                                event,
-                                matches_selector,
-                                &mut matched_selector_keys,
-                            ) else {
+                            let Some(event) = session_bootstrap
+                                .classify_event(event, matches_selector)
+                                .into_deliverable()
+                            else {
                                 continue;
                             };
-                            if let Some(delivered_rv) = event.resource_version() {
-                                last_delivered_scoped_rv =
-                                    last_delivered_scoped_rv.max(delivered_rv);
-                            }
+                            session_bootstrap.observe_delivered_event(&event);
                             let mut json = serde_json::to_vec(&event).unwrap_or_default();
                             json.push(b'\n');
                             yield Ok::<_, std::convert::Infallible>(json);
                         }
                         let snap = last_rv.max(list.resource_version);
-                        initial_list_rv = initial_list_rv.max(snap);
+                        session_bootstrap.observe_catch_up_frontier(snap);
                         send_initial_snapshot_rv = send_initial_snapshot_rv.max(snap);
                     }
                 }
@@ -863,8 +842,7 @@ async fn list_cr_inner(
                 // learns the RV to resume from — required even when the initial
                 // list was empty/filtered. The built-in path emits this; the CR
                 // builder previously omitted it entirely.
-                last_delivered_scoped_rv = last_delivered_scoped_rv.max(send_initial_snapshot_rv);
-                initial_list_rv = initial_list_rv.max(send_initial_snapshot_rv);
+                session_bootstrap.observe_snapshot_rv(send_initial_snapshot_rv);
                 let bookmark =
                     WatchEvent::bookmark_initial_events_end(send_initial_snapshot_rv, &av, &kind);
                 yield Ok::<_, std::convert::Infallible>(
@@ -930,17 +908,20 @@ async fn list_cr_inner(
                             watch_ns.as_deref(),
                             parsed_label_selector.as_ref(),
                         ) && event.matches_field_selector(field_selector.as_deref());
-                        let Some(event) = apply_selector_transition_event(
-                            event,
-                            matches_selector,
-                            &mut matched_selector_keys,
-                        ) else {
+                        let Some(key) = crate::api::watch_session::watch_event_key(&event) else {
                             continue;
                         };
-                        if let Some(delivered_rv) = event.resource_version() {
-                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(delivered_rv);
-                        }
-                        baseline_delivered_rvs.push(rv);
+                        let Some(event) = session_bootstrap
+                            .classify_event(event, matches_selector)
+                            .into_deliverable()
+                        else {
+                            continue;
+                        };
+                        session_bootstrap.record_baseline_member(
+                            key,
+                            rv,
+                            BaselineDisposition::Emitted,
+                        );
                         let mut json = serde_json::to_vec(&event).unwrap_or_default();
                         json.push(b'\n');
                         yield Ok::<_, std::convert::Infallible>(json);
@@ -976,7 +957,7 @@ async fn list_cr_inner(
                         if resource.resource_version <= catch_up_resume_floor {
                             continue;
                         }
-                        initial_list_rv = initial_list_rv.max(resource.resource_version);
+                        session_bootstrap.observe_catch_up_frontier(resource.resource_version);
                         let event = CatchUpResource {
                             resource: catchup.resource,
                             event_type: catchup.event_type,
@@ -1009,16 +990,13 @@ async fn list_cr_inner(
                             watch_ns.as_deref(),
                             parsed_label_selector.as_ref(),
                         ) && event.matches_field_selector(field_selector.as_deref());
-                        let Some(event) = apply_selector_transition_event(
-                            event,
-                            matches_selector,
-                            &mut matched_selector_keys,
-                        ) else {
+                        let Some(event) = session_bootstrap
+                            .classify_event(event, matches_selector)
+                            .into_deliverable()
+                        else {
                             continue;
                         };
-                        if let Some(delivered_rv) = event.resource_version() {
-                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(delivered_rv);
-                        }
+                        session_bootstrap.observe_delivered_event(&event);
                         let mut json = serde_json::to_vec(&event).unwrap_or_default();
                         json.push(b'\n');
                         yield Ok::<_, std::convert::Infallible>(json);
@@ -1073,8 +1051,11 @@ async fn list_cr_inner(
                                 continue;
                             }
                             let key = crate::api::watch_stream::resource_to_seen_key(&resource);
-                            matched_selector_keys.insert(key.clone());
-                            baseline_low_rv_allowlist.push((key, resource.resource_version));
+                            session_bootstrap.record_baseline_member(
+                                key,
+                                resource.resource_version,
+                                BaselineDisposition::Retained,
+                            );
                         }
                     }
                 }
@@ -1115,27 +1096,14 @@ async fn list_cr_inner(
             } else {
                 crate::watch::WatchDeliveryScope::NamespacedAll
             };
-            let mut cursor = crate::watch::SignalWatchCursor::new_many(
+            let mut session = session_bootstrap.establish_many(
                 signal_rx,
                 replay_source,
                 watch_topics,
                 delivery_scope,
-                crate::api::watch_stream::selector_watch_cursor_floor(
-                    has_selector,
-                    requested_rv,
-                    initial_list_rv,
-                    last_delivered_scoped_rv,
-                ),
-                crate::watch::WindowPolicy::default_watch_delivery(),
             );
-            for rv in baseline_delivered_rvs {
-                cursor.mark_delivered(rv);
-            }
-            for ((namespace, name), after_rv) in baseline_low_rv_allowlist {
-                cursor.allow_low_rv_for_key(namespace, name, after_rv);
-            }
             if requested_rv > 0 || send_initial_events {
-                match cursor.prime_replay_or_expired().await {
+                match session.prime_replay_or_expired().await {
                     Ok(_) => {}
                     Err(WatchCursorError::Expired) => {
                         yield Ok::<_, std::convert::Infallible>(
@@ -1178,7 +1146,7 @@ async fn list_cr_inner(
                     Some(()) = recv_watch_timeout(&mut timeout_tick) => {
                         break;
                     }
-                    result = cursor.next_event() => {
+                    result = session.next_event() => {
                         let event = match result {
                             Ok(event) => event,
                             Err(WatchCursorError::Replay(err)) => {
@@ -1229,27 +1197,20 @@ async fn list_cr_inner(
                             watch_ns.as_deref(),
                             parsed_label_selector.as_ref(),
                         ) && event.matches_field_selector(field_selector.as_deref());
-                        let event_rv = event.resource_version();
-                        let filtered_key = crate::api::watch_stream::watch_event_key(&event);
-                        let Some(event) = apply_selector_transition_event(
-                            event,
-                            matches_selector,
-                            &mut matched_selector_keys,
-                        ) else {
-                            if let Some(rv) = event_rv
-                                && let Some((namespace, name)) = filtered_key
-                            {
-                                cursor.mark_filtered_for_key(namespace, name, rv);
+                        let event = match session.classify_event(event, matches_selector) {
+                            WatchSessionEvent::Deliver(event) => event,
+                            WatchSessionEvent::Filtered { key, rv } => {
+                                session.accept_filtered(key, rv);
+                                continue;
                             }
-                            continue;
+                            WatchSessionEvent::Ignored => continue,
                         };
                         let delivered_rv = event.resource_version();
                         let mut json = serde_json::to_vec(&event).unwrap_or_default();
                         json.push(b'\n');
                         yield Ok::<_, std::convert::Infallible>(json);
                         if let Some(delivered_rv) = delivered_rv {
-                            cursor.accept_event(delivered_rv);
-                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(delivered_rv);
+                            session.accept_delivered_rv(delivered_rv);
                         }
                     }
                     Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
@@ -1263,8 +1224,8 @@ async fn list_cr_inner(
                                 field_selector: field_selector.as_deref(),
                                 requested_rv,
                                 has_scope_filter,
-                                cursor_high_water_rv: cursor.accepted_rv(),
-                                last_delivered_scoped_rv,
+                                cursor_high_water_rv: session.accepted_rv(),
+                                last_delivered_scoped_rv: session.last_delivered_scoped_rv(),
                             },
                         )
                         .await;

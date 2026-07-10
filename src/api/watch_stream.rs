@@ -1,15 +1,18 @@
 use crate::api::watch_event_to_table;
+use crate::api::watch_session::{
+    BaselineDisposition, WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent,
+};
+pub(crate) use crate::api::watch_session::{resource_to_seen_key, watch_event_key};
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{CatchUpResource, RawWatchEvent};
 use crate::datastore::{DatastoreHandle, WatchTarget};
 use crate::label_selector::LabelSelector;
 use crate::watch::{
-    EventType, RawSignalWatchCursor, SignalWatchCursor, WatchContentType, WatchCursorError,
-    WatchDeliveryScope, WatchEvent, WatchSignal, WatchTopic, WindowPolicy,
+    EventType, RawSignalWatchCursor, WatchContentType, WatchCursorError, WatchDeliveryScope,
+    WatchEvent, WatchSignal, WatchTopic,
 };
 use axum::body::Body;
 use serde_json::Value;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -98,93 +101,6 @@ pub fn object_matches_field_selector(object: &Value, field_selector: Option<&str
     crate::watch::value_matches_field_selector(object, field_selector)
 }
 
-pub fn watch_event_key(event: &WatchEvent) -> Option<(Option<String>, String)> {
-    let name = event
-        .object
-        .pointer("/metadata/name")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)?;
-    let namespace = event
-        .object
-        .pointer("/metadata/namespace")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string);
-    Some((namespace, name))
-}
-
-/// Extract the membership key for a resource returned by `list_resources`,
-/// using the JSON metadata as the source of truth.
-///
-/// The live broadcast path identifies events by `(metadata.namespace,
-/// metadata.name)` extracted from the JSON object (see `watch_event_key`).
-/// The baseline membership set must use the SAME extraction or cluster-scoped
-/// kinds that the storage layer mis-classifies as namespaced (and back-fills
-/// `Resource.namespace = Some("default")`) end up with a key the live event
-/// can never match — which silently rewrites every MODIFIED into ADDED and
-/// breaks K8s "API operations" conformance for those kinds.
-pub fn resource_to_seen_key(resource: &crate::datastore::Resource) -> (Option<String>, String) {
-    let namespace = resource
-        .data
-        .pointer("/metadata/namespace")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string);
-    (namespace, resource.name.clone())
-}
-
-pub fn apply_selector_transition_event(
-    mut event: WatchEvent,
-    matches_selector: bool,
-    matched_keys: &mut HashSet<(Option<String>, String)>,
-) -> Option<WatchEvent> {
-    if event.event_type == crate::watch::EventType::Bookmark {
-        return Some(event);
-    }
-    let key = watch_event_key(&event)?;
-    // Helper: rewrite `event.event_type` AND invalidate any pre-encoded
-    // payload. The broadcaster stamps the in-flight event_type into
-    // `encoded_payload` at publish time. `serialize_watch_event_line`
-    // short-circuits to those cached bytes when present, so any in-memory
-    // mutation here without invalidation would land on the wire with the
-    // pre-transition type — exactly the regression behind sonobuoy
-    // `should observe an object deletion if it stops meeting the
-    // requirements of the selector`.
-    fn rewrite_event_type(event: &mut WatchEvent, new_type: crate::watch::EventType) {
-        if event.event_type != new_type {
-            event.event_type = new_type;
-            event.encoded_payload = None;
-        }
-    }
-    match event.event_type {
-        crate::watch::EventType::Deleted => {
-            if matched_keys.remove(&key) || matches_selector {
-                Some(event)
-            } else {
-                None
-            }
-        }
-        crate::watch::EventType::Added | crate::watch::EventType::Modified => {
-            if matches_selector {
-                if matched_keys.insert(key) {
-                    rewrite_event_type(&mut event, crate::watch::EventType::Added);
-                }
-                Some(event)
-            } else if matched_keys.remove(&key) {
-                rewrite_event_type(&mut event, crate::watch::EventType::Deleted);
-                Some(event)
-            } else {
-                None
-            }
-        }
-        _ => {
-            if matches_selector {
-                Some(event)
-            } else {
-                None
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 pub struct WatchEncodeReuseContext<'a> {
     pub event: &'a WatchEvent,
@@ -265,19 +181,6 @@ fn serialize_watch_catch_up_failure_status_line() -> Vec<u8> {
         "Expired",
         "too old resource version: unable to replay watch catch-up; relist required",
     )
-}
-
-pub(crate) fn selector_watch_cursor_floor(
-    has_selector: bool,
-    requested_rv: i64,
-    catch_up_frontier_rv: i64,
-    delivered_scoped_rv: i64,
-) -> i64 {
-    if has_selector {
-        requested_rv.max(delivered_scoped_rv)
-    } else {
-        requested_rv.max(catch_up_frontier_rv)
-    }
 }
 
 pub async fn spawn_bookmark_tick_stream(
@@ -636,8 +539,10 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         // from a post-subscribe `current_rv` read inside the stream; that old
         // high-watermark path can skip an event already buffered by the
         // receiver during watch establishment.
-        let mut initial_list_rv = requested_rv;
-        let mut last_delivered_scoped_rv = requested_rv;
+        let mut session_bootstrap = WatchSessionBootstrap::new(WatchSessionConfig {
+            requested_rv,
+            has_selector,
+        });
 
         if !use_raw_selectorless_json && !send_initial_events && requested_rv > 0 {
             // If the resume point predates the retained watch-event window, the
@@ -707,7 +612,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                     }
                     continue;
                 }
-                initial_list_rv = initial_list_rv.max(resource.resource_version);
+                session_bootstrap.observe_catch_up_frontier(resource.resource_version);
                 let event = CatchUpResource {
                     resource: catchup.resource,
                     event_type: catchup.event_type,
@@ -721,7 +626,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                     continue;
                 }
                 if let Some(rv) = event.resource_version() {
-                    last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
+                    session_bootstrap.observe_delivered_rv(rv);
                 }
                 yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
                     event,
@@ -736,12 +641,6 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         // If a visible resource leaves selector view -> send DELETED.
         // Keyed by (namespace, name) to avoid collisions across namespaces
         // in cluster-wide watches.
-        let mut seen_resources: HashSet<(Option<String>, String)> = HashSet::new();
-        // rvs already emitted to the client as ADDED from the baseline list
-        // below; used to seed the cursor so the (intentionally lower) live
-        // floor does not re-deliver them.
-        let mut baseline_delivered_rvs: Vec<i64> = Vec::new();
-        let mut baseline_low_rv_allowlist: Vec<((Option<String>, String), i64)> = Vec::new();
 
         // Label-selector watches need a current membership baseline. For
         // resourceVersion-less selector watches, Kubernetes-compatible clients
@@ -757,11 +656,12 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 let baseline_items = baseline.items;
                 for resource in baseline_items {
                     let key = resource_to_seen_key(&resource);
-                    seen_resources.insert(key.clone());
                     if requested_rv <= 0 {
-                        baseline_delivered_rvs.push(resource.resource_version);
-                        last_delivered_scoped_rv =
-                            last_delivered_scoped_rv.max(resource.resource_version);
+                        session_bootstrap.record_baseline_member(
+                            key,
+                            resource.resource_version,
+                            BaselineDisposition::Emitted,
+                        );
                         let event = CatchUpResource::added(resource).into_watch_event();
                         yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
                             event,
@@ -769,7 +669,11 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                             table_format,
                         ));
                     } else {
-                        baseline_low_rv_allowlist.push((key, resource.resource_version));
+                        session_bootstrap.record_baseline_member(
+                            key,
+                            resource.resource_version,
+                            BaselineDisposition::Retained,
+                        );
                     }
                 }
                 // For rv-less selector watches, keep the live cursor floor at
@@ -794,11 +698,11 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
 
                     last_rv = last_rv.max(resource.resource_version);
                     if has_selector {
-                        seen_resources.insert(resource_to_seen_key(&resource));
+                        session_bootstrap.record_member(resource_to_seen_key(&resource));
                     }
                     let event = CatchUpResource::added(resource).into_watch_event();
                     if let Some(rv) = event.resource_version() {
-                        last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
+                        session_bootstrap.observe_delivered_rv(rv);
                     }
                     yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
                         event,
@@ -821,8 +725,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 last_rv = last_rv.max(list.resource_version);
             }
 
-            initial_list_rv = last_rv;
-            last_delivered_scoped_rv = last_delivered_scoped_rv.max(last_rv);
+            session_bootstrap.observe_snapshot_rv(last_rv);
 
             let bookmark_event =
                 WatchEvent::bookmark_initial_events_end(last_rv, &api_version, &kind);
@@ -857,11 +760,9 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 vec![replay_target.clone()],
                 topic.clone(),
                 delivery_scope.clone(),
-                initial_list_rv.max(requested_rv),
+                session_bootstrap.cursor_floor(),
             );
-            for rv in baseline_delivered_rvs {
-                cursor.mark_delivered(rv);
-            }
+            session_bootstrap.seed_raw_cursor(&mut cursor);
             if requested_rv > 0 || send_initial_events {
                 match cursor.prime_replay_or_expired().await {
                     Ok(_) => {}
@@ -926,7 +827,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         let rv = event.resource_version;
                         yield Ok::<_, std::convert::Infallible>(serialize_raw_watch_event_line(&event));
                         cursor.accept_event(rv);
-                        last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
+                        session_bootstrap.observe_delivered_rv(rv);
                     }
                     Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
                         let decision = resolve_periodic_bookmark_decision(PeriodicBookmarkContext {
@@ -939,7 +840,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                             requested_rv,
                             has_scope_filter,
                             cursor_high_water_rv: cursor.accepted_rv(),
-                            last_delivered_scoped_rv,
+                            last_delivered_scoped_rv: session_bootstrap.last_delivered_scoped_rv(),
                         })
                         .await;
                         match decision {
@@ -965,27 +866,14 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             }
             return;
         }
-        let mut cursor = SignalWatchCursor::new(
+        let mut session = session_bootstrap.establish_many(
             signal_rx,
             replay_source,
-            topic,
+            vec![topic],
             delivery_scope,
-            selector_watch_cursor_floor(
-                has_selector,
-                requested_rv,
-                initial_list_rv,
-                last_delivered_scoped_rv,
-            ),
-            WindowPolicy::default_watch_delivery(),
         );
-        for rv in baseline_delivered_rvs {
-            cursor.mark_delivered(rv);
-        }
-        for ((namespace, name), after_rv) in baseline_low_rv_allowlist {
-            cursor.allow_low_rv_for_key(namespace, name, after_rv);
-        }
         if requested_rv > 0 || send_initial_events {
-            match cursor.prime_replay_or_expired().await {
+            match session.prime_replay_or_expired().await {
                 Ok(_) => {}
                 Err(WatchCursorError::Expired) => {
                     // Resume point predates the retained watch-event window;
@@ -1023,7 +911,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 Some(()) = recv_watch_timeout(&mut timeout_tick) => {
                     break;
                 }
-                result = cursor.next_event() => {
+                result = session.next_event() => {
                     let event = match result {
                         Ok(event) => event,
                         Err(WatchCursorError::Replay(err)) => {
@@ -1051,12 +939,12 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         }
                     };
 
+                    let matches = event.matches_filter_parsed(&kind, watch_namespace.as_deref(), parsed_label_selector.as_ref())
+                        && event.matches_field_selector(field_selector.as_deref());
                     if has_selector {
-                        let matches = event.matches_filter_parsed(&kind, watch_namespace.as_deref(), parsed_label_selector.as_ref())
-                            && event.matches_field_selector(field_selector.as_deref());
                         // Canary: a live MODIFIED for an object the watcher
                         // believes it has never seen is rewritten to ADDED
-                        // (object absent from `seen_resources`); a MODIFIED that
+                        // (object absent from the session membership); a MODIFIED that
                         // no longer matches is rewritten to a synthetic DELETED.
                         // Both silently swallow the MODIFIED a client may be
                         // waiting for — the exact signature of the flaky
@@ -1076,59 +964,49 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         )
                         .then(|| watch_event_key(&event))
                         .flatten();
-                        let event_rv = event.resource_version();
-                        let filtered_key = watch_event_key(&event);
-                        if let Some(transitioned) = apply_selector_transition_event(
-                            event,
-                            matches,
-                            &mut seen_resources,
-                        ) {
-                            if let Some(rv) = transitioned.resource_version() {
-                                last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
+                        match session.classify_event(event, matches) {
+                            WatchSessionEvent::Deliver(transitioned) => {
+                                if pre_transition_type == EventType::Modified
+                                    && transitioned.event_type != EventType::Modified
+                                    && let Some((ns, name)) = transition_key.as_ref()
+                                {
+                                    tracing::warn!(
+                                        target: "klights::watch_diag",
+                                        kind = %kind,
+                                        namespace = ns.as_deref().unwrap_or(""),
+                                        name = %name,
+                                        rewritten_to = %transitioned.event_type,
+                                        matches_selector = matches,
+                                        rv = transitioned.resource_version().unwrap_or(0),
+                                        "selector watch rewrote a live MODIFIED (client awaiting MODIFIED may miss it)"
+                                    );
+                                }
+                                let rv = transitioned.resource_version();
+                                let line = serialize_watch_event_line(transitioned, &kind, table_format);
+                                yield Ok::<_, std::convert::Infallible>(line);
+                                if let Some(rv) = rv {
+                                    session.accept_delivered_rv(rv);
+                                }
                             }
-                            if pre_transition_type == EventType::Modified
-                                && transitioned.event_type != EventType::Modified
-                                && let Some((ns, name)) = transition_key.as_ref()
-                            {
-                                tracing::warn!(
-                                    target: "klights::watch_diag",
-                                    kind = %kind,
-                                    namespace = ns.as_deref().unwrap_or(""),
-                                    name = %name,
-                                    rewritten_to = %transitioned.event_type,
-                                    matches_selector = matches,
-                                    rv = transitioned.resource_version().unwrap_or(0),
-                                    "selector watch rewrote a live MODIFIED (client awaiting MODIFIED may miss it)"
-                                );
+                            WatchSessionEvent::Filtered { key, rv } => {
+                                session.accept_filtered(key, rv);
                             }
-                            let rv = transitioned.resource_version();
-                            let line = serialize_watch_event_line(
-                                transitioned,
-                                &kind,
-                                table_format,
-                            );
-                            yield Ok::<_, std::convert::Infallible>(line);
-                            if let Some(rv) = rv {
-                                cursor.accept_event(rv);
-                                last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
-                            }
-                        } else if let Some(rv) = event_rv
-                            && let Some((namespace, name)) = filtered_key
-                        {
-                            cursor.mark_filtered_for_key(namespace, name, rv);
+                            WatchSessionEvent::Ignored => {}
                         }
-                    } else if event.matches_filter_parsed(&kind, watch_namespace.as_deref(), parsed_label_selector.as_ref())
-                        && event.matches_field_selector(field_selector.as_deref()) {
-                        let rv = event.resource_version();
-                        let line = serialize_watch_event_line(
-                            event,
-                            &kind,
-                            table_format,
-                        );
-                        yield Ok::<_, std::convert::Infallible>(line);
-                        if let Some(rv) = rv {
-                            cursor.accept_event(rv);
-                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
+                    } else {
+                        match session.classify_event(event, matches) {
+                            WatchSessionEvent::Deliver(event) => {
+                                let rv = event.resource_version();
+                                let line = serialize_watch_event_line(event, &kind, table_format);
+                                yield Ok::<_, std::convert::Infallible>(line);
+                                if let Some(rv) = rv {
+                                    session.accept_delivered_rv(rv);
+                                }
+                            }
+                            WatchSessionEvent::Filtered { key, rv } => {
+                                session.accept_filtered(key, rv);
+                            }
+                            WatchSessionEvent::Ignored => {}
                         }
                     }
                 }
@@ -1142,8 +1020,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         field_selector: field_selector.as_deref(),
                         requested_rv,
                         has_scope_filter,
-                        cursor_high_water_rv: cursor.accepted_rv(),
-                        last_delivered_scoped_rv,
+                        cursor_high_water_rv: session.accepted_rv(),
+                        last_delivered_scoped_rv: session.last_delivered_scoped_rv(),
                     })
                     .await;
                     match decision {
@@ -1175,7 +1053,9 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::watch_session::apply_selector_transition_event;
     use crate::task_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     #[test]
@@ -1224,25 +1104,6 @@ mod tests {
         }
         let watch_event = event.into_watch_event();
         assert_eq!(watch_event.event_type, EventType::Added);
-    }
-
-    #[test]
-    fn selector_watch_cursor_floor_uses_delivered_scoped_rv() {
-        assert_eq!(
-            selector_watch_cursor_floor(true, 10, 50, 14),
-            14,
-            "selector watches must not let unrelated catch-up churn inflate the live replay floor"
-        );
-        assert_eq!(
-            selector_watch_cursor_floor(true, 10, 50, 0),
-            10,
-            "when no scoped event was delivered, selector watches resume from the client RV"
-        );
-        assert_eq!(
-            selector_watch_cursor_floor(false, 10, 50, 14),
-            50,
-            "selector-free watches keep the complete catch-up frontier"
-        );
     }
 
     #[test]

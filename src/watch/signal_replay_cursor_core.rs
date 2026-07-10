@@ -119,6 +119,19 @@ where
         self.record_non_advancing_seen_rv(rv);
     }
 
+    pub fn mark_delivered_for_key(&mut self, namespace: Option<String>, name: String, rv: i64) {
+        if rv <= 0 {
+            return;
+        }
+        self.record_non_advancing_seen_event(ReplayEventMarker {
+            rv,
+            topic: (self.topics.len() == 1)
+                .then(|| self.topics.iter().next().cloned())
+                .flatten(),
+            key: Some((namespace, name)),
+        });
+    }
+
     pub fn mark_filtered_for_key(&mut self, namespace: Option<String>, name: String, rv: i64) {
         if rv <= 0 {
             return;

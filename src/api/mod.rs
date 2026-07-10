@@ -39,6 +39,7 @@ mod state;
 #[cfg(test)]
 pub mod test_support;
 mod validation;
+mod watch_session;
 mod watch_stream;
 
 #[cfg(test)]
@@ -149,11 +150,13 @@ pub use validation::{
     apply_schema_defaults_pub, validate_against_schema, validate_metadata_fields,
     validate_webhook_configuration,
 };
+use watch_session::{
+    BaselineDisposition, WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent,
+};
 use watch_stream::{
-    LabelSelectorWatchStreamRequest, WatchCatchUpMode, apply_selector_transition_event,
-    build_label_selector_watch_stream, maybe_spawn_bookmark_tick_stream,
-    maybe_spawn_watch_timeout_stream, object_matches_field_selector, recv_bookmark_tick,
-    recv_watch_timeout,
+    LabelSelectorWatchStreamRequest, WatchCatchUpMode, build_label_selector_watch_stream,
+    maybe_spawn_bookmark_tick_stream, maybe_spawn_watch_timeout_stream,
+    object_matches_field_selector, recv_bookmark_tick, recv_watch_timeout,
 };
 
 #[cfg(test)]
