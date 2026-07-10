@@ -214,12 +214,50 @@ pub fn service_ct_guard_tuples(services: &[ServiceSpec]) -> Vec<ServiceCtTuple> 
     tuples
 }
 
+/// Failure-safe guard generations for a Service DNAT replacement.
+///
+/// The staged generation accepts tuples referenced by either the currently
+/// installed or desired DNAT rules. Once the DNAT generation has switched,
+/// the finalized generation removes tuples that are no longer active.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceCtGuardTransition {
+    pub staged: Vec<ServiceCtTuple>,
+    pub finalized: Vec<ServiceCtTuple>,
+}
+
+pub fn service_ct_guard_transition(
+    previous: &[ServiceSpec],
+    desired: &[ServiceSpec],
+) -> ServiceCtGuardTransition {
+    let mut staged = service_ct_guard_tuples(previous);
+    let finalized = service_ct_guard_tuples(desired);
+    staged.extend(finalized.iter().copied());
+    staged.sort();
+    staged.dedup();
+    ServiceCtGuardTransition { staged, finalized }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct PortSpecKey {
     protocol: Protocol,
     service_port: u16,
     target_port: u16,
     node_port: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ServicePortKey {
+    protocol: Protocol,
+    service_port: u16,
+}
+
+impl From<&PortSpec> for ServicePortKey {
+    fn from(port: &PortSpec) -> Self {
+        Self {
+            protocol: port.protocol,
+            service_port: port.service_port,
+        }
+    }
 }
 
 impl From<&PortSpec> for PortSpecKey {
@@ -252,7 +290,11 @@ fn normalize_service_ports(mut spec: ServiceSpec) -> ServiceSpec {
     spec
 }
 
-pub(super) fn select_service_spec_with_fullest_endpoints(
+/// Select the authoritative endpoint source independently for each Service
+/// port. An EndpointSlice declaration, including an observed empty one, owns
+/// that protocol/port. Legacy Endpoints only fills ports not represented by
+/// the EndpointSlice snapshot.
+pub(super) fn select_authoritative_service_spec(
     endpointslice_spec: Option<ServiceSpec>,
     legacy_endpoints_spec: Option<ServiceSpec>,
 ) -> Option<ServiceSpec> {
@@ -260,20 +302,21 @@ pub(super) fn select_service_spec_with_fullest_endpoints(
         (Some(slice), Some(legacy)) => {
             let mut slice = normalize_service_ports(slice);
             let legacy = normalize_service_ports(legacy);
+            let slice_port_keys = slice
+                .ports
+                .iter()
+                .map(ServicePortKey::from)
+                .collect::<std::collections::BTreeSet<_>>();
             let mut ports_by_key = std::collections::BTreeMap::<PortSpecKey, PortSpec>::new();
             for port in slice.ports.drain(..) {
                 ports_by_key.insert(PortSpecKey::from(&port), port);
             }
             for port in legacy.ports {
+                if slice_port_keys.contains(&ServicePortKey::from(&port)) {
+                    continue;
+                }
                 let key = PortSpecKey::from(&port);
-                ports_by_key
-                    .entry(key)
-                    .and_modify(|existing| {
-                        if port.endpoints.len() > existing.endpoints.len() {
-                            *existing = port.clone();
-                        }
-                    })
-                    .or_insert(port);
+                ports_by_key.insert(key, port);
             }
             slice.ports = ports_by_key.into_values().collect();
             Some(slice)
@@ -403,10 +446,6 @@ impl ServiceSpec {
                 .filter_map(|s| s.parse::<Ipv4Addr>().ok())
                 .filter(|ip| !ip.is_unspecified())
                 .collect();
-            if ready_ips.is_empty() {
-                continue;
-            }
-
             for slice_port in slice_ports {
                 if let Some(p) = port_spec_from_endpointslice(slice_port, svc_ports, &ready_ips) {
                     ports.push(p);

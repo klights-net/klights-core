@@ -14,7 +14,7 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
-use super::service_rules::{ServiceSpec, select_service_spec_with_fullest_endpoints};
+use super::service_rules::{ServiceSpec, select_authoritative_service_spec};
 
 /// Per-Service inventory entry. `endpoint_slices` is keyed by EndpointSlice
 /// name so updates and deletes are O(1).
@@ -235,10 +235,7 @@ impl ServiceRouteInventory {
                 .endpoints
                 .as_ref()
                 .and_then(|eps| ServiceSpec::from_service_and_endpoints(service, Some(eps)));
-            let spec = select_service_spec_with_fullest_endpoints(
-                endpointslice_spec,
-                legacy_endpoints_spec,
-            );
+            let spec = select_authoritative_service_spec(endpointslice_spec, legacy_endpoints_spec);
             if let Some(spec) = spec {
                 specs.push(spec);
             }
@@ -373,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn route_inventory_prefers_fuller_legacy_endpoints_over_partial_slice_snapshot() {
+    fn route_inventory_prefers_observed_slice_over_larger_legacy_snapshot() {
         let mut inv = ServiceRouteInventory::new();
 
         assert_eq!(
@@ -406,11 +403,38 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(
             specs[0].ports[0].endpoints,
-            vec![
-                "10.50.0.20".parse::<std::net::Ipv4Addr>().unwrap(),
-                "10.50.0.21".parse::<std::net::Ipv4Addr>().unwrap()
-            ],
-            "a partial EndpointSlice watch snapshot must not shadow the fuller legacy Endpoints view"
+            vec!["10.50.0.30".parse::<std::net::Ipv4Addr>().unwrap()],
+            "an observed EndpointSlice is authoritative over stale legacy Endpoints cardinality"
+        );
+    }
+
+    #[test]
+    fn route_inventory_observed_empty_slice_does_not_revive_stale_legacy_endpoint() {
+        let mut inv = ServiceRouteInventory::new();
+        inv.apply_service_event("kube-system", "kube-dns", 1, false, Some(dns_service()));
+        inv.apply_endpoints_event(
+            "kube-system",
+            "kube-dns",
+            2,
+            false,
+            Some(dns_endpoints("10.50.0.20")),
+        );
+        let mut empty_slice = dns_slice("kube-dns-1", "10.50.0.30");
+        empty_slice["endpoints"] = json!([]);
+        inv.apply_endpoint_slice_event(
+            "kube-system",
+            "kube-dns",
+            "kube-dns-1",
+            3,
+            false,
+            Some(empty_slice),
+        );
+
+        let specs = inv.to_specs();
+        assert_eq!(specs.len(), 1);
+        assert!(
+            specs[0].ports.iter().all(|port| port.endpoints.is_empty()),
+            "observed empty EndpointSlice state must suppress stale legacy routing"
         );
     }
 

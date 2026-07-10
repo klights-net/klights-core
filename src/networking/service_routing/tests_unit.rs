@@ -549,6 +549,53 @@ fn test_service_ct_guard_tuples_remove_dropped_udp_port() {
 }
 
 #[test]
+fn service_ct_guard_transition_keeps_old_and_new_tuples_until_dnat_switches() {
+    let cluster_ip = Ipv4Addr::new(10, 43, 128, 12);
+    let endpoint = Ipv4Addr::new(10, 43, 0, 20);
+    let service = |protocol| ServiceSpec {
+        cluster_ip,
+        ports: vec![PortSpec {
+            service_port: 80,
+            target_port: 80,
+            node_port: None,
+            protocol,
+            endpoints: vec![endpoint],
+        }],
+        session_affinity: SessionAffinity::None,
+    };
+    let previous = vec![service(Protocol::Udp)];
+    let desired = vec![service(Protocol::Tcp)];
+
+    let transition = service_ct_guard_transition(&previous, &desired);
+
+    assert_eq!(
+        transition.staged,
+        vec![
+            ServiceCtTuple {
+                cluster_ip,
+                protocol: Protocol::Tcp,
+                service_port: 80,
+            },
+            ServiceCtTuple {
+                cluster_ip,
+                protocol: Protocol::Udp,
+                service_port: 80,
+            },
+        ],
+        "the pre-DNAT guard must accept the union so either kernel generation remains safe"
+    );
+    assert_eq!(
+        transition.finalized,
+        vec![ServiceCtTuple {
+            cluster_ip,
+            protocol: Protocol::Tcp,
+            service_port: 80,
+        }],
+        "the post-DNAT guard must remove tuples absent from the desired generation"
+    );
+}
+
+#[test]
 fn test_service_ct_guard_scope_ignores_other_namespace_bridge() {
     assert!(
         service_ct_guard_applies_to_forward_packet(
@@ -1151,7 +1198,7 @@ async fn service_specs_from_api_uses_bounded_bulk_fresh_inventory() {
 }
 
 #[tokio::test]
-async fn service_specs_from_api_uses_legacy_endpoints_when_endpointslice_snapshot_is_partial() {
+async fn service_specs_from_api_prefers_observed_endpointslice_state_over_larger_legacy_snapshot() {
     let api = FreshServiceInventoryClient {
         legacy_endpoints_partial: true,
         legacy_endpoint_ips: Some(vec!["10.50.0.2".to_string(), "10.50.0.3".to_string()]),
@@ -1161,7 +1208,7 @@ async fn service_specs_from_api_uses_legacy_endpoints_when_endpointslice_snapsho
 
     let specs = service_specs_from_api(&api)
         .await
-        .expect("service specs should build from the fuller endpoint source");
+        .expect("service specs should build from the authoritative EndpointSlice source");
 
     assert_eq!(specs.len(), 1);
     let mut tuples: Vec<_> = specs[0]
@@ -1180,20 +1227,31 @@ async fn service_specs_from_api_uses_legacy_endpoints_when_endpointslice_snapsho
     assert_eq!(
         tuples,
         vec![
-            (
-                Protocol::Tcp,
-                53,
-                53,
-                vec![Ipv4Addr::new(10, 50, 0, 2), Ipv4Addr::new(10, 50, 0, 3)]
-            ),
-            (
-                Protocol::Udp,
-                53,
-                53,
-                vec![Ipv4Addr::new(10, 50, 0, 2), Ipv4Addr::new(10, 50, 0, 3)]
-            ),
+            (Protocol::Tcp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 20)]),
+            (Protocol::Udp, 53, 53, vec![Ipv4Addr::new(10, 50, 0, 20)]),
         ],
-        "a partial EndpointSlice snapshot must not shadow the fuller legacy Endpoints view during routing churn"
+        "an observed EndpointSlice port is authoritative even when legacy Endpoints still contains stale extras"
+    );
+}
+
+#[tokio::test]
+async fn service_specs_from_api_observed_empty_endpointslice_does_not_revive_stale_legacy() {
+    let api = FreshServiceInventoryClient {
+        legacy_endpoints_partial: true,
+        legacy_endpoint_ips: Some(vec!["10.50.0.2".to_string()]),
+        endpointslice_endpoint_ips: Some(Vec::new()),
+        ..Default::default()
+    };
+
+    let specs = service_specs_from_api(&api)
+        .await
+        .expect("observed empty EndpointSlice state should still build deterministically");
+
+    assert_eq!(specs.len(), 1);
+    assert!(
+        specs[0].ports.iter().all(|port| port.endpoints.is_empty()),
+        "an EndpointSlice that explicitly reports no ready endpoints must not fall back to stale legacy addresses: {:?}",
+        specs[0].ports
     );
 }
 

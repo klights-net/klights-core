@@ -4,7 +4,7 @@ use super::network_policy::{
     Ipv4CidrMatch, NetworkPolicyDirection, NetworkPolicyPeerMatch, NetworkPolicyPlan,
 };
 use super::prelude::*;
-use super::service_rules::select_service_spec_with_fullest_endpoints;
+use super::service_rules::select_authoritative_service_spec;
 use super::*;
 use crate::utils::lock_recover;
 use nftnl::expr::Expression;
@@ -443,7 +443,7 @@ where
     };
     let legacy_endpoints_spec =
         endpoints.and_then(|eps| ServiceSpec::from_service_and_endpoints(service, Some(&eps.data)));
-    select_service_spec_with_fullest_endpoints(endpointslice_spec, legacy_endpoints_spec)
+    select_authoritative_service_spec(endpointslice_spec, legacy_endpoints_spec)
 }
 
 impl KlightsTable {
@@ -979,7 +979,7 @@ impl KlightsTable {
         ))
     }
 
-    /// Atomically rebuild the `services` chain from the supplied
+    /// Rebuild the `services` chain from the supplied
     /// service inventory. Each [`ServiceSpec`] contributes one or more
     /// DNAT rules — one for each endpoint of each service port, plus a
     /// NodePort variant if the service exposes one.
@@ -1004,23 +1004,31 @@ impl KlightsTable {
         for svc in services {
             self.append_service_rules(&services_chain, svc, &mut rules);
         }
-        let service_ct_guard_rules = self.service_ct_guard_rules(&service_ct_guard_chain, services);
+        let previous_specs = lock_recover(&self.applied_service_specs).clone();
+        let previous_tuples = service_ct_guard_tuples(&previous_specs);
+        let guard_transition = service_ct_guard_transition(&previous_specs, services);
 
         let rule_count = rules.len();
         // The services chain is referenced by `jump services` from
         // nat-prerouting and nat-output, while service_ct_guard is referenced
         // from filter-forward. We can't DEL+ADD either chain (EBUSY), so both
-        // chains are flushed in place. Send the guard first so new DNAT rules
-        // are never visible before the forward guard allows their original
-        // ClusterIP/protocol/port tuple. Keeping the two rewrites in separate
-        // batches also avoids oversized netlink transactions during large
-        // conformance Service churn.
-        let mut guard_batch = Batch::new();
-        guard_batch.replace_chain_rules(&service_ct_guard_chain, &service_ct_guard_rules);
-        self.nf
-            .send(guard_batch)
-            .await
-            .context("replace service conntrack guard rules")?;
+        // chains are flushed in place. Stage the union of old and new guard
+        // tuples before switching DNAT, then remove obsolete tuples after the
+        // DNAT batch succeeds. Every partial outcome therefore remains safe:
+        // old DNAT + union and new DNAT + union both preserve connectivity,
+        // and a retry can finish the same idempotent transition.
+        if guard_transition.staged != previous_tuples {
+            let staged_rules = self.service_ct_guard_rules_for_tuples(
+                &service_ct_guard_chain,
+                &guard_transition.staged,
+            );
+            let mut guard_batch = Batch::new();
+            guard_batch.replace_chain_rules(&service_ct_guard_chain, &staged_rules);
+            self.nf
+                .send(guard_batch)
+                .await
+                .context("stage service conntrack guard rules")?;
+        }
 
         let mut batch = Batch::new();
         batch.replace_chain_rules(&services_chain, &rules);
@@ -1028,6 +1036,19 @@ impl KlightsTable {
             .send(batch)
             .await
             .context("replace services chain rules")?;
+
+        if guard_transition.finalized != guard_transition.staged {
+            let finalized_rules = self.service_ct_guard_rules_for_tuples(
+                &service_ct_guard_chain,
+                &guard_transition.finalized,
+            );
+            let mut guard_batch = Batch::new();
+            guard_batch.replace_chain_rules(&service_ct_guard_chain, &finalized_rules);
+            self.nf
+                .send(guard_batch)
+                .await
+                .context("finalize service conntrack guard rules")?;
+        }
 
         tracing::debug!(
             "nft services chain replaced: {} services, {} rules",
@@ -1577,9 +1598,17 @@ impl KlightsTable {
         chain: &'a Chain<'a>,
         services: &[ServiceSpec],
     ) -> Vec<Rule<'a>> {
+        self.service_ct_guard_rules_for_tuples(chain, &service_ct_guard_tuples(services))
+    }
+
+    fn service_ct_guard_rules_for_tuples<'a>(
+        &self,
+        chain: &'a Chain<'a>,
+        tuples: &[ServiceCtTuple],
+    ) -> Vec<Rule<'a>> {
         let mut rules = Vec::new();
-        for tuple in service_ct_guard_tuples(services) {
-            rules.push(self.rule_return_active_service_ct_tuple(chain, tuple));
+        for tuple in tuples {
+            rules.push(self.rule_return_active_service_ct_tuple(chain, *tuple));
         }
         rules.push(self.rule_drop_stale_service_ct_mapping(chain));
         rules.push(self.rule_return_from_service_ct_guard(chain));
