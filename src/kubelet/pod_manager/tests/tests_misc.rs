@@ -48,6 +48,41 @@ fn pod_watcher_node_event_filter_matches_only_local_pods() {
 }
 
 #[tokio::test]
+async fn pod_watcher_filtered_pod_event_does_not_advance_signal_cursor() {
+    let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
+    let (_tx, rx) = tokio::sync::broadcast::channel(4);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        DatastoreWatchReplaySource::new(
+            db_handle,
+            vec![crate::datastore::WatchTarget::namespaced("v1", "Pod")],
+        ),
+        WatchTopic::new("v1", "Pod"),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+    let event = crate::watch::WatchEvent::modified(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "name": "remote-pod",
+            "namespace": "default",
+            "resourceVersion": "50"
+        },
+        "spec": {"nodeName": "node-b"}
+    }));
+
+    record_pod_watcher_filtered_event(&mut cursor, &event, 50);
+
+    assert_eq!(
+        cursor.accepted_rv(),
+        10,
+        "node-selector-filtered Pod events must not move the cursor past unseen lower-RV local Pod updates"
+    );
+}
+
+#[tokio::test]
 async fn app_state_pod_watcher_disables_cluster_reconciliation_on_raft_follower() {
     let mut state = crate::api::test_support::build_test_app_state().await;
     let (_lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(1);
