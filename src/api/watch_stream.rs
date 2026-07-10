@@ -689,9 +689,10 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 }
             };
 
+            let catch_up_resume_floor = requested_rv;
             for catchup in missed {
                 let resource = catchup.resource.clone();
-                if resource.resource_version <= initial_list_rv {
+                if resource.resource_version <= catch_up_resume_floor {
                     if catchup.event_type.as_ref() == "ADDED" {
                         tracing::warn!(
                             target: "klights::watch_diag",
@@ -700,7 +701,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                             name = %resource.name,
                             added_rv = resource.resource_version,
                             requested_rv,
-                            initial_list_rv,
+                            initial_list_rv = catch_up_resume_floor,
                             "catch-up dropped an ADDED event (rv <= resume floor)"
                         );
                     }

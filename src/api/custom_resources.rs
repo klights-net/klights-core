@@ -970,9 +970,12 @@ async fn list_cr_inner(
                         .map_err(AppError::from)
                 };
                 if let Ok(missed) = missed {
+                    let catch_up_resume_floor = requested_rv;
                     for catchup in missed {
                         let resource = catchup.resource.clone();
-                        if resource.resource_version <= initial_list_rv { continue; }
+                        if resource.resource_version <= catch_up_resume_floor {
+                            continue;
+                        }
                         initial_list_rv = initial_list_rv.max(resource.resource_version);
                         let event = CatchUpResource {
                             resource: catchup.resource,

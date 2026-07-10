@@ -6012,6 +6012,501 @@ async fn test_scoped_watch_reconnect_from_bookmark_delivers_subsequent_in_scope_
 }
 
 #[tokio::test]
+async fn test_guestbook_selector_pod_list_returns_fresh_running_status_json_and_protobuf() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    fn mk(method: &str, uri: String, body: Option<Vec<u8>>) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap()
+    }
+
+    async fn list_pods(
+        app: &axum::Router,
+        namespace: &str,
+        selector: &str,
+        extra_query: Option<&str>,
+        accept: Option<&str>,
+    ) -> serde_json::Value {
+        let extra_query = extra_query.unwrap_or("");
+        let mut request = Request::builder().method("GET").uri(format!(
+            "/api/v1/namespaces/{namespace}/pods?labelSelector={selector}{extra_query}"
+        ));
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        if accept.is_some_and(|value| value.contains("protobuf")) {
+            assert!(
+                content_type.contains("application/vnd.kubernetes.protobuf"),
+                "protobuf Accept must return Kubernetes protobuf, got {content_type}"
+            );
+            crate::protobuf::decode_protobuf(&body).unwrap()
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        }
+    }
+
+    fn assert_all_running(list: &serde_json::Value, expected: &[&str]) {
+        let items = list
+            .get("items")
+            .and_then(|value| value.as_array())
+            .expect("PodList must include items");
+        assert_eq!(items.len(), expected.len(), "unexpected PodList: {list}");
+        for name in expected {
+            let pod = items
+                .iter()
+                .find(|item| {
+                    item.pointer("/metadata/name")
+                        .and_then(|value| value.as_str())
+                        == Some(*name)
+                })
+                .unwrap_or_else(|| panic!("{name} missing from PodList: {list}"));
+            assert_eq!(
+                pod.pointer("/status/phase"),
+                Some(&json!("Running")),
+                "{name} must list as Running: {pod}"
+            );
+            assert!(
+                pod.pointer("/status/conditions")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|conditions| {
+                        conditions.iter().any(|condition| {
+                            condition.pointer("/type").and_then(|value| value.as_str())
+                                == Some("Ready")
+                                && condition
+                                    .pointer("/status")
+                                    .and_then(|value| value.as_str())
+                                    == Some("True")
+                        })
+                    }),
+                "{name} must preserve Ready=True in PodList: {pod}"
+            );
+        }
+    }
+
+    let (app, db) = build_test_router_with_db().await;
+    let namespace = "gb-selector-list-runtime";
+    let selector = "app%3Dguestbook%2Ctier%3Dfrontend";
+    let pods = [
+        ("frontend-a", "mn-controlplane2", "10.50.1.3"),
+        ("frontend-b", "mn-worker", "10.50.4.2"),
+        ("frontend-c", "mn-controlplane3", "10.50.2.3"),
+    ];
+
+    for (_, node, _) in pods {
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            node,
+            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":node},"spec":{},"status":{}}),
+        )
+        .await
+        .unwrap();
+    }
+    let namespace_resp = app
+        .clone()
+        .oneshot(mk(
+            "POST",
+            "/api/v1/namespaces".to_string(),
+            Some(
+                json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":namespace}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(namespace_resp.status(), StatusCode::CREATED);
+
+    for (pod, node, _) in pods {
+        let body = json!({
+            "apiVersion":"v1",
+            "kind":"Pod",
+            "metadata":{"name":pod,"namespace":namespace,"labels":{"app":"guestbook","tier":"frontend"}},
+            "spec":{"nodeName":node,"containers":[{"name":"c","image":"registry.k8s.io/pause:3.10.1"}]},
+            "status":{"phase":"Pending"}
+        });
+        let create_resp = app
+            .clone()
+            .oneshot(mk(
+                "POST",
+                format!("/api/v1/namespaces/{namespace}/pods"),
+                Some(serde_json::to_vec(&body).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::CREATED);
+    }
+
+    for (pod, _, ip) in pods {
+        let ready_patch = json!({"status":{"phase":"Running","podIP":ip,"podIPs":[{"ip":ip}],"conditions":[
+            {"type":"Ready","status":"True","reason":"PodReady"},
+            {"type":"ContainersReady","status":"True","reason":"PodReady"}
+        ]}});
+        let patch_resp = app
+            .clone()
+            .oneshot(mk(
+                "PATCH",
+                format!("/api/v1/namespaces/{namespace}/pods/{pod}/status"),
+                Some(serde_json::to_vec(&ready_patch).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patch_resp.status(), StatusCode::OK);
+    }
+
+    let expected: Vec<&str> = pods.iter().map(|(name, _, _)| *name).collect();
+    let json_list = list_pods(&app, namespace, selector, None, None).await;
+    assert_all_running(&json_list, &expected);
+
+    let protobuf_list = list_pods(
+        &app,
+        namespace,
+        selector,
+        None,
+        Some("application/vnd.kubernetes.protobuf,application/json"),
+    )
+    .await;
+    assert_all_running(&protobuf_list, &expected);
+
+    let reflector_initial_list = list_pods(
+        &app,
+        namespace,
+        selector,
+        Some("&resourceVersion=0"),
+        Some("application/vnd.kubernetes.protobuf,application/json"),
+    )
+    .await;
+    assert_all_running(&reflector_initial_list, &expected);
+}
+
+#[tokio::test]
+async fn test_selector_watch_catch_up_same_rv_filtered_event_does_not_hide_matching_pod() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    let namespace = "selector-catchup-same-rv";
+    let selector = "app%3Dguestbook%2Ctier%3Dfrontend";
+    let ns_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/namespaces")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":namespace}})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+
+    let filtered = json!({
+        "apiVersion":"v1",
+        "kind":"Pod",
+        "metadata":{"name":"backend","namespace":namespace,"labels":{"app":"guestbook","tier":"backend"}},
+        "spec":{"containers":[{"name":"c","image":"registry.k8s.io/pause:3.10.1"}]},
+        "status":{"phase":"Running"}
+    });
+    let matching = json!({
+        "apiVersion":"v1",
+        "kind":"Pod",
+        "metadata":{"name":"frontend","namespace":namespace,"labels":{"app":"guestbook","tier":"frontend"}},
+        "spec":{"containers":[{"name":"c","image":"registry.k8s.io/pause:3.10.1"}]},
+        "status":{"phase":"Running"}
+    });
+    let resume_rv = db.get_current_resource_version().await.unwrap();
+    db.apply_resource_batch(vec![
+        crate::datastore::ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some(namespace.to_string()),
+            name: "backend".to_string(),
+            data: filtered,
+            mode: crate::datastore::ResourceBatchPutMode::Create,
+            preconditions: crate::datastore::ResourcePreconditions::default(),
+        },
+        crate::datastore::ResourceBatchOperation::Put {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some(namespace.to_string()),
+            name: "frontend".to_string(),
+            data: matching,
+            mode: crate::datastore::ResourceBatchPutMode::Create,
+            preconditions: crate::datastore::ResourcePreconditions::default(),
+        },
+    ])
+    .await
+    .unwrap();
+
+    let watch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/{namespace}/pods?watch=true&resourceVersion={resume_rv}&labelSelector={selector}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+    let mut stream = watch_resp.into_body().into_data_stream();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let chunk = match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(err))) => panic!("watch stream failed: {err}"),
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+        for line in String::from_utf8(chunk.to_vec())
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
+            let event = serde_json::from_str::<serde_json::Value>(line).unwrap();
+            if event
+                .pointer("/object/metadata/name")
+                .and_then(|value| value.as_str())
+                == Some("frontend")
+                && event
+                    .pointer("/object/status/phase")
+                    .and_then(|value| value.as_str())
+                    == Some("Running")
+            {
+                return;
+            }
+        }
+    }
+
+    panic!("selector catch-up must not let same-RV filtered Pod hide matching Pod");
+}
+
+#[tokio::test]
+async fn test_guestbook_selector_watch_observes_raft_pod_status_outbox_update() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    fn mk(method: &str, uri: String, body: Option<Vec<u8>>) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap()
+    }
+
+    let (app, db) = build_test_router_with_db().await;
+    let namespace = "gb-watch-raft-status";
+    let selector = "app%3Dguestbook%2Ctier%3Dfrontend";
+    let node = "mn-worker";
+    let pod = "frontend-raft-status";
+
+    db.create_resource(
+        "v1",
+        "Node",
+        None,
+        node,
+        json!({"apiVersion":"v1","kind":"Node","metadata":{"name":node},"spec":{},"status":{}}),
+    )
+    .await
+    .unwrap();
+
+    let ns_resp = app
+        .clone()
+        .oneshot(mk(
+            "POST",
+            "/api/v1/namespaces".to_string(),
+            Some(
+                json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":namespace}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+
+    let pod_body = json!({
+        "apiVersion":"v1",
+        "kind":"Pod",
+        "metadata":{"name":pod,"namespace":namespace,"labels":{"app":"guestbook","tier":"frontend"}},
+        "spec":{"nodeName":node,"containers":[{"name":"guestbook-frontend","image":"registry.k8s.io/pause:3.10.1"}]},
+        "status":{"phase":"Pending"}
+    });
+    let create_resp = app
+        .clone()
+        .oneshot(mk(
+            "POST",
+            format!("/api/v1/namespaces/{namespace}/pods"),
+            Some(serde_json::to_vec(&pod_body).unwrap()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::CREATED);
+
+    let created = db
+        .get_resource("v1", "Pod", Some(namespace), pod)
+        .await
+        .unwrap()
+        .expect("pod must exist");
+
+    let list_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/{namespace}/pods?labelSelector={selector}"
+                ))
+                .header(
+                    "accept",
+                    "application/vnd.kubernetes.protobuf,application/json",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_body = to_bytes(list_resp.into_body(), usize::MAX).await.unwrap();
+    let list = crate::protobuf::decode_protobuf(&list_body).unwrap();
+    assert_eq!(
+        list.pointer("/items/0/status/phase"),
+        Some(&json!("Pending"))
+    );
+    let list_rv: i64 = list
+        .pointer("/metadata/resourceVersion")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse().ok())
+        .expect("protobuf PodList must carry list resourceVersion");
+
+    let watch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/{namespace}/pods?watch=true&resourceVersion={list_rv}&labelSelector={selector}"
+                ))
+                .header("accept", "application/vnd.kubernetes.protobuf,application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+    let mut stream = watch_resp.into_body().into_data_stream();
+
+    let command = crate::datastore::command::StorageCommand::UpdateStatus {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some(namespace.to_string()),
+        name: pod.to_string(),
+        status: json!({
+            "phase": "Running",
+            "podIP": "10.50.4.2",
+            "podIPs": [{"ip": "10.50.4.2"}],
+            "containerStatuses": [{
+                "name": "guestbook-frontend",
+                "ready": true,
+                "started": true,
+                "restartCount": 0,
+                "state": {"running": {"startedAt": "2026-07-10T01:01:23Z"}}
+            }],
+            "conditions": [
+                {"type":"Ready","status":"True","reason":"PodReady"},
+                {"type":"ContainersReady","status":"True","reason":"PodReady"}
+            ]
+        }),
+        expected_rv: Some(created.resource_version),
+        preconditions: crate::datastore::ResourcePreconditions::from_resource(&created),
+        observed_status_stamp: Some(1),
+    };
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+    let outcome = db
+        .build_log_apply_commit_for_outbox(
+            "guestbook-watch-raft-status",
+            crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+            payload.as_ref(),
+            node,
+        )
+        .await
+        .expect("outbox status commit must build");
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
+        panic!("expected a raft commit for PodStatus");
+    };
+    db.apply_log_apply_commit(commit).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let chunk = match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(err))) => panic!("watch stream failed: {err}"),
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+        for line in String::from_utf8(chunk.to_vec())
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
+            let event = serde_json::from_str::<serde_json::Value>(line).unwrap();
+            if event
+                .pointer("/object/metadata/name")
+                .and_then(|value| value.as_str())
+                == Some(pod)
+                && event
+                    .pointer("/object/status/phase")
+                    .and_then(|value| value.as_str())
+                    == Some("Running")
+            {
+                return;
+            }
+        }
+    }
+
+    panic!("selector watch must observe raft-applied PodStatus Running update");
+}
+
+#[tokio::test]
 async fn test_positive_rv_selector_pod_watch_replays_status_after_list_when_baseline_is_current() {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
