@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -25,6 +25,152 @@ use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::watch::{EventType, WatchBus, WatchEvent, WatchSignal, WatchTopic};
 
 const WORKER_WATCH_EVENT_HISTORY_CAPACITY: usize = 32_768;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ReflectedResourceKey {
+    api_version: String,
+    kind: String,
+    namespace: Option<String>,
+    name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ReplayEventIdentity {
+    resource: ReflectedResourceKey,
+    uid: String,
+    resource_version: i64,
+}
+
+#[derive(Clone, Debug)]
+struct ReflectedResource {
+    uid: String,
+    object: Arc<Value>,
+}
+
+#[derive(Default)]
+struct ReflectorState {
+    resources: HashMap<ReflectedResourceKey, ReflectedResource>,
+}
+
+impl ReflectorState {
+    fn replace_snapshot(&mut self, resources: Vec<Resource>, snapshot_rv: i64) -> Vec<WatchEvent> {
+        let mut replacement = HashMap::with_capacity(resources.len());
+        for resource in resources {
+            replacement.insert(
+                ReflectedResourceKey {
+                    api_version: resource.api_version,
+                    kind: resource.kind,
+                    namespace: resource.namespace,
+                    name: resource.name,
+                },
+                ReflectedResource {
+                    uid: resource.uid,
+                    object: resource.data,
+                },
+            );
+        }
+
+        let mut events = Vec::new();
+        for (key, previous) in &self.resources {
+            match replacement.get(key) {
+                None => events.push(WatchEvent {
+                    event_type: EventType::Deleted,
+                    object: object_at_resource_version(&previous.object, snapshot_rv),
+                    encoded_payload: None,
+                }),
+                Some(current) if current.uid != previous.uid => {
+                    events.push(WatchEvent {
+                        event_type: EventType::Deleted,
+                        object: object_at_resource_version(&previous.object, snapshot_rv),
+                        encoded_payload: None,
+                    });
+                    events.push(WatchEvent {
+                        event_type: EventType::Added,
+                        object: current.object.clone(),
+                        encoded_payload: None,
+                    });
+                }
+                Some(current) if current.object != previous.object => events.push(WatchEvent {
+                    event_type: EventType::Modified,
+                    object: current.object.clone(),
+                    encoded_payload: None,
+                }),
+                Some(_) => {}
+            }
+        }
+        for (key, current) in &replacement {
+            if !self.resources.contains_key(key) {
+                events.push(WatchEvent {
+                    event_type: EventType::Added,
+                    object: current.object.clone(),
+                    encoded_payload: None,
+                });
+            }
+        }
+        self.resources = replacement;
+        events
+    }
+
+    fn observe(&mut self, event: &WatchEvent) {
+        let Some(key) = reflected_resource_key(&event.object) else {
+            return;
+        };
+        match event.event_type {
+            EventType::Added | EventType::Modified => {
+                self.resources.insert(
+                    key,
+                    ReflectedResource {
+                        uid: event
+                            .object
+                            .pointer("/metadata/uid")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        object: event.object.clone(),
+                    },
+                );
+            }
+            EventType::Deleted => {
+                let event_uid = event
+                    .object
+                    .pointer("/metadata/uid")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if self
+                    .resources
+                    .get(&key)
+                    .is_some_and(|current| current.uid == event_uid)
+                {
+                    self.resources.remove(&key);
+                }
+            }
+            EventType::Bookmark | EventType::Error => {}
+        }
+    }
+}
+
+fn reflected_resource_key(object: &Value) -> Option<ReflectedResourceKey> {
+    Some(ReflectedResourceKey {
+        api_version: object.get("apiVersion")?.as_str()?.to_string(),
+        kind: object.get("kind")?.as_str()?.to_string(),
+        namespace: object
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        name: object.pointer("/metadata/name")?.as_str()?.to_string(),
+    })
+}
+
+fn object_at_resource_version(object: &Arc<Value>, resource_version: i64) -> Arc<Value> {
+    let mut object = object.as_ref().clone();
+    if let Some(metadata) = object.get_mut("metadata").and_then(Value::as_object_mut) {
+        metadata.insert(
+            "resourceVersion".to_string(),
+            Value::String(resource_version.to_string()),
+        );
+    }
+    Arc::new(object)
+}
 
 /// Worker-local compatibility store for legacy kubelet call sites.
 ///
@@ -137,6 +283,7 @@ impl WorkerStoreAdapter {
         cancel: tokio_util::sync::CancellationToken,
     ) {
         let mut next_resource_version = req.start_resource_version;
+        let mut state = ReflectorState::default();
         // Consecutive failed reconnects; reset to 0 once the stream delivers an
         // event (progress). Drives the shared exponential reconnect backoff so
         // a sustained leader/WAN outage cannot become a fixed-interval
@@ -147,7 +294,7 @@ impl WorkerStoreAdapter {
                 return;
             }
             if next_resource_version.is_none() {
-                match self.publish_initial_watch_snapshot(&req).await {
+                match self.reconcile_watch_snapshot(&req, &mut state).await {
                     Ok(resource_version) => {
                         next_resource_version = Some(resource_version);
                     }
@@ -185,6 +332,7 @@ impl WorkerStoreAdapter {
                                             next_resource_version =
                                                 Some(next_resource_version.unwrap_or(0).max(rv));
                                         }
+                                        state.observe(&event.event);
                                         self.publish_watch_from_mirror(event.event).await;
                                     }
                                     Some(Err(err)) => {
@@ -245,7 +393,11 @@ impl WorkerStoreAdapter {
         }
     }
 
-    async fn publish_initial_watch_snapshot(&self, req: &WatchRequest) -> Result<i64> {
+    async fn reconcile_watch_snapshot(
+        &self,
+        req: &WatchRequest,
+        state: &mut ReflectorState,
+    ) -> Result<i64> {
         let list = self
             .cluster_api
             .list_resources(ListRequest {
@@ -260,13 +412,8 @@ impl WorkerStoreAdapter {
             .await?;
         self.observe_rv(list.resource_version);
         let resource_version = list.resource_version;
-        for resource in list.items {
-            self.publish_watch_from_mirror(WatchEvent {
-                event_type: EventType::Added,
-                object: resource.data.clone(),
-                encoded_payload: None,
-            })
-            .await;
+        for event in state.replace_snapshot(list.items, resource_version) {
+            self.publish_watch_from_mirror(event).await;
         }
         Ok(resource_version)
     }
@@ -562,6 +709,19 @@ fn catchup_resource_from_watch_event(event: &WatchEvent) -> Option<CatchUpResour
         },
         event_type: std::borrow::Cow::Owned(event.event_type.to_string()),
     })
+}
+
+fn replay_event_identity(resource: &Resource) -> ReplayEventIdentity {
+    ReplayEventIdentity {
+        resource: ReflectedResourceKey {
+            api_version: resource.api_version.clone(),
+            kind: resource.kind.clone(),
+            namespace: resource.namespace.clone(),
+            name: resource.name.clone(),
+        },
+        uid: resource.uid.clone(),
+        resource_version: resource.resource_version,
+    }
 }
 
 #[async_trait]
@@ -1071,9 +1231,9 @@ impl DatastoreBackend for WorkerStoreAdapter {
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
         let mut events = self.historical_watch_events_since(targets, since_rv);
-        let mut seen_rvs: HashSet<i64> = events
+        let mut seen_events: HashSet<_> = events
             .iter()
-            .map(|event| event.resource.resource_version)
+            .map(|event| replay_event_identity(&event.resource))
             .collect();
         let event_type = Self::snapshot_replay_event_type(since_rv);
         for target in targets {
@@ -1083,7 +1243,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
                 list.items
                     .into_iter()
                     .filter(|resource| resource.resource_version > since_rv)
-                    .filter(|resource| seen_rvs.insert(resource.resource_version))
+                    .filter(|resource| seen_events.insert(replay_event_identity(resource)))
                     .map(|resource| CatchUpResource {
                         resource,
                         event_type: std::borrow::Cow::Borrowed(event_type),
@@ -1441,6 +1601,124 @@ mod tests {
         );
     }
 
+    fn reflected_resource(name: &str, uid: &str, rv: i64) -> Resource {
+        Resource {
+            id: rv,
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: name.to_string(),
+            uid: uid.to_string(),
+            resource_version: rv,
+            data: Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "namespace": "default",
+                    "name": name,
+                    "uid": uid,
+                    "resourceVersion": rv.to_string()
+                }
+            })),
+        }
+    }
+
+    #[test]
+    fn reflector_relist_diff_synthesizes_missed_delete_at_snapshot_rv() {
+        let mut state = ReflectorState::default();
+        let initial = state.replace_snapshot(vec![reflected_resource("removed", "uid-1", 41)], 41);
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].event_type, EventType::Added);
+
+        let replacement = state.replace_snapshot(Vec::new(), 52);
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].event_type, EventType::Deleted);
+        assert_eq!(replacement[0].resource_version(), Some(52));
+        assert_eq!(
+            replacement[0]
+                .object
+                .pointer("/metadata/name")
+                .and_then(Value::as_str),
+            Some("removed")
+        );
+    }
+
+    #[test]
+    fn reflector_snapshot_keeps_distinct_objects_with_the_same_rv() {
+        let mut state = ReflectorState::default();
+        let events = state.replace_snapshot(
+            vec![
+                reflected_resource("first", "uid-first", 41),
+                reflected_resource("second", "uid-second", 41),
+            ],
+            41,
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event
+                    .object
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    .unwrap())
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["first", "second"])
+        );
+    }
+
+    #[test]
+    fn reflector_relist_replaces_same_name_uid_with_delete_then_add() {
+        let mut state = ReflectorState::default();
+        state.replace_snapshot(vec![reflected_resource("same-name", "uid-old", 41)], 41);
+
+        let replacement =
+            state.replace_snapshot(vec![reflected_resource("same-name", "uid-new", 52)], 52);
+
+        assert_eq!(
+            replacement
+                .iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            vec![EventType::Deleted, EventType::Added]
+        );
+        assert_eq!(
+            replacement[0]
+                .object
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str),
+            Some("uid-old")
+        );
+        assert_eq!(
+            replacement[1]
+                .object
+                .pointer("/metadata/uid")
+                .and_then(Value::as_str),
+            Some("uid-new")
+        );
+    }
+
+    #[test]
+    fn reflector_relist_marks_same_uid_changes_modified_and_ignores_unchanged_objects() {
+        let mut state = ReflectorState::default();
+        let initial = reflected_resource("updated", "uid-stable", 41);
+        state.replace_snapshot(vec![initial.clone()], 41);
+
+        assert!(state.replace_snapshot(vec![initial], 41).is_empty());
+
+        let mut updated = reflected_resource("updated", "uid-stable", 52);
+        Arc::make_mut(&mut updated.data)
+            .as_object_mut()
+            .unwrap()
+            .insert("data".to_string(), serde_json::json!({"key": "new"}));
+        let events = state.replace_snapshot(vec![updated], 52);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EventType::Modified);
+        assert_eq!(events[0].resource_version(), Some(52));
+    }
+
     #[derive(Default)]
     struct HandoffLeaderApi;
 
@@ -1673,34 +1951,35 @@ mod tests {
                 Some("spec.nodeName=worker-a")
             );
             let attempt = self.list_count.fetch_add(1, Ordering::SeqCst);
-            let items = if attempt == 0 {
-                Vec::new()
+            let (name, uid, resource_version) = if attempt == 0 {
+                ("removed-before-relist", "uid-removed", 41)
             } else {
-                vec![Resource {
-                    id: 1,
-                    api_version: "v1".to_string(),
-                    kind: "Pod".to_string(),
-                    namespace: Some("default".to_string()),
-                    name: "scheduled-after-relist".to_string(),
-                    uid: "uid-after-relist".to_string(),
-                    resource_version: 52,
-                    data: Arc::new(serde_json::json!({
-                        "apiVersion": "v1",
-                        "kind": "Pod",
-                        "metadata": {
-                            "namespace": "default",
-                            "name": "scheduled-after-relist",
-                            "uid": "uid-after-relist",
-                            "resourceVersion": "52"
-                        },
-                        "spec": {
-                            "nodeName": "worker-a",
-                            "containers": [{"name": "app", "image": "busybox"}]
-                        },
-                        "status": {"phase": "Pending"}
-                    })),
-                }]
+                ("scheduled-after-relist", "uid-after-relist", 52)
             };
+            let items = vec![Resource {
+                id: 1,
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: name.to_string(),
+                uid: uid.to_string(),
+                resource_version,
+                data: Arc::new(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": name,
+                        "uid": uid,
+                        "resourceVersion": resource_version.to_string()
+                    },
+                    "spec": {
+                        "nodeName": "worker-a",
+                        "containers": [{"name": "app", "image": "busybox"}]
+                    },
+                    "status": {"phase": "Pending"}
+                })),
+            }];
             Ok(ResourceList {
                 items,
                 resource_version: if attempt == 0 { 41 } else { 52 },
@@ -2554,22 +2833,43 @@ mod tests {
             .await
             .expect("start watch mirrors");
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), watch_rx.recv())
-            .await
-            .expect("mirror should relist and publish the scheduled pod")
-            .expect("watch channel should remain open");
+        let events = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut events = Vec::new();
+            while events.len() < 3 {
+                events.push(
+                    watch_rx
+                        .recv()
+                        .await
+                        .expect("watch channel should remain open"),
+                );
+            }
+            events
+        })
+        .await
+        .expect("mirror should publish initial and authoritative replacement events");
         cancel.cancel();
         for handle in handles {
             let _ = handle.join().await;
         }
 
-        assert_eq!(event.event_type, crate::watch::EventType::Added);
         assert_eq!(
-            event
-                .object
-                .pointer("/metadata/name")
-                .and_then(|v| v.as_str()),
-            Some("scheduled-after-relist")
+            events
+                .iter()
+                .map(|event| (
+                    event.event_type,
+                    event
+                        .object
+                        .pointer("/metadata/name")
+                        .and_then(Value::as_str)
+                        .unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (EventType::Added, "removed-before-relist"),
+                (EventType::Deleted, "removed-before-relist"),
+                (EventType::Added, "scheduled-after-relist"),
+            ],
+            "expired replay relist must remove objects absent from the authoritative snapshot"
         );
         assert!(
             cluster_api.list_count.load(Ordering::SeqCst) >= 2,

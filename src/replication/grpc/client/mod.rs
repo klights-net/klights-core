@@ -1346,59 +1346,86 @@ impl ReplicationGrpcClient {
             start_resource_version: req.start_resource_version.unwrap_or(0),
             label_selector: req.label_selector,
         };
-        let mut last_retryable: Option<String> = None;
+        let response = self
+            .streaming_open_call(
+                "grpc_watch_resources_open",
+                ChannelLane::Read,
+                move |mut client| {
+                    let request = request.clone();
+                    async move { client.watch_resources(request).await }
+                },
+            )
+            .await
+            .context("gRPC WatchResources failed")?;
+        let stream = response.into_inner().map(|event| {
+            event
+                // Preserve the tonic::Status as the error source (rather than
+                // flattening it into a display string) so the worker reflector
+                // can detect a replay-window expiration (Code::OutOfRange) and
+                // relist, matching the K8s "too old resource version" contract.
+                .map_err(|err| {
+                    anyhow::Error::from(err).context("gRPC WatchResources stream failed")
+                })
+                .and_then(resource_event_from_proto)
+        });
+        Ok(Box::pin(stream))
+    }
+
+    /// Opens a long-lived streaming RPC through the same bounded candidate
+    /// recovery policy for every caller. Candidate endpoints are probes: the
+    /// accepted leader hint changes only after the server returns response
+    /// headers successfully. This prevents a failed or stale candidate from
+    /// poisoning unrelated RPCs while still bounding a connection that keeps
+    /// HTTP/2 alive but never opens the stream.
+    async fn streaming_open_call<T, F, Fut>(
+        &self,
+        name: &'static str,
+        lane: ChannelLane,
+        make_call: F,
+    ) -> Result<tonic::Response<T>>
+    where
+        F: Fn(TonicClient<Channel>) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    {
+        let mut last_retryable: Option<anyhow::Error> = None;
         for endpoint in self.leader_endpoint_candidates() {
-            self.set_current_leader_endpoint(Some(endpoint.clone()));
-            let mut client = match self
-                .tonic_client_lane_for_endpoint(ChannelLane::Read, &endpoint)
-                .await
-            {
+            let client = match self.tonic_client_lane_for_endpoint(lane, &endpoint).await {
                 Ok(client) => client,
                 Err(err) => {
-                    last_retryable = Some(err.to_string());
+                    last_retryable = Some(err);
                     continue;
                 }
             };
-            let mut grpc_request = tonic::Request::new(request.clone());
-            self.add_join_token(&mut grpc_request)?;
-            let response = match client.watch_resources(grpc_request).await {
-                Ok(stream) => stream,
-                Err(status) if is_not_raft_leader_status(&status) => {
-                    last_retryable = Some(status.to_string());
-                    continue;
+            match self
+                .supervisor
+                .timeout(name, self.policy.stream_open_deadline, make_call(client))
+                .await
+            {
+                Ok(Ok(Ok(response))) => {
+                    self.set_current_leader_endpoint(Some(endpoint));
+                    return Ok(response);
                 }
-                Err(status) if is_transport_status(&status) => {
-                    // Self-heal: a leader restart wedges the Read-lane warm
-                    // pool. Evict it so the caller's reconnect loop rebuilds a
-                    // fresh channel on the next watch attempt.
-                    self.heal_lane_on_transport(ChannelLane::Read, &status)
-                        .await;
-                    last_retryable = Some(status.to_string());
-                    continue;
+                Ok(Ok(Err(status))) if is_not_raft_leader_status(&status) => {
+                    last_retryable = Some(anyhow::Error::from(status));
                 }
-                Err(status) => {
-                    return Err(anyhow::Error::from(status).context("gRPC WatchResources failed"));
+                Ok(Ok(Err(status))) if is_transport_status(&status) => {
+                    if self.policy.evict_lane_on_transport_error {
+                        self.heal_lane_on_transport(lane, &status).await;
+                    }
+                    last_retryable = Some(anyhow::Error::from(status));
                 }
-            };
-            let stream = response.into_inner().map(|event| {
-                event
-                    // Preserve the tonic::Status as the error source (rather than
-                    // flattening it into a display string) so the worker reflector
-                    // can detect a replay-window expiration (Code::OutOfRange) and
-                    // relist, matching the K8s "too old resource version" contract.
-                    .map_err(|err| {
-                        anyhow::Error::from(err).context("gRPC WatchResources stream failed")
-                    })
-                    .and_then(resource_event_from_proto)
-            });
-            return Ok(Box::pin(stream));
+                Ok(Ok(Err(status))) => return Err(anyhow::Error::from(status)),
+                Ok(Err(_elapsed)) => {
+                    self.invalidate_lane(lane).await;
+                    last_retryable = Some(anyhow!(
+                        "{name} deadline exceeded after {:?}",
+                        self.policy.stream_open_deadline
+                    ));
+                }
+                Err(err) => return Err(err),
+            }
         }
-        Err(anyhow!(
-            "{}",
-            last_retryable
-                .unwrap_or_else(|| "no leader endpoint accepted grpc_watch_resources".to_string())
-        )
-        .context("gRPC WatchResources failed"))
+        Err(last_retryable.unwrap_or_else(|| anyhow!("no leader endpoint accepted {name}")))
     }
 
     pub async fn projected_service_account_token_rpc(

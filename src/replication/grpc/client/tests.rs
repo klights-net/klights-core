@@ -467,6 +467,47 @@ mod cases {
         (endpoint, db, leader_tx, handle)
     }
 
+    async fn grpc_hanging_watch_server() -> (String, tokio::task::JoinHandle<()>) {
+        async fn hang_watch_open(
+            request: axum::extract::Request,
+            next: axum::middleware::Next,
+        ) -> axum::response::Response {
+            if request.uri().path() == "/klights.replication.Replication/WatchResources" {
+                return futures::future::pending::<axum::response::Response>().await;
+            }
+            next.run(request).await
+        }
+
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+            .await
+            .unwrap();
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let (_leader_tx, leader_rx) = tokio::sync::watch::channel(true);
+        let app = crate::replication::grpc::server::mount_service_full(
+            axum::Router::new(),
+            service,
+            db,
+            None,
+            None,
+            None,
+            None,
+            "",
+            Some(leader_rx),
+            None,
+            default_transport_policy(),
+        )
+        .layer(axum::middleware::from_fn(hang_watch_open));
+        let app = mount_test_service_with_node_cert(app, "worker-1");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (endpoint, handle)
+    }
+
     #[tokio::test]
     async fn https_join_without_skip_ca_succeeds_with_trusted_ca() {
         let fixture = TlsGrpcLeaderFixture::start().await;
@@ -659,6 +700,99 @@ mod cases {
 
         stale_handle.abort();
         leader_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watch_open_does_not_commit_failed_endpoint_candidate() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let original = "http://127.0.0.1:1".to_string();
+        let failed_candidate = "http://127.0.0.1:2".to_string();
+        let mut policy = *default_transport_policy();
+        policy.connect_timeout = Duration::from_millis(50);
+        let client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: original.clone(),
+                token: "abcdef.0123456789abcdef".to_string(),
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: dataplane(),
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            Arc::new(policy),
+        );
+        client.set_all_leader_endpoints(vec![original.clone(), failed_candidate]);
+
+        let result = client
+            .watch_resources_rpc(crate::control_plane::client::WatchRequest {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: None,
+                label_selector: None,
+                field_selector: None,
+                start_resource_version: Some(41),
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "all unavailable candidates must fail watch open"
+        );
+
+        assert_eq!(
+            client.current_leader_endpoint(),
+            original,
+            "candidate probing must not replace the accepted leader hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_open_has_a_supervised_response_header_deadline() {
+        let (endpoint, handle) = grpc_hanging_watch_server().await;
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let mut policy = *default_transport_policy();
+        policy.stream_open_deadline = Duration::from_millis(80);
+        let client = ReplicationGrpcClient::new(
+            GrpcClientConfig {
+                leader_endpoint: endpoint,
+                token: "abcdef.0123456789abcdef".to_string(),
+                node_name: "worker-1".to_string(),
+                role: JoinRole::Worker,
+                dataplane: dataplane(),
+                ca_cert_path: None,
+                skip_ca: false,
+                client_cert_pem: None,
+                client_key_pem: None,
+            },
+            supervisor,
+            Arc::new(policy),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.watch_resources_rpc(crate::control_plane::client::WatchRequest {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: None,
+                label_selector: None,
+                field_selector: None,
+                start_resource_version: Some(41),
+            }),
+        )
+        .await
+        .expect("watch open must be bounded by the transport policy");
+        let error = match result {
+            Ok(_) => panic!("a server that never opens the stream must time out"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("deadline exceeded"),
+            "deadline failure should remain diagnosable: {error:#}"
+        );
+        handle.abort();
     }
 
     #[tokio::test]

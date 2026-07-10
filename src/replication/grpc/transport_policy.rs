@@ -61,6 +61,11 @@ pub struct GrpcTransportPolicy {
     /// evicted and openraft's own retry/backoff re-sends on a fresh
     /// connection.
     pub raft_unary_deadline: Duration,
+    /// Deadline for receiving response headers when opening a long-lived
+    /// server stream. Once headers arrive the stream is intentionally
+    /// unbounded and liveness is driven by watch bookmarks; this only prevents
+    /// a responsive HTTP/2 connection from hanging forever during open.
+    pub stream_open_deadline: Duration,
 
     // --- tls ---
     /// Server-side TLS handshake timeout.
@@ -136,6 +141,7 @@ impl Default for GrpcTransportPolicy {
             // aborts near 5 s instead of 15 s — well inside openraft's
             // election timeout and long enough for a slow WAN round-trip.
             raft_unary_deadline: Duration::from_secs(5),
+            stream_open_deadline: Duration::from_secs(15),
             // Former `tls::TLS_HANDSHAKE_TIMEOUT`.
             tls_handshake_timeout: Duration::from_secs(10),
             evict_lane_on_transport_error: true,
@@ -225,6 +231,7 @@ mod tests {
         assert_eq!(p.max_message_bytes, 32 * 1024 * 1024);
         // Former DEFAULT_UNARY_DEADLINE.
         assert_eq!(p.unary_deadline, Duration::from_secs(15));
+        assert_eq!(p.stream_open_deadline, Duration::from_secs(15));
         // Former tls::TLS_HANDSHAKE_TIMEOUT.
         assert_eq!(p.tls_handshake_timeout, Duration::from_secs(10));
         assert!(p.evict_lane_on_transport_error);
