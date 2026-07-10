@@ -6673,6 +6673,194 @@ async fn test_positive_rv_selector_pod_watch_replays_status_after_list_when_base
     panic!("positive-RV selector watch must replay the post-LIST Running status");
 }
 
+#[tokio::test]
+async fn test_guestbook_selector_watchlist_delivers_ready_after_initial_events_end() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    fn mk(method: &str, uri: String, body: Option<Vec<u8>>) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap()
+    }
+
+    let (app, db) = build_test_router_with_db().await;
+    let namespace = "gb-watchlist-ready";
+    let selector = "app%3Dguestbook%2Ctier%3Dfrontend";
+    let pods = [
+        ("frontend-a", "mn-replica", "10.50.3.2"),
+        ("frontend-b", "mn-worker", "10.50.4.2"),
+        ("frontend-c", "mn-worker2", "10.50.5.2"),
+    ];
+
+    for (_, node, _) in pods {
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            node,
+            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":node},"spec":{},"status":{}}),
+        )
+        .await
+        .unwrap();
+    }
+
+    let ns_resp = app
+        .clone()
+        .oneshot(mk(
+            "POST",
+            "/api/v1/namespaces".to_string(),
+            Some(
+                json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":namespace}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ns_resp.status(), StatusCode::CREATED);
+
+    for (pod, node, _) in pods {
+        let pod_body = json!({
+            "apiVersion":"v1",
+            "kind":"Pod",
+            "metadata":{"name":pod,"namespace":namespace,"labels":{"app":"guestbook","tier":"frontend"}},
+            "spec":{"nodeName":node,"containers":[{"name":"guestbook-frontend","image":"registry.k8s.io/pause:3.10.1"}]},
+            "status":{"phase":"Pending"}
+        });
+        let create_resp = app
+            .clone()
+            .oneshot(mk(
+                "POST",
+                format!("/api/v1/namespaces/{namespace}/pods"),
+                Some(serde_json::to_vec(&pod_body).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_resp.status(), StatusCode::CREATED);
+    }
+
+    let watch_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/api/v1/namespaces/{namespace}/pods?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true&labelSelector={selector}&timeoutSeconds=5"
+                ))
+                .header("accept", "application/vnd.kubernetes.protobuf,application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watch_resp.status(), StatusCode::OK);
+    let mut stream = watch_resp.into_body().into_data_stream();
+
+    let mut initial = BTreeSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    'initial_events: loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "watch-list must emit initial-events-end bookmark"
+        );
+        let chunk = tokio::time::timeout(Duration::from_millis(500), stream.next())
+            .await
+            .expect("watch-list chunk before initial-events-end")
+            .expect("watch-list stream ended before initial-events-end")
+            .expect("watch-list chunk must be ok");
+        for line in String::from_utf8(chunk.to_vec())
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
+            let event = serde_json::from_str::<serde_json::Value>(line).unwrap();
+            if event["type"] == "ADDED"
+                && let Some(name) = event
+                    .pointer("/object/metadata/name")
+                    .and_then(|value| value.as_str())
+            {
+                initial.insert(name.to_string());
+            }
+            if event["type"] == "BOOKMARK"
+                && event.pointer("/object/metadata/annotations/k8s.io~1initial-events-end")
+                    == Some(&json!("true"))
+            {
+                assert_eq!(
+                    initial,
+                    pods.iter()
+                        .map(|(name, _, _)| name.to_string())
+                        .collect::<BTreeSet<_>>(),
+                    "watch-list initial stream must include every frontend Pod"
+                );
+                break 'initial_events;
+            }
+        }
+    }
+
+    for (pod, _, ip) in pods {
+        let ready_patch = json!({"status":{"phase":"Running","podIP":ip,"podIPs":[{"ip":ip}],"conditions":[
+            {"type":"Ready","status":"True","reason":"PodReady"},
+            {"type":"ContainersReady","status":"True","reason":"PodReady"}
+        ]}});
+        let patch_resp = app
+            .clone()
+            .oneshot(mk(
+                "PATCH",
+                format!("/api/v1/namespaces/{namespace}/pods/{pod}/status"),
+                Some(serde_json::to_vec(&ready_patch).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patch_resp.status(), StatusCode::OK);
+    }
+
+    let mut ready = BTreeSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let chunk = match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(err))) => panic!("watch-list stream failed: {err}"),
+            Ok(None) => break,
+            Err(_) => continue,
+        };
+        for line in String::from_utf8(chunk.to_vec())
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
+            let event = serde_json::from_str::<serde_json::Value>(line).unwrap();
+            if event["type"] != "MODIFIED" {
+                continue;
+            }
+            if event.pointer("/object/status/phase") != Some(&json!("Running")) {
+                continue;
+            }
+            if let Some(name) = event
+                .pointer("/object/metadata/name")
+                .and_then(|value| value.as_str())
+            {
+                ready.insert(name.to_string());
+            }
+        }
+        if ready.len() == pods.len() {
+            return;
+        }
+    }
+
+    panic!(
+        "watch-list stream must deliver Running MODIFIED events for every frontend Pod; got {ready:?}"
+    );
+}
+
 /// Regression for the `[sig-cli] Kubectl client Guestbook application ... should
 /// create and stop a working application` readiness timeout under multinode
 /// netns latency + packet loss (canary run `/tmp/2r.log` run 25, build
