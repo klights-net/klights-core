@@ -732,6 +732,27 @@ pub struct GrpcClientConfig {
     // would only confuse callers; struct shape simplified.
 }
 
+pub(crate) fn node_registration_to_proto(
+    registration: &crate::kubelet::node::NodeRegistrationSnapshot,
+) -> generated::NodeRegistrationSnapshot {
+    let node_mode = match &registration.node_mode {
+        crate::controllers::annotations::NodePeerMode::Root => "root",
+        crate::controllers::annotations::NodePeerMode::Rootless => "rootless",
+    };
+    generated::NodeRegistrationSnapshot {
+        cpu_count: registration.host.cpu_count,
+        memory_ki: registration.host.memory_ki,
+        architecture: registration.host.architecture.clone(),
+        operating_system: registration.host.operating_system.clone(),
+        os_image: registration.host.os_image.clone(),
+        kernel_version: registration.host.kernel_version.clone(),
+        container_runtime_version: registration.host.container_runtime_version.clone(),
+        kubelet_version: registration.host.kubelet_version.clone(),
+        git_commit: registration.host.git_commit.clone(),
+        node_mode: node_mode.to_string(),
+    }
+}
+
 impl GrpcClientConfig {
     fn leader_tls_verification(&self) -> LeaderTlsVerification {
         LeaderTlsVerificationPolicy::new(self.ca_cert_path.clone(), self.skip_ca).verification()
@@ -1763,23 +1784,44 @@ impl ReplicationGrpcClient {
         &self,
         node_id: u64,
         addr: &str,
-        node_name: &str,
-        as_learner: bool,
-        node_internal_ip: &str,
+        registration: &crate::kubelet::node::NodeRegistrationSnapshot,
     ) -> Result<crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome> {
         use crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome;
+        registration.validate()?;
+        anyhow::ensure!(
+            matches!(
+                (&registration.node_mode, self.config.dataplane.mode),
+                (
+                    crate::controllers::annotations::NodePeerMode::Root,
+                    DataplaneMode::Root
+                ) | (
+                    crate::controllers::annotations::NodePeerMode::Rootless,
+                    DataplaneMode::Rootless
+                )
+            ),
+            "Node registration mode must match JoinAsControlplane dataplane mode"
+        );
+        let as_learner = match &registration.node_role {
+            crate::bootstrap::NodeRole::Controlplane { as_learner, .. } => *as_learner,
+            other => {
+                return Err(anyhow!(
+                    "JoinAsControlplane requires Controlplane registration, got {other:?}"
+                ));
+            }
+        };
         let request = generated::JoinAsControlplaneRequest {
             node_id,
             addr: addr.to_string(),
-            node_name: node_name.to_string(),
+            node_name: registration.node_name.clone(),
             as_learner,
             dataplane_public_key: self.config.dataplane.public_key.clone().unwrap_or_default(),
             dataplane_endpoint: self.config.dataplane.endpoint.clone(),
             dataplane_port: self.config.dataplane.port.unwrap_or_default() as u32,
             dataplane_mode: self.config.dataplane.mode.as_str().to_string(),
             dataplane_encryption: self.config.dataplane.encryption.as_str().to_string(),
-            node_internal_ip: node_internal_ip.to_string(),
-            node_git_commit: crate::version::GIT_COMMIT_SHORT.to_string(),
+            node_internal_ip: registration.addresses.internal_ip().to_string(),
+            node_git_commit: registration.host.git_commit.clone(),
+            node_registration: Some(node_registration_to_proto(registration)),
         };
         let join_token = self.controlplane_join_token_value()?;
         let response = self

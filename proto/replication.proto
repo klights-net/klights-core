@@ -527,7 +527,26 @@ message JoinAsControlplaneRequest {
   string dataplane_mode = 8;
   string dataplane_encryption = 9;
   string node_internal_ip = 10;
+  // Legacy compatibility for persisted control-plane members that predate
+  // node_registration. New clients send git_commit inside the typed snapshot.
   string node_git_commit = 11;
+  NodeRegistrationSnapshot node_registration = 12;
+}
+
+// Joiner-owned host facts used to construct the joining node's Kubernetes
+// Node object. These values must be captured on the joiner; the leader must
+// never fill them from its own host.
+message NodeRegistrationSnapshot {
+  uint32 cpu_count = 1;
+  uint64 memory_ki = 2;
+  string architecture = 3;
+  string operating_system = 4;
+  string os_image = 5;
+  string kernel_version = 6;
+  string container_runtime_version = 7;
+  string kubelet_version = 8;
+  string git_commit = 9;
+  string node_mode = 10;
 }
 
 message JoinAsControlplaneResponse {

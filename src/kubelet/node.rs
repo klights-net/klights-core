@@ -41,6 +41,218 @@ impl NodeRegistrationAddresses {
     }
 }
 
+/// Host facts owned by the node being registered. Remote registration must
+/// receive these from the joiner; the leader must never substitute its own
+/// capacity, architecture, kernel, runtime, or build identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeRegistrationHostFacts {
+    pub cpu_count: u32,
+    pub memory_ki: u64,
+    pub architecture: String,
+    pub operating_system: String,
+    pub os_image: String,
+    pub kernel_version: String,
+    pub container_runtime_version: String,
+    pub kubelet_version: String,
+    pub git_commit: String,
+}
+
+impl NodeRegistrationHostFacts {
+    pub async fn capture_local(node_mode: &crate::bootstrap::NodeMode) -> Self {
+        let (host_info, memory_info) = tokio::join!(
+            host_node_info(),
+            crate::utils::read_utf8_file_async("/proc/meminfo")
+        );
+        let memory_ki = memory_info
+            .ok()
+            .and_then(|content| parse_memory_ki(&content))
+            .unwrap_or(8 * 1024 * 1024);
+        Self {
+            cpu_count: u32::try_from(num_cpus()).unwrap_or(u32::MAX),
+            memory_ki,
+            architecture: std::env::consts::ARCH.to_string(),
+            operating_system: "linux".to_string(),
+            os_image: host_info.os_image,
+            kernel_version: host_info.kernel_version,
+            container_runtime_version: "containerd://1.7.0".to_string(),
+            kubelet_version: crate::version::kubelet_version_for_mode(node_mode),
+            git_commit: crate::version::GIT_COMMIT_SHORT.to_string(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.cpu_count > 0,
+            "node registration cpu_count must be positive"
+        );
+        anyhow::ensure!(
+            self.memory_ki > 0,
+            "node registration memory_ki must be positive"
+        );
+        validate_node_registration_text("architecture", &self.architecture, 63)?;
+        validate_node_registration_text("operating_system", &self.operating_system, 63)?;
+        anyhow::ensure!(
+            self.operating_system == "linux",
+            "node registration operating_system must be 'linux'"
+        );
+        validate_node_registration_text("os_image", &self.os_image, 256)?;
+        validate_node_registration_text("kernel_version", &self.kernel_version, 256)?;
+        validate_node_registration_text(
+            "container_runtime_version",
+            &self.container_runtime_version,
+            256,
+        )?;
+        validate_node_registration_text("kubelet_version", &self.kubelet_version, 256)?;
+        validate_node_registration_text("git_commit", &self.git_commit, 128)?;
+        Ok(())
+    }
+
+    /// Rehydrate facts for an old persisted control-plane member whose legacy
+    /// JoinAsControlplane request predates the typed snapshot. This reads only
+    /// the member's existing Node row; it never samples the leader host.
+    pub fn from_existing_node(
+        node: &serde_json::Value,
+        joiner_git_commit: Option<&str>,
+    ) -> Result<Self> {
+        let cpu_count = node
+            .pointer("/status/capacity/cpu")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<u32>().ok())
+            .context("persisted Node capacity.cpu is not a positive integer")?;
+        let memory_ki = node
+            .pointer("/status/capacity/memory")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.strip_suffix("Ki"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .context("persisted Node capacity.memory is not expressed in Ki")?;
+        let text = |pointer: &str, field: &str| -> Result<String> {
+            node.pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .with_context(|| format!("persisted Node is missing {field}"))
+        };
+        let git_commit = joiner_git_commit
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                node.pointer("/metadata/annotations/klights.io~1git-commit")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .context("persisted Node is missing joiner-owned git commit")?;
+        let facts = Self {
+            cpu_count,
+            memory_ki,
+            architecture: text("/status/nodeInfo/architecture", "nodeInfo.architecture")?,
+            operating_system: text(
+                "/status/nodeInfo/operatingSystem",
+                "nodeInfo.operatingSystem",
+            )?,
+            os_image: text("/status/nodeInfo/osImage", "nodeInfo.osImage")?,
+            kernel_version: text("/status/nodeInfo/kernelVersion", "nodeInfo.kernelVersion")?,
+            container_runtime_version: text(
+                "/status/nodeInfo/containerRuntimeVersion",
+                "nodeInfo.containerRuntimeVersion",
+            )?,
+            kubelet_version: text("/status/nodeInfo/kubeletVersion", "nodeInfo.kubeletVersion")?,
+            git_commit,
+        };
+        facts.validate()?;
+        Ok(facts)
+    }
+}
+
+/// Complete typed input for constructing one Kubernetes Node registration.
+/// Registration metadata and host facts travel together so a remote writer
+/// cannot accidentally combine joiner identity with leader-local host data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeRegistrationSnapshot {
+    pub node_name: String,
+    pub node_mode: crate::controllers::annotations::NodePeerMode,
+    pub node_role: crate::bootstrap::NodeRole,
+    pub addresses: NodeRegistrationAddresses,
+    pub raft_shape: Option<crate::datastore::raft::types::RaftShape>,
+    pub grpc_port: Option<u16>,
+    pub host: NodeRegistrationHostFacts,
+}
+
+impl NodeRegistrationSnapshot {
+    pub async fn capture_local(
+        node_name: &str,
+        node_mode: &crate::bootstrap::NodeMode,
+        node_role: &crate::bootstrap::NodeRole,
+        addresses: NodeRegistrationAddresses,
+        raft_shape: Option<&crate::datastore::raft::types::RaftShape>,
+        grpc_port: Option<u16>,
+    ) -> Self {
+        let peer_mode = match node_mode {
+            crate::bootstrap::NodeMode::Root => crate::controllers::annotations::NodePeerMode::Root,
+            crate::bootstrap::NodeMode::Rootless { .. } => {
+                crate::controllers::annotations::NodePeerMode::Rootless
+            }
+        };
+        Self {
+            node_name: node_name.to_string(),
+            node_mode: peer_mode,
+            node_role: node_role.clone(),
+            addresses,
+            raft_shape: raft_shape.cloned(),
+            grpc_port,
+            host: NodeRegistrationHostFacts::capture_local(node_mode).await,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_node_registration_text("node_name", &self.node_name, 253)?;
+        validate_node_registration_text("internal_ip", self.addresses.internal_ip(), 64)?;
+        self.addresses
+            .internal_ip()
+            .parse::<std::net::IpAddr>()
+            .context("node registration internal_ip is invalid")?;
+        if let Some(external_ip) = self.addresses.external_ip() {
+            validate_node_registration_text("external_ip", external_ip, 64)?;
+        }
+        self.host.validate()
+    }
+}
+
+fn validate_node_registration_text(field: &str, value: &str, max_len: usize) -> Result<()> {
+    anyhow::ensure!(
+        !value.is_empty(),
+        "node registration {field} must not be empty"
+    );
+    anyhow::ensure!(
+        value == value.trim(),
+        "node registration {field} must not have surrounding whitespace"
+    );
+    anyhow::ensure!(
+        value.len() <= max_len,
+        "node registration {field} exceeds {max_len} bytes"
+    );
+    Ok(())
+}
+
+fn registration_mode_annotation(
+    mode: &crate::controllers::annotations::NodePeerMode,
+) -> &'static str {
+    match mode {
+        crate::controllers::annotations::NodePeerMode::Root => "root",
+        crate::controllers::annotations::NodePeerMode::Rootless => "rootless",
+    }
+}
+
+fn registration_hostport_range(
+    mode: &crate::controllers::annotations::NodePeerMode,
+) -> &'static str {
+    match mode {
+        crate::controllers::annotations::NodePeerMode::Root => "",
+        crate::controllers::annotations::NodePeerMode::Rootless => {
+            crate::controllers::annotations::DEFAULT_HOSTPORT_RANGE
+        }
+    }
+}
+
 /// Get number of CPUs from system
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
@@ -56,18 +268,17 @@ pub fn memory_ki() -> u64 {
     *MEMORY_KI.get_or_init(|| {
         crate::utils::read_utf8_file("/proc/meminfo")
             .ok()
-            .and_then(|content| {
-                content
-                    .lines()
-                    .find(|line| line.starts_with("MemTotal:"))
-                    .and_then(|line| {
-                        line.split_whitespace()
-                            .nth(1)
-                            .and_then(|s| s.parse::<u64>().ok())
-                    })
-            })
+            .and_then(|content| parse_memory_ki(&content))
             .unwrap_or(8 * 1024 * 1024) // Default 8GB if unable to read
     })
+}
+
+fn parse_memory_ki(content: &str) -> Option<u64> {
+    content
+        .lines()
+        .find(|line| line.starts_with("MemTotal:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 struct HostNodeInfo {
@@ -330,18 +541,15 @@ pub async fn register_node(
     dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
     dataplane_external_ip: Option<&str>,
 ) -> Result<()> {
-    register_node_impl(
-        db,
-        None,
+    let snapshot = capture_node_registration_snapshot(
         node_name,
         node_mode,
         node_role,
-        dataplane_health,
         dataplane_external_ip,
         None,
-        None,
     )
-    .await
+    .await;
+    register_node_snapshot(db, None, None, dataplane_health, &snapshot).await
 }
 
 pub async fn register_node_with_outbox(
@@ -353,18 +561,15 @@ pub async fn register_node_with_outbox(
     dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
     dataplane_external_ip: Option<&str>,
 ) -> Result<()> {
-    register_node_impl(
-        db,
-        Some(outbox),
+    let snapshot = capture_node_registration_snapshot(
         node_name,
         node_mode,
         node_role,
-        dataplane_health,
         dataplane_external_ip,
         None,
-        None,
     )
-    .await
+    .await;
+    register_node_snapshot(db, Some(outbox), None, dataplane_health, &snapshot).await
 }
 
 pub async fn register_node_at_addresses(
@@ -375,20 +580,16 @@ pub async fn register_node_at_addresses(
     dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
     addresses: &NodeRegistrationAddresses,
 ) -> Result<()> {
-    register_node_impl_opts(
-        db,
-        None,
-        None,
+    let snapshot = NodeRegistrationSnapshot::capture_local(
         node_name,
         node_mode,
         node_role,
-        dataplane_health,
-        addresses.external_ip(),
+        addresses.clone(),
         None,
-        Some(addresses.internal_ip().to_string()),
         None,
     )
-    .await
+    .await;
+    register_node_snapshot(db, None, None, dataplane_health, &snapshot).await
 }
 
 pub async fn register_node_with_outbox_at_addresses(
@@ -400,207 +601,54 @@ pub async fn register_node_with_outbox_at_addresses(
     dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
     addresses: &NodeRegistrationAddresses,
 ) -> Result<()> {
-    register_node_impl_opts(
-        db,
-        Some(outbox),
-        None,
+    let snapshot = NodeRegistrationSnapshot::capture_local(
         node_name,
         node_mode,
         node_role,
-        dataplane_health,
-        addresses.external_ip(),
+        addresses.clone(),
         None,
-        Some(addresses.internal_ip().to_string()),
         None,
     )
-    .await
+    .await;
+    register_node_snapshot(db, Some(outbox), None, dataplane_health, &snapshot).await
 }
 
-/// Bug 4 Option C.2: worker node registration that synchronously creates the
-/// Node on the leader via `cluster_api.apply_outbox()` before returning.
-/// This ensures the Node exists on the leader before any controller (e.g.
-/// node_subnet watcher) tries to read it, preventing the race condition
-/// where the watcher's initial sync runs before the outbox dispatch completes.
-///
-/// Falls back gracefully: if the direct apply fails, the outbox dispatch
-/// will eventually apply the registration asynchronously.
-#[allow(clippy::too_many_arguments)]
-pub async fn register_node_sync_with_outbox_at_addresses(
-    db: &dyn DatastoreBackend,
-    outbox: &Outbox,
-    cluster_api: std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient>,
+async fn capture_node_registration_snapshot(
     node_name: &str,
     node_mode: &crate::bootstrap::NodeMode,
     node_role: &crate::bootstrap::NodeRole,
-    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
-    addresses: &NodeRegistrationAddresses,
-) -> Result<()> {
-    register_node_impl_opts(
-        db,
-        Some(outbox),
-        Some(cluster_api),
-        node_name,
-        node_mode,
-        node_role,
-        dataplane_health,
-        addresses.external_ip(),
-        None,
-        Some(addresses.internal_ip().to_string()),
-        None,
-    )
-    .await
-}
-
-/// P3-11d: register_node variant that consumes a live `RaftShape` so
-/// the published `node-role.kubernetes.io/*` labels reflect cluster
-/// shape (solo voter → `leader`, 2+ voters → `controlplane[,leader]`).
-/// Called from the supervised shape-label task spawned in bootstrap.
-#[allow(clippy::too_many_arguments)]
-pub async fn register_node_with_outbox_and_shape(
-    db: &dyn DatastoreBackend,
-    outbox: &Outbox,
-    node_name: &str,
-    node_mode: &crate::bootstrap::NodeMode,
-    node_role: &crate::bootstrap::NodeRole,
-    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
     dataplane_external_ip: Option<&str>,
-    raft_shape: Option<&crate::datastore::raft::types::RaftShape>,
     grpc_port: Option<u16>,
-) -> Result<()> {
-    register_node_impl(
-        db,
-        Some(outbox),
+) -> NodeRegistrationSnapshot {
+    let node_ip = crate::kubelet::node_ip::resolve_node_ip(node_name).await;
+    NodeRegistrationSnapshot::capture_local(
         node_name,
         node_mode,
         node_role,
-        dataplane_health,
-        dataplane_external_ip,
-        raft_shape,
-        grpc_port,
-    )
-    .await
-}
-
-/// Address-explicit shape registration. Use this for multinode runtimes
-/// where `KLIGHTS_NODE_IP` is the Kubernetes InternalIP and
-/// `KLIGHTS_EXTERNAL_ENDPOINT` is the transport ingress address.
-#[allow(clippy::too_many_arguments)]
-pub async fn register_node_with_outbox_and_shape_at_addresses(
-    db: &dyn DatastoreBackend,
-    outbox: &Outbox,
-    node_name: &str,
-    node_mode: &crate::bootstrap::NodeMode,
-    node_role: &crate::bootstrap::NodeRole,
-    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
-    addresses: &NodeRegistrationAddresses,
-    raft_shape: Option<&crate::datastore::raft::types::RaftShape>,
-    grpc_port: Option<u16>,
-) -> Result<()> {
-    register_node_impl_opts(
-        db,
-        Some(outbox),
+        NodeRegistrationAddresses::new(node_ip, dataplane_external_ip.map(str::to_string)),
         None,
-        node_name,
-        node_mode,
-        node_role,
-        dataplane_health,
-        addresses.external_ip(),
-        raft_shape,
-        Some(addresses.internal_ip().to_string()),
         grpc_port,
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn register_node_impl(
-    db: &dyn DatastoreBackend,
-    outbox: Option<&Outbox>,
-    node_name: &str,
-    node_mode: &crate::bootstrap::NodeMode,
-    node_role: &crate::bootstrap::NodeRole,
-    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
-    dataplane_external_ip: Option<&str>,
-    raft_shape: Option<&crate::datastore::raft::types::RaftShape>,
-    grpc_port: Option<u16>,
-) -> Result<()> {
-    register_node_impl_opts(
-        db,
-        outbox,
-        None,
-        node_name,
-        node_mode,
-        node_role,
-        dataplane_health,
-        dataplane_external_ip,
-        raft_shape,
-        None, // use default IP resolution
-        grpc_port,
-    )
-    .await
-}
-
-/// Like `register_node_impl` but allows overriding the node IP.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn register_node_impl_opts(
+pub(crate) async fn register_node_snapshot(
     db: &dyn DatastoreBackend,
     outbox: Option<&Outbox>,
     cluster_api: Option<std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient>>,
-    node_name: &str,
-    node_mode: &crate::bootstrap::NodeMode,
-    node_role: &crate::bootstrap::NodeRole,
     dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
-    dataplane_external_ip: Option<&str>,
-    raft_shape: Option<&crate::datastore::raft::types::RaftShape>,
-    override_node_ip: Option<String>,
-    grpc_port: Option<u16>,
-) -> Result<()> {
-    register_node_impl_opts_with_git_commit(
-        db,
-        outbox,
-        cluster_api,
-        node_name,
-        node_mode,
-        node_role,
-        dataplane_health,
-        dataplane_external_ip,
-        raft_shape,
-        override_node_ip,
-        grpc_port,
-        None,
-    )
-    .await
-}
-
-/// Like `register_node_impl_opts` but allows a leader to register a remote
-/// node with the remote node's build commit instead of the leader's commit.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn register_node_impl_opts_with_git_commit(
-    db: &dyn DatastoreBackend,
-    outbox: Option<&Outbox>,
-    cluster_api: Option<std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient>>,
-    node_name: &str,
-    node_mode: &crate::bootstrap::NodeMode,
-    node_role: &crate::bootstrap::NodeRole,
-    dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
-    dataplane_external_ip: Option<&str>,
-    raft_shape: Option<&crate::datastore::raft::types::RaftShape>,
-    override_node_ip: Option<String>,
-    grpc_port: Option<u16>,
-    node_git_commit: Option<&str>,
+    snapshot: &NodeRegistrationSnapshot,
 ) -> Result<()> {
     use crate::controllers::annotations::{
         GIT_COMMIT_ANNOTATION, GRPC_PORT_ANNOTATION, HOSTPORT_RANGE_ANNOTATION,
-        NODE_MODE_ANNOTATION, hostport_range_for_local_node, node_mode_to_annotation,
+        NODE_MODE_ANNOTATION,
     };
+    snapshot.validate()?;
+    let node_name = &snapshot.node_name;
+    let node_role = &snapshot.node_role;
     tracing::info!("Registering node: {}", node_name);
-    let git_commit = node_git_commit_for_registration(node_git_commit);
-    let node_ip = if let Some(ip) = override_node_ip {
-        ip
-    } else {
-        crate::kubelet::node_ip::resolve_node_ip(node_name).await
-    };
-    let host_info = host_node_info().await;
+    let host = &snapshot.host;
+    let node_ip = snapshot.addresses.internal_ip();
 
     let conditions = NodeNetworkConditions::from_health(dataplane_health);
     let NodeNetworkConditions {
@@ -617,7 +665,9 @@ pub(crate) async fn register_node_impl_opts_with_git_commit(
         serde_json::json!({"type": "InternalIP", "address": node_ip}),
     ];
     if registration_external_ip_is_ingress_observed(node_role)
-        && let Some(external_ip) = dataplane_external_ip
+        && let Some(external_ip) = snapshot
+            .addresses
+            .external_ip()
             .map(str::trim)
             .filter(|value| !value.is_empty())
     {
@@ -632,14 +682,14 @@ pub(crate) async fn register_node_impl_opts_with_git_commit(
             "creationTimestamp": k8s_time_now(),
             "labels": {
                 "kubernetes.io/hostname": node_name,
-                "kubernetes.io/os": "linux",
-                "kubernetes.io/arch": std::env::consts::ARCH,
+                "kubernetes.io/os": host.operating_system,
+                "kubernetes.io/arch": host.architecture,
                 "node.kubernetes.io/instance-type": "klights",
             },
             "annotations": {
-                NODE_MODE_ANNOTATION: node_mode_to_annotation(node_mode),
-                HOSTPORT_RANGE_ANNOTATION: hostport_range_for_local_node(node_mode),
-                GIT_COMMIT_ANNOTATION: git_commit,
+                NODE_MODE_ANNOTATION: registration_mode_annotation(&snapshot.node_mode),
+                HOSTPORT_RANGE_ANNOTATION: registration_hostport_range(&snapshot.node_mode),
+                GIT_COMMIT_ANNOTATION: host.git_commit,
             }
         },
         "spec": {
@@ -647,13 +697,13 @@ pub(crate) async fn register_node_impl_opts_with_git_commit(
         },
         "status": {
             "capacity": {
-                "cpu": num_cpus().to_string(),
-                "memory": format!("{}Ki", memory_ki()),
+                "cpu": host.cpu_count.to_string(),
+                "memory": format!("{}Ki", host.memory_ki),
                 "pods": "110"
             },
             "allocatable": {
-                "cpu": num_cpus().to_string(),
-                "memory": format!("{}Ki", memory_ki()),
+                "cpu": host.cpu_count.to_string(),
+                "memory": format!("{}Ki", host.memory_ki),
                 "pods": "110"
             },
             "conditions": [
@@ -700,12 +750,12 @@ pub(crate) async fn register_node_impl_opts_with_git_commit(
                 }
             },
             "nodeInfo": {
-                "kubeletVersion": crate::version::kubelet_version_for_mode(node_mode),
-                "operatingSystem": "linux",
-                "architecture": std::env::consts::ARCH,
-                "osImage": host_info.os_image,
-                "kernelVersion": host_info.kernel_version,
-                "containerRuntimeVersion": "containerd://1.7.0"
+                "kubeletVersion": host.kubelet_version,
+                "operatingSystem": host.operating_system,
+                "architecture": host.architecture,
+                "osImage": host.os_image,
+                "kernelVersion": host.kernel_version,
+                "containerRuntimeVersion": host.container_runtime_version,
             }
         }
     });
@@ -716,13 +766,13 @@ pub(crate) async fn register_node_impl_opts_with_git_commit(
         // P3-11d: stamp the shape-driven role label set. With no raft_shape
         // the helper falls back to the static `node_role_label_key`, so
         // legacy LeaderFollower mode keeps the same wire bytes.
-        for key in role_label_keys_for_shape(node_role, raft_shape) {
+        for key in role_label_keys_for_shape(node_role, snapshot.raft_shape.as_ref()) {
             labels.insert(key.to_string(), serde_json::json!(""));
         }
     }
     // Publish grpc-port annotation for controlplane nodes so workers can
     // discover all controlplane endpoints from Node watch.
-    if let Some(port) = grpc_port
+    if let Some(port) = snapshot.grpc_port
         && let Some(annotations) = node
             .pointer_mut("/metadata/annotations")
             .and_then(|a| a.as_object_mut())
@@ -907,13 +957,6 @@ fn current_git_commit_annotation_patch_command(node_name: &str) -> StorageComman
         preconditions: ResourcePreconditions::default(),
         strict_resource_version: false,
     }
-}
-
-fn node_git_commit_for_registration(explicit: Option<&str>) -> &str {
-    explicit
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(crate::version::GIT_COMMIT_SHORT)
 }
 
 async fn send_node_command(
@@ -2644,6 +2687,86 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| !value.trim().is_empty()),
             "Node status.nodeInfo.containerRuntimeVersion must be populated for kubectl wide output"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_registration_snapshot_preserves_remote_host_facts_exactly() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let snapshot = NodeRegistrationSnapshot {
+            node_name: "remote-cp".to_string(),
+            node_mode: crate::controllers::annotations::NodePeerMode::Root,
+            node_role: crate::bootstrap::NodeRole::Controlplane {
+                leader_endpoints: vec!["https://192.0.2.10:7679".to_string()],
+                token: None,
+                skip_ca: false,
+                as_learner: false,
+            },
+            addresses: NodeRegistrationAddresses::new(
+                "172.31.50.2".to_string(),
+                Some("192.0.2.50".to_string()),
+            ),
+            raft_shape: Some(crate::datastore::raft::types::RaftShape {
+                voter_count: 2,
+                is_leader: false,
+                is_learner: false,
+            }),
+            grpc_port: Some(7679),
+            host: NodeRegistrationHostFacts {
+                cpu_count: 37,
+                memory_ki: 98_765_432,
+                architecture: "remote-arch".to_string(),
+                operating_system: "linux".to_string(),
+                os_image: "Remote Linux 42".to_string(),
+                kernel_version: "9.8.7-remote".to_string(),
+                container_runtime_version: "containerd://9.9.9".to_string(),
+                kubelet_version: "v1.34.0-klights.remote".to_string(),
+                git_commit: "joinerabc".to_string(),
+            },
+        };
+
+        register_node_snapshot(&db, None, None, None, &snapshot)
+            .await
+            .unwrap();
+
+        let node = db
+            .get_resource("v1", "Node", None, "remote-cp")
+            .await
+            .unwrap()
+            .expect("remote Node must be registered");
+        assert_eq!(node.data["status"]["capacity"]["cpu"], "37");
+        assert_eq!(node.data["status"]["capacity"]["memory"], "98765432Ki");
+        assert_eq!(node.data["status"]["allocatable"]["cpu"], "37");
+        assert_eq!(node.data["status"]["allocatable"]["memory"], "98765432Ki");
+        assert_eq!(node.data["metadata"]["labels"]["kubernetes.io/os"], "linux");
+        assert_eq!(
+            node.data["metadata"]["labels"]["kubernetes.io/arch"],
+            "remote-arch"
+        );
+        assert_eq!(
+            node.data["status"]["nodeInfo"]["architecture"],
+            "remote-arch"
+        );
+        assert_eq!(node.data["status"]["nodeInfo"]["operatingSystem"], "linux");
+        assert_eq!(
+            node.data["status"]["nodeInfo"]["osImage"],
+            "Remote Linux 42"
+        );
+        assert_eq!(
+            node.data["status"]["nodeInfo"]["kernelVersion"],
+            "9.8.7-remote"
+        );
+        assert_eq!(
+            node.data["status"]["nodeInfo"]["containerRuntimeVersion"],
+            "containerd://9.9.9"
+        );
+        assert_eq!(
+            node.data["status"]["nodeInfo"]["kubeletVersion"],
+            "v1.34.0-klights.remote"
+        );
+        assert_eq!(
+            node.data["metadata"]["annotations"]["klights.io/git-commit"],
+            "joinerabc"
         );
     }
 

@@ -17,6 +17,7 @@ use crate::task_supervisor::TaskSupervisor;
 pub struct OpenLeaderArgs<'a> {
     pub config: &'a Arc<KlightsConfig>,
     pub role: &'a NodeRole,
+    pub node_mode: &'a crate::bootstrap::NodeMode,
     pub supervisor: Arc<TaskSupervisor>,
     pub grpc_transport_policy:
         crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
@@ -68,6 +69,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     let OpenLeaderArgs {
         config,
         role,
+        node_mode,
         supervisor,
         grpc_transport_policy,
         shutdown_token,
@@ -346,7 +348,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 leader_endpoints,
                 token,
                 skip_ca,
-                as_learner,
+                as_learner: _,
             } = r
             {
                 tracing::info!(
@@ -365,7 +367,6 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 let external_endpoint = local_dataplane.endpoint.clone();
                 let tls_port = config.tls_port;
                 let node_name = config.node_name.clone();
-                let node_internal_ip = node_ip.to_string();
                 let join_supervisor = supervisor.clone();
                 let join_dataplane = local_dataplane.clone();
                 // The JoinAsControlplane RPC must trust the seed cluster's CA
@@ -381,7 +382,19 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 } else {
                     *skip_ca
                 };
-                let as_learner = *as_learner;
+                let join_node_registration =
+                    crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
+                        &config.node_name,
+                        node_mode,
+                        r,
+                        crate::kubelet::node::NodeRegistrationAddresses::new(
+                            node_ip.to_string(),
+                            config.external_endpoint.clone(),
+                        ),
+                        None,
+                        Some(config.tls_port),
+                    )
+                    .await;
                 let join_namespace = config.containerd_namespace.clone();
                 let join_supervisor_for_loop = join_supervisor.clone();
                 let join_grpc_transport_policy = grpc_transport_policy.clone();
@@ -459,9 +472,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                     .join_as_controlplane_rpc(
                                         node_id,
                                         &my_addr,
-                                        &node_name,
-                                        as_learner,
-                                        &node_internal_ip,
+                                        &join_node_registration,
                                     )
                                     .await
                                 {

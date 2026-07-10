@@ -504,22 +504,28 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
     // guarantees the Node exists when the watcher syncs, and that the watcher's
     // Node watch subscription is established after the registration event.
     //
-    // Option C.2: use register_node_sync_with_outbox_at_addresses which
-    // applies the registration synchronously via cluster_api.apply_outbox()
+    // Option C.2: apply the typed registration snapshot synchronously via
+    // cluster_api.apply_outbox()
     // before enqueuing in the outbox. This ensures the Node exists on the
     // leader before the node_subnet watcher's initial sync_peer_routes call,
     // which reads the Node via gRPC to write its dataplane-readiness conditions.
     let registration_addresses =
         kubelet::node::NodeRegistrationAddresses::new(node_ip.clone(), None);
-    if let Err(e) = kubelet::node::register_node_sync_with_outbox_at_addresses(
-        db,
-        outbox.as_ref(),
-        cluster_api.clone(),
+    let registration = kubelet::node::NodeRegistrationSnapshot::capture_local(
         &config.node_name,
         &node_mode,
         &cli.role,
+        registration_addresses,
+        None,
+        None,
+    )
+    .await;
+    if let Err(e) = kubelet::node::register_node_snapshot(
+        db,
+        Some(outbox.as_ref()),
+        Some(cluster_api.clone()),
         Some(&dataplane_health),
-        &registration_addresses,
+        &registration,
     )
     .await
     {
@@ -817,6 +823,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let ds = phases::datastore::open_leader(phases::datastore::OpenLeaderArgs {
         config: &config,
         role: &cli.role,
+        node_mode: &node_mode,
         supervisor: task_supervisor.clone(),
         grpc_transport_policy: grpc_transport_policy.clone(),
         shutdown_token: shutdown_token.clone(),

@@ -826,9 +826,14 @@ impl RaftNodeJoinHandler {
         addr: &str,
         as_learner: bool,
         node_internal_ip: Option<String>,
-        node_git_commit: Option<String>,
+        node_registration: Option<
+            crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot,
+        >,
+        legacy_node_git_commit: Option<String>,
     ) -> anyhow::Result<()> {
-        use crate::kubelet::node::NodeRegistrationAddresses;
+        use crate::kubelet::node::{
+            NodeRegistrationAddresses, NodeRegistrationHostFacts, NodeRegistrationSnapshot,
+        };
         // Extract the joiner's IP from the gRPC address
         // (e.g. "https://10.99.0.14:7679" → "10.99.0.14")
         let joiner_ip = addr
@@ -842,7 +847,6 @@ impl RaftNodeJoinHandler {
         // grpc-port annotation (workers use it for controlplane discovery).
         let joiner_grpc_port = addr.rsplit(':').next().and_then(|s| s.parse::<u16>().ok());
 
-        let node_mode = crate::bootstrap::NodeMode::Root;
         let node_role = crate::bootstrap::NodeRole::Controlplane {
             leader_endpoints: vec![addr.to_string()],
             token: None,
@@ -864,21 +868,42 @@ impl RaftNodeJoinHandler {
             node_internal_ip.unwrap_or_else(|| joiner_ip.clone()),
             Some(joiner_ip),
         );
-        crate::kubelet::node::register_node_impl_opts_with_git_commit(
-            self.db.as_ref(),
-            None,
-            None,
-            node_name,
-            &node_mode,
-            &node_role,
-            None,
-            registration_addresses.external_ip(),
-            Some(&joiner_shape),
-            Some(registration_addresses.internal_ip().to_string()),
-            joiner_grpc_port,
-            node_git_commit.as_deref(),
-        )
-        .await
+        let (node_mode, host) = match node_registration {
+            Some(registration) => (registration.node_mode, registration.host),
+            None => {
+                let existing = self
+                    .db
+                    .get_resource("v1", "Node", None, node_name)
+                    .await?
+                    .with_context(|| {
+                        format!(
+                            "legacy JoinAsControlplane rejoin for {node_name} has no persisted Node registration snapshot"
+                        )
+                    })?;
+                let node_mode = crate::controllers::annotations::parse_node_peer_mode(
+                    existing
+                        .data
+                        .pointer("/metadata/annotations/klights.io~1mode")
+                        .and_then(serde_json::Value::as_str),
+                )?;
+                let host = NodeRegistrationHostFacts::from_existing_node(
+                    &existing.data,
+                    legacy_node_git_commit.as_deref(),
+                )?;
+                (node_mode, host)
+            }
+        };
+        let snapshot = NodeRegistrationSnapshot {
+            node_name: node_name.to_string(),
+            node_mode,
+            node_role,
+            addresses: registration_addresses,
+            raft_shape: Some(joiner_shape),
+            grpc_port: joiner_grpc_port,
+            host,
+        };
+        crate::kubelet::node::register_node_snapshot(self.db.as_ref(), None, None, None, &snapshot)
+            .await
     }
 
     async fn refresh_cluster_membership_metadata(
@@ -956,17 +981,21 @@ fn merge_controlplane_join_membership_metadata(
 impl crate::replication::grpc::raft_rpc::ControlplaneJoinHandler for RaftNodeJoinHandler {
     async fn join(
         &self,
-        node_id: u64,
-        addr: String,
-        node_name: String,
-        as_learner: bool,
-        node_internal_ip: Option<String>,
-        node_git_commit: Option<String>,
+        request: crate::replication::grpc::raft_rpc::ControlplaneJoinRequest,
     ) -> std::result::Result<
         crate::replication::grpc::raft_rpc::ControlplaneJoinOutcome,
         crate::replication::grpc::raft_rpc::RaftRpcRouterError,
     > {
         use crate::replication::grpc::raft_rpc::{ControlplaneJoinOutcome, RaftRpcRouterError};
+        let crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
+            node_id,
+            addr,
+            node_name,
+            as_learner,
+            node_internal_ip,
+            node_registration,
+            legacy_node_git_commit,
+        } = request;
         let metrics = self.node.raft.metrics().borrow().clone();
         let is_leader = metrics.current_leader == Some(self.node.node_id);
         if !is_leader {
@@ -1019,7 +1048,8 @@ impl crate::replication::grpc::raft_rpc::ControlplaneJoinHandler for RaftNodeJoi
                 &addr,
                 as_learner,
                 node_internal_ip,
-                node_git_commit,
+                node_registration,
+                legacy_node_git_commit,
             )
             .await
         {
@@ -2009,6 +2039,40 @@ mod tests {
         ds
     }
 
+    fn test_controlplane_join_request(
+        node_id: u64,
+        addr: &str,
+        node_name: &str,
+        as_learner: bool,
+        node_internal_ip: Option<&str>,
+        git_commit: &str,
+    ) -> crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
+        crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
+            node_id,
+            addr: addr.to_string(),
+            node_name: node_name.to_string(),
+            as_learner,
+            node_internal_ip: node_internal_ip.map(str::to_string),
+            node_registration: Some(
+                crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
+                    node_mode: crate::controllers::annotations::NodePeerMode::Root,
+                    host: crate::kubelet::node::NodeRegistrationHostFacts {
+                        cpu_count: 4,
+                        memory_ki: 8 * 1024 * 1024,
+                        architecture: "test-arch".to_string(),
+                        operating_system: "linux".to_string(),
+                        os_image: "Test Linux".to_string(),
+                        kernel_version: "6.1-test".to_string(),
+                        container_runtime_version: "containerd://1.7.0".to_string(),
+                        kubelet_version: "v1.34.0-test".to_string(),
+                        git_commit: git_commit.to_string(),
+                    },
+                },
+            ),
+            legacy_node_git_commit: None,
+        }
+    }
+
     #[tokio::test]
     async fn join_handler_on_leader_runs_add_voter_and_reports_count() {
         use crate::datastore::raft::network::LoopbackRegistry;
@@ -2028,14 +2092,14 @@ mod tests {
 
         let handler = RaftNodeJoinHandler::new(leader.clone(), test_db().await);
         let outcome = handler
-            .join(
+            .join(test_controlplane_join_request(
                 51,
-                "https://10.99.0.51:7679".into(),
-                "n51".into(),
+                "https://10.99.0.51:7679",
+                "n51",
                 false,
                 None,
-                Some("joinerhash1".to_string()),
-            )
+                "joinerhash1",
+            ))
             .await
             .expect("leader runs add_voter");
         match outcome {
@@ -2066,6 +2130,40 @@ mod tests {
             git_commit,
             Some("joinerhash1"),
             "leader-side Node registration must stamp the joining node's git commit"
+        );
+        assert_eq!(node.data["status"]["capacity"]["cpu"], "4");
+        assert_eq!(node.data["status"]["capacity"]["memory"], "8388608Ki");
+        assert_eq!(node.data["status"]["nodeInfo"]["architecture"], "test-arch");
+        assert_eq!(node.data["status"]["nodeInfo"]["osImage"], "Test Linux");
+
+        handler
+            .join(
+                crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
+                    node_id: 51,
+                    addr: "https://10.99.0.51:7679".to_string(),
+                    node_name: "n51".to_string(),
+                    as_learner: false,
+                    node_internal_ip: None,
+                    node_registration: None,
+                    legacy_node_git_commit: Some("legacyrejoin".to_string()),
+                },
+            )
+            .await
+            .expect("persisted member may rejoin without the new snapshot");
+        let rejoined = handler
+            .db
+            .get_resource("v1", "Node", None, "n51")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejoined.data["status"]["capacity"]["cpu"], "4");
+        assert_eq!(
+            rejoined.data["status"]["nodeInfo"]["architecture"], "test-arch",
+            "legacy rejoin must reuse persisted joiner facts, not leader facts"
+        );
+        assert_eq!(
+            rejoined.data["metadata"]["annotations"]["klights.io/git-commit"], "legacyrejoin",
+            "legacy commit remains joiner-owned"
         );
     }
 
@@ -2100,14 +2198,14 @@ mod tests {
 
         let handler = RaftNodeJoinHandler::new(leader.clone(), leader_db.clone());
         let outcome = handler
-            .join(
+            .join(test_controlplane_join_request(
                 53,
-                "https://10.99.0.53:7679".into(),
-                "mn-controlplane2".into(),
+                "https://10.99.0.53:7679",
+                "mn-controlplane2",
                 false,
                 None,
-                None,
-            )
+                "joinerhash2",
+            ))
             .await
             .expect("leader runs add_voter");
         assert!(
@@ -2141,14 +2239,14 @@ mod tests {
         let arc = Arc::new(node);
         let handler = RaftNodeJoinHandler::new(arc, test_db().await);
         let outcome = handler
-            .join(
+            .join(test_controlplane_join_request(
                 61,
-                "https://10.99.0.61:7679".into(),
-                "n61".into(),
+                "https://10.99.0.61:7679",
+                "n61",
                 false,
                 None,
-                None,
-            )
+                "joinerhash3",
+            ))
             .await
             .expect("handler returns Denied not error");
         match outcome {
@@ -2179,14 +2277,14 @@ mod tests {
 
         let handler = RaftNodeJoinHandler::new(leader.clone(), test_db().await);
         let outcome = handler
-            .join(
+            .join(test_controlplane_join_request(
                 71,
-                "https://10.99.0.71:7679".into(),
-                "n71".into(),
+                "https://10.99.0.71:7679",
+                "n71",
                 true,
                 None,
-                None,
-            )
+                "joinerhash4",
+            ))
             .await
             .expect("leader runs add_learner_only");
         match outcome {
@@ -2252,14 +2350,14 @@ mod tests {
         let leader_db = test_db().await;
         let handler = RaftNodeJoinHandler::new(leader.clone(), leader_db.clone());
         let outcome = handler
-            .join(
+            .join(test_controlplane_join_request(
                 73,
-                "https://10.99.0.73:7679".into(),
-                "n73".into(),
+                "https://10.99.0.73:7679",
+                "n73",
                 true,
                 None,
-                None,
-            )
+                "joinerhash5",
+            ))
             .await
             .expect("learner admission succeeds");
         assert!(
@@ -2313,14 +2411,14 @@ mod tests {
         let leader_db = test_db().await;
         let handler = RaftNodeJoinHandler::new(leader.clone(), leader_db.clone());
         let outcome = handler
-            .join(
+            .join(test_controlplane_join_request(
                 81,
-                "https://10.99.0.81:7679".into(),
-                "n81".into(),
+                "https://10.99.0.81:7679",
+                "n81",
                 false,
-                Some("172.31.81.2".to_string()),
-                None,
-            )
+                Some("172.31.81.2"),
+                "joinerhash6",
+            ))
             .await
             .expect("voter admission succeeds");
         assert!(

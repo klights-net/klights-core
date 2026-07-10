@@ -104,6 +104,27 @@ fn validate_controlplane_join_dataplane_metadata_with_endpoint(
     )
 }
 
+fn validate_controlplane_node_registration(
+    registration: generated::NodeRegistrationSnapshot,
+) -> Result<crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot> {
+    let node_mode =
+        crate::controllers::annotations::parse_node_peer_mode(Some(&registration.node_mode))
+            .map_err(|err| anyhow!(err))?;
+    let host = crate::kubelet::node::NodeRegistrationHostFacts {
+        cpu_count: registration.cpu_count,
+        memory_ki: registration.memory_ki,
+        architecture: registration.architecture,
+        operating_system: registration.operating_system,
+        os_image: registration.os_image,
+        kernel_version: registration.kernel_version,
+        container_runtime_version: registration.container_runtime_version,
+        kubelet_version: registration.kubelet_version,
+        git_commit: registration.git_commit,
+    };
+    host.validate()?;
+    Ok(crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot { node_mode, host })
+}
+
 fn uri_host_for_ip(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(ip) => ip.to_string(),
@@ -1627,7 +1648,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             .await
             .is_ok();
         let client_cert_identity = node_client_identity(&request)?;
-        let req = request.into_inner();
+        let mut req = request.into_inner();
         let Some(identity) = client_cert_identity.as_ref() else {
             return Err(Status::unauthenticated(
                 "JoinAsControlplane requires a node client certificate; bootstrap tokens are only valid for CSR bootstrap",
@@ -1650,27 +1671,65 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         // is short-lived and gone by then; raft membership is the persisted
         // record of "this node is an authorized control plane"). A worker has
         // neither and is rejected here.
-        if !controlplane_token_authenticated
-            && !handler.is_controlplane_member(&req.node_name).await
-        {
+        let existing_member = handler.is_controlplane_member(&req.node_name).await;
+        if !controlplane_token_authenticated && !existing_member {
             return Err(Status::permission_denied(
                 "JoinAsControlplane requires a valid controlplane bootstrap token (first join) or an existing controlplane membership (rejoin)",
             ));
         }
+        let node_registration = match req.node_registration.take() {
+            Some(registration) => Some(
+                validate_controlplane_node_registration(registration)
+                    .map_err(|err| Status::invalid_argument(err.to_string()))?,
+            ),
+            None if existing_member => None,
+            None => {
+                return Err(Status::invalid_argument(
+                    "first-time JoinAsControlplane requires node_registration host facts",
+                ));
+            }
+        };
         let observed_ip = remote_addr.map(|addr| addr.ip());
         let dataplane =
             validate_controlplane_join_dataplane_metadata_with_endpoint(&req, observed_ip)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        if let Some(registration) = node_registration.as_ref() {
+            let mode_matches = matches!(
+                (&registration.node_mode, dataplane.mode),
+                (
+                    crate::controllers::annotations::NodePeerMode::Root,
+                    DataplaneMode::Root
+                ) | (
+                    crate::controllers::annotations::NodePeerMode::Rootless,
+                    DataplaneMode::Rootless
+                )
+            );
+            if !mode_matches {
+                return Err(Status::invalid_argument(
+                    "node_registration.node_mode must match dataplane_mode",
+                ));
+            }
+        }
         let raft_addr = raft_addr_with_observed_host(&req.addr, observed_ip)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let node_internal_ip = Some(req.node_internal_ip).filter(|value| !value.trim().is_empty());
+        if let Some(internal_ip) = node_internal_ip.as_deref() {
+            internal_ip.parse::<IpAddr>().map_err(|err| {
+                Status::invalid_argument(format!("invalid node_internal_ip: {err}"))
+            })?;
+        }
         let outcome = handler
             .join(
-                req.node_id,
-                raft_addr,
-                req.node_name,
-                req.as_learner,
-                Some(req.node_internal_ip).filter(|value| !value.trim().is_empty()),
-                Some(req.node_git_commit).filter(|value| !value.trim().is_empty()),
+                crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
+                    node_id: req.node_id,
+                    addr: raft_addr,
+                    node_name: req.node_name,
+                    as_learner: req.as_learner,
+                    node_internal_ip,
+                    node_registration,
+                    legacy_node_git_commit: Some(req.node_git_commit)
+                        .filter(|value| !value.trim().is_empty()),
+                },
             )
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
@@ -3117,20 +3176,54 @@ mod tests {
 
     struct AcceptingControlplaneJoinHandler;
 
+    fn test_node_registration_proto(git_commit: &str) -> generated::NodeRegistrationSnapshot {
+        generated::NodeRegistrationSnapshot {
+            cpu_count: 6,
+            memory_ki: 12 * 1024 * 1024,
+            architecture: "test-arch".to_string(),
+            operating_system: "linux".to_string(),
+            os_image: "Test Linux".to_string(),
+            kernel_version: "6.1-test".to_string(),
+            container_runtime_version: "containerd://1.7.0".to_string(),
+            kubelet_version: "v1.34.0-test".to_string(),
+            git_commit: git_commit.to_string(),
+            node_mode: "root".to_string(),
+        }
+    }
+
+    #[test]
+    fn controlplane_node_registration_rejects_empty_or_invalid_host_facts() {
+        let mut cases = Vec::new();
+        let mut zero_cpu = test_node_registration_proto("joiner");
+        zero_cpu.cpu_count = 0;
+        cases.push(("zero-cpu", zero_cpu));
+        let mut zero_memory = test_node_registration_proto("joiner");
+        zero_memory.memory_ki = 0;
+        cases.push(("zero-memory", zero_memory));
+        let mut empty_kernel = test_node_registration_proto("joiner");
+        empty_kernel.kernel_version.clear();
+        cases.push(("empty-kernel", empty_kernel));
+        let mut invalid_mode = test_node_registration_proto("joiner");
+        invalid_mode.node_mode = "leader-root".to_string();
+        cases.push(("invalid-mode", invalid_mode));
+
+        for (name, registration) in cases {
+            assert!(
+                super::validate_controlplane_node_registration(registration).is_err(),
+                "{name} must be rejected"
+            );
+        }
+    }
+
     #[async_trait::async_trait]
     impl ControlplaneJoinHandler for AcceptingControlplaneJoinHandler {
         async fn join(
             &self,
-            _node_id: u64,
-            _addr: String,
-            _node_name: String,
-            as_learner: bool,
-            _node_internal_ip: Option<String>,
-            _node_git_commit: Option<String>,
+            request: crate::replication::grpc::raft_rpc::ControlplaneJoinRequest,
         ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError> {
             Ok(ControlplaneJoinOutcome::Accepted {
-                voter_count_after: if as_learner { 1 } else { 2 },
-                admitted_as_learner: as_learner,
+                voter_count_after: if request.as_learner { 1 } else { 2 },
+                admitted_as_learner: request.as_learner,
                 ca_cert_pem: String::new(),
                 encrypted_ca_key: Vec::new(),
                 ca_key_nonce: [0u8; 12],
@@ -3154,16 +3247,11 @@ mod tests {
     impl ControlplaneJoinHandler for NonMemberControlplaneJoinHandler {
         async fn join(
             &self,
-            _node_id: u64,
-            _addr: String,
-            _node_name: String,
-            as_learner: bool,
-            _node_internal_ip: Option<String>,
-            _node_git_commit: Option<String>,
+            request: crate::replication::grpc::raft_rpc::ControlplaneJoinRequest,
         ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError> {
             Ok(ControlplaneJoinOutcome::Accepted {
-                voter_count_after: if as_learner { 1 } else { 2 },
-                admitted_as_learner: as_learner,
+                voter_count_after: if request.as_learner { 1 } else { 2 },
+                admitted_as_learner: request.as_learner,
                 ca_cert_pem: String::new(),
                 encrypted_ca_key: Vec::new(),
                 ca_key_nonce: [0u8; 12],
@@ -3182,7 +3270,9 @@ mod tests {
         node_name: String,
         as_learner: bool,
         node_internal_ip: Option<String>,
-        node_git_commit: Option<String>,
+        node_registration:
+            Option<crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot>,
+        legacy_node_git_commit: Option<String>,
     }
 
     #[derive(Default)]
@@ -3203,13 +3293,17 @@ mod tests {
     impl ControlplaneJoinHandler for RecordingControlplaneJoinHandler {
         async fn join(
             &self,
-            node_id: u64,
-            addr: String,
-            node_name: String,
-            as_learner: bool,
-            node_internal_ip: Option<String>,
-            node_git_commit: Option<String>,
+            request: crate::replication::grpc::raft_rpc::ControlplaneJoinRequest,
         ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError> {
+            let crate::replication::grpc::raft_rpc::ControlplaneJoinRequest {
+                node_id,
+                addr,
+                node_name,
+                as_learner,
+                node_internal_ip,
+                node_registration,
+                legacy_node_git_commit,
+            } = request;
             self.calls
                 .lock()
                 .expect("recording join handler mutex poisoned")
@@ -3219,7 +3313,8 @@ mod tests {
                     node_name,
                     as_learner,
                     node_internal_ip,
-                    node_git_commit,
+                    node_registration,
+                    legacy_node_git_commit,
                 });
             Ok(ControlplaneJoinOutcome::Accepted {
                 voter_count_after: if as_learner { 1 } else { 2 },
@@ -4178,6 +4273,7 @@ mod tests {
                 dataplane_encryption: "enabled".to_string(),
                 node_internal_ip: "172.31.50.2".to_string(),
                 node_git_commit: "testhash1".to_string(),
+                node_registration: Some(test_node_registration_proto("testhash1")),
             },
             "worker-1",
         );
@@ -4210,22 +4306,21 @@ mod tests {
             .with_controlplane_join_handler(Arc::new(NonMemberControlplaneJoinHandler))
             .with_leader_gate(is_leader_rx);
 
-        let mut request = request_with_node_client_cert(
-            generated::JoinAsControlplaneRequest {
-                node_id: raft_node_id_for_node_name_in_test("mn-controlplane2"),
-                addr: "https://192.0.2.20:7679".to_string(),
-                node_name: "mn-controlplane2".to_string(),
-                as_learner: false,
-                dataplane_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
-                dataplane_endpoint: "192.0.2.20".to_string(),
-                dataplane_port: 7679,
-                dataplane_mode: "root".to_string(),
-                dataplane_encryption: "enabled".to_string(),
-                node_internal_ip: "172.31.20.2".to_string(),
-                node_git_commit: "testhash2".to_string(),
-            },
-            "mn-controlplane2",
-        );
+        let join_request = generated::JoinAsControlplaneRequest {
+            node_id: raft_node_id_for_node_name_in_test("mn-controlplane2"),
+            addr: "https://192.0.2.20:7679".to_string(),
+            node_name: "mn-controlplane2".to_string(),
+            as_learner: false,
+            dataplane_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            dataplane_endpoint: "192.0.2.20".to_string(),
+            dataplane_port: 7679,
+            dataplane_mode: "root".to_string(),
+            dataplane_encryption: "enabled".to_string(),
+            node_internal_ip: "172.31.20.2".to_string(),
+            node_git_commit: "testhash2".to_string(),
+            node_registration: Some(test_node_registration_proto("testhash2")),
+        };
+        let mut request = request_with_node_client_cert(join_request.clone(), "mn-controlplane2");
         request.metadata_mut().insert(
             "x-klights-join-token",
             "123456.fedcba9876543210".parse().unwrap(),
@@ -4242,6 +4337,19 @@ mod tests {
                 _
             ))
         ));
+
+        let mut legacy_first_join = join_request;
+        legacy_first_join.node_registration = None;
+        let mut request = request_with_node_client_cert(legacy_first_join, "mn-controlplane2");
+        request.metadata_mut().insert(
+            "x-klights-join-token",
+            "123456.fedcba9876543210".parse().unwrap(),
+        );
+        let status = grpc
+            .join_as_controlplane(request)
+            .await
+            .expect_err("first join without typed node registration must be rejected");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
     fn raft_node_id_for_node_name_in_test(node_name: &str) -> u64 {
@@ -4521,7 +4629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_controlplane_join_persists_dataplane_metadata() {
+    async fn accepted_legacy_controlplane_rejoin_without_snapshot_persists_dataplane_metadata() {
         let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
@@ -4551,6 +4659,7 @@ mod tests {
             dataplane_encryption: "enabled".to_string(),
             node_internal_ip: "172.31.20.2".to_string(),
             node_git_commit: "testhash3".to_string(),
+            node_registration: None,
         });
 
         let response = client
@@ -4606,6 +4715,7 @@ mod tests {
             dataplane_encryption: "enabled".to_string(),
             node_internal_ip: "172.31.14.2".to_string(),
             node_git_commit: "joinhash1".to_string(),
+            node_registration: Some(test_node_registration_proto("joinhash1")),
         });
 
         let response = client
@@ -4629,7 +4739,13 @@ mod tests {
                 node_name: "mn-controlplane2".to_string(),
                 as_learner: false,
                 node_internal_ip: Some("172.31.14.2".to_string()),
-                node_git_commit: Some("joinhash1".to_string()),
+                node_registration: Some(
+                    super::validate_controlplane_node_registration(test_node_registration_proto(
+                        "joinhash1",
+                    ))
+                    .unwrap(),
+                ),
+                legacy_node_git_commit: Some("joinhash1".to_string()),
             }],
             "raft membership must use the externally observed peer address"
         );

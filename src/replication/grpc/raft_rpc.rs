@@ -65,6 +65,25 @@ pub enum ControlplaneJoinOutcome {
     Denied { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteNodeRegistrationSnapshot {
+    pub node_mode: crate::controllers::annotations::NodePeerMode,
+    pub host: crate::kubelet::node::NodeRegistrationHostFacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlplaneJoinRequest {
+    pub node_id: u64,
+    pub addr: String,
+    pub node_name: String,
+    pub as_learner: bool,
+    pub node_internal_ip: Option<String>,
+    pub node_registration: Option<RemoteNodeRegistrationSnapshot>,
+    /// Rolling-upgrade compatibility for a persisted member whose request
+    /// predates the typed snapshot. Never used to synthesize other host facts.
+    pub legacy_node_git_commit: Option<String>,
+}
+
 #[async_trait]
 pub trait ControlplaneJoinHandler: Send + Sync {
     /// T1.5.x: `as_learner=true` dispatches to `RaftNode::add_learner_only`
@@ -73,12 +92,7 @@ pub trait ControlplaneJoinHandler: Send + Sync {
     /// (`RaftNode::add_voter`).
     async fn join(
         &self,
-        node_id: u64,
-        addr: String,
-        node_name: String,
-        as_learner: bool,
-        node_internal_ip: Option<String>,
-        node_git_commit: Option<String>,
+        request: ControlplaneJoinRequest,
     ) -> Result<ControlplaneJoinOutcome, RaftRpcRouterError>;
 
     /// Whether `node_name` is a current raft member (voter or learner) of this

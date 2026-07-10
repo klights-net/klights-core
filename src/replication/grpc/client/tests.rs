@@ -1485,6 +1485,49 @@ mod cases {
         handle.abort();
     }
 
+    #[test]
+    fn controlplane_join_proto_preserves_joiner_owned_registration_snapshot() {
+        let registration = crate::kubelet::node::NodeRegistrationSnapshot {
+            node_name: "cp-remote".to_string(),
+            node_mode: crate::controllers::annotations::NodePeerMode::Rootless,
+            node_role: crate::bootstrap::NodeRole::Controlplane {
+                leader_endpoints: vec!["https://192.0.2.1:7679".to_string()],
+                token: None,
+                skip_ca: false,
+                as_learner: true,
+            },
+            addresses: crate::kubelet::node::NodeRegistrationAddresses::new(
+                "172.31.40.2".to_string(),
+                Some("192.0.2.40".to_string()),
+            ),
+            raft_shape: None,
+            grpc_port: Some(7679),
+            host: crate::kubelet::node::NodeRegistrationHostFacts {
+                cpu_count: 23,
+                memory_ki: 45_678_901,
+                architecture: "joiner-arch".to_string(),
+                operating_system: "linux".to_string(),
+                os_image: "Joiner OS".to_string(),
+                kernel_version: "7.7-joiner".to_string(),
+                container_runtime_version: "containerd://8.0".to_string(),
+                kubelet_version: "v1.34.0-joiner".to_string(),
+                git_commit: "joinercommit".to_string(),
+            },
+        };
+
+        let proto = crate::replication::grpc::client::node_registration_to_proto(&registration);
+        assert_eq!(proto.cpu_count, 23);
+        assert_eq!(proto.memory_ki, 45_678_901);
+        assert_eq!(proto.architecture, "joiner-arch");
+        assert_eq!(proto.operating_system, "linux");
+        assert_eq!(proto.os_image, "Joiner OS");
+        assert_eq!(proto.kernel_version, "7.7-joiner");
+        assert_eq!(proto.container_runtime_version, "containerd://8.0");
+        assert_eq!(proto.kubelet_version, "v1.34.0-joiner");
+        assert_eq!(proto.git_commit, "joinercommit");
+        assert_eq!(proto.node_mode, "rootless");
+    }
+
     #[tokio::test]
     async fn every_unary_rpc_is_bounded_by_per_call_deadline() {
         // bug-grpc A2 acceptance: NO unary worker→leader RPC may await a raw
@@ -1591,9 +1634,24 @@ mod cases {
                 bound_node_uid: None,
             })
         );
+        let controlplane_registration =
+            crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
+                "cp2",
+                &crate::bootstrap::NodeMode::Root,
+                &crate::bootstrap::NodeRole::Controlplane {
+                    leader_endpoints: vec!["https://127.0.0.1:1".to_string()],
+                    token: None,
+                    skip_ca: false,
+                    as_learner: false,
+                },
+                crate::kubelet::node::NodeRegistrationAddresses::new("127.0.0.1".to_string(), None),
+                None,
+                Some(7679),
+            )
+            .await;
         assert_bounded!(
             "join_as_controlplane_rpc",
-            client.join_as_controlplane_rpc(2, "https://127.0.0.1:1", "cp2", false, "127.0.0.1")
+            client.join_as_controlplane_rpc(2, "https://127.0.0.1:1", &controlplane_registration,)
         );
         assert_bounded!(
             "sign_controlplane_csr_rpc",

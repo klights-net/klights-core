@@ -480,16 +480,21 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             node_ip.to_string(),
             config.external_endpoint.clone(),
         );
-        kubelet::node::register_node_with_outbox_and_shape_at_addresses(
-            db,
-            &outbox_runtime,
+        let registration = kubelet::node::NodeRegistrationSnapshot::capture_local(
             &config.node_name,
             node_mode,
             &cli.role,
-            Some(dataplane_health),
-            &registration_addresses,
+            registration_addresses,
             initial_raft_shape.as_ref(),
             grpc_port,
+        )
+        .await;
+        kubelet::node::register_node_snapshot(
+            db,
+            Some(&outbox_runtime),
+            None,
+            Some(dataplane_health),
+            &registration,
         )
         .await
     };
@@ -606,16 +611,21 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                                 node_ip_task.clone(),
                                 external_endpoint_task.clone(),
                             );
-                        let res = crate::kubelet::node::register_node_with_outbox_and_shape_at_addresses(
-                            db_handle_task.as_ref(),
-                            &outbox_task,
+                        let registration = crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
                             &node_name,
                             &node_mode_task,
                             &role_task,
-                            None,
-                            &registration_addresses,
+                            registration_addresses,
                             Some(&shape),
                             grpc_port_task,
+                        )
+                        .await;
+                        let res = crate::kubelet::node::register_node_snapshot(
+                            db_handle_task.as_ref(),
+                            Some(&outbox_task),
+                            None,
+                            None,
+                            &registration,
                         )
                         .await;
                         if let Err(err) = res {
