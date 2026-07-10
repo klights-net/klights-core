@@ -483,7 +483,9 @@ async fn run_pod_watcher_with_runtime(
                         break;
                     }
                 };
+                let event_rv = event.resource_version().unwrap_or(0);
                 if !event_filter.matches(&event) {
+                    cursor.accept_event(event_rv);
                     continue;
                 }
                 // Fire-and-forget lifecycle trace message: spawn through the
@@ -508,6 +510,7 @@ async fn run_pod_watcher_with_runtime(
                     },
                     event,
                 ).await;
+                cursor.accept_event(event_rv);
             }
 
             Some(ev) = cri_event_rx.recv() => {
