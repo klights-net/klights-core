@@ -742,7 +742,6 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         // floor does not re-deliver them.
         let mut baseline_delivered_rvs: Vec<i64> = Vec::new();
         let mut baseline_low_rv_allowlist: Vec<((Option<String>, String), i64)> = Vec::new();
-        let mut exact_name_empty_baseline: Option<String> = None;
 
         // Label-selector watches need a current membership baseline. For
         // resourceVersion-less selector watches, Kubernetes-compatible clients
@@ -756,16 +755,6 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 .await
             {
                 let baseline_items = baseline.items;
-                if baseline_items.is_empty()
-                    && requested_rv > 0
-                    && label_selector.is_none()
-                    && let Some(name) = exact_metadata_name_field_selector(
-                        field_selector.as_deref(),
-                        watch_namespace.as_deref(),
-                    )
-                {
-                    exact_name_empty_baseline = Some(name.to_string());
-                }
                 for resource in baseline_items {
                     let key = resource_to_seen_key(&resource);
                     seen_resources.insert(key.clone());
@@ -790,59 +779,6 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 // can drop a genuinely live ADDED whose replicated commit is
                 // broadcast after watch establishment with a lower RV.
             }
-
-        if let Some(name) = exact_name_empty_baseline {
-            let target = match watch_namespace.as_deref() {
-                Some(namespace) => {
-                    WatchTarget::namespaced_in_namespace(api_version.clone(), kind.clone(), namespace)
-                }
-                None => WatchTarget::cluster(api_version.clone(), kind.clone()),
-            };
-            match db.list_watch_events_since(&[target], 0).await {
-                Ok(events) => {
-                    let retained = events
-                        .into_iter()
-                        .filter(|catchup| {
-                            catchup.resource.api_version == api_version
-                                && catchup.resource.kind == kind
-                                && catchup.resource.name == name
-                                && catchup.resource.resource_version <= requested_rv
-                                && catchup.event_type == "DELETED"
-                        })
-                        .filter(|catchup| {
-                            let event = catchup.clone().into_watch_event();
-                            event.matches_filter_parsed(
-                                &kind,
-                                watch_namespace.as_deref(),
-                                parsed_label_selector.as_ref(),
-                            ) && event.matches_field_selector(field_selector.as_deref())
-                        })
-                        .max_by_key(|catchup| catchup.resource.resource_version);
-                    if let Some(catchup) = retained {
-                        let event = catchup.into_watch_event();
-                        if let Some(rv) = event.resource_version() {
-                            last_delivered_scoped_rv = last_delivered_scoped_rv.max(rv);
-                        }
-                        yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
-                            event,
-                            &kind,
-                            table_format,
-                        ));
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        target: "klights::watch_diag",
-                        kind = %kind,
-                        namespace = watch_namespace.as_deref().unwrap_or(""),
-                        name = %name,
-                        requested_rv,
-                        error = %err,
-                        "exact-name empty watch tombstone replay failed"
-                    );
-                }
-            }
-        }
 
         if send_initial_events {
             let initial_list = db

@@ -5077,13 +5077,11 @@ async fn test_list_rv_is_global_snapshot_so_watch_does_not_replay_deleted_object
     assert_eq!(event["type"], "ADDED");
 }
 
-/// A field-selected empty list for a just-deleted object is the handoff used by
-/// `kubectl delete --wait`: the client lists `metadata.name=<name>` and then
-/// watches from the returned list RV until it sees `DELETED`. If the list RV is
-/// equal to the retained delete event RV, the strictly-after watch replay skips
-/// the only terminal event and the client reconnects forever.
+/// A list/watch handoff must never replay history at or before the list
+/// snapshot. An empty exact-name list has already observed the deletion; a
+/// watch from that list RV waits only for later changes.
 #[tokio::test]
-async fn test_exact_name_empty_list_watch_handoff_replays_retained_delete() {
+async fn test_exact_name_empty_list_watch_handoff_does_not_replay_pre_snapshot_delete() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use futures::StreamExt;
@@ -5209,11 +5207,15 @@ async fn test_exact_name_empty_list_watch_handoff_replays_retained_delete() {
         Some(0),
         "exact-name list must observe the object as gone"
     );
-    let _list_rv = list
+    let list_rv = list
         .pointer("/metadata/resourceVersion")
         .and_then(|rv| rv.as_str())
-        .expect("list must carry a resourceVersion");
-    let watch_rv = inflated_rv.to_string();
+        .and_then(|rv| rv.parse::<i64>().ok())
+        .expect("list must carry a numeric resourceVersion");
+    assert_eq!(
+        list_rv, inflated_rv,
+        "an empty exact-name list reports its current collection snapshot, not an older tombstone floor"
+    );
 
     let watch_resp = app
         .clone()
@@ -5221,7 +5223,7 @@ async fn test_exact_name_empty_list_watch_handoff_replays_retained_delete() {
             Request::builder()
                 .method("GET")
                 .uri(format!(
-                    "/api/v1/namespaces/{ns}/configmaps?watch=true&resourceVersion={watch_rv}&fieldSelector=metadata.name%3D{name}&allowWatchBookmarks=true&timeoutSeconds=1"
+                    "/api/v1/namespaces/{ns}/configmaps?watch=true&resourceVersion={list_rv}&fieldSelector=metadata.name%3D{name}&timeoutSeconds=1"
                 ))
                 .body(Body::empty())
                 .unwrap(),
@@ -5231,21 +5233,12 @@ async fn test_exact_name_empty_list_watch_handoff_replays_retained_delete() {
     assert_eq!(watch_resp.status(), StatusCode::OK);
 
     let mut stream = watch_resp.into_body().into_data_stream();
-    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+    let next = tokio::time::timeout(Duration::from_secs(2), stream.next())
         .await
-        .expect("watch from exact-name empty-list RV should yield retained delete")
-        .expect("watch stream should yield a chunk")
-        .expect("watch chunk should be ok");
-    let event: serde_json::Value = serde_json::from_slice(&chunk).unwrap();
-    assert_eq!(
-        event["type"], "DELETED",
-        "exact-name list/watch handoff must deliver the terminal delete event, got {event:#?}"
-    );
-    assert_eq!(
-        event
-            .pointer("/object/metadata/name")
-            .and_then(|value| value.as_str()),
-        Some(name)
+        .expect("server-side watch timeout should close the idle stream");
+    assert!(
+        next.is_none(),
+        "a watch from rv={list_rv} must not replay the earlier delete rv={delete_rv}: {next:?}"
     );
 }
 

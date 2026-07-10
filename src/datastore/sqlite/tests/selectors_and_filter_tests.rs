@@ -330,7 +330,7 @@ async fn list_resources_response_rv_does_not_advance_past_concurrent_delete_snap
 }
 
 #[tokio::test]
-async fn list_resources_response_rv_caps_before_retained_delete_for_returned_item() {
+async fn list_resources_response_rv_stays_at_snapshot_despite_retained_delete_history() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db_root = dir.path().join("state");
     let cluster_db_path = db_root.join("sqlite").join("cluster.db");
@@ -413,10 +413,8 @@ async fn list_resources_response_rv_caps_before_retained_delete_for_returned_ite
         "test setup must return the stale row whose retained delete is visible"
     );
     assert_eq!(
-        list.resource_version,
-        delete_rv - 1,
-        "a list that returns cm-retained-delete must not report the retained delete rv; \
-         a watch from the list rv must be able to replay delete rv={delete_rv}"
+        list.resource_version, delete_rv,
+        "list resourceVersion is the current collection snapshot; retained history must not move it backward even for this deliberately inconsistent raw-SQL fixture"
     );
 }
 
