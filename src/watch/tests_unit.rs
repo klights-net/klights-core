@@ -196,6 +196,96 @@ struct SignalCursorReplaySource {
     calls: std::sync::Arc<std::sync::Mutex<Vec<(i64, usize)>>>,
 }
 
+/// Test double for a positioned backend whose bounded scan can return a
+/// non-empty short page before the durable history is exhausted.
+#[derive(Clone)]
+struct ShortPageReplaySource {
+    events: std::sync::Arc<Vec<WatchEvent>>,
+    page_sizes: std::sync::Arc<Vec<usize>>,
+    calls: std::sync::Arc<std::sync::Mutex<usize>>,
+}
+
+impl ShortPageReplaySource {
+    fn new(events: Vec<WatchEvent>, page_sizes: Vec<usize>) -> Self {
+        Self {
+            events: std::sync::Arc::new(events),
+            page_sizes: std::sync::Arc::new(page_sizes),
+            calls: std::sync::Arc::new(std::sync::Mutex::new(0)),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        *self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl WatchReplaySource for ShortPageReplaySource {
+    async fn replay_since(&self, since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+        Ok(self
+            .events
+            .iter()
+            .filter(|event| event.resource_version().unwrap_or_default() > since_rv)
+            .cloned()
+            .collect())
+    }
+
+    async fn replay_after_checked(
+        &self,
+        position: crate::datastore::WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<WatchEvent>> {
+        let mut call = self
+            .calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let page_size = self.page_sizes.get(*call).copied().unwrap_or(limit.get());
+        *call += 1;
+        drop(call);
+
+        let start = if position.event_id > 0 {
+            position.event_id as usize
+        } else {
+            self.events
+                .iter()
+                .position(|event| {
+                    event.resource_version().unwrap_or_default() > position.resource_version
+                })
+                .unwrap_or(self.events.len())
+        };
+        let positioned: Vec<_> = self
+            .events
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(page_size.min(limit.get()))
+            .map(|(index, event)| crate::datastore::PositionedWatchEvent {
+                position: crate::datastore::WatchReplayPosition {
+                    resource_version: event.resource_version().unwrap_or_default(),
+                    event_id: index as i64 + 1,
+                    resource_version_filter_through_event_id: 0,
+                },
+                event: event.clone(),
+            })
+            .collect();
+        let next_position = crate::datastore::WatchReplayPosition::after_page(
+            position,
+            &positioned,
+            self.events.len() as i64,
+            limit,
+        );
+        Ok(crate::datastore::PositionedWatchReplayRead::Events(
+            crate::datastore::PositionedWatchReplay {
+                events: positioned,
+                next_position,
+            },
+        ))
+    }
+}
+
 impl SignalCursorReplaySource {
     fn events(events: Vec<WatchEvent>) -> Self {
         Self {
@@ -584,6 +674,38 @@ async fn signal_cursor_pages_every_same_revision_event_without_loss() {
         }
         assert_eq!(delivered.len(), count, "same-RV fixture size {count}");
     }
+}
+
+#[tokio::test]
+async fn signal_cursor_continues_after_short_nonempty_positioned_page() {
+    let (_tx, rx) = broadcast::channel(4);
+    let source = ShortPageReplaySource::new(
+        vec![
+            signal_cursor_pod("default", "pod-short-page", 11),
+            signal_cursor_pod("default", "pod-after-short-page", 12),
+        ],
+        // The first bounded read returns one row despite a three-row limit;
+        // the second row must be read without another signal.
+        vec![1, 1],
+    );
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    cursor.prime_replay_or_expired().await.unwrap();
+    let first = cursor.next_event().await.unwrap();
+    assert_eq!(first.object["metadata"]["name"], "pod-short-page");
+    let second = tokio::time::timeout(std::time::Duration::from_secs(1), cursor.next_event())
+        .await
+        .expect("short page must schedule the next positioned read")
+        .unwrap();
+    assert_eq!(second.object["metadata"]["name"], "pod-after-short-page");
+    assert!(source.call_count() >= 2);
 }
 
 #[tokio::test]

@@ -147,7 +147,16 @@ where
             PositionedWatchReplayRead::Events(replay) => {
                 let event_count = replay.events.len();
                 self.replay_position = replay.next_position;
-                self.replay_needed = event_count == limit.get();
+                // Keep draining durable history until a read is empty.  A
+                // positioned backend may return a short page even when rows
+                // remain (for example when target/selector filtering or a
+                // backend-side scan boundary under-fills the LIMIT).  Using
+                // `event_count == limit` would then incorrectly hand control
+                // back to the signal receiver and stall a list/watch handoff
+                // until an unrelated future write.  An empty page is the
+                // authoritative exhaustion marker; the next read is still
+                // bounded and event-driven, and it avoids any idle polling.
+                self.replay_needed = event_count > 0;
                 if event_count == 0 {
                     self.processed_position = replay.next_position;
                     self.covered_position_after_pending = None;

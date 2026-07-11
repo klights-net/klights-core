@@ -6695,16 +6695,26 @@ async fn test_positive_rv_selector_pod_watch_replays_status_after_list_when_base
         {"type":"Ready","status":"True","reason":"PodReady"},
         {"type":"ContainersReady","status":"True","reason":"PodReady"}
     ]}});
-    let patch_resp = app
-        .clone()
-        .oneshot(mk(
-            "PATCH",
-            format!("/api/v1/namespaces/{namespace}/pods/{pod}/status"),
-            Some(serde_json::to_vec(&ready_patch).unwrap()),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(patch_resp.status(), StatusCode::OK);
+    // Build a replay history longer than the cursor's three-event window. The
+    // first four transitions remain non-ready so the assertion can only pass
+    // if the cursor continues paging without waiting for another signal.
+    for index in 0..5 {
+        let patch = if index == 4 {
+            ready_patch.clone()
+        } else {
+            json!({"status":{"phase":"Pending","podIP":format!("10.42.0.{}", index + 1)}})
+        };
+        let patch_resp = app
+            .clone()
+            .oneshot(mk(
+                "PATCH",
+                format!("/api/v1/namespaces/{namespace}/pods/{pod}/status"),
+                Some(serde_json::to_vec(&patch).unwrap()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patch_resp.status(), StatusCode::OK);
+    }
 
     let watch_resp = app
         .clone()

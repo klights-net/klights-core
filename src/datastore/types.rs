@@ -550,18 +550,20 @@ impl WatchReplayPosition {
         current: Self,
         events: &[PositionedWatchEvent<T>],
         high_water_event_id: i64,
-        limit: std::num::NonZeroUsize,
+        _limit: std::num::NonZeroUsize,
     ) -> Self {
-        if events.len() == limit.get() {
-            return events.last().map_or(current, |event| {
-                let mut next = event.position;
-                if next.event_id < current.resource_version_filter_through_event_id {
-                    next.resource_version = current.resource_version;
-                    next.resource_version_filter_through_event_id =
-                        current.resource_version_filter_through_event_id;
-                }
-                next
-            });
+        if let Some(event) = events.last() {
+            // Advance only through rows actually returned.  A backend may
+            // under-fill a bounded scan while rows remain (target filtering,
+            // decode skips, or a keyset boundary); jumping to the high-water
+            // event ID on every short page would permanently skip that suffix.
+            let mut next = event.position;
+            if next.event_id < current.resource_version_filter_through_event_id {
+                next.resource_version = current.resource_version;
+                next.resource_version_filter_through_event_id =
+                    current.resource_version_filter_through_event_id;
+            }
+            return next;
         }
         Self {
             resource_version: events.last().map_or(current.resource_version, |event| {
