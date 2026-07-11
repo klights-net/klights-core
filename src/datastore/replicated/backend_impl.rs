@@ -18,6 +18,25 @@ use super::ReplicatedDatastore;
 #[cfg(test)]
 use super::apply_command_to_backend;
 
+fn ensure_mark_delete_timestamps(data: &mut Value, grace_seconds: i64) {
+    let Some(metadata) = data.get_mut("metadata").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if metadata
+        .get("deletionTimestamp")
+        .and_then(|timestamp| timestamp.as_str())
+        .is_none_or(str::is_empty)
+    {
+        metadata.insert(
+            "deletionTimestamp".to_string(),
+            Value::String(crate::utils::k8s_timestamp()),
+        );
+    }
+    metadata
+        .entry("deletionGracePeriodSeconds".to_string())
+        .or_insert_with(|| Value::from(grace_seconds));
+}
+
 #[async_trait]
 impl DatastoreBackend for ReplicatedDatastore {
     async fn acquire_snapshot_exclusive_fence(
@@ -398,28 +417,17 @@ impl DatastoreBackend for ReplicatedDatastore {
             return Ok(Some(current));
         }
 
-        if metadata
-            .get("deletionTimestamp")
-            .and_then(|timestamp| timestamp.as_str())
-            .is_none_or(str::is_empty)
-        {
-            metadata.insert(
-                "deletionTimestamp".to_string(),
-                Value::String(crate::utils::k8s_timestamp()),
-            );
-        }
-        metadata
-            .entry("deletionGracePeriodSeconds".to_string())
-            .or_insert_with(|| Value::from(grace_seconds));
+        ensure_mark_delete_timestamps(&mut current_data, grace_seconds);
 
         let proposer = self.require_raft_proposer()?;
+        let expected_rv = preconditions.resource_version.unwrap_or(0);
         let command = StorageCommand::UpdateResource {
             api_version: api_version.to_string(),
             kind: kind.to_string(),
             namespace: namespace.map(str::to_string),
             name: name.to_string(),
             data: current_data,
-            expected_rv: preconditions.resource_version.unwrap_or(0),
+            expected_rv,
             preconditions,
         };
         self.propose_command_via_raft(&proposer, command).await?;
@@ -488,6 +496,49 @@ impl DatastoreBackend for ReplicatedDatastore {
         self.propose_command_via_raft(&proposer, command).await?;
         Ok(self.inner.get_current_resource_version().await.unwrap_or(0))
     }
+
+    async fn delete_resource_without_watch_with_tombstone(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Resource> {
+        let Some(current) = self
+            .inner
+            .get_resource(api_version, kind, namespace, name)
+            .await?
+        else {
+            return Err(DatastoreError::not_found(format!(
+                "delete_resource_without_watch_with_tombstone: {api_version}/{kind}/{name} not found"
+            ))
+            .into());
+        };
+        let mut data = (*current.data).clone();
+        if data.get("metadata").and_then(Value::as_object).is_none() {
+            return Err(anyhow::anyhow!(
+                "delete_resource_without_watch_with_tombstone: {api_version}/{kind}/{name} is missing metadata"
+            ));
+        };
+        ensure_mark_delete_timestamps(&mut data, grace_seconds);
+        let mut updated = current;
+        updated.data = std::sync::Arc::new(data);
+
+        let proposer = self.require_raft_proposer()?;
+        let command = StorageCommand::DeleteResourceWithTombstone {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+            preconditions,
+            grace_seconds,
+        };
+        self.propose_command_via_raft(&proposer, command).await?;
+        Ok(updated)
+    }
+
     async fn get_current_resource_version(&self) -> Result<i64> {
         self.inner.get_current_resource_version().await
     }

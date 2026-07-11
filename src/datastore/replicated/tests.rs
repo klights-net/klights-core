@@ -11,7 +11,7 @@ mod cases {
     use crate::datastore::errors::OpenError;
     use crate::datastore::types::*;
     use async_trait::async_trait;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// T7.2: Create a ReplicatedDatastore in Raft mode with an inline
@@ -207,6 +207,75 @@ mod cases {
                 .pointer("/metadata/deletionTimestamp")
                 .and_then(|value| value.as_str()),
             Some(delete_timestamp)
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_mode_delete_without_watch_with_tombstone_removes_resource_and_returns_marked_row()
+    {
+        let (ds, calls) = make_ds_with_inline_proposer().await;
+        let created = ds
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "mark-without-watch",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "mark-without-watch",
+                        "namespace": "default",
+                        "uid": "terminal-uid"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        calls.lock().unwrap().clear();
+
+        let deleted = ds
+            .delete_resource_without_watch_with_tombstone(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "mark-without-watch",
+                ResourcePreconditions::uid_and_resource_version(
+                    "terminal-uid".to_string(),
+                    created.resource_version,
+                ),
+                30,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["DeleteResourceWithTombstone"],
+            "terminal delete path must use the tombstone command"
+        );
+        assert!(
+            deleted
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str)
+                .is_some(),
+            "response should include deletionTimestamp"
+        );
+        assert_eq!(
+            deleted
+                .data
+                .pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(Value::as_i64),
+            Some(30),
+            "response should include deletion grace"
+        );
+
+        assert!(
+            ds.get_resource("v1", "ConfigMap", Some("default"), "mark-without-watch")
+                .await
+                .unwrap()
+                .is_none(),
+            "terminal delete must remove the resource row"
         );
     }
 

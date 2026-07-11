@@ -156,6 +156,21 @@ impl DatastoreBackend for RedbDatastore {
         }
         self.resources.delete_res(a, k, n, m).await
     }
+
+    async fn delete_resource_without_watch_with_tombstone(
+        &self,
+        a: &str,
+        k: &str,
+        n: Option<&str>,
+        m: &str,
+        p: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Resource> {
+        self.resources
+            .delete_res_with_tombstone(a, k, n, m, p, grace_seconds)
+            .await
+    }
+
     async fn list_resources(
         &self,
         a: &str,

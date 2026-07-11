@@ -463,6 +463,143 @@ async fn apply_resource_batch_update_preserves_existing_server_metadata() {
 }
 
 #[tokio::test]
+async fn build_delete_resource_with_tombstone_emits_watch_event_and_delete() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "tombstone-mark",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "tombstone-mark",
+                    "namespace": "default",
+                    "uid": "tombstone-mark-uid"
+                },
+                "data": {"k": "v"}
+            }),
+        )
+        .await
+        .unwrap();
+
+    let command = StorageCommand::DeleteResourceWithTombstone {
+        api_version: "v1".to_string(),
+        kind: "ConfigMap".to_string(),
+        namespace: Some("default".to_string()),
+        name: "tombstone-mark".to_string(),
+        preconditions: ResourcePreconditions::uid_and_resource_version(
+            created.uid.clone(),
+            created.resource_version,
+        ),
+        grace_seconds: 30,
+    };
+
+    let commit = db
+        .db_call("test_build_delete_resource_with_tombstone", move |conn| {
+            let tx = conn.transaction()?;
+            let (commit, _rv) = Datastore::build_log_apply_commit_in_tx_from_command(
+                &tx,
+                command,
+                "PodTermination",
+                "leader",
+            )?;
+            tx.commit()?;
+            Ok(commit)
+        })
+        .await
+        .unwrap();
+
+    let mut tombstone_events = 0usize;
+    let mut delete_mutations = 0usize;
+    for mutation in &commit.mutations {
+        match mutation {
+            crate::log_apply::LogApplyMutation::PutWatchEvent(row) => {
+                tombstone_events += 1;
+                assert_eq!(row.event_type, "DELETED");
+                assert_eq!(row.namespace.as_deref(), Some("default"));
+                assert_eq!(row.name, "tombstone-mark");
+                assert_eq!(row.resource_version, commit.resource_version);
+            }
+            crate::log_apply::LogApplyMutation::DeleteResource(_) => delete_mutations += 1,
+            other => panic!("unexpected mutation in tombstone delete command: {other:?}"),
+        }
+    }
+    assert_eq!(tombstone_events, 1);
+    assert_eq!(delete_mutations, 1);
+
+    db.apply_raft_log_apply_commit(commit.clone())
+        .await
+        .unwrap();
+
+    let resource = db
+        .get_resource("v1", "ConfigMap", Some("default"), "tombstone-mark")
+        .await
+        .unwrap();
+    assert!(
+        resource.is_none(),
+        "tombstone delete must remove resource row"
+    );
+
+    let commit_rv = commit.resource_version;
+    let row_count: i64 = db
+        .db_call("test_select_tombstone_watch_events", move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM watch_events \
+                 WHERE api_version = ?1 AND kind = ?2 \
+                 AND COALESCE(namespace, '#cluster') = ?3 \
+                 AND name = ?4 \
+                 AND resource_version = ?5",
+                rusqlite::params!["v1", "ConfigMap", "default", "tombstone-mark", commit_rv],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        row_count, 1,
+        "tombstone delete should emit exactly one watch row"
+    );
+
+    let event: (String, Vec<u8>) = db
+        .db_call("test_select_tombstone_watch_event", move |conn| {
+            Ok(conn.query_row(
+                "SELECT event_type, data FROM watch_events \
+                 WHERE api_version = ?1 AND kind = ?2 \
+                 AND COALESCE(namespace, '#cluster') = ?3 \
+                 AND name = ?4 \
+                 AND resource_version = ?5",
+                rusqlite::params!["v1", "ConfigMap", "default", "tombstone-mark", commit_rv],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(event.0, "DELETED");
+
+    let payload: serde_json::Value = serde_json::from_slice(&event.1).unwrap();
+    assert_eq!(payload["metadata"]["name"].as_str(), Some("tombstone-mark"));
+    assert_eq!(payload["metadata"]["namespace"].as_str(), Some("default"));
+    assert!(
+        payload["metadata"]["deletionTimestamp"]
+            .as_str()
+            .is_some_and(|ts| !ts.is_empty()),
+        "watch payload should carry deletionTimestamp"
+    );
+    assert_eq!(
+        payload["metadata"]["deletionGracePeriodSeconds"],
+        serde_json::json!(30),
+        "watch payload should carry deletionGracePeriodSeconds"
+    );
+    assert_eq!(
+        payload["metadata"]["resourceVersion"],
+        commit_rv.to_string()
+    );
+}
+
+#[tokio::test]
 async fn apply_resource_batch_update_rejects_metadata_uid_change() {
     let db = Datastore::new_in_memory().await.unwrap();
     let existing = db

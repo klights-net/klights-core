@@ -753,6 +753,131 @@ impl RedbResourceStore {
         .await
     }
 
+    pub async fn delete_res_with_tombstone(
+        &self,
+        av: &str,
+        kind: &str,
+        ns: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Resource> {
+        let key = resource_key(av, kind, ns, name);
+        let av_owned = av.to_string();
+        let kind_owned = kind.to_string();
+        let ns_owned = ns.map(|s| s.to_string());
+        let name_owned = name.to_string();
+        let watch_bus = self.watch_bus.clone();
+        let av_error = av_owned.clone();
+        let kind_error = kind_owned.clone();
+        let ns_error = ns_owned.clone();
+        let name_error = name_owned.clone();
+        let av_event = av_owned.clone();
+        let kind_event = kind_owned.clone();
+        let ns_event = ns_owned.clone();
+        let name_event = name_owned.clone();
+
+        let (resource_version, data, uid) = self
+            .db_call("delete_res_with_tombstone", move |db| {
+                let res_tbl = if ns_error.is_some() {
+                    tables::RES_NS
+                } else {
+                    tables::RES_CLUSTER
+                };
+                let w = db.begin_write()?;
+
+                let (old_body, data, _) = {
+                    let table = w.open_table(res_tbl)?;
+                    let Some(current_row) = table.get(key.as_slice())? else {
+                        return Err(crate::datastore::errors::DatastoreError::not_found(format!(
+                            "delete_resource_without_watch_with_tombstone: {av_error}/{kind_error}/{name_error} not found"
+                        ))
+                        .into());
+                    };
+                    let body = current_row.value().1.to_vec();
+                    let current_rv = current_row.value().0 as i64;
+                    let mut current = serde_json::from_slice::<Value>(&body)?;
+                    helpers::validate_resource_preconditions(&preconditions, &current, current_rv)?;
+                    let Some(metadata) = current.get_mut("metadata").and_then(Value::as_object_mut) else {
+                        return Err(anyhow!(
+                            "delete_resource_without_watch_with_tombstone: {av_error}/{kind_error}/{name_error} is missing metadata"
+                        ));
+                    };
+                    if metadata
+                        .get("deletionTimestamp")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                    {
+                        metadata.insert(
+                            "deletionTimestamp".to_string(),
+                            serde_json::Value::String(crate::utils::k8s_timestamp()),
+                        );
+                    }
+                    metadata
+                        .entry("deletionGracePeriodSeconds".to_string())
+                        .or_insert_with(|| Value::from(grace_seconds));
+
+                    (body, current, current_rv)
+                };
+
+                let watch_data = data.clone();
+                let resource_uid = Resource::uid_from_data(&data);
+                let rv = helpers::incr_rv(&w)?;
+                {
+                    let mut r = w.open_table(res_tbl)?;
+                    r.remove(key.as_slice())?;
+                }
+                {
+                    let mut rvk = w.open_table(tables::RV_TO_KEY)?;
+                    rvk.remove(rv as u64)?;
+                }
+                let ev = serde_json::json!({
+                    "apiVersion":av_event,
+                    "kind":kind_event,
+                    "namespace":ns_event,
+                    "name":name_event,
+                    "eventType":"DELETED",
+                    "data":data,
+                });
+                helpers::watch_insert(&w, rv, &ev)?;
+                helpers::update_owner_table(
+                    &w,
+                    &av_event,
+                    &kind_event,
+                    ns_event.as_deref(),
+                    &name_event,
+                    Some(&old_body),
+                    None,
+                )?;
+                w.commit()?;
+                publish_pending(
+                    create_pending_watch_event(
+                        &av_event,
+                        &kind_event,
+                        ns_event.as_deref(),
+                        &name_event,
+                        rv,
+                        "DELETED",
+                        watch_data,
+                    ),
+                    &watch_bus,
+                );
+                Ok::<_, anyhow::Error>((rv, Arc::new(data), resource_uid))
+            })
+            .await?;
+
+        Ok(Resource {
+            id: 0,
+            api_version: av_owned,
+            kind: kind_owned,
+            namespace: ns_owned,
+            name: name_owned,
+            uid,
+            resource_version,
+            data,
+        })
+    }
+
     pub async fn list_res(
         &self,
         av: &str,

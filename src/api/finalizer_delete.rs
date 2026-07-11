@@ -442,58 +442,32 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
             }
         }
 
-        match db
-            .mark_for_delete_without_watch(
-                api_version,
-                kind,
-                namespace,
-                name,
-                ResourcePreconditions::uid_and_resource_version(
-                    expected_uid.clone(),
-                    resource.resource_version,
-                ),
-                grace_seconds,
-            )
-            .await
-        {
-            Ok(Some(updated)) => {
-                resource = updated;
-            }
-            Ok(None) => {}
-            Err(err)
-                if explicit_rv.is_none()
-                    && is_conflict_error(&err)
-                    && attempt < DELETE_MAX_CONFLICT_RETRIES =>
-            {
-                continue;
-            }
-            Err(err) => return Err(AppError::from(err)),
-        }
-
         let delete_preconditions = ResourcePreconditions::uid_and_resource_version(
             resource.uid.clone(),
             resource.resource_version,
         );
         match db
-            .delete_resource_with_preconditions(
+            .delete_resource_without_watch_with_tombstone(
                 api_version,
                 kind,
                 namespace,
                 name,
                 delete_preconditions,
+                grace_seconds,
             )
             .await
         {
-            Ok(()) => return Ok(DeleteCompletion::HardDeleted(resource)),
+            Ok(deleted) => return Ok(DeleteCompletion::HardDeleted(deleted)),
             Err(err) => {
+                if explicit_rv.is_none()
+                    && is_conflict_error(&err)
+                    && attempt < DELETE_MAX_CONFLICT_RETRIES
+                {
+                    continue;
+                }
                 let app_error = AppError::from(err);
                 match app_error {
                     AppError::NotFound(_) => return Ok(DeleteCompletion::GoneOrUidChanged),
-                    AppError::Conflict(_)
-                        if explicit_rv.is_none() && attempt < DELETE_MAX_CONFLICT_RETRIES =>
-                    {
-                        continue;
-                    }
                     other => return Err(other),
                 }
             }

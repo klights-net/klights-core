@@ -4,7 +4,7 @@
 //! SQLite and redb without duplication. Backend-specific tests (PRAGMA,
 //! fingerprint, table-definition) stay in their own module.
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::redb::RedbDatastore;
@@ -63,6 +63,70 @@ parametrize_backends!(create_and_get, |db| {
     assert!(got.is_some());
     assert_eq!(got.unwrap().name, "nginx");
 });
+
+parametrize_backends!(
+    delete_resource_without_watch_with_tombstone_marks_and_deletes_with_default_backend_fallback,
+    |db| {
+        let created = db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "tombstone-mark-fallback",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "tombstone-mark-fallback",
+                        "namespace": "default",
+                        "uid": "tombstone-mark-fallback-uid"
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+
+        let deleted = db
+            .delete_resource_without_watch_with_tombstone(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "tombstone-mark-fallback",
+                ResourcePreconditions::uid_and_resource_version(
+                    created.uid.clone(),
+                    created.resource_version,
+                ),
+                15,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(deleted.uid, created.uid);
+        assert_eq!(deleted.name, "tombstone-mark-fallback");
+        assert!(
+            deleted
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str)
+                .is_some_and(|ts| !ts.is_empty())
+        );
+        assert_eq!(deleted.data["metadata"]["deletionGracePeriodSeconds"], 15);
+
+        let after = db
+            .get_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "tombstone-mark-fallback",
+            )
+            .await
+            .unwrap();
+        assert!(
+            after.is_none(),
+            "delete_resource_without_watch_with_tombstone must remove the row"
+        );
+    }
+);
 
 parametrize_backends!(status_noop_update_does_not_advance_resource_version, |db| {
     let created = db
@@ -1875,4 +1939,101 @@ async fn redb_find_owned_by_name_kind_empty_uid() {
         .unwrap();
     assert_eq!(owned.len(), 1);
     assert_eq!(owned[0].name, "mydep-abc");
+}
+
+#[tokio::test]
+async fn redb_delete_resource_with_tombstone_command_stamps_and_watches_deleted_row() {
+    use crate::datastore::command::{
+        COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
+    };
+    use crate::datastore::replicated::DatastoreApplier;
+
+    let db = redb_db().await;
+    let created = db
+        .create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "delete-cmd-tombstone",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "delete-cmd-tombstone", "namespace": "default", "uid": "delete-cmd-tombstone-uid"},
+            }),
+        )
+        .await
+        .unwrap();
+
+    let command = StorageCommand::DeleteResourceWithTombstone {
+        api_version: "v1".to_string(),
+        kind: "ConfigMap".to_string(),
+        namespace: Some("default".to_string()),
+        name: "delete-cmd-tombstone".to_string(),
+        preconditions: ResourcePreconditions::uid_and_resource_version(
+            created.uid.clone(),
+            created.resource_version,
+        ),
+        grace_seconds: 20,
+    };
+
+    db.apply_command(
+        command,
+        CommandMeta {
+            command_id: CommandId("redb-delete-tombstone-command".to_string()),
+            codec_version: COMMAND_CODEC_VERSION,
+            resource_version: 0,
+            uid: None,
+            timestamp_ms: 0,
+            authoring_node: "test-node".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let key_events: Vec<_> = db
+        .list_all_watch_events_since(0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.resource.name == "delete-cmd-tombstone")
+        .collect();
+
+    assert_eq!(
+        key_events.len(),
+        2,
+        "tombstone command should emit ADDED + DELETED watch entries only"
+    );
+
+    let deleted = key_events
+        .iter()
+        .find(|event| event.event_type.as_ref() == "DELETED")
+        .expect("delete command should emit exactly one DELETED watch event");
+    assert_eq!(
+        deleted.resource.data["metadata"]["deletionGracePeriodSeconds"],
+        json!(20)
+    );
+    assert!(
+        deleted
+            .resource
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .and_then(Value::as_str)
+            .is_some_and(|ts| !ts.is_empty()),
+        "DELETED watch payload must include deletionTimestamp"
+    );
+
+    assert!(
+        !key_events
+            .iter()
+            .any(|event| event.event_type.as_ref() == "MODIFIED"),
+        "tombstone command must not emit an intermediate MODIFIED event"
+    );
+
+    assert!(
+        db.get_resource("v1", "ConfigMap", Some("default"), "delete-cmd-tombstone")
+            .await
+            .unwrap()
+            .is_none(),
+        "resource row should be removed after tombstone delete"
+    );
 }

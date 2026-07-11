@@ -434,6 +434,99 @@ pub trait DatastoreBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Mark and remove a resource in one terminal-delete commit without
+    /// emitting an extra watch event.
+    ///
+    /// Backends that do not have a dedicated terminal-delete command
+    /// may emulate this by delegating to
+    /// `mark_for_delete_without_watch` followed by a normal delete.
+    async fn delete_resource_without_watch_with_tombstone(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Resource> {
+        if let Some(candidate) = self
+            .mark_for_delete_without_watch(
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions.clone(),
+                grace_seconds,
+            )
+            .await?
+        {
+            let delete_preconditions = ResourcePreconditions::uid_and_resource_version(
+                candidate.uid.clone(),
+                candidate.resource_version,
+            );
+            self.delete_resource_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                delete_preconditions,
+            )
+            .await?;
+            return Ok(candidate);
+        }
+
+        let candidate = self
+            .get_resource(api_version, kind, namespace, name)
+            .await?
+            .ok_or_else(|| {
+                super::errors::DatastoreError::not_found(format!(
+                    "delete_resource_without_watch_with_tombstone: {api_version}/{kind}/{name} not found"
+                ))
+            })?;
+        let mut data = (*candidate.data).clone();
+        let Some(meta) = data.get_mut("metadata").and_then(Value::as_object_mut) else {
+            return Err(anyhow::anyhow!(
+                "delete_resource_without_watch_with_tombstone: {api_version}/{kind}/{name} is missing metadata"
+            ));
+        };
+        if meta
+            .get("deletionTimestamp")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            meta.insert(
+                "deletionTimestamp".to_string(),
+                Value::String(crate::utils::k8s_timestamp()),
+            );
+        }
+        meta.entry("deletionGracePeriodSeconds".to_string())
+            .or_insert_with(|| Value::from(grace_seconds));
+
+        let candidate = self
+            .update_resource_with_preconditions(
+                api_version,
+                kind,
+                namespace,
+                name,
+                data,
+                preconditions,
+            )
+            .await?;
+        let delete_preconditions = ResourcePreconditions::uid_and_resource_version(
+            candidate.uid.clone(),
+            candidate.resource_version,
+        );
+        self.delete_resource_with_preconditions(
+            api_version,
+            kind,
+            namespace,
+            name,
+            delete_preconditions,
+        )
+        .await?;
+        Ok(candidate)
+    }
+
     async fn get_current_resource_version(&self) -> Result<i64>;
     async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource>;
     async fn get_namespace(&self, name: &str) -> Result<Option<Resource>>;

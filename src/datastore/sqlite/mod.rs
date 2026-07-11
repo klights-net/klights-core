@@ -686,6 +686,82 @@ impl Datastore {
                     ))],
                 )
             }
+            StorageCommand::DeleteResourceWithTombstone {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions,
+                grace_seconds,
+            } => {
+                let (current_rv, current_uid, data_bytes) = Self::resource_row_for_update_in_tx(
+                    tx,
+                    &api_version,
+                    &kind,
+                    namespace.as_deref(),
+                    &name,
+                )?;
+                validate_resource_preconditions(&preconditions, Some(&current_uid), current_rv)
+                    .map_err(Self::sqlite_conversion_error)?;
+                let mut data: Value =
+                    serde_json::from_slice(&data_bytes).map_err(serde_to_sqlite_error)?;
+                let Some(metadata) = data.get_mut("metadata").and_then(Value::as_object_mut) else {
+                    return Err(Self::sqlite_conversion_error(anyhow::anyhow!(
+                        "resource missing metadata for DeleteResourceWithTombstone: {api_version}/{kind}/{}",
+                        name
+                    )));
+                };
+                if metadata
+                    .get("deletionTimestamp")
+                    .and_then(|timestamp| timestamp.as_str())
+                    .is_none_or(str::is_empty)
+                {
+                    metadata.insert(
+                        "deletionTimestamp".to_string(),
+                        serde_json::Value::String(crate::utils::k8s_timestamp()),
+                    );
+                }
+                metadata
+                    .entry("deletionGracePeriodSeconds".to_string())
+                    .or_insert_with(|| Value::from(grace_seconds));
+
+                let watch_event_data = hydrate_watch_event_data(
+                    data.clone(),
+                    &api_version,
+                    &kind,
+                    namespace.as_deref(),
+                    &name,
+                    rv,
+                );
+                let watch_event_row = LogApplyWatchEventRow {
+                    event_id: None,
+                    api_version: api_version.clone(),
+                    kind: kind.clone(),
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    resource_version: rv,
+                    event_type: "DELETED".to_string(),
+                    data: watch_event_data,
+                };
+
+                let delete_key = LogApplyResourceKey {
+                    api_version,
+                    kind,
+                    namespace,
+                    name,
+                    uid: current_uid,
+                    precondition_resource_version: preconditions.resource_version,
+                };
+                LogApplyCommit::from_cluster_mutations(
+                    rv,
+                    vec![
+                        ClusterMutation::WatchHistory(WatchHistoryMutation::PutWatchEvent(
+                            watch_event_row,
+                        )),
+                        ClusterMutation::Resource(ResourceMutation::DeleteResource(delete_key)),
+                    ],
+                )
+            }
 
             StorageCommand::UpdateNodeDataplane {
                 node_name,
@@ -2354,6 +2430,14 @@ impl Datastore {
                 namespace,
                 name,
                 preconditions,
+            }
+            | StorageCommand::DeleteResourceWithTombstone {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions,
+                grace_seconds: _,
             } => (api_version, kind, namespace, name, preconditions),
             _ => return None,
         };

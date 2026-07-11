@@ -410,6 +410,49 @@ pub(crate) async fn apply_forwarded_command(
             }
             Ok(applied)
         }
+        StorageCommand::DeleteResourceWithTombstone {
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+            grace_seconds,
+        } => {
+            let pre_delete_resource = if api_version == "v1" && kind == "Pod" {
+                db.get_resource(&api_version, &kind, namespace.as_deref(), &name)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let before_rv = db.get_current_resource_version().await.unwrap_or(0);
+            db.delete_resource_with_preconditions(
+                &api_version,
+                &kind,
+                namespace.as_deref(),
+                &name,
+                preconditions.clone(),
+            )
+            .await?;
+            let rv = resource_version_after_mutation(db, before_rv).await?;
+            let mut applied = ack_apply(
+                StorageCommand::DeleteResourceWithTombstone {
+                    api_version,
+                    kind,
+                    namespace,
+                    name,
+                    preconditions,
+                    grace_seconds,
+                },
+                rv,
+                authoring_node,
+            );
+            if let Some(res) = pre_delete_resource {
+                applied.resource = Some(res.into());
+            }
+            Ok(applied)
+        }
         StorageCommand::CreateNamespace { name, data } => {
             let resource = db.create_namespace(&name, data).await?;
             let entry = entry_for_resource(

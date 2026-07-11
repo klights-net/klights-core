@@ -71,6 +71,24 @@ impl DatastoreApplier for RedbDatastore {
                 )
                 .await?;
             }
+            StorageCommand::DeleteResourceWithTombstone {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions,
+                grace_seconds,
+            } => {
+                self.delete_resource_without_watch_with_tombstone(
+                    &api_version,
+                    &kind,
+                    namespace.as_deref(),
+                    &name,
+                    preconditions,
+                    grace_seconds,
+                )
+                .await?;
+            }
             StorageCommand::PatchResource {
                 api_version,
                 kind,

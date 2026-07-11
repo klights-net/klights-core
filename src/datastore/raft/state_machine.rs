@@ -185,6 +185,12 @@ fn is_uid_bound_pod_command(command: &StorageCommand) -> bool {
             kind,
             preconditions,
             ..
+        }
+        | StorageCommand::DeleteResourceWithTombstone {
+            api_version,
+            kind,
+            preconditions,
+            ..
         } => (api_version, kind, preconditions),
         _ => return false,
     };
@@ -223,6 +229,20 @@ async fn resource_before_delete(
         ..
     } = command
     else {
+        if let StorageCommand::DeleteResourceWithTombstone {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        } = command
+        {
+            return db
+                .get_resource(api_version, kind, namespace.as_deref(), name)
+                .await
+                .map(|resource| resource.map(ForwardedResource::from))
+                .map_err(|err| OutboxApplyError::Retryable(err.to_string()));
+        }
         return Ok(None);
     };
     db.get_resource(api_version, kind, namespace.as_deref(), name)
@@ -262,7 +282,8 @@ async fn resource_after_apply(
             .await
             .map(|resource| resource.map(ForwardedResource::from))
             .map_err(|err| OutboxApplyError::Retryable(err.to_string())),
-        StorageCommand::DeleteResource { .. } => Ok(deleted_resource),
+        StorageCommand::DeleteResource { .. }
+        | StorageCommand::DeleteResourceWithTombstone { .. } => Ok(deleted_resource),
         _ => Ok(None),
     }
 }

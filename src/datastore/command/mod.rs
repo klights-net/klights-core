@@ -146,6 +146,17 @@ pub enum StorageCommand {
         preconditions: ResourcePreconditions,
     },
 
+    /// Delete a K8s resource and persist an explicit tombstone
+    /// watch event for this same command in a single commit.
+    DeleteResourceWithTombstone {
+        api_version: String,
+        kind: String,
+        namespace: Option<String>,
+        name: String,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    },
+
     /// Apply a merge patch to a resource.
     PatchResource {
         api_version: String,
@@ -333,6 +344,7 @@ impl StorageCommand {
             StorageCommand::CreateResource { .. } => "CreateResource",
             StorageCommand::UpdateResource { .. } => "UpdateResource",
             StorageCommand::DeleteResource { .. } => "DeleteResource",
+            StorageCommand::DeleteResourceWithTombstone { .. } => "DeleteResourceWithTombstone",
             StorageCommand::PatchResource { .. } => "PatchResource",
             StorageCommand::UpdateStatus { .. } => "UpdateStatus",
             StorageCommand::ApplyResourceBatch { .. } => "ApplyResourceBatch",

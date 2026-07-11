@@ -205,6 +205,59 @@ struct ShortPageReplaySource {
     calls: std::sync::Arc<std::sync::Mutex<usize>>,
 }
 
+/// Positioned replay source that can suspend a selected page until the caller
+/// drops the in-flight cursor future. This makes replay cancellation tests
+/// deterministic without relying on timing.
+#[derive(Clone)]
+struct CancellationReplaySource {
+    inner: SignalCursorReplaySource,
+    wait_on_call: usize,
+    calls: std::sync::Arc<std::sync::Mutex<usize>>,
+    page_started: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl CancellationReplaySource {
+    fn new(events: Vec<WatchEvent>, wait_on_call: usize) -> Self {
+        Self {
+            inner: SignalCursorReplaySource::events(events),
+            wait_on_call,
+            calls: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            page_started: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    async fn wait_for_page(&self) {
+        self.page_started.notified().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl WatchReplaySource for CancellationReplaySource {
+    async fn replay_since(&self, since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+        self.inner.replay_since(since_rv).await
+    }
+
+    async fn replay_after_checked(
+        &self,
+        position: crate::datastore::WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<WatchEvent>> {
+        let call = {
+            let mut calls = self
+                .calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *calls += 1;
+            *calls
+        };
+        if call == self.wait_on_call {
+            self.page_started.notify_one();
+            std::future::pending::<()>().await;
+        }
+        self.inner.replay_after_checked(position, limit).await
+    }
+}
+
 impl ShortPageReplaySource {
     fn new(events: Vec<WatchEvent>, page_sizes: Vec<usize>) -> Self {
         Self {
@@ -1057,6 +1110,98 @@ async fn signal_cursor_lost_signal_replays_all_missing_events_on_next_signal() {
     ];
     assert_eq!(delivered, vec![Some(11), Some(12), Some(13)]);
     assert_eq!(source.calls(), vec![(10, 3)]);
+}
+
+#[tokio::test]
+async fn signal_cursor_replay_cancellation_keeps_second_page_obligation() {
+    let (tx, rx) = tokio::sync::broadcast::channel(1);
+    let source = CancellationReplaySource::new(
+        vec![
+            signal_cursor_pod("default", "pod-11", 11),
+            signal_cursor_pod("default", "pod-12", 12),
+            signal_cursor_pod("default", "pod-13", 13),
+            signal_cursor_pod("default", "pod-14", 14),
+        ],
+        2,
+    );
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    // Force a lagged receive so replay is the durable recovery path.
+    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    // Leave only a non-matching signal queued after the forced lag. If the
+    // replay obligation is lost on cancellation, next_event cannot recover by
+    // accidentally consuming another matching signal.
+    tx.send(WatchSignal {
+        topic: WatchTopic::new("v1", "Service"),
+        advances: vec![WatchAdvance {
+            namespace: Some("default".to_string()),
+            low_rv: 14,
+            high_rv: 14,
+        }],
+    })
+    .unwrap();
+    assert_eq!(
+        cursor.next_event().await.unwrap().resource_version(),
+        Some(11)
+    );
+    assert_eq!(
+        cursor.next_event().await.unwrap().resource_version(),
+        Some(12)
+    );
+    assert_eq!(
+        cursor.next_event().await.unwrap().resource_version(),
+        Some(13)
+    );
+
+    // Cancel while the second (suffix) page is in flight. The cursor must
+    // retain replay_needed so no later signal is required to resume.
+    let mut cancelled = Box::pin(cursor.next_event());
+    tokio::select! {
+        _ = source.wait_for_page() => {}
+        result = &mut cancelled => panic!("second replay page unexpectedly completed: {result:?}"),
+    }
+    drop(cancelled);
+
+    let suffix = tokio::time::timeout(std::time::Duration::from_secs(1), cursor.next_event())
+        .await
+        .expect("replay obligation must survive cancellation")
+        .unwrap();
+    assert_eq!(suffix.resource_version(), Some(14));
+}
+
+#[tokio::test]
+async fn signal_cursor_matching_signal_cancellation_keeps_replay_obligation() {
+    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    let source = CancellationReplaySource::new(vec![signal_cursor_pod("default", "pod-11", 11)], 1);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source.clone(),
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    let mut cancelled = Box::pin(cursor.next_event());
+    tokio::select! {
+        _ = source.wait_for_page() => {}
+        result = &mut cancelled => panic!("matching-signal replay unexpectedly completed: {result:?}"),
+    }
+    drop(cancelled);
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), cursor.next_event())
+        .await
+        .expect("matching signal replay obligation must survive cancellation")
+        .unwrap();
+    assert_eq!(event.resource_version(), Some(11));
 }
 
 #[tokio::test]

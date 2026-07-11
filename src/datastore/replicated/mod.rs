@@ -306,6 +306,24 @@ where
                 )
                 .await?;
         }
+        StorageCommand::DeleteResourceWithTombstone {
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+            grace_seconds: _,
+        } => {
+            backend
+                .delete_resource_with_preconditions(
+                    &api_version,
+                    &kind,
+                    namespace.as_deref(),
+                    &name,
+                    preconditions,
+                )
+                .await?;
+        }
         StorageCommand::PatchResource {
             api_version,
             kind,

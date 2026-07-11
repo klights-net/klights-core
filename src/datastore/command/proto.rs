@@ -120,7 +120,7 @@ pub struct ProtoErrorResp {
 pub struct ProtoStorageCommand {
     #[prost(
         oneof = "proto_storage_command::Command",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28"
     )]
     pub command: Option<proto_storage_command::Command>,
 }
@@ -180,6 +180,8 @@ pub mod proto_storage_command {
         ApplyResourceBatch(super::ProtoApplyResourceBatch),
         #[prost(message, tag = "27")]
         GcAppliedOutbox(super::ProtoGcAppliedOutbox),
+        #[prost(message, tag = "28")]
+        DeleteResourceWithTombstone(super::ProtoDeleteResourceWithTombstone),
     }
 }
 
@@ -229,6 +231,22 @@ pub struct ProtoDeleteResource {
     pub name: String,
     #[prost(message, optional, tag = "5")]
     pub preconditions: Option<ProtoResourcePreconditions>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct ProtoDeleteResourceWithTombstone {
+    #[prost(string, tag = "1")]
+    pub api_version: String,
+    #[prost(string, tag = "2")]
+    pub kind: String,
+    #[prost(string, optional, tag = "3")]
+    pub namespace: Option<String>,
+    #[prost(string, tag = "4")]
+    pub name: String,
+    #[prost(message, optional, tag = "5")]
+    pub preconditions: Option<ProtoResourcePreconditions>,
+    #[prost(int64, tag = "6")]
+    pub grace_seconds: i64,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

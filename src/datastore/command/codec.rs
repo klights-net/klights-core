@@ -281,6 +281,23 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 name,
                 preconditions: Some(preconditions.into()),
             }),
+            StorageCommand::DeleteResourceWithTombstone {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions,
+                grace_seconds,
+            } => proto_storage_command::Command::DeleteResourceWithTombstone(
+                ProtoDeleteResourceWithTombstone {
+                    api_version,
+                    kind,
+                    namespace,
+                    name,
+                    preconditions: Some(preconditions.into()),
+                    grace_seconds,
+                },
+            ),
             StorageCommand::PatchResource {
                 api_version,
                 kind,
@@ -527,6 +544,19 @@ impl TryFrom<ProtoStorageCommand> for StorageCommand {
                 name: p.name,
                 preconditions: decode_preconditions(p.preconditions, "DeleteResource")?,
             },
+            proto_storage_command::Command::DeleteResourceWithTombstone(p) => {
+                StorageCommand::DeleteResourceWithTombstone {
+                    api_version: p.api_version,
+                    kind: p.kind,
+                    namespace: p.namespace,
+                    name: p.name,
+                    preconditions: decode_preconditions(
+                        p.preconditions,
+                        "DeleteResourceWithTombstone",
+                    )?,
+                    grace_seconds: p.grace_seconds,
+                }
+            }
             proto_storage_command::Command::PatchResource(p) => StorageCommand::PatchResource {
                 api_version: p.api_version,
                 kind: p.kind,
@@ -933,6 +963,17 @@ mod tests {
                 "DeleteResource",
             ),
             (
+                StorageCommand::DeleteResourceWithTombstone {
+                    api_version: "v1".into(),
+                    kind: "Pod".into(),
+                    namespace: Some("default".into()),
+                    name: "my-pod".into(),
+                    preconditions: uid_preconditions("uid-abc-123"),
+                    grace_seconds: 30,
+                },
+                "DeleteResourceWithTombstone",
+            ),
+            (
                 StorageCommand::PatchResource {
                     api_version: "v1".into(),
                     kind: "Pod".into(),
@@ -1186,6 +1227,7 @@ mod tests {
             "CreateResource",
             "UpdateResource",
             "DeleteResource",
+            "DeleteResourceWithTombstone",
             "PatchResource",
             "UpdateStatus",
             "ApplyResourceBatch",

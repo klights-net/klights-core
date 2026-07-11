@@ -117,7 +117,6 @@ where
             }
 
             if self.replay_needed {
-                self.replay_needed = false;
                 self.replay_once().await?;
                 continue;
             }
@@ -125,6 +124,11 @@ where
             match self.signal_rx.recv().await {
                 Ok(signal) => {
                     if self.signal_matches(&signal) {
+                        // Keep the replay obligation durable while the source
+                        // is awaited. If this future is cancelled, the next
+                        // call must resume from the same positioned cursor
+                        // without requiring another signal.
+                        self.replay_needed = true;
                         self.replay_once().await?;
                     }
                 }

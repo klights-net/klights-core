@@ -71,6 +71,23 @@ impl DatastoreApplier for Datastore {
                 )
                 .await?;
             }
+            StorageCommand::DeleteResourceWithTombstone {
+                api_version,
+                kind,
+                namespace,
+                name,
+                preconditions,
+                ..
+            } => {
+                self.delete_resource_with_preconditions(
+                    &api_version,
+                    &kind,
+                    namespace.as_deref(),
+                    &name,
+                    preconditions,
+                )
+                .await?;
+            }
             StorageCommand::PatchResource {
                 api_version,
                 kind,
