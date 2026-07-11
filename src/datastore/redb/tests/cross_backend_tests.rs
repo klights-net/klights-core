@@ -616,6 +616,428 @@ parametrize_backends!(list_limit_zero_returns_all_items_without_continue, |db| {
     assert_eq!(list.remaining_item_count, None);
 });
 
+parametrize_backends!(list_carries_atomic_durable_watch_position, |db| {
+    db.create_resource(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "positioned-list",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "positioned-list", "namespace": "default"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let resources = db
+        .list_resources("v1", "ConfigMap", Some("default"), ResourceListQuery::all())
+        .await
+        .unwrap();
+    let resource_position = resources
+        .watch_replay_position
+        .expect("resource LIST must expose its durable replay position");
+    assert!(resource_position.event_id > 0);
+    assert_eq!(
+        resource_position.resource_version,
+        resources.resource_version
+    );
+    assert_eq!(
+        resource_position.event_id,
+        db.current_watch_replay_position().await.unwrap().event_id
+    );
+
+    db.create_namespace(
+        "positioned-list-ns",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "positioned-list-ns"}
+        }),
+    )
+    .await
+    .unwrap();
+    let namespaces = db.list_namespaces(None, None).await.unwrap();
+    let namespace_position = namespaces
+        .watch_replay_position
+        .expect("Namespace LIST must expose its durable replay position");
+    assert!(namespace_position.event_id > resource_position.event_id);
+    assert_eq!(
+        namespace_position.resource_version,
+        namespaces.resource_version
+    );
+    assert_eq!(
+        namespace_position.event_id,
+        db.current_watch_replay_position().await.unwrap().event_id
+    );
+});
+
+parametrize_backends!(multi_version_watch_baseline_is_one_atomic_snapshot, |db| {
+    for (api_version, name) in [
+        ("widgets.example.test/v1", "widget-v1"),
+        ("widgets.example.test/v2", "widget-v2"),
+    ] {
+        db.create_resource(
+            api_version,
+            "Widget",
+            Some("default"),
+            name,
+            json!({
+                "apiVersion": api_version,
+                "kind": "Widget",
+                "metadata": {
+                    "name": name,
+                    "namespace": "default",
+                    "labels": {"baseline": "atomic"}
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    db.create_resource(
+        "widgets.example.test/v1",
+        "Widget",
+        Some("other"),
+        "widget-v1-other",
+        json!({
+            "apiVersion": "widgets.example.test/v1",
+            "kind": "Widget",
+            "metadata": {
+                "name": "widget-v1-other",
+                "namespace": "other",
+                "labels": {"baseline": "atomic"}
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "clusterwidgets.example.test/v1",
+        "ClusterWidget",
+        None,
+        "cluster-widget",
+        json!({
+            "apiVersion": "clusterwidgets.example.test/v1",
+            "kind": "ClusterWidget",
+            "metadata": {
+                "name": "cluster-widget",
+                "labels": {"baseline": "atomic"}
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "widgets.example.test/v2",
+        "Widget",
+        Some("default"),
+        "widget-filtered-out",
+        json!({
+            "apiVersion": "widgets.example.test/v2",
+            "kind": "Widget",
+            "metadata": {
+                "name": "widget-filtered-out",
+                "namespace": "default",
+                "labels": {"baseline": "other"}
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let list = db
+        .list_resources_for_watch_targets(
+            &[
+                WatchTarget::namespaced("widgets.example.test/v1", "Widget"),
+                WatchTarget::namespaced_in_namespace(
+                    "widgets.example.test/v2",
+                    "Widget",
+                    "default",
+                ),
+                WatchTarget::cluster("clusterwidgets.example.test/v1", "ClusterWidget"),
+            ],
+            Some("baseline=atomic"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        list.items
+            .iter()
+            .map(|item| (item.api_version.as_str(), item.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("widgets.example.test/v1", "widget-v1"),
+            ("widgets.example.test/v1", "widget-v1-other"),
+            ("widgets.example.test/v2", "widget-v2"),
+            ("clusterwidgets.example.test/v1", "cluster-widget")
+        ]
+    );
+    let position = list
+        .watch_replay_position
+        .expect("multi-version baseline must carry one durable replay position");
+    assert_eq!(position.resource_version, list.resource_version);
+    assert_eq!(
+        position.event_id,
+        db.current_watch_replay_position().await.unwrap().event_id
+    );
+});
+
+parametrize_backends!(
+    multi_target_watch_list_supports_kubernetes_label_operators,
+    |db| {
+        for (name, labels) in [
+            ("prod", json!({"env": "prod", "tier": "web"})),
+            ("dev", json!({"env": "dev"})),
+            ("unlabelled", json!({"tier": "batch"})),
+        ] {
+            db.create_resource(
+                "widgets.test/v1",
+                "Widget",
+                Some("default"),
+                name,
+                json!({
+                    "metadata": {
+                        "name": name,
+                        "namespace": "default",
+                        "labels": labels
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        let targets = [WatchTarget::namespaced_in_namespace(
+            "widgets.test/v1",
+            "Widget",
+            "default",
+        )];
+        for (selector, expected) in [
+            ("env", vec!["dev", "prod"]),
+            ("!env", vec!["unlabelled"]),
+            ("env in (prod,stage)", vec!["prod"]),
+            ("env notin (prod)", vec!["dev", "unlabelled"]),
+            ("env!=prod", vec!["dev", "unlabelled"]),
+        ] {
+            let list = db
+                .list_resources_for_watch_targets(&targets, Some(selector))
+                .await
+                .unwrap();
+            assert_eq!(
+                list.items
+                    .iter()
+                    .map(|item| item.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "selector {selector}"
+            );
+        }
+    }
+);
+
+parametrize_backends!(positive_rv_handoff_keeps_late_lower_rv_events, |db| {
+    async fn apply(db: &dyn DatastoreBackend, name: &str, resource_version: i64) {
+        db.apply_replicated_create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": name,
+                    "namespace": "default",
+                    "uid": format!("uid-{name}"),
+                    "resourceVersion": resource_version.to_string()
+                }
+            }),
+            ReplicatedCreateOptions {
+                resource_version,
+                meta_uid: Some(format!("uid-{name}")),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    apply(db, "at-floor", 10).await;
+    apply(db, "pre-anchor", 12).await;
+    let anchor = db.current_watch_replay_position().await.unwrap();
+    apply(db, "late-lower", 11).await;
+    apply(db, "post-anchor", 13).await;
+
+    let target = WatchTarget::namespaced_in_namespace("v1", "ConfigMap", "default");
+    let mut position =
+        WatchReplayPosition::from_resource_version_through_event_id(10, anchor.event_id);
+    let mut names = Vec::new();
+    loop {
+        let replay = db
+            .list_watch_events_after_position_checked_bounded(
+                std::slice::from_ref(&target),
+                position,
+                std::num::NonZeroUsize::new(1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let PositionedWatchReplayRead::Events(replay) = replay else {
+            panic!("fresh composite handoff must be replayable");
+        };
+        names.extend(
+            replay
+                .events
+                .iter()
+                .map(|event| event.event.resource.name.clone()),
+        );
+        position = replay.next_position;
+        if replay.events.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(names, vec!["pre-anchor", "late-lower", "post-anchor"]);
+    assert_eq!(
+        position.resource_version_filter_through_event_id, 0,
+        "RV filtering must be released after replay crosses the handoff anchor"
+    );
+});
+
+parametrize_backends!(
+    snapshot_at_exact_watch_position_reverses_later_change,
+    |db| {
+        let created = db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "selected",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "selected",
+                        "namespace": "default",
+                        "labels": {"track": "yes"}
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let position = db.current_watch_replay_position().await.unwrap();
+
+        let mut changed = (*created.data).clone();
+        changed["metadata"]["labels"]["track"] = json!("no");
+        db.update_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "selected",
+            changed,
+            created.resource_version,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = db
+            .snapshot_resources_at_position(
+                &[WatchTarget::namespaced_in_namespace(
+                    "v1",
+                    "ConfigMap",
+                    "default",
+                )],
+                Some("track=yes"),
+                None,
+                position,
+            )
+            .await
+            .unwrap();
+        let SnapshotAtRv::List(snapshot) = snapshot else {
+            panic!("an earlier exact event position must be reconstructed");
+        };
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].name, "selected");
+        assert_eq!(snapshot.watch_replay_position, Some(position));
+    }
+);
+
+parametrize_backends!(
+    snapshot_at_composite_position_is_atomic_across_targets,
+    |db| {
+        db.create_resource(
+            "widgets.test/v1",
+            "Widget",
+            Some("default"),
+            "v1",
+            json!({
+                "apiVersion": "widgets.test/v1",
+                "kind": "Widget",
+                "metadata": {"name": "v1", "namespace": "default"}
+            }),
+        )
+        .await
+        .unwrap();
+        db.create_resource(
+            "widgets.test/v2",
+            "Widget",
+            Some("default"),
+            "v2-existing",
+            json!({
+                "apiVersion": "widgets.test/v2",
+                "kind": "Widget",
+                "metadata": {"name": "v2-existing", "namespace": "default"}
+            }),
+        )
+        .await
+        .unwrap();
+        let rv_boundary = db.get_current_resource_version().await.unwrap();
+        let anchor = db.current_watch_replay_position().await.unwrap();
+        db.create_resource(
+            "widgets.test/v2",
+            "Widget",
+            Some("default"),
+            "v2-late",
+            json!({
+                "apiVersion": "widgets.test/v2",
+                "kind": "Widget",
+                "metadata": {"name": "v2-late", "namespace": "default"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let position = WatchReplayPosition::from_resource_version_through_event_id(
+            rv_boundary,
+            anchor.event_id,
+        );
+        let snapshot = db
+            .snapshot_resources_at_position(
+                &[
+                    WatchTarget::namespaced("widgets.test/v2", "Widget"),
+                    WatchTarget::namespaced("widgets.test/v1", "Widget"),
+                ],
+                None,
+                None,
+                position,
+            )
+            .await
+            .unwrap();
+        let SnapshotAtRv::List(snapshot) = snapshot else {
+            panic!("composite position before the current event high-water must reconstruct");
+        };
+        assert_eq!(
+            snapshot
+                .items
+                .iter()
+                .map(|resource| resource.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v2-existing", "v1"],
+            "reconstructed snapshot must preserve caller/storage-version order"
+        );
+        assert_eq!(snapshot.watch_replay_position, Some(position));
+    }
+);
+
 parametrize_backends!(list_page_request_drives_resource_pagination, |db| {
     for name in ["cm-1", "cm-2", "cm-3"] {
         db.create_resource(
@@ -767,6 +1189,124 @@ parametrize_backends!(gc_watch_events, |db| {
     }
     let removed = db.gc_watch_events(3, 1000).await.unwrap();
     assert!(removed >= 2);
+});
+
+parametrize_backends!(watch_position_survives_empty_retained_history, |db| {
+    db.create_resource(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "before-gc",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "before-gc", "namespace": "default"}
+        }),
+    )
+    .await
+    .unwrap();
+    let before_gc = db.current_watch_replay_position().await.unwrap();
+    assert!(before_gc.event_id > 0);
+    assert!(db.gc_watch_events(0, -1).await.unwrap() > 0);
+
+    let list = db
+        .list_resources("v1", "ConfigMap", Some("default"), ResourceListQuery::all())
+        .await
+        .unwrap();
+    let after_gc = list
+        .watch_replay_position
+        .expect("LIST must retain the allocator high-water after watch GC");
+    assert_eq!(after_gc.event_id, before_gc.event_id);
+
+    db.create_resource(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "after-gc",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "after-gc", "namespace": "default"}
+        }),
+    )
+    .await
+    .unwrap();
+    let replay = db
+        .list_watch_events_after_position_checked_bounded(
+            &[WatchTarget::namespaced_in_namespace(
+                "v1",
+                "ConfigMap",
+                "default",
+            )],
+            after_gc,
+            std::num::NonZeroUsize::new(10).unwrap(),
+        )
+        .await
+        .unwrap();
+    let PositionedWatchReplayRead::Events(replay) = replay else {
+        panic!("a current allocator position must not expire after retention GC");
+    };
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .map(|event| event.event.resource.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["after-gc"]
+    );
+});
+
+parametrize_backends!(watch_position_ahead_of_allocator_expires, |db| {
+    db.create_resource(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "anchor",
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "anchor", "namespace": "default"}
+        }),
+    )
+    .await
+    .unwrap();
+    let current = db.current_watch_replay_position().await.unwrap();
+    let ahead = WatchReplayPosition {
+        event_id: current.event_id.saturating_add(1),
+        ..current
+    };
+
+    assert!(matches!(
+        db.list_watch_events_after_position_checked_bounded(
+            &[WatchTarget::namespaced_in_namespace(
+                "v1",
+                "ConfigMap",
+                "default",
+            )],
+            ahead,
+            std::num::NonZeroUsize::new(10).unwrap(),
+        )
+        .await
+        .unwrap(),
+        PositionedWatchReplayRead::Expired
+    ));
+
+    let legacy_ahead =
+        WatchReplayPosition::from_resource_version(current.resource_version.saturating_add(1));
+    assert!(matches!(
+        db.list_watch_events_after_position_checked_bounded(
+            &[WatchTarget::namespaced_in_namespace(
+                "v1",
+                "ConfigMap",
+                "default",
+            )],
+            legacy_ahead,
+            std::num::NonZeroUsize::new(10).unwrap(),
+        )
+        .await
+        .unwrap(),
+        PositionedWatchReplayRead::Expired
+    ));
 });
 
 parametrize_backends!(

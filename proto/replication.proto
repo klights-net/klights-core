@@ -316,6 +316,15 @@ message ListResourcesResponse {
   optional string continue_token = 3;
   int64 resource_version = 4;
   optional int64 remaining_item_count = 5;
+  optional WatchReplayPosition watch_replay_position = 6;
+}
+
+// Durable apply-order cursor used for lossless LIST/WATCH handoff.  The
+// scalar resource_version fields remain for compatibility with older peers.
+message WatchReplayPosition {
+  int64 resource_version = 1;
+  int64 event_id = 2;
+  int64 resource_version_filter_through_event_id = 3;
 }
 
 message WatchResourcesRequest {
@@ -325,11 +334,13 @@ message WatchResourcesRequest {
   optional string field_selector = 4;
   int64 start_resource_version = 5;
   optional string label_selector = 6;
+  optional WatchReplayPosition start_watch_replay_position = 7;
 }
 
 message WatchEvent {
   string event_type = 1;
   ResourceObject resource = 2;
+  optional WatchReplayPosition resume_position = 3;
 }
 
 message ProjectedServiceAccountTokenRequest {

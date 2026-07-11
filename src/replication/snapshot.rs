@@ -35,7 +35,28 @@ const SNAPSHOT_JSON_COMMIT_BATCH_SIZE: usize = 128;
 /// `emit_snapshot_commits`. Bounded so a multi-million-row table is consumed
 /// batch by batch instead of materialized into one `Vec`. 512 rows ≈ a few
 /// MiB of working set, regardless of total table size.
-const SNAPSHOT_EMIT_PAGE_SIZE: usize = 512;
+pub(crate) const SNAPSHOT_EMIT_PAGE_SIZE: usize = 512;
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SnapshotWatchPagePause {
+    pub(crate) reached: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) resume: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static SNAPSHOT_WATCH_PAGE_PAUSE: std::sync::Mutex<Option<SnapshotWatchPagePause>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn install_snapshot_watch_page_pause() -> SnapshotWatchPagePause {
+    let pause = SnapshotWatchPagePause {
+        reached: std::sync::Arc::new(tokio::sync::Notify::new()),
+        resume: std::sync::Arc::new(tokio::sync::Notify::new()),
+    };
+    *SNAPSHOT_WATCH_PAGE_PAUSE.lock().unwrap() = Some(pause.clone());
+    pause
+}
 
 /// Result of comparing local replica metadata against leader metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,9 +221,19 @@ pub async fn write_snapshot_commits_json_array<W: Write>(
     after_rv: i64,
     writer: &mut W,
 ) -> Result<()> {
+    let high_water = db.current_watch_replay_position().await?.event_id;
+    write_snapshot_commits_json_array_through_event_id(db, after_rv, high_water, writer).await
+}
+
+pub async fn write_snapshot_commits_json_array_through_event_id<W: Write>(
+    db: &dyn DatastoreBackend,
+    after_rv: i64,
+    high_water_event_id: i64,
+    writer: &mut W,
+) -> Result<()> {
     writer.write_all(b"[")?;
     let mut sink = JsonArrayCommitSink::new(writer);
-    stream_snapshot_commits(db, after_rv, &mut sink).await?;
+    stream_snapshot_commits_through_event_id(db, after_rv, high_water_event_id, &mut sink).await?;
     writer.write_all(b"]")?;
     Ok(())
 }
@@ -212,14 +243,25 @@ pub(crate) async fn stream_snapshot_commits<S: SnapshotCommitSink + Unpin>(
     _after_rv: i64,
     sink: &mut S,
 ) -> Result<()> {
+    let high_water_event_id = db.current_watch_replay_position().await?.event_id;
+    stream_snapshot_commits_through_event_id(db, _after_rv, high_water_event_id, sink).await
+}
+
+async fn stream_snapshot_commits_through_event_id<S: SnapshotCommitSink + Unpin>(
+    db: &dyn DatastoreBackend,
+    _after_rv: i64,
+    high_water_event_id: i64,
+    sink: &mut S,
+) -> Result<()> {
     let mut batcher = SnapshotCommitBatcher::new(sink);
-    emit_snapshot_commits(db, &mut batcher).await?;
+    emit_snapshot_commits(db, high_water_event_id, &mut batcher).await?;
     batcher.finish().await?;
     sink.finish()
 }
 
 async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
     db: &dyn DatastoreBackend,
+    high_water_event_id: i64,
     sink: &mut S,
 ) -> Result<()> {
     let namespaces = db.list_namespaces(None, None).await?;
@@ -264,19 +306,16 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
     // memory-improvement.md §10 P1: page the watch-events table instead of
     // loading it all into one Vec. The loop keyset-pages on (rv, id) in the
     // same ordering the unbounded form used, so content/order are unchanged.
-    let mut after_rv = 0i64;
     let mut after_id = 0i64;
     loop {
         let page = db
-            .list_all_watch_events_since_paged(0, after_rv, after_id, page_limit)
+            .list_all_watch_events_after_id_bounded(after_id, high_water_event_id, page_limit)
             .await?;
         if page.is_empty() {
             break;
         }
-        let last = page.last().expect("non-empty page has a last row");
-        after_rv = last.1.resource.resource_version;
-        after_id = last.0;
-        for (_id, event) in page {
+        after_id = page.last().expect("non-empty page has a last row").0;
+        for (event_id, event) in page {
             let event_type = event.event_type.into_owned();
             let resource = event.resource;
             let key = SnapshotResourceKey::from_resource(&resource);
@@ -306,12 +345,19 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
             {
                 mutations.push(live_resource_mutation(current));
             }
-            mutations.push(watch_event_mutation(resource, event_type));
+            mutations.push(watch_event_mutation(event_id, resource, event_type));
             sink.push(LogApplyCommit::from_cluster_mutations(
                 resource_version,
                 mutations,
             ))
             .await?;
+        }
+        #[cfg(test)]
+        let pause = { SNAPSHOT_WATCH_PAGE_PAUSE.lock().unwrap().take() };
+        #[cfg(test)]
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
         }
     }
 
@@ -585,8 +631,9 @@ fn delete_mutation_from_watch_resource(resource: &Resource) -> ClusterMutation {
     }
 }
 
-fn watch_event_mutation(resource: Resource, event_type: String) -> ClusterMutation {
+fn watch_event_mutation(event_id: i64, resource: Resource, event_type: String) -> ClusterMutation {
     ClusterMutation::WatchHistory(WatchHistoryMutation::PutWatchEvent(LogApplyWatchEventRow {
+        event_id: Some(event_id),
         api_version: resource.api_version,
         kind: resource.kind,
         namespace: resource.namespace,
@@ -948,11 +995,155 @@ mod tests {
                 snapshot,
                 leader.get_current_resource_version().await.unwrap(),
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
 
         assert_eq!(watch_history_for_compare(&follower).await, leader_events);
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_preserves_retained_watch_event_ids() {
+        let leader = crate::datastore::test_support::in_memory().await;
+        for index in 0..5 {
+            leader
+                .create_resource(
+                    "v1",
+                    "ConfigMap",
+                    Some("default"),
+                    &format!("retained-{index}"),
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": format!("retained-{index}"),
+                            "namespace": "default"
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        leader.gc_watch_events(2, 100).await.unwrap();
+        let page_limit = std::num::NonZeroUsize::new(100).unwrap();
+        let leader_rows = leader
+            .list_all_watch_events_since_paged(0, 0, 0, page_limit)
+            .await
+            .unwrap();
+        assert_eq!(leader_rows.len(), 2, "fixture must retain only the tail");
+
+        let position = leader.current_watch_replay_position().await.unwrap();
+        let snapshot = generate_snapshot(&leader, 0).await.unwrap();
+        let follower = crate::datastore::test_support::in_memory().await;
+        follower
+            .replace_replicated_resource_state(
+                snapshot,
+                position.resource_version,
+                Some(position.event_id),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let follower_rows = follower
+            .list_all_watch_events_since_paged(0, 0, 0, page_limit)
+            .await
+            .unwrap();
+        assert_eq!(
+            follower_rows
+                .iter()
+                .map(|(event_id, _)| *event_id)
+                .collect::<Vec<_>>(),
+            leader_rows
+                .iter()
+                .map(|(event_id, _)| *event_id)
+                .collect::<Vec<_>>(),
+            "snapshot log-apply rows must retain durable apply-order IDs"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_preserves_allocator_high_water_with_empty_history() {
+        let leader = crate::datastore::test_support::in_memory().await;
+        leader
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "before-gc",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "before-gc", "namespace": "default"}
+                }),
+            )
+            .await
+            .unwrap();
+        let leader_position = leader.current_watch_replay_position().await.unwrap();
+        assert!(leader_position.event_id > 0);
+        assert!(leader.gc_watch_events(0, -1).await.unwrap() > 0);
+
+        let snapshot = generate_snapshot(&leader, 0).await.unwrap();
+        let follower = crate::datastore::test_support::in_memory().await;
+        follower
+            .replace_replicated_resource_state(
+                snapshot,
+                leader_position.resource_version,
+                Some(leader_position.event_id),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            follower
+                .current_watch_replay_position()
+                .await
+                .unwrap()
+                .event_id,
+            leader_position.event_id,
+            "an empty retained history must not reset the restored allocator"
+        );
+        assert!(
+            follower
+                .list_all_watch_events_since_paged(
+                    0,
+                    0,
+                    0,
+                    std::num::NonZeroUsize::new(10).unwrap(),
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "restore must not synthesize rows that retention removed on the leader"
+        );
+        follower
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "after-restore",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "after-restore", "namespace": "default"}
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            follower
+                .current_watch_replay_position()
+                .await
+                .unwrap()
+                .event_id
+                > leader_position.event_id,
+            "the first post-restore event must allocate above the leader high-water"
+        );
     }
 
     #[tokio::test]
@@ -984,7 +1175,7 @@ mod tests {
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
         let follower = crate::datastore::test_support::in_memory().await;
         follower
-            .replace_replicated_resource_state(snapshot, leader_rv, None)
+            .replace_replicated_resource_state(snapshot, leader_rv, None, None, None)
             .await
             .unwrap();
 
@@ -1040,6 +1231,8 @@ mod tests {
                 snapshot,
                 leader.get_current_resource_version().await.unwrap(),
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1077,7 +1270,7 @@ mod tests {
 
         let follower = crate::datastore::test_support::in_memory().await;
         follower
-            .replace_replicated_resource_state(snapshot, leader_rv, None)
+            .replace_replicated_resource_state(snapshot, leader_rv, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1244,7 +1437,7 @@ mod tests {
 
         let follower = crate::datastore::test_support::in_memory().await;
         follower
-            .replace_replicated_resource_state(snapshot, leader_rv, None)
+            .replace_replicated_resource_state(snapshot, leader_rv, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1333,6 +1526,8 @@ mod tests {
                 snapshot,
                 leader.get_current_resource_version().await.unwrap(),
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1396,6 +1591,8 @@ mod tests {
             .replace_replicated_resource_state(
                 snapshot,
                 leader.get_current_resource_version().await.unwrap(),
+                None,
+                None,
                 None,
             )
             .await
@@ -1653,7 +1850,7 @@ mod tests {
         let snapshot = generate_snapshot(&leader, 0).await.unwrap();
         let follower = crate::datastore::test_support::in_memory().await;
         follower
-            .replace_replicated_resource_state(snapshot, leader_rv, None)
+            .replace_replicated_resource_state(snapshot, leader_rv, None, None, None)
             .await
             .unwrap();
 

@@ -19,6 +19,18 @@ use super::apply_command_to_backend;
 
 #[async_trait]
 impl DatastoreBackend for ReplicatedDatastore {
+    async fn acquire_snapshot_exclusive_fence(
+        &self,
+    ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
+        self.inner.acquire_snapshot_exclusive_fence().await
+    }
+
+    async fn acquire_snapshot_mutation_fence(
+        &self,
+    ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
+        self.inner.acquire_snapshot_mutation_fence().await
+    }
+
     fn attach_raft_proposer(&self, proposer: std::sync::Arc<dyn super::RaftProposer>) {
         self.set_raft_proposer(proposer);
     }
@@ -50,10 +62,18 @@ impl DatastoreBackend for ReplicatedDatastore {
         &self,
         entries: Vec<crate::log_apply::LogApplyCommit>,
         current_rv: i64,
+        watch_event_high_water: Option<i64>,
+        watch_replay_floors: Option<Vec<WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
         self.inner
-            .replace_replicated_resource_state(entries, current_rv, metadata)
+            .replace_replicated_resource_state(
+                entries,
+                current_rv,
+                watch_event_high_water,
+                watch_replay_floors,
+                metadata,
+            )
             .await
     }
 
@@ -146,6 +166,15 @@ impl DatastoreBackend for ReplicatedDatastore {
                 field_selector,
                 page,
             )
+            .await
+    }
+    async fn list_resources_for_watch_targets(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+    ) -> Result<ResourceList> {
+        self.inner
+            .list_resources_for_watch_targets(targets, label_selector)
             .await
     }
     async fn list_resource_keys_for_scope(
@@ -666,6 +695,22 @@ impl DatastoreBackend for ReplicatedDatastore {
             .await
     }
 
+    async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
+        self.inner.current_watch_replay_position().await
+    }
+
+    async fn snapshot_resources_at_position(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        position: WatchReplayPosition,
+    ) -> Result<SnapshotAtRv> {
+        self.inner
+            .snapshot_resources_at_position(targets, label_selector, field_selector, position)
+            .await
+    }
+
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
         targets: &[WatchTarget],
@@ -706,6 +751,21 @@ impl DatastoreBackend for ReplicatedDatastore {
         self.inner
             .list_all_watch_events_since_paged(since_rv, after_resource_version, after_id, limit)
             .await
+    }
+
+    async fn list_all_watch_events_after_id_bounded(
+        &self,
+        after_id: i64,
+        through_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        self.inner
+            .list_all_watch_events_after_id_bounded(after_id, through_id, limit)
+            .await
+    }
+
+    async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
+        self.inner.list_watch_replay_floors().await
     }
 
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {

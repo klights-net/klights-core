@@ -15,11 +15,12 @@ use crate::control_plane::client::{
 use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::replicated::WriteRejection;
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{DatastoreHandle, NodeSubnet, PodCleanupIntent, Resource, WatchTarget};
+use crate::datastore::{
+    DatastoreHandle, NodeSubnet, PodCleanupIntent, Resource, SnapshotAtRv, WatchTarget,
+};
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{OutboxApplyClient, OutboxApplyError, OutboxApplyResult};
 use crate::networking::wireguard::DataplanePeerMetadata;
-use crate::watch::{WatchEvent, WatchEventSelection};
 
 /// T6 step 1: builds a `watch::Receiver<bool>` that is permanently true.
 ///
@@ -200,22 +201,105 @@ impl LeaderApiClient for LocalApiClient {
 
     async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
         let topic = crate::watch::WatchTopic::new(&req.api_version, &req.kind);
+        let legacy_start_rv = req.start_resource_version.unwrap_or(0).max(0);
+        let requested_position = req.start_watch_replay_position;
+        let has_selector = super::watch_request_has_selector(&req);
+        // Capture the durable handoff before any selector baseline await. No
+        // await occurs between final establishment and signal subscription;
+        // replay closes every interval beginning at this early anchor.
+        let early_anchor = if requested_position.is_none() {
+            Some(self.db.current_watch_replay_position().await?)
+        } else {
+            None
+        };
+        let mut selector_membership = crate::watch::SelectorMembership::default();
+        let mut current_baseline_position = None;
+        if has_selector {
+            let snapshot_position = requested_position.or_else(|| {
+                (legacy_start_rv > 0).then(|| {
+                    crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(
+                        legacy_start_rv,
+                        early_anchor.unwrap_or_default().event_id,
+                    )
+                })
+            });
+            let query = || {
+                crate::datastore::ResourceListQuery::new(
+                    req.label_selector.as_deref(),
+                    req.field_selector.as_deref(),
+                    None,
+                    None,
+                )
+            };
+            let baseline = if let Some(snapshot_position) = snapshot_position {
+                match self
+                    .db
+                    .snapshot_resources_at_position(
+                        std::slice::from_ref(&watch_target_for_request(&req)),
+                        req.label_selector.as_deref(),
+                        req.field_selector.as_deref(),
+                        snapshot_position,
+                    )
+                    .await?
+                {
+                    SnapshotAtRv::List(list) => list,
+                    SnapshotAtRv::Current => {
+                        self.db
+                            .list_resources(
+                                &req.api_version,
+                                &req.kind,
+                                req.namespace.as_deref(),
+                                query(),
+                            )
+                            .await?
+                    }
+                    SnapshotAtRv::Expired => {
+                        anyhow::bail!(
+                            "local selector watch membership snapshot at position {snapshot_position:?} expired"
+                        )
+                    }
+                }
+            } else {
+                self.db
+                    .list_resources(
+                        &req.api_version,
+                        &req.kind,
+                        req.namespace.as_deref(),
+                        query(),
+                    )
+                    .await?
+            };
+            selector_membership.replace_from_resources(&baseline.items);
+            current_baseline_position = baseline.watch_replay_position;
+        }
+        let replay_position = if let Some(position) = requested_position {
+            position
+        } else if legacy_start_rv > 0 {
+            crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(
+                legacy_start_rv,
+                early_anchor.unwrap_or_default().event_id,
+            )
+        } else if let Some(position) = current_baseline_position {
+            position
+        } else {
+            early_anchor.unwrap_or_default()
+        };
+        let start_rv = legacy_start_rv.max(replay_position.resource_version);
         let signal_rx = self.db.subscribe_watch_signals(topic.clone());
         let replay_source =
             DatastoreWatchReplaySource::new(self.db.clone(), vec![watch_target_for_request(&req)]);
         let scope = watch_delivery_scope_for_request(&req);
-        let start_rv = req.start_resource_version.unwrap_or(0).max(0);
         let stream = async_stream::stream! {
-            let mut cursor = crate::watch::SignalWatchCursor::new(
+            let mut cursor = crate::watch::SignalWatchCursor::new_many_at_position(
                 signal_rx,
                 replay_source,
-                topic,
+                vec![topic],
                 scope,
                 start_rv,
+                replay_position,
                 crate::watch::WindowPolicy::default_watch_delivery(),
             );
-            if start_rv > 0
-                && let Err(err) = cursor.prime_replay_or_expired().await
+            if let Err(err) = cursor.prime_replay_or_expired().await
             {
                 yield Err(local_watch_cursor_error(err, cursor.accepted_rv()));
                 return;
@@ -223,8 +307,17 @@ impl LeaderApiClient for LocalApiClient {
             loop {
                 match cursor.next_event().await {
                     Ok(event) => {
-                        if watch_event_matches(&event, &req) {
-                            yield Ok(ResourceEvent { event });
+                        let matches = super::watch_request_matches_event(&req, &event);
+                        let event = if has_selector {
+                            selector_membership.transition(event, matches)
+                        } else {
+                            matches.then_some(event)
+                        };
+                        if let Some(event) = event {
+                            yield Ok(ResourceEvent {
+                                event,
+                                resume_position: Some(cursor.processed_position()),
+                            });
                         }
                     }
                     Err(crate::watch::WatchCursorError::Closed) => {
@@ -295,6 +388,7 @@ impl LeaderApiClient for LocalApiClient {
                 label_selector: None,
                 field_selector: Some(format!("spec.nodeName={node_name}")),
                 start_resource_version: None,
+                start_watch_replay_position: None,
             })
             .await?;
         let node_name = node_name.to_string();
@@ -374,6 +468,7 @@ impl LeaderApiClient for LocalApiClient {
                 label_selector: None,
                 field_selector: None,
                 start_resource_version: None,
+                start_watch_replay_position: None,
             })
             .await?;
         let name = name.to_string();
@@ -523,14 +618,6 @@ impl OutboxApplyClient for LocalApiClient {
     }
 }
 
-fn watch_event_matches(event: &WatchEvent, req: &WatchRequest) -> bool {
-    WatchEventSelection::new(&req.api_version, &req.kind)
-        .namespace(req.namespace.as_deref())
-        .label_selector(req.label_selector.as_deref())
-        .field_selector(req.field_selector.as_deref())
-        .matches(event)
-}
-
 fn watch_target_for_request(req: &WatchRequest) -> WatchTarget {
     if let Some(namespace) = req.namespace.as_ref() {
         return WatchTarget::namespaced_in_namespace(
@@ -585,6 +672,7 @@ mod inner_gate_tests {
     use crate::control_plane::client::{ListRequest, ResourceKey};
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::command::StorageCommand;
+    use crate::datastore::{ReplicatedCreateOptions, ResourceListQuery};
     use crate::kubelet::outbox::OutboxApplyError;
     use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
 
@@ -769,6 +857,223 @@ mod inner_gate_tests {
             1,
             "non-leader list_resources must succeed"
         );
+    }
+
+    #[tokio::test]
+    async fn local_selector_watch_synthesizes_deleted_when_pod_leaves_node() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let pod = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "moving",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {"namespace": "default", "name": "moving", "uid": "uid-moving"},
+                    "spec": {"nodeName": "node-a", "containers": [{"name": "app", "image": "pause"}]}
+                }),
+            )
+            .await
+            .unwrap();
+        let (_tx, rx) = watch::channel(true);
+        let client = LocalApiClient::new(db.clone(), "node-a".to_string(), rx);
+        let mut stream = client
+            .watch_resources(WatchRequest {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: None,
+                label_selector: None,
+                field_selector: Some("spec.nodeName=node-a".to_string()),
+                start_resource_version: None,
+                start_watch_replay_position: None,
+            })
+            .await
+            .unwrap();
+
+        let mut moved = (*pod.data).clone();
+        moved["spec"]["nodeName"] = serde_json::Value::String("node-b".to_string());
+        db.update_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "moving",
+            moved,
+            pod.resource_version,
+        )
+        .await
+        .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("leave transition should arrive")
+            .expect("stream should remain open")
+            .expect("event should decode");
+        assert_eq!(event.event.event_type, crate::watch::EventType::Deleted);
+        assert_eq!(event.event.object["metadata"]["name"], "moving");
+    }
+
+    #[tokio::test]
+    async fn exact_position_selector_watch_replays_late_lower_rv_leave_as_deleted() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let selected = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "namespace": "default",
+                "name": "selected",
+                "uid": "uid-selected",
+                "labels": {"track": "yes"}
+            }
+        });
+        db.apply_replicated_create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "selected",
+            selected.clone(),
+            ReplicatedCreateOptions {
+                resource_version: 40,
+                meta_uid: Some("uid-selected".into()),
+            },
+        )
+        .await
+        .unwrap();
+        db.apply_replicated_create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "rv-high-water",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "rv-high-water",
+                    "uid": "uid-high-water"
+                }
+            }),
+            ReplicatedCreateOptions {
+                resource_version: 50,
+                meta_uid: Some("uid-high-water".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let list = db
+            .list_resources(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                ResourceListQuery::new(Some("track=yes"), None, None, None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.items.len(), 1);
+        assert_eq!(list.resource_version, 50);
+        let list_position = list
+            .watch_replay_position
+            .expect("LIST must carry its exact durable position");
+
+        let mut nonmatching = selected;
+        nonmatching["metadata"]["labels"]["track"] = serde_json::json!("no");
+        db.apply_replicated_create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "selected",
+            nonmatching,
+            ReplicatedCreateOptions {
+                resource_version: 45,
+                meta_uid: Some("uid-selected".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let db: DatastoreHandle = Arc::new(db);
+        let (_tx, rx) = watch::channel(true);
+        let client = LocalApiClient::new(db, "node-a".to_string(), rx);
+        let mut stream = client
+            .watch_resources(WatchRequest {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                namespace: Some("default".into()),
+                label_selector: Some("track=yes".into()),
+                field_selector: None,
+                start_resource_version: Some(50),
+                start_watch_replay_position: Some(list_position),
+            })
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("retained lower-RV leave must replay")
+            .expect("watch remains open")
+            .expect("event decodes");
+        assert_eq!(event.event.event_type, crate::watch::EventType::Deleted);
+        assert_eq!(event.event.object["metadata"]["labels"]["track"], "yes");
+        assert!(
+            event
+                .resume_position
+                .is_some_and(|position| position.event_id > list_position.event_id),
+            "resume cursor must advance through the lower-RV mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_omitted_rv_watch_starts_after_existing_objects() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "existing",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "existing"}
+            }),
+        )
+        .await
+        .unwrap();
+        let (_tx, rx) = watch::channel(true);
+        let client = LocalApiClient::new(db.clone(), "node-a".to_string(), rx);
+        let mut stream = client
+            .watch_resources(WatchRequest {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                label_selector: None,
+                field_selector: None,
+                start_resource_version: None,
+                start_watch_replay_position: None,
+            })
+            .await
+            .unwrap();
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "fresh",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "fresh"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("post-establishment event should arrive")
+            .expect("stream should remain open")
+            .expect("event should decode");
+        assert_eq!(event.event.object["metadata"]["name"], "fresh");
     }
 
     /// Promotion is a watch flip. The same client instance must start

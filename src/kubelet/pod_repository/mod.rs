@@ -453,8 +453,41 @@ pub struct PodRepository {
     supervisor: Arc<TaskSupervisor>,
     outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     cluster_api: Option<Arc<dyn LeaderApiClient>>,
-    deletion_finalizer:
-        Arc<crate::kubelet::pod_runtime::deletion_finalizer::RealPodDeletionFinalizer>,
+    deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
+}
+
+/// Finalizer decorator that releases repository-private deferred runtime state
+/// only after the actor-owned deletion boundary reports a terminal outcome.
+/// Pending finalizers and errors retain the observation for the actor retry.
+struct DeferredRuntimeCleanupFinalizer {
+    inner: Arc<dyn PodDeletionFinalizer>,
+    deferred_runtime: status::DeferredRuntimeReducerHandle,
+}
+
+impl DeferredRuntimeCleanupFinalizer {
+    fn new(
+        inner: Arc<dyn PodDeletionFinalizer>,
+        deferred_runtime: status::DeferredRuntimeReducerHandle,
+    ) -> Self {
+        Self {
+            inner,
+            deferred_runtime,
+        }
+    }
+}
+
+#[async_trait]
+impl PodDeletionFinalizer for DeferredRuntimeCleanupFinalizer {
+    async fn finalize_after_actor_cleanup(
+        &self,
+        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
+    ) -> Result<PodDeletionFinalizeResult> {
+        let result = self.inner.finalize_after_actor_cleanup(key).await?;
+        if matches!(result, PodDeletionFinalizeResult::DeletedOrAlreadyGone) {
+            self.deferred_runtime.forget(&key.uid);
+        }
+        Ok(result)
+    }
 }
 
 fn ensure_pod_uid_matches(data: &Value, expected_uid: &str, ns: &str, name: &str) -> Result<()> {
@@ -649,7 +682,7 @@ impl PodRepository {
         let gc_pod_delete_sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink> = api.clone();
         workqueue.set_remote_pod_delete_resignal_sink(Arc::downgrade(&gc_pod_delete_sink));
 
-        let deletion_finalizer = Arc::new(
+        let runtime_deletion_finalizer: Arc<dyn PodDeletionFinalizer> = Arc::new(
             crate::kubelet::pod_runtime::deletion_finalizer::RealPodDeletionFinalizer::new(
                 store.clone(),
                 gc_pod_delete_sink,
@@ -660,6 +693,11 @@ impl PodRepository {
                 supervisor.clone(),
             ),
         );
+        let deletion_finalizer: Arc<dyn PodDeletionFinalizer> =
+            Arc::new(DeferredRuntimeCleanupFinalizer::new(
+                runtime_deletion_finalizer,
+                status.deferred_runtime_handle(),
+            ));
 
         let repository = Self {
             store,

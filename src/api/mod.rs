@@ -51,7 +51,6 @@ pub(crate) use apiservice_proxy::proxy_apiservice_request;
 use crd_conversion::{
     convert_crd_objects_to_requested_version,
     convert_custom_resource_watch_event_to_requested_version,
-    gather_custom_resource_events_across_served_versions,
     gather_custom_resources_across_served_versions, load_crd_conversion_config,
 };
 use custom_resources::{
@@ -150,13 +149,11 @@ pub use validation::{
     apply_schema_defaults_pub, validate_against_schema, validate_metadata_fields,
     validate_webhook_configuration,
 };
-use watch_session::{
-    BaselineDisposition, WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent,
-};
+use watch_session::{WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent};
 use watch_stream::{
     LabelSelectorWatchStreamRequest, WatchCatchUpMode, build_label_selector_watch_stream,
     maybe_spawn_bookmark_tick_stream, maybe_spawn_watch_timeout_stream,
-    object_matches_field_selector, recv_bookmark_tick, recv_watch_timeout,
+    object_matches_field_selector, recv_bookmark_tick, recv_watch_timeout, subscribe_watch_handoff,
 };
 
 #[cfg(test)]

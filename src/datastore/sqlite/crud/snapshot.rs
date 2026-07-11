@@ -447,6 +447,7 @@ fn paginate_snapshot(
     Ok(ResourceList {
         items: page,
         resource_version: snapshot_rv,
+        watch_replay_position: None,
         continue_token,
         remaining_item_count,
     })

@@ -1,4 +1,6 @@
-use super::super::crud::helpers::{WatchEventInsert, insert_watch_event_in_conn};
+use super::super::crud::helpers::{
+    WatchEventInsert, WatchEventPayload, insert_watch_event_in_conn,
+};
 use super::super::{create_pending_watch_event, gc::gc_watch_events_in_tx};
 use crate::log_apply::LogApplyWatchEventRow;
 
@@ -20,13 +22,16 @@ impl<'tx, 'conn> WatchHistoryStateApplier<'tx, 'conn> {
         insert_watch_event_in_conn(
             self.tx,
             WatchEventInsert::preserve_committed_payload(
-                &row.api_version,
-                &row.kind,
-                row.namespace.as_deref(),
-                &row.name,
-                row.resource_version,
-                &row.event_type,
-                &data_bytes,
+                row.event_id,
+                WatchEventPayload {
+                    api_version: &row.api_version,
+                    kind: &row.kind,
+                    namespace: row.namespace.as_deref(),
+                    name: &row.name,
+                    resource_version: row.resource_version,
+                    event_type: &row.event_type,
+                    data: &data_bytes,
+                },
             ),
         )?;
         Ok(create_pending_watch_event(

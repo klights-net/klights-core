@@ -650,6 +650,7 @@ mod cases {
                 label_selector: None,
                 field_selector: Some("spec.nodeName=worker-1".to_string()),
                 start_resource_version: None,
+                start_watch_replay_position: None,
             })
             .await
             .expect("watch open should fail over to the current leader");
@@ -734,6 +735,7 @@ mod cases {
                 label_selector: None,
                 field_selector: None,
                 start_resource_version: Some(41),
+                start_watch_replay_position: None,
             })
             .await;
         assert!(
@@ -779,6 +781,7 @@ mod cases {
                 label_selector: None,
                 field_selector: None,
                 start_resource_version: Some(41),
+                start_watch_replay_position: None,
             }),
         )
         .await
@@ -874,6 +877,7 @@ mod cases {
                 label_selector: None,
                 field_selector: None,
                 start_resource_version: Some(resume_rv),
+                start_watch_replay_position: None,
             })
             .await
             .expect("watch open should fail over to the current leader");
@@ -2407,6 +2411,7 @@ mod cases {
             label_selector: None,
             field_selector: None,
             start_resource_version: None,
+            start_watch_replay_position: None,
         };
 
         // Warm the Read lane by opening a watch stream. The stream itself

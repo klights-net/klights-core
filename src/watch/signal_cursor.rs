@@ -3,6 +3,7 @@ use super::{
     WatchCursorError, WatchDeliveryScope, WatchEvent, WatchEventFilter, WatchReplaySource,
     WatchSignalReceiver, WatchTopic, WindowPolicy,
 };
+use crate::datastore::WatchReplayPosition;
 
 pub struct SignalWatchCursor<S>
 where
@@ -39,13 +40,34 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
         accepted_rv: i64,
         window: WindowPolicy,
     ) -> Self {
+        Self::new_many_at_position(
+            signal_rx,
+            replay_source,
+            topics,
+            scope,
+            accepted_rv,
+            WatchReplayPosition::from_resource_version(accepted_rv),
+            window,
+        )
+    }
+
+    pub fn new_many_at_position(
+        signal_rx: impl Into<WatchSignalReceiver>,
+        replay_source: S,
+        topics: Vec<WatchTopic>,
+        scope: WatchDeliveryScope,
+        accepted_rv: i64,
+        replay_position: WatchReplayPosition,
+        window: WindowPolicy,
+    ) -> Self {
         Self {
-            core: SignalReplayCursorCore::new(
+            core: SignalReplayCursorCore::new_at_position(
                 signal_rx,
                 replay_source,
                 topics,
                 scope,
                 accepted_rv,
+                replay_position,
                 window,
             ),
             event_filter: WatchEventFilter::new(),
@@ -65,20 +87,8 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
         self.core.accept_event(rv);
     }
 
-    pub fn mark_delivered(&mut self, rv: i64) {
-        self.core.mark_delivered(rv);
-    }
-
-    pub fn mark_delivered_for_key(&mut self, namespace: Option<String>, name: String, rv: i64) {
-        self.core.mark_delivered_for_key(namespace, name, rv);
-    }
-
-    pub fn mark_filtered_for_key(&mut self, namespace: Option<String>, name: String, rv: i64) {
-        self.core.mark_filtered_for_key(namespace, name, rv);
-    }
-
-    pub fn allow_low_rv_for_key(&mut self, namespace: Option<String>, name: String, after_rv: i64) {
-        self.core.allow_low_rv_for_key(namespace, name, after_rv);
+    pub fn processed_position(&self) -> WatchReplayPosition {
+        self.core.processed_position()
     }
 
     pub async fn prime_replay_or_expired(&mut self) -> Result<usize, WatchCursorError> {
@@ -91,24 +101,6 @@ impl<S: WatchReplaySource> SignalWatchCursor<S> {
             if self.event_filter.matches(&event) {
                 return Ok(event);
             }
-            self.mark_filtered_event(&event);
         }
-    }
-
-    fn mark_filtered_event(&mut self, event: &WatchEvent) {
-        let Some(rv) = event.resource_version() else {
-            return;
-        };
-        let Some(metadata) = event.object.get("metadata") else {
-            return;
-        };
-        let Some(name) = metadata.get("name").and_then(|name| name.as_str()) else {
-            return;
-        };
-        let namespace = metadata
-            .get("namespace")
-            .and_then(|namespace| namespace.as_str())
-            .map(str::to_string);
-        self.mark_filtered_for_key(namespace, name.to_string(), rv);
     }
 }

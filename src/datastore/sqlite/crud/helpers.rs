@@ -45,6 +45,7 @@ pub fn needs_event_v1_compat(api_version: &str, kind: &str) -> bool {
 /// succeed; otherwise the divergence is real and we propagate the
 /// original error.
 pub struct WatchEventInsert<'a> {
+    pub event_id: Option<i64>,
     pub api_version: &'a str,
     pub kind: &'a str,
     pub namespace: Option<&'a str>,
@@ -53,6 +54,16 @@ pub struct WatchEventInsert<'a> {
     pub event_type: &'a str,
     pub data: &'a [u8],
     canonicalize_object: bool,
+}
+
+pub struct WatchEventPayload<'a> {
+    pub api_version: &'a str,
+    pub kind: &'a str,
+    pub namespace: Option<&'a str>,
+    pub name: &'a str,
+    pub resource_version: i64,
+    pub event_type: &'a str,
+    pub data: &'a [u8],
 }
 
 impl<'a> WatchEventInsert<'a> {
@@ -66,6 +77,7 @@ impl<'a> WatchEventInsert<'a> {
         data: &'a [u8],
     ) -> Self {
         Self {
+            event_id: None,
             api_version,
             kind,
             namespace,
@@ -78,22 +90,18 @@ impl<'a> WatchEventInsert<'a> {
     }
 
     pub fn preserve_committed_payload(
-        api_version: &'a str,
-        kind: &'a str,
-        namespace: Option<&'a str>,
-        name: &'a str,
-        resource_version: i64,
-        event_type: &'a str,
-        data: &'a [u8],
+        event_id: Option<i64>,
+        payload: WatchEventPayload<'a>,
     ) -> Self {
         Self {
-            api_version,
-            kind,
-            namespace,
-            name,
-            resource_version,
-            event_type,
-            data,
+            event_id,
+            api_version: payload.api_version,
+            kind: payload.kind,
+            namespace: payload.namespace,
+            name: payload.name,
+            resource_version: payload.resource_version,
+            event_type: payload.event_type,
+            data: payload.data,
             canonicalize_object: false,
         }
     }
@@ -104,6 +112,7 @@ pub fn insert_watch_event_in_conn(
     event: WatchEventInsert<'_>,
 ) -> rusqlite::Result<()> {
     let WatchEventInsert {
+        event_id,
         api_version,
         kind,
         namespace,
@@ -125,18 +134,37 @@ pub fn insert_watch_event_in_conn(
     } else {
         data.to_vec()
     };
-    match conn.execute(
-        queries::WATCH_EVENTS_INSERT,
-        rusqlite::params![
-            api_version,
-            kind,
-            namespace,
-            name,
-            resource_version,
-            event_type,
-            &data
-        ],
-    ) {
+    let insert = if let Some(event_id) = event_id {
+        conn.execute(
+            "INSERT INTO watch_events
+             (id, api_version, kind, namespace, name, resource_version, event_type, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                event_id,
+                api_version,
+                kind,
+                namespace,
+                name,
+                resource_version,
+                event_type,
+                &data
+            ],
+        )
+    } else {
+        conn.execute(
+            queries::WATCH_EVENTS_INSERT,
+            rusqlite::params![
+                api_version,
+                kind,
+                namespace,
+                name,
+                resource_version,
+                event_type,
+                &data
+            ],
+        )
+    };
+    match insert {
         Ok(_) => Ok(()),
         Err(err) => {
             if !is_watch_events_unique_violation(&err) {

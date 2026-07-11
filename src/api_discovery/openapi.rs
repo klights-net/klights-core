@@ -35,6 +35,7 @@ pub async fn openapi_v3_discovery_with_crds(db: &dyn DatastoreBackend) -> Value 
         .unwrap_or_else(|_| crate::datastore::ResourceList {
             items: vec![],
             resource_version: 0,
+            watch_replay_position: None,
             continue_token: None,
             remaining_item_count: None,
         });
@@ -604,6 +605,7 @@ pub async fn openapi_v2(db: &dyn DatastoreBackend) -> Value {
         .unwrap_or_else(|_| crate::datastore::ResourceList {
             items: vec![],
             resource_version: 0,
+            watch_replay_position: None,
             continue_token: None,
             remaining_item_count: None,
         });

@@ -162,6 +162,11 @@ impl std::fmt::Debug for PodLifecycleRouter {
 }
 
 impl PodLifecycleRouter {
+    #[cfg(test)]
+    pub(crate) fn new_test_backend(backend: Arc<dyn PodLifecycleRouteBackend>) -> Self {
+        Self { backend }
+    }
+
     /// Create a router for actor mode backed by a real `PodLifecycleRegistry`
     /// and the default no-op executor.
     pub fn new_actor(registry: Arc<PodLifecycleRegistry>) -> Self {

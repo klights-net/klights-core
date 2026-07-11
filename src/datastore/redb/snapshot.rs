@@ -402,6 +402,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_round_trip_preserves_empty_watch_history_high_water() {
+        let db = fresh_redb().await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "before-gc",
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "before-gc", "namespace": "default"}
+            }),
+        )
+        .await
+        .unwrap();
+        let before_gc = db.current_watch_replay_position().await.unwrap();
+        assert!(before_gc.event_id > 0);
+        assert!(db.gc_watch_events(0, -1).await.unwrap() > 0);
+
+        let envelope = db.snapshot().await.unwrap();
+        let restored = fresh_redb().await;
+        restored.restore(&envelope).await.unwrap();
+
+        assert_eq!(
+            restored.current_watch_replay_position().await.unwrap(),
+            before_gc,
+            "redb snapshot meta must retain the allocator after all rows are compacted"
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_excludes_node_local_tables() {
         let db = fresh_redb().await;
 

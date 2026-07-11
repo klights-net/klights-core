@@ -412,7 +412,7 @@ impl Datastore {
             let token_for_count = token_owned.clone();
             let ns_for_count = ns_owned.clone();
             let event_compat = needs_event_v1_compat(api_version, kind);
-            let (items, total_after_token, current_rv, pending_reserved_rv) =
+            let (items, total_after_token, watch_position, pending_reserved_rv) =
                 if use_namespaced_table(api_version, kind, &namespace) {
                     self.read_db_call("db_query", move |conn| {
                         let tx = conn.transaction()?;
@@ -475,13 +475,18 @@ impl Datastore {
                             count_params.iter().map(|p| p.as_ref()).collect();
                         let total_after_token: i64 =
                             conn.query_row(&count_query, &count_param_refs[..], |row| row.get(0))?;
-                        let current_rv = Self::current_resource_version_in_tx(&tx)?;
+                        let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
                         let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
                             &tx,
                             &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
                         )?;
 
-                        Ok((items, total_after_token, current_rv, pending_reserved_rv))
+                        Ok((
+                            items,
+                            total_after_token,
+                            watch_position,
+                            pending_reserved_rv,
+                        ))
                     })
                     .await?
                 } else {
@@ -522,12 +527,17 @@ impl Datastore {
                             count_params.iter().map(|p| p.as_ref()).collect();
                         let total_after_token: i64 =
                             conn.query_row(&count_query, &count_param_refs[..], |row| row.get(0))?;
-                        let current_rv = Self::current_resource_version_in_tx(&tx)?;
+                        let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
                         let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
                             &tx,
                             &list_subject_key_prefix(&av, &k, None),
                         )?;
-                        Ok((items, total_after_token, current_rv, pending_reserved_rv))
+                        Ok((
+                            items,
+                            total_after_token,
+                            watch_position,
+                            pending_reserved_rv,
+                        ))
                     })
                     .await?
                 };
@@ -538,12 +548,20 @@ impl Datastore {
                 next_token = items.last().map(|r| r.name.clone());
                 remaining_item_count = Some((total_after_token - lim).max(0));
             }
-            let response_rv =
-                list_response_resource_version(&items, current_rv, pending_reserved_rv);
+            let response_rv = list_response_resource_version(
+                &items,
+                watch_position.resource_version,
+                pending_reserved_rv,
+            );
+            let watch_replay_position = Some(WatchReplayPosition {
+                resource_version: response_rv,
+                ..watch_position
+            });
 
             return Ok(ResourceList {
                 items,
                 resource_version: response_rv,
+                watch_replay_position,
                 continue_token: next_token,
                 remaining_item_count,
             });
@@ -575,7 +593,7 @@ impl Datastore {
             // Build the pushdown separately for each branch because the param
             // offset (base query parameter count) differs between namespaced
             // and cluster paths.
-            let (items, current_rv, pending_reserved_rv) = if use_namespaced_table(
+            let (items, watch_position, pending_reserved_rv) = if use_namespaced_table(
                 api_version,
                 kind,
                 &namespace,
@@ -748,12 +766,12 @@ impl Datastore {
                             }
                             cursor_name = last_candidate_name;
                         }
-                        let current_rv = Self::current_resource_version_in_tx(&tx)?;
+                        let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
                         let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
                             &tx,
                             &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
                         )?;
-                        Ok((page_items, current_rv, pending_reserved_rv))
+                        Ok((page_items, watch_position, pending_reserved_rv))
                     })
                     .await?
                 } else {
@@ -865,12 +883,12 @@ impl Datastore {
                             pause_limit,
                             pause_continue_token.as_deref(),
                         );
-                        let current_rv = Self::current_resource_version_in_tx(&tx)?;
+                        let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
                         let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
                             &tx,
                             &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
                         )?;
-                        Ok((page_items, current_rv, pending_reserved_rv))
+                        Ok((page_items, watch_position, pending_reserved_rv))
                     })
                     .await?
                 }
@@ -1001,12 +1019,12 @@ impl Datastore {
                             }
                             cursor_name = last_candidate_name;
                         }
-                        let current_rv = Self::current_resource_version_in_tx(&tx)?;
+                        let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
                         let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
                             &tx,
                             &list_subject_key_prefix(&av, &k, None),
                         )?;
-                        Ok((page_items, current_rv, pending_reserved_rv))
+                        Ok((page_items, watch_position, pending_reserved_rv))
                     })
                     .await?
                 } else {
@@ -1075,12 +1093,12 @@ impl Datastore {
                                 break;
                             }
                         }
-                        let current_rv = Self::current_resource_version_in_tx(&tx)?;
+                        let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
                         let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
                             &tx,
                             &list_subject_key_prefix(&av, &k, None),
                         )?;
-                        Ok((page_items, current_rv, pending_reserved_rv))
+                        Ok((page_items, watch_position, pending_reserved_rv))
                     })
                     .await?
                 }
@@ -1095,12 +1113,20 @@ impl Datastore {
                 items.truncate(lim);
                 next_token = items.last().map(|r| r.name.clone());
             }
-            let response_rv =
-                list_response_resource_version(&items, current_rv, pending_reserved_rv);
+            let response_rv = list_response_resource_version(
+                &items,
+                watch_position.resource_version,
+                pending_reserved_rv,
+            );
+            let watch_replay_position = Some(WatchReplayPosition {
+                resource_version: response_rv,
+                ..watch_position
+            });
 
             return Ok(ResourceList {
                 items,
                 resource_version: response_rv,
+                watch_replay_position,
                 continue_token: next_token,
                 remaining_item_count: None,
             });
@@ -1137,7 +1163,7 @@ impl Datastore {
                 Vec::new()
             };
 
-        let (items, current_rv, pending_reserved_rv) = if use_namespaced_table(
+        let (items, watch_position, pending_reserved_rv) = if use_namespaced_table(
             api_version,
             kind,
             &namespace,
@@ -1228,12 +1254,12 @@ impl Datastore {
                     }
                     items.push(item);
                 }
-                let current_rv = Self::current_resource_version_in_tx(&tx)?;
+                let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
                 let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
                     &tx,
                     &list_subject_key_prefix(&av, &k, ns_owned.as_deref()),
                 )?;
-                Ok((items, current_rv, pending_reserved_rv))
+                Ok((items, watch_position, pending_reserved_rv))
             })
             .await?
         } else {
@@ -1307,12 +1333,12 @@ impl Datastore {
                     }
                     items.push(item);
                 }
-                let current_rv = Self::current_resource_version_in_tx(&tx)?;
+                let watch_position = Self::current_watch_replay_position_in_tx(&tx)?;
                 let pending_reserved_rv = pending_reserved_rv_for_collection_in_tx(
                     &tx,
                     &list_subject_key_prefix(&av, &k, None),
                 )?;
-                Ok((items, current_rv, pending_reserved_rv))
+                Ok((items, watch_position, pending_reserved_rv))
             })
             .await?
         };
@@ -1332,10 +1358,18 @@ impl Datastore {
             items.truncate(lim as usize);
             next_token = Some(items.last().unwrap().name.clone());
         }
-        let response_rv = list_response_resource_version(&items, current_rv, pending_reserved_rv);
+        let response_rv = list_response_resource_version(
+            &items,
+            watch_position.resource_version,
+            pending_reserved_rv,
+        );
         Ok(ResourceList {
             items,
             resource_version: response_rv,
+            watch_replay_position: Some(WatchReplayPosition {
+                resource_version: response_rv,
+                ..watch_position
+            }),
             continue_token: next_token,
             remaining_item_count,
         })
@@ -1362,6 +1396,163 @@ impl Datastore {
             ),
         )
         .await
+    }
+
+    pub async fn list_resources_for_watch_targets(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+    ) -> Result<ResourceList> {
+        let targets = targets.to_vec();
+        let label_requirements = label_selector
+            .map(parse_label_selector)
+            .transpose()?
+            .unwrap_or_default();
+        #[cfg(test)]
+        let label_selector_for_pause = label_selector.map(str::to_string);
+
+        self.read_db_call("list_resources_for_watch_targets", move |conn| {
+            let tx = conn.transaction()?;
+            let mut items = Vec::new();
+            let mut pending_reserved_rv = None::<i64>;
+            for target in &targets {
+                let namespace = match &target.scope {
+                    WatchTargetScope::Cluster => None,
+                    WatchTargetScope::Namespaced(namespace) => namespace.as_deref(),
+                };
+                if let Some(reserved_rv) = pending_reserved_rv_for_collection_in_tx(
+                    &tx,
+                    &list_subject_key_prefix(&target.api_version, &target.kind, namespace),
+                )? {
+                    pending_reserved_rv = Some(
+                        pending_reserved_rv.map_or(reserved_rv, |current| current.min(reserved_rv)),
+                    );
+                }
+            }
+
+            for target in &targets {
+                match &target.scope {
+                    WatchTargetScope::Cluster => {
+                        let mut query = "SELECT r.id, r.api_version, r.kind, r.name, \
+                             r.resource_version, r.uid, r.data \
+                             FROM cluster_resources r \
+                             WHERE r.api_version = ?1 AND r.kind = ?2"
+                            .to_string();
+                        let api_version = target.api_version.clone();
+                        let kind = target.kind.clone();
+                        let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                            vec![Box::new(api_version.clone()), Box::new(kind.clone())];
+                        let pushdown = selector_index::build_selector_pushdown(
+                            &label_requirements,
+                            &[],
+                            &api_version,
+                            &kind,
+                            params.len(),
+                            true,
+                        );
+                        for clause in &pushdown.sql_clauses {
+                            query.push_str(&format!(" AND {clause}"));
+                        }
+                        for parameter in pushdown.sql_params {
+                            params.push(Box::new(parameter));
+                        }
+                        let residual_labels = pushdown.residual_labels;
+                        query.push_str(" ORDER BY r.name");
+                        let param_refs = params
+                            .iter()
+                            .map(|parameter| parameter.as_ref())
+                            .collect::<Vec<&dyn rusqlite::ToSql>>();
+                        let mut stmt = tx.prepare(&query)?;
+                        let rows =
+                            stmt.query_map(param_refs.as_slice(), row_to_cluster_resource)?;
+                        for row in rows {
+                            let item = row?;
+                            if residual_labels.is_empty()
+                                || matches_label_requirements(&item.data, &residual_labels)
+                            {
+                                items.push(item);
+                            }
+                        }
+                    }
+                    WatchTargetScope::Namespaced(namespace) => {
+                        let mut query = "SELECT r.id, r.api_version, r.kind, r.namespace, \
+                             r.name, r.resource_version, r.uid, r.data \
+                             FROM namespaced_resources r \
+                             WHERE r.api_version = ?1 AND r.kind = ?2"
+                            .to_string();
+                        let api_version = target.api_version.clone();
+                        let kind = target.kind.clone();
+                        let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                            vec![Box::new(api_version.clone()), Box::new(kind.clone())];
+                        if let Some(namespace) = namespace {
+                            query.push_str(" AND r.namespace = ?3");
+                            params.push(Box::new(namespace.clone()));
+                        }
+                        let pushdown = selector_index::build_selector_pushdown(
+                            &label_requirements,
+                            &[],
+                            &api_version,
+                            &kind,
+                            params.len(),
+                            false,
+                        );
+                        for clause in &pushdown.sql_clauses {
+                            query.push_str(&format!(" AND {clause}"));
+                        }
+                        for parameter in pushdown.sql_params {
+                            params.push(Box::new(parameter));
+                        }
+                        let residual_labels = pushdown.residual_labels;
+                        query.push_str(" ORDER BY r.namespace, r.name");
+                        let param_refs = params
+                            .iter()
+                            .map(|param| param.as_ref())
+                            .collect::<Vec<&dyn rusqlite::ToSql>>();
+                        let mut stmt = tx.prepare(&query)?;
+                        let rows =
+                            stmt.query_map(param_refs.as_slice(), row_to_namespaced_resource)?;
+                        for row in rows {
+                            let item = row?;
+                            if residual_labels.is_empty()
+                                || matches_label_requirements(&item.data, &residual_labels)
+                            {
+                                items.push(item);
+                            }
+                        }
+                    }
+                }
+                #[cfg(test)]
+                maybe_pause_list_resources_snapshot_after_rows_for_test(
+                    &target.api_version,
+                    &target.kind,
+                    match &target.scope {
+                        WatchTargetScope::Cluster => None,
+                        WatchTargetScope::Namespaced(namespace) => namespace.as_deref(),
+                    },
+                    label_selector_for_pause.as_deref(),
+                    None,
+                    None,
+                    None,
+                );
+            }
+
+            let mut watch_replay_position = Self::current_watch_replay_position_in_tx(&tx)?;
+            let response_rv = list_response_resource_version(
+                &items,
+                watch_replay_position.resource_version,
+                pending_reserved_rv,
+            );
+            watch_replay_position.resource_version = response_rv;
+            Ok(ResourceList {
+                items,
+                resource_version: response_rv,
+                watch_replay_position: Some(watch_replay_position),
+                continue_token: None,
+                remaining_item_count: None,
+            })
+        })
+        .await
+        .map_err(|err| anyhow!("Failed to atomically list watch targets: {err}"))
     }
 
     pub async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {

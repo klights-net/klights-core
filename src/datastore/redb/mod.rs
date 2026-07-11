@@ -25,6 +25,7 @@ pub mod network;
 pub mod open_boundary;
 pub mod opener;
 pub mod pod_slot;
+mod position_membership;
 pub mod sandbox;
 pub mod snapshot;
 pub mod tables;

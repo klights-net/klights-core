@@ -710,6 +710,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
     let seed_watch_10 = LogApplyCommit::new(
         10,
         vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+            event_id: None,
             api_version: "v1".to_string(),
             kind: "ConfigMap".to_string(),
             namespace: Some("mixed-family-ns".to_string()),
@@ -723,6 +724,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
     let seed_watch_20 = LogApplyCommit::new(
         20,
         vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+            event_id: None,
             api_version: "v1".to_string(),
             kind: "ConfigMap".to_string(),
             namespace: Some("mixed-family-ns".to_string()),
@@ -815,6 +817,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
                 pod_data: json!({"metadata": {"name": "family-schedulable-pod"}}),
             }),
             LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                event_id: None,
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: Some("mixed-family-ns".to_string()),

@@ -4,6 +4,64 @@ use serde_json::json;
 static LIST_RESOURCES_SNAPSHOT_PAUSE_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
     std::sync::OnceLock::new();
 
+fn spawn_raw_create_with_watch_event(
+    cluster_db_path: std::path::PathBuf,
+    api_version: &'static str,
+    kind: &'static str,
+    namespace: &'static str,
+    name: &'static str,
+    data: serde_json::Value,
+) -> std::thread::JoinHandle<rusqlite::Result<i64>> {
+    std::thread::spawn(move || {
+        let mut conn = rusqlite::Connection::open(cluster_db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let tx = conn.transaction()?;
+
+        tx.execute(
+            "UPDATE metadata SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) \
+             WHERE key = 'resource_version'",
+            [],
+        )?;
+        let rv: i64 = tx.query_row(
+            "SELECT CAST(value AS INTEGER) FROM metadata WHERE key = 'resource_version'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let row_data = serde_json::to_vec(&data)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let uid = format!("raw-uid-{name}");
+        tx.execute(
+            "INSERT INTO namespaced_resources (api_version, kind, namespace, name, uid, resource_version, created_rv, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
+            rusqlite::params![api_version, kind, namespace, name, uid, rv, &row_data],
+        )?;
+        crate::datastore::sqlite::selector_index::upsert_index_entries(
+            &tx,
+            &api_version,
+            &kind,
+            &namespace,
+            &name,
+            &row_data,
+        )?;
+        crate::datastore::sqlite::crud::helpers::insert_watch_event_in_conn(
+            &tx,
+            crate::datastore::sqlite::crud::helpers::WatchEventInsert::new(
+                &api_version,
+                &kind,
+                Some(&namespace),
+                &name,
+                rv,
+                "ADDED",
+                &row_data,
+            ),
+        )?;
+
+        tx.commit()?;
+        Ok(rv)
+    })
+}
+
 async fn list_resources_snapshot_pause_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
     LIST_RESOURCES_SNAPSHOT_PAUSE_TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
@@ -326,6 +384,232 @@ async fn list_resources_response_rv_does_not_advance_past_concurrent_delete_snap
         "list contains cm-a, so its resourceVersion must precede cm-a deletion; list rv={}, delete rv={}",
         list.resource_version,
         delete_rv
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_resources_watch_position_is_atomic_with_row_snapshot() {
+    let _pause_guard = list_resources_snapshot_pause_test_guard().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
+        crate::task_supervisor::TaskCategoryConfig::default(),
+    ));
+    let db_root = dir.path().join("state");
+    let db = Datastore::new_persistent(&db_root, supervisor, None)
+        .await
+        .unwrap();
+
+    db.create_resource(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        "cm-before-list",
+        json!({
+            "metadata": {
+                "name": "cm-before-list",
+                "namespace": "default",
+                "labels": {"race": "watch-position"}
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let pause = Datastore::install_list_resources_snapshot_after_rows_pause_for_test(
+        "v1",
+        "ConfigMap",
+        Some("default"),
+        Some("race=watch-position"),
+        None,
+        Some(500),
+        None,
+    );
+    let list_db = db.clone();
+    let list_task = tokio::spawn(async move {
+        list_db
+            .list_resources(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                ResourceListQuery::new(Some("race=watch-position"), None, Some(500), None),
+            )
+            .await
+            .unwrap()
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), pause.wait_for_hit())
+        .await
+        .expect("list_resources after-rows pause was not reached");
+    let cluster_db_path = db_root.join("sqlite").join("cluster.db");
+    let create_result = spawn_raw_create_with_watch_event(
+        cluster_db_path,
+        "v1",
+        "ConfigMap",
+        "default",
+        "cm-after-list-snapshot",
+        json!({
+            "metadata": {
+                "name": "cm-after-list-snapshot",
+                "namespace": "default",
+                "labels": {"race": "watch-position"}
+            }
+        }),
+    );
+    let create_result = create_result.join();
+    pause.resume();
+    let _created_rv = create_result
+        .expect("raw sqlite create thread panicked")
+        .expect("raw sqlite create failed");
+    let current_position = db.current_watch_replay_position().await.unwrap();
+
+    let list = list_task.await.expect("list task panicked");
+    assert_eq!(
+        list.items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cm-before-list"]
+    );
+    let list_position = list
+        .watch_replay_position
+        .expect("live LIST must carry an atomic watch position");
+    assert!(
+        list_position.event_id < current_position.event_id,
+        "LIST position must exclude a watch event committed after its row snapshot"
+    );
+
+    let replay = db
+        .list_watch_events_after_position_checked_bounded(
+            &[crate::datastore::WatchTarget::namespaced_in_namespace(
+                "v1",
+                "ConfigMap",
+                "default",
+            )],
+            list_position,
+            std::num::NonZeroUsize::new(10).unwrap(),
+        )
+        .await
+        .unwrap();
+    let crate::datastore::PositionedWatchReplayRead::Events(replay) = replay else {
+        panic!("fresh post-LIST event must remain replayable");
+    };
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .map(|event| event.event.resource.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cm-after-list-snapshot"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_target_watch_list_uses_one_snapshot_across_target_scans() {
+    let _pause_guard = list_resources_snapshot_pause_test_guard().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
+        crate::task_supervisor::TaskCategoryConfig::default(),
+    ));
+    let db = Datastore::new_persistent(&dir.path().join("state"), supervisor, None)
+        .await
+        .unwrap();
+    db.create_resource(
+        "widgets.test/v1",
+        "Widget",
+        Some("default"),
+        "before",
+        json!({
+            "metadata": {
+                "name": "before",
+                "namespace": "default",
+                "labels": {"atomic": "yes"}
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let pause = Datastore::install_list_resources_snapshot_after_rows_pause_for_test(
+        "widgets.test/v1",
+        "Widget",
+        Some("default"),
+        Some("atomic=yes"),
+        None,
+        None,
+        None,
+    );
+    let targets = vec![
+        crate::datastore::WatchTarget::namespaced_in_namespace(
+            "widgets.test/v1",
+            "Widget",
+            "default",
+        ),
+        crate::datastore::WatchTarget::namespaced_in_namespace(
+            "widgets.test/v2",
+            "Widget",
+            "default",
+        ),
+    ];
+    let list_db = db.clone();
+    let list_targets = targets.clone();
+    let list_task = tokio::spawn(async move {
+        list_db
+            .list_resources_for_watch_targets(&list_targets, Some("atomic=yes"))
+            .await
+            .unwrap()
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), pause.wait_for_hit())
+        .await
+        .expect("multi-target LIST did not pause after its first target scan");
+    let cluster_db_path = dir.path().join("state").join("sqlite").join("cluster.db");
+    let create_result = spawn_raw_create_with_watch_event(
+        cluster_db_path,
+        "widgets.test/v2",
+        "Widget",
+        "default",
+        "after-snapshot",
+        json!({
+            "metadata": {
+                "name": "after-snapshot",
+                "namespace": "default",
+                "labels": {"atomic": "yes"}
+            }
+        }),
+    );
+    let create_result = create_result.join();
+    pause.resume();
+    let _created_rv = create_result
+        .expect("raw sqlite create thread panicked")
+        .expect("raw sqlite create failed");
+
+    let list = list_task.await.expect("multi-target LIST task panicked");
+    assert_eq!(
+        list.items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["before"],
+        "a later target must not observe a commit made after the first target's snapshot"
+    );
+    let replay = db
+        .list_watch_events_after_position_checked_bounded(
+            &targets,
+            list.watch_replay_position.unwrap(),
+            std::num::NonZeroUsize::new(10).unwrap(),
+        )
+        .await
+        .unwrap();
+    let crate::datastore::PositionedWatchReplayRead::Events(replay) = replay else {
+        panic!("post-snapshot multi-target event must remain replayable");
+    };
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .map(|event| event.event.resource.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["after-snapshot"]
     );
 }
 

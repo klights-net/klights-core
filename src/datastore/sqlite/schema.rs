@@ -170,7 +170,7 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
     // resources after restart.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS watch_events (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             api_version TEXT NOT NULL,
             kind TEXT NOT NULL,
             namespace TEXT,
@@ -182,6 +182,7 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
         [],
     )?;
     migrate_watch_events_allow_same_rv(conn)?;
+    migrate_watch_events_monotonic_id(conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_watch_events_ns
          ON watch_events(api_version, kind, namespace, resource_version, id)",
@@ -372,7 +373,7 @@ fn migrate_watch_events_allow_same_rv(conn: &mut rusqlite::Connection) -> rusqli
     tx.execute("ALTER TABLE watch_events RENAME TO watch_events_old", [])?;
     tx.execute(
         "CREATE TABLE watch_events (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             api_version TEXT NOT NULL,
             kind TEXT NOT NULL,
             namespace TEXT,
@@ -392,6 +393,61 @@ fn migrate_watch_events_allow_same_rv(conn: &mut rusqlite::Connection) -> rusqli
         [],
     )?;
     tx.execute("DROP TABLE watch_events_old", [])?;
+    tx.commit()
+}
+
+fn migrate_watch_events_monotonic_id(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let create_sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'watch_events'",
+        [],
+        |row| row.get(0),
+    )?;
+    let retained_high_water: i64 =
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM watch_events", [], |row| {
+            row.get(0)
+        })?;
+    let retained_floor_high_water: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(floor_event_id), 0) FROM watch_replay_floors",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let high_water = retained_high_water.max(retained_floor_high_water);
+    if create_sql.to_ascii_uppercase().contains("AUTOINCREMENT") {
+        if high_water > retained_high_water {
+            super::Datastore::advance_watch_event_allocator_in_conn(conn, high_water)?;
+        }
+        return Ok(());
+    }
+
+    let tx = conn.transaction()?;
+    tx.execute("ALTER TABLE watch_events RENAME TO watch_events_old", [])?;
+    tx.execute(
+        "CREATE TABLE watch_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_version TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            namespace TEXT,
+            name TEXT NOT NULL,
+            resource_version INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            data BLOB NOT NULL
+        )",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO watch_events
+         (id, api_version, kind, namespace, name, resource_version, event_type, data)
+         SELECT id, api_version, kind, namespace, name, resource_version, event_type, data
+         FROM watch_events_old
+         ORDER BY id ASC",
+        [],
+    )?;
+    tx.execute("DROP TABLE watch_events_old", [])?;
+    if high_water > retained_high_water {
+        super::Datastore::advance_watch_event_allocator_in_conn(&tx, high_water)?;
+    }
     tx.commit()
 }
 
@@ -522,6 +578,64 @@ mod tests {
         )
         .unwrap_or(0)
             == 1
+    }
+
+    #[test]
+    fn upgrades_legacy_watch_event_allocator_without_reusing_gc_ids() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            "CREATE TABLE watch_events (
+                id INTEGER PRIMARY KEY,
+                api_version TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                namespace TEXT,
+                name TEXT NOT NULL,
+                resource_version INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                data BLOB NOT NULL
+            );
+            CREATE TABLE watch_replay_floors (
+                api_version TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                namespace_key TEXT NOT NULL,
+                floor_rv INTEGER NOT NULL,
+                floor_event_id INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(api_version, kind, namespace_key)
+            );
+            INSERT INTO watch_replay_floors
+                (api_version, kind, namespace_key, floor_rv, floor_event_id)
+            VALUES ('v1', 'ConfigMap', 'default', 41, 41);",
+        )
+        .expect("seed legacy schema after full watch GC");
+
+        init_schema_in_conn(&mut conn).expect("upgrade schema");
+
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'watch_events'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("watch_events DDL");
+        assert!(table_sql.to_ascii_uppercase().contains("AUTOINCREMENT"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'watch_events'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("durable allocator high-water"),
+            41
+        );
+
+        conn.execute(
+            "INSERT INTO watch_events
+             (api_version, kind, namespace, name, resource_version, event_type, data)
+             VALUES ('v1', 'ConfigMap', 'default', 'after-upgrade', 42, 'ADDED', x'00')",
+            [],
+        )
+        .expect("insert after upgrade");
+        assert_eq!(conn.last_insert_rowid(), 42);
     }
 
     /// Regression: the raft snapshot/GC `watch_events` paged reads order by

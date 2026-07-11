@@ -234,8 +234,30 @@ pub fn incr_rv(w: &::redb::WriteTransaction) -> Result<i64> {
     Ok(next)
 }
 
+/// Advance the global resource-version counter up to at least `min_rv`.
+pub fn advance_rv_to_at_least(w: &::redb::WriteTransaction, min_rv: i64) -> Result<()> {
+    if min_rv <= 0 {
+        return Ok(());
+    }
+    let mut meta = w.open_table(tables::META)?;
+    let current = meta
+        .get("rv")?
+        .map(|g| {
+            std::str::from_utf8(g.value())
+                .unwrap_or("0")
+                .parse::<i64>()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    if current < min_rv {
+        meta.insert("rv", min_rv.to_string().as_bytes())?;
+    }
+    Ok(())
+}
+
 /// Append a watch event to the watch-event table.
 pub fn watch_insert(w: &::redb::WriteTransaction, rv: i64, event: &Value) -> Result<()> {
+    advance_rv_to_at_least(w, rv)?;
     let event_id = {
         let mut meta = w.open_table(tables::META)?;
         let current = meta
@@ -328,6 +350,41 @@ pub fn read_rv_meta(w: &::redb::WriteTransaction) -> Result<i64> {
         })
     };
     Ok(guard.unwrap_or(0))
+}
+
+/// Read the resource-version and durable watch-log high-water mark from one
+/// Redb read snapshot so LIST can resume without a list/watch race.
+pub fn watch_replay_position_in_read(
+    read: &::redb::ReadTransaction,
+) -> Result<WatchReplayPosition> {
+    let resource_version = {
+        let meta = read.open_table(tables::META)?;
+        let value = meta.get("rv")?;
+        value
+            .map(|value| {
+                std::str::from_utf8(value.value())
+                    .unwrap_or("0")
+                    .parse::<i64>()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    };
+    let event_id = watch_event_high_water_in_read(read)?;
+    Ok(WatchReplayPosition {
+        resource_version,
+        event_id,
+        resource_version_filter_through_event_id: 0,
+    })
+}
+
+/// Return the monotonic watch-event allocator high-water, which remains valid
+/// after retention removes the last materialized event row.
+pub fn watch_event_high_water_in_read(read: &::redb::ReadTransaction) -> Result<i64> {
+    let meta = read.open_table(tables::META)?;
+    Ok(meta
+        .get("watch_event_id")?
+        .and_then(|value| std::str::from_utf8(value.value()).ok()?.parse::<i64>().ok())
+        .unwrap_or(0))
 }
 
 /// Parse a `Resource` from a namespaced resource body.

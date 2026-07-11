@@ -127,7 +127,6 @@ impl Datastore {
         label_selector: Option<&str>,
         field_selector: Option<&str>,
     ) -> Result<ResourceList> {
-        let current_rv = self.get_current_resource_version().await?;
         let parsed_label_selector = label_selector
             .map(str::trim)
             .filter(|selector| !selector.is_empty())
@@ -137,6 +136,8 @@ impl Datastore {
         let field_selector_owned = field_selector.map(str::to_string);
 
         self.read_db_call("db_query", move |conn| {
+            let tx = conn.transaction()?;
+            let conn = &tx;
             let mut query = queries::NAMESPACES_LIST_HEAD.to_string();
             let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -184,9 +185,11 @@ impl Datastore {
                     items.retain(|item| matches_field_selector_conditions(&item.data, &conditions));
                 }
             }
+            let watch_replay_position = Self::current_watch_replay_position_in_tx(&tx)?;
             Ok(ResourceList {
                 items,
-                resource_version: current_rv,
+                resource_version: watch_replay_position.resource_version,
+                watch_replay_position: Some(watch_replay_position),
                 continue_token: None,
                 remaining_item_count: None,
             })

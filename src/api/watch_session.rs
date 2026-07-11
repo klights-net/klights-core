@@ -1,10 +1,8 @@
+use crate::datastore::WatchReplayPosition;
 use crate::watch::{
-    EventType, RawSignalWatchCursor, SignalWatchCursor, WatchCursorError, WatchDeliveryScope,
-    WatchEvent, WatchReplaySource, WatchSignalReceiver, WatchTopic, WindowPolicy,
+    SelectorMembership, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
+    WatchReplaySource, WatchSignalReceiver, WatchTopic, WindowPolicy,
 };
-use std::collections::HashSet;
-
-pub(crate) type WatchObjectKey = (Option<String>, String);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WatchSessionConfig {
@@ -12,24 +10,17 @@ pub(crate) struct WatchSessionConfig {
     pub has_selector: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BaselineDisposition {
-    Emitted,
-    Retained,
-}
-
 #[derive(Debug)]
 pub(crate) enum WatchSessionEvent {
     Deliver(WatchEvent),
-    Filtered { key: WatchObjectKey, rv: i64 },
-    Ignored,
+    Filtered,
 }
 
 impl WatchSessionEvent {
     pub(crate) fn into_deliverable(self) -> Option<WatchEvent> {
         match self {
             Self::Deliver(event) => Some(event),
-            Self::Filtered { .. } | Self::Ignored => None,
+            Self::Filtered => None,
         }
     }
 }
@@ -42,9 +33,8 @@ pub(crate) struct WatchSessionBootstrap {
     config: WatchSessionConfig,
     initial_list_rv: i64,
     last_delivered_scoped_rv: i64,
-    matched_keys: HashSet<WatchObjectKey>,
-    baseline_delivered: Vec<(WatchObjectKey, i64)>,
-    baseline_low_rv_allowlist: Vec<(WatchObjectKey, i64)>,
+    replay_start_position: WatchReplayPosition,
+    membership: SelectorMembership,
 }
 
 impl WatchSessionBootstrap {
@@ -52,10 +42,9 @@ impl WatchSessionBootstrap {
         Self {
             initial_list_rv: config.requested_rv,
             last_delivered_scoped_rv: config.requested_rv,
+            replay_start_position: WatchReplayPosition::from_resource_version(config.requested_rv),
             config,
-            matched_keys: HashSet::new(),
-            baseline_delivered: Vec::new(),
-            baseline_low_rv_allowlist: Vec::new(),
+            membership: SelectorMembership::default(),
         }
     }
 
@@ -68,6 +57,7 @@ impl WatchSessionBootstrap {
         self.observe_delivered_rv(rv);
     }
 
+    #[cfg(test)]
     pub(crate) fn observe_delivered_event(&mut self, event: &WatchEvent) {
         if let Some(rv) = event.resource_version() {
             self.observe_delivered_rv(rv);
@@ -78,26 +68,16 @@ impl WatchSessionBootstrap {
         self.last_delivered_scoped_rv = self.last_delivered_scoped_rv.max(rv);
     }
 
-    pub(crate) fn record_baseline_member(
-        &mut self,
-        key: WatchObjectKey,
-        rv: i64,
-        disposition: BaselineDisposition,
-    ) {
-        self.matched_keys.insert(key.clone());
-        match disposition {
-            BaselineDisposition::Emitted => {
-                self.baseline_delivered.push((key, rv));
-                self.observe_delivered_rv(rv);
-            }
-            BaselineDisposition::Retained => {
-                self.baseline_low_rv_allowlist.push((key, rv));
-            }
-        }
+    pub(crate) fn set_replay_start_position(&mut self, position: WatchReplayPosition) {
+        self.replay_start_position = position;
     }
 
-    pub(crate) fn record_member(&mut self, key: WatchObjectKey) {
-        self.matched_keys.insert(key);
+    pub(crate) fn record_baseline_event(&mut self, event: &WatchEvent) {
+        if self.membership.record_event(event)
+            && let Some(rv) = event.resource_version()
+        {
+            self.observe_delivered_rv(rv);
+        }
     }
 
     pub(crate) fn classify_event(
@@ -109,7 +89,7 @@ impl WatchSessionBootstrap {
             event,
             matches_selector,
             self.config.has_selector,
-            &mut self.matched_keys,
+            &mut self.membership,
         )
     }
 
@@ -125,20 +105,13 @@ impl WatchSessionBootstrap {
         self.last_delivered_scoped_rv
     }
 
-    pub(crate) fn seed_raw_cursor(&self, cursor: &mut RawSignalWatchCursor) {
-        for ((namespace, name), rv) in &self.baseline_delivered {
-            cursor.mark_delivered_for_key(namespace.clone(), name.clone(), *rv);
-        }
+    pub(crate) fn replay_start_position(&self) -> WatchReplayPosition {
+        self.replay_start_position
     }
 
     #[cfg(test)]
-    fn baseline_delivered(&self) -> &[(WatchObjectKey, i64)] {
-        &self.baseline_delivered
-    }
-
-    #[cfg(test)]
-    fn contains_member(&self, key: &WatchObjectKey) -> bool {
-        self.matched_keys.contains(key)
+    fn contains_member(&self, key: &(Option<String>, String)) -> bool {
+        self.membership.contains(key)
     }
 
     pub(crate) fn establish_many<S: WatchReplaySource>(
@@ -148,25 +121,20 @@ impl WatchSessionBootstrap {
         topics: Vec<WatchTopic>,
         delivery_scope: WatchDeliveryScope,
     ) -> WatchSession<S> {
-        let mut cursor = SignalWatchCursor::new_many(
+        let cursor = SignalWatchCursor::new_many_at_position(
             signal_rx,
             replay_source,
             topics,
             delivery_scope,
             self.cursor_floor(),
+            self.replay_start_position,
             WindowPolicy::default_watch_delivery(),
         );
-        for ((namespace, name), rv) in &self.baseline_delivered {
-            cursor.mark_delivered_for_key(namespace.clone(), name.clone(), *rv);
-        }
-        for ((namespace, name), after_rv) in &self.baseline_low_rv_allowlist {
-            cursor.allow_low_rv_for_key(namespace.clone(), name.clone(), *after_rv);
-        }
         WatchSession {
             cursor,
             config: self.config,
             last_delivered_scoped_rv: self.last_delivered_scoped_rv,
-            matched_keys: self.matched_keys,
+            membership: self.membership,
         }
     }
 }
@@ -175,7 +143,7 @@ pub(crate) struct WatchSession<S: WatchReplaySource> {
     cursor: SignalWatchCursor<S>,
     config: WatchSessionConfig,
     last_delivered_scoped_rv: i64,
-    matched_keys: HashSet<WatchObjectKey>,
+    membership: SelectorMembership,
 }
 
 impl<S: WatchReplaySource> WatchSession<S> {
@@ -196,17 +164,13 @@ impl<S: WatchReplaySource> WatchSession<S> {
             event,
             matches_selector,
             self.config.has_selector,
-            &mut self.matched_keys,
+            &mut self.membership,
         )
     }
 
     pub(crate) fn accept_delivered_rv(&mut self, rv: i64) {
         self.cursor.accept_event(rv);
         self.last_delivered_scoped_rv = self.last_delivered_scoped_rv.max(rv);
-    }
-
-    pub(crate) fn accept_filtered(&mut self, key: WatchObjectKey, rv: i64) {
-        self.cursor.mark_filtered_for_key(key.0, key.1, rv);
     }
 
     pub(crate) fn accepted_rv(&self) -> i64 {
@@ -222,12 +186,10 @@ fn classify_event(
     event: WatchEvent,
     matches_selector: bool,
     has_selector: bool,
-    matched_keys: &mut HashSet<WatchObjectKey>,
+    membership: &mut SelectorMembership,
 ) -> WatchSessionEvent {
-    let event_rv = event.resource_version();
-    let key = watch_event_key(&event);
     let event = if has_selector {
-        apply_selector_transition_event(event, matches_selector, matched_keys)
+        membership.transition(event, matches_selector)
     } else if matches_selector {
         Some(event)
     } else {
@@ -235,76 +197,7 @@ fn classify_event(
     };
     match event {
         Some(event) => WatchSessionEvent::Deliver(event),
-        None => match (key, event_rv) {
-            (Some(key), Some(rv)) => WatchSessionEvent::Filtered { key, rv },
-            _ => WatchSessionEvent::Ignored,
-        },
-    }
-}
-
-pub(crate) fn watch_event_key(event: &WatchEvent) -> Option<WatchObjectKey> {
-    let name = event
-        .object
-        .pointer("/metadata/name")
-        .and_then(|value| value.as_str())?
-        .to_string();
-    let namespace = event
-        .object
-        .pointer("/metadata/namespace")
-        .and_then(|value| value.as_str())
-        .map(str::to_string);
-    Some((namespace, name))
-}
-
-/// Extract baseline identity from JSON metadata, matching the live event path
-/// even when storage classification differs from the Kubernetes scope.
-pub(crate) fn resource_to_seen_key(resource: &crate::datastore::Resource) -> WatchObjectKey {
-    let namespace = resource
-        .data
-        .pointer("/metadata/namespace")
-        .and_then(|value| value.as_str())
-        .map(str::to_string);
-    (namespace, resource.name.clone())
-}
-
-pub(crate) fn apply_selector_transition_event(
-    mut event: WatchEvent,
-    matches_selector: bool,
-    matched_keys: &mut HashSet<WatchObjectKey>,
-) -> Option<WatchEvent> {
-    if event.event_type == EventType::Bookmark {
-        return Some(event);
-    }
-    let key = watch_event_key(&event)?;
-    let rewrite_event_type = |event: &mut WatchEvent, new_type| {
-        if event.event_type != new_type {
-            event.event_type = new_type;
-            event.encoded_payload = None;
-        }
-    };
-    match event.event_type {
-        EventType::Deleted => {
-            if matched_keys.remove(&key) || matches_selector {
-                Some(event)
-            } else {
-                None
-            }
-        }
-        EventType::Added | EventType::Modified => {
-            if matches_selector {
-                if matched_keys.insert(key) {
-                    rewrite_event_type(&mut event, EventType::Added);
-                }
-                Some(event)
-            } else if matched_keys.remove(&key) {
-                rewrite_event_type(&mut event, EventType::Deleted);
-                Some(event)
-            } else {
-                None
-            }
-        }
-        _ if matches_selector => Some(event),
-        _ => None,
+        None => WatchSessionEvent::Filtered,
     }
 }
 
@@ -315,7 +208,7 @@ mod tests {
         PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead,
         WatchReplayPosition, WatchReplayRead,
     };
-    use crate::watch::{EventType, WatchContentType, WatchEvent, encode_watch_payload};
+    use crate::watch::{EventType, WatchContentType, WatchEvent, encode_watch_payload, event_key};
     use async_trait::async_trait;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
@@ -373,6 +266,7 @@ mod tests {
                     position: WatchReplayPosition {
                         resource_version: event.resource_version().unwrap_or_default(),
                         event_id: index as i64 + 1,
+                        resource_version_filter_through_event_id: 0,
                     },
                     event: event.clone(),
                 })
@@ -408,6 +302,7 @@ mod tests {
                 "metadata": {
                     "namespace": namespace,
                     "name": name,
+                    "uid": format!("uid-{name}"),
                     "resourceVersion": rv.to_string(),
                 }
             })),
@@ -550,23 +445,14 @@ mod tests {
     }
 
     #[test]
-    fn baseline_dedupe_is_recorded_without_collapsing_same_rv_distinct_members() {
+    fn baseline_membership_tracks_namespaced_keys_independently() {
         for adapter in ["built-in", "custom-resource"] {
             let mut bootstrap = WatchSessionBootstrap::new(WatchSessionConfig {
                 requested_rv: 0,
                 has_selector: true,
             });
-            bootstrap.record_baseline_member(
-                (Some("a".into()), "shared".into()),
-                9,
-                BaselineDisposition::Emitted,
-            );
-            bootstrap.record_baseline_member(
-                (Some("b".into()), "shared".into()),
-                9,
-                BaselineDisposition::Emitted,
-            );
-            assert_eq!(bootstrap.baseline_delivered().len(), 2, "{adapter}");
+            bootstrap.record_baseline_event(&event(EventType::Added, "a", "shared", 9));
+            bootstrap.record_baseline_event(&event(EventType::Added, "b", "shared", 9));
             assert!(
                 bootstrap.contains_member(&(Some("a".into()), "shared".into())),
                 "{adapter}"
@@ -586,10 +472,7 @@ mod tests {
         });
         let filtered =
             bootstrap.classify_event(event(EventType::Modified, "default", "filtered", 11), false);
-        assert!(matches!(
-            filtered,
-            WatchSessionEvent::Filtered { rv: 11, .. }
-        ));
+        assert!(matches!(filtered, WatchSessionEvent::Filtered));
         assert_eq!(bootstrap.last_delivered_scoped_rv(), 10);
         let delivered =
             bootstrap.classify_event(event(EventType::Added, "default", "visible", 11), true);
@@ -599,12 +482,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn built_in_and_cr_identity_dedupe_preserves_same_rv_distinct_objects() {
+    async fn built_in_and_cr_positioned_replay_preserves_same_rv_distinct_objects() {
         // A single positioned replay page carrying two distinct objects that
         // share one resourceVersion (a same-raft-revision pair) must deliver
-        // both; the kernel must not collapse them by numeric RV. The
-        // baseline-delivered dedup seed is covered by the bootstrap-level
-        // `baseline_dedupe_is_recorded_*` unit tests.
+        // both; the kernel must not collapse them by numeric RV.
         for adapter in ["built-in", "custom-resource"] {
             let bootstrap = WatchSessionBootstrap::new(WatchSessionConfig {
                 requested_rv: 0,
@@ -620,14 +501,66 @@ mod tests {
             let mut session = establish(bootstrap, source);
             session.prime_replay_or_expired().await.unwrap();
             let first = session.next_event().await.unwrap();
-            assert_eq!(watch_event_key(&first).unwrap().1, "first", "{adapter}");
+            assert_eq!(event_key(&first).unwrap().1, "first", "{adapter}");
             let second = session.next_event().await.unwrap();
             assert_eq!(
-                watch_event_key(&second).unwrap().1,
+                event_key(&second).unwrap().1,
                 "second",
                 "{adapter}: same-rv distinct peer must not be collapsed"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn positioned_same_type_same_identity_rows_are_distinct_events() {
+        let bootstrap = WatchSessionBootstrap::new(WatchSessionConfig {
+            requested_rv: 0,
+            has_selector: false,
+        });
+        let source = ReplaySource {
+            events: vec![
+                event(EventType::Modified, "default", "same", 9),
+                event(EventType::Modified, "default", "same", 9),
+            ],
+            expired: false,
+        };
+        let mut session = establish(bootstrap, source);
+        session.prime_replay_or_expired().await.unwrap();
+
+        assert_eq!(
+            session.next_event().await.unwrap().event_type,
+            EventType::Modified
+        );
+        assert_eq!(
+            session.next_event().await.unwrap().event_type,
+            EventType::Modified
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_anchor_skips_history_and_keeps_lower_rv_post_anchor_event() {
+        let mut bootstrap = WatchSessionBootstrap::new(WatchSessionConfig {
+            requested_rv: 0,
+            has_selector: false,
+        });
+        bootstrap.set_replay_start_position(WatchReplayPosition {
+            resource_version: 0,
+            event_id: 1,
+            resource_version_filter_through_event_id: 0,
+        });
+        let source = ReplaySource {
+            events: vec![
+                event(EventType::Added, "default", "history", 50),
+                event(EventType::Added, "default", "late-apply", 14),
+            ],
+            expired: false,
+        };
+        let mut session = establish(bootstrap, source);
+        session.prime_replay_or_expired().await.unwrap();
+
+        let delivered = session.next_event().await.unwrap();
+        assert_eq!(event_key(&delivered).unwrap().1, "late-apply");
+        assert_eq!(delivered.resource_version(), Some(14));
     }
 
     #[tokio::test]
@@ -648,11 +581,11 @@ mod tests {
             session.prime_replay_or_expired().await.unwrap();
             let filtered = session.next_event().await.unwrap();
             match session.classify_event(filtered, false) {
-                WatchSessionEvent::Filtered { key, rv } => session.accept_filtered(key, rv),
+                WatchSessionEvent::Filtered => {}
                 other => panic!("{adapter}: expected filtered event, got {other:?}"),
             }
             let visible = session.next_event().await.unwrap();
-            assert_eq!(watch_event_key(&visible).unwrap().1, "visible", "{adapter}");
+            assert_eq!(event_key(&visible).unwrap().1, "visible", "{adapter}");
         }
     }
 

@@ -88,6 +88,7 @@ impl FakeLeaderApiClient {
         let mut list = crate::datastore::ResourceList {
             items: Vec::new(),
             resource_version: self.pod.resource_version,
+            watch_replay_position: None,
             continue_token: None,
             remaining_item_count: None,
         };
@@ -4336,6 +4337,128 @@ async fn deferred_runtime_reducer_keeps_latest_restart_generation_after_stale_ne
         Some(&json!("2026-05-17T00:00:02Z")),
         "only the latest explicitly deferred runtime generation may be promoted"
     );
+}
+
+#[tokio::test]
+async fn actor_finalization_clears_deferred_runtime_observation() {
+    use super::PodStatusWriter;
+
+    let repo = build_repo().await;
+    let mut seed = pending_pod("deferred-runtime-finalized");
+    seed["metadata"]["deletionTimestamp"] = json!("2026-05-17T00:00:02Z");
+    seed["metadata"]["deletionGracePeriodSeconds"] = json!(0);
+    seed["status"] = json!({"phase": "Pending"});
+    let created = repo
+        .store
+        .create("default", "deferred-runtime-finalized", seed)
+        .await
+        .unwrap();
+
+    repo.apply_runtime_reconcile_status_for_uid(
+        "default",
+        "deferred-runtime-finalized",
+        &created.uid,
+        super::RuntimeReconcileStatus {
+            phase: "Running".to_string(),
+            container_statuses: vec![deferred_running_status(
+                "c",
+                Some("containerd://finalized"),
+                0,
+                "2026-05-17T00:00:01Z",
+            )],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(repo.status.has_deferred_runtime_for_uid(&created.uid));
+
+    let result = repo
+        .deletion_finalizer()
+        .finalize_after_actor_cleanup(&PodRuntimeKey::new(
+            "default",
+            "deferred-runtime-finalized",
+            &created.uid,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(result, PodDeletionFinalizeResult::DeletedOrAlreadyGone);
+    assert!(
+        !repo.status.has_deferred_runtime_for_uid(&created.uid),
+        "actor-owned finalization must release UID-keyed deferred runtime state"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum DeferredRuntimeFinalizerOutcome {
+    Deleted,
+    Pending,
+    Error,
+}
+
+struct FixedDeferredRuntimeFinalizer {
+    outcome: DeferredRuntimeFinalizerOutcome,
+}
+
+#[async_trait::async_trait]
+impl crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer
+    for FixedDeferredRuntimeFinalizer
+{
+    async fn finalize_after_actor_cleanup(
+        &self,
+        _key: &PodRuntimeKey,
+    ) -> anyhow::Result<PodDeletionFinalizeResult> {
+        match self.outcome {
+            DeferredRuntimeFinalizerOutcome::Deleted => {
+                Ok(PodDeletionFinalizeResult::DeletedOrAlreadyGone)
+            }
+            DeferredRuntimeFinalizerOutcome::Pending => {
+                Ok(PodDeletionFinalizeResult::FinalizersPending)
+            }
+            DeferredRuntimeFinalizerOutcome::Error => anyhow::bail!("injected finalizer failure"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn deferred_runtime_cleanup_finalizer_clears_only_terminal_success() {
+    for (name, outcome, should_clear) in [
+        (
+            "deleted-or-already-gone",
+            DeferredRuntimeFinalizerOutcome::Deleted,
+            true,
+        ),
+        (
+            "finalizers-pending",
+            DeferredRuntimeFinalizerOutcome::Pending,
+            false,
+        ),
+        ("error", DeferredRuntimeFinalizerOutcome::Error, false),
+    ] {
+        let uid = format!("uid-{name}");
+        let deferred_runtime = super::status::DeferredRuntimeReducerHandle::default();
+        deferred_runtime.insert_marker(&uid);
+        let finalizer = super::DeferredRuntimeCleanupFinalizer::new(
+            Arc::new(FixedDeferredRuntimeFinalizer { outcome }),
+            deferred_runtime.clone(),
+        );
+
+        let result = finalizer
+            .finalize_after_actor_cleanup(&PodRuntimeKey::new("default", name, &uid))
+            .await;
+
+        if matches!(outcome, DeferredRuntimeFinalizerOutcome::Error) {
+            assert!(result.is_err(), "{name} must preserve the inner error");
+        } else {
+            assert!(result.is_ok(), "{name} must preserve the inner result");
+        }
+        assert_eq!(
+            !deferred_runtime.contains(&uid),
+            should_clear,
+            "{name} cleanup decision"
+        );
+    }
 }
 
 #[tokio::test]

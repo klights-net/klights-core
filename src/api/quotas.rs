@@ -615,6 +615,7 @@ pub async fn check_service_type_quota(
         .unwrap_or_else(|_| crate::datastore::ResourceList {
             items: vec![],
             resource_version: 0,
+            watch_replay_position: None,
             continue_token: None,
             remaining_item_count: None,
         });
@@ -646,6 +647,7 @@ pub async fn check_service_type_quota(
                 .unwrap_or_else(|_| crate::datastore::ResourceList {
                     items: vec![],
                     resource_version: 0,
+                    watch_replay_position: None,
                     continue_token: None,
                     remaining_item_count: None,
                 });
@@ -683,6 +685,7 @@ pub async fn check_service_type_quota(
                 .unwrap_or_else(|_| crate::datastore::ResourceList {
                     items: vec![],
                     resource_version: 0,
+                    watch_replay_position: None,
                     continue_token: None,
                     remaining_item_count: None,
                 });

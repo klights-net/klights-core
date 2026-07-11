@@ -111,6 +111,19 @@ pub struct ReplicatedSnapshotMetadata {
     pub membership: Option<crate::control_plane::client::membership::ClusterMembership>,
 }
 
+/// Per-resource-scope compaction boundary for durable watch replay.
+/// Snapshot restore replaces these rows authoritatively together with watch
+/// history so a failover neither skips compacted events nor spuriously expires
+/// a cursor that remains valid on the leader.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchReplayFloor {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace_key: String,
+    pub floor_resource_version: i64,
+    pub floor_event_id: i64,
+}
+
 impl Resource {
     pub fn from_watch_event(event: WatchEvent) -> Self {
         Self::from_watch_event_data(event.object)
@@ -506,6 +519,11 @@ pub enum WatchReplayRead<T = CatchUpResource> {
 pub struct WatchReplayPosition {
     pub resource_version: i64,
     pub event_id: i64,
+    /// While non-zero, rows through this durable event ID are filtered by
+    /// `resource_version`; later rows are selected solely by event ID. This
+    /// closes a positive-RV list/watch handoff without losing a lower-RV row
+    /// applied after the signal subscription is established.
+    pub resource_version_filter_through_event_id: i64,
 }
 
 impl WatchReplayPosition {
@@ -513,6 +531,18 @@ impl WatchReplayPosition {
         Self {
             resource_version,
             event_id: 0,
+            resource_version_filter_through_event_id: 0,
+        }
+    }
+
+    pub const fn from_resource_version_through_event_id(
+        resource_version: i64,
+        event_id: i64,
+    ) -> Self {
+        Self {
+            resource_version,
+            event_id: 0,
+            resource_version_filter_through_event_id: event_id,
         }
     }
 
@@ -523,13 +553,28 @@ impl WatchReplayPosition {
         limit: std::num::NonZeroUsize,
     ) -> Self {
         if events.len() == limit.get() {
-            return events.last().map_or(current, |event| event.position);
+            return events.last().map_or(current, |event| {
+                let mut next = event.position;
+                if next.event_id < current.resource_version_filter_through_event_id {
+                    next.resource_version = current.resource_version;
+                    next.resource_version_filter_through_event_id =
+                        current.resource_version_filter_through_event_id;
+                }
+                next
+            });
         }
         Self {
             resource_version: events.last().map_or(current.resource_version, |event| {
                 event.position.resource_version
             }),
             event_id: high_water_event_id,
+            resource_version_filter_through_event_id: if high_water_event_id
+                < current.resource_version_filter_through_event_id
+            {
+                current.resource_version_filter_through_event_id
+            } else {
+                0
+            },
         }
     }
 }
@@ -723,6 +768,9 @@ impl WatchTarget {
 pub struct ResourceList {
     pub items: Vec<Resource>,
     pub resource_version: i64,
+    /// Durable watch-log position captured atomically with this LIST snapshot.
+    /// Backends that cannot provide an atomic position leave this unset.
+    pub watch_replay_position: Option<WatchReplayPosition>,
     pub continue_token: Option<String>,
     /// Number of items remaining after the current page (set when continue_token is Some)
     pub remaining_item_count: Option<i64>,

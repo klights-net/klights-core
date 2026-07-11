@@ -386,54 +386,21 @@ pub async fn list_inner(
             .resource_version
             .as_deref()
             .is_some_and(|rv| rv.trim() == "0");
-        let mut requested_rv: i64 = query
+        let requested_rv: i64 = query
             .resource_version
             .as_ref()
             .and_then(|rv| rv.parse::<i64>().ok())
             .unwrap_or(0);
 
-        // bug-grpc B1: gap-free establishment for a plain RV-less ("start from
-        // now") watch. Capture the establishment floor RV *before* subscribing
-        // and pin the watch to it, so an event committed in the establishment
-        // window (between subscribe and the stream's own RV read, widened by
-        // the freshness wait) is replayed/delivered via the resume path rather
-        // than silently filtered as `rv <= a post-subscribe high watermark`.
-        // This closes the APF-PLC and RC-lifecycle "watch opened -> immediate
-        // mutate -> event never delivered" races.
-        //
-        // Scoped to selector-less watches: a label/field-selector RV-less watch
-        // has its own replay-existing-matches-as-ADDED semantics in the stream
-        // (the RV-less branch), and send_initial_events has its own semantics —
-        // both must keep `requested_rv <= 0` so they take those branches.
-        let has_selector = query
-            .label_selector
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-            || query
-                .field_selector
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
-        // For a selector-less rv-less watch we pin requested_rv to the
-        // pre-subscribe global rv so the stream starts "from now" (the original
-        // B1 fix). A selector rv-less watch keeps requested_rv <= 0 (so the
-        // stream still emits existing matches as ADDED) and keeps its live floor
-        // at 0, deduping the baseline by exact rv in the stream builder.
-        if requested_rv <= 0
-            && !send_initial_events
-            && !has_selector
-            && !explicit_resource_version_zero
-            && let Ok(floor) = state.db.get_current_resource_version().await
-            && floor > 0
-        {
-            requested_rv = floor;
-        }
-
-        let signal_rx = state
-            .db
-            .subscribe_watch_signals(crate::watch::WatchTopic::new(api_version, kind));
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(str::to_string);
         let db = state.db.clone();
+        let (signal_rx, replay_start_position) = subscribe_watch_handoff(
+            &db,
+            vec![crate::watch::WatchTopic::new(api_version, kind)],
+            requested_rv,
+        )
+        .await?;
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let table_format = wants_table_format(&headers)?;
         let label_selector = query.label_selector.clone();
@@ -446,6 +413,7 @@ pub async fn list_inner(
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
             db,
             signal_rx,
+            replay_start_position,
             task_supervisor: state.task_supervisor.clone(),
             api_version,
             kind: kind_owned,

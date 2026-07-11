@@ -1288,6 +1288,7 @@ async fn raft_explicit_watch_event_replay_preserves_committed_payload_bytes() {
         10_024,
         vec![crate::log_apply::LogApplyMutation::PutWatchEvent(
             crate::log_apply::LogApplyWatchEventRow {
+                event_id: None,
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: Some("default".to_string()),
@@ -1365,6 +1366,7 @@ async fn raft_watch_gc_replays_identically() {
             resource_version,
             vec![crate::log_apply::LogApplyMutation::PutWatchEvent(
                 crate::log_apply::LogApplyWatchEventRow {
+                    event_id: None,
                     api_version: "v1".to_string(),
                     kind: "ConfigMap".to_string(),
                     namespace: Some("default".to_string()),

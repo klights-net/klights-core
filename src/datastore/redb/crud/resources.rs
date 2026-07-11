@@ -158,6 +158,341 @@ impl RedbResourceStore {
         })
     }
 
+    #[cfg(test)]
+    pub async fn apply_replicated_create_resource(
+        &self,
+        av: &str,
+        kind: &str,
+        ns: Option<&str>,
+        name: &str,
+        mut data: Value,
+        options: ReplicatedCreateOptions,
+    ) -> Result<Resource> {
+        let ReplicatedCreateOptions {
+            resource_version,
+            meta_uid,
+        } = options;
+        if resource_version <= 0 {
+            return Err(anyhow!(
+                "replicated create resourceVersion must be positive"
+            ));
+        }
+        helpers::ensure_uid(&mut data);
+        let incoming_uid = helpers::resource_uid(&data)
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        if let Some(expected_uid) = meta_uid.as_deref()
+            && expected_uid != incoming_uid
+        {
+            return Err(crate::datastore::errors::DatastoreError::conflict(format!(
+                "replicated create UID precondition failed: expected {expected_uid} got {incoming_uid}"
+            ))
+            .into());
+        }
+
+        let data_for_return = Arc::new(data.clone());
+        let data_for_publish = data.clone();
+        let data_bytes = serde_json::to_vec(&data_for_publish)?;
+        let key = resource_key(av, kind, ns, name);
+        let av_owned = av.to_string();
+        let kind_owned = kind.to_string();
+        let ns_owned = ns.map(|value| value.to_string());
+        let name_owned = name.to_string();
+        let watch_bus = self.watch_bus.clone();
+        let incoming_uid_for_db = incoming_uid.clone();
+        let av_for_db = av_owned.clone();
+        let kind_for_db = kind_owned.clone();
+        let ns_for_db = ns_owned.clone();
+        let name_for_db = name_owned.clone();
+        let event_payload_for_db = data_for_publish;
+
+        enum ApplyCreateResult {
+            AlreadyReflected {
+                current_rv: i64,
+                current_data: Vec<u8>,
+            },
+            Inserted,
+            UpdatedSameUid,
+            ReplacedDifferentUid {
+                old_data: Vec<u8>,
+                deleted_rv: i64,
+            },
+        }
+
+        let outcome = self
+            .db_call("apply_replicated_create_resource", move |db| {
+                let w = db.begin_write()?;
+                let av_o = av_for_db;
+                let kind_o = kind_for_db;
+                let ns_o = ns_for_db;
+                let name_o = name_for_db;
+                let event_payload = event_payload_for_db;
+                let data_bytes = data_bytes;
+                let resource_version = resource_version;
+                let incoming_uid_for_db = incoming_uid_for_db;
+                let key = key;
+                let res_tbl = if ns_o.is_some() {
+                    tables::RES_NS
+                } else {
+                    tables::RES_CLUSTER
+                };
+                let existing = {
+                    let table = w.open_table(res_tbl)?;
+                    table.get(key.as_slice())?.map(|entry| {
+                        let (current_rv, old_body) = entry.value();
+                        (current_rv, old_body.to_vec())
+                    })
+                };
+                let outcome = match existing {
+                    None => {
+                        {
+                            let mut table = w.open_table(res_tbl)?;
+                            table.insert(
+                                key.as_slice(),
+                                (resource_version as u64, data_bytes.as_slice()),
+                            )?;
+                        }
+                        {
+                            let mut rvk = w.open_table(tables::RV_TO_KEY)?;
+                            rvk.insert(resource_version as u64, key.as_slice())?;
+                        }
+                        helpers::watch_insert(
+                            &w,
+                            resource_version,
+                            &serde_json::json!({
+                                "apiVersion":av_o,
+                                "kind":kind_o,
+                                "namespace":ns_o,
+                                "name":name_o,
+                                "eventType":"ADDED",
+                                "data":event_payload.clone(),
+                            }),
+                        )?;
+                        helpers::update_owner_table(
+                            &w,
+                            &av_o,
+                            &kind_o,
+                            ns_o.as_deref(),
+                            &name_o,
+                            None,
+                            Some(&data_bytes),
+                        )?;
+                        ApplyCreateResult::Inserted
+                    }
+                    Some(existing) => {
+                        let (current_rv, old_body) = existing;
+                        let current_data: Value =
+                            serde_json::from_slice(&old_body).unwrap_or(Value::Null);
+                        let current_uid = Resource::uid_from_data(&current_data);
+                        if current_uid == incoming_uid_for_db {
+                            if current_rv >= resource_version as u64 {
+                                ApplyCreateResult::AlreadyReflected {
+                                    current_rv: current_rv as i64,
+                                    current_data: old_body,
+                                }
+                            } else {
+                                {
+                                    let mut table = w.open_table(res_tbl)?;
+                                    table.insert(
+                                        key.as_slice(),
+                                        (resource_version as u64, data_bytes.as_slice()),
+                                    )?;
+                                }
+                                {
+                                    let mut rvk = w.open_table(tables::RV_TO_KEY)?;
+                                    rvk.insert(resource_version as u64, key.as_slice())?;
+                                }
+                                helpers::watch_insert(
+                                    &w,
+                                    resource_version,
+                                    &serde_json::json!({
+                                        "apiVersion":av_o,
+                                        "kind":kind_o,
+                                        "namespace":ns_o,
+                                        "name":name_o,
+                                        "eventType":"MODIFIED",
+                                        "data":event_payload.clone(),
+                                    }),
+                                )?;
+                                helpers::update_owner_table(
+                                    &w,
+                                    &av_o,
+                                    &kind_o,
+                                    ns_o.as_deref(),
+                                    &name_o,
+                                    Some(&old_body),
+                                    Some(&data_bytes),
+                                )?;
+                                ApplyCreateResult::UpdatedSameUid
+                            }
+                        } else {
+                            let deleted_rv = resource_version.saturating_sub(1);
+                            {
+                                let mut table = w.open_table(res_tbl)?;
+                                table.remove(key.as_slice())?;
+                                table.insert(
+                                    key.as_slice(),
+                                    (resource_version as u64, data_bytes.as_slice()),
+                                )?;
+                            }
+                            {
+                                let mut rvk = w.open_table(tables::RV_TO_KEY)?;
+                                rvk.insert(resource_version as u64, key.as_slice())?;
+                            }
+                            helpers::watch_insert(
+                                &w,
+                                deleted_rv,
+                                &serde_json::json!({
+                                    "apiVersion":av_o,
+                                    "kind":kind_o,
+                                    "namespace":ns_o,
+                                    "name":name_o,
+                                    "eventType":"DELETED",
+                                    "data":current_data,
+                                }),
+                            )?;
+                            helpers::watch_insert(
+                                &w,
+                                resource_version,
+                                &serde_json::json!({
+                                    "apiVersion":av_o,
+                                    "kind":kind_o,
+                                    "namespace":ns_o,
+                                    "name":name_o,
+                                    "eventType":"ADDED",
+                                    "data":event_payload.clone(),
+                                }),
+                            )?;
+                            helpers::update_owner_table(
+                                &w,
+                                &av_o,
+                                &kind_o,
+                                ns_o.as_deref(),
+                                &name_o,
+                                Some(&old_body),
+                                Some(&data_bytes),
+                            )?;
+                            ApplyCreateResult::ReplacedDifferentUid {
+                                old_data: old_body,
+                                deleted_rv,
+                            }
+                        }
+                    }
+                };
+                w.commit()?;
+                Ok(outcome)
+            })
+            .await?;
+
+        match outcome {
+            ApplyCreateResult::AlreadyReflected {
+                current_rv,
+                current_data,
+            } => {
+                let current_data: Value =
+                    serde_json::from_slice(&current_data).unwrap_or(Value::Null);
+                Ok(Resource {
+                    id: 0,
+                    api_version: av_owned,
+                    kind: kind_owned,
+                    namespace: ns_owned,
+                    name: name_owned,
+                    uid: Resource::uid_from_data(&current_data),
+                    resource_version: current_rv,
+                    data: Arc::new(current_data),
+                })
+            }
+            ApplyCreateResult::Inserted => {
+                publish_pending(
+                    create_pending_watch_event(
+                        &av_owned,
+                        &kind_owned,
+                        ns_owned.as_deref(),
+                        &name_owned,
+                        resource_version,
+                        "ADDED",
+                        (*data_for_return).clone(),
+                    ),
+                    &watch_bus,
+                );
+                Ok(Resource {
+                    id: 0,
+                    api_version: av_owned,
+                    kind: kind_owned,
+                    namespace: ns_owned,
+                    name: name_owned,
+                    uid: incoming_uid,
+                    resource_version,
+                    data: data_for_return,
+                })
+            }
+            ApplyCreateResult::UpdatedSameUid => {
+                publish_pending(
+                    create_pending_watch_event(
+                        &av_owned,
+                        &kind_owned,
+                        ns_owned.as_deref(),
+                        &name_owned,
+                        resource_version,
+                        "MODIFIED",
+                        (*data_for_return).clone(),
+                    ),
+                    &watch_bus,
+                );
+                Ok(Resource {
+                    id: 0,
+                    api_version: av_owned,
+                    kind: kind_owned,
+                    namespace: ns_owned,
+                    name: name_owned,
+                    uid: incoming_uid,
+                    resource_version,
+                    data: data_for_return,
+                })
+            }
+            ApplyCreateResult::ReplacedDifferentUid {
+                old_data,
+                deleted_rv,
+            } => {
+                let old_object: Value = serde_json::from_slice(&old_data).unwrap_or(Value::Null);
+                publish_pending(
+                    create_pending_watch_event(
+                        &av_owned,
+                        &kind_owned,
+                        ns_owned.as_deref(),
+                        &name_owned,
+                        deleted_rv,
+                        "DELETED",
+                        old_object,
+                    ),
+                    &watch_bus,
+                );
+                publish_pending(
+                    create_pending_watch_event(
+                        &av_owned,
+                        &kind_owned,
+                        ns_owned.as_deref(),
+                        &name_owned,
+                        resource_version,
+                        "ADDED",
+                        (*data_for_return).clone(),
+                    ),
+                    &watch_bus,
+                );
+                Ok(Resource {
+                    id: 0,
+                    api_version: av_owned,
+                    kind: kind_owned,
+                    namespace: ns_owned,
+                    name: name_owned,
+                    uid: incoming_uid,
+                    resource_version,
+                    data: data_for_return,
+                })
+            }
+        }
+    }
+
     pub async fn get_res(
         &self,
         av: &str,
@@ -449,6 +784,7 @@ impl RedbResourceStore {
         let result = self
             .db_call("list_res", move |db| {
                 let r = db.begin_read()?;
+                let watch_replay_position = helpers::watch_replay_position_in_read(&r)?;
 
                 // Selector path: filter inside the scan loop, stop early
                 // once we have limit+1 matches. No remainingItemCount.
@@ -545,7 +881,8 @@ impl RedbResourceStore {
                     // Selector lists omit remainingItemCount — exact count
                     // would require scanning all rows.
                     return Ok(ResourceList {
-                        resource_version: 0,
+                        resource_version: watch_replay_position.resource_version,
+                        watch_replay_position: Some(watch_replay_position),
                         items: matches,
                         continue_token,
                         remaining_item_count: None,
@@ -622,7 +959,8 @@ impl RedbResourceStore {
                     None
                 };
                 Ok(ResourceList {
-                    resource_version: 0,
+                    resource_version: watch_replay_position.resource_version,
+                    watch_replay_position: Some(watch_replay_position),
                     items,
                     continue_token,
                     remaining_item_count: if has_more {
@@ -657,6 +995,91 @@ impl RedbResourceStore {
                 page.continue_token(),
             ),
         )
+        .await
+    }
+
+    pub async fn list_resources_for_watch_targets(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+    ) -> Result<ResourceList> {
+        let targets = targets.to_vec();
+        let label_requirements = label_selector
+            .map(crate::label_selector::parse_label_selector)
+            .transpose()?
+            .unwrap_or_default();
+
+        self.db_call("list_resources_for_watch_targets", move |db| {
+            let read = db.begin_read()?;
+            let mut items = Vec::new();
+
+            for target in targets {
+                let target_start = items.len();
+                let (table_definition, namespace_filter) = match &target.scope {
+                    WatchTargetScope::Cluster => (tables::RES_CLUSTER, None),
+                    WatchTargetScope::Namespaced(namespace) => {
+                        (tables::RES_NS, namespace.as_deref())
+                    }
+                };
+
+                let table = read.open_table(table_definition)?;
+                let start_prefix =
+                    resource_prefix(&target.api_version, &target.kind, namespace_filter);
+                let mut start = start_prefix.clone();
+                start.push(0);
+                let end = lex_next(&start_prefix).unwrap_or_else(|| {
+                    let mut end = start_prefix;
+                    end.push(0xFF);
+                    end
+                });
+                for entry in table.range(start.as_slice()..end.as_slice())? {
+                    let (_key, value) = entry?;
+                    let (resource_version, body) = value.value();
+                    let data: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+                    let labels = data
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("labels"))
+                        .and_then(Value::as_object);
+                    if !label_requirements
+                        .iter()
+                        .all(|requirement| requirement.matches(labels))
+                    {
+                        continue;
+                    }
+                    let namespace = data
+                        .pointer("/metadata/namespace")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    let name = data
+                        .pointer("/metadata/name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    items.push(Resource {
+                        id: 0,
+                        api_version: target.api_version.clone(),
+                        kind: target.kind.clone(),
+                        namespace,
+                        name,
+                        uid: Resource::uid_from_data(&data),
+                        resource_version: resource_version as i64,
+                        data: Arc::new(data),
+                    });
+                }
+                items[target_start..].sort_by(|left, right| {
+                    (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name))
+                });
+            }
+
+            let watch_replay_position = helpers::watch_replay_position_in_read(&read)?;
+            Ok(ResourceList {
+                items,
+                resource_version: watch_replay_position.resource_version,
+                watch_replay_position: Some(watch_replay_position),
+                continue_token: None,
+                remaining_item_count: None,
+            })
+        })
         .await
     }
 

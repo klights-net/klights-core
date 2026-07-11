@@ -810,6 +810,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
         Ok(crate::datastore::ResourceList {
             items: Vec::new(),
             resource_version: 1,
+            watch_replay_position: None,
             continue_token: None,
             remaining_item_count: None,
         })
@@ -855,6 +856,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                     Vec::new()
                 },
                 resource_version: 73,
+                watch_replay_position: None,
                 continue_token: None,
                 remaining_item_count: None,
             });
@@ -895,6 +897,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                     }),
                 )],
                 resource_version: 72,
+                watch_replay_position: None,
                 continue_token: None,
                 remaining_item_count: None,
             });
@@ -927,6 +930,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                 }),
             )],
             resource_version: 32,
+            watch_replay_position: None,
             continue_token: None,
             remaining_item_count: None,
         })

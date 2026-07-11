@@ -19,7 +19,7 @@ use crate::datastore::{
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodWorkqueueEntry,
     PodWorkqueueKind, PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead,
     RawWatchEvent, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions, SandboxRef,
-    WatchReplayPosition, WatchReplayRead, WatchTarget, WatchTargetScope,
+    SnapshotAtRv, WatchReplayPosition, WatchReplayRead, WatchTarget, WatchTargetScope,
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
@@ -53,8 +53,17 @@ struct ReflectorState {
     resources: HashMap<ReflectedResourceKey, ReflectedResource>,
 }
 
+struct PendingReflectorSnapshot {
+    replacement: HashMap<ReflectedResourceKey, ReflectedResource>,
+    events: Vec<WatchEvent>,
+}
+
 impl ReflectorState {
-    fn replace_snapshot(&mut self, resources: Vec<Resource>, snapshot_rv: i64) -> Vec<WatchEvent> {
+    fn prepare_snapshot(
+        &self,
+        resources: Vec<Resource>,
+        snapshot_rv: i64,
+    ) -> PendingReflectorSnapshot {
         let mut replacement = HashMap::with_capacity(resources.len());
         for resource in resources {
             replacement.insert(
@@ -108,7 +117,27 @@ impl ReflectorState {
                 });
             }
         }
+        events.sort_unstable_by(|left, right| {
+            reflected_event_order_key(left).cmp(&reflected_event_order_key(right))
+        });
+        PendingReflectorSnapshot {
+            replacement,
+            events,
+        }
+    }
+
+    fn commit_snapshot(&mut self, replacement: HashMap<ReflectedResourceKey, ReflectedResource>) {
         self.resources = replacement;
+    }
+
+    #[cfg(test)]
+    fn replace_snapshot(&mut self, resources: Vec<Resource>, snapshot_rv: i64) -> Vec<WatchEvent> {
+        let pending = self.prepare_snapshot(resources, snapshot_rv);
+        let PendingReflectorSnapshot {
+            replacement,
+            events,
+        } = pending;
+        self.commit_snapshot(replacement);
         events
     }
 
@@ -148,6 +177,35 @@ impl ReflectorState {
             EventType::Bookmark | EventType::Error => {}
         }
     }
+}
+
+fn reflected_event_order_key(event: &WatchEvent) -> (&str, &str, Option<&str>, &str, u8) {
+    let object = event.object.as_ref();
+    let event_rank = match event.event_type {
+        EventType::Deleted => 0,
+        EventType::Added => 1,
+        EventType::Modified => 2,
+        EventType::Bookmark => 3,
+        EventType::Error => 4,
+    };
+    (
+        object
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        object
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        object
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str),
+        object
+            .pointer("/metadata/name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        event_rank,
+    )
 }
 
 fn reflected_resource_key(object: &Value) -> Option<ReflectedResourceKey> {
@@ -263,6 +321,7 @@ impl WorkerStoreAdapter {
             label_selector: None,
             field_selector: Some(format!("spec.nodeName={}", self.node_name)),
             start_resource_version: None,
+            start_watch_replay_position: None,
         }];
         for (api_version, kind, namespace) in [
             ("v1", "Namespace", None),
@@ -280,6 +339,7 @@ impl WorkerStoreAdapter {
                 label_selector: None,
                 field_selector: None,
                 start_resource_version: None,
+                start_watch_replay_position: None,
             });
         }
         reqs
@@ -292,7 +352,10 @@ impl WorkerStoreAdapter {
         cancel: tokio_util::sync::CancellationToken,
     ) {
         let mut next_resource_version = req.start_resource_version;
+        let mut next_watch_replay_position = req.start_watch_replay_position;
         let mut state = ReflectorState::default();
+        let mut selector_membership = crate::watch::SelectorMembership::default();
+        let has_selector = super::watch_request_has_selector(&req);
         // Consecutive failed reconnects; reset to 0 once the stream delivers an
         // event (progress). Drives the shared exponential reconnect backoff so
         // a sustained leader/WAN outage cannot become a fixed-interval
@@ -303,9 +366,17 @@ impl WorkerStoreAdapter {
                 return;
             }
             if next_resource_version.is_none() {
-                match self.reconcile_watch_snapshot(&req, &mut state).await {
-                    Ok(resource_version) => {
+                match self
+                    .reconcile_watch_snapshot(
+                        &req,
+                        &mut state,
+                        has_selector.then_some(&mut selector_membership),
+                    )
+                    .await
+                {
+                    Ok((resource_version, watch_replay_position)) => {
                         next_resource_version = Some(resource_version);
+                        next_watch_replay_position = watch_replay_position;
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, "worker store watch mirror initial list failed");
@@ -326,6 +397,8 @@ impl WorkerStoreAdapter {
 
             let mut watch_req = req.clone();
             watch_req.start_resource_version = next_resource_version;
+            watch_req.start_watch_replay_position = next_watch_replay_position;
+            let selector_req = watch_req.clone();
             match self.cluster_api.watch_resources(watch_req).await {
                 Ok(mut stream) => {
                     use futures::StreamExt;
@@ -337,12 +410,62 @@ impl WorkerStoreAdapter {
                                 match event {
                                     Some(Ok(event)) => {
                                         reconnect_attempt = 0;
-                                        if let Some(rv) = event.event.resource_version() {
-                                            next_resource_version =
-                                                Some(next_resource_version.unwrap_or(0).max(rv));
+                                        let event_rv = event.event.resource_version();
+                                        let resume_position = event.resume_position;
+                                        let matches = super::watch_request_matches_event(
+                                            &selector_req,
+                                            &event.event,
+                                        );
+                                        let (transitioned, membership_mutation) = if has_selector {
+                                            let (event, mutation) = selector_membership
+                                                .prepare_transition(event.event, matches)
+                                                .into_parts();
+                                            (event, Some(mutation))
+                                        } else {
+                                            (matches.then_some(event.event), None)
+                                        };
+                                        let Some(transitioned) = transitioned
+                                        else {
+                                            if let Some(mutation) = membership_mutation {
+                                                selector_membership.commit(mutation);
+                                            }
+                                            if let Some(rv) = event_rv {
+                                                self.observe_rv(rv);
+                                            }
+                                            super::advance_watch_resume_after_apply(
+                                                &mut next_resource_version,
+                                                &mut next_watch_replay_position,
+                                                event_rv,
+                                                resume_position,
+                                            );
+                                            continue;
+                                        };
+                                        let transitioned = match self
+                                            .publish_watch_from_mirror(transitioned)
+                                            .await
+                                        {
+                                            Ok(event) => event,
+                                            Err(err) => {
+                                                tracing::warn!(
+                                                    error = %err,
+                                                    "worker store watch mirror could not apply event; reconnecting from last applied position"
+                                                );
+                                                break;
+                                            }
+                                        };
+                                        state.observe(&transitioned);
+                                        if let Some(mutation) = membership_mutation {
+                                            selector_membership.commit(mutation);
                                         }
-                                        state.observe(&event.event);
-                                        self.publish_watch_from_mirror(event.event).await;
+                                        if let Some(rv) = event_rv {
+                                            self.observe_rv(rv);
+                                        }
+                                        super::advance_watch_resume_after_apply(
+                                            &mut next_resource_version,
+                                            &mut next_watch_replay_position,
+                                            event_rv,
+                                            resume_position,
+                                        );
                                     }
                                     Some(Err(err)) => {
                                         if is_watch_window_expired(&err) {
@@ -363,6 +486,7 @@ impl WorkerStoreAdapter {
                                                 "worker store watch mirror replay window expired; relisting"
                                             );
                                             next_resource_version = None;
+                                            next_watch_replay_position = None;
                                             reconnect_attempt = 0;
                                             relist_required = true;
                                             break;
@@ -389,6 +513,7 @@ impl WorkerStoreAdapter {
                             "worker store watch mirror open replay window expired; relisting"
                         );
                         next_resource_version = None;
+                        next_watch_replay_position = None;
                         reconnect_attempt = 0;
                         continue;
                     }
@@ -406,10 +531,11 @@ impl WorkerStoreAdapter {
         &self,
         req: &WatchRequest,
         state: &mut ReflectorState,
-    ) -> Result<i64> {
+        selector_membership: Option<&mut crate::watch::SelectorMembership>,
+    ) -> Result<(i64, Option<WatchReplayPosition>)> {
         let list = self
             .cluster_api
-            .list_resources(ListRequest {
+            .list_resources_fresh(ListRequest {
                 api_version: req.api_version.clone(),
                 kind: req.kind.clone(),
                 namespace: req.namespace.clone(),
@@ -419,39 +545,48 @@ impl WorkerStoreAdapter {
                 continue_token: None,
             })
             .await?;
-        self.observe_rv(list.resource_version);
         let resource_version = list.resource_version;
-        for event in state.replace_snapshot(list.items, resource_version) {
-            self.publish_watch_from_mirror(event).await;
+        let pending_membership = selector_membership.as_ref().map(|_| {
+            let mut membership = crate::watch::SelectorMembership::default();
+            membership.replace_from_resources(&list.items);
+            membership
+        });
+        let PendingReflectorSnapshot {
+            replacement,
+            events,
+        } = state.prepare_snapshot(list.items, resource_version);
+        for event in events {
+            self.publish_watch_from_mirror(event).await?;
         }
-        Ok(resource_version)
+        state.commit_snapshot(replacement);
+        if let (Some(selector_membership), Some(pending_membership)) =
+            (selector_membership, pending_membership)
+        {
+            *selector_membership = pending_membership;
+        }
+        self.observe_rv(resource_version);
+        Ok((resource_version, list.watch_replay_position))
     }
 
-    async fn publish_watch_from_mirror(&self, event: WatchEvent) {
+    async fn publish_watch_from_mirror(&self, event: WatchEvent) -> Result<WatchEvent> {
         let lifecycle_message = self.local_pod_lifecycle_message(&event);
-        self.publish_watch(event);
-        let Some(message) = lifecycle_message else {
-            return;
-        };
-        let router = self
-            .pod_lifecycle_router
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let Some(router) = router else {
-            tracing::debug!(
-                node = %self.node_name,
-                "worker store mirror saw local Pod before lifecycle router was configured"
-            );
-            return;
-        };
-        if let Err(err) = router.route(message).await {
-            tracing::warn!(
-                node = %self.node_name,
-                error = %err,
-                "worker store mirror failed to route local Pod to lifecycle actor"
-            );
+        if let Some(message) = lifecycle_message {
+            let router = self
+                .pod_lifecycle_router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "worker store mirror saw local Pod before lifecycle router was configured"
+                    )
+                })?;
+            router.route(message).await.map_err(|err| {
+                anyhow!("worker store mirror failed to route local Pod to lifecycle actor: {err}")
+            })?;
         }
+        self.publish_watch(event.clone());
+        Ok(event)
     }
 
     fn publish_watch(&self, event: WatchEvent) {
@@ -708,6 +843,20 @@ fn watch_event_matches_targets(event: &WatchEvent, targets: &[WatchTarget]) -> b
             WatchTargetScope::Namespaced(Some(target_ns)) => namespace == Some(target_ns.as_str()),
             WatchTargetScope::Namespaced(None) => namespace.is_some(),
         }
+    })
+}
+
+fn worker_replay_event_follows_position(
+    position: WatchReplayPosition,
+    event_id: i64,
+    event: &WatchEvent,
+) -> bool {
+    event.resource_version().is_some_and(|resource_version| {
+        !crate::datastore::position_membership::position_represents(
+            position,
+            event_id,
+            resource_version,
+        )
     })
 }
 
@@ -1327,13 +1476,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
             .events
             .iter()
             .filter(|(event_id, event)| {
-                if position.event_id == 0 {
-                    event
-                        .resource_version()
-                        .is_some_and(|rv| rv > position.resource_version)
-                } else {
-                    *event_id > position.event_id
-                }
+                worker_replay_event_follows_position(position, *event_id, event)
             })
             .filter(|(_, event)| watch_event_matches_targets(event, targets))
             .filter_map(|(event_id, event)| {
@@ -1342,6 +1485,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
                     position: WatchReplayPosition {
                         resource_version,
                         event_id: *event_id,
+                        resource_version_filter_through_event_id: 0,
                     },
                     event: catchup_resource_from_watch_event(event)?,
                 })
@@ -1353,6 +1497,105 @@ impl DatastoreBackend for WorkerStoreAdapter {
         Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
             events,
             next_position,
+        }))
+    }
+
+    async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
+        Ok(WatchReplayPosition {
+            resource_version: self.current_rv.load(Ordering::Relaxed),
+            event_id: self.next_event_id.load(Ordering::Relaxed).saturating_sub(1),
+            resource_version_filter_through_event_id: 0,
+        })
+    }
+
+    async fn snapshot_resources_at_position(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        position: WatchReplayPosition,
+    ) -> Result<SnapshotAtRv> {
+        let high_water_event_id = self.next_event_id.load(Ordering::Relaxed).saturating_sub(1);
+        if position.event_id > high_water_event_id
+            || position.resource_version_filter_through_event_id > high_water_event_id
+            || (position.event_id == 0
+                && position.resource_version_filter_through_event_id == 0
+                && position.resource_version > self.current_rv.load(Ordering::Relaxed))
+        {
+            return Ok(SnapshotAtRv::Expired);
+        }
+
+        let history = self
+            .event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Once a target's initial mirror rows have been compacted, the worker
+        // no longer owns enough state to rebuild an arbitrary historical
+        // collection. Fail closed instead of mixing sequential leader LISTs.
+        if targets.iter().any(|target| {
+            let topic = WatchTopic::new(&target.api_version, &target.kind);
+            history.floors.keys().any(|(floor_topic, namespace)| {
+                if floor_topic != &topic {
+                    return false;
+                }
+                match &target.scope {
+                    WatchTargetScope::Cluster => namespace.is_none(),
+                    WatchTargetScope::Namespaced(Some(want)) => {
+                        namespace.as_deref() == Some(want.as_str())
+                    }
+                    WatchTargetScope::Namespaced(None) => namespace.is_some(),
+                }
+            })
+        }) {
+            return Ok(SnapshotAtRv::Expired);
+        }
+
+        let mut resources = HashMap::<ReflectedResourceKey, Resource>::new();
+        for (event_id, event) in &history.events {
+            if !watch_event_matches_targets(event, targets) {
+                continue;
+            }
+            let Some(resource_version) = event.resource_version() else {
+                return Ok(SnapshotAtRv::Expired);
+            };
+            if !crate::datastore::position_membership::position_represents(
+                position,
+                *event_id,
+                resource_version,
+            ) {
+                continue;
+            }
+            let Some(resource) =
+                catchup_resource_from_watch_event(event).map(|catchup| catchup.resource)
+            else {
+                return Ok(SnapshotAtRv::Expired);
+            };
+            let key = ReflectedResourceKey {
+                api_version: resource.api_version.clone(),
+                kind: resource.kind.clone(),
+                namespace: resource.namespace.clone(),
+                name: resource.name.clone(),
+            };
+            if event.event_type == EventType::Deleted {
+                resources.remove(&key);
+            } else {
+                resources.insert(key, resource);
+            }
+        }
+        drop(history);
+
+        let mut items = crate::datastore::position_membership::apply_membership_selectors(
+            resources.into_values().collect(),
+            label_selector,
+            field_selector,
+        )?;
+        crate::datastore::position_membership::sort_for_watch_targets(&mut items, targets);
+        Ok(SnapshotAtRv::List(ResourceList {
+            items,
+            resource_version: position.resource_version,
+            watch_replay_position: Some(position),
+            continue_token: None,
+            remaining_item_count: None,
         }))
     }
 
@@ -1672,8 +1915,319 @@ mod tests {
         CacheScope, ConfigMap, Node, Pod, ResourceEvent, Secret, WatchStream,
     };
     use crate::datastore::DatastoreBackend;
+    use crate::kubelet::pod_lifecycle_router::{
+        PodLifecycleDiagnostics, PodLifecycleRouteBackend, PodLifecycleRouteError,
+        PodLifecycleRouteMode,
+    };
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn worker_replay_position_filter_matches_shared_position_semantics() {
+        struct Case {
+            name: &'static str,
+            position: WatchReplayPosition,
+            event_id: i64,
+            resource_version: Option<i64>,
+            expected: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "scalar filters older rv",
+                position: WatchReplayPosition::from_resource_version(50),
+                event_id: 11,
+                resource_version: Some(40),
+                expected: false,
+            },
+            Case {
+                name: "scalar includes newer rv",
+                position: WatchReplayPosition::from_resource_version(50),
+                event_id: 11,
+                resource_version: Some(51),
+                expected: true,
+            },
+            Case {
+                name: "exact includes later lower rv",
+                position: WatchReplayPosition {
+                    resource_version: 50,
+                    event_id: 10,
+                    resource_version_filter_through_event_id: 0,
+                },
+                event_id: 11,
+                resource_version: Some(40),
+                expected: true,
+            },
+            Case {
+                name: "composite filters lower rv through anchor",
+                position: WatchReplayPosition::from_resource_version_through_event_id(50, 12),
+                event_id: 11,
+                resource_version: Some(40),
+                expected: false,
+            },
+            Case {
+                name: "composite includes lower rv after anchor",
+                position: WatchReplayPosition::from_resource_version_through_event_id(50, 12),
+                event_id: 13,
+                resource_version: Some(40),
+                expected: true,
+            },
+            Case {
+                name: "missing rv fails closed",
+                position: WatchReplayPosition::default(),
+                event_id: 1,
+                resource_version: None,
+                expected: false,
+            },
+        ];
+
+        for case in cases {
+            let event = WatchEvent {
+                event_type: EventType::Modified,
+                object: Arc::new(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": case.name,
+                        "resourceVersion": case.resource_version.map(|rv| rv.to_string()),
+                    }
+                })),
+                encoded_payload: None,
+            };
+            assert_eq!(
+                worker_replay_event_follows_position(case.position, case.event_id, &event),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    struct FailingPodLifecycleBackend {
+        remaining_failures: AtomicUsize,
+        route_attempts: AtomicUsize,
+    }
+
+    impl FailingPodLifecycleBackend {
+        fn new(failures: usize) -> Self {
+            Self {
+                remaining_failures: AtomicUsize::new(failures),
+                route_attempts: AtomicUsize::new(0),
+            }
+        }
+
+        fn route_attempts(&self) -> usize {
+            self.route_attempts.load(Ordering::Acquire)
+        }
+    }
+
+    fn configure_successful_pod_router(adapter: &WorkerStoreAdapter) {
+        adapter.set_pod_lifecycle_router(Arc::new(PodLifecycleRouter::new_test_backend(Arc::new(
+            FailingPodLifecycleBackend::new(0),
+        ))));
+    }
+
+    #[async_trait]
+    impl PodLifecycleRouteBackend for FailingPodLifecycleBackend {
+        async fn route(
+            &self,
+            _message: LifecycleMessage,
+        ) -> std::result::Result<(), PodLifecycleRouteError> {
+            self.route_attempts.fetch_add(1, Ordering::AcqRel);
+            if self
+                .remaining_failures
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err(PodLifecycleRouteError::SendError(
+                    "injected worker mirror route failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn try_route_nonblocking(&self, _message: LifecycleMessage) {}
+
+        fn mode(&self) -> PodLifecycleRouteMode {
+            PodLifecycleRouteMode::Actor
+        }
+
+        async fn remove_pod_state(&self, _key: &PodLifecycleKey) -> bool {
+            false
+        }
+
+        async fn diagnostics(&self) -> PodLifecycleDiagnostics {
+            PodLifecycleDiagnostics {
+                mode: PodLifecycleRouteMode::Actor,
+                actor_states: Vec::new(),
+                recent_trace: Vec::new(),
+                active_pod_count: 0,
+            }
+        }
+
+        async fn active_pod_count(&self) -> usize {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_local_pod_route_is_not_published_by_worker_mirror() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-route-apply-gate-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(
+            Arc::new(HandoffLeaderApi),
+            node_local,
+            "worker-a".to_string(),
+        );
+        let backend = Arc::new(FailingPodLifecycleBackend::new(1));
+        adapter.set_pod_lifecycle_router(Arc::new(PodLifecycleRouter::new_test_backend(
+            backend.clone(),
+        )));
+        let mut watch = adapter.watch_topic(WatchTopic::new("v1", "Pod"));
+
+        let result = adapter
+            .publish_watch_from_mirror(WatchEvent::added(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "must-replay",
+                    "uid": "uid-must-replay",
+                    "resourceVersion": "42"
+                },
+                "spec": {"nodeName": "worker-a"}
+            })))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "the lifecycle routing failure must propagate"
+        );
+        assert!(
+            watch.try_recv().is_err(),
+            "a Pod event whose lifecycle route failed must not be locally published"
+        );
+        assert_eq!(
+            adapter.current_rv.load(Ordering::Acquire),
+            0,
+            "a failed route must not advance worker mirror state"
+        );
+        assert_eq!(backend.route_attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_pod_route_retries_without_committing_reflector_or_membership() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        cluster_db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "snapshot-replay",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "snapshot-replay",
+                        "uid": "uid-snapshot-replay"
+                    },
+                    "spec": {
+                        "nodeName": "worker-a",
+                        "containers": [{"name": "app", "image": "busybox"}]
+                    }
+                }),
+            )
+            .await
+            .expect("create snapshot Pod");
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-snapshot-apply-gate-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let backend = Arc::new(FailingPodLifecycleBackend::new(1));
+        adapter.set_pod_lifecycle_router(Arc::new(PodLifecycleRouter::new_test_backend(
+            backend.clone(),
+        )));
+        let req = WatchRequest {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: None,
+            label_selector: None,
+            field_selector: Some("spec.nodeName=worker-a".to_string()),
+            start_resource_version: None,
+            start_watch_replay_position: None,
+        };
+        let mut state = ReflectorState::default();
+        let mut membership = crate::watch::SelectorMembership::default();
+        let mut watch = adapter.watch_topic(WatchTopic::new("v1", "Pod"));
+
+        let first = adapter
+            .reconcile_watch_snapshot(&req, &mut state, Some(&mut membership))
+            .await;
+        assert!(
+            first.is_err(),
+            "the initial snapshot route failure must propagate"
+        );
+        assert!(
+            state.resources.is_empty(),
+            "reflector state must remain uncommitted"
+        );
+        assert_eq!(
+            membership.len(),
+            0,
+            "selector membership must remain uncommitted"
+        );
+        assert_eq!(adapter.current_rv.load(Ordering::Acquire), 0);
+        assert!(
+            watch.try_recv().is_err(),
+            "failed snapshot must not publish"
+        );
+
+        adapter
+            .reconcile_watch_snapshot(&req, &mut state, Some(&mut membership))
+            .await
+            .expect("the same snapshot must replay after the route recovers");
+        let replayed = watch.try_recv().expect("replayed snapshot event");
+        assert_eq!(replayed.event_type, EventType::Added);
+        assert_eq!(
+            replayed
+                .object
+                .pointer("/metadata/name")
+                .and_then(Value::as_str),
+            Some("snapshot-replay")
+        );
+        assert_eq!(state.resources.len(), 1);
+        assert_eq!(membership.len(), 1);
+        assert_eq!(
+            backend.route_attempts(),
+            2,
+            "the failed initial-list event must be routed again on snapshot retry"
+        );
+    }
 
     #[test]
     fn is_watch_window_expired_detects_out_of_range_in_error_chain() {
@@ -1767,6 +2321,32 @@ mod tests {
                     .unwrap())
                 .collect::<std::collections::HashSet<_>>(),
             std::collections::HashSet::from(["first", "second"])
+        );
+    }
+
+    #[test]
+    fn reflector_snapshot_diff_order_is_stable_by_resource_key() {
+        let mut state = ReflectorState::default();
+        let names = [
+            "hotel", "alpha", "golf", "bravo", "foxtrot", "charlie", "echo", "delta",
+        ];
+        let events = state.replace_snapshot(
+            names
+                .iter()
+                .map(|name| reflected_resource(name, &format!("uid-{name}"), 41))
+                .collect(),
+            41,
+        );
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.object["metadata"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"
+            ],
+            "authoritative relist diffs must be deterministic for replay and tests"
         );
     }
 
@@ -1899,6 +2479,11 @@ mod tests {
             Ok(ResourceList {
                 items: Vec::new(),
                 resource_version,
+                watch_replay_position: (resource_version > 0).then_some(WatchReplayPosition {
+                    resource_version,
+                    event_id: 91,
+                    resource_version_filter_through_event_id: 0,
+                }),
                 continue_token: None,
                 remaining_item_count: None,
             })
@@ -1907,6 +2492,14 @@ mod tests {
         async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
             if req.api_version == "v1" && req.kind == "Pod" {
                 assert_eq!(req.start_resource_version, Some(41));
+                assert_eq!(
+                    req.start_watch_replay_position,
+                    Some(WatchReplayPosition {
+                        resource_version: 41,
+                        event_id: 91,
+                        resource_version_filter_through_event_id: 0,
+                    })
+                );
                 let event = ResourceEvent {
                     event: WatchEvent::modified(serde_json::json!({
                         "apiVersion": "v1",
@@ -1923,6 +2516,11 @@ mod tests {
                         },
                         "status": {"phase": "Pending"}
                     })),
+                    resume_position: Some(WatchReplayPosition {
+                        resource_version: 42,
+                        event_id: 92,
+                        resource_version_filter_through_event_id: 0,
+                    }),
                 };
                 return Ok(Box::pin(futures::stream::once(async move { Ok(event) })));
             }
@@ -2023,6 +2621,77 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn failed_pod_route_reconnects_and_replays_from_prior_exact_position() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor.clone(),
+            None,
+            "sqlite:worker-store-route-replay-position-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = Arc::new(WorkerStoreAdapter::new(
+            Arc::new(HandoffLeaderApi),
+            node_local,
+            "worker-a".to_string(),
+        ));
+        let backend = Arc::new(FailingPodLifecycleBackend::new(1));
+        adapter.set_pod_lifecycle_router(Arc::new(PodLifecycleRouter::new_test_backend(
+            backend.clone(),
+        )));
+        let mut watch = adapter.watch_topic(WatchTopic::new("v1", "Pod"));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let driver_adapter = adapter.clone();
+        let driver_supervisor = supervisor.clone();
+        let driver_cancel = cancel.clone();
+        let handle = supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::Network,
+                "worker_store_route_replay_position_test",
+                async move {
+                    driver_adapter
+                        .run_watch_mirror(
+                            WatchRequest {
+                                api_version: "v1".to_string(),
+                                kind: "Pod".to_string(),
+                                namespace: None,
+                                label_selector: None,
+                                field_selector: Some("spec.nodeName=worker-a".to_string()),
+                                start_resource_version: None,
+                                start_watch_replay_position: None,
+                            },
+                            driver_supervisor,
+                            driver_cancel,
+                        )
+                        .await;
+                },
+            )
+            .await
+            .expect("spawn mirror driver");
+
+        let replayed = tokio::time::timeout(std::time::Duration::from_secs(3), watch.recv())
+            .await
+            .expect("failed route should reconnect and replay")
+            .expect("worker Pod watch remains open");
+        assert_eq!(
+            replayed
+                .object
+                .pointer("/metadata/name")
+                .and_then(Value::as_str),
+            Some("bound-during-handoff")
+        );
+        assert!(
+            backend.route_attempts() >= 2,
+            "the event must be routed once unsuccessfully, then replayed and routed again"
+        );
+
+        cancel.cancel();
+        let _ = handle.join().await;
+    }
+
     #[derive(Default)]
     struct OpenExpiredThenRelistLeaderApi {
         list_count: AtomicUsize,
@@ -2044,6 +2713,7 @@ mod tests {
                 return Ok(ResourceList {
                     items: Vec::new(),
                     resource_version: 0,
+                    watch_replay_position: None,
                     continue_token: None,
                     remaining_item_count: None,
                 });
@@ -2085,6 +2755,7 @@ mod tests {
             Ok(ResourceList {
                 items,
                 resource_version: if attempt == 0 { 41 } else { 52 },
+                watch_replay_position: None,
                 continue_token: None,
                 remaining_item_count: None,
             })
@@ -2792,6 +3463,7 @@ mod tests {
             node_local,
             "worker-a".to_string(),
         ));
+        configure_successful_pod_router(&adapter);
         let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Pod"));
         let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -2927,6 +3599,7 @@ mod tests {
             node_local,
             "worker-a".to_string(),
         ));
+        configure_successful_pod_router(&adapter);
         let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Pod"));
         let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -3051,6 +3724,7 @@ mod tests {
                     } else {
                         0
                     },
+                    watch_replay_position: None,
                     continue_token: None,
                     remaining_item_count: None,
                 })
@@ -3081,6 +3755,7 @@ mod tests {
                                 },
                                 "status": {"phase": "Pending"}
                             })),
+                            resume_position: None,
                         },
                         ResourceEvent {
                             event: WatchEvent::modified(serde_json::json!({
@@ -3099,6 +3774,43 @@ mod tests {
                                 },
                                 "status": {"phase": "Succeeded"}
                             })),
+                            resume_position: None,
+                        },
+                        ResourceEvent {
+                            event: WatchEvent::added(serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "namespace": "default",
+                                    "name": "moving-away",
+                                    "uid": "uid-moving-away",
+                                    "resourceVersion": "44"
+                                },
+                                "spec": {
+                                    "nodeName": "worker-a",
+                                    "containers": [{"name": "app", "image": "busybox"}]
+                                },
+                                "status": {"phase": "Running"}
+                            })),
+                            resume_position: None,
+                        },
+                        ResourceEvent {
+                            event: WatchEvent::modified(serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Pod",
+                                "metadata": {
+                                    "namespace": "default",
+                                    "name": "moving-away",
+                                    "uid": "uid-moving-away",
+                                    "resourceVersion": "45"
+                                },
+                                "spec": {
+                                    "nodeName": "worker-b",
+                                    "containers": [{"name": "app", "image": "busybox"}]
+                                },
+                                "status": {"phase": "Running"}
+                            })),
+                            resume_position: None,
                         },
                     ];
                     return Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))));
@@ -3224,11 +3936,36 @@ mod tests {
         );
         adapter.set_pod_lifecycle_router(router);
 
+        let mut pod_watch = adapter.watch_topic(WatchTopic::new("v1", "Pod"));
+
         let cancel = tokio_util::sync::CancellationToken::new();
         let handles = adapter
             .start_watch_mirrors(supervisor, cancel.clone())
             .await
             .expect("start watch mirrors");
+
+        let moving_types = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut types = Vec::new();
+            while types.len() < 2 {
+                let event = pod_watch.recv().await.expect("Pod watch remains open");
+                if event
+                    .object
+                    .pointer("/metadata/name")
+                    .and_then(Value::as_str)
+                    == Some("moving-away")
+                {
+                    types.push(event.event_type);
+                }
+            }
+            types
+        })
+        .await
+        .expect("nodeName leave transition should be mirrored");
+        assert_eq!(
+            moving_types,
+            vec![EventType::Added, EventType::Deleted],
+            "a Pod leaving spec.nodeName=worker-a must synthesize Deleted on the worker mirror"
+        );
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         let mut observed = Vec::new();
@@ -3288,6 +4025,7 @@ mod tests {
             node_local,
             "worker-a".to_string(),
         ));
+        configure_successful_pod_router(&adapter);
         let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Pod"));
         let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -3305,7 +4043,11 @@ mod tests {
             let _ = handle.join().await;
         }
 
-        assert_eq!(event.event_type, crate::watch::EventType::Modified);
+        assert_eq!(
+            event.event_type,
+            crate::watch::EventType::Added,
+            "a Pod entering the worker's nodeName selector after LIST must be ADDED"
+        );
         assert_eq!(
             event
                 .object

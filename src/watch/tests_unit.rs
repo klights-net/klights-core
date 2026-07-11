@@ -304,6 +304,7 @@ impl WatchReplaySource for SignalCursorReplaySource {
                 position: crate::datastore::WatchReplayPosition {
                     resource_version: event.resource_version().unwrap_or_default(),
                     event_id: index as i64 + 1,
+                    resource_version_filter_through_event_id: 0,
                 },
                 event: event.clone(),
             })
@@ -388,6 +389,7 @@ impl WatchReplaySource for MutableSignalCursorReplaySource {
                 position: crate::datastore::WatchReplayPosition {
                     resource_version: event.resource_version().unwrap_or_default(),
                     event_id: index as i64 + 1,
+                    resource_version_filter_through_event_id: 0,
                 },
                 event: event.clone(),
             })
@@ -491,14 +493,54 @@ async fn signal_cursor_default_window_three_delivers_two_events_without_waiting_
 
     let first = cursor.next_event().await.unwrap();
     assert_eq!(first.resource_version(), Some(11));
+    assert_eq!(
+        cursor.processed_position().event_id,
+        1,
+        "resume position must not expose the second read-ahead event"
+    );
     assert_eq!(cursor.accepted_rv(), 10);
     cursor.accept_event(11);
     let second = cursor.next_event().await.unwrap();
     assert_eq!(second.resource_version(), Some(12));
+    assert_eq!(cursor.processed_position().event_id, 2);
     assert_eq!(cursor.accepted_rv(), 11);
     cursor.accept_event(12);
     assert_eq!(cursor.accepted_rv(), 12);
     assert_eq!(source.calls(), vec![(10, 3)]);
+}
+
+#[tokio::test]
+async fn signal_cursor_resume_position_retains_scalar_filter_until_anchor_is_crossed() {
+    let (_tx, rx) = broadcast::channel(4);
+    let source = SignalCursorReplaySource::events(vec![
+        signal_cursor_pod("default", "pod-11", 11),
+        signal_cursor_pod("default", "pod-12", 12),
+        signal_cursor_pod("default", "pod-13", 13),
+    ]);
+    let start =
+        crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(10, 3);
+    let mut cursor = SignalWatchCursor::new_many_at_position(
+        rx,
+        source,
+        vec![signal_cursor_topic()],
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        start,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    cursor.prime_replay_or_expired().await.unwrap();
+    let first = cursor.next_event().await.unwrap();
+    assert_eq!(first.resource_version(), Some(11));
+    assert_eq!(
+        cursor.processed_position(),
+        crate::datastore::WatchReplayPosition {
+            resource_version: 10,
+            event_id: 1,
+            resource_version_filter_through_event_id: 3,
+        },
+        "a reconnect before the anchor must keep filtering the legacy RV prefix"
+    );
 }
 
 #[tokio::test]
@@ -582,6 +624,54 @@ async fn signal_cursor_identity_includes_topic_for_same_name_and_revision() {
     ];
     assert!(kinds.contains(&Some("Pod")));
     assert!(kinds.contains(&Some("ConfigMap")));
+}
+
+#[tokio::test]
+async fn signal_cursor_identity_includes_event_type_for_same_name_and_revision() {
+    let (tx, rx) = broadcast::channel(4);
+    let old = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "namespace": "default",
+            "name": "replaced",
+            "uid": "uid-old",
+            "resourceVersion": "11"
+        }
+    });
+    let new = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": {
+            "namespace": "default",
+            "name": "replaced",
+            "uid": "uid-new",
+            "resourceVersion": "11"
+        }
+    });
+    let source =
+        SignalCursorReplaySource::events(vec![WatchEvent::deleted(old), WatchEvent::added(new)]);
+    let mut cursor = SignalWatchCursor::new(
+        rx,
+        source,
+        signal_cursor_topic(),
+        WatchDeliveryScope::Namespaced("default".to_string()),
+        10,
+        WindowPolicy::default_watch_delivery(),
+    );
+
+    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    let deleted = cursor.next_event().await.unwrap();
+    cursor.accept_event(11);
+    let added = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
+        .await
+        .expect("same-name replacement ADD must not be deduplicated after DELETE")
+        .unwrap();
+
+    assert_eq!(deleted.event_type, EventType::Deleted);
+    assert_eq!(deleted.object["metadata"]["uid"], "uid-old");
+    assert_eq!(added.event_type, EventType::Added);
+    assert_eq!(added.object["metadata"]["uid"], "uid-new");
 }
 
 #[tokio::test]
@@ -693,7 +783,6 @@ async fn signal_cursor_filtered_event_does_not_advance_past_late_lower_rv() {
     tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
     let filtered = cursor.next_event().await.unwrap();
     assert_eq!(filtered.resource_version(), Some(50));
-    cursor.mark_filtered_for_key(Some("default".into()), "unmatched".into(), 50);
     assert_eq!(
         cursor.accepted_rv(),
         10,
@@ -811,8 +900,6 @@ async fn signal_cursor_filtered_same_rv_event_does_not_hide_matching_resource() 
     let filtered = cursor.next_event().await.unwrap();
     assert_eq!(filtered.resource_version(), Some(50));
     assert_eq!(filtered.object["metadata"]["name"], "unmatched");
-    cursor.mark_filtered_for_key(Some("default".into()), "unmatched".into(), 50);
-
     let delivered = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
         .await
         .expect("same-RV matching resource must not be hidden by filtered selector noise")

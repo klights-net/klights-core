@@ -154,6 +154,11 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
         I: IntoIterator<Item = openraft::Entry<TypeConfig>> + Send,
         I::IntoIter: Send,
     {
+        let _snapshot_mutation = self
+            .backend
+            .acquire_snapshot_mutation_fence()
+            .await
+            .map_err(ioerr_write)?;
         let mut out = Vec::new();
         // P3-8: defensive fence against stale-leader writes. openraft
         // already refuses to dispatch an entry whose term is below the
@@ -209,12 +214,9 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        let last_applied = self.read_last_applied().await.unwrap_or(None);
-        let membership = self.read_membership().await.unwrap_or_default();
         SqliteRaftSnapshotBuilder {
             backend: self.backend.clone(),
-            last_applied,
-            membership,
+            node_local: self.node_local.clone(),
         }
     }
 
@@ -231,6 +233,11 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
     ) -> Result<(), StorageError<NodeId>> {
         let bytes = snapshot.into_inner();
         let data = RaftSnapshotData::deserialize_from_bytes(&bytes).map_err(ioerr_write)?;
+        let _snapshot_mutation = self
+            .backend
+            .acquire_snapshot_mutation_fence()
+            .await
+            .map_err(ioerr_write)?;
         // Raft snapshot install semantics: the destination state machine
         // must become byte/key-identical to the leader snapshot at the
         // snapshot index. Applying snapshot commits over the existing local
@@ -242,7 +249,13 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
         // tables first, then replays the snapshot commits and restores the
         // leader RV. (finding.md H1 / P0 cluster.db divergence.)
         self.backend
-            .replace_replicated_resource_state(data.commits, data.current_rv, None)
+            .replace_replicated_resource_state(
+                data.commits,
+                data.current_rv,
+                data.watch_event_high_water,
+                data.watch_replay_floors,
+                None,
+            )
             .await
             .map_err(|e| StorageError::IO {
                 source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
@@ -271,6 +284,11 @@ mod tests {
     use openraft::storage::RaftSnapshotBuilder;
     use openraft::{Entry, EntryPayload, LeaderId, Membership};
     use std::collections::BTreeSet;
+
+    fn snapshot_watch_page_pause_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
 
     async fn fresh_sm() -> SqliteRaftStateMachine {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
@@ -455,6 +473,342 @@ mod tests {
             "installed snapshot must be cached for future outgoing transfer"
         );
         assert_eq!(cur.unwrap().meta.last_log_id.unwrap().index, 42);
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_restores_empty_watch_history_allocator_exactly() {
+        let backend_src: Arc<dyn DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        backend_src
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "leader-anchor",
+                serde_json::json!({
+                    "metadata": {"name": "leader-anchor", "namespace": "default"}
+                }),
+            )
+            .await
+            .unwrap();
+        let leader_position = backend_src.current_watch_replay_position().await.unwrap();
+        assert!(backend_src.gc_watch_events(0, -1).await.unwrap() > 0);
+
+        let mut sm_src = build_sm_with_backend(backend_src).await;
+        let mut builder = sm_src.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+
+        let backend_dst: Arc<dyn DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        for index in 0..8 {
+            backend_dst
+                .create_resource(
+                    "v1",
+                    "ConfigMap",
+                    Some("default"),
+                    &format!("divergent-{index}"),
+                    serde_json::json!({
+                        "metadata": {
+                            "name": format!("divergent-{index}"),
+                            "namespace": "default"
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            backend_dst
+                .current_watch_replay_position()
+                .await
+                .unwrap()
+                .event_id
+                > leader_position.event_id
+        );
+
+        let mut sm_dst = build_sm_with_backend(backend_dst.clone()).await;
+        sm_dst
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            backend_dst
+                .current_watch_replay_position()
+                .await
+                .unwrap()
+                .event_id,
+            leader_position.event_id,
+            "Raft install must replace a divergent local allocator with the leader boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_fence_excludes_post_anchor_resource_and_watch_event() {
+        let _pause_guard = snapshot_watch_page_pause_test_lock().lock().await;
+        let backend = crate::datastore::test_support::in_memory().await;
+        let entries = (1..=crate::replication::snapshot::SNAPSHOT_EMIT_PAGE_SIZE as i64)
+            .map(|event_id| {
+                crate::log_apply::LogApplyCommit::put_watch_event(
+                    crate::log_apply::LogApplyWatchEventRow {
+                        event_id: Some(event_id),
+                        api_version: "v1".to_string(),
+                        kind: "ConfigMap".to_string(),
+                        namespace: Some("default".to_string()),
+                        name: format!("seed-{event_id}"),
+                        resource_version: 1_000 + event_id,
+                        event_type: "ADDED".to_string(),
+                        data: serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "ConfigMap",
+                            "metadata": {
+                                "name": format!("seed-{event_id}"),
+                                "namespace": "default",
+                                "resourceVersion": (1_000 + event_id).to_string()
+                            }
+                        }),
+                    },
+                )
+            })
+            .collect();
+        backend
+            .replace_replicated_resource_state(entries, 2_000, Some(512), Some(Vec::new()), None)
+            .await
+            .unwrap();
+
+        let backend: Arc<dyn DatastoreBackend> = Arc::new(backend);
+        let mut state_machine = build_sm_with_backend(backend).await;
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let pause = crate::replication::snapshot::install_snapshot_watch_page_pause();
+        let snapshot_task = tokio::spawn(async move { builder.build_snapshot().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("snapshot must reach the first watch page");
+
+        let late_resource = serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "late-resource",
+                "namespace": "default",
+                "uid": "late-resource-uid",
+                "resourceVersion": "2001"
+            }
+        });
+        let commit = crate::log_apply::LogApplyCommit::new(
+            2_001,
+            vec![
+                crate::log_apply::LogApplyMutation::PutResource(
+                    crate::log_apply::LogApplyResourceRow {
+                        api_version: "v1".to_string(),
+                        kind: "ConfigMap".to_string(),
+                        namespace: Some("default".to_string()),
+                        name: "late-resource".to_string(),
+                        uid: "late-resource-uid".to_string(),
+                        resource_version: 2_001,
+                        data: late_resource.clone(),
+                        require_absent: false,
+                        require_existing: false,
+                        precondition_uid: None,
+                        precondition_resource_version: None,
+                        status_only: false,
+                    },
+                ),
+                crate::log_apply::LogApplyMutation::PutWatchEvent(
+                    crate::log_apply::LogApplyWatchEventRow {
+                        event_id: Some(513),
+                        api_version: "v1".to_string(),
+                        kind: "ConfigMap".to_string(),
+                        namespace: Some("default".to_string()),
+                        name: "late-resource".to_string(),
+                        resource_version: 2_001,
+                        event_type: "ADDED".to_string(),
+                        data: late_resource,
+                    },
+                ),
+            ],
+        );
+        let payload = crate::log_apply::encode_commit_protobuf(&commit).unwrap();
+        let apply_task = tokio::spawn(async move {
+            state_machine
+                .apply(vec![Entry::<TypeConfig> {
+                    log_id: LogId::new(LeaderId::new(1, 1), 1),
+                    payload: EntryPayload::Normal(
+                        crate::datastore::raft::types::StorageCommandPayload::from_bytes(payload),
+                    ),
+                }])
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!apply_task.is_finished());
+        pause.resume.notify_one();
+
+        let snapshot = snapshot_task.await.unwrap().unwrap();
+        apply_task.await.unwrap().unwrap();
+        let decoded =
+            RaftSnapshotData::deserialize_from_bytes(snapshot.snapshot.get_ref()).unwrap();
+        assert_eq!(decoded.watch_event_high_water, Some(512));
+        assert!(
+            !decoded.commits.iter().any(|commit| {
+                commit.mutations.iter().any(|mutation| match mutation {
+                    crate::log_apply::LogApplyMutation::PutResource(row) => {
+                        row.name == "late-resource"
+                    }
+                    crate::log_apply::LogApplyMutation::PutWatchEvent(row) => {
+                        row.name == "late-resource"
+                    }
+                    _ => false,
+                })
+            }),
+            "post-anchor materialized state and its event must both remain outside the snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_fence_blocks_concurrent_authoritative_install() {
+        let _pause_guard = snapshot_watch_page_pause_test_lock().lock().await;
+        let source_backend: Arc<dyn DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        let mut source_sm = build_sm_with_backend(source_backend).await;
+        let replacement = source_sm
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let destination = crate::datastore::test_support::in_memory().await;
+        let entries = (1..=crate::replication::snapshot::SNAPSHOT_EMIT_PAGE_SIZE as i64)
+            .map(|event_id| {
+                crate::log_apply::LogApplyCommit::put_watch_event(
+                    crate::log_apply::LogApplyWatchEventRow {
+                        event_id: Some(event_id),
+                        api_version: "v1".to_string(),
+                        kind: "ConfigMap".to_string(),
+                        namespace: Some("default".to_string()),
+                        name: format!("seed-{event_id}"),
+                        resource_version: event_id,
+                        event_type: "ADDED".to_string(),
+                        data: serde_json::json!({"metadata": {"name": format!("seed-{event_id}")}}),
+                    },
+                )
+            })
+            .collect();
+        destination
+            .replace_replicated_resource_state(entries, 512, Some(512), Some(Vec::new()), None)
+            .await
+            .unwrap();
+        let destination: Arc<dyn DatastoreBackend> = Arc::new(destination);
+        let mut destination_sm = build_sm_with_backend(destination).await;
+        let mut builder = destination_sm.get_snapshot_builder().await;
+        let pause = crate::replication::snapshot::install_snapshot_watch_page_pause();
+        let snapshot_task = tokio::spawn(async move { builder.build_snapshot().await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("snapshot must reach the first watch page");
+
+        let install_task = tokio::spawn(async move {
+            destination_sm
+                .install_snapshot(&replacement.meta, replacement.snapshot)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !install_task.is_finished(),
+            "authoritative install must wait until snapshot capture releases its fence"
+        );
+        pause.resume.notify_one();
+        snapshot_task.await.unwrap().unwrap();
+        install_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_replaces_divergent_watch_replay_floors() {
+        let backend_src: Arc<dyn DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        for index in 0..5 {
+            backend_src
+                .create_resource(
+                    "v1",
+                    "ConfigMap",
+                    Some("floor-ns"),
+                    &format!("leader-{index}"),
+                    serde_json::json!({
+                        "metadata": {
+                            "name": format!("leader-{index}"),
+                            "namespace": "floor-ns"
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(backend_src.gc_watch_events(1, 100).await.unwrap(), 4);
+        let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+            "v1",
+            "ConfigMap",
+            "floor-ns",
+        )];
+        let leader_cursor = crate::datastore::WatchReplayPosition {
+            resource_version: 4,
+            event_id: 4,
+            resource_version_filter_through_event_id: 0,
+        };
+        assert!(matches!(
+            backend_src
+                .list_watch_events_after_position_checked_bounded(
+                    &target,
+                    leader_cursor,
+                    std::num::NonZeroUsize::new(10).unwrap(),
+                )
+                .await
+                .unwrap(),
+            crate::datastore::PositionedWatchReplayRead::Events(_)
+        ));
+
+        let mut sm_src = build_sm_with_backend(backend_src).await;
+        let mut builder = sm_src.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+
+        let backend_dst: Arc<dyn DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        for index in 0..10 {
+            backend_dst
+                .create_resource(
+                    "v1",
+                    "ConfigMap",
+                    Some("floor-ns"),
+                    &format!("follower-{index}"),
+                    serde_json::json!({
+                        "metadata": {
+                            "name": format!("follower-{index}"),
+                            "namespace": "floor-ns"
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(backend_dst.gc_watch_events(1, 100).await.unwrap(), 9);
+
+        let mut sm_dst = build_sm_with_backend(backend_dst.clone()).await;
+        sm_dst
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                backend_dst
+                    .list_watch_events_after_position_checked_bounded(
+                        &target,
+                        leader_cursor,
+                        std::num::NonZeroUsize::new(10).unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+                crate::datastore::PositionedWatchReplayRead::Events(_)
+            ),
+            "a cursor valid against the leader floor must remain valid after snapshot install"
+        );
     }
 
     /// finding.md H1 / P0 cluster.db divergence: installing a leader snapshot

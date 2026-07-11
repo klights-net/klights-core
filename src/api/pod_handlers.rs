@@ -59,7 +59,7 @@ pub async fn list_pods(
         let field_selector = query.field_selector.clone();
 
         // Parse resourceVersion filter (0 or missing = send all, >0 = filter old events)
-        let mut requested_rv: i64 = query
+        let requested_rv: i64 = query
             .resource_version
             .as_ref()
             .and_then(|rv| rv.parse::<i64>().ok())
@@ -72,34 +72,17 @@ pub async fn list_pods(
         // K8s watch semantics: default watch does NOT replay initial objects.
         // Initial list+watch replay is only enabled when sendInitialEvents=true.
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
-        let has_selector = label_selector
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-            || field_selector
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
-
-        // Selector-less rv-less watches pin the live floor to "now" (the
-        // pre-subscribe global rv) so the stream starts from the present.
-        // Selector watches keep the floor at 0 and dedup the baseline by exact
-        // rv (see build_label_selector_watch_stream), so no floor is needed.
-        if requested_rv <= 0
-            && !send_initial_events
-            && !has_selector
-            && !explicit_resource_version_zero
-            && let Ok(floor) = state.db.get_current_resource_version().await
-            && floor > 0
-        {
-            requested_rv = floor;
-        }
-
-        let signal_rx = state
-            .db
-            .subscribe_watch_signals(crate::watch::WatchTopic::new("v1", &kind));
         let db = state.db.clone();
+        let (signal_rx, replay_start_position) = subscribe_watch_handoff(
+            &db,
+            vec![crate::watch::WatchTopic::new("v1", &kind)],
+            requested_rv,
+        )
+        .await?;
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
             db,
             signal_rx,
+            replay_start_position,
             task_supervisor: state.task_supervisor.clone(),
             api_version: "v1",
             kind,
@@ -493,7 +476,7 @@ pub async fn list_all_pods(
         let label_selector = query.label_selector.clone();
         let field_selector = query.field_selector.clone();
 
-        let mut requested_rv: i64 = query
+        let requested_rv: i64 = query
             .resource_version
             .as_ref()
             .and_then(|rv| rv.parse::<i64>().ok())
@@ -504,32 +487,17 @@ pub async fn list_all_pods(
             .is_some_and(|rv| rv.trim() == "0");
 
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
-        let has_selector = label_selector
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-            || field_selector
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
-
-        // Selector-less rv-less watches pin the live floor to "now"; selector
-        // watches keep the floor at 0 and dedup the baseline by exact rv.
-        if requested_rv <= 0
-            && !send_initial_events
-            && !has_selector
-            && !explicit_resource_version_zero
-            && let Ok(floor) = state.db.get_current_resource_version().await
-            && floor > 0
-        {
-            requested_rv = floor;
-        }
-
-        let signal_rx = state
-            .db
-            .subscribe_watch_signals(crate::watch::WatchTopic::new("v1", &kind));
         let db = state.db.clone();
+        let (signal_rx, replay_start_position) = subscribe_watch_handoff(
+            &db,
+            vec![crate::watch::WatchTopic::new("v1", &kind)],
+            requested_rv,
+        )
+        .await?;
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
             db,
             signal_rx,
+            replay_start_position,
             task_supervisor: state.task_supervisor.clone(),
             api_version: "v1",
             kind,

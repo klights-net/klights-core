@@ -31,7 +31,7 @@ pub(super) struct PodStatusService {
     controller_dispatcher: ControllerDispatcherSlot,
     outbox: Option<Arc<Outbox>>,
     cluster_api: Option<Arc<dyn LeaderApiClient>>,
-    deferred_runtime: Mutex<DeferredRuntimeReducer>,
+    deferred_runtime: DeferredRuntimeReducerHandle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,6 +57,62 @@ struct DeferredRunningObservation {
 #[derive(Default)]
 struct DeferredRuntimeReducer {
     by_pod_uid: HashMap<String, DeferredRunningObservation>,
+}
+
+/// Shared owner for UID-keyed deferred runtime observations. The status
+/// reducer records and consumes observations, while the actor-owned deletion
+/// finalizer uses the same handle to forget a UID only after deletion has
+/// reached a terminal outcome.
+#[derive(Clone, Default)]
+pub(super) struct DeferredRuntimeReducerHandle {
+    reducer: Arc<Mutex<DeferredRuntimeReducer>>,
+}
+
+impl DeferredRuntimeReducerHandle {
+    fn lock(&self) -> std::sync::MutexGuard<'_, DeferredRuntimeReducer> {
+        self.reducer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn observe_deferred_running(&self, pod_uid: &str, pod: &Value, container_statuses: &[Value]) {
+        self.lock()
+            .observe_deferred_running(pod_uid, pod, container_statuses);
+    }
+
+    pub(super) fn forget(&self, pod_uid: &str) {
+        self.lock().clear(pod_uid);
+    }
+
+    fn promotable_observation(
+        &self,
+        pod_uid: &str,
+        pod: &Value,
+        incoming_statuses: &[Value],
+    ) -> Option<DeferredRunningObservation> {
+        self.lock()
+            .promotable_observation(pod_uid, pod, incoming_statuses)
+    }
+
+    fn consume_if_current(&self, pod_uid: &str, promoted: &DeferredRunningObservation) {
+        self.lock().consume_if_current(pod_uid, promoted);
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(&self, pod_uid: &str) -> bool {
+        self.lock().by_pod_uid.contains_key(pod_uid)
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_marker(&self, pod_uid: &str) {
+        self.lock().by_pod_uid.insert(
+            pod_uid.to_string(),
+            DeferredRunningObservation {
+                containers: BTreeMap::new(),
+                container_statuses: Vec::new(),
+            },
+        );
+    }
 }
 
 impl DeferredRuntimeReducer {
@@ -138,14 +194,17 @@ impl PodStatusService {
             controller_dispatcher,
             outbox,
             cluster_api,
-            deferred_runtime: Mutex::new(DeferredRuntimeReducer::default()),
+            deferred_runtime: DeferredRuntimeReducerHandle::default(),
         }
     }
 
-    fn lock_deferred_runtime(&self) -> std::sync::MutexGuard<'_, DeferredRuntimeReducer> {
-        self.deferred_runtime
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    pub(super) fn deferred_runtime_handle(&self) -> DeferredRuntimeReducerHandle {
+        self.deferred_runtime.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_deferred_runtime_for_uid(&self, pod_uid: &str) -> bool {
+        self.deferred_runtime.contains(pod_uid)
     }
 
     async fn send_status_command(&self, command: OutboxCommand) -> Result<bool> {
@@ -390,13 +449,13 @@ impl PodStatusService {
             }
             let mut phase = stored_terminal_phase.unwrap_or(&update.phase).to_string();
             if matches!(phase.as_str(), "Succeeded" | "Failed") {
-                self.lock_deferred_runtime().clear(&pod_resource.uid);
+                self.deferred_runtime.forget(&pod_resource.uid);
             }
             let promoted_observation = if stored_terminal_phase.is_none()
                 && phase == "Pending"
                 && network_status_is_published(update, &pod)
             {
-                self.lock_deferred_runtime().promotable_observation(
+                self.deferred_runtime.promotable_observation(
                     &pod_resource.uid,
                     &pod,
                     &update.container_statuses,
@@ -529,7 +588,7 @@ impl PodStatusService {
                 .await?
             {
                 if let Some(observation) = promoted_observation {
-                    self.lock_deferred_runtime()
+                    self.deferred_runtime
                         .consume_if_current(&pod_resource.uid, &observation);
                 }
                 return Ok(PodStatusWriteResult {
@@ -546,7 +605,7 @@ impl PodStatusService {
             {
                 Ok(updated) => {
                     if let Some(observation) = promoted_observation {
-                        self.lock_deferred_runtime()
+                        self.deferred_runtime
                             .consume_if_current(&pod_resource.uid, &observation);
                     }
                     let changed = log_pod_status_write_result(
@@ -847,28 +906,25 @@ impl PodStatusService {
                 apply_runtime_readiness_conditions(obj);
             }
 
+            if phase_override.is_some()
+                && update.phase == "Running"
+                && stored_terminal_phase.is_none()
             {
-                let mut reducer = self.lock_deferred_runtime();
-                if phase_override.is_some()
-                    && update.phase == "Running"
-                    && stored_terminal_phase.is_none()
-                {
-                    let container_statuses = status
-                        .pointer("/containerStatuses")
-                        .and_then(Value::as_array)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]);
-                    reducer.observe_deferred_running(
-                        &pod_resource.uid,
-                        &pod_resource.data,
-                        container_statuses,
-                    );
-                } else {
-                    // A runtime observation with a publishable phase (including
-                    // terminal state) supersedes any earlier Running observation
-                    // that was waiting only for pod networking.
-                    reducer.clear(&pod_resource.uid);
-                }
+                let container_statuses = status
+                    .pointer("/containerStatuses")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                self.deferred_runtime.observe_deferred_running(
+                    &pod_resource.uid,
+                    &pod_resource.data,
+                    container_statuses,
+                );
+            } else {
+                // A runtime observation with a publishable phase (including
+                // terminal state) supersedes any earlier Running observation
+                // that was waiting only for pod networking.
+                self.deferred_runtime.forget(&pod_resource.uid);
             }
 
             // Dedup gate intentionally removed for the runtime-reconcile path

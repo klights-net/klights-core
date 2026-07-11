@@ -19,6 +19,28 @@ use anyhow::Result;
 mod ca_files;
 pub const JOIN_TOKEN_METADATA_KEY: &str = "x-klights-join-token";
 
+pub(crate) fn watch_replay_position_to_proto(
+    position: crate::datastore::WatchReplayPosition,
+) -> generated::WatchReplayPosition {
+    generated::WatchReplayPosition {
+        resource_version: position.resource_version,
+        event_id: position.event_id,
+        resource_version_filter_through_event_id: position.resource_version_filter_through_event_id,
+    }
+}
+
+pub(crate) fn watch_replay_position_from_proto(
+    position: &generated::WatchReplayPosition,
+) -> crate::datastore::WatchReplayPosition {
+    crate::datastore::WatchReplayPosition {
+        resource_version: position.resource_version.max(0),
+        event_id: position.event_id.max(0),
+        resource_version_filter_through_event_id: position
+            .resource_version_filter_through_event_id
+            .max(0),
+    }
+}
+
 use crate::datastore::command::{
     decode_command_protobuf, decode_meta_protobuf, encode_command_protobuf, encode_meta_protobuf,
 };
@@ -78,6 +100,28 @@ mod tests {
         datastore::command::{COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand},
         replication::{grpc, protocol},
     };
+
+    #[test]
+    fn watch_replay_position_proto_round_trip_preserves_composite_cursor() {
+        let position = crate::datastore::WatchReplayPosition {
+            resource_version: 41,
+            event_id: 92,
+            resource_version_filter_through_event_id: 87,
+        };
+        let encoded = super::watch_replay_position_to_proto(position);
+        assert_eq!(super::watch_replay_position_from_proto(&encoded), position);
+
+        let invalid = grpc::generated::WatchReplayPosition {
+            resource_version: -1,
+            event_id: -2,
+            resource_version_filter_through_event_id: -3,
+        };
+        assert_eq!(
+            super::watch_replay_position_from_proto(&invalid),
+            crate::datastore::WatchReplayPosition::default(),
+            "untrusted wire cursors must be normalized to non-negative values"
+        );
+    }
 
     #[test]
     fn proto_generated_messages_round_trip() {

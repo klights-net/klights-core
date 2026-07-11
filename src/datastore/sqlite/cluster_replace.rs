@@ -29,11 +29,20 @@ impl Datastore {
         &self,
         entries: Vec<LogApplyCommit>,
         current_rv: i64,
+        watch_event_high_water: Option<i64>,
+        watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
         let pending = self
             .db_call("replace_replicated_resource_state", move |conn| {
-                replace_resource_state_in_conn(conn, entries, current_rv, metadata)
+                replace_resource_state_in_conn(
+                    conn,
+                    entries,
+                    current_rv,
+                    watch_event_high_water,
+                    watch_replay_floors,
+                    metadata,
+                )
             })
             .await
             .map_err(|err| anyhow!("failed to replace replicated resource state: {err}"))?;
@@ -47,6 +56,8 @@ fn replace_resource_state_in_conn(
     conn: &mut rusqlite::Connection,
     entries: Vec<LogApplyCommit>,
     current_rv: i64,
+    watch_event_high_water: Option<i64>,
+    watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
     metadata: Option<ReplicatedSnapshotMetadata>,
 ) -> tokio_rusqlite::Result<Vec<PendingWatchEvent>> {
     if current_rv < 0 {
@@ -55,6 +66,11 @@ fn replace_resource_state_in_conn(
 
     let tx = conn.transaction()?;
     tx.execute(queries::REPLACE_STATE_DELETE_WATCH_EVENTS, [])?;
+    tx.execute("DELETE FROM watch_replay_floors", [])?;
+    // Snapshot replacement is authoritative. Reset the local allocator before
+    // replay so legacy rows without explicit IDs do not inherit a divergent
+    // follower sequence; new snapshots set the exact leader boundary below.
+    Datastore::set_watch_event_allocator_in_conn(&tx, 0)?;
     tx.execute(queries::REPLACE_STATE_DELETE_APPLIED_OUTBOX, [])?;
     tx.execute(queries::REPLACE_STATE_DELETE_POD_CLEANUP_INTENTS, [])?;
     tx.execute(queries::REPLACE_STATE_DELETE_NODE_DATAPLANE, [])?;
@@ -72,6 +88,12 @@ fn replace_resource_state_in_conn(
             .iter()
             .any(|mutation| matches!(mutation, LogApplyMutation::PutWatchEvent(_)))
     });
+    // A modern snapshot carries an allocator boundary even when retention has
+    // removed every watch row. Do not manufacture replacement-time events in
+    // that case; synthetic history is only a compatibility path for legacy
+    // snapshots that carried neither explicit rows nor an allocator boundary.
+    let emit_synthetic_watch_events =
+        watch_event_high_water.is_none() && !has_explicit_watch_history;
     let mut pending = Vec::with_capacity(entries.len());
     for commit in entries {
         if commit.resource_version <= 0 {
@@ -87,11 +109,86 @@ fn replace_resource_state_in_conn(
             )));
         }
         let (_applied_rv, commit_pending) =
-            apply_commit_in_tx_with_watch_events(&tx, commit, !has_explicit_watch_history, false)?;
+            apply_commit_in_tx_with_watch_events(&tx, commit, emit_synthetic_watch_events, false)?;
         pending.extend(commit_pending);
     }
     if has_explicit_watch_history {
         restore_created_rv_from_watch_history(&tx)?;
+    }
+    if let Some(high_water) = watch_event_high_water {
+        if high_water < 0 {
+            return Err(other_error(
+                "snapshot watch_event_high_water must be non-negative",
+            ));
+        }
+        let restored_max: i64 =
+            tx.query_row("SELECT COALESCE(MAX(id), 0) FROM watch_events", [], |row| {
+                row.get(0)
+            })?;
+        if high_water < restored_max {
+            return Err(other_error(format!(
+                "snapshot watch_event_high_water {high_water} is below restored event ID {restored_max}"
+            )));
+        }
+        Datastore::set_watch_event_allocator_in_conn(&tx, high_water)?;
+    }
+    if let Some(floors) = watch_replay_floors {
+        for floor in floors {
+            if floor.floor_resource_version < 0 || floor.floor_event_id < 0 {
+                return Err(other_error(
+                    "snapshot watch replay floor must be non-negative",
+                ));
+            }
+            if watch_event_high_water.is_some_and(|high_water| floor.floor_event_id > high_water) {
+                return Err(other_error(format!(
+                    "snapshot replay floor event ID {} exceeds allocator high-water {}",
+                    floor.floor_event_id,
+                    watch_event_high_water.unwrap_or_default()
+                )));
+            }
+            tx.execute(
+                "INSERT INTO watch_replay_floors
+                 (api_version, kind, namespace_key, floor_rv, floor_event_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    floor.api_version,
+                    floor.kind,
+                    floor.namespace_key,
+                    floor.floor_resource_version,
+                    floor.floor_event_id,
+                ],
+            )?;
+        }
+    } else {
+        // A legacy snapshot does not prove which scopes were compacted. Mark
+        // every restored scope, plus a wildcard checked by replay, at the
+        // snapshot boundary so stale cursors force a relist instead of
+        // silently observing an incomplete empty history.
+        let legacy_event_floor = match watch_event_high_water {
+            Some(high_water) => high_water,
+            None => Datastore::watch_event_allocator_high_water_in_conn(&tx)?,
+        };
+        tx.execute(
+            "INSERT INTO watch_replay_floors
+             (api_version, kind, namespace_key, floor_rv, floor_event_id)
+             VALUES ('*', '*', '*', ?1, ?2)",
+            rusqlite::params![current_rv, legacy_event_floor],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO watch_replay_floors
+             (api_version, kind, namespace_key, floor_rv, floor_event_id)
+             SELECT api_version, kind, namespace_key, ?1, ?2 FROM (
+                 SELECT api_version, kind, COALESCE(namespace, '#cluster') AS namespace_key
+                   FROM watch_events
+                 UNION
+                 SELECT api_version, kind, namespace FROM namespaced_resources
+                 UNION
+                 SELECT api_version, kind, '#cluster' FROM cluster_resources
+                 UNION
+                 SELECT 'v1', 'Namespace', '#cluster' FROM namespaces
+             )",
+            rusqlite::params![current_rv, legacy_event_floor],
+        )?;
     }
 
     tx.execute(
@@ -777,6 +874,8 @@ mod tests {
             ],
             2,
             None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -810,6 +909,8 @@ mod tests {
                 dataplane_commit(10, "worker", "192.0.2.10", 7679),
             ],
             10,
+            None,
+            None,
             None,
         )
         .await
@@ -853,7 +954,7 @@ mod tests {
             .unwrap();
         assert_eq!(before, 1);
 
-        db.replace_replicated_resource_state(Vec::new(), 0, None)
+        db.replace_replicated_resource_state(Vec::new(), 0, None, None, None)
             .await
             .unwrap();
 
@@ -906,6 +1007,7 @@ mod tests {
                     })],
                 ),
                 LogApplyCommit::put_watch_event(LogApplyWatchEventRow {
+                    event_id: None,
                     api_version: "v1".to_string(),
                     kind: "ConfigMap".to_string(),
                     namespace: Some("default".to_string()),
@@ -925,6 +1027,7 @@ mod tests {
                     }),
                 }),
                 LogApplyCommit::put_watch_event(LogApplyWatchEventRow {
+                    event_id: None,
                     api_version: "v1".to_string(),
                     kind: "ConfigMap".to_string(),
                     namespace: Some("default".to_string()),
@@ -945,6 +1048,8 @@ mod tests {
                 }),
             ],
             5,
+            None,
+            None,
             None,
         )
         .await
@@ -967,6 +1072,196 @@ mod tests {
             created_rv, 2,
             "snapshot restore must preserve the leader's resource creation RV"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_replacement_sets_allocator_to_leader_high_water_exactly() {
+        let db = crate::datastore::test_support::in_memory().await;
+        for index in 0..8 {
+            db.create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                &format!("divergent-{index}"),
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": format!("divergent-{index}"),
+                        "namespace": "default"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(db.current_watch_replay_position().await.unwrap().event_id > 2);
+
+        db.replace_replicated_resource_state(
+            vec![LogApplyCommit::put_watch_event(LogApplyWatchEventRow {
+                event_id: Some(2),
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "leader-row".to_string(),
+                resource_version: 2,
+                event_type: "ADDED".to_string(),
+                data: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "leader-row",
+                        "namespace": "default",
+                        "resourceVersion": "2"
+                    }
+                }),
+            })],
+            2,
+            Some(2),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.current_watch_replay_position().await.unwrap().event_id,
+            2
+        );
+
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "after-restore",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "after-restore", "namespace": "default"}
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.current_watch_replay_position().await.unwrap().event_id,
+            3,
+            "the first follower event must use the leader high-water plus one"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_replacement_rejects_high_water_below_restored_event_id() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let err = db
+            .replace_replicated_resource_state(
+                vec![LogApplyCommit::put_watch_event(LogApplyWatchEventRow {
+                    event_id: Some(4),
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "leader-row".to_string(),
+                    resource_version: 2,
+                    event_type: "ADDED".to_string(),
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "leader-row",
+                            "namespace": "default",
+                            "resourceVersion": "2"
+                        }
+                    }),
+                })],
+                2,
+                Some(3),
+                None,
+                None,
+            )
+            .await
+            .expect_err("an allocator below a restored row must be rejected");
+        assert!(err.to_string().contains("below restored event ID 4"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_event_pages_follow_event_id_across_lower_resource_versions() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let row = |event_id, resource_version, name: &str| {
+            LogApplyCommit::put_watch_event(LogApplyWatchEventRow {
+                event_id: Some(event_id),
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: name.to_string(),
+                resource_version,
+                event_type: "ADDED".to_string(),
+                data: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": name,
+                        "namespace": "default",
+                        "resourceVersion": resource_version.to_string()
+                    }
+                }),
+            })
+        };
+        db.replace_replicated_resource_state(
+            vec![row(1, 100, "higher-rv"), row(2, 50, "later-lower-rv")],
+            100,
+            Some(2),
+            Some(Vec::new()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let rows = db
+            .list_all_watch_events_after_id_bounded(0, 2, std::num::NonZeroUsize::new(10).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|(id, event)| (*id, event.resource.resource_version))
+                .collect::<Vec<_>>(),
+            vec![(1, 100), (2, 50)]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_without_floors_forces_relist_for_unknown_scopes() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.replace_replicated_resource_state(Vec::new(), 10, Some(5), None, None)
+            .await
+            .unwrap();
+        let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+            "example.test/v1",
+            "GoneResource",
+            "gone-ns",
+        )];
+
+        assert!(matches!(
+            db.list_watch_events_after_position_checked_bounded(
+                &target,
+                crate::datastore::WatchReplayPosition {
+                    resource_version: 9,
+                    event_id: 4,
+                    resource_version_filter_through_event_id: 0,
+                },
+                std::num::NonZeroUsize::new(10).unwrap(),
+            )
+            .await
+            .unwrap(),
+            crate::datastore::PositionedWatchReplayRead::Expired
+        ));
+        assert!(matches!(
+            db.list_watch_events_since_checked_bounded(
+                &target,
+                9,
+                std::num::NonZeroUsize::new(10).unwrap(),
+            )
+            .await
+            .unwrap(),
+            crate::datastore::WatchReplayRead::Expired
+        ));
     }
 
     #[tokio::test]
@@ -1182,6 +1477,7 @@ mod tests {
         db.apply_log_apply_commit(LogApplyCommit::new(
             7,
             vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                event_id: None,
                 api_version: "v1".to_string(),
                 kind: "Pod".to_string(),
                 namespace: Some("default".to_string()),
@@ -1271,6 +1567,7 @@ mod tests {
                     status_only: false,
                 }),
                 LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                    event_id: None,
                     api_version: "v1".to_string(),
                     kind: "ConfigMap".to_string(),
                     namespace: Some("default".to_string()),

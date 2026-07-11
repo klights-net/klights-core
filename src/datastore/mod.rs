@@ -15,6 +15,7 @@ pub mod domain;
 pub mod errors;
 pub mod node_local;
 pub mod pod_serviceaccount;
+pub(crate) mod position_membership;
 pub mod raft;
 pub mod redb;
 pub mod replicated;

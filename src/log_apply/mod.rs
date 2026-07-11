@@ -376,6 +376,8 @@ pub struct LogApplyAppliedOutboxRow {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogApplyWatchEventRow {
+    #[serde(default)]
+    pub event_id: Option<i64>,
     pub api_version: String,
     pub kind: String,
     pub namespace: Option<String>,
@@ -791,6 +793,8 @@ struct ProtoLogApplyWatchEventRow {
     event_type: String,
     #[prost(bytes = "vec", tag = "7")]
     data_json: Vec<u8>,
+    #[prost(int64, optional, tag = "8")]
+    event_id: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1245,6 +1249,7 @@ impl From<LogApplyWatchEventRow> for ProtoLogApplyWatchEventRow {
             event_type: row.event_type,
             data_json: serde_json::to_vec(&row.data)
                 .expect("serde_json::Value serialization is infallible"),
+            event_id: row.event_id,
         }
     }
 }
@@ -1254,6 +1259,7 @@ impl TryFrom<ProtoLogApplyWatchEventRow> for LogApplyWatchEventRow {
 
     fn try_from(row: ProtoLogApplyWatchEventRow) -> Result<Self> {
         Ok(Self {
+            event_id: row.event_id,
             api_version: row.api_version,
             kind: row.kind,
             namespace: row.namespace,
@@ -1448,6 +1454,7 @@ mod parity_tests {
                 batch_cap: 5_000,
             },
             "PutWatchEvent" => LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                event_id: Some(37),
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: Some("default".to_string()),

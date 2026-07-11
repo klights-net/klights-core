@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
 
-use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource, ResourceList};
+use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource, ResourceList, WatchReplayPosition};
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
 use crate::networking::wireguard::DataplanePeerMetadata;
@@ -55,6 +55,8 @@ pub struct WatchRequest {
     pub label_selector: Option<String>,
     pub field_selector: Option<String>,
     pub start_resource_version: Option<i64>,
+    /// Exact durable cursor, preferred over the legacy scalar RV when present.
+    pub start_watch_replay_position: Option<WatchReplayPosition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +89,41 @@ pub enum CacheScope {
 #[derive(Debug, Clone)]
 pub struct ResourceEvent {
     pub event: WatchEvent,
+    /// Resume point covered by this event. Consumers retain it only after the
+    /// event has been safely applied.
+    pub resume_position: Option<WatchReplayPosition>,
+}
+
+/// Advance a reflector's reconnect cursor after (and only after) the event is
+/// safely applied. An omitted composite position deliberately clears any older
+/// exact cursor so rolling-upgrade peers fall back to the advanced scalar RV.
+pub(crate) fn advance_watch_resume_after_apply(
+    resource_version: &mut Option<i64>,
+    replay_position: &mut Option<WatchReplayPosition>,
+    delivered_resource_version: Option<i64>,
+    delivered_replay_position: Option<WatchReplayPosition>,
+) {
+    if let Some(rv) = delivered_resource_version {
+        *resource_version = Some(resource_version.unwrap_or(0).max(rv));
+    }
+    *replay_position = delivered_replay_position;
+}
+
+pub(crate) fn watch_request_matches_event(req: &WatchRequest, event: &WatchEvent) -> bool {
+    crate::watch::WatchEventSelection::new(&req.api_version, &req.kind)
+        .namespace(req.namespace.as_deref())
+        .label_selector(req.label_selector.as_deref())
+        .field_selector(req.field_selector.as_deref())
+        .matches(event)
+}
+
+pub(crate) fn watch_request_has_selector(req: &WatchRequest) -> bool {
+    selectors_present(req.label_selector.as_deref(), req.field_selector.as_deref())
+}
+
+pub(crate) fn selectors_present(label: Option<&str>, field: Option<&str>) -> bool {
+    label.is_some_and(|selector| !selector.trim().is_empty())
+        || field.is_some_and(|selector| !selector.trim().is_empty())
 }
 
 #[async_trait]
@@ -176,6 +213,43 @@ mod tests {
     use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
     use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
+
+    #[test]
+    fn watch_resume_advances_only_to_the_applied_event_and_falls_back_for_legacy_peers() {
+        let list_position = crate::datastore::WatchReplayPosition {
+            resource_version: 41,
+            event_id: 91,
+            resource_version_filter_through_event_id: 0,
+        };
+        let event_position = crate::datastore::WatchReplayPosition {
+            resource_version: 42,
+            event_id: 92,
+            resource_version_filter_through_event_id: 0,
+        };
+        for (name, delivered_position, expected_position) in [
+            ("composite", Some(event_position), Some(event_position)),
+            ("legacy", None, None),
+        ] {
+            let mut rv = Some(41);
+            let mut position = Some(list_position);
+            let event = super::ResourceEvent {
+                event: crate::watch::WatchEvent::modified(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": name, "resourceVersion": "42"}
+                })),
+                resume_position: delivered_position,
+            };
+            super::advance_watch_resume_after_apply(
+                &mut rv,
+                &mut position,
+                event.event.resource_version(),
+                event.resume_position,
+            );
+            assert_eq!(rv, Some(42), "{name}");
+            assert_eq!(position, expected_position, "{name}");
+        }
+    }
 
     fn pod_status_payload(uid: &str) -> Bytes {
         let command = StorageCommand::UpdateStatus {

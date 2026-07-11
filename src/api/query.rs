@@ -448,6 +448,7 @@ mod resolve_list_page_tests {
         ResourceList {
             items: Vec::new(),
             resource_version: rv,
+            watch_replay_position: None,
             continue_token: continue_token.map(str::to_string),
             remaining_item_count: continue_token.map(|_| 1),
         }

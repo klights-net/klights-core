@@ -25,8 +25,32 @@ use super::types::{
     PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplayRead,
     RawWatchEvent, ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation, ResourceList,
     ResourceListQuery, ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv,
-    WatchReplayPosition, WatchReplayRead, WatchTarget,
+    WatchReplayFloor, WatchReplayPosition, WatchReplayRead, WatchTarget,
 };
+
+/// Exclusive guard held while a logical snapshot walks multiple bounded read
+/// pages. Backends without this coordination return `None`.
+pub struct SnapshotExclusiveFence {
+    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+}
+
+impl SnapshotExclusiveFence {
+    pub(crate) fn new(guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
+        Self { _guard: guard }
+    }
+}
+
+/// Shared guard held by authoritative Raft state-machine mutations so apply
+/// and install cannot overlap an exclusive snapshot capture.
+pub struct SnapshotMutationFence {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+impl SnapshotMutationFence {
+    pub(crate) fn new(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        Self { _guard: guard }
+    }
+}
 
 /// `DatastoreBackend` is the runtime contract. Every state operation goes
 /// through this trait.
@@ -37,6 +61,14 @@ use super::types::{
 /// exists.
 #[async_trait]
 pub trait DatastoreBackend: Send + Sync {
+    async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>> {
+        Ok(None)
+    }
+
+    async fn acquire_snapshot_mutation_fence(&self) -> Result<Option<SnapshotMutationFence>> {
+        Ok(None)
+    }
+
     /// Release backend-specific resources (file locks, connections, etc.)
     /// after graceful shutdown work is complete.  No-op by default.
     fn close(&self) {}
@@ -91,9 +123,17 @@ pub trait DatastoreBackend: Send + Sync {
         &self,
         entries: Vec<crate::log_apply::LogApplyCommit>,
         current_rv: i64,
+        watch_event_high_water: Option<i64>,
+        watch_replay_floors: Option<Vec<WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
-        let _ = (entries, current_rv, metadata);
+        let _ = (
+            entries,
+            current_rv,
+            watch_event_high_water,
+            watch_replay_floors,
+            metadata,
+        );
         Err(anyhow::anyhow!(
             "backend does not support atomic replicated resource-state replacement"
         ))
@@ -240,6 +280,24 @@ pub trait DatastoreBackend: Send + Sync {
         field_selector: Option<&str>,
         page: ListPageRequest,
     ) -> Result<ResourceList>;
+
+    /// Atomically list every collection used to establish one multi-topic
+    /// watch baseline. Implementations must scan all targets and capture the
+    /// returned durable replay position in the same read transaction/snapshot.
+    /// Items retain target order and are namespace/name ordered within each
+    /// target so CRD storage-version precedence remains explicit to callers.
+    /// Pagination and field selectors are intentionally excluded: this is the
+    /// focused CRD conversion-watch establishment primitive.
+    async fn list_resources_for_watch_targets(
+        &self,
+        _targets: &[WatchTarget],
+        _label_selector: Option<&str>,
+    ) -> Result<ResourceList> {
+        Err(anyhow::anyhow!(
+            "datastore backend does not implement atomic multi-target watch baseline LIST"
+        ))
+    }
+
     async fn list_resource_keys_for_scope(
         &self,
         api_version: String,
@@ -568,6 +626,40 @@ pub trait DatastoreBackend: Send + Sync {
         ))
     }
 
+    /// Capture the current durable watch-log insertion boundary. A watch that
+    /// subscribes and then establishes a baseline can replay strictly after
+    /// this position without translating the boundary through resourceVersion.
+    async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
+        Err(anyhow::anyhow!(
+            "datastore backend does not implement a durable watch replay anchor"
+        ))
+    }
+
+    /// Reconstruct the atomically consistent resource state represented by a
+    /// durable watch cursor across one or more targets. The represented state
+    /// is the exact inverse of positioned replay, including the composite
+    /// positive-RV handoff filter. Selectors are applied after reconstruction.
+    async fn snapshot_resources_at_position(
+        &self,
+        _targets: &[WatchTarget],
+        _label_selector: Option<&str>,
+        _field_selector: Option<&str>,
+        position: WatchReplayPosition,
+    ) -> Result<SnapshotAtRv> {
+        let current = self.current_watch_replay_position().await?;
+        let covers_current = position.event_id >= current.event_id
+            || (position.resource_version_filter_through_event_id >= current.event_id
+                && position.resource_version >= current.resource_version)
+            || (position.event_id == 0
+                && position.resource_version_filter_through_event_id == 0
+                && position.resource_version >= current.resource_version);
+        if covers_current {
+            Ok(SnapshotAtRv::Current)
+        } else {
+            Ok(SnapshotAtRv::Expired)
+        }
+    }
+
     /// Replay durable watch rows with routing/cursor metadata carried in typed
     /// fields and the original object JSON left as bytes.
     async fn list_raw_watch_events_since_checked_bounded(
@@ -647,6 +739,25 @@ pub trait DatastoreBackend: Send + Sync {
         after_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>>;
+
+    /// Snapshot-only apply-order page bounded by a pre-captured allocator
+    /// anchor. Rows are ordered solely by durable event ID so a concurrently
+    /// applied lower resourceVersion cannot fall behind the continuation key.
+    async fn list_all_watch_events_after_id_bounded(
+        &self,
+        after_id: i64,
+        through_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        let _ = (after_id, through_id, limit);
+        Err(anyhow::anyhow!(
+            "datastore backend does not implement bounded event-ID snapshot paging"
+        ))
+    }
+
+    async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
+        Ok(Vec::new())
+    }
 
     /// List deleted resource watch events after `since_rv` across all scopes.
     ///
@@ -1856,6 +1967,8 @@ pub trait ReplicationStore: Send + Sync {
         &self,
         entries: Vec<crate::log_apply::LogApplyCommit>,
         current_rv: i64,
+        watch_event_high_water: Option<i64>,
+        watch_replay_floors: Option<Vec<WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()>;
     async fn apply_log_apply_commit(&self, commit: crate::log_apply::LogApplyCommit) -> Result<()>;
@@ -1880,10 +1993,19 @@ impl<T: DatastoreBackend + ?Sized> ReplicationStore for T {
         &self,
         entries: Vec<crate::log_apply::LogApplyCommit>,
         current_rv: i64,
+        watch_event_high_water: Option<i64>,
+        watch_replay_floors: Option<Vec<WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
-        DatastoreBackend::replace_replicated_resource_state(self, entries, current_rv, metadata)
-            .await
+        DatastoreBackend::replace_replicated_resource_state(
+            self,
+            entries,
+            current_rv,
+            watch_event_high_water,
+            watch_replay_floors,
+            metadata,
+        )
+        .await
     }
 
     async fn apply_log_apply_commit(&self, commit: crate::log_apply::LogApplyCommit) -> Result<()> {
@@ -1913,10 +2035,18 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
         &self,
         entries: Vec<crate::log_apply::LogApplyCommit>,
         current_rv: i64,
+        watch_event_high_water: Option<i64>,
+        watch_replay_floors: Option<Vec<WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
         self.as_ref()
-            .replace_replicated_resource_state(entries, current_rv, metadata)
+            .replace_replicated_resource_state(
+                entries,
+                current_rv,
+                watch_event_high_water,
+                watch_replay_floors,
+                metadata,
+            )
             .await
     }
 

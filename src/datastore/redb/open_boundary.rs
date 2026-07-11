@@ -3,7 +3,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
-use ::redb::{Database, ReadableTable, ReadableTableMetadata};
+use ::redb::{Database, ReadableTable};
 
 use crate::datastore::errors::OpenError;
 use crate::task_supervisor::TaskSupervisor;
@@ -170,38 +170,41 @@ fn initialize_tables(db: &Database) -> anyhow::Result<()> {
 }
 
 fn migrate_watch_events_v2(w: &redb::WriteTransaction) -> anyhow::Result<()> {
-    let new_is_empty = w.open_table(tables::WATCH_EVENTS)?.is_empty()?;
-    if !new_is_empty {
-        return Ok(());
-    }
-    let legacy_rows: Vec<(u64, Vec<u8>)> = {
-        let legacy = w.open_table(tables::WATCH_EVENTS_LEGACY)?;
-        legacy
-            .iter()?
-            .map(|entry| entry.map(|(rv, value)| (rv.value(), value.value().to_vec())))
-            .collect::<Result<_, _>>()?
+    let mut high_water = {
+        let current = w.open_table(tables::WATCH_EVENTS)?;
+        current.last()?.map_or(0, |(key, _)| key.value())
     };
-    if legacy_rows.is_empty() {
-        return Ok(());
-    }
-    let mut next_id = 0_u64;
-    {
-        let mut current = w.open_table(tables::WATCH_EVENTS)?;
-        for (resource_version, value) in legacy_rows {
-            next_id += 1;
-            let mut event: serde_json::Value = serde_json::from_slice(&value)?;
-            if let Some(object) = event.as_object_mut() {
-                object.insert(
-                    "resourceVersion".to_string(),
-                    serde_json::Value::from(resource_version),
-                );
+    if high_water == 0 {
+        let legacy_rows: Vec<(u64, Vec<u8>)> = {
+            let legacy = w.open_table(tables::WATCH_EVENTS_LEGACY)?;
+            legacy
+                .iter()?
+                .map(|entry| entry.map(|(rv, value)| (rv.value(), value.value().to_vec())))
+                .collect::<Result<_, _>>()?
+        };
+        if !legacy_rows.is_empty() {
+            let mut current = w.open_table(tables::WATCH_EVENTS)?;
+            for (resource_version, value) in legacy_rows {
+                high_water += 1;
+                let mut event: serde_json::Value = serde_json::from_slice(&value)?;
+                if let Some(object) = event.as_object_mut() {
+                    object.insert(
+                        "resourceVersion".to_string(),
+                        serde_json::Value::from(resource_version),
+                    );
+                }
+                let encoded = serde_json::to_vec(&event)?;
+                current.insert(high_water, encoded.as_slice())?;
             }
-            let encoded = serde_json::to_vec(&event)?;
-            current.insert(next_id, encoded.as_slice())?;
         }
     }
     let mut meta = w.open_table(tables::META)?;
-    meta.insert("watch_event_id", next_id.to_string().as_bytes())?;
+    let persisted = meta
+        .get("watch_event_id")?
+        .and_then(|value| std::str::from_utf8(value.value()).ok()?.parse::<u64>().ok())
+        .unwrap_or(0);
+    high_water = high_water.max(persisted);
+    meta.insert("watch_event_id", high_water.to_string().as_bytes())?;
     Ok(())
 }
 
@@ -275,5 +278,57 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let legacy: serde_json::Value = serde_json::from_slice(rows[0].1.value()).unwrap();
         assert_eq!(legacy["resourceVersion"], 7);
+    }
+
+    #[test]
+    fn initializes_missing_allocator_metadata_from_existing_v2_rows() {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut events = write.open_table(tables::WATCH_EVENTS).unwrap();
+            let encoded = serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "namespace": "default",
+                "name": "existing",
+                "resourceVersion": 7,
+                "eventType": "ADDED",
+                "data": {}
+            }))
+            .unwrap();
+            events.insert(7, encoded.as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+
+        initialize_tables(&db).unwrap();
+        let write = db.begin_write().unwrap();
+        crate::datastore::redb::helpers::watch_insert(
+            &write,
+            8,
+            &serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "namespace": "default",
+                "name": "new",
+                "eventType": "ADDED",
+                "data": {}
+            }),
+        )
+        .unwrap();
+        write.commit().unwrap();
+
+        let read = db.begin_read().unwrap();
+        let events = read.open_table(tables::WATCH_EVENTS).unwrap();
+        let ids = events
+            .iter()
+            .unwrap()
+            .map(|entry| entry.map(|(key, _)| key.value()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ids, vec![7, 8]);
+        let meta = read.open_table(tables::META).unwrap();
+        assert_eq!(meta.get("watch_event_id").unwrap().unwrap().value(), b"8");
     }
 }

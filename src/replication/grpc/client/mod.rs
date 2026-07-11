@@ -36,6 +36,7 @@ use crate::replication::grpc::generated::replication_client::ReplicationClient a
 use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
 use crate::replication::grpc::{
     JOIN_TOKEN_METADATA_KEY, entry_from_proto, generated, log_apply_commit_from_proto,
+    watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
 /// Response from SignControlplaneCsr RPC.
 pub struct SignControlplaneCsrResponse {
@@ -1350,6 +1351,10 @@ impl ReplicationGrpcClient {
         Ok(ListResponse {
             items,
             resource_version: response.resource_version,
+            watch_replay_position: response
+                .watch_replay_position
+                .as_ref()
+                .map(watch_replay_position_from_proto),
             continue_token: response.continue_token,
             remaining_item_count: response.remaining_item_count,
         })
@@ -1366,6 +1371,9 @@ impl ReplicationGrpcClient {
             field_selector: req.field_selector,
             start_resource_version: req.start_resource_version.unwrap_or(0),
             label_selector: req.label_selector,
+            start_watch_replay_position: req
+                .start_watch_replay_position
+                .map(watch_replay_position_to_proto),
         };
         let response = self
             .streaming_open_call(
@@ -2958,12 +2966,17 @@ fn resource_from_proto(resource: generated::ResourceObject) -> Result<Resource> 
 }
 
 fn resource_event_from_proto(event: generated::WatchEvent) -> Result<ResourceEvent> {
+    let resume_position = event
+        .resume_position
+        .as_ref()
+        .map(watch_replay_position_from_proto);
     let resource = event
         .resource
         .ok_or_else(|| anyhow!("WatchResources event missing resource"))?;
     let resource = resource_from_proto(resource)?;
     Ok(ResourceEvent {
         event: crate::watch::WatchEvent::from_type(&event.event_type, (*resource.data).clone()),
+        resume_position,
     })
 }
 

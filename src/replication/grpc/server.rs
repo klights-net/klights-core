@@ -9,12 +9,15 @@ use tonic::{Request, Response, Status, metadata::MetadataMap};
 use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{Resource, ResourcePreconditions, WatchTarget};
+use crate::datastore::{Resource, ResourcePreconditions, WatchReplayPosition, WatchTarget};
 use crate::metrics::{
     NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResponse,
 };
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
-use crate::replication::grpc::{JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated};
+use crate::replication::grpc::{
+    JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, watch_replay_position_from_proto,
+    watch_replay_position_to_proto,
+};
 use crate::replication::protocol::{
     ExecStreamChannel, FollowerControlMessage, JoinResponse, JoinRole, NodeExecRequest,
     NodeExecStreamFrame, NodeExecSyncRequest, NodeExecSyncResponse, PodLogRequest, PodLogResponse,
@@ -1125,6 +1128,9 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             continue_token: list.continue_token,
             resource_version: list.resource_version,
             remaining_item_count: list.remaining_item_count,
+            watch_replay_position: list
+                .watch_replay_position
+                .map(watch_replay_position_to_proto),
         }))
     }
 
@@ -1139,6 +1145,30 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         self.require_raft_leader()?;
         let req = request.into_inner();
         let topic = crate::watch::WatchTopic::new(&req.api_version, &req.kind);
+        // For new peers, the exact position came from the same read snapshot as
+        // LIST. For legacy scalar-RV peers, capture a durable high-water mark
+        // before synchronously subscribing, then filter the pre-anchor prefix
+        // by RV. Rows applied after the anchor are replayed by event ID even if
+        // their RV is lower than an earlier row.
+        let requested_position = req
+            .start_watch_replay_position
+            .as_ref()
+            .map(watch_replay_position_from_proto);
+        let replay_position = if let Some(position) = requested_position {
+            position
+        } else {
+            let anchor = self
+                .db
+                .current_watch_replay_position()
+                .await
+                .map_err(|err| Status::internal(err.to_string()))?;
+            WatchReplayPosition::from_resource_version_through_event_id(
+                req.start_resource_version.max(0),
+                anchor.event_id,
+            )
+        };
+        // No await is permitted between the durable anchor above and this
+        // subscription. Replay closes the anchor->subscribe interval.
         let signal_rx = self.db.subscribe_watch_signals(topic.clone());
         let replay_source =
             DatastoreWatchReplaySource::new(self.db.clone(), vec![watch_target_for_request(&req)]);
@@ -1152,18 +1182,20 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         // stale informer-cached state in the window.
         let mut leader_rx = self.is_leader_rx.clone();
         let stream = async_stream::stream! {
-            let mut last_rv = req.start_resource_version.max(0);
-            let mut cursor = crate::watch::SignalWatchCursor::new(
+            let mut last_rv = req
+                .start_resource_version
+                .max(replay_position.resource_version)
+                .max(0);
+            let mut cursor = crate::watch::SignalWatchCursor::new_many_at_position(
                 signal_rx,
                 replay_source,
-                topic,
+                vec![topic],
                 scope,
                 last_rv,
+                replay_position,
                 crate::watch::WindowPolicy::default_watch_delivery(),
             );
-            if last_rv > 0
-                && let Err(err) = cursor.prime_replay_or_expired().await
-            {
+            if let Err(err) = cursor.prime_replay_or_expired().await {
                 yield Err(watch_cursor_error_to_status(err, cursor.accepted_rv()));
                 return;
             }
@@ -1179,7 +1211,12 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             loop {
                 let elapsed = last_yield_at.elapsed();
                 if elapsed >= heartbeat_interval {
-                    yield Ok(watch_heartbeat_proto(&req.api_version, &req.kind, last_rv));
+                    yield Ok(watch_heartbeat_proto(
+                        &req.api_version,
+                        &req.kind,
+                        last_rv,
+                        cursor.processed_position(),
+                    ));
                     last_yield_at = Instant::now();
                     continue;
                 }
@@ -1207,7 +1244,12 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     // bookmark carrying the cursor so the client resumes
                     // correctly, and reset the per-stream clock.
                     Ok(Err(_elapsed)) => {
-                        yield Ok(watch_heartbeat_proto(&req.api_version, &req.kind, last_rv));
+                        yield Ok(watch_heartbeat_proto(
+                            &req.api_version,
+                            &req.kind,
+                            last_rv,
+                            cursor.processed_position(),
+                        ));
                         last_yield_at = Instant::now();
                         continue;
                     }
@@ -1222,7 +1264,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                         return;
                     }
                 };
-                if !watch_event_matches(&event, &req) {
+                if !watch_event_should_stream(&event, &req) {
                     continue;
                 }
                 let resource = resource_from_event(&event);
@@ -1231,6 +1273,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 yield Ok(generated::WatchEvent {
                     event_type,
                     resource: Some(resource_to_proto(&resource)),
+                    resume_position: Some(watch_replay_position_to_proto(cursor.processed_position())),
                 });
                 if rv > 0 {
                     cursor.accept_event(rv);
@@ -1677,6 +1720,14 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 "JoinAsControlplane requires a valid controlplane bootstrap token (first join) or an existing controlplane membership (rejoin)",
             ));
         }
+        let expected_node_id =
+            crate::datastore::raft::types::raft_node_id_for_node_name(&req.node_name);
+        if req.node_id != expected_node_id {
+            return Err(Status::invalid_argument(format!(
+                "JoinAsControlplane node_id {} does not match the ID derived from authenticated node name {}",
+                req.node_id, req.node_name
+            )));
+        }
         let node_registration = match req.node_registration.take() {
             Some(registration) => Some(
                 validate_controlplane_node_registration(registration)
@@ -1992,24 +2043,19 @@ fn watch_event_type(event: &crate::watch::WatchEvent) -> &'static str {
 /// treats it as both liveness and a resume point. Reuses the normal event
 /// proto shape (the client decode requires a `resource`), and the worker's
 /// informer cache skips BOOKMARK events rather than materializing them.
-fn watch_heartbeat_proto(api_version: &str, kind: &str, last_rv: i64) -> generated::WatchEvent {
+fn watch_heartbeat_proto(
+    api_version: &str,
+    kind: &str,
+    last_rv: i64,
+    resume_position: WatchReplayPosition,
+) -> generated::WatchEvent {
     let hb = crate::watch::WatchEvent::bookmark_typed(last_rv, api_version, kind);
     let resource = resource_from_event(&hb);
     generated::WatchEvent {
         event_type: watch_event_type(&hb).to_string(),
         resource: Some(resource_to_proto(&resource)),
+        resume_position: Some(watch_replay_position_to_proto(resume_position)),
     }
-}
-
-fn watch_event_matches(
-    event: &crate::watch::WatchEvent,
-    req: &generated::WatchResourcesRequest,
-) -> bool {
-    WatchEventSelection::new(&req.api_version, &req.kind)
-        .namespace(req.namespace.as_deref())
-        .label_selector(req.label_selector.as_deref())
-        .field_selector(req.field_selector.as_deref())
-        .matches(event)
 }
 
 fn watch_cursor_error_to_status(err: crate::watch::WatchCursorError, accepted_rv: i64) -> Status {
@@ -2022,6 +2068,57 @@ fn watch_cursor_error_to_status(err: crate::watch::WatchCursorError, accepted_rv
         }
         crate::watch::WatchCursorError::Closed => Status::unavailable("watch stream closed"),
     }
+}
+
+fn watch_event_should_stream(
+    event: &crate::watch::WatchEvent,
+    req: &generated::WatchResourcesRequest,
+) -> bool {
+    if event.event_type == crate::watch::EventType::Bookmark {
+        return true;
+    }
+    if WatchEventSelection::new(&req.api_version, &req.kind)
+        .namespace(req.namespace.as_deref())
+        .label_selector(req.label_selector.as_deref())
+        .field_selector(req.field_selector.as_deref())
+        .matches(event)
+    {
+        return true;
+    }
+    event.event_type == crate::watch::EventType::Modified && selector_may_change_membership(req)
+}
+
+fn selector_may_change_membership(req: &generated::WatchResourcesRequest) -> bool {
+    if req
+        .label_selector
+        .as_deref()
+        .is_some_and(|selector| !selector.trim().is_empty())
+    {
+        return true;
+    }
+    let Some(selector) = req
+        .field_selector
+        .as_deref()
+        .filter(|selector| !selector.trim().is_empty())
+    else {
+        return false;
+    };
+    selector.split(',').any(|requirement| {
+        let (field, operator) = if let Some((field, _)) = requirement.split_once("!=") {
+            (field.trim(), "!=")
+        } else if let Some((field, _)) = requirement.split_once("==") {
+            (field.trim(), "==")
+        } else if let Some((field, _)) = requirement.split_once('=') {
+            (field.trim(), "=")
+        } else {
+            (requirement.trim(), "")
+        };
+        match field {
+            "metadata.name" | "metadata.namespace" => false,
+            "spec.nodeName" => operator == "!=",
+            _ => true,
+        }
+    })
 }
 
 /// Complete when the raft leadership signal reports this node is no longer the
@@ -2354,7 +2451,7 @@ mod tests {
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
-    use crate::datastore::types::ResourcePreconditions;
+    use crate::datastore::types::{ResourcePreconditions, WatchReplayPosition};
     use crate::replication::grpc::generated::replication_client::ReplicationClient;
     use crate::replication::grpc::generated::replication_server::Replication;
     use crate::replication::grpc::raft_rpc::{
@@ -2427,6 +2524,7 @@ mod tests {
             field_selector: None,
             start_resource_version: 0,
             label_selector: None,
+            start_watch_replay_position: None,
         }
     }
 
@@ -2474,6 +2572,63 @@ mod tests {
         assert_eq!(
             scoped.scope,
             WatchTargetScope::Namespaced(Some("kube-system".to_string()))
+        );
+    }
+
+    #[test]
+    fn watch_server_prefilter_forwards_only_possible_selector_transitions() {
+        let modified = crate::watch::WatchEvent::modified(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "other",
+                "labels": {"app": "other"},
+                "resourceVersion": "2"
+            },
+            "spec": {"nodeName": "worker-b"},
+            "status": {"phase": "Pending"}
+        }));
+
+        let mut label_req = watch_pods_request();
+        label_req.label_selector = Some("app=selected".to_string());
+        assert!(super::watch_event_should_stream(&modified, &label_req));
+
+        let mut mutable_field_req = watch_pods_request();
+        mutable_field_req.field_selector = Some("status.phase=Running".to_string());
+        assert!(super::watch_event_should_stream(
+            &modified,
+            &mutable_field_req
+        ));
+
+        let mut node_req = watch_pods_request();
+        node_req.field_selector = Some("spec.nodeName=worker-a".to_string());
+        assert!(
+            !super::watch_event_should_stream(&modified, &node_req),
+            "nonmatching immutable nodeName traffic must stay server-filtered"
+        );
+
+        let bound_to_excluded_node = crate::watch::WatchEvent::modified(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "newly-bound",
+                "resourceVersion": "3"
+            },
+            "spec": {"nodeName": "worker-a"}
+        }));
+        let mut node_not_equal_req = watch_pods_request();
+        node_not_equal_req.field_selector = Some("spec.nodeName!=worker-a".to_string());
+        assert!(
+            super::watch_event_should_stream(&bound_to_excluded_node, &node_not_equal_req),
+            "nodeName inequality can leave membership when an unassigned Pod binds"
+        );
+
+        let nonmatching_added = crate::watch::WatchEvent::added((*modified.object).clone());
+        assert!(
+            !super::watch_event_should_stream(&nonmatching_added, &label_req),
+            "nonmatching ADDED events cannot be leave transitions"
         );
     }
 
@@ -2788,6 +2943,7 @@ mod tests {
                 field_selector: None,
                 start_resource_version: 0,
                 label_selector: None,
+                start_watch_replay_position: None,
             })
             .await
             .unwrap()
@@ -2929,6 +3085,7 @@ mod tests {
                 field_selector: Some("spec.nodeName=worker-1".to_string()),
                 start_resource_version: 0,
                 label_selector: None,
+                start_watch_replay_position: None,
             })
             .await
             .unwrap()
@@ -3002,6 +3159,7 @@ mod tests {
             field_selector: None,
             start_resource_version: 0,
             label_selector: None,
+            start_watch_replay_position: None,
         }
     }
 
@@ -3013,6 +3171,7 @@ mod tests {
             field_selector: None,
             start_resource_version,
             label_selector: None,
+            start_watch_replay_position: None,
         }
     }
 
@@ -3087,9 +3246,70 @@ mod tests {
             .expect("watch stream should yield")
             .expect("watch stream should stay healthy");
         assert_eq!(event.event_type, "ADDED");
+        let first_resume_position = event
+            .resume_position
+            .clone()
+            .expect("replayed event must carry a resume position");
+        assert!(
+            first_resume_position.event_id > 0,
+            "legacy scalar-RV watches must be upgraded to a composite resume position"
+        );
         let resource = event.resource.expect("watch event should carry resource");
         assert_eq!(resource.name, "resume-old");
         assert!(resource.resource_version > resume_rv);
+
+        drop(stream);
+        let mut resumed_request = watch_configmaps_from_rv(resource.resource_version);
+        resumed_request.start_watch_replay_position = Some(first_resume_position);
+        let mut resumed = grpc
+            .watch_resources(request_with_node_client_cert(resumed_request, "worker-1"))
+            .await
+            .expect("composite continuation should open")
+            .into_inner();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), resumed.next())
+            .await
+            .expect("composite continuation should replay the unread suffix")
+            .expect("continuation stream should yield")
+            .expect("continuation stream should stay healthy");
+        assert_eq!(
+            next.resource.expect("event resource").name,
+            "resume-new",
+            "per-event resume position must neither duplicate nor skip read-ahead events"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_resources_replays_retained_event_for_legacy_zero_resume_without_new_signal() {
+        use futures::StreamExt;
+
+        let (db, _resume_rv) = configmap_replay_db().await;
+        let (grpc, _leader_tx) = grpc_leader_server_with_db(db, true).await;
+        let mut stream = grpc
+            .watch_resources(request_with_node_client_cert(
+                watch_configmaps_from_rv(0),
+                "worker-1",
+            ))
+            .await
+            .expect("leader should accept legacy zero-rv watch")
+            .into_inner();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("initial positioned replay must not wait for an unrelated later signal")
+            .expect("watch stream should yield")
+            .expect("watch stream should stay healthy");
+        assert_eq!(event.event_type, "ADDED");
+        assert_eq!(
+            event.resource.expect("watch event resource").name,
+            "resume-old"
+        );
+        assert!(
+            event
+                .resume_position
+                .expect("new server must upgrade legacy watch to exact position")
+                .event_id
+                > 0
+        );
     }
 
     #[tokio::test]
@@ -4320,6 +4540,20 @@ mod tests {
             node_git_commit: "testhash2".to_string(),
             node_registration: Some(test_node_registration_proto("testhash2")),
         };
+
+        let mut mismatched_id = join_request.clone();
+        mismatched_id.node_id = mismatched_id.node_id.wrapping_add(1);
+        let mut request = request_with_node_client_cert(mismatched_id, "mn-controlplane2");
+        request.metadata_mut().insert(
+            "x-klights-join-token",
+            "123456.fedcba9876543210".parse().unwrap(),
+        );
+        let status = grpc
+            .join_as_controlplane(request)
+            .await
+            .expect_err("raft node ID must be derived from the authenticated node name");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
         let mut request = request_with_node_client_cert(join_request.clone(), "mn-controlplane2");
         request.metadata_mut().insert(
             "x-klights-join-token",
@@ -4648,7 +4882,7 @@ mod tests {
             .unwrap();
         let mut client = ReplicationClient::new(channel);
         let request = tonic::Request::new(generated::JoinAsControlplaneRequest {
-            node_id: 2,
+            node_id: raft_node_id_for_node_name_in_test("mn-controlplane2"),
             addr: "https://192.0.2.20:7679".to_string(),
             node_name: "mn-controlplane2".to_string(),
             as_learner: false,
@@ -4704,7 +4938,7 @@ mod tests {
             .unwrap();
         let mut client = ReplicationClient::new(channel);
         let request = tonic::Request::new(generated::JoinAsControlplaneRequest {
-            node_id: 2,
+            node_id: raft_node_id_for_node_name_in_test("mn-controlplane2"),
             addr: "https://172.31.14.2:7679".to_string(),
             node_name: "mn-controlplane2".to_string(),
             as_learner: false,
@@ -4734,7 +4968,7 @@ mod tests {
         assert_eq!(
             calls,
             vec![RecordedControlplaneJoin {
-                node_id: 2,
+                node_id: raft_node_id_for_node_name_in_test("mn-controlplane2"),
                 addr: "https://127.0.0.1:7679".to_string(),
                 node_name: "mn-controlplane2".to_string(),
                 as_learner: false,
@@ -4883,8 +5117,20 @@ mod tests {
         // stream cursor RV so the worker treats it as liveness + a resume
         // point, and it must round-trip through the normal event proto shape
         // (the client decode requires a `resource`).
-        let event = super::watch_heartbeat_proto("v1", "Pod", 4242);
+        let resume_position = WatchReplayPosition {
+            resource_version: 4242,
+            event_id: 77,
+            resource_version_filter_through_event_id: 0,
+        };
+        let event = super::watch_heartbeat_proto("v1", "Pod", 4242, resume_position);
         assert_eq!(event.event_type, "BOOKMARK");
+        assert_eq!(
+            event
+                .resume_position
+                .as_ref()
+                .map(|position| position.event_id),
+            Some(77)
+        );
         let resource = event.resource.expect("heartbeat must carry a resource");
         assert_eq!(resource.resource_version, 4242);
         let data: serde_json::Value =

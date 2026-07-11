@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, value::RawValue};
 
 use crate::datastore::redb::accessor::RedbAccessor;
-use crate::datastore::redb::tables;
+use crate::datastore::redb::{helpers, tables};
 use crate::datastore::types::*;
 
 const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
@@ -168,6 +168,13 @@ impl RedbWatchStore {
         let targets = targets.to_vec();
         self.db_call("watch_list_positioned", move |db| {
             let read = db.begin_read()?;
+            let current = helpers::watch_replay_position_in_read(&read)?;
+            let high_water_event_id = current.event_id;
+            if position.event_id > high_water_event_id
+                || (position.event_id == 0 && position.resource_version > current.resource_version)
+            {
+                return Ok(PositionedWatchReplayRead::Expired);
+            }
             if position.event_id == 0 {
                 for target in &targets {
                     if target_floor(&read, target)?
@@ -180,7 +187,6 @@ impl RedbWatchStore {
                 return Ok(PositionedWatchReplayRead::Expired);
             }
             let table = read.open_table(tables::WATCH_EVENTS)?;
-            let high_water_event_id = table.last()?.map_or(0, |(key, _)| key.value()) as i64;
             let start_id = if position.event_id == 0 {
                 0
             } else {
@@ -196,7 +202,14 @@ impl RedbWatchStore {
                     .get("resourceVersion")
                     .and_then(Value::as_i64)
                     .unwrap_or_default();
-                if position.event_id == 0 && rv <= position.resource_version {
+                let rv_filter_through = if position.resource_version_filter_through_event_id > 0 {
+                    position.resource_version_filter_through_event_id
+                } else if position.event_id == 0 {
+                    i64::MAX
+                } else {
+                    0
+                };
+                if event_id <= rv_filter_through && rv <= position.resource_version {
                     continue;
                 }
                 let av = event
@@ -222,6 +235,7 @@ impl RedbWatchStore {
                     position: WatchReplayPosition {
                         resource_version: rv,
                         event_id,
+                        resource_version_filter_through_event_id: 0,
                     },
                     event: CatchUpResource {
                         resource: Resource {
@@ -251,6 +265,14 @@ impl RedbWatchStore {
         .await
     }
 
+    pub async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
+        self.db_call("current_watch_replay_position", |db| {
+            let read = db.begin_read()?;
+            helpers::watch_replay_position_in_read(&read)
+        })
+        .await
+    }
+
     pub async fn watch_list_raw_positioned_checked_bounded(
         &self,
         targets: &[WatchTarget],
@@ -260,6 +282,13 @@ impl RedbWatchStore {
         let targets = targets.to_vec();
         self.db_call("watch_list_raw_positioned", move |db| {
             let read = db.begin_read()?;
+            let current = helpers::watch_replay_position_in_read(&read)?;
+            let high_water_event_id = current.event_id;
+            if position.event_id > high_water_event_id
+                || (position.event_id == 0 && position.resource_version > current.resource_version)
+            {
+                return Ok(PositionedWatchReplayRead::Expired);
+            }
             if position.event_id == 0 {
                 for target in &targets {
                     if target_floor(&read, target)?
@@ -272,7 +301,6 @@ impl RedbWatchStore {
                 return Ok(PositionedWatchReplayRead::Expired);
             }
             let table = read.open_table(tables::WATCH_EVENTS)?;
-            let high_water_event_id = table.last()?.map_or(0, |(key, _)| key.value()) as i64;
             let start_id = if position.event_id == 0 {
                 0
             } else {
@@ -287,7 +315,14 @@ impl RedbWatchStore {
                     continue;
                 };
                 let rv = event.resource_version.unwrap_or_default();
-                if position.event_id == 0 && rv <= position.resource_version {
+                let rv_filter_through = if position.resource_version_filter_through_event_id > 0 {
+                    position.resource_version_filter_through_event_id
+                } else if position.event_id == 0 {
+                    i64::MAX
+                } else {
+                    0
+                };
+                if event_id <= rv_filter_through && rv <= position.resource_version {
                     continue;
                 }
                 let av = event.api_version.unwrap_or("");
@@ -302,6 +337,7 @@ impl RedbWatchStore {
                     position: WatchReplayPosition {
                         resource_version: rv,
                         event_id,
+                        resource_version_filter_through_event_id: 0,
                     },
                     event: RawWatchEvent {
                         api_version: av.to_string(),
@@ -588,6 +624,109 @@ impl RedbWatchStore {
                 }
             }
             Ok(result)
+        })
+        .await
+    }
+
+    pub async fn watch_list_all_after_id_bounded(
+        &self,
+        after_id: i64,
+        through_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        self.db_call("watch_list_all_after_id_bounded", move |db| {
+            let r = db.begin_read()?;
+            let tbl = r.open_table(tables::WATCH_EVENTS)?;
+            let mut result = Vec::with_capacity(limit.get());
+            let start = after_id.saturating_add(1).max(0) as u64;
+            let end = through_id.max(0) as u64;
+            for entry in tbl.range(start..=end)? {
+                let (id, value) = entry?;
+                let event: Value = serde_json::from_slice(value.value()).unwrap_or(Value::Null);
+                let data = event.get("data").cloned().unwrap_or(Value::Null);
+                result.push((
+                    id.value() as i64,
+                    CatchUpResource {
+                        resource: Resource {
+                            id: 0,
+                            api_version: event
+                                .get("apiVersion")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            kind: event
+                                .get("kind")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            namespace: event
+                                .get("namespace")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            name: event
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            uid: Resource::uid_from_data(&data),
+                            resource_version: event
+                                .get("resourceVersion")
+                                .and_then(Value::as_i64)
+                                .unwrap_or_default(),
+                            data: std::sync::Arc::new(data),
+                        },
+                        event_type: std::borrow::Cow::Owned(
+                            event
+                                .get("eventType")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        ),
+                    },
+                ));
+                if result.len() == limit.get() {
+                    break;
+                }
+            }
+            Ok(result)
+        })
+        .await
+    }
+
+    pub async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
+        self.db_call("list_watch_replay_floors", |db| {
+            let read = db.begin_read()?;
+            let table = read.open_table(tables::WATCH_REPLAY_POSITION_FLOORS)?;
+            let mut floors = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                let mut parts = key.value().splitn(3, |byte| *byte == 0);
+                let (Some(api_version), Some(kind), Some(namespace_key)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                let Some((floor_resource_version, floor_event_id)) =
+                    decode_position_floor(value.value())
+                else {
+                    continue;
+                };
+                floors.push(WatchReplayFloor {
+                    api_version: String::from_utf8_lossy(api_version).into_owned(),
+                    kind: String::from_utf8_lossy(kind).into_owned(),
+                    namespace_key: String::from_utf8_lossy(namespace_key).into_owned(),
+                    floor_resource_version: floor_resource_version as i64,
+                    floor_event_id: floor_event_id as i64,
+                });
+            }
+            floors.sort_by(|left, right| {
+                (&left.api_version, &left.kind, &left.namespace_key).cmp(&(
+                    &right.api_version,
+                    &right.kind,
+                    &right.namespace_key,
+                ))
+            });
+            Ok(floors)
         })
         .await
     }

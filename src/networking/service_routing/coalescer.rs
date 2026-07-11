@@ -588,6 +588,7 @@ impl ServiceRoutingWatchTarget {
             label_selector: None,
             field_selector: None,
             start_resource_version: None,
+            start_watch_replay_position: None,
         }
     }
 }
@@ -1261,6 +1262,7 @@ mod tests {
                 target,
                 ResourceEvent {
                     event: crate::watch::WatchEvent::modified(object),
+                    resume_position: None,
                 },
             )
             .expect("policy-only watch target must not poison service inventory sync");

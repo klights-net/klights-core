@@ -211,6 +211,7 @@ mod tests {
             Ok(ResourceList {
                 items: Vec::new(),
                 resource_version: 0,
+                watch_replay_position: None,
                 continue_token: None,
                 remaining_item_count: None,
             })

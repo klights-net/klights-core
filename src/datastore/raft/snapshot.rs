@@ -37,6 +37,14 @@ pub struct RaftSnapshotData {
     pub membership: StoredMembership<NodeId, openraft::BasicNode>,
     #[serde(default)]
     pub current_rv: i64,
+    /// Durable watch-log allocator boundary. `None` identifies snapshots
+    /// written by peers predating apply-order event IDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_event_high_water: Option<i64>,
+    /// Authoritative watch-compaction boundaries. `None` is reserved for
+    /// snapshots from peers predating replay-floor transfer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
     pub commits: Vec<crate::log_apply::LogApplyCommit>,
 }
 
@@ -60,6 +68,14 @@ impl RaftSnapshotData {
         last_applied: Option<LogId<NodeId>>,
         membership: &StoredMembership<NodeId, openraft::BasicNode>,
     ) -> Result<Cursor<Vec<u8>>> {
+        Self::serialize_from_backend_to_cursor_inner(db, last_applied, membership).await
+    }
+
+    async fn serialize_from_backend_to_cursor_inner(
+        db: &dyn DatastoreBackend,
+        last_applied: Option<LogId<NodeId>>,
+        membership: &StoredMembership<NodeId, openraft::BasicNode>,
+    ) -> Result<Cursor<Vec<u8>>> {
         // P2 (memory-improvement.md): stream the JSON through a zstd encoder
         // so the uncompressed JSON is never fully materialized in memory.
         // The old code wrote ALL commits to a raw Cursor<Vec<u8>> (hundreds
@@ -78,30 +94,59 @@ impl RaftSnapshotData {
         serde_json::to_writer(&mut encoder, &last_applied)?;
         encoder.write_all(b",\"membership\":")?;
         serde_json::to_writer(&mut encoder, membership)?;
-        // Stream the snapshot commits BEFORE reading the leader current_rv.
-        // Reading current_rv first opens a TOCTOU window: commits applied
-        // during the many streaming awaits below would land in the snapshot
-        // with a resourceVersion higher than the already-captured current_rv,
-        // producing an internally inconsistent snapshot that a follower
-        // rejects in `replace_resource_state_in_conn` ("snapshot entry
-        // resourceVersion N is ahead of leader current_rv M"), permanently
-        // breaking raft catch-up. Because every emitted commit was already
-        // applied to the leader store (and its metadata.resource_version
-        // advanced atomically in the same transaction) before we read its
-        // rows, reading current_rv last guarantees it is >= the maximum
-        // emitted resourceVersion. The JSON key order is irrelevant to serde
-        // deserialization, so emitting `commits` before `current_rv` is safe.
+        // Freeze the apply-order boundary before the first streamed page.
+        // Concurrent rows are replayed from the Raft log after this snapshot;
+        // certifying them in the snapshot cursor would skip them on failover.
+        let snapshot_position = db.current_watch_replay_position().await?;
+        // The backend fence keeps resources, history, outbox state, allocator,
+        // and replay floors mutation-stable across every awaited page. Emit
+        // commits first and serialize the counters afterward; JSON key order
+        // is irrelevant to serde deserialization.
         encoder.write_all(b",\"commits\":")?;
-        crate::replication::snapshot::write_snapshot_commits_json_array(db, 0, &mut encoder)
-            .await?;
-        let current_rv = db.get_current_resource_version().await?;
+        crate::replication::snapshot::write_snapshot_commits_json_array_through_event_id(
+            db,
+            0,
+            snapshot_position.event_id,
+            &mut encoder,
+        )
+        .await?;
+        let replay_position = db.current_watch_replay_position().await?;
+        let floors = normalize_snapshot_floors(
+            db.list_watch_replay_floors().await?,
+            snapshot_position.event_id,
+            replay_position.resource_version,
+        );
         encoder.write_all(b",\"current_rv\":")?;
-        serde_json::to_writer(&mut encoder, &current_rv)?;
+        serde_json::to_writer(&mut encoder, &replay_position.resource_version)?;
+        encoder.write_all(b",\"watch_event_high_water\":")?;
+        serde_json::to_writer(&mut encoder, &snapshot_position.event_id)?;
+        encoder.write_all(b",\"watch_replay_floors\":")?;
+        serde_json::to_writer(&mut encoder, &floors)?;
         encoder.write_all(b"}")?;
         // Finish the zstd stream — flushes remaining compressed data to `framed`.
         encoder.finish()?;
         Ok(Cursor::new(framed))
     }
+}
+
+fn normalize_snapshot_floors(
+    mut floors: Vec<crate::datastore::WatchReplayFloor>,
+    high_water_event_id: i64,
+    current_resource_version: i64,
+) -> Vec<crate::datastore::WatchReplayFloor> {
+    for floor in &mut floors {
+        if floor.floor_event_id > high_water_event_id {
+            // GC may advance after the boundary was captured. Relative to this
+            // snapshot every older cursor is compacted while the boundary
+            // itself remains a valid empty replay position.
+            floor.floor_event_id = high_water_event_id;
+            floor.floor_resource_version = current_resource_version;
+        } else {
+            floor.floor_resource_version =
+                floor.floor_resource_version.min(current_resource_version);
+        }
+    }
+    floors
 }
 
 pub fn snapshot_id_for(last_applied: Option<LogId<NodeId>>) -> String {
@@ -124,25 +169,46 @@ fn snapshot_write_err<E: std::fmt::Display>(e: E) -> StorageError<NodeId> {
 #[derive(Clone)]
 pub struct SqliteRaftSnapshotBuilder {
     pub(crate) backend: Arc<dyn DatastoreBackend>,
-    pub(crate) last_applied: Option<LogId<NodeId>>,
-    pub(crate) membership: StoredMembership<NodeId, openraft::BasicNode>,
+    pub(crate) node_local: Arc<crate::datastore::node_local::SqliteNodeLocalDb>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for SqliteRaftSnapshotBuilder {
     async fn build_snapshot(
         &mut self,
     ) -> std::result::Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
-        let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor(
+        let _snapshot_fence = self
+            .backend
+            .acquire_snapshot_exclusive_fence()
+            .await
+            .map_err(snapshot_write_err)?;
+        let last_applied = self
+            .node_local
+            .raft_meta_get("last_applied")
+            .await
+            .map_err(snapshot_write_err)?
+            .map(|bytes| serde_json::from_slice(&bytes))
+            .transpose()
+            .map_err(snapshot_write_err)?;
+        let membership = self
+            .node_local
+            .raft_meta_get("last_membership")
+            .await
+            .map_err(snapshot_write_err)?
+            .map(|bytes| serde_json::from_slice(&bytes))
+            .transpose()
+            .map_err(snapshot_write_err)?
+            .unwrap_or_default();
+        let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor_inner(
             self.backend.as_ref(),
-            self.last_applied,
-            &self.membership,
+            last_applied,
+            &membership,
         )
         .await
         .map_err(snapshot_write_err)?;
         let meta = SnapshotMeta {
-            last_log_id: self.last_applied,
-            last_membership: self.membership.clone(),
-            snapshot_id: snapshot_id_for(self.last_applied),
+            last_log_id: last_applied,
+            last_membership: membership,
+            snapshot_id: snapshot_id_for(last_applied),
         };
         Ok(Snapshot {
             meta,
@@ -193,6 +259,10 @@ mod tests {
             decoded.current_rv,
             db.get_current_resource_version().await.unwrap()
         );
+        assert_eq!(
+            decoded.watch_event_high_water,
+            Some(db.current_watch_replay_position().await.unwrap().event_id)
+        );
         assert!(!decoded.commits.is_empty(), "snapshot must contain commits");
         assert!(
             decoded.commits.iter().any(|c| c.mutations.iter().any(|m| {
@@ -201,5 +271,24 @@ mod tests {
             })),
             "snapshot must contain the ConfigMap"
         );
+    }
+
+    #[test]
+    fn legacy_snapshot_without_watch_allocator_remains_decodable() {
+        let legacy = serde_json::json!({
+            "last_applied": null,
+            "membership": StoredMembership::<NodeId, openraft::BasicNode>::default(),
+            "current_rv": 7,
+            "commits": []
+        });
+        let framed = crate::datastore::raft::compressed::encode(
+            serde_json::to_vec(&legacy).unwrap().as_slice(),
+        )
+        .unwrap();
+
+        let decoded = RaftSnapshotData::deserialize_from_bytes(&framed).unwrap();
+        assert_eq!(decoded.current_rv, 7);
+        assert_eq!(decoded.watch_event_high_water, None);
+        assert_eq!(decoded.watch_replay_floors, None);
     }
 }

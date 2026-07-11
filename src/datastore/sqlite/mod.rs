@@ -16,6 +16,7 @@ mod gc;
 mod merge_patch;
 pub mod opener;
 pub(super) mod owner_ref_index;
+mod position_membership;
 mod queries;
 mod replay;
 mod resource_shape;
@@ -106,6 +107,7 @@ pub struct Datastore {
     watch_bus: std::sync::Arc<WatchBus>,
     pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
     pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
+    snapshot_fence: std::sync::Arc<tokio::sync::RwLock<()>>,
 }
 
 struct AtomicOutboxMutation {
@@ -1039,6 +1041,7 @@ impl Datastore {
                     rv,
                     vec![ClusterMutation::WatchHistory(
                         WatchHistoryMutation::PutWatchEvent(LogApplyWatchEventRow {
+                            event_id: None,
                             api_version,
                             kind,
                             namespace,
@@ -2609,6 +2612,7 @@ impl Datastore {
             watch_bus: std::sync::Arc::new(WatchBus::new(1024)),
             pod_endpoint_tx,
             pod_slot_admission_tx,
+            snapshot_fence: std::sync::Arc::new(tokio::sync::RwLock::new(())),
         };
         ds.gc_stale_applied_outbox_placeholders(
             std::time::SystemTime::now()
@@ -2765,6 +2769,24 @@ impl Datastore {
 
 #[async_trait]
 impl DatastoreBackend for Datastore {
+    async fn acquire_snapshot_exclusive_fence(
+        &self,
+    ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
+        Ok(Some(
+            crate::datastore::backend::SnapshotExclusiveFence::new(
+                self.snapshot_fence.clone().write_owned().await,
+            ),
+        ))
+    }
+
+    async fn acquire_snapshot_mutation_fence(
+        &self,
+    ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
+        Ok(Some(crate::datastore::backend::SnapshotMutationFence::new(
+            self.snapshot_fence.clone().read_owned().await,
+        )))
+    }
+
     #[cfg(test)]
     async fn seed_namespace_for_test(&self, name: &str) {
         Datastore::seed_namespace_no_rv(self, name)
@@ -2795,9 +2817,19 @@ impl DatastoreBackend for Datastore {
         &self,
         entries: Vec<crate::log_apply::LogApplyCommit>,
         current_rv: i64,
+        watch_event_high_water: Option<i64>,
+        watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
-        Datastore::replace_replicated_resource_state(self, entries, current_rv, metadata).await
+        Datastore::replace_replicated_resource_state(
+            self,
+            entries,
+            current_rv,
+            watch_event_high_water,
+            watch_replay_floors,
+            metadata,
+        )
+        .await
     }
 
     async fn apply_log_apply_commit(&self, commit: crate::log_apply::LogApplyCommit) -> Result<()> {
@@ -2884,6 +2916,14 @@ impl DatastoreBackend for Datastore {
             page,
         )
         .await
+    }
+
+    async fn list_resources_for_watch_targets(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+    ) -> Result<ResourceList> {
+        Datastore::list_resources_for_watch_targets(self, targets, label_selector).await
     }
 
     async fn snapshot_resources_at_rv(
@@ -3318,6 +3358,27 @@ impl DatastoreBackend for Datastore {
             .await
     }
 
+    async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
+        Datastore::current_watch_replay_position(self).await
+    }
+
+    async fn snapshot_resources_at_position(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        position: WatchReplayPosition,
+    ) -> Result<SnapshotAtRv> {
+        Datastore::snapshot_resources_at_position(
+            self,
+            targets,
+            label_selector,
+            field_selector,
+            position,
+        )
+        .await
+    }
+
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
         targets: &[WatchTarget],
@@ -3362,6 +3423,19 @@ impl DatastoreBackend for Datastore {
             limit,
         )
         .await
+    }
+
+    async fn list_all_watch_events_after_id_bounded(
+        &self,
+        after_id: i64,
+        through_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        Datastore::list_all_watch_events_after_id_bounded(self, after_id, through_id, limit).await
+    }
+
+    async fn list_watch_replay_floors(&self) -> Result<Vec<crate::datastore::WatchReplayFloor>> {
+        Datastore::list_watch_replay_floors(self).await
     }
 
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {

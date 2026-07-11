@@ -902,8 +902,22 @@ impl RaftNodeJoinHandler {
             grpc_port: joiner_grpc_port,
             host,
         };
-        crate::kubelet::node::register_node_snapshot(self.db.as_ref(), None, None, None, &snapshot)
-            .await
+        // The leader can validate the joiner's identity and host facts, but it
+        // does not own the joiner's kubelet/dataplane health.  Keep a newly
+        // admitted remote Node unavailable until that node publishes its own
+        // status after peer-route reconciliation.  In particular, do not pass
+        // `None` here: local single-node registration intentionally interprets
+        // an absent health tracker as healthy.
+        let pending_dataplane = crate::networking::dataplane_health::DataplaneHealth::new_healthy();
+        pending_dataplane.set_peers_pending();
+        crate::kubelet::node::register_node_snapshot(
+            self.db.as_ref(),
+            None,
+            None,
+            Some(&pending_dataplane),
+            &snapshot,
+        )
+        .await
     }
 
     async fn refresh_cluster_membership_metadata(
@@ -2135,6 +2149,26 @@ mod tests {
         assert_eq!(node.data["status"]["capacity"]["memory"], "8388608Ki");
         assert_eq!(node.data["status"]["nodeInfo"]["architecture"], "test-arch");
         assert_eq!(node.data["status"]["nodeInfo"]["osImage"], "Test Linux");
+        let ready = node.data["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|condition| condition["type"] == "Ready")
+            .unwrap();
+        assert_eq!(
+            ready["status"], "False",
+            "leader admission must not report a remote joiner Ready before its dataplane reports health"
+        );
+        let network_unavailable = node.data["status"]["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|condition| condition["type"] == "NetworkUnavailable")
+            .unwrap();
+        assert_eq!(
+            network_unavailable["status"], "True",
+            "leader admission must keep a remote joiner's network unavailable until the joiner reports health"
+        );
 
         handler
             .join(

@@ -170,6 +170,10 @@ impl RemoteApiClient {
 
     async fn run_watch_driver(self: Arc<Self>, req: ListRequest, cancel: CancellationToken) {
         let mut next_resource_version = None;
+        let mut next_watch_replay_position = None;
+        let mut selector_membership = crate::watch::SelectorMembership::default();
+        let has_selector =
+            super::selectors_present(req.label_selector.as_deref(), req.field_selector.as_deref());
         // Consecutive failed reconnects; reset to 0 once the stream delivers an
         // event. Drives the shared exponential reconnect backoff so a sustained
         // leader/WAN outage cannot become a fixed-interval reconnect storm.
@@ -181,7 +185,11 @@ impl RemoteApiClient {
             if next_resource_version.is_none() {
                 match self.prime_list_scope(req.clone()).await {
                     Ok(list) => {
+                        if has_selector {
+                            selector_membership.replace_from_resources(&list.items);
+                        }
                         next_resource_version = Some(list.resource_version);
+                        next_watch_replay_position = list.watch_replay_position;
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -203,7 +211,9 @@ impl RemoteApiClient {
                 label_selector: req.label_selector.clone(),
                 field_selector: req.field_selector.clone(),
                 start_resource_version: next_resource_version,
+                start_watch_replay_position: next_watch_replay_position,
             };
+            let selector_req = watch_req.clone();
             match self.watch_resources(watch_req).await {
                 Ok(mut stream) => loop {
                     let next = tokio::select! {
@@ -225,6 +235,34 @@ impl RemoteApiClient {
                             // before this event and reconnect, so catch-up replay
                             // re-delivers it — never advance past an event that
                             // was not applied (silent loss on reconnect).
+                            let event_rv = resource_event_version(&event);
+                            let resume_position = event.resume_position;
+                            let matches =
+                                super::watch_request_matches_event(&selector_req, &event.event);
+                            let (transitioned, membership_mutation) = if has_selector {
+                                let (event, mutation) = selector_membership
+                                    .prepare_transition(event.event, matches)
+                                    .into_parts();
+                                (event, Some(mutation))
+                            } else {
+                                (matches.then_some(event.event), None)
+                            };
+                            let Some(transitioned) = transitioned else {
+                                if let Some(mutation) = membership_mutation {
+                                    selector_membership.commit(mutation);
+                                }
+                                super::advance_watch_resume_after_apply(
+                                    &mut next_resource_version,
+                                    &mut next_watch_replay_position,
+                                    event_rv,
+                                    resume_position,
+                                );
+                                continue;
+                            };
+                            let event = ResourceEvent {
+                                event: transitioned,
+                                resume_position,
+                            };
                             if let Err(err) = self.cache.apply_event(&event).await {
                                 tracing::warn!(
                                     api_version = %req.api_version,
@@ -234,14 +272,20 @@ impl RemoteApiClient {
                                 );
                                 break;
                             }
-                            if let Some(rv) = resource_event_version(&event) {
-                                next_resource_version =
-                                    Some(next_resource_version.unwrap_or(0).max(rv));
+                            if let Some(mutation) = membership_mutation {
+                                selector_membership.commit(mutation);
                             }
+                            super::advance_watch_resume_after_apply(
+                                &mut next_resource_version,
+                                &mut next_watch_replay_position,
+                                event_rv,
+                                event.resume_position,
+                            );
                         }
                         IdleNext::Item(Err(err)) => {
                             if watch_error_requires_relist(&err) {
                                 next_resource_version = None;
+                                next_watch_replay_position = None;
                             }
                             tracing::warn!(
                                 api_version = %req.api_version,
@@ -465,6 +509,7 @@ impl LeaderApiClient for RemoteApiClient {
                 label_selector: None,
                 field_selector: Some(format!("spec.nodeName={node_name}")),
                 start_resource_version: None,
+                start_watch_replay_position: None,
             })
             .await?;
         let cache = self.cache.clone();
@@ -530,6 +575,7 @@ impl LeaderApiClient for RemoteApiClient {
                 label_selector: None,
                 field_selector: Some(format!("metadata.name={name}")),
                 start_resource_version: None,
+                start_watch_replay_position: None,
             })
             .await?;
         let cache = self.cache.clone();
@@ -658,7 +704,9 @@ mod tests {
     use serde_json::json;
 
     use crate::control_plane::client::remote::RemoteApiClient;
-    use crate::control_plane::client::{CacheScope, LeaderApiClient, ResourceKey, WatchRequest};
+    use crate::control_plane::client::{
+        CacheScope, LeaderApiClient, ListRequest, ResourceKey, WatchRequest,
+    };
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend::DatastoreHandle;
     use crate::datastore::command::StorageCommand;
@@ -1012,6 +1060,7 @@ mod tests {
                 label_selector: None,
                 field_selector: Some("spec.nodeName=worker-1".to_string()),
                 start_resource_version: Some(start_rv),
+                start_watch_replay_position: None,
             })
             .await
             .expect("open continuation watch");
@@ -1020,12 +1069,91 @@ mod tests {
             .expect("continuation watch should replay missed event")
             .expect("stream should yield")
             .expect("watch event should decode");
+        assert!(
+            event
+                .resume_position
+                .is_some_and(|position| position.event_id > 0),
+            "gRPC watch events must carry an apply-order resume position"
+        );
         let pod_name = event
             .event
             .object
             .pointer("/metadata/name")
             .and_then(|value| value.as_str());
         assert_eq!(pod_name, Some("missed"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn grpc_list_position_round_trips_into_lossless_watch_resume() {
+        let (client, db, handle) = remote_client_and_leader_db().await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "before-list",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "before-list"}
+            }),
+        )
+        .await
+        .unwrap();
+        let list_req = ListRequest {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+        };
+        let list = client
+            .list_resources_fresh(list_req)
+            .await
+            .expect("list through gRPC");
+        let list_position = list
+            .watch_replay_position
+            .expect("gRPC LIST must preserve its atomic replay position");
+        assert!(list_position.event_id > 0);
+
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "after-list",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "after-list"}
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = client
+            .watch_resources(WatchRequest {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                label_selector: None,
+                field_selector: None,
+                start_resource_version: Some(list.resource_version),
+                start_watch_replay_position: Some(list_position),
+            })
+            .await
+            .expect("resume watch from atomic list position");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("post-list event must replay")
+            .expect("stream should yield")
+            .expect("event should decode");
+        assert_eq!(event.event.object["metadata"]["name"], "after-list");
+        assert!(
+            event
+                .resume_position
+                .is_some_and(|position| position.event_id > list_position.event_id)
+        );
         handle.abort();
     }
 
@@ -1270,6 +1398,7 @@ mod tests {
         let pod = make_pod("default", "web", "uid-1", "worker-1", "Running");
         let event = super::ResourceEvent {
             event: crate::watch::WatchEvent::from_type("ADDED", (*pod.data).clone()),
+            resume_position: None,
         };
         let mut live: super::WatchStream<super::ResourceEvent> =
             Box::pin(futures::stream::once(async move { Ok(event) }));
@@ -1300,6 +1429,11 @@ mod tests {
         // so the driver does NOT advance the resume cursor past it.
         let undecodable = super::ResourceEvent {
             event: crate::watch::WatchEvent::from_type("ADDED", serde_json::json!({})),
+            resume_position: Some(crate::datastore::WatchReplayPosition {
+                resource_version: 41,
+                event_id: 99,
+                resource_version_filter_through_event_id: 0,
+            }),
         };
         assert!(
             cache.apply_event(&undecodable).await.is_err(),
@@ -1310,6 +1444,7 @@ mod tests {
         // the driver may advance to.
         let bookmark = super::ResourceEvent {
             event: crate::watch::WatchEvent::bookmark_typed(42, "v1", "Pod"),
+            resume_position: None,
         };
         assert!(
             cache.apply_event(&bookmark).await.is_ok(),
@@ -1320,6 +1455,7 @@ mod tests {
         let pod = make_pod("default", "web", "uid-1", "worker-1", "Running");
         let good = super::ResourceEvent {
             event: crate::watch::WatchEvent::from_type("ADDED", (*pod.data).clone()),
+            resume_position: None,
         };
         assert!(
             cache.apply_event(&good).await.is_ok(),

@@ -7670,6 +7670,21 @@ async fn test_cluster_custom_resource_watch_skips_stale_backlog_event_when_rv_ze
     assert_eq!(watch_resp.status(), StatusCode::OK);
     let mut stream = watch_resp.into_body().into_data_stream();
 
+    // Drive the lazy response body through its atomic baseline before the
+    // concurrent mutation below. This makes the intended LIST/WATCH boundary
+    // explicit instead of allowing the first poll to occur after the patch.
+    let baseline_chunk = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
+        .await
+        .expect("baseline watch body must become ready")
+        .expect("baseline watch body must remain open")
+        .expect("baseline watch chunk must be readable");
+    let baseline_event: serde_json::Value = serde_json::from_slice(&baseline_chunk).unwrap();
+    assert_eq!(baseline_event["type"], "ADDED");
+    assert_eq!(
+        baseline_event["object"]["metadata"]["resourceVersion"],
+        old_rv.to_string()
+    );
+
     // Simulate delayed/stale broadcast delivery from backlog.
     db.broadcast_watch_event(crate::datastore::PendingWatchEvent::from_event(
         crate::watch::WatchEvent::added(old_object.clone()),
@@ -7708,7 +7723,7 @@ async fn test_cluster_custom_resource_watch_skips_stale_backlog_event_when_rv_ze
     // (name1 @ old_rv) as a baseline ADDED, then the fresh update (@ fresh_rv).
     // The injected STALE DUPLICATE broadcast (@ old_rv) must be deduped — never
     // re-delivered — so the client never regresses to stale content.
-    let mut old_count = 0;
+    let mut old_count = 1;
     let mut saw_fresh = false;
     for _ in 0..6 {
         let chunk =

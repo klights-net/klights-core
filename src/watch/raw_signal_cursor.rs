@@ -20,13 +20,34 @@ impl RawSignalWatchCursor {
         scope: WatchDeliveryScope,
         accepted_rv: i64,
     ) -> Self {
+        Self::new_at_position(
+            signal_rx,
+            db,
+            targets,
+            topic,
+            scope,
+            accepted_rv,
+            WatchReplayPosition::from_resource_version(accepted_rv),
+        )
+    }
+
+    pub fn new_at_position(
+        signal_rx: impl Into<WatchSignalReceiver>,
+        db: DatastoreHandle,
+        targets: Vec<WatchTarget>,
+        topic: WatchTopic,
+        scope: WatchDeliveryScope,
+        accepted_rv: i64,
+        replay_position: WatchReplayPosition,
+    ) -> Self {
         Self {
-            core: SignalReplayCursorCore::new(
+            core: SignalReplayCursorCore::new_at_position(
                 signal_rx,
                 RawWatchReplaySource { db, targets },
                 vec![topic],
                 scope,
                 accepted_rv,
+                replay_position,
                 WindowPolicy::default_watch_delivery(),
             ),
         }
@@ -38,14 +59,6 @@ impl RawSignalWatchCursor {
 
     pub fn accept_event(&mut self, rv: i64) {
         self.core.accept_event(rv);
-    }
-
-    pub fn mark_delivered(&mut self, rv: i64) {
-        self.core.mark_delivered(rv);
-    }
-
-    pub fn mark_delivered_for_key(&mut self, namespace: Option<String>, name: String, rv: i64) {
-        self.core.mark_delivered_for_key(namespace, name, rv);
     }
 
     pub async fn prime_replay_or_expired(&mut self) -> Result<usize, WatchCursorError> {

@@ -271,6 +271,107 @@ async fn test_cluster_pod_watch_send_initial_events_emits_initial_events_end_boo
 }
 
 #[tokio::test]
+async fn test_watchlist_positive_rv_still_emits_complete_current_snapshot() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let app = build_test_router().await;
+    let namespace = "watchlist-positive-rv-snapshot";
+    for (uri, body) in [
+        (
+            "/api/v1/namespaces".to_string(),
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": namespace}
+            }),
+        ),
+        (
+            format!("/api/v1/namespaces/{namespace}/configmaps"),
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "existing", "namespace": namespace}
+            }),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/namespaces/{namespace}/configmaps"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list: serde_json::Value =
+        serde_json::from_slice(&to_bytes(list.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let rv = list["metadata"]["resourceVersion"]
+        .as_str()
+        .expect("LIST must return a resourceVersion");
+
+    let watch = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/namespaces/{namespace}/configmaps?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&resourceVersion={rv}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watch.status(), StatusCode::OK);
+    let mut stream = watch.into_body().into_data_stream();
+    let mut saw_existing = false;
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("WatchList must reach its initial-events-end bookmark")
+            .expect("WatchList ended before its initial-events-end bookmark")
+            .expect("WatchList stream chunk failed");
+        for line in String::from_utf8(chunk.to_vec())
+            .unwrap()
+            .lines()
+            .filter(|line| !line.is_empty())
+        {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            saw_existing |=
+                event["type"] == "ADDED" && event["object"]["metadata"]["name"] == "existing";
+            if event["type"] == "BOOKMARK"
+                && event["object"]["metadata"]["annotations"]["k8s.io/initial-events-end"] == "true"
+            {
+                assert!(
+                    saw_existing,
+                    "sendInitialEvents must emit every object in the current snapshot even when its RV is not newer than the requested RV"
+                );
+                return;
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_pod_watchlist_send_initial_events_requires_not_older_than() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -8774,6 +8875,154 @@ async fn register_selw_crd(app: &axum::Router) {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_crd_watch_resource_version_zero_emits_current_objects() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    register_selw_crd(&app).await;
+    db.create_resource(
+        "selwatch.example.com/v1",
+        "Selw",
+        Some("default"),
+        "existing",
+        serde_json::json!({
+            "apiVersion": "selwatch.example.com/v1",
+            "kind": "Selw",
+            "metadata": {"name": "existing", "namespace": "default"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/apis/selwatch.example.com/v1/namespaces/default/selws?watch=true&resourceVersion=0&timeoutSeconds=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("resourceVersion=0 CR watch must emit its current baseline")
+        .expect("CR watch ended before its current baseline")
+        .expect("CR watch stream chunk failed");
+    let event: serde_json::Value = serde_json::from_slice(&chunk).unwrap();
+    assert_eq!(event["type"], "ADDED");
+    assert_eq!(event["object"]["metadata"]["name"], "existing");
+}
+
+#[tokio::test]
+async fn test_crd_live_replay_failure_emits_terminal_error() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    // Redb has a deterministic close boundary used to inject the replay read
+    // failure; the default SQLite test handle remains callable after close.
+    let mut state = build_test_app_state().await;
+    let db: crate::datastore::DatastoreHandle = std::sync::Arc::new(
+        crate::datastore::redb::RedbDatastore::new_in_memory()
+            .await
+            .unwrap(),
+    );
+    state.db = db.clone();
+    let app = crate::api::build_router(state);
+    register_selw_crd(&app).await;
+    let create = |name: &str| {
+        serde_json::json!({
+            "apiVersion": "selwatch.example.com/v1",
+            "kind": "Selw",
+            "metadata": {"name": name, "namespace": "default"}
+        })
+    };
+    db.create_resource(
+        "selwatch.example.com/v1",
+        "Selw",
+        Some("default"),
+        "baseline",
+        create("baseline"),
+    )
+    .await
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/apis/selwatch.example.com/v1/namespaces/default/selws?watch=true&resourceVersion=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let baseline = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("CR watch should emit its current baseline")
+        .expect("CR watch ended before baseline")
+        .expect("CR baseline frame failed");
+    let baseline: serde_json::Value = serde_json::from_slice(&baseline).unwrap();
+    assert_eq!(baseline["object"]["metadata"]["name"], "baseline");
+
+    // Drive one event through the live loop so the subsequent failure cannot
+    // be mistaken for initial replay establishment.
+    db.create_resource(
+        "selwatch.example.com/v1",
+        "Selw",
+        Some("default"),
+        "live-ok",
+        create("live-ok"),
+    )
+    .await
+    .unwrap();
+    let live = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("CR live loop should replay the persisted event")
+        .expect("CR watch ended before live event")
+        .expect("CR live frame failed");
+    let live: serde_json::Value = serde_json::from_slice(&live).unwrap();
+    assert_eq!(live["object"]["metadata"]["name"], "live-ok");
+
+    // Queue a matching wakeup, then make its replay read fail. The watch must
+    // send one protocol ERROR and terminate instead of waiting for another write.
+    db.create_resource(
+        "selwatch.example.com/v1",
+        "Selw",
+        Some("default"),
+        "live-fails",
+        create("live-fails"),
+    )
+    .await
+    .unwrap();
+    db.close();
+    let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("CR live replay failure must not park")
+        .expect("CR live replay failure should emit ERROR")
+        .expect("CR terminal frame failed");
+    let terminal: serde_json::Value = serde_json::from_slice(&terminal).unwrap();
+    assert_eq!(terminal["type"], "ERROR");
+    assert_eq!(terminal["object"]["code"], 500);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("CR watch must terminate after ERROR")
+            .is_none()
+    );
 }
 
 /// Regression (B1): a CRD WatchList (`sendInitialEvents=true`) must terminate

@@ -1,6 +1,6 @@
 use crate::api::AppError;
 use crate::api::apiservice_proxy::resolve_service_proxy_target;
-use crate::datastore::{CatchUpResource, DatastoreBackend, Resource};
+use crate::datastore::{DatastoreBackend, Resource};
 use crate::watch::{EventType, WatchEvent};
 use serde_json::Value;
 use std::net::SocketAddr;
@@ -437,45 +437,6 @@ pub async fn gather_custom_resources_across_served_versions(
         .collect();
     items.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((items, safe_snapshot_rv))
-}
-
-pub async fn gather_custom_resource_events_across_served_versions(
-    db: &dyn DatastoreBackend,
-    conversion: &CrdConversionConfig,
-    group: &str,
-    kind: &str,
-    namespace: Option<String>,
-    since_rv: i64,
-) -> Result<Vec<CatchUpResource>, AppError> {
-    let mut version_order = Vec::with_capacity(conversion.served_versions.len());
-    if conversion
-        .served_versions
-        .iter()
-        .any(|v| v == &conversion.storage_version)
-    {
-        version_order.push(conversion.storage_version.clone());
-    }
-    for served in &conversion.served_versions {
-        if served != &conversion.storage_version {
-            version_order.push(served.clone());
-        }
-    }
-
-    let mut events = Vec::new();
-    for served_version in &version_order {
-        let api_version = format!("{group}/{served_version}");
-        let mut version_events = db
-            .list_resources_modified_since(
-                &api_version,
-                kind,
-                namespace.clone().as_deref(),
-                since_rv,
-            )
-            .await?;
-        events.append(&mut version_events);
-    }
-    events.sort_by_key(|event| event.resource.resource_version);
-    Ok(events)
 }
 
 pub async fn convert_custom_resource_watch_event_to_requested_version(

@@ -333,6 +333,7 @@ impl LeaderApiClient for StubRemoteForwarder {
         Ok(crate::datastore::ResourceList {
             items: vec![],
             resource_version: 0,
+            watch_replay_position: None,
             continue_token: None,
             remaining_item_count: None,
         })
@@ -475,6 +476,7 @@ mod tests {
             Ok(crate::datastore::ResourceList {
                 items: vec![],
                 resource_version: 0,
+                watch_replay_position: None,
                 continue_token: None,
                 remaining_item_count: None,
             })
@@ -896,6 +898,7 @@ mod tests {
                     label_selector: None,
                     field_selector: None,
                     start_resource_version: None,
+                    start_watch_replay_position: None,
                 })
                 .await
                 .expect("watch");
@@ -1001,6 +1004,7 @@ mod tests {
                 Ok(crate::datastore::ResourceList {
                     items: vec![],
                     resource_version: 0,
+                    watch_replay_position: None,
                     continue_token: None,
                     remaining_item_count: None,
                 })

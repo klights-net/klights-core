@@ -71,6 +71,20 @@ impl DatastoreBackend for RedbDatastore {
     ) -> Result<Resource> {
         self.resources.create_res(a, k, n, m, d).await
     }
+    #[cfg(test)]
+    async fn apply_replicated_create_resource(
+        &self,
+        a: &str,
+        k: &str,
+        n: Option<&str>,
+        m: &str,
+        d: Value,
+        o: crate::datastore::types::ReplicatedCreateOptions,
+    ) -> Result<Resource> {
+        self.resources
+            .apply_replicated_create_resource(a, k, n, m, d, o)
+            .await
+    }
     async fn get_resource(
         &self,
         a: &str,
@@ -161,6 +175,15 @@ impl DatastoreBackend for RedbDatastore {
         page: ListPageRequest,
     ) -> Result<ResourceList> {
         self.resources.list_res_page(a, k, n, ls, fs, page).await
+    }
+    async fn list_resources_for_watch_targets(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+    ) -> Result<ResourceList> {
+        self.resources
+            .list_resources_for_watch_targets(targets, label_selector)
+            .await
     }
     async fn list_resource_keys_for_scope(
         &self,
@@ -263,10 +286,11 @@ impl DatastoreBackend for RedbDatastore {
         } else {
             None
         };
-        let mut items = self
+        let (mut items, watch_replay_position) = self
             .accessor
             .call("list_namespaces", move |db| {
                 let r = db.begin_read()?;
+                let watch_replay_position = helpers::watch_replay_position_in_read(&r)?;
                 let t = r.open_table(tables::NAMESPACES)?;
                 let items: Vec<_> = t
                     .iter()?
@@ -282,7 +306,7 @@ impl DatastoreBackend for RedbDatastore {
                         data: helpers::body_val(v.value()),
                     })
                     .collect();
-                Ok(items)
+                Ok((items, watch_replay_position))
             })
             .await?;
 
@@ -300,7 +324,8 @@ impl DatastoreBackend for RedbDatastore {
             items = helpers::filter_by_field_selector(items, fs);
         }
         Ok(ResourceList {
-            resource_version: 0,
+            resource_version: watch_replay_position.resource_version,
+            watch_replay_position: Some(watch_replay_position),
             items,
             continue_token: None,
             remaining_item_count: None,
@@ -497,6 +522,25 @@ impl DatastoreBackend for RedbDatastore {
             .watch_list_positioned_checked_bounded(targets, position, limit)
             .await
     }
+    async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
+        self.watch_store.current_watch_replay_position().await
+    }
+    async fn snapshot_resources_at_position(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        position: WatchReplayPosition,
+    ) -> Result<SnapshotAtRv> {
+        RedbDatastore::snapshot_resources_at_position(
+            self,
+            targets,
+            label_selector,
+            field_selector,
+            position,
+        )
+        .await
+    }
     async fn list_raw_watch_events_since_checked_bounded(
         &self,
         t: &[WatchTarget],
@@ -530,6 +574,19 @@ impl DatastoreBackend for RedbDatastore {
         self.watch_store
             .watch_list_all_since_paged(s, after_resource_version, after_id, limit)
             .await
+    }
+    async fn list_all_watch_events_after_id_bounded(
+        &self,
+        after_id: i64,
+        through_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        self.watch_store
+            .watch_list_all_after_id_bounded(after_id, through_id, limit)
+            .await
+    }
+    async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
+        self.watch_store.list_watch_replay_floors().await
     }
     async fn list_deleted_watch_events_since(&self, s: i64) -> Result<Vec<CatchUpResource>> {
         self.watch_store.watch_list_deleted_since(s).await
