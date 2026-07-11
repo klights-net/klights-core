@@ -409,6 +409,31 @@ pub trait DatastoreBackend: Send + Sync {
         self.get_current_resource_version().await
     }
 
+    /// Mark a non-finalizer delete target as terminating without emitting a
+    /// watch event.
+    ///
+    /// Backends may return `Ok(None)` when they do not support this internal
+    /// optimization; callers should fall back to their hard-delete path.
+    async fn mark_for_delete_without_watch(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Option<Resource>> {
+        let _ = (
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+            grace_seconds,
+        );
+        Ok(None)
+    }
+
     async fn get_current_resource_version(&self) -> Result<i64>;
     async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource>;
     async fn get_namespace(&self, name: &str) -> Result<Option<Resource>>;

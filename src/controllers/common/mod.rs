@@ -591,6 +591,25 @@ async fn write_status_with_retry(
 
     let mut last_err = None;
     for attempt in 0..STATUS_WRITE_MAX_ATTEMPTS {
+        let Some(current) = db
+            .get_resource(api_version, kind, namespace, name)
+            .await
+            .with_context(|| {
+                format!("write_status: reread {api_version}/{kind} {namespace:?}/{name}")
+            })?
+        else {
+            return Err(anyhow!("write_status: resource not found during retry"));
+        };
+        if is_marked_for_delete(&current.data) {
+            if let Some(observed_uid) = observed_uid.as_deref()
+                && observed_uid != current.uid
+            {
+                return Err(status_retry_conflict(
+                    "write_status: resource uid mismatch while resource is deleting",
+                ));
+            }
+            return Ok(current);
+        }
         match db
             .update_status_only_with_preconditions(
                 api_version,
@@ -617,6 +636,16 @@ async fn write_status_with_retry(
                     return Err(err).context("write_status: resource deleted during CAS retry");
                 };
                 if current.data.get("status") == Some(&status_value) {
+                    return Ok(current);
+                }
+                if is_marked_for_delete(&current.data) {
+                    if let Some(observed_uid) = observed_uid.as_deref()
+                        && observed_uid != current.uid
+                    {
+                        return Err(err).context(
+                            "write_status: resource uid changed while resource is deleting",
+                        );
+                    }
                     return Ok(current);
                 }
                 if !same_status_retry_identity(original, &current.data) {
@@ -657,6 +686,13 @@ fn metadata_generation(resource: &Value) -> Option<i64> {
     resource
         .pointer("/metadata/generation")
         .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn is_marked_for_delete(resource: &Value) -> bool {
+    resource
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| !value.is_empty())
 }
 
 /// Typed wrapper for owner references that provides safe append, remove, and lookup operations.

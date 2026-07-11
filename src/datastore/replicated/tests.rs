@@ -120,6 +120,97 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn raft_mode_mark_for_delete_without_watch_reuses_mark_and_routes_through_raft() {
+        let (ds, calls) = make_ds_with_inline_proposer().await;
+        let created = ds
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "mark-safety",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "mark-safety", "namespace": "default", "uid": "mark-uid"}
+                }),
+            )
+            .await
+            .unwrap();
+        calls.lock().unwrap().clear();
+
+        let first_mark = ds
+            .mark_for_delete_without_watch(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "mark-safety",
+                ResourcePreconditions::uid_and_resource_version(
+                    "mark-uid".to_string(),
+                    created.resource_version,
+                ),
+                30,
+            )
+            .await
+            .unwrap()
+            .expect("mark_for_delete_without_watch must return the updated resource");
+        let delete_timestamp = first_mark
+            .data
+            .pointer("/metadata/deletionTimestamp")
+            .and_then(|value| value.as_str())
+            .expect("delete timestamp must be written by mark path");
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["UpdateResource"],
+            "mark path must route through raft in replicated mode"
+        );
+        assert_eq!(
+            first_mark
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(|value| value.as_str()),
+            Some(delete_timestamp)
+        );
+        assert_eq!(
+            first_mark
+                .data
+                .pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(|value| value.as_i64()),
+            Some(30)
+        );
+
+        let second_mark = ds
+            .mark_for_delete_without_watch(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "mark-safety",
+                ResourcePreconditions::uid_and_resource_version(
+                    "mark-uid".to_string(),
+                    first_mark.resource_version,
+                ),
+                30,
+            )
+            .await
+            .unwrap()
+            .expect("already marked resources should still return a resource");
+
+        assert_eq!(first_mark.resource_version, second_mark.resource_version);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["UpdateResource"],
+            "idempotent mark_for_delete_without_watch must not re-propose"
+        );
+        assert_eq!(
+            second_mark
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(|value| value.as_str()),
+            Some(delete_timestamp)
+        );
+    }
+
+    #[tokio::test]
     async fn replicated_backend_raft_apply_returns_terminal_conflict_result() {
         let inner: crate::datastore::backend::DatastoreHandle =
             Arc::new(crate::datastore::test_support::in_memory().await);

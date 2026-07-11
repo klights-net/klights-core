@@ -3048,6 +3048,27 @@ impl DatastoreBackend for Datastore {
         .await
     }
 
+    async fn mark_for_delete_without_watch(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Option<Resource>> {
+        Datastore::mark_resource_for_deletion_without_watch(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+            grace_seconds,
+        )
+        .await
+    }
+
     async fn delete_resource(
         &self,
         api_version: &str,

@@ -1484,6 +1484,106 @@ async fn test_replicaset_status_updated_after_reconcile() {
 }
 
 #[tokio::test]
+async fn test_replicaset_status_update_preserves_stale_external_conditions() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let __pod_repo = crate::controllers::test_utils::pod_repository_for_test(&db);
+
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "test-ns",
+        json!({"metadata": {"name": "test-ns"}}),
+    )
+    .await
+    .unwrap();
+
+    let rs_uid = "rs-test-uid-stale-status";
+    let replicaset = json!({
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "metadata": {"name": "stale-status-rs", "namespace": "test-ns", "uid": rs_uid},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": "stale-status"}},
+            "template": {
+                "metadata": {"labels": {"app": "stale-status"}},
+                "spec": {"containers": [{"name": "nginx", "image": "nginx"}]}
+            }
+        }
+    });
+
+    let created = db
+        .create_resource(
+            "apps/v1",
+            "ReplicaSet",
+            Some("test-ns"),
+            "stale-status-rs",
+            replicaset,
+        )
+        .await
+        .unwrap();
+
+    let mut stale_replicaset: serde_json::Value = (*created.data).clone();
+    if let Some(meta) = stale_replicaset
+        .get_mut("metadata")
+        .and_then(|m| m.as_object_mut())
+    {
+        meta.insert(
+            "resourceVersion".to_string(),
+            json!(created.resource_version.to_string()),
+        );
+    }
+
+    db.update_status_only(
+        "apps/v1",
+        "ReplicaSet",
+        Some("test-ns"),
+        "stale-status-rs",
+        json!({
+            "conditions": [{"type": "CustomControllerReady", "status": "False", "reason": "Stale"}]
+        }),
+        Some(created.resource_version),
+    )
+    .await
+    .unwrap();
+
+    reconcile_replicaset(
+        &db,
+        __pod_repo.as_ref(),
+        __pod_repo.as_ref(),
+        __pod_repo.as_ref(),
+        &stale_replicaset,
+        "test-node",
+    )
+    .await
+    .unwrap();
+
+    let updated_rs = db
+        .get_resource("apps/v1", "ReplicaSet", Some("test-ns"), "stale-status-rs")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let status = &updated_rs.data["status"];
+    assert_eq!(
+        status["replicas"], 1,
+        "Status.replicas must still reflect desired replica count"
+    );
+    assert_eq!(
+        status["observedGeneration"], 1,
+        "Status.observedGeneration must stay aligned with metadata.generation"
+    );
+    assert_eq!(
+        status
+            .pointer("/conditions/0/type")
+            .and_then(|value| value.as_str()),
+        Some("CustomControllerReady"),
+        "Stale status updates must preserve externally-set conditions"
+    );
+}
+
+#[tokio::test]
 async fn test_replicaset_pods_have_owner_reference_with_controller_true() {
     let db = crate::datastore::test_support::in_memory().await;
     let __pod_repo = crate::controllers::test_utils::pod_repository_for_test(&db);

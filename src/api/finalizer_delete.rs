@@ -442,8 +442,36 @@ pub async fn complete_non_foreground_delete_with_live_recheck(
             }
         }
 
+        match db
+            .mark_for_delete_without_watch(
+                api_version,
+                kind,
+                namespace,
+                name,
+                ResourcePreconditions::uid_and_resource_version(
+                    expected_uid.clone(),
+                    resource.resource_version,
+                ),
+                grace_seconds,
+            )
+            .await
+        {
+            Ok(Some(updated)) => {
+                resource = updated;
+            }
+            Ok(None) => {}
+            Err(err)
+                if explicit_rv.is_none()
+                    && is_conflict_error(&err)
+                    && attempt < DELETE_MAX_CONFLICT_RETRIES =>
+            {
+                continue;
+            }
+            Err(err) => return Err(AppError::from(err)),
+        }
+
         let delete_preconditions = ResourcePreconditions::uid_and_resource_version(
-            expected_uid.clone(),
+            resource.uid.clone(),
             resource.resource_version,
         );
         match db
@@ -1022,6 +1050,127 @@ mod tests {
                 .is_none_or(|refs| refs.is_empty()),
             "orphaned ReplicaSet must not retain Deployment ownerRef: {:?}",
             child.data
+        );
+    }
+
+    #[tokio::test]
+    async fn non_finalizer_delete_without_finalizers_emits_only_deleted_watch_event() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_namespace(
+            "no-finalizer-delete",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "no-finalizer-delete"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        db.create_resource(
+            "apps/v1",
+            "Deployment",
+            Some("no-finalizer-delete"),
+            "demo",
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {
+                    "namespace": "no-finalizer-delete",
+                    "name": "demo",
+                    "uid": "deploy-uid"
+                },
+                "spec": {
+                    "replicas": 1,
+                    "selector": {"matchLabels": {"app": "demo"}},
+                    "template": {
+                        "metadata": {"labels": {"app": "demo"}},
+                        "spec": {"containers": [{"name": "nginx", "image": "nginx"}]}
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let owner = db
+            .get_resource("apps/v1", "Deployment", Some("no-finalizer-delete"), "demo")
+            .await
+            .unwrap()
+            .expect("deployment exists");
+        let mut watch = db.subscribe_watch(crate::watch::WatchTopic::new(
+            owner.api_version.as_str(),
+            owner.kind.as_str(),
+        ));
+
+        let outcome = complete_non_foreground_delete_with_live_recheck(
+            &db,
+            NonForegroundDeleteRequest {
+                target: ResourceDeleteTarget {
+                    api_version: "apps/v1",
+                    kind: "Deployment",
+                    namespace: Some("no-finalizer-delete"),
+                    name: "demo",
+                },
+                initial_resource: owner,
+                delete_preconditions: ResourcePreconditions::uid("deploy-uid"),
+                orphan_children_before_completion: false,
+                uid_mismatch_is_conflict: true,
+                grace_seconds: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, DeleteCompletion::HardDeleted(_)));
+
+        let mut events = Vec::new();
+        for _ in 0..4 {
+            match tokio::time::timeout(Duration::from_millis(200), watch.recv()).await {
+                Ok(Ok(event)) => events.push(event),
+                _ => break,
+            }
+        }
+
+        let has_modified = events.iter().any(|event| {
+            event.event_type == EventType::Modified
+                && event.object.pointer("/apiVersion").and_then(|v| v.as_str()) == Some("apps/v1")
+                && event.object.pointer("/kind").and_then(|v| v.as_str()) == Some("Deployment")
+                && event
+                    .object
+                    .pointer("/metadata/name")
+                    .and_then(|v| v.as_str())
+                    == Some("demo")
+                && event
+                    .object
+                    .pointer("/metadata/deletionTimestamp")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|value| !value.is_empty())
+        });
+        let has_deleted = events.iter().any(|event| {
+            event.event_type == EventType::Deleted
+                && event.object.pointer("/apiVersion").and_then(|v| v.as_str()) == Some("apps/v1")
+                && event.object.pointer("/kind").and_then(|v| v.as_str()) == Some("Deployment")
+                && event
+                    .object
+                    .pointer("/metadata/name")
+                    .and_then(|v| v.as_str())
+                    == Some("demo")
+        });
+
+        assert!(
+            !has_modified,
+            "non-finalizer delete must not emit a MODIFIED event"
+        );
+        assert!(
+            has_deleted,
+            "non-finalizer delete must emit a DELETED event"
+        );
+        assert!(
+            db.get_resource("apps/v1", "Deployment", Some("no-finalizer-delete"), "demo")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

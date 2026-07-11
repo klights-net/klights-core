@@ -10,6 +10,7 @@ use crate::datastore::backend::DatastoreBackend;
 #[cfg(test)]
 use crate::datastore::command::CommandMeta;
 use crate::datastore::command::StorageCommand;
+use crate::datastore::errors::DatastoreError;
 use crate::datastore::types::*;
 use crate::watch::{WatchSignal, WatchTopic};
 
@@ -358,6 +359,79 @@ impl DatastoreBackend for ReplicatedDatastore {
                     "raft-routed update_status_only_with_preconditions: row missing after commit for {api_version}/{kind}/{name}"
                 )
             })
+    }
+
+    async fn mark_for_delete_without_watch(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Option<Resource>> {
+        let Some(current) = self
+            .inner
+            .get_resource(api_version, kind, namespace, name)
+            .await?
+        else {
+            return Err(DatastoreError::not_found(format!(
+                "mark_for_delete_without_watch: {api_version}/{kind}/{name} not found"
+            ))
+            .into());
+        };
+
+        let mut current_data = (*current.data).clone();
+        let Some(metadata) = current_data
+            .get_mut("metadata")
+            .and_then(Value::as_object_mut)
+        else {
+            return Err(anyhow::anyhow!(
+                "mark_for_delete_without_watch: {api_version}/{kind}/{name} is missing metadata"
+            ));
+        };
+        if metadata
+            .get("deletionTimestamp")
+            .and_then(|timestamp| timestamp.as_str())
+            .is_some_and(|timestamp| !timestamp.is_empty())
+        {
+            return Ok(Some(current));
+        }
+
+        if metadata
+            .get("deletionTimestamp")
+            .and_then(|timestamp| timestamp.as_str())
+            .is_none_or(str::is_empty)
+        {
+            metadata.insert(
+                "deletionTimestamp".to_string(),
+                Value::String(crate::utils::k8s_timestamp()),
+            );
+        }
+        metadata
+            .entry("deletionGracePeriodSeconds".to_string())
+            .or_insert_with(|| Value::from(grace_seconds));
+
+        let proposer = self.require_raft_proposer()?;
+        let command = StorageCommand::UpdateResource {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+            data: current_data,
+            expected_rv: preconditions.resource_version.unwrap_or(0),
+            preconditions,
+        };
+        self.propose_command_via_raft(&proposer, command).await?;
+        self.inner
+            .get_resource(api_version, kind, namespace, name)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "raft-routed mark_for_delete_without_watch: row missing after commit for {api_version}/{kind}/{name}"
+                )
+            })
+            .map(Some)
     }
     async fn delete_resource(
         &self,

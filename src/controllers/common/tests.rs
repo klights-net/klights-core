@@ -197,6 +197,140 @@ mod cases {
         assert_eq!(count_ready_pods(&pods), 2);
     }
 
+    #[tokio::test]
+    async fn test_write_status_for_resource_does_not_mutate_deleting_resource() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_namespace(
+            "delete-blocking",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "delete-blocking"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let existing = db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("delete-blocking"),
+                "blocked",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "blocked",
+                        "namespace": "delete-blocking",
+                        "uid": "cm-uid",
+                        "deletionTimestamp": "2026-06-01T00:00:00Z"
+                    },
+                    "data": {"key": "value"},
+                    "status": {"message": "original"}
+                }),
+            )
+            .await
+            .unwrap();
+
+        let updated = write_status_for_resource(&db, &existing, &json!({"message": "updated"}))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.resource_version, existing.resource_version);
+        assert_eq!(updated.data["status"], existing.data["status"]);
+        assert_eq!(
+            updated
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(|value| value.as_str()),
+            Some("2026-06-01T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_status_for_resource_rejects_stale_uid_for_replacement_marked_deleting() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_namespace(
+            "delete-stale-uid",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "delete-stale-uid"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stale = db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("delete-stale-uid"),
+                "blocked",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "blocked",
+                        "namespace": "delete-stale-uid",
+                        "uid": "cm-old"
+                    },
+                    "data": {"key": "value"},
+                    "status": {"message": "original"}
+                }),
+            )
+            .await
+            .unwrap();
+
+        db.delete_resource("v1", "ConfigMap", Some("delete-stale-uid"), "blocked")
+            .await
+            .unwrap();
+
+        let _replacement = db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("delete-stale-uid"),
+                "blocked",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "blocked",
+                        "namespace": "delete-stale-uid",
+                        "uid": "cm-new",
+                        "deletionTimestamp": "2026-06-01T00:00:00Z"
+                    },
+                    "data": {"key": "value"},
+                    "status": {"message": "replacement"}
+                }),
+            )
+            .await
+            .unwrap();
+
+        let stale_write =
+            write_status_for_resource(&db, &stale, &json!({"message": "updated"})).await;
+        let err = stale_write
+            .expect_err("old UID status writer must not write deletion-marked replacement");
+        assert!(
+            crate::datastore::errors::is_conflict_error(&err),
+            "expected conflict from stale UID write, got {err:#}"
+        );
+
+        let live = db
+            .get_resource("v1", "ConfigMap", Some("delete-stale-uid"), "blocked")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.uid, "cm-new");
+        assert_eq!(live.data["status"]["message"], "replacement");
+        assert_eq!(
+            live.data["metadata"]["deletionTimestamp"],
+            "2026-06-01T00:00:00Z"
+        );
+    }
+
     #[test]
     fn test_count_ready_pods_returns_zero_for_empty_slice() {
         let pods: Vec<Resource> = vec![];

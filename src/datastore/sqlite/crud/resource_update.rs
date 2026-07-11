@@ -33,6 +33,196 @@ struct MainUpdatePreconditionCheck<'a> {
 }
 
 impl Datastore {
+    fn ensure_deletion_timestamp_in_mark_data(data: &mut Value, grace_seconds: i64) {
+        let Some(meta) = data
+            .get_mut("metadata")
+            .and_then(|value| value.as_object_mut())
+        else {
+            return;
+        };
+        if meta
+            .get("deletionTimestamp")
+            .and_then(|value| value.as_str())
+            .is_none_or(str::is_empty)
+        {
+            meta.insert(
+                "deletionTimestamp".to_string(),
+                Value::String(crate::utils::k8s_timestamp()),
+            );
+        }
+        meta.entry("deletionGracePeriodSeconds".to_string())
+            .or_insert_with(|| Value::from(grace_seconds));
+    }
+
+    fn has_deletion_timestamp_in_data(data: &Value) -> bool {
+        data.pointer("/metadata/deletionTimestamp")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty())
+    }
+
+    pub async fn mark_resource_for_deletion_without_watch(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Option<Resource>> {
+        let av = api_version.to_string();
+        let k = kind.to_string();
+        let n = name.to_string();
+        let expected_rv = preconditions.resource_version;
+        let expected_uid = preconditions.uid;
+
+        let mark_outcome = if use_namespaced_table(api_version, kind, &namespace) {
+            let ns = namespace.unwrap_or("default").to_string();
+            let expected_uid = expected_uid.clone();
+            self.db_call("db_query", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (_id, current_rv, current_uid, current_bytes): (i64, i64, String, Vec<u8>) = tx
+                    .query_row(
+                        queries::NAMESPACED_SELECT_STATUS_ROW,
+                        rusqlite::params![&av, &k, &ns, &n],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?;
+                if let Some(expected_uid) = expected_uid.as_deref()
+                    && expected_uid != current_uid.as_str()
+                {
+                    return Err(tokio_rusqlite::Error::Rusqlite(
+                        rusqlite::Error::QueryReturnedNoRows,
+                    ));
+                }
+                if let Some(expected_rv) = expected_rv
+                    && expected_rv != current_rv
+                {
+                    return Err(tokio_rusqlite::Error::Rusqlite(
+                        rusqlite::Error::QueryReturnedNoRows,
+                    ));
+                }
+
+                let mut current: Value =
+                    serde_json::from_slice(&current_bytes).map_err(serde_to_sqlite_error)?;
+                if Self::has_deletion_timestamp_in_data(&current) {
+                    tx.commit()?;
+                    return Ok(Some((current_rv, current_bytes)));
+                }
+
+                Self::ensure_deletion_timestamp_in_mark_data(&mut current, grace_seconds);
+                let merged = serde_json::to_vec(&current).map_err(serde_to_sqlite_error)?;
+                let new_rv = Self::next_resource_version_in_tx(&tx)?;
+                let rows = tx.execute(
+                    queries::NAMESPACED_UPDATE_BY_RV,
+                    rusqlite::params![
+                        new_rv,
+                        &current_uid,
+                        &merged,
+                        &av,
+                        &k,
+                        &ns,
+                        &n,
+                        expected_rv,
+                        expected_uid.as_deref(),
+                    ],
+                )?;
+                if rows == 0 {
+                    return Err(tokio_rusqlite::Error::Rusqlite(
+                        rusqlite::Error::QueryReturnedNoRows,
+                    ));
+                }
+                selector_index::upsert_index_entries(&tx, &av, &k, &ns, &n, &merged)?;
+                owner_ref_index::upsert_owner_refs(&tx, &av, &k, &ns, &n, &merged)?;
+                tx.commit()?;
+                Ok(Some((new_rv, merged)))
+            })
+            .await
+        } else {
+            let expected_uid = expected_uid.clone();
+            self.db_call("db_query", move |conn| {
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let (_id, current_rv, current_uid, current_bytes): (i64, i64, String, Vec<u8>) = tx
+                    .query_row(
+                        queries::CLUSTER_SELECT_STATUS_ROW,
+                        rusqlite::params![&av, &k, &n],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )?;
+                if let Some(expected_uid) = expected_uid.as_deref()
+                    && expected_uid != current_uid.as_str()
+                {
+                    return Err(tokio_rusqlite::Error::Rusqlite(
+                        rusqlite::Error::QueryReturnedNoRows,
+                    ));
+                }
+                if let Some(expected_rv) = expected_rv
+                    && expected_rv != current_rv
+                {
+                    return Err(tokio_rusqlite::Error::Rusqlite(
+                        rusqlite::Error::QueryReturnedNoRows,
+                    ));
+                }
+
+                let mut current: Value =
+                    serde_json::from_slice(&current_bytes).map_err(serde_to_sqlite_error)?;
+                if Self::has_deletion_timestamp_in_data(&current) {
+                    tx.commit()?;
+                    return Ok(Some((current_rv, current_bytes)));
+                }
+
+                Self::ensure_deletion_timestamp_in_mark_data(&mut current, grace_seconds);
+                let merged = serde_json::to_vec(&current).map_err(serde_to_sqlite_error)?;
+                let new_rv = Self::next_resource_version_in_tx(&tx)?;
+                let rows = tx.execute(
+                    queries::CLUSTER_UPDATE_BY_RV,
+                    rusqlite::params![
+                        new_rv,
+                        &current_uid,
+                        &merged,
+                        &av,
+                        &k,
+                        &n,
+                        expected_rv,
+                        expected_uid.as_deref(),
+                    ],
+                )?;
+                if rows == 0 {
+                    return Err(tokio_rusqlite::Error::Rusqlite(
+                        rusqlite::Error::QueryReturnedNoRows,
+                    ));
+                }
+                selector_index::upsert_index_entries(&tx, &av, &k, "", &n, &merged)?;
+                owner_ref_index::upsert_owner_refs(&tx, &av, &k, "", &n, &merged)?;
+                tx.commit()?;
+                Ok(Some((new_rv, merged)))
+            })
+            .await
+        };
+
+        let (resource_version, data) = match mark_outcome {
+            Ok(Some(resource_data)) => resource_data,
+            Ok(None) => return Ok(None),
+            Err(tokio_rusqlite::Error::Rusqlite(rusqlite::Error::QueryReturnedNoRows)) => {
+                return Err(crate::datastore::errors::DatastoreError::conflict(
+                    "Resource not found or version conflict",
+                )
+                .into());
+            }
+            Err(err) => return Err(anyhow!("Failed to mark resource for delete: {err}")),
+        };
+
+        Ok(Some(Resource {
+            id: 0,
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+            uid: Resource::uid_from_data(&serde_json::from_slice::<Value>(&data)?),
+            resource_version,
+            data: std::sync::Arc::new(
+                serde_json::from_slice(&data).context("deserialize marked delete payload")?,
+            ),
+        }))
+    }
+
     fn preserve_latest_status_subresource_in_tx(
         tx: &rusqlite::Transaction<'_>,
         api_version: &str,

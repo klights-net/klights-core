@@ -257,28 +257,32 @@ pub async fn reconcile_replicaset(
         .filter(|p| pod_is_active(&p.data))
         .cloned()
         .collect();
-    let Some(status_resource) = db
-        .get_resource("apps/v1", "ReplicaSet", Some(namespace), name)
-        .await?
-    else {
-        return Ok(());
-    };
-    let status_replicaset =
-        crate::api::inject_resource_version(status_resource.data, status_resource.resource_version);
-    let status_metadata = status_replicaset
-        .get("metadata")
-        .ok_or_else(|| anyhow::anyhow!("Missing metadata"))?;
 
-    // Count pods with Ready=True condition (not terminating)
+    // Count pods with Ready=True condition (not terminating).
     let ready_replicas = common.count_ready_pods(&active_current_owned_pods);
-    let observed_generation = status_metadata
+
+    // Re-read the latest status-bearing snapshot before writing status so a
+    // concurrent status-only write is not clobbered by reconcile from a stale
+    // payload.
+    let latest_status_resource = db
+        .get_resource("apps/v1", "ReplicaSet", Some(namespace), name)
+        .await?;
+    let latest_status_resource = match latest_status_resource {
+        Some(resource) => resource,
+        None => return Ok(()),
+    };
+    let latest_status_replicaset = crate::api::inject_resource_version(
+        latest_status_resource.data,
+        latest_status_resource.resource_version,
+    );
+    let observed_generation = latest_status_replicaset
+        .get("metadata")
+        .ok_or_else(|| anyhow::anyhow!("Missing metadata"))?
         .get("generation")
         .and_then(|g| g.as_u64())
         .unwrap_or(1);
 
-    // Preserve conditions set via UpdateStatus — the RS controller only owns replica
-    // count fields, not conditions (which are set by external callers or higher-level controllers).
-    let existing_conditions = status_replicaset
+    let existing_conditions = latest_status_replicaset
         .pointer("/status/conditions")
         .and_then(|v| v.as_array())
         .cloned()
@@ -295,7 +299,7 @@ pub async fn reconcile_replicaset(
         status["conditions"] = Value::Array(existing_conditions);
     }
 
-    crate::controllers::common::write_status(db, &status_replicaset, &status).await?;
+    crate::controllers::common::write_status(db, &latest_status_replicaset, &status).await?;
 
     Ok(())
 }
