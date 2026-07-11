@@ -147,6 +147,15 @@ impl StatusMergeRegistry {
                     },
                 }))
             }
+            ("v1", "Service") => {
+                StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
+                    terminal_condition_types: &[],
+                    stale_mode: GenericStaleStatusMode::Merge {
+                        condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
+                        field_merge: FieldMergeMode::PreserveUnmentioned,
+                    },
+                }))
+            }
             _ => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
@@ -167,15 +176,19 @@ pub fn merge_status_for_apply(
 ) {
     let profile = StatusMergeRegistry::default().profile(api_version, kind);
 
-    // A fresh apply of a GENERIC kind is authoritative — the writer had the
+    // A fresh apply of most generic kinds is authoritative — the writer had the
     // latest resourceVersion, so its status replaces the live one without
     // merging (the registry has nothing to preserve). Pod and Node are never
     // short-circuited: Pod status is always reconciled against the live
     // kubelet-owned object, and Node status is a heartbeat where each reporter
     // sends partial conditions that must always be merged by transition time
     // (a stale worker Ready=True must not overwrite a fresher leader Unknown).
+    // Service is explicit exception: even fresh status writes must preserve
+    // external/live fields (loadBalancer, annotations, etc.) managed by other
+    // actors.
     if freshness == StatusApplyFreshness::Fresh
         && matches!(profile.kind, StatusMergeProfileKind::Generic(_))
+        && !(api_version == "v1" && kind == "Service")
     {
         return;
     }
@@ -204,9 +217,10 @@ pub fn merge_status_for_apply(
 ///   registry's per-kind policy — Pod/Node typed merge, and for generic kinds
 ///   their registered `Merge` policy preserves live actor-owned
 ///   fields/conditions instead of clobbering them;
-/// - a **fresh** non-Pod apply is a no-op (the registry early-returns), so it
-///   is always safe to call this whenever a live row exists. Pod always merges
-///   (typed) regardless of freshness, matching the prior unconditional Pod path.
+/// - a **fresh** non-`Service` non-Pod apply is a no-op (the registry
+///   early-returns), so it is always safe to call this whenever a live row
+///   exists. Pod always merges (typed) regardless of freshness, and Service
+///   gets merge-based preservation for API-sourced status writes.
 ///
 /// `kubelet_origin` is true when the command carries a kubelet status-outbox
 /// stamp (`observed_status_stamp.is_some()`); the origin is stamp-derived, not
@@ -546,7 +560,16 @@ mod tests {
         live_preserved_field: (&'static str, serde_json::Value),
     }
 
-    fn generic_status_policy_cases() -> [GenericStatusPolicyCase; 9] {
+    struct ServiceStatusMergePathCase {
+        label: &'static str,
+        freshness: StatusApplyFreshness,
+        origin: StatusApplyOrigin,
+        incoming_status: serde_json::Value,
+        expected_lb_ip: &'static str,
+        expected_conditions: &'static [(&'static str, &'static str)],
+    }
+
+    fn generic_status_policy_cases() -> [GenericStatusPolicyCase; 10] {
         [
             GenericStatusPolicyCase {
                 api_version: "batch/v1",
@@ -602,6 +625,15 @@ mod tests {
                 terminal_type: None,
                 live_preserved_field: ("numberReady", json!(1)),
             },
+            GenericStatusPolicyCase {
+                api_version: "v1",
+                kind: "Service",
+                terminal_type: None,
+                live_preserved_field: (
+                    "loadBalancer",
+                    json!({"ingress": [{"ip": "198.51.100.1"}]}),
+                ),
+            },
         ]
     }
 
@@ -634,6 +666,19 @@ mod tests {
         let cronjob = StatusMergeRegistry::default().profile("batch/v1", "CronJob");
         let StatusMergeProfileKind::Generic(policy) = cronjob.kind else {
             panic!("CronJob must use a Generic policy");
+        };
+        assert!(policy.terminal_condition_types.is_empty());
+        assert_eq!(
+            policy.stale_mode,
+            GenericStaleStatusMode::Merge {
+                condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
+                field_merge: FieldMergeMode::PreserveUnmentioned,
+            }
+        );
+
+        let service = StatusMergeRegistry::default().profile("v1", "Service");
+        let StatusMergeProfileKind::Generic(policy) = service.kind else {
+            panic!("Service must use a Generic policy");
         };
         assert!(policy.terminal_condition_types.is_empty());
         assert_eq!(
@@ -733,6 +778,111 @@ mod tests {
             Some(&json!("True")),
             "API /status clients must remain authoritative for non-scheduler Pod conditions"
         );
+    }
+
+    fn service_condition_status<'a>(
+        incoming_status: &'a Value,
+        condition_type: &str,
+    ) -> Option<&'a str> {
+        incoming_status
+            .get("conditions")
+            .and_then(Value::as_array)
+            .and_then(|conditions| {
+                conditions
+                    .iter()
+                    .find_map(|condition| {
+                        (condition.get("type").and_then(Value::as_str) == Some(condition_type))
+                            .then(|| condition.get("status").and_then(Value::as_str))
+                    })
+                    .flatten()
+            })
+    }
+
+    #[test]
+    fn service_status_merge_matrix_covers_api_and_replicated_paths() {
+        let live = json!({
+            "status": {
+                "loadBalancer": {"ingress": [{"ip": "198.51.100.1"}]},
+                "conditions": [
+                    {"type": "Ready", "status": "False"},
+                    {"type": "ExternalTrafficPolicy", "status": "True"}
+                ],
+                "metadataField": "from-live",
+            }
+        });
+
+        let cases = [
+            ServiceStatusMergePathCase {
+                label: "api subresource condition update keeps controller-owned fields",
+                freshness: StatusApplyFreshness::Fresh,
+                origin: StatusApplyOrigin::ApiSubresource,
+                incoming_status: json!({
+                    "conditions": [
+                        {"type": "Ready", "status": "True"}
+                    ]
+                }),
+                expected_lb_ip: "198.51.100.1",
+                expected_conditions: &[("Ready", "True"), ("ExternalTrafficPolicy", "True")],
+            },
+            ServiceStatusMergePathCase {
+                label: "replicated status write updates LB while preserving external conditions",
+                freshness: StatusApplyFreshness::Fresh,
+                origin: StatusApplyOrigin::ReplicatedApply,
+                incoming_status: json!({
+                    "loadBalancer": {"ingress": [{"ip": "198.51.100.9"}]},
+                    "conditions": []
+                }),
+                expected_lb_ip: "198.51.100.9",
+                expected_conditions: &[("Ready", "False"), ("ExternalTrafficPolicy", "True")],
+            },
+            ServiceStatusMergePathCase {
+                label: "stale replicated status write preserves external conditions",
+                freshness: StatusApplyFreshness::Stale,
+                origin: StatusApplyOrigin::ReplicatedApply,
+                incoming_status: json!({
+                    "conditions": [
+                        {"type": "ExternalTrafficPolicy", "status": "False"}
+                    ]
+                }),
+                expected_lb_ip: "198.51.100.1",
+                expected_conditions: &[("Ready", "False"), ("ExternalTrafficPolicy", "False")],
+            },
+        ];
+
+        for case in cases {
+            let mut incoming = case.incoming_status;
+            merge_status_for_apply(
+                "v1",
+                "Service",
+                &live,
+                &mut incoming,
+                case.freshness,
+                case.origin,
+            );
+
+            assert_eq!(
+                incoming["loadBalancer"]["ingress"][0]["ip"],
+                json!(case.expected_lb_ip),
+                "{}: loadBalancer should be preserved unless explicitly replaced",
+                case.label
+            );
+            assert_eq!(
+                incoming["metadataField"],
+                json!("from-live"),
+                "{}: metadataField should be preserved",
+                case.label
+            );
+
+            for (condition_type, expected_status) in case.expected_conditions {
+                assert_eq!(
+                    service_condition_status(&incoming, condition_type),
+                    Some(*expected_status),
+                    "{}: missing preserved condition {}",
+                    case.label,
+                    condition_type
+                );
+            }
+        }
     }
 
     #[test]
@@ -872,7 +1022,24 @@ mod tests {
                 StatusApplyFreshness::Fresh,
                 StatusApplyOrigin::ApiSubresource,
             );
-            assert_eq!(fresh, json!({"replaced": true}));
+            if case.api_version == "v1" && case.kind == "Service" {
+                assert_eq!(
+                    fresh.get("replaced"),
+                    Some(&json!(true)),
+                    "{} {} fresh API-origin status should preserve unrelated live fields",
+                    case.api_version,
+                    case.kind
+                );
+                assert_eq!(
+                    fresh.get(case.live_preserved_field.0),
+                    Some(&case.live_preserved_field.1),
+                    "{} {} fresh API-origin Service status must preserve live fields",
+                    case.api_version,
+                    case.kind
+                );
+            } else {
+                assert_eq!(fresh, json!({"replaced": true}));
+            }
         }
 
         let live = json!({"status": {"observedGeneration": 9}});

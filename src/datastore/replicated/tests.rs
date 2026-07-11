@@ -3918,6 +3918,205 @@ mod cases {
         .await;
     }
 
+    #[tokio::test]
+    async fn replicated_stale_service_status_preserves_live_load_balancer_and_conditions() {
+        use std::collections::HashSet;
+
+        let live = apply_replicated_stale_status_case(ReplicatedStaleStatusCase {
+            api_version: "v1",
+            kind: "Service",
+            namespace: Some("default"),
+            name: "replicated-stale-service",
+            uid: "replicated-service-uid",
+            initial: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": "replicated-stale-service",
+                    "namespace": "default",
+                    "uid": "replicated-service-uid"
+                },
+                "spec": {
+                    "selector": {
+                        "app": "service-status"
+                    },
+                    "ports": [
+                        {"name": "http", "protocol": "TCP", "port": 80, "targetPort": 8080}
+                    ]
+                },
+                "status": {
+                    "loadBalancer": {
+                        "ingress": [{"ip": "198.51.100.1"}]
+                    },
+                    "metadataField": "from-live",
+                    "conditions": [
+                        {"type": "Ready", "status": "False"},
+                        {"type": "ExternalTrafficPolicy", "status": "True"}
+                    ]
+                }
+            }),
+            stale_status: serde_json::json!({
+                "conditions": [
+                    {"type": "ExternalTrafficPolicy", "status": "False"}
+                ]
+            }),
+            expected_pointer: "/status/loadBalancer/ingress/0/ip",
+            expected_value: serde_json::json!("198.51.100.1"),
+        })
+        .await;
+
+        let condition_types: HashSet<_> = live
+            .data
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|condition| condition.get("type").and_then(serde_json::Value::as_str))
+            .collect();
+        assert!(
+            condition_types.contains("Ready"),
+            "stale Service status apply must preserve live Ready condition"
+        );
+        assert!(
+            condition_types.contains("ExternalTrafficPolicy"),
+            "stale Service status apply must keep update ExternalTrafficPolicy"
+        );
+        assert_eq!(
+            live.data.pointer("/status/metadataField"),
+            Some(&serde_json::json!("from-live")),
+            "stale Service status apply must preserve unmentioned status fields"
+        );
+        let external_status = live
+            .data
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|conditions| {
+                conditions.iter().find_map(|condition| {
+                    (condition.get("type").and_then(serde_json::Value::as_str)
+                        == Some("ExternalTrafficPolicy"))
+                    .then(|| condition.get("status").and_then(serde_json::Value::as_str))
+                })
+            })
+            .expect("service stale merge should include ExternalTrafficPolicy condition");
+        assert_eq!(external_status, Some("False"));
+    }
+
+    #[tokio::test]
+    async fn replicated_fresh_service_status_replaces_load_balancer_and_preserves_conditions() {
+        use crate::datastore::replicated::apply_command_to_backend;
+
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "v1",
+                "Service",
+                Some("default"),
+                "replicated-fresh-service",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Service",
+                    "metadata": {
+                        "name": "replicated-fresh-service",
+                        "namespace": "default",
+                        "uid": "replicated-fresh-service-uid"
+                    },
+                    "spec": {
+                        "selector": {"app": "service-status"},
+                        "ports": [{"name": "http", "protocol": "TCP", "port": 80, "targetPort": 8080}]
+                    },
+                    "status": {
+                        "loadBalancer": {
+                            "ingress": [{"ip": "198.51.100.2"}]
+                        },
+                        "conditions": [
+                            {"type": "Ready", "status": "False"},
+                            {"type": "ExternalTrafficPolicy", "status": "False"}
+                        ],
+                        "metadataField": "from-live"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+
+        apply_command_to_backend(
+            &db,
+            StorageCommand::UpdateStatus {
+                api_version: "v1".into(),
+                kind: "Service".into(),
+                namespace: Some("default".into()),
+                name: "replicated-fresh-service".into(),
+                status: serde_json::json!({
+                    "loadBalancer": {"ingress": [{"ip": "198.51.100.9"}]},
+                    "conditions": [
+                        {"type": "ExternalTrafficPolicy", "status": "True"}
+                    ]
+                }),
+                expected_rv: Some(created.resource_version),
+                preconditions: ResourcePreconditions {
+                    uid: Some("replicated-fresh-service-uid".into()),
+                    resource_version: Some(created.resource_version),
+                },
+                observed_status_stamp: None,
+            },
+            CommandMeta {
+                command_id: CommandId::new(),
+                codec_version: COMMAND_CODEC_VERSION,
+                resource_version: created.resource_version,
+                uid: Some("replicated-fresh-service-uid".into()),
+                timestamp_ms: 0,
+                authoring_node: "controlplane1".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let live = db
+            .get_resource("v1", "Service", Some("default"), "replicated-fresh-service")
+            .await
+            .unwrap()
+            .expect("fresh Service status apply should persist");
+        assert_eq!(
+            live.data.pointer("/status/loadBalancer/ingress/0/ip"),
+            Some(&serde_json::json!("198.51.100.9")),
+            "fresh Service status apply should replace loadBalancer when explicitly provided"
+        );
+        assert_eq!(
+            live.data.pointer("/status/metadataField"),
+            Some(&serde_json::json!("from-live")),
+            "fresh Service status apply should preserve unmentioned status fields"
+        );
+        let mut ready_false = false;
+        let mut external_true = false;
+        for condition in live
+            .data
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match condition.get("type").and_then(serde_json::Value::as_str) {
+                Some("Ready") => {
+                    ready_false = condition.get("status").and_then(serde_json::Value::as_str)
+                        == Some("False");
+                }
+                Some("ExternalTrafficPolicy") => {
+                    external_true =
+                        condition.get("status").and_then(serde_json::Value::as_str) == Some("True");
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            ready_false,
+            "fresh Service status apply should preserve Ready"
+        );
+        assert!(
+            external_true,
+            "fresh Service status apply should keep provided ExternalTrafficPolicy"
+        );
+    }
+
     // ── raft-fix.md: forwarded stale-status path (site #4, `replication/apply/mod.rs`) ──
     // The forwarded UpdateStatus path hard-codes `kind == "Pod" || kind == "Node"`
     // and silently skips every generic workload kind, so a stale forwarded
