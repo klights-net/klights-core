@@ -62,6 +62,8 @@ async fn raft_outbox_stream_duplicate_seq_noops_whole_commit() {
     let db = Datastore::new_in_memory().await.unwrap();
     let commit = LogApplyCommit {
         resource_version: 50,
+        resource_version_assignment:
+            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
         outbox_watermark: Some(OutboxStreamWatermark {
             client_id: "worker-a".to_string(),
             stream_id: 7,
@@ -97,7 +99,7 @@ async fn raft_outbox_stream_duplicate_seq_noops_whole_commit() {
 }
 
 #[tokio::test]
-async fn watermarked_outbox_commit_does_not_append_applied_outbox_ledger_mutation() {
+async fn watermarked_outbox_commit_appends_applied_outbox_ledger_mutation() {
     use crate::datastore::sqlite::BuildOutboxOutcome;
     use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark};
 
@@ -113,6 +115,7 @@ async fn watermarked_outbox_commit_does_not_append_applied_outbox_ledger_mutatio
     let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
+    let rv_before = db.get_current_resource_version().await.unwrap();
 
     let outcome = db
         .build_log_apply_commit_for_outbox_with_watermark(
@@ -133,21 +136,34 @@ async fn watermarked_outbox_commit_does_not_append_applied_outbox_ledger_mutatio
     };
 
     assert!(commit.outbox_watermark.is_some());
-    assert!(
-        commit
-            .mutations
-            .iter()
-            .all(|mutation| { !matches!(mutation, LogApplyMutation::PutAppliedOutbox(_)) })
+    assert!(commit.resource_version > rv_before);
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        commit.resource_version
     );
+    assert!(commit.mutations.iter().any(|mutation| {
+        matches!(mutation, LogApplyMutation::PutAppliedOutbox(row)
+            if row.idempotency_key == "legacy-key-ignored-for-watermark"
+                && row.operation == "PodMetadata"
+                && row.applied_rv.is_none()
+                && row.status_stamp.is_none())
+    }));
 }
 
 #[tokio::test]
 async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit() {
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::sqlite::BuildOutboxOutcome;
-    use crate::log_apply::OutboxStreamWatermark;
+    use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark, ResourceVersionAssignment};
 
     let db = Datastore::new_in_memory().await.unwrap();
+    crate::datastore::DatastoreBackend::set_klights_meta(
+        &db,
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
     let command = StorageCommand::UpdateStatus {
         api_version: "v1".to_string(),
         kind: "Pod".to_string(),
@@ -183,8 +199,77 @@ async fn watermarked_uid_bound_missing_pod_outbox_builds_watermark_only_commit()
     let BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected stale UID-bound Pod row to consume its stream watermark");
     };
-    assert_eq!(commit.mutations.len(), 0);
+    assert_eq!(commit.mutations.len(), 1);
+    assert!(commit.mutations.iter().any(|mutation| {
+        matches!(mutation, LogApplyMutation::PutAppliedOutbox(row)
+            if row.idempotency_key == "missing-pod-status"
+                && row.operation == "PodStatus"
+                && row.status_stamp == Some(42)
+                && row.applied_rv.is_none())
+    }));
+    assert_eq!(
+        commit.resource_version_assignment,
+        ResourceVersionAssignment::CommittedApplyV1
+    );
+    assert_eq!(commit.resource_version, 0);
     assert_eq!(commit.outbox_watermark.unwrap().stream_seq, 1);
+}
+
+#[tokio::test]
+async fn stamped_worker_pod_status_merges_against_latest_preserving_scheduler_fields() {
+    use crate::datastore::sqlite::BuildOutboxOutcome;
+
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db.create_resource("v1", "Pod", Some("default"), "stamped-status", json!({"metadata":{"name":"stamped-status","namespace":"default","uid":"stamped-status-uid"},"spec":{"nodeName":"node-a"},"status":{"phase":"Pending"}})).await.unwrap();
+    db.update_resource("v1", "Pod", Some("default"), "stamped-status", json!({"metadata":{"name":"stamped-status","namespace":"default","uid":"stamped-status-uid","labels":{"scheduler":"kept"}},"spec":{"nodeName":"node-a","priority":1000},"status":{"phase":"Pending"}}), created.resource_version).await.unwrap();
+    let command = StorageCommand::UpdateStatus {
+        api_version: "v1".into(),
+        kind: "Pod".into(),
+        namespace: Some("default".into()),
+        name: "stamped-status".into(),
+        status: json!({"phase":"Running","podIP":"10.0.0.7","podIPs":[{"ip":"10.0.0.7"}]}),
+        expected_rv: Some(created.resource_version),
+        preconditions: crate::datastore::ResourcePreconditions {
+            uid: Some("stamped-status-uid".into()),
+            resource_version: Some(created.resource_version),
+        },
+        observed_status_stamp: Some(7),
+    };
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+        .encode_protobuf()
+        .unwrap();
+    let BuildOutboxOutcome::NeedsPropose { commit, .. } = db
+        .build_log_apply_commit_for_outbox(
+            "stamped-status",
+            "PodStatus",
+            payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected status commit")
+    };
+    db.apply_raft_log_apply_commit(commit).await.unwrap();
+    let pod = db
+        .get_resource("v1", "Pod", Some("default"), "stamped-status")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pod.data.pointer("/status/phase").and_then(|v| v.as_str()),
+        Some("Running")
+    );
+    assert_eq!(
+        pod.data
+            .pointer("/metadata/labels/scheduler")
+            .and_then(|v| v.as_str()),
+        Some("kept")
+    );
+    assert_eq!(
+        pod.data.pointer("/spec/priority").and_then(|v| v.as_i64()),
+        Some(1000)
+    );
 }
 
 #[tokio::test]
@@ -223,6 +308,191 @@ async fn build_log_apply_commit_for_command_has_no_applied_outbox_mutation() {
 }
 
 #[tokio::test]
+async fn ordinary_raft_command_materialization_uses_persisted_rv_assignment_mode() {
+    use crate::datastore::command::StorageCommand;
+    use crate::log_apply::ResourceVersionAssignment;
+
+    let db = Datastore::new_in_memory().await.unwrap();
+    let command = || StorageCommand::CreateResource {
+        api_version: "v1".to_string(),
+        kind: "ConfigMap".to_string(),
+        namespace: Some("default".to_string()),
+        name: "mode-test".to_string(),
+        data: serde_json::json!({"metadata": {"name": "mode-test", "namespace": "default"}}),
+    };
+    let before_legacy = db.get_current_resource_version().await.unwrap();
+    let legacy = db
+        .build_log_apply_commit_for_command(command(), "CreateResource", "test-node")
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy.resource_version_assignment,
+        ResourceVersionAssignment::LegacyLeaderAssigned
+    );
+    assert!(legacy.resource_version > before_legacy);
+    assert_eq!(
+        db.get_current_resource_version().await.unwrap(),
+        legacy.resource_version
+    );
+
+    crate::datastore::DatastoreBackend::set_klights_meta(
+        &db,
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
+    let before_v1 = db.get_current_resource_version().await.unwrap();
+    let v1 = db
+        .build_log_apply_commit_for_command(command(), "CreateResource", "test-node")
+        .await
+        .unwrap();
+    assert_eq!(
+        v1.resource_version_assignment,
+        ResourceVersionAssignment::CommittedApplyV1
+    );
+    assert_eq!(v1.resource_version, 0);
+    assert_eq!(db.get_current_resource_version().await.unwrap(), before_v1);
+
+    let applied = db.apply_raft_log_apply_commit(v1).await.unwrap();
+    assert!(applied.applied_rv.unwrap() > before_v1);
+}
+
+#[tokio::test]
+async fn outbox_commit_builders_materialize_committed_apply_v1_templates() {
+    use crate::datastore::sqlite::BuildOutboxOutcome;
+    use crate::log_apply::{LogApplyMutation, OutboxStreamWatermark, ResourceVersionAssignment};
+
+    let command = || StorageCommand::CreateResource {
+        api_version: "v1".to_string(),
+        kind: "ConfigMap".to_string(),
+        namespace: Some("default".to_string()),
+        name: "outbox-v1-template".to_string(),
+        data: json!({
+            "metadata": {"name": "outbox-v1-template", "namespace": "default"}
+        }),
+    };
+    let payload = || {
+        crate::kubelet::outbox::payload::OutboxPayload::from_command(command())
+            .encode_protobuf()
+            .unwrap()
+    };
+
+    let legacy_db = Datastore::new_in_memory().await.unwrap();
+    let legacy_rv_before = legacy_db.get_current_resource_version().await.unwrap();
+    let legacy_payload = payload();
+    let BuildOutboxOutcome::NeedsPropose { commit: legacy, .. } = legacy_db
+        .build_log_apply_commit_for_outbox(
+            "legacy-outbox-template",
+            "CreateResource",
+            legacy_payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected legacy outbox commit");
+    };
+    assert_eq!(
+        legacy.resource_version_assignment,
+        ResourceVersionAssignment::LegacyLeaderAssigned
+    );
+    assert!(legacy.resource_version > 0);
+    assert!(legacy.resource_version > legacy_rv_before);
+    assert_eq!(
+        legacy_db.get_current_resource_version().await.unwrap(),
+        legacy.resource_version
+    );
+    assert!(legacy.mutations.iter().any(|mutation| {
+        matches!(mutation, LogApplyMutation::PutResource(row) if row.resource_version > 0)
+    }));
+
+    let v1_db = Datastore::new_in_memory().await.unwrap();
+    crate::datastore::DatastoreBackend::set_klights_meta(
+        &v1_db,
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
+    let v1_rv_before = v1_db.get_current_resource_version().await.unwrap();
+    let v1_payload = payload();
+    let BuildOutboxOutcome::NeedsPropose { commit: v1, .. } = v1_db
+        .build_log_apply_commit_for_outbox(
+            "v1-outbox-template",
+            "CreateResource",
+            v1_payload.as_ref(),
+            "worker-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected V1 outbox commit");
+    };
+    assert_eq!(
+        v1.resource_version_assignment,
+        ResourceVersionAssignment::CommittedApplyV1
+    );
+    assert_eq!(v1.resource_version, 0);
+    assert_eq!(
+        v1_db.get_current_resource_version().await.unwrap(),
+        v1_rv_before
+    );
+    assert!(v1.mutations.iter().any(|mutation| {
+        matches!(mutation, LogApplyMutation::PutResource(row) if row.resource_version == 0)
+    }));
+    assert!(v1.mutations.iter().any(|mutation| {
+        matches!(mutation, LogApplyMutation::PutAppliedOutbox(row) if row.applied_rv.is_none())
+    }));
+
+    let watermarked_db = Datastore::new_in_memory().await.unwrap();
+    crate::datastore::DatastoreBackend::set_klights_meta(
+        &watermarked_db,
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
+    let watermarked_v1_rv_before = watermarked_db.get_current_resource_version().await.unwrap();
+    let watermarked_payload = payload();
+    let BuildOutboxOutcome::NeedsPropose {
+        commit: watermarked,
+        ..
+    } = watermarked_db
+        .build_log_apply_commit_for_outbox_with_watermark(
+            "v1-watermarked-outbox-template",
+            "CreateResource",
+            watermarked_payload.as_ref(),
+            "worker-a",
+            Some(OutboxStreamWatermark {
+                client_id: "client-a".to_string(),
+                stream_id: 1,
+                stream_seq: 1,
+            }),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected V1 watermarked outbox commit");
+    };
+    assert_eq!(
+        watermarked.resource_version_assignment,
+        ResourceVersionAssignment::CommittedApplyV1
+    );
+    assert_eq!(watermarked.resource_version, 0);
+    assert_eq!(
+        watermarked_db.get_current_resource_version().await.unwrap(),
+        watermarked_v1_rv_before
+    );
+    assert!(watermarked.mutations.iter().any(|mutation| {
+        matches!(mutation, LogApplyMutation::PutResource(row) if row.resource_version == 0)
+    }));
+    assert!(watermarked.mutations.iter().any(|mutation| {
+        matches!(mutation, LogApplyMutation::PutAppliedOutbox(row) if row.applied_rv.is_none())
+    }));
+}
+
+#[tokio::test]
 async fn raft_outbox_stream_gap_rejects_without_mutating_resource() {
     use crate::log_apply::{
         LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, OutboxStreamWatermark,
@@ -231,6 +501,8 @@ async fn raft_outbox_stream_gap_rejects_without_mutating_resource() {
     let db = Datastore::new_in_memory().await.unwrap();
     let commit = LogApplyCommit {
         resource_version: 60,
+        resource_version_assignment:
+            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
         outbox_watermark: Some(OutboxStreamWatermark {
             client_id: "worker-a".to_string(),
             stream_id: 8,
@@ -312,6 +584,7 @@ async fn apply_resource_batch_command_builds_one_commit_with_two_puts() {
                 command,
                 "ServiceEndpointReconcile",
                 "test-node",
+                None,
             )?;
             assert_eq!(rv, commit.resource_version);
             tx.commit()?;
@@ -372,6 +645,7 @@ async fn apply_resource_batch_update_requires_resource_version_precondition() {
                 command,
                 "ServiceEndpointReconcile",
                 "test-node",
+                None,
             );
             tx.rollback()?;
             result.map(|_| ())
@@ -505,6 +779,7 @@ async fn build_delete_resource_with_tombstone_emits_watch_event_and_delete() {
                 command,
                 "PodTermination",
                 "leader",
+                None,
             )?;
             tx.commit()?;
             Ok(commit)
@@ -895,6 +1170,13 @@ async fn raft_committed_pv_bind_update_preserves_concurrent_user_labels() {
 #[tokio::test]
 async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid() {
     let db = Datastore::new_in_memory().await.unwrap();
+    crate::datastore::DatastoreBackend::set_klights_meta(
+        &db,
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
     let created = db
         .create_resource(
             "v1",
@@ -955,7 +1237,7 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         }),
         expected_rv: Some(created.resource_version),
         preconditions: ResourcePreconditions::from_resource(&created),
-        observed_status_stamp: None,
+        observed_status_stamp: Some(1),
     };
     let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
@@ -973,6 +1255,11 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
     let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a fresh commit");
     };
+    assert_eq!(commit.resource_version, 0);
+    assert_eq!(
+        commit.resource_version_assignment,
+        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+    );
     let put = commit
         .mutations
         .iter()
@@ -991,7 +1278,8 @@ async fn raft_commit_builder_applies_pod_status_outbox_against_latest_same_uid()
         "kubelet status snapshots must not depend on stale worker RVs"
     );
 
-    db.apply_log_apply_commit(commit).await.unwrap();
+    let applied = db.apply_raft_log_apply_commit(commit).await.unwrap();
+    assert!(applied.error_message.is_none());
     let stored = db
         .get_resource("v1", "Pod", Some("default"), "web")
         .await
@@ -1294,6 +1582,13 @@ async fn raft_apply_rejects_duplicate_create_built_before_first_apply() {
 #[tokio::test]
 async fn raft_apply_rejects_stale_resource_version_built_before_prior_apply() {
     let db = Datastore::new_in_memory().await.unwrap();
+    crate::datastore::DatastoreBackend::set_klights_meta(
+        &db,
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
     let created = db
         .create_resource(
             "v1",
@@ -1352,18 +1647,21 @@ async fn raft_apply_rejects_stale_resource_version_built_before_prior_apply() {
     let first = build_update("raft-stale-rv-first", "first").await;
     let second = build_update("raft-stale-rv-second", "second").await;
 
-    db.apply_log_apply_commit(first)
+    let first_result = db
+        .apply_raft_log_apply_commit(first)
         .await
         .expect("first update applies");
-    let err = db
-        .apply_log_apply_commit(second)
+    assert_eq!(first_result.error_message, None);
+    let rejected = db
+        .apply_raft_log_apply_commit(second)
         .await
-        .expect_err("second update must reject against apply-time RV");
+        .expect("terminal conflicts are returned as deterministic raft results");
     assert!(
-        err.to_string()
-            .contains("resourceVersion precondition failed")
-            && err.to_string().contains("409 Conflict"),
-        "expected apply-time RV conflict, got: {err:#}"
+        rejected.error_message.as_deref().is_some_and(|message| {
+            message.contains("resourceVersion precondition failed")
+                && message.contains("409 Conflict")
+        }),
+        "expected apply-time RV conflict, got: {rejected:?}"
     );
 
     let live = db
@@ -3465,6 +3763,7 @@ async fn build_log_apply_commit_from_gc_applied_outbox_command_maps_to_outbox_le
                 command,
                 "ServiceTest",
                 "test-node",
+                None,
             )?;
             tx.commit()?;
             Ok(commit)
@@ -3565,6 +3864,13 @@ async fn raft_outbox_build_treats_fresh_placeholder_as_retryable_inflight() {
 #[tokio::test]
 async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
     let db = Datastore::new_in_memory().await.unwrap();
+    crate::datastore::DatastoreBackend::set_klights_meta(
+        &db,
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
     db.create_resource(
         "v1",
         "ConfigMap",
@@ -3649,6 +3955,13 @@ async fn raft_apply_replays_rejected_idempotency_key_as_same_rejection() {
 #[tokio::test]
 async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() {
     let db = Datastore::new_in_memory().await.unwrap();
+    crate::datastore::DatastoreBackend::set_klights_meta(
+        &db,
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
     db.create_resource(
         "v1",
         "ConfigMap",
@@ -3690,7 +4003,8 @@ async fn raft_apply_terminal_conflict_without_outbox_returns_rejection_result() 
                 status_only: false,
             },
         )],
-    );
+    )
+    .into_committed_apply_v1_template();
 
     let rejected = db
         .apply_raft_log_apply_commit(commit)
@@ -5452,6 +5766,7 @@ async fn raft_allocate_node_subnet_resolves_lowest_free_24_at_apply_time() {
                         command,
                         "ClusterMaintenance",
                         "mn-controlplane1",
+                        None,
                     )?;
                     assert!(
                         commit.resource_version > 0,

@@ -77,6 +77,10 @@ pub struct BootstrapRunArgs<'a> {
     /// can drive `RaftAppendEntries` / `RaftVote` / `RaftInstallSnapshot`
     /// and a joining controlplane can call `JoinAsControlplane`.
     pub raft_node: Option<Arc<crate::datastore::raft::node::RaftNode>>,
+    /// Probes each Raft member's replication protocol capabilities before a
+    /// leader activates the committed-apply resource-version V1 mode.
+    pub member_feature_probe:
+        Option<Arc<crate::bootstrap::raft_transport::ReplicationGrpcMemberFeatureProbe>>,
     /// T6 step 4: leadership watch sender, created in runtime.rs before
     /// `open_leader`. The shape watcher inside this phase updates it on
     /// every `Raft::metrics()` change so `LocalApiClient`'s inner gate
@@ -85,6 +89,25 @@ pub struct BootstrapRunArgs<'a> {
     /// to `open_leader` so it's wired into the datastore phase.
     pub is_leader_tx: tokio::sync::watch::Sender<bool>,
     pub is_leader_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+async fn activate_committed_apply_rv_v1_if_possible(
+    raft: &crate::datastore::raft::node::RaftNode,
+    probe: Option<&Arc<crate::bootstrap::raft_transport::ReplicationGrpcMemberFeatureProbe>>,
+) -> bool {
+    let Some(probe) = probe else {
+        return false;
+    };
+    match raft.activate_committed_apply_rv_v1(probe.as_ref()).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "raft_shape_role_label_watcher: failed to activate committed-apply resource-version V1"
+            );
+            false
+        }
+    }
 }
 
 pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
@@ -117,6 +140,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         grpc_transport_policy,
         shutdown_token,
         raft_node,
+        member_feature_probe,
         is_leader_tx,
         is_leader_rx,
     } = args;
@@ -549,6 +573,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             None
         };
         let control_plane_lease_client_for_leader_updates = control_plane_lease_client.clone();
+        let member_feature_probe_task = member_feature_probe.clone();
         let mut last_shape = initial_raft_shape.clone();
         supervisor
             .spawn_async(
@@ -562,6 +587,20 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     // full metrics via current_shape()/current_leader_info()
                     // only when woken.
                     let mut metrics = raft_task.server_metrics_watch();
+                    // A single-voter seed can already be elected before this
+                    // watcher starts. Attempt once now; a missing gRPC server
+                    // or unready peer merely leaves this false, so future
+                    // real metrics changes retry without a timer or polling.
+                    let mut activation_succeeded = if raft_task.is_leader() {
+                        activate_committed_apply_rv_v1_if_possible(
+                            raft_task.as_ref(),
+                            member_feature_probe_task.as_ref(),
+                        )
+                        .await
+                    } else {
+                        false
+                    };
+                    let mut last_was_leader = false;
                     loop {
                         if metrics.changed().await.is_err() {
                             tracing::debug!(
@@ -578,7 +617,23 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                         // after, so the shape comparison would skip the
                         // proxy update, leaving the follower's API proxy
                         // pinned to the dead leader's address.
-                        let _ = is_leader_tx_task.send(raft_task.is_leader());
+                        let is_leader = raft_task.is_leader();
+                        let _ = is_leader_tx_task.send(is_leader);
+                        if !is_leader {
+                            activation_succeeded = false;
+                        } else if !activation_succeeded {
+                            if !last_was_leader {
+                                tracing::debug!(
+                                    "raft_shape_role_label_watcher: local leadership gained; attempting committed-apply resource-version V1 activation"
+                                );
+                            }
+                            activation_succeeded = activate_committed_apply_rv_v1_if_possible(
+                                raft_task.as_ref(),
+                                member_feature_probe_task.as_ref(),
+                            )
+                            .await;
+                        }
+                        last_was_leader = is_leader;
                         match raft_task.current_leader_info() {
                             Some((_, addr)) => {
                                 if let Some(lease_client) = control_plane_lease_client_for_leader_updates.as_ref()

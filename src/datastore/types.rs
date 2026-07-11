@@ -109,6 +109,9 @@ pub struct ReplicatedSnapshotMetadata {
     pub cluster_id: String,
     pub leader_epoch: i64,
     pub membership: Option<crate::control_plane::client::membership::ClusterMembership>,
+    /// Snapshot-only mode metadata. `None` preserves callers that restore
+    /// cluster identity without carrying the RV-assignment envelope.
+    pub resource_version_assignment_mode: Option<crate::log_apply::ResourceVersionAssignment>,
 }
 
 /// Per-resource-scope compaction boundary for durable watch replay.

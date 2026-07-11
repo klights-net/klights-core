@@ -1251,6 +1251,7 @@ impl ReplicationGrpcClient {
             leader_epoch: response.leader_epoch,
             current_rv: response.current_rv,
             current_log_index: response.current_log_index,
+            supported_features: response.supported_features,
         })
     }
 
@@ -1830,6 +1831,7 @@ impl ReplicationGrpcClient {
             node_internal_ip: registration.addresses.internal_ip().to_string(),
             node_git_commit: registration.host.git_commit.clone(),
             node_registration: Some(node_registration_to_proto(registration)),
+            supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
         };
         let join_token = self.controlplane_join_token_value()?;
         let response = self

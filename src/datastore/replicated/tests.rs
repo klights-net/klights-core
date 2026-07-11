@@ -299,6 +299,13 @@ mod cases {
             )
             .await
             .expect("seed existing resource");
+        DatastoreBackend::set_klights_meta(
+            inner.as_ref(),
+            crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+        )
+        .await
+        .expect("activate V1 for zero-RV raft template");
         let ds = ReplicatedDatastore::new(
             inner,
             ReplicationMode::Raft {
@@ -331,7 +338,8 @@ mod cases {
                     status_only: false,
                 },
             )],
-        );
+        )
+        .into_committed_apply_v1_template();
 
         let result = ds
             .apply_raft_log_apply_commit(commit)

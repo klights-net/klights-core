@@ -254,7 +254,12 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                 data.current_rv,
                 data.watch_event_high_water,
                 data.watch_replay_floors,
-                None,
+                Some(crate::datastore::ReplicatedSnapshotMetadata {
+                    cluster_id: String::new(),
+                    leader_epoch: 0,
+                    membership: None,
+                    resource_version_assignment_mode: Some(data.resource_version_assignment_mode),
+                }),
             )
             .await
             .map_err(|e| StorageError::IO {
@@ -1337,12 +1342,19 @@ mod tests {
     async fn apply_normal_entry_stamps_provisional_rv_after_current_store_rv() {
         let backend: Arc<dyn DatastoreBackend> =
             Arc::new(crate::datastore::test_support::in_memory().await);
+        backend
+            .set_klights_meta(
+                crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+            )
+            .await
+            .unwrap();
         let snapshot_rv = backend
             .advance_resource_version_after(100)
             .await
             .expect("establish a list snapshot rv above the raft log index");
 
-        let commit = crate::log_apply::LogApplyCommit::new(
+        let mut commit = crate::log_apply::LogApplyCommit::new(
             0,
             vec![crate::log_apply::LogApplyMutation::PutResource(
                 crate::log_apply::LogApplyResourceRow {
@@ -1370,6 +1382,8 @@ mod tests {
                 },
             )],
         );
+        commit.resource_version_assignment =
+            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1;
         let payload_bytes =
             crate::log_apply::encode_commit_protobuf(&commit).expect("encode LogApplyCommit");
         let entry = Entry::<TypeConfig> {
@@ -1398,6 +1412,94 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some(expected_rv.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn follower_selector_list_positive_watch_receives_v1_ready_transition() {
+        let backend: Arc<dyn DatastoreBackend> =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        backend
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("guestbook"),
+                "guestbook-0",
+                serde_json::json!({"metadata":{"name":"guestbook-0","namespace":"guestbook","uid":"guestbook-uid","labels":{"app":"guestbook"}},"status":{"phase":"Pending"}}),
+            )
+            .await
+            .unwrap();
+        backend.advance_resource_version_after(100).await.unwrap();
+        backend
+            .set_klights_meta(
+                crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+            )
+            .await
+            .unwrap();
+        let list = backend
+            .list_resources(
+                "v1",
+                "Pod",
+                Some("guestbook"),
+                crate::datastore::ResourceListQuery::new(Some("app=guestbook"), None, None, None),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            list.items[0]
+                .data
+                .pointer("/status/phase")
+                .and_then(|v| v.as_str()),
+            Some("Pending")
+        );
+
+        let mut commit = crate::log_apply::LogApplyCommit::new(
+            0,
+            vec![crate::log_apply::LogApplyMutation::PutResource(
+                crate::log_apply::LogApplyResourceRow {
+                    api_version: "v1".into(),
+                    kind: "Pod".into(),
+                    namespace: Some("guestbook".into()),
+                    name: "guestbook-0".into(),
+                    uid: "guestbook-uid".into(),
+                    resource_version: 0,
+                    data: serde_json::json!({"metadata":{"name":"guestbook-0","namespace":"guestbook","uid":"guestbook-uid","labels":{"app":"guestbook"}},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}}),
+                    require_absent: false,
+                    require_existing: true,
+                    precondition_uid: None,
+                    precondition_resource_version: Some(1),
+                    status_only: true,
+                },
+            )],
+        );
+        commit.resource_version_assignment =
+            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1;
+        let payload = crate::log_apply::encode_commit_protobuf(&commit).unwrap();
+        let mut sm = build_sm_with_backend(backend.clone()).await;
+        let result = sm
+            .apply(vec![Entry::<TypeConfig> {
+                log_id: LogId::new(LeaderId::new(3, 10), 42),
+                payload: EntryPayload::Normal(
+                    crate::datastore::raft::types::StorageCommandPayload::from_bytes(payload),
+                ),
+            }])
+            .await
+            .unwrap();
+        let ready_rv = result[0].applied_rv.unwrap();
+        assert!(ready_rv > list.resource_version);
+        let events = backend
+            .list_resources_modified_since("v1", "Pod", Some("guestbook"), list.resource_version)
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type.as_ref() == "MODIFIED"
+                && event
+                    .resource
+                    .data
+                    .pointer("/status/conditions/0/status")
+                    .and_then(|v| v.as_str())
+                    == Some("True")
+        }));
     }
 
     #[tokio::test]

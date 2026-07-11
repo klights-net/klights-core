@@ -6555,6 +6555,12 @@ async fn test_guestbook_selector_watch_observes_raft_pod_status_outbox_update() 
     let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
         .encode_protobuf()
         .unwrap();
+    db.set_klights_meta(
+        crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+    )
+    .await
+    .unwrap();
     let outcome = db
         .build_log_apply_commit_for_outbox(
             "guestbook-watch-raft-status",
@@ -6567,7 +6573,17 @@ async fn test_guestbook_selector_watch_observes_raft_pod_status_outbox_update() 
     let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, .. } = outcome else {
         panic!("expected a raft commit for PodStatus");
     };
-    db.apply_log_apply_commit(commit).await.unwrap();
+    assert_eq!(
+        commit.resource_version_assignment,
+        crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+    );
+    assert_eq!(commit.resource_version, 0);
+    let apply = db.apply_raft_log_apply_commit(commit).await.unwrap();
+    assert!(
+        apply.error_message.is_none(),
+        "V1 raft status commit must apply without an error: {:?}",
+        apply.error_message
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {

@@ -172,12 +172,6 @@ fn list_response_resource_version(
     // collection revision anchors a follow-up `?watch=true&resourceVersion=<list
     // rv>` to "now", replaying nothing for objects already reflected in the
     // list (the kubectl `-w` phantom-pod artifact).
-    //
-    // The only exception is an in-flight Raft reservation: proposals reserve
-    // the leader's next RV before state-machine apply, so the global metadata
-    // RV can advance past a mutation that is not yet visible in rows/watch
-    // history. Cap just before the earliest unapplied reservation so a
-    // follow-up watch cannot skip that eventual ADDED/MODIFIED/DELETED event.
     let mut response_rv = current_rv;
     if let Some(reserved_rv) = pending_reserved_rv.filter(|rv| *rv > 0) {
         response_rv = response_rv.min(reserved_rv.saturating_sub(1));
@@ -195,7 +189,12 @@ fn list_subject_key_prefix(api_version: &str, kind: &str, namespace: Option<&str
 fn pending_reserved_rv_for_collection_in_tx(
     tx: &rusqlite::Transaction<'_>,
     subject_prefix: &str,
-) -> rusqlite::Result<Option<i64>> {
+) -> tokio_rusqlite::Result<Option<i64>> {
+    if Datastore::resource_version_assignment_mode_in_tx(tx)?
+        == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+    {
+        return Ok(None);
+    }
     tx.query_row(
         "SELECT MIN(reserved_rv) FROM applied_outbox
          WHERE reserved_rv IS NOT NULL
@@ -205,6 +204,7 @@ fn pending_reserved_rv_for_collection_in_tx(
         rusqlite::params![format!("{subject_prefix}%")],
         |row| row.get(0),
     )
+    .map_err(tokio_rusqlite::Error::from)
 }
 
 impl Datastore {

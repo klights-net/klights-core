@@ -37,7 +37,7 @@ fn pod_status_payload_with_rv(uid: &str, expected_rv: i64, status: serde_json::V
             uid: Some(uid.to_string()),
             resource_version: Some(expected_rv),
         },
-        observed_status_stamp: None,
+        observed_status_stamp: Some(1),
     };
     OutboxPayload::from_command(command)
         .encode_protobuf()

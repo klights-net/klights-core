@@ -37,6 +37,10 @@ pub struct RaftSnapshotData {
     pub membership: StoredMembership<NodeId, openraft::BasicNode>,
     #[serde(default)]
     pub current_rv: i64,
+    /// Persisted assignment protocol. Missing from legacy envelopes means the
+    /// historical leader-assigned RV behavior.
+    #[serde(default)]
+    pub resource_version_assignment_mode: crate::log_apply::ResourceVersionAssignment,
     /// Durable watch-log allocator boundary. `None` identifies snapshots
     /// written by peers predating apply-order event IDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,6 +115,11 @@ impl RaftSnapshotData {
         )
         .await?;
         let replay_position = db.current_watch_replay_position().await?;
+        let resource_version_assignment_mode =
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                db,
+            )
+            .await?;
         let floors = normalize_snapshot_floors(
             db.list_watch_replay_floors().await?,
             snapshot_position.event_id,
@@ -118,6 +127,8 @@ impl RaftSnapshotData {
         );
         encoder.write_all(b",\"current_rv\":")?;
         serde_json::to_writer(&mut encoder, &replay_position.resource_version)?;
+        encoder.write_all(b",\"resource_version_assignment_mode\":")?;
+        serde_json::to_writer(&mut encoder, &resource_version_assignment_mode)?;
         encoder.write_all(b",\"watch_event_high_water\":")?;
         serde_json::to_writer(&mut encoder, &snapshot_position.event_id)?;
         encoder.write_all(b",\"watch_replay_floors\":")?;
@@ -273,6 +284,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn snapshot_serialization_preserves_v1_assignment_mode() {
+        let db = test_support::in_memory().await;
+        crate::datastore::resource_version_assignment::write_resource_version_assignment_mode(
+            &db,
+            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
+        )
+        .await
+        .unwrap();
+        let membership = StoredMembership::<NodeId, openraft::BasicNode>::default();
+        let snapshot = RaftSnapshotData::serialize_from_backend_to_cursor(&db, None, &membership)
+            .await
+            .unwrap();
+        let decoded = RaftSnapshotData::deserialize_from_bytes(&snapshot.into_inner()).unwrap();
+        assert_eq!(
+            decoded.resource_version_assignment_mode,
+            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+        );
+
+        let restored = test_support::in_memory().await;
+        crate::datastore::resource_version_assignment::write_resource_version_assignment_mode(
+            &restored,
+            decoded.resource_version_assignment_mode,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                &restored
+            )
+            .await
+            .unwrap(),
+            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+        );
+    }
+
     #[test]
     fn legacy_snapshot_without_watch_allocator_remains_decodable() {
         let legacy = serde_json::json!({
@@ -290,5 +337,9 @@ mod tests {
         assert_eq!(decoded.current_rv, 7);
         assert_eq!(decoded.watch_event_high_water, None);
         assert_eq!(decoded.watch_replay_floors, None);
+        assert_eq!(
+            decoded.resource_version_assignment_mode,
+            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
+        );
     }
 }

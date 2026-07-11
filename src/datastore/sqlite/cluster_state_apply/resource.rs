@@ -5,9 +5,7 @@
 //! normalized payload so raft members cannot diverge by recomputing local state
 //! while applying the same committed entry.
 
-use super::super::cluster_replace::{
-    ApplyConflictCode, apply_conflict_error, other_error, record_raft_authoritative_apply_conflict,
-};
+use super::super::cluster_replace::{ApplyConflictCode, apply_conflict_error, other_error};
 use super::super::crud::helpers::{
     WatchEventInsert, insert_watch_event_in_conn, serde_to_sqlite_error,
 };
@@ -18,6 +16,15 @@ use rusqlite::OptionalExtension;
 
 pub(in crate::datastore::sqlite) struct ClusterStateApplier<'tx, 'conn> {
     tx: &'tx rusqlite::Transaction<'conn>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ResourcePreconditionMode {
+    /// Legacy replay mode preserves convergence behavior for ordinary resource replay,
+    /// while leaving status-only writes subject to strict preconditions.
+    LegacyFollowerReplay,
+    /// Committed-v1 mode enforces full uid/resourceVersion preconditions.
+    StrictCommittedApply,
 }
 
 struct ResourceWriteSink<'tx, 'conn> {
@@ -184,7 +191,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         &self,
         mut row: LogApplyResourceRow,
         emit_watch_events: bool,
-        raft_authoritative: bool,
+        resource_precondition_mode: ResourcePreconditionMode,
     ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
@@ -198,19 +205,19 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
             );
             self.get_existing_resource(identity)?
         };
-        let normalized_before_validation = row.status_only;
-        if normalized_before_validation {
-            normalize_committed_resource_for_apply(&mut row, existing.as_ref())?;
+        match resource_precondition_mode {
+            // V1 must validate the exact committed mutation before status
+            // normalization can merge live fields or relax its preconditions.
+            ResourcePreconditionMode::StrictCommittedApply => {
+                validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
+            }
+            // Legacy replay converges ordinary and status rows using only the
+            // structural create/update presence conditions.
+            ResourcePreconditionMode::LegacyFollowerReplay => {
+                validate_put_resource_presence_preconditions(&row, existing.as_ref())?;
+            }
         }
-        if raft_authoritative {
-            validate_put_resource_presence_preconditions(&row, existing.as_ref())?;
-            log_raft_put_conflict_if_any(&row, existing.as_ref());
-        } else {
-            validate_put_resource_apply_preconditions(&row, existing.as_ref())?;
-        }
-        if !normalized_before_validation {
-            normalize_committed_resource_for_apply(&mut row, existing.as_ref())?;
-        }
+        normalize_committed_resource_for_apply(&mut row, existing.as_ref())?;
         let identity = resource_identity(
             &row.api_version,
             &row.kind,
@@ -247,7 +254,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         &self,
         patch: LogApplyResourcePatch,
         emit_watch_events: bool,
-        raft_authoritative: bool,
+        resource_precondition_mode: ResourcePreconditionMode,
     ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
@@ -274,7 +281,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
             &current_uid,
             &current_bytes,
             identity.namespace(),
-            raft_authoritative,
+            resource_precondition_mode,
         )?;
         let data_bytes = serde_json::to_vec(&patched_data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
@@ -300,7 +307,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         resource_version: i64,
         key: LogApplyResourceKey,
         emit_watch_events: bool,
-        raft_authoritative: bool,
+        resource_precondition_mode: ResourcePreconditionMode,
     ) -> tokio_rusqlite::Result<Option<PendingWatchEvent>> {
         let mut namespace_owned = String::new();
         let sink = ResourceWriteSink::new(self.tx);
@@ -318,25 +325,18 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         if !key.uid.is_empty() && key.uid.as_str() != current_uid.as_str() {
             return Ok(None);
         }
-        if let Some(expected_rv) = key.precondition_resource_version
+        if matches!(
+            resource_precondition_mode,
+            ResourcePreconditionMode::StrictCommittedApply
+        ) && let Some(expected_rv) = key.precondition_resource_version
             && expected_rv != current_rv
         {
-            if raft_authoritative {
-                record_raft_authoritative_apply_conflict();
-                tracing::warn!(
-                    api_version = %key.api_version, kind = %key.kind,
-                    namespace = ?key.namespace, name = %key.name,
-                    local_rv = %current_rv, committed_rv = %expected_rv,
-                    "raft authoritative DELETE: rv precondition bypassed, removing stale row"
-                );
-            } else {
-                return Err(apply_conflict_error(
-                    ApplyConflictCode::ResourceVersionPrecondition,
-                    format!(
-                        "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-                    ),
-                ));
-            }
+            return Err(apply_conflict_error(
+                ApplyConflictCode::ResourceVersionPrecondition,
+                format!(
+                    "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
+                ),
+            ));
         }
         sink.delete_resource_from_identity(identity)?;
         sink.delete_indexes_from_identity(identity)?;
@@ -479,38 +479,20 @@ fn apply_latest_patch_to_current_resource(
     current_uid: &str,
     current_bytes: &[u8],
     namespace: Option<&str>,
-    raft_authoritative: bool,
+    resource_precondition_mode: ResourcePreconditionMode,
 ) -> tokio_rusqlite::Result<serde_json::Value> {
-    if let Some(expected_uid) = patch.precondition_uid.as_deref()
-        && expected_uid != current_uid
-    {
-        if raft_authoritative {
-            record_raft_authoritative_apply_conflict();
-            tracing::warn!(
-                api_version = %patch.api_version, kind = %patch.kind,
-                namespace = ?patch.namespace, name = %patch.name,
-                local_uid = %current_uid, committed_uid = %expected_uid,
-                "raft authoritative PATCH: uid precondition bypassed, applying patch to current row"
-            );
-        } else {
+    if let ResourcePreconditionMode::StrictCommittedApply = resource_precondition_mode {
+        if let Some(expected_uid) = patch.precondition_uid.as_deref()
+            && expected_uid != current_uid
+        {
             return Err(apply_conflict_error(
                 ApplyConflictCode::UidPrecondition,
                 "UID precondition failed (409 Conflict)",
             ));
         }
-    }
-    if let Some(expected_rv) = patch.precondition_resource_version
-        && expected_rv != current_rv
-    {
-        if raft_authoritative {
-            record_raft_authoritative_apply_conflict();
-            tracing::warn!(
-                api_version = %patch.api_version, kind = %patch.kind,
-                namespace = ?patch.namespace, name = %patch.name,
-                local_rv = %current_rv, committed_rv = %expected_rv,
-                "raft authoritative PATCH: rv precondition bypassed, applying patch to current row"
-            );
-        } else {
+        if let Some(expected_rv) = patch.precondition_resource_version
+            && expected_rv != current_rv
+        {
             return Err(apply_conflict_error(
                 ApplyConflictCode::ResourceVersionPrecondition,
                 format!(
@@ -873,9 +855,9 @@ fn validate_put_resource_apply_preconditions(
     Ok(())
 }
 
-/// Raft-authoritative variant: enforces only structural conditions
-/// (require_absent / require_existing) and skips staleness-related
-/// conditions. The committed raft entry wins over stale local rv/uid.
+/// `LegacyFollowerReplay` PUT validation: enforce only structural conditions
+/// (`require_absent` / `require_existing`) and allow ordinary resource replay
+/// to converge despite stale local UID/resourceVersion preconditions.
 fn validate_put_resource_presence_preconditions(
     row: &LogApplyResourceRow,
     existing: Option<&ExistingResourceRow>,
@@ -893,32 +875,4 @@ fn validate_put_resource_presence_preconditions(
         ));
     }
     Ok(())
-}
-
-fn log_raft_put_conflict_if_any(row: &LogApplyResourceRow, existing: Option<&ExistingResourceRow>) {
-    let Some((current_rv, current_uid, _)) = existing else {
-        return;
-    };
-    if let Some(expected_uid) = row.precondition_uid.as_deref()
-        && expected_uid != current_uid.as_str()
-    {
-        record_raft_authoritative_apply_conflict();
-        tracing::warn!(
-            api_version = %row.api_version, kind = %row.kind,
-            namespace = ?row.namespace, name = %row.name,
-            local_uid = %current_uid, committed_uid = %expected_uid,
-            "raft authoritative PUT: uid precondition bypassed, reconciling to committed value"
-        );
-    }
-    if let Some(expected_rv) = row.precondition_resource_version
-        && expected_rv != *current_rv
-    {
-        record_raft_authoritative_apply_conflict();
-        tracing::warn!(
-            api_version = %row.api_version, kind = %row.kind,
-            namespace = ?row.namespace, name = %row.name,
-            local_rv = %current_rv, committed_rv = %expected_rv,
-            "raft authoritative PUT: rv precondition bypassed, reconciling to committed value"
-        );
-    }
 }

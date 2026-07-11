@@ -27,6 +27,76 @@ use crate::datastore::raft::network::{LeaderForwarder, StubRaftNetwork};
 use crate::datastore::raft::state_machine_impl::SqliteRaftStateMachine;
 use crate::datastore::raft::types::{NodeId, RaftShape, StorageCommandPayload, TypeConfig};
 
+/// One-shot metadata RPC port used by the committed-apply activation
+/// preflight. The caller supplies the existing replication gRPC client; this
+/// keeps Raft membership ownership independent of transport construction.
+#[async_trait]
+pub trait MemberFeatureProbe: Send + Sync {
+    async fn metadata_for_member(
+        &self,
+        node_id: NodeId,
+        addr: &str,
+    ) -> Result<crate::replication::protocol::MetadataResponse>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResourceVersionV1PreflightError {
+    #[error("committed-apply-v1 preflight is not ready: {0}")]
+    NotReady(String),
+    #[error("committed-apply-v1 is unsupported by member {node_id}")]
+    Unsupported { node_id: NodeId },
+    #[error("committed-apply-v1 metadata probe for member {node_id} is unavailable: {message}")]
+    Unavailable { node_id: NodeId, message: String },
+}
+
+/// Held only after membership has been frozen and every proposal lane drained.
+/// Dropping it reopens both gates.
+pub struct ResourceVersionV1Preflight<'a> {
+    _membership_guard: tokio::sync::MutexGuard<'a, ()>,
+    _proposal_drain: crate::datastore::raft::flow_control::RaftCommitFlowControlDrain,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResourceVersionV1ActivationError {
+    #[error("committed-apply-v1 activation requires the current Raft leader")]
+    NotLeader,
+    #[error(transparent)]
+    Preflight(#[from] ResourceVersionV1PreflightError),
+    #[error("committed-apply-v1 activation apply failed: {0}")]
+    Apply(String),
+}
+
+impl ResourceVersionV1ActivationError {
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::NotLeader
+                | Self::Preflight(ResourceVersionV1PreflightError::NotReady(_))
+                | Self::Preflight(ResourceVersionV1PreflightError::Unavailable { .. })
+                | Self::Apply(_)
+        )
+    }
+}
+
+async fn verify_committed_apply_rv_v1_members(
+    members: Vec<(NodeId, String)>,
+    probe: &dyn MemberFeatureProbe,
+) -> std::result::Result<(), ResourceVersionV1PreflightError> {
+    for (node_id, addr) in members {
+        let metadata = probe
+            .metadata_for_member(node_id, &addr)
+            .await
+            .map_err(|err| ResourceVersionV1PreflightError::Unavailable {
+                node_id,
+                message: err.to_string(),
+            })?;
+        if metadata.supported_features & crate::replication::protocol::COMMITTED_APPLY_RV_V1 == 0 {
+            return Err(ResourceVersionV1PreflightError::Unsupported { node_id });
+        }
+    }
+    Ok(())
+}
+
 /// Lossy-link transport sizing (finding.md H3). `max_payload_entries` keeps each
 /// AppendEntries retry small (it bounds **retransmit cost**: leader→follower).
 pub(crate) const RAFT_MAX_PAYLOAD_ENTRIES: u64 = 16;
@@ -262,29 +332,6 @@ impl RaftNode {
         }
     }
 
-    async fn cleanup_rejected_materialized_commit(&self, idempotency_key: &str, reserved_rv: i64) {
-        match self
-            .backend
-            .delete_uncommitted_applied_outbox_placeholder(idempotency_key, reserved_rv)
-            .await
-        {
-            Ok(true) => {
-                tracing::warn!(
-                    idempotency_key,
-                    "removed uncommitted applied_outbox placeholder after rejected raft proposal"
-                );
-            }
-            Ok(false) => {}
-            Err(err) => {
-                tracing::warn!(
-                    idempotency_key,
-                    error = %err,
-                    "failed to remove uncommitted applied_outbox placeholder after rejected raft proposal"
-                );
-            }
-        }
-    }
-
     /// Add a new voter to the running cluster. Wraps openraft's two-step
     /// dance: first promote the target to a learner so the leader starts
     /// replicating its log to it, then issue `change_membership` to fold
@@ -322,6 +369,101 @@ impl RaftNode {
             .change_membership(new_voters, false)
             .await
             .map_err(|e| anyhow::anyhow!("Raft::change_membership({node_id}): {e}"))?;
+        Ok(())
+    }
+
+    /// Freeze current membership, prove every voter/learner advertises the
+    /// committed-apply RV capability through the existing metadata RPC, then
+    /// drain both proposal lanes. This is deliberately a one-shot operation:
+    /// callers hold the returned guard only for the subsequent activation
+    /// transaction; no polling or background coordinator is introduced.
+    pub async fn preflight_committed_apply_rv_v1<'a>(
+        &'a self,
+        probe: &dyn MemberFeatureProbe,
+    ) -> std::result::Result<ResourceVersionV1Preflight<'a>, ResourceVersionV1PreflightError> {
+        let membership_guard = self.membership_mutex.lock().await;
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics.current_leader != Some(self.node_id) {
+            return Err(ResourceVersionV1PreflightError::NotReady(
+                "local Raft node is not the current leader".to_string(),
+            ));
+        }
+        let members: Vec<(NodeId, String)> = metrics
+            .membership_config
+            .nodes()
+            .map(|(node_id, node)| (*node_id, node.addr.clone()))
+            .collect();
+        if members.is_empty() {
+            return Err(ResourceVersionV1PreflightError::NotReady(
+                "Raft membership has no voters or learners".to_string(),
+            ));
+        }
+        verify_committed_apply_rv_v1_members(members, probe).await?;
+        let proposal_drain = self.flow_control.acquire_exclusive_drain().await;
+        Ok(ResourceVersionV1Preflight {
+            _membership_guard: membership_guard,
+            _proposal_drain: proposal_drain,
+        })
+    }
+
+    /// Commit the cluster-wide V1 mode switch after the caller has proved all
+    /// current members support it. The metadata commit itself remains Legacy
+    /// so every pre-upgrade member can apply the activation entry.
+    pub async fn activate_committed_apply_rv_v1(
+        &self,
+        probe: &dyn MemberFeatureProbe,
+    ) -> std::result::Result<(), ResourceVersionV1ActivationError> {
+        if !self.is_leader() {
+            return Err(ResourceVersionV1ActivationError::NotLeader);
+        }
+        let mode =
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                self.backend.as_ref(),
+            )
+            .await
+            .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
+        if mode == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 {
+            return Ok(());
+        }
+        let _preflight = self.preflight_committed_apply_rv_v1(probe).await?;
+        // Re-read while membership and proposal lanes are frozen. A second
+        // activation caller sees the committed mode and emits no extra entry.
+        let mode =
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                self.backend.as_ref(),
+            )
+            .await
+            .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
+        if mode == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1 {
+            return Ok(());
+        }
+        let current_rv = self
+            .backend
+            .get_current_resource_version()
+            .await
+            .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
+        let commit = crate::log_apply::LogApplyCommit::from_cluster_mutations(
+            current_rv.max(1),
+            vec![crate::log_apply::ClusterMutation::ClusterMeta(
+                crate::log_apply::ClusterMetaMutation::PutKlightsMeta {
+                    key: crate::datastore::resource_version_assignment::
+                        KEY_RESOURCE_VERSION_ASSIGNMENT_MODE
+                        .to_string(),
+                    value: crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+                        .as_metadata_value()
+                        .to_string(),
+                },
+            )],
+        );
+        let bytes = crate::log_apply::encode_commit_protobuf(&commit)
+            .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
+        let result = self
+            .propose_materialized_commit(StorageCommandPayload::from_bytes(bytes))
+            .await
+            .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
+        if let Some(error) = result.error_message {
+            return Err(ResourceVersionV1ActivationError::Apply(error));
+        }
         Ok(())
     }
 
@@ -659,7 +801,6 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
                 });
             }
         };
-        let reserved_rv = commit.resource_version;
         let entry_bytes = crate::log_apply::encode_commit_protobuf(&commit).map_err(|err| {
             crate::kubelet::outbox::OutboxApplyError::Retryable(format!(
                 "encode LogApplyCommit for raft outbox propose: {err}"
@@ -671,8 +812,6 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
         {
             Ok(result) => result,
             Err(err) => {
-                self.cleanup_rejected_materialized_commit(idempotency_key, reserved_rv)
-                    .await;
                 return Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
                     format!("raft propose: {err}"),
                 ));
@@ -991,6 +1130,21 @@ fn merge_controlplane_join_membership_metadata(
     membership
 }
 
+fn validate_committed_apply_v1_join_feature(
+    assignment_mode: crate::log_apply::ResourceVersionAssignment,
+    supported_features: u64,
+) -> std::result::Result<(), String> {
+    if assignment_mode == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+        && supported_features & crate::replication::protocol::COMMITTED_APPLY_RV_V1 == 0
+    {
+        return Err(
+            "committed-apply-v1 is active; joining voters and learners must advertise COMMITTED_APPLY_RV_V1"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl crate::replication::grpc::raft_rpc::ControlplaneJoinHandler for RaftNodeJoinHandler {
     async fn join(
@@ -1006,6 +1160,7 @@ impl crate::replication::grpc::raft_rpc::ControlplaneJoinHandler for RaftNodeJoi
             addr,
             node_name,
             as_learner,
+            supported_features,
             node_internal_ip,
             node_registration,
             legacy_node_git_commit,
@@ -1022,6 +1177,17 @@ impl crate::replication::grpc::raft_rpc::ControlplaneJoinHandler for RaftNodeJoi
                     reason: "no leader currently elected; retry later".into(),
                 },
             });
+        }
+        let assignment_mode =
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                self.node.backend.as_ref(),
+            )
+            .await
+            .map_err(|err| RaftRpcRouterError::Dispatch(err.to_string()))?;
+        if let Err(reason) =
+            validate_committed_apply_v1_join_feature(assignment_mode, supported_features)
+        {
+            return Ok(ControlplaneJoinOutcome::Denied { reason });
         }
         let admit_result = if as_learner {
             // T1.5.x: learner admission — call add_learner_only which
@@ -1118,6 +1284,185 @@ mod tests {
     use super::*;
     use crate::datastore::sqlite::{DbExecutor, opener};
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+
+    struct FeatureProbe {
+        replies: std::collections::BTreeMap<NodeId, Result<u64>>,
+    }
+
+    #[async_trait]
+    impl MemberFeatureProbe for FeatureProbe {
+        async fn metadata_for_member(
+            &self,
+            node_id: NodeId,
+            _addr: &str,
+        ) -> Result<crate::replication::protocol::MetadataResponse> {
+            let features = self
+                .replies
+                .get(&node_id)
+                .expect("test probe reply")
+                .as_ref()
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            Ok(crate::replication::protocol::MetadataResponse {
+                cluster_id: "test".to_string(),
+                leader_epoch: 1,
+                current_rv: 0,
+                current_log_index: 0,
+                supported_features: *features,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_apply_v1_preflight_member_probe_requires_every_member() {
+        let members = vec![
+            (1, "https://node-1".to_string()),
+            (2, "https://node-2".to_string()),
+        ];
+        let all_capable = FeatureProbe {
+            replies: [
+                (1, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
+                (2, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        verify_committed_apply_rv_v1_members(members.clone(), &all_capable)
+            .await
+            .expect("all current members support V1");
+
+        let missing = FeatureProbe {
+            replies: [
+                (1, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
+                (2, Ok(0)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert!(matches!(
+            verify_committed_apply_rv_v1_members(members.clone(), &missing).await,
+            Err(ResourceVersionV1PreflightError::Unsupported { node_id: 2 })
+        ));
+
+        let unavailable = FeatureProbe {
+            replies: [
+                (1, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1)),
+                (2, Err(anyhow::anyhow!("transport unavailable"))),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert!(matches!(
+            verify_committed_apply_rv_v1_members(members, &unavailable).await,
+            Err(ResourceVersionV1PreflightError::Unavailable { node_id: 2, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn committed_apply_v1_activation_is_leader_gated_idempotent_and_persisted() {
+        let (node, backend) = fresh_node(701).await;
+        node.bootstrap_single_voter("https://127.0.0.1:7701".to_string())
+            .await
+            .unwrap();
+        wait_for_leader(&node, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let probe = FeatureProbe {
+            replies: [(701, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1))]
+                .into_iter()
+                .collect(),
+        };
+        node.activate_committed_apply_rv_v1(&probe).await.unwrap();
+        assert_eq!(
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                backend.as_ref()
+            )
+            .await
+            .unwrap(),
+            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+        );
+        let rv_after_first = backend.get_current_resource_version().await.unwrap();
+        node.activate_committed_apply_rv_v1(&probe).await.unwrap();
+        assert_eq!(
+            backend.get_current_resource_version().await.unwrap(),
+            rv_after_first
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_apply_v1_activation_rejects_nonleader_and_failed_preflight_without_write() {
+        let (not_leader, backend) = fresh_node(702).await;
+        let probe = FeatureProbe {
+            replies: [(702, Ok(crate::replication::protocol::COMMITTED_APPLY_RV_V1))]
+                .into_iter()
+                .collect(),
+        };
+        assert!(matches!(
+            not_leader.activate_committed_apply_rv_v1(&probe).await,
+            Err(ResourceVersionV1ActivationError::NotLeader)
+        ));
+        assert_eq!(
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                backend.as_ref()
+            )
+            .await
+            .unwrap(),
+            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
+        );
+        not_leader.shutdown().await.unwrap();
+
+        let (leader, backend) = fresh_node(703).await;
+        leader
+            .bootstrap_single_voter("https://127.0.0.1:7703".to_string())
+            .await
+            .unwrap();
+        wait_for_leader(&leader, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let missing = FeatureProbe {
+            replies: [(703, Ok(0))].into_iter().collect(),
+        };
+        assert!(matches!(
+            leader.activate_committed_apply_rv_v1(&missing).await,
+            Err(ResourceVersionV1ActivationError::Preflight(
+                ResourceVersionV1PreflightError::Unsupported { .. }
+            ))
+        ));
+        assert_eq!(
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                backend.as_ref()
+            )
+            .await
+            .unwrap(),
+            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
+        );
+        leader.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn committed_apply_v1_join_feature_gate_allows_legacy_and_rejects_featureless_v1_joiners() {
+        assert!(
+            validate_committed_apply_v1_join_feature(
+                crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+                0
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_committed_apply_v1_join_feature(
+                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
+                0
+            )
+            .is_err()
+        );
+        assert!(
+            validate_committed_apply_v1_join_feature(
+                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
+                crate::replication::protocol::COMMITTED_APPLY_RV_V1
+            )
+            .is_ok()
+        );
+    }
 
     /// Test-only helper: poll metrics until this node is the leader.
     /// Production should wait on `raft.metrics()` via TaskSupervisor.
@@ -2066,6 +2411,7 @@ mod tests {
             addr: addr.to_string(),
             node_name: node_name.to_string(),
             as_learner,
+            supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
             node_internal_ip: node_internal_ip.map(str::to_string),
             node_registration: Some(
                 crate::replication::grpc::raft_rpc::RemoteNodeRegistrationSnapshot {
@@ -2177,6 +2523,7 @@ mod tests {
                     addr: "https://10.99.0.51:7679".to_string(),
                     node_name: "n51".to_string(),
                     as_learner: false,
+                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
                     node_internal_ip: None,
                     node_registration: None,
                     legacy_node_git_commit: Some("legacyrejoin".to_string()),

@@ -62,7 +62,12 @@ pub struct MetadataResponse {
     pub leader_epoch: i64,
     pub current_rv: i64,
     pub current_log_index: i64,
+    #[serde(default)]
+    pub supported_features: u64,
 }
+
+pub const COMMITTED_APPLY_RV_V1: u64 = 1 << 0;
+pub const LOCAL_SUPPORTED_FEATURES: u64 = COMMITTED_APPLY_RV_V1;
 
 impl From<ClusterMetadata> for MetadataResponse {
     fn from(m: ClusterMetadata) -> Self {
@@ -71,6 +76,7 @@ impl From<ClusterMetadata> for MetadataResponse {
             leader_epoch: m.leader_epoch,
             current_rv: m.current_rv,
             current_log_index: 0,
+            supported_features: LOCAL_SUPPORTED_FEATURES,
         }
     }
 }
@@ -485,6 +491,21 @@ mod tests {
         assert_eq!(resp.leader_epoch, 5);
         assert_eq!(resp.current_rv, 100);
         assert_eq!(resp.current_log_index, 0);
+        assert_eq!(resp.supported_features, COMMITTED_APPLY_RV_V1);
+        assert_eq!(
+            serde_json::from_str::<MetadataResponse>(&serde_json::to_string(&resp).unwrap())
+                .unwrap()
+                .supported_features,
+            COMMITTED_APPLY_RV_V1
+        );
+        assert_eq!(
+            serde_json::from_str::<MetadataResponse>(
+                r#"{"cluster_id":"legacy","leader_epoch":1,"current_rv":2,"current_log_index":3}"#
+            )
+            .unwrap()
+            .supported_features,
+            0
+        );
     }
 
     #[test]

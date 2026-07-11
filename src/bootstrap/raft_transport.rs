@@ -156,11 +156,91 @@ impl GrpcRaftClientFactory for ReplicationGrpcRaftClientFactory {
     }
 }
 
+/// Metadata probe for Raft-member capability checks. It deliberately reuses
+/// the exact mTLS/CA/dataplane transport template used by Raft RPC clients.
+pub struct ReplicationGrpcMemberFeatureProbe {
+    supervisor: Arc<TaskSupervisor>,
+    template: ReplicationGrpcRaftClientTemplate,
+    local_node_id: crate::datastore::raft::types::NodeId,
+}
+
+impl ReplicationGrpcMemberFeatureProbe {
+    pub fn new(
+        supervisor: Arc<TaskSupervisor>,
+        template: ReplicationGrpcRaftClientTemplate,
+    ) -> Self {
+        let local_node_id =
+            crate::datastore::raft::types::raft_node_id_for_node_name(&template.node_name);
+        Self {
+            supervisor,
+            template,
+            local_node_id,
+        }
+    }
+
+    fn local_metadata_for_member(
+        local_node_id: crate::datastore::raft::types::NodeId,
+        node_id: crate::datastore::raft::types::NodeId,
+    ) -> Option<crate::replication::protocol::MetadataResponse> {
+        (node_id == local_node_id).then(|| crate::replication::protocol::MetadataResponse {
+            cluster_id: String::new(),
+            leader_epoch: 0,
+            current_rv: 0,
+            current_log_index: 0,
+            supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::datastore::raft::node::MemberFeatureProbe for ReplicationGrpcMemberFeatureProbe {
+    async fn metadata_for_member(
+        &self,
+        node_id: crate::datastore::raft::types::NodeId,
+        addr: &str,
+    ) -> anyhow::Result<crate::replication::protocol::MetadataResponse> {
+        if let Some(metadata) = Self::local_metadata_for_member(self.local_node_id, node_id) {
+            return Ok(metadata);
+        }
+        let client = crate::replication::grpc::client::ReplicationGrpcClient::new(
+            crate::replication::grpc::client::GrpcClientConfig {
+                leader_endpoint: addr.to_string(),
+                token: self.template.token.clone(),
+                node_name: self.template.node_name.clone(),
+                role: crate::replication::protocol::JoinRole::Worker,
+                dataplane: self.template.dataplane.clone(),
+                ca_cert_path: self.template.ca_cert_path.clone(),
+                skip_ca: self.template.skip_ca,
+                client_cert_pem: self.template.client_cert_pem.clone(),
+                client_key_pem: self.template.client_key_pem.clone(),
+            },
+            self.supervisor.clone(),
+            self.template.transport_policy.clone(),
+        );
+        client.metadata().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::datastore::raft::grpc_network::GrpcRaftRpcError;
     use crate::replication::grpc::client::UnaryRpcError;
+
+    #[test]
+    fn local_member_feature_probe_shortcuts_to_local_capabilities() {
+        let local = crate::datastore::raft::types::raft_node_id_for_node_name("cp-1");
+        let metadata = ReplicationGrpcMemberFeatureProbe::local_metadata_for_member(local, local)
+            .expect("the local member must not require a self gRPC connection");
+        assert_eq!(
+            metadata.supported_features,
+            crate::replication::protocol::LOCAL_SUPPORTED_FEATURES
+        );
+        assert!(
+            ReplicationGrpcMemberFeatureProbe::local_metadata_for_member(local, local + 1)
+                .is_none()
+        );
+    }
 
     /// P0#3 fix #1: a tonic transport failure must reach `map_rpc_outcome` as a
     /// STRUCTURED `RaftPeerTransportError` carrying the peer address and the

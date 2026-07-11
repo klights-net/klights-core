@@ -146,7 +146,6 @@ pub fn log_slow_log_apply_commit(
     mutation_count: usize,
     pending_watch_events: usize,
     emit_watch_events: bool,
-    raft_authoritative: bool,
 ) {
     if !should_log_slow_path(elapsed, 0, LOG_APPLY_COMMIT_WARN_MS, usize::MAX) {
         return;
@@ -159,7 +158,6 @@ pub fn log_slow_log_apply_commit(
         mutation_count,
         pending_watch_events,
         emit_watch_events,
-        raft_authoritative,
         "slow log_apply commit"
     );
 }

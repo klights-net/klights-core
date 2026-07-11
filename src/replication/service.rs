@@ -317,6 +317,7 @@ impl ReplicationService {
                     leader_epoch: 0,
                     current_rv: 0,
                     current_log_index: 0,
+                    supported_features: crate::replication::protocol::LOCAL_SUPPORTED_FEATURES,
                 }
             }
         }

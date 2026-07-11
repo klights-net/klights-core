@@ -398,6 +398,8 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
         for watermark in db.list_outbox_stream_watermarks().await? {
             sink.push(LogApplyCommit {
                 resource_version: current_rv,
+                resource_version_assignment:
+                    crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
                 mutations: Vec::new(),
                 outbox_watermark: Some(watermark),
             })
@@ -1160,6 +1162,8 @@ mod tests {
             leader
                 .apply_raft_log_apply_commit(LogApplyCommit {
                     resource_version: seq,
+                    resource_version_assignment:
+                        crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
                     mutations: Vec::new(),
                     outbox_watermark: Some(OutboxStreamWatermark {
                         client_id: watermark.client_id.clone(),
@@ -1182,6 +1186,8 @@ mod tests {
         let duplicate = follower
             .apply_raft_log_apply_commit(LogApplyCommit {
                 resource_version: 2,
+                resource_version_assignment:
+                    crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
                 mutations: Vec::new(),
                 outbox_watermark: Some(watermark),
             })

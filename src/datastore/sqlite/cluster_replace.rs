@@ -3,21 +3,21 @@ use super::{Datastore, queries};
 use crate::bootstrap::cluster_meta::{
     KEY_CLUSTER_ID, KEY_LEADER_EPOCH, KEY_RAFT_LEADER_HINT, KEY_RAFT_TERM, KEY_RAFT_VOTERS,
 };
+use crate::datastore::sqlite::cluster_state_apply::ResourcePreconditionMode;
 use crate::datastore::types::{AppliedOutboxRecord, PendingWatchEvent, ReplicatedSnapshotMetadata};
-use crate::log_apply::{ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark};
+use crate::log_apply::{
+    ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark,
+    ResourceVersionAssignment,
+};
 #[cfg(test)]
-use crate::log_apply::{LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow, LogApplyWatchEventRow};
+use crate::log_apply::{
+    LogApplyAppliedOutboxRow, LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow,
+    LogApplyWatchEventRow,
+};
 #[cfg(test)]
 use crate::log_apply::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow};
 use anyhow::{Result, anyhow};
 use rusqlite::OptionalExtension;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static RAFT_AUTHORITATIVE_APPLY_CONFLICTS_TOTAL: AtomicU64 = AtomicU64::new(0);
-
-pub(super) fn record_raft_authoritative_apply_conflict() {
-    RAFT_AUTHORITATIVE_APPLY_CONFLICTS_TOTAL.fetch_add(1, Ordering::Relaxed);
-}
 
 impl Datastore {
     /// Replace cluster-replicated Kubernetes resources from a full leader snapshot.
@@ -94,6 +94,7 @@ fn replace_resource_state_in_conn(
     // snapshots that carried neither explicit rows nor an allocator boundary.
     let emit_synthetic_watch_events =
         watch_event_high_water.is_none() && !has_explicit_watch_history;
+    let resource_precondition_mode = ResourcePreconditionMode::StrictCommittedApply;
     let mut pending = Vec::with_capacity(entries.len());
     for commit in entries {
         if commit.resource_version <= 0 {
@@ -108,8 +109,12 @@ fn replace_resource_state_in_conn(
                 commit.resource_version, current_rv
             )));
         }
-        let (_applied_rv, commit_pending) =
-            apply_commit_in_tx_with_watch_events(&tx, commit, emit_synthetic_watch_events, false)?;
+        let (_applied_rv, commit_pending) = apply_commit_in_tx_with_watch_events(
+            &tx,
+            commit,
+            emit_synthetic_watch_events,
+            resource_precondition_mode,
+        )?;
         pending.extend(commit_pending);
     }
     if has_explicit_watch_history {
@@ -196,14 +201,25 @@ fn replace_resource_state_in_conn(
         rusqlite::params![current_rv.to_string()],
     )?;
     if let Some(metadata) = metadata {
-        tx.execute(
-            queries::UPSERT_KLIGHTS_META,
-            rusqlite::params![KEY_CLUSTER_ID, metadata.cluster_id],
-        )?;
-        tx.execute(
-            queries::UPSERT_KLIGHTS_META,
-            rusqlite::params![KEY_LEADER_EPOCH, metadata.leader_epoch.to_string()],
-        )?;
+        if !metadata.cluster_id.is_empty() {
+            tx.execute(
+                queries::UPSERT_KLIGHTS_META,
+                rusqlite::params![KEY_CLUSTER_ID, metadata.cluster_id],
+            )?;
+            tx.execute(
+                queries::UPSERT_KLIGHTS_META,
+                rusqlite::params![KEY_LEADER_EPOCH, metadata.leader_epoch.to_string()],
+            )?;
+        }
+        if let Some(mode) = metadata.resource_version_assignment_mode {
+            tx.execute(
+                queries::UPSERT_KLIGHTS_META,
+                rusqlite::params![
+                    crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+                    mode.as_metadata_value()
+                ],
+            )?;
+        }
         if let Some(membership) = metadata.membership {
             let voters = serde_json::to_string(&membership.voters)
                 .map_err(|err| other_error(format!("failed to serialize voters: {err}")))?;
@@ -328,6 +344,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
     commit: LogApplyCommit,
 ) -> tokio_rusqlite::Result<RaftLogApplyOutcome> {
     let reserved_rv = commit.resource_version;
+    validate_live_raft_resource_version_assignment(tx, &commit)?;
     let outbox_template = commit.mutations.iter().find_map(|mutation| match mutation {
         LogApplyMutation::PutAppliedOutbox(row) => Some(row.clone()),
         _ => None,
@@ -342,14 +359,63 @@ pub(crate) fn apply_commit_in_tx_for_raft(
         });
     }
 
-    // Authoritative apply: committed raft entries are ground truth.
-    // Staleness-related preconditions (precondition_resource_version / precondition_uid) are
-    // bypassed so a stale follower converges from the log without relying solely on snapshot
-    // install (finding.md H2). Structural conditions (require_absent / require_existing) are
-    // still enforced — they represent true API-level invariants (e.g. duplicate-create detection
-    // on the leader) and must be propagated back to the proposer as terminal results.
+    // A duplicate watermark has already been applied. Do not allocate a V1
+    // public RV for an entry that will have no visible effect.
+    if commit.resource_version_assignment == ResourceVersionAssignment::CommittedApplyV1
+        && matches!(
+            outbox_watermark_decision_in_tx(tx, commit.outbox_watermark.as_ref())?,
+            OutboxWatermarkDecision::Duplicate
+        )
+    {
+        return Ok(RaftLogApplyOutcome {
+            result: crate::datastore::raft::types::StorageCommandResult {
+                applied_rv: Some(Datastore::current_resource_version_in_tx(tx)?),
+                error_message: None,
+            },
+            pending: Vec::new(),
+        });
+    }
+
+    let resource_precondition_mode = match commit.resource_version_assignment {
+        ResourceVersionAssignment::CommittedApplyV1 => {
+            ResourcePreconditionMode::StrictCommittedApply
+        }
+        _ => ResourcePreconditionMode::LegacyFollowerReplay,
+    };
+
+    if commit.resource_version_assignment == ResourceVersionAssignment::CommittedApplyV1
+        && let Some((subject_key, incoming_stamp)) =
+            stamped_pod_status_subject_and_stamp_from_commit(&commit)
+    {
+        let last_applied_stamp: Option<i64> = tx.query_row(
+            queries::APPLIED_OUTBOX_MAX_STATUS_STAMP_FOR_SUBJECT,
+            rusqlite::params![subject_key],
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+
+        if last_applied_stamp.is_some_and(|last| incoming_stamp <= last) {
+            let (applied_rv, pending) = apply_commit_in_tx_with_watch_events(
+                tx,
+                {
+                    let mut outbox_commit = commit_with_outbox_rows_only(commit);
+                    outbox_commit.resource_version = Datastore::current_resource_version_in_tx(tx)?;
+                    outbox_commit
+                },
+                true,
+                resource_precondition_mode,
+            )?;
+            return Ok(RaftLogApplyOutcome {
+                result: crate::datastore::raft::types::StorageCommandResult {
+                    applied_rv: Some(applied_rv),
+                    error_message: None,
+                },
+                pending,
+            });
+        }
+    }
+
     tx.execute("SAVEPOINT raft_apply_attempt", [])?;
-    match apply_commit_in_tx_returning_rv(tx, commit, true) {
+    match apply_commit_in_tx_returning_rv(tx, commit, resource_precondition_mode) {
         Ok((rv, pending)) => {
             tx.execute("RELEASE raft_apply_attempt", [])?;
             Ok(RaftLogApplyOutcome {
@@ -393,18 +459,59 @@ pub(crate) fn apply_commit_in_tx_for_raft(
     }
 }
 
+fn validate_live_raft_resource_version_assignment(
+    tx: &rusqlite::Transaction<'_>,
+    commit: &LogApplyCommit,
+) -> tokio_rusqlite::Result<()> {
+    commit
+        .validate_live_resource_version_assignment()
+        .map_err(|err| other_error(err.to_string()))?;
+    if commit.resource_version_assignment == ResourceVersionAssignment::CommittedApplyV1 {
+        let persisted = tx
+            .query_row(
+                queries::META_SELECT,
+                [crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| {
+                crate::datastore::resource_version_assignment::parse_resource_version_assignment_mode(
+                    &value,
+                )
+                .map_err(|err| other_error(err.to_string()))
+            })
+            .transpose()?
+            .unwrap_or(ResourceVersionAssignment::LegacyLeaderAssigned);
+        if persisted != ResourceVersionAssignment::CommittedApplyV1 {
+            return Err(other_error(
+                "committed-apply-v1 resourceVersion assignment is not activated",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn apply_commit_in_tx(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
 ) -> tokio_rusqlite::Result<Vec<PendingWatchEvent>> {
-    let (_applied_rv, pending) = apply_commit_in_tx_returning_rv(tx, commit, false)?;
+    let resource_precondition_mode = match commit.resource_version_assignment {
+        ResourceVersionAssignment::CommittedApplyV1 => {
+            ResourcePreconditionMode::StrictCommittedApply
+        }
+        ResourceVersionAssignment::LegacyLeaderAssigned => {
+            ResourcePreconditionMode::LegacyFollowerReplay
+        }
+    };
+    let (_applied_rv, pending) =
+        apply_commit_in_tx_returning_rv(tx, commit, resource_precondition_mode)?;
     Ok(pending)
 }
 
 pub(crate) fn apply_commit_in_tx_returning_rv(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
-    raft_authoritative: bool,
+    resource_precondition_mode: ResourcePreconditionMode,
 ) -> tokio_rusqlite::Result<(i64, Vec<PendingWatchEvent>)> {
     let has_explicit_watch_history = commit
         .mutations
@@ -414,7 +521,7 @@ pub(crate) fn apply_commit_in_tx_returning_rv(
         tx,
         commit,
         !has_explicit_watch_history,
-        raft_authoritative,
+        resource_precondition_mode,
     )
 }
 
@@ -422,7 +529,7 @@ fn apply_commit_in_tx_with_watch_events(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
     emit_watch_events: bool,
-    raft_authoritative: bool,
+    resource_precondition_mode: ResourcePreconditionMode,
 ) -> tokio_rusqlite::Result<(i64, Vec<PendingWatchEvent>)> {
     if commit.resource_version < 0 {
         return Err(other_error(
@@ -461,7 +568,7 @@ fn apply_commit_in_tx_with_watch_events(
             commit.resource_version,
             ClusterMutation::from(mutation),
             emit_watch_events,
-            raft_authoritative,
+            resource_precondition_mode,
             &mut effects,
         )?;
     }
@@ -476,7 +583,6 @@ fn apply_commit_in_tx_with_watch_events(
         mutation_count,
         pending.len(),
         emit_watch_events,
-        raft_authoritative,
     );
     Ok((applied_rv, pending))
 }
@@ -544,12 +650,19 @@ fn stamp_provisional_resource_version_in_tx(
     tx: &rusqlite::Transaction<'_>,
     mut commit: LogApplyCommit,
 ) -> tokio_rusqlite::Result<LogApplyCommit> {
+    let is_committed_apply_v1 =
+        commit.resource_version_assignment == ResourceVersionAssignment::CommittedApplyV1;
     let rv = if commit.resource_version == 0 {
         Datastore::next_resource_version_in_tx(tx)?
     } else {
         commit.resource_version
     };
     commit.resource_version = rv;
+    let should_hydrate_watch_event_payload =
+        |data: &serde_json::Value| match data.get("type").and_then(|value| value.as_str()) {
+            Some("ADDED" | "MODIFIED" | "DELETED" | "ERROR") => data.get("object").is_some(),
+            _ => false,
+        };
     for mutation in &mut commit.mutations {
         match mutation {
             LogApplyMutation::PutResource(row) => {
@@ -586,14 +699,40 @@ fn stamp_provisional_resource_version_in_tx(
                     );
                 }
             }
+            LogApplyMutation::PutWatchEvent(row) => {
+                if row.resource_version == 0 {
+                    row.resource_version = rv;
+                }
+                if is_committed_apply_v1
+                    && row.resource_version == rv
+                    && !should_hydrate_watch_event_payload(&row.data)
+                {
+                    row.data = crate::datastore::sqlite::resource_shape::hydrate_watch_event_data(
+                        std::mem::take(&mut row.data),
+                        &row.api_version,
+                        &row.kind,
+                        row.namespace.as_deref(),
+                        &row.name,
+                        rv,
+                    );
+                }
+            }
             LogApplyMutation::PutPodCleanupIntent(row) if row.resource_version == 0 => {
                 row.resource_version = rv;
             }
             LogApplyMutation::PutAppliedOutbox(row) => {
-                if row.applied_rv.is_none() {
+                if is_committed_apply_v1 || row.applied_rv.is_none() {
                     row.applied_rv = Some(rv);
                 }
                 if row.result_proto.is_empty()
+                    || (is_committed_apply_v1
+                        && crate::datastore::command::decode_response_protobuf(&row.result_proto)
+                            .is_ok_and(|response| {
+                                matches!(
+                                    response,
+                                    crate::datastore::command::StorageResponse::Ack { .. }
+                                )
+                            }))
                     || crate::datastore::command::decode_response_protobuf(&row.result_proto)
                         .is_ok_and(|response| {
                             matches!(
@@ -619,6 +758,51 @@ fn stamp_provisional_resource_version_in_tx(
         }
     }
     Ok(commit)
+}
+
+fn stamped_pod_status_subject_and_stamp_from_commit(
+    commit: &LogApplyCommit,
+) -> Option<(String, i64)> {
+    commit.mutations.iter().find_map(|mutation| match mutation {
+        LogApplyMutation::PutAppliedOutbox(row)
+            if row.status_stamp.is_some_and(|stamp| stamp > 0)
+                && is_stamped_pod_status_outbox_operation(&row.operation)
+                && !row.subject_key.is_empty() =>
+        {
+            Some((
+                row.subject_key.clone(),
+                row.status_stamp.expect("status_stamp was validated"),
+            ))
+        }
+        _ => None,
+    })
+}
+
+fn is_stamped_pod_status_outbox_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "PodStatus"
+            | "RuntimeReconcile"
+            | "ProbeReadiness"
+            | "DeadlineExceeded"
+            | "ContainerStatusSnapshot"
+            | "EphemeralContainerStatuses"
+    )
+}
+
+fn commit_with_outbox_rows_only(commit: LogApplyCommit) -> LogApplyCommit {
+    let mutations = commit
+        .mutations
+        .into_iter()
+        .filter_map(|mutation| match mutation {
+            LogApplyMutation::PutAppliedOutbox(_) => Some(mutation),
+            _ => None,
+        })
+        .collect();
+    LogApplyCommit {
+        mutations,
+        ..commit
+    }
 }
 
 fn applied_outbox_record_in_tx(
@@ -759,7 +943,628 @@ pub(super) fn other_error(message: impl Into<String>) -> tokio_rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datastore::DatastoreBackend;
     use std::net::Ipv4Addr;
+
+    fn committed_apply_v1(commit: LogApplyCommit) -> LogApplyCommit {
+        LogApplyCommit {
+            resource_version_assignment: ResourceVersionAssignment::CommittedApplyV1,
+            ..commit
+        }
+    }
+
+    fn v1_resource(name: &str, uid: &str) -> LogApplyMutation {
+        LogApplyMutation::PutResource(LogApplyResourceRow {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: name.to_string(),
+            uid: uid.to_string(),
+            resource_version: 0,
+            data: serde_json::json!({"metadata": {"name": name, "namespace": "default", "uid": uid}}),
+            require_absent: true,
+            require_existing: false,
+            precondition_uid: None,
+            precondition_resource_version: None,
+            status_only: false,
+        })
+    }
+
+    async fn enable_committed_apply_v1(db: &Datastore) {
+        db.set_klights_meta(
+            crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+            ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn pod_status_subject_key(name: &str, uid: &str) -> String {
+        format!("v1/Pod/default/{name}/{uid}")
+    }
+
+    fn pod_status_commit_with_stamp(
+        idempotency_key: &str,
+        status_message: &str,
+        status_stamp: i64,
+        name: &str,
+        uid: &str,
+    ) -> LogApplyCommit {
+        LogApplyCommit::new(
+            0,
+            vec![
+                LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".into(),
+                    kind: "Pod".into(),
+                    namespace: Some("default".into()),
+                    name: name.to_string(),
+                    uid: uid.to_string(),
+                    resource_version: 0,
+                    data: serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {"name": name, "namespace": "default", "uid": uid},
+                        "status": {"phase": "Running", "message": status_message},
+                    }),
+                    require_absent: false,
+                    require_existing: true,
+                    precondition_uid: Some(uid.to_string()),
+                    precondition_resource_version: None,
+                    status_only: true,
+                }),
+                LogApplyMutation::PutAppliedOutbox(LogApplyAppliedOutboxRow {
+                    idempotency_key: idempotency_key.to_string(),
+                    subject_key: pod_status_subject_key(name, uid),
+                    operation: "PodStatus".to_string(),
+                    first_seen_ms: status_stamp,
+                    applied_rv: None,
+                    result_proto: crate::datastore::command::encode_response_protobuf(
+                        &crate::datastore::command::StorageResponse::Ack {
+                            resource_version: 0,
+                        },
+                    )
+                    .unwrap_or_default(),
+                    status_stamp: Some(status_stamp),
+                }),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn committed_apply_v1_allocates_one_rv_after_current_counter() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.advance_resource_version_after(10).await.unwrap();
+        enable_committed_apply_v1(&db).await;
+
+        let result = db
+            .apply_raft_log_apply_commit(committed_apply_v1(LogApplyCommit::new(
+                0,
+                vec![v1_resource("v1-one", "v1-one-uid")],
+            )))
+            .await
+            .unwrap();
+        let rv = result.applied_rv.unwrap();
+        assert!(rv > 10);
+        let resource = db
+            .get_resource("v1", "ConfigMap", Some("default"), "v1-one")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resource.resource_version, rv);
+        assert_eq!(
+            resource
+                .data
+                .pointer("/metadata/resourceVersion")
+                .and_then(|value| value.as_str()),
+            Some(rv.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_replace_persists_v1_mode_and_preserves_legacy_rows() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let legacy = LogApplyCommit::new(10, vec![v1_resource("snapshot-legacy", "snapshot-uid")]);
+        db.replace_replicated_resource_state(
+            vec![legacy],
+            10,
+            None,
+            None,
+            Some(ReplicatedSnapshotMetadata {
+                cluster_id: String::new(),
+                leader_epoch: 0,
+                membership: None,
+                resource_version_assignment_mode: Some(ResourceVersionAssignment::CommittedApplyV1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                &db
+            )
+            .await
+            .unwrap(),
+            ResourceVersionAssignment::CommittedApplyV1
+        );
+        assert_eq!(
+            db.get_resource("v1", "ConfigMap", Some("default"), "snapshot-legacy")
+                .await
+                .unwrap()
+                .unwrap()
+                .resource_version,
+            10
+        );
+        let applied = db
+            .apply_raft_log_apply_commit(committed_apply_v1(LogApplyCommit::new(
+                0,
+                vec![v1_resource("after-snapshot", "after-snapshot-uid")],
+            )))
+            .await
+            .unwrap();
+        assert!(applied.applied_rv.unwrap() > 10);
+    }
+
+    #[tokio::test]
+    async fn snapshot_replace_accepts_authoritative_counter_rollback() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.advance_resource_version_after(20).await.unwrap();
+        db.replace_replicated_resource_state(Vec::new(), 10, None, None, None)
+            .await
+            .expect("authoritative snapshot must replace the local counter");
+        assert_eq!(db.get_current_resource_version().await.unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn committed_apply_v1_multi_mutation_shares_one_rv() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        enable_committed_apply_v1(&db).await;
+        let result = db
+            .apply_raft_log_apply_commit(committed_apply_v1(LogApplyCommit::new(
+                0,
+                vec![
+                    v1_resource("v1-left", "v1-left-uid"),
+                    v1_resource("v1-right", "v1-right-uid"),
+                ],
+            )))
+            .await
+            .unwrap();
+        let rv = result.applied_rv.unwrap();
+        for name in ["v1-left", "v1-right"] {
+            assert_eq!(
+                db.get_resource("v1", "ConfigMap", Some("default"), name)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .resource_version,
+                rv
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raft_apply_stale_ordinary_put_returns_terminal_conflict_without_side_effects() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        enable_committed_apply_v1(&db).await;
+        let created = db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "stale-put",
+                serde_json::json!({"metadata":{"name":"stale-put","namespace":"default","uid":"stale-put-uid"},"data":{"v":"old"}}),
+            )
+            .await
+            .unwrap();
+        let current = db
+            .update_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "stale-put",
+                serde_json::json!({"metadata":{"name":"stale-put","namespace":"default","uid":"stale-put-uid"},"data":{"v":"current"}}),
+                created.resource_version,
+            )
+            .await
+            .unwrap();
+        let rv_before = db.get_current_resource_version().await.unwrap();
+        let watch_before = db
+            .list_resources_modified_since("v1", "ConfigMap", Some("default"), 0)
+            .await
+            .unwrap()
+            .len();
+        let result = db
+            .apply_raft_log_apply_commit(committed_apply_v1(LogApplyCommit::new(
+                0,
+                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".into(), kind: "ConfigMap".into(), namespace: Some("default".into()), name: "stale-put".into(), uid: current.uid.clone(), resource_version: 0,
+                    data: serde_json::json!({"metadata":{"name":"stale-put","namespace":"default","uid":"stale-put-uid"},"data":{"v":"stale"}}),
+                    require_absent: false, require_existing: true, precondition_uid: Some(current.uid), precondition_resource_version: Some(created.resource_version), status_only: false,
+                })],
+            )))
+            .await
+            .unwrap();
+        assert_eq!(result.applied_rv, None);
+        assert!(result.error_message.is_some());
+        assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+        assert_eq!(
+            db.get_resource("v1", "ConfigMap", Some("default"), "stale-put")
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .pointer("/data/v")
+                .and_then(|value| value.as_str()),
+            Some("current")
+        );
+        assert_eq!(
+            db.list_resources_modified_since("v1", "ConfigMap", Some("default"), 0)
+                .await
+                .unwrap()
+                .len(),
+            watch_before
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_apply_stale_ordinary_patch_returns_terminal_conflict_without_side_effects() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        enable_committed_apply_v1(&db).await;
+        let created = db
+            .create_resource("v1", "ConfigMap", Some("default"), "stale-patch", serde_json::json!({"metadata":{"name":"stale-patch","namespace":"default","uid":"stale-patch-uid"},"data":{"v":"old"}}))
+            .await.unwrap();
+        db.update_resource("v1", "ConfigMap", Some("default"), "stale-patch", serde_json::json!({"metadata":{"name":"stale-patch","namespace":"default","uid":"stale-patch-uid"},"data":{"v":"current"}}), created.resource_version).await.unwrap();
+        let rv_before = db.get_current_resource_version().await.unwrap();
+        let watch_before = db
+            .list_resources_modified_since("v1", "ConfigMap", Some("default"), 0)
+            .await
+            .unwrap()
+            .len();
+        let result = db
+            .apply_raft_log_apply_commit(committed_apply_v1(LogApplyCommit::new(
+                0,
+                vec![LogApplyMutation::PatchResourceLatest(
+                    LogApplyResourcePatch {
+                        api_version: "v1".into(),
+                        kind: "ConfigMap".into(),
+                        namespace: Some("default".into()),
+                        name: "stale-patch".into(),
+                        resource_version: 0,
+                        patch_kind: crate::datastore::PatchKind::Merge,
+                        patch: serde_json::json!({"data":{"v":"stale"}}),
+                        require_existing: true,
+                        precondition_uid: Some("stale-patch-uid".into()),
+                        precondition_resource_version: Some(created.resource_version),
+                        terminating_pod_unready_timestamp: None,
+                    },
+                )],
+            )))
+            .await
+            .unwrap();
+        assert_eq!(result.applied_rv, None);
+        assert!(result.error_message.is_some());
+        assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+        assert_eq!(
+            db.get_resource("v1", "ConfigMap", Some("default"), "stale-patch")
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .pointer("/data/v")
+                .and_then(|value| value.as_str()),
+            Some("current")
+        );
+        assert_eq!(
+            db.list_resources_modified_since("v1", "ConfigMap", Some("default"), 0)
+                .await
+                .unwrap()
+                .len(),
+            watch_before
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_apply_stale_ordinary_delete_returns_terminal_conflict_without_side_effects() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        enable_committed_apply_v1(&db).await;
+        let created = db.create_resource("v1", "ConfigMap", Some("default"), "stale-delete", serde_json::json!({"metadata":{"name":"stale-delete","namespace":"default","uid":"stale-delete-uid"}})).await.unwrap();
+        db.update_resource("v1", "ConfigMap", Some("default"), "stale-delete", serde_json::json!({"metadata":{"name":"stale-delete","namespace":"default","uid":"stale-delete-uid"},"data":{"v":"current"}}), created.resource_version).await.unwrap();
+        let rv_before = db.get_current_resource_version().await.unwrap();
+        let watch_before = db
+            .list_resources_modified_since("v1", "ConfigMap", Some("default"), 0)
+            .await
+            .unwrap()
+            .len();
+        let result = db
+            .apply_raft_log_apply_commit(committed_apply_v1(LogApplyCommit::new(
+                0,
+                vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "stale-delete".into(),
+                    uid: "stale-delete-uid".into(),
+                    precondition_resource_version: Some(created.resource_version),
+                })],
+            )))
+            .await
+            .unwrap();
+        assert_eq!(result.applied_rv, None);
+        assert!(result.error_message.is_some());
+        assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+        assert!(
+            db.get_resource("v1", "ConfigMap", Some("default"), "stale-delete")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            db.list_resources_modified_since("v1", "ConfigMap", Some("default"), 0)
+                .await
+                .unwrap()
+                .len(),
+            watch_before
+        );
+    }
+
+    #[tokio::test]
+    async fn raft_apply_stale_status_without_stamp_returns_terminal_conflict_without_side_effects()
+    {
+        let db = Datastore::new_in_memory().await.unwrap();
+        enable_committed_apply_v1(&db).await;
+        let created = db.create_resource("v1", "Pod", Some("default"), "stale-status", serde_json::json!({"metadata":{"name":"stale-status","namespace":"default","uid":"stale-status-uid"},"spec":{"nodeName":"node-a"},"status":{"phase":"Pending"}})).await.unwrap();
+        db.update_resource("v1", "Pod", Some("default"), "stale-status", serde_json::json!({"metadata":{"name":"stale-status","namespace":"default","uid":"stale-status-uid","labels":{"scheduler":"owned"}},"spec":{"nodeName":"node-a"},"status":{"phase":"Running"}}), created.resource_version).await.unwrap();
+        let rv_before = db.get_current_resource_version().await.unwrap();
+        let watch_before = db
+            .list_resources_modified_since("v1", "Pod", Some("default"), 0)
+            .await
+            .unwrap()
+            .len();
+        let result = db.apply_raft_log_apply_commit(committed_apply_v1(LogApplyCommit::new(0, vec![LogApplyMutation::PutResource(LogApplyResourceRow {
+            api_version:"v1".into(), kind:"Pod".into(), namespace:Some("default".into()), name:"stale-status".into(), uid:"stale-status-uid".into(), resource_version:0,
+            data:serde_json::json!({"metadata":{"name":"stale-status","namespace":"default","uid":"stale-status-uid"},"spec":{"nodeName":"node-a"},"status":{"phase":"Failed"}}), require_absent:false, require_existing:true, precondition_uid:Some("stale-status-uid".into()), precondition_resource_version:Some(created.resource_version), status_only:true,
+        })]))).await.unwrap();
+        assert_eq!(result.applied_rv, None);
+        assert!(result.error_message.is_some());
+        assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+        assert_eq!(
+            db.get_resource("v1", "Pod", Some("default"), "stale-status")
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .pointer("/status/phase")
+                .and_then(|v| v.as_str()),
+            Some("Running")
+        );
+        assert_eq!(
+            db.list_resources_modified_since("v1", "Pod", Some("default"), 0)
+                .await
+                .unwrap()
+                .len(),
+            watch_before
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_apply_v1_stale_pod_status_stamp_replay_updates_only_outbox() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        enable_committed_apply_v1(&db).await;
+
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "stamped-status",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "name": "stamped-status",
+                    "namespace": "default",
+                    "uid": "stamped-status-uid"
+                },
+                "status": {"phase": "Pending", "message": "origin"}
+            }),
+        )
+        .await
+        .unwrap();
+
+        let watch_before = db
+            .list_resources_modified_since("v1", "Pod", Some("default"), 0)
+            .await
+            .unwrap()
+            .len();
+
+        let fresh = db
+            .apply_raft_log_apply_commit(committed_apply_v1(pod_status_commit_with_stamp(
+                "fresh",
+                "fresh",
+                200,
+                "stamped-status",
+                "stamped-status-uid",
+            )))
+            .await
+            .unwrap();
+        assert_eq!(fresh.error_message, None);
+        assert!(fresh.applied_rv.is_some());
+
+        let watch_after_fresh = db
+            .list_resources_modified_since("v1", "Pod", Some("default"), 0)
+            .await
+            .unwrap()
+            .len();
+        assert!(watch_after_fresh > watch_before);
+        assert_eq!(
+            db.get_resource("v1", "Pod", Some("default"), "stamped-status")
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .pointer("/status/message")
+                .and_then(|value| value.as_str()),
+            Some("fresh")
+        );
+
+        let stale = db
+            .apply_raft_log_apply_commit(committed_apply_v1(pod_status_commit_with_stamp(
+                "stale",
+                "stale",
+                100,
+                "stamped-status",
+                "stamped-status-uid",
+            )))
+            .await
+            .unwrap();
+        assert_eq!(stale.error_message, None);
+
+        let watch_after_stale = db
+            .list_resources_modified_since("v1", "Pod", Some("default"), 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(watch_after_fresh, watch_after_stale);
+        assert_eq!(
+            db.get_resource("v1", "Pod", Some("default"), "stamped-status")
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .pointer("/status/message")
+                .and_then(|value| value.as_str()),
+            Some("fresh")
+        );
+
+        let same_stamp = db
+            .apply_raft_log_apply_commit(committed_apply_v1(pod_status_commit_with_stamp(
+                "same",
+                "same",
+                200,
+                "stamped-status",
+                "stamped-status-uid",
+            )))
+            .await
+            .unwrap();
+        assert_eq!(same_stamp.error_message, None);
+
+        let watch_after_same_stamp = db
+            .list_resources_modified_since("v1", "Pod", Some("default"), 0)
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(watch_after_stale, watch_after_same_stamp);
+        assert_eq!(
+            db.get_resource("v1", "Pod", Some("default"), "stamped-status")
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .pointer("/status/message")
+                .and_then(|value| value.as_str()),
+            Some("fresh")
+        );
+
+        assert!(
+            db.get_applied_outbox("fresh")
+                .await
+                .unwrap()
+                .expect("fresh stamped outbox row should exist")
+                .status_stamp
+                .is_some_and(|stamp| stamp == 200)
+        );
+        assert!(
+            db.get_applied_outbox("stale")
+                .await
+                .unwrap()
+                .expect("stale stamped outbox row should exist")
+                .status_stamp
+                .is_some_and(|stamp| stamp == 100)
+        );
+        assert!(
+            db.get_applied_outbox("same")
+                .await
+                .unwrap()
+                .expect("same stamped outbox row should exist")
+                .status_stamp
+                .is_some_and(|stamp| stamp == 200)
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_apply_v1_conflict_and_duplicate_do_not_allocate_rv() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        enable_committed_apply_v1(&db).await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "v1-existing",
+            serde_json::json!({"metadata": {"name": "v1-existing", "namespace": "default", "uid": "existing-uid"}}),
+        )
+        .await
+        .unwrap();
+        let before_conflict = db.get_current_resource_version().await.unwrap();
+        let conflict = db
+            .apply_raft_log_apply_commit(committed_apply_v1(LogApplyCommit::new(
+                0,
+                vec![v1_resource("v1-existing", "new-uid")],
+            )))
+            .await
+            .unwrap();
+        assert!(conflict.error_message.is_some());
+        assert_eq!(
+            db.get_current_resource_version().await.unwrap(),
+            before_conflict
+        );
+
+        let outbox = crate::log_apply::LogApplyAppliedOutboxRow {
+            idempotency_key: "v1-duplicate".to_string(),
+            subject_key: "v1/Pod/default/test".to_string(),
+            operation: "PodStatus".to_string(),
+            first_seen_ms: 1,
+            applied_rv: None,
+            result_proto: crate::datastore::command::encode_response_protobuf(
+                &crate::datastore::command::StorageResponse::Ack {
+                    resource_version: 0,
+                },
+            )
+            .unwrap(),
+            status_stamp: None,
+        };
+        let commit = committed_apply_v1(LogApplyCommit::new(
+            0,
+            vec![LogApplyMutation::PutAppliedOutbox(outbox)],
+        ));
+        db.apply_raft_log_apply_commit(commit.clone())
+            .await
+            .unwrap();
+        let before_duplicate = db.get_current_resource_version().await.unwrap();
+        let duplicate = db.apply_raft_log_apply_commit(commit).await.unwrap();
+        assert_eq!(duplicate.applied_rv, Some(before_duplicate));
+        assert_eq!(
+            db.get_current_resource_version().await.unwrap(),
+            before_duplicate
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_assignment_preserves_embedded_rv_and_v1_requires_activation() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        let legacy = LogApplyCommit::new(41, vec![v1_resource("legacy-rv", "legacy-rv-uid")]);
+        let result = db.apply_raft_log_apply_commit(legacy).await.unwrap();
+        assert_eq!(result.applied_rv, Some(41));
+        assert_eq!(db.get_current_resource_version().await.unwrap(), 41);
+
+        let before = db.get_current_resource_version().await.unwrap();
+        let err = db
+            .apply_raft_log_apply_commit(committed_apply_v1(LogApplyCommit::new(
+                0,
+                vec![v1_resource("not-active", "not-active-uid")],
+            )))
+            .await
+            .expect_err("V1 must reject before persisted activation");
+        assert!(err.to_string().contains("not activated"));
+        assert_eq!(db.get_current_resource_version().await.unwrap(), before);
+    }
 
     fn subnet_commit(resource_version: i64, node_name: &str, subnet: Ipv4Addr) -> LogApplyCommit {
         LogApplyCommit::new(
@@ -1367,9 +2172,9 @@ mod tests {
 
     /// A committed PUT with require_existing=true on a row that is absent on the follower
     /// returns a terminal "404 Not Found" result because require_existing is a structural
-    /// API invariant (not a staleness-related precondition) and is preserved in the raft
-    /// authoritative apply path. Staleness-related preconditions (precondition_rv /
-    /// precondition_uid) are bypassed by the raft path.
+    /// API invariant. `LegacyFollowerReplay` retains this presence check while
+    /// bypassing stale UID/resourceVersion preconditions; `StrictCommittedApply`
+    /// enforces both the structural and full UID/resourceVersion conditions.
     #[tokio::test]
     async fn raft_apply_missing_required_resource_returns_terminal_result() {
         let db = crate::datastore::test_support::in_memory().await;
@@ -1608,6 +2413,121 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(watch_data, leader_watch_row.to_string());
+    }
+
+    #[tokio::test]
+    async fn apply_log_apply_commit_replays_explicit_watch_payload_without_synthesizing() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let explicit_payload = serde_json::json!({
+            "type": "ADDED",
+            "object": {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "explicit-watch-payload",
+                    "namespace": "default",
+                    "uid": "explicit-watch-payload-uid"
+                },
+                "data": {
+                    "state": "raw"
+                }
+            }
+        });
+        let expected_watch_payload = explicit_payload.clone();
+
+        db.apply_log_apply_commit(LogApplyCommit::new(
+            11,
+            vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                event_id: None,
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "explicit-watch-payload".to_string(),
+                resource_version: 11,
+                event_type: "ADDED".to_string(),
+                data: explicit_payload,
+            })],
+        ))
+        .await
+        .unwrap();
+
+        let watch_data: Vec<u8> = db
+            .db_call("test_explicit_watch_event_no_synthesizing", |conn| {
+                Ok(conn.query_row(
+                    "SELECT data FROM watch_events WHERE resource_version = ?1",
+                    rusqlite::params![11],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            watch_data,
+            serde_json::to_vec(&expected_watch_payload).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_apply_v1_watch_event_payload_hydrates_only_resource_shape_events() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        enable_committed_apply_v1(&db).await;
+
+        let resource_shape_payload = serde_json::json!({
+            "metadata": {
+                "name": "v1-watch-resource-shape",
+                "namespace": "default",
+                "uid": "v1-watch-resource-shape-uid"
+            },
+            "data": {"state": "seed"},
+        });
+
+        let result = db
+            .apply_raft_log_apply_commit(committed_apply_v1(LogApplyCommit::new(
+                0,
+                vec![LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                    event_id: None,
+                    api_version: "v1".to_string(),
+                    kind: "ConfigMap".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "v1-watch-resource-shape".to_string(),
+                    resource_version: 0,
+                    event_type: "ADDED".to_string(),
+                    data: resource_shape_payload,
+                })],
+            )))
+            .await
+            .unwrap();
+        let applied_rv = result
+            .applied_rv
+            .expect("applied watch event should allocate RV");
+
+        let watch_data: Vec<u8> = db
+            .db_call(
+                "test_committed_watch_event_resource_shape_hydrates",
+                move |conn| {
+                    Ok(conn.query_row(
+                        "SELECT data FROM watch_events WHERE resource_version = ?1",
+                        rusqlite::params![applied_rv],
+                        |row| row.get(0),
+                    )?)
+                },
+            )
+            .await
+            .unwrap();
+
+        let hydrated = serde_json::to_vec(&serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "v1-watch-resource-shape",
+                "namespace": "default",
+                "uid": "v1-watch-resource-shape-uid",
+                "resourceVersion": applied_rv.to_string()
+            },
+            "data": {"state": "seed"},
+        }))
+        .unwrap();
+        assert_eq!(watch_data, hydrated);
     }
 
     // ── Task 1: Committed Raft Apply Authoritative Over Stale Follower State ─────────────────
@@ -2829,84 +3749,6 @@ mod tests {
         assert!(
             second.error_message.is_none(),
             "idempotent re-apply must not set error_message: {second:?}"
-        );
-    }
-
-    /// An apply conflict (local diverges from committed) must be observable: the result must NOT
-    /// carry error_message (swallowing the divergence), and the row must be reconciled.
-    #[tokio::test]
-    async fn apply_conflict_is_observable_not_silently_successful() {
-        let db = crate::datastore::test_support::in_memory().await;
-        db.create_resource(
-            "v1",
-            "ConfigMap",
-            Some("default"),
-            "observable-cm",
-            serde_json::json!({
-                "apiVersion": "v1",
-                "kind": "ConfigMap",
-                "metadata": {
-                    "name": "observable-cm",
-                    "namespace": "default",
-                    "uid": "cm-obs"
-                },
-                "data": {"state": "stale"}
-            }),
-        )
-        .await
-        .unwrap();
-        // Committed PUT with precondition_rv=999 (mismatch with local rv=1).
-        // Old behavior: swallowed as error_message, stale row unchanged.
-        // New behavior: row reconciled to committed value, no error_message.
-        let conflicts_before = RAFT_AUTHORITATIVE_APPLY_CONFLICTS_TOTAL.load(Ordering::Relaxed);
-        let result = db
-            .apply_raft_log_apply_commit(LogApplyCommit::new(
-                90,
-                vec![LogApplyMutation::PutResource(LogApplyResourceRow {
-                    api_version: "v1".to_string(),
-                    kind: "ConfigMap".to_string(),
-                    namespace: Some("default".to_string()),
-                    name: "observable-cm".to_string(),
-                    uid: "cm-obs".to_string(),
-                    resource_version: 90,
-                    data: serde_json::json!({
-                        "apiVersion": "v1",
-                        "kind": "ConfigMap",
-                        "metadata": {
-                            "name": "observable-cm",
-                            "namespace": "default",
-                            "uid": "cm-obs",
-                            "resourceVersion": "90"
-                        },
-                        "data": {"state": "authoritative"}
-                    }),
-                    require_absent: false,
-                    require_existing: false,
-                    precondition_uid: Some("cm-obs".to_string()),
-                    precondition_resource_version: Some(999),
-                    status_only: false,
-                })],
-            ))
-            .await
-            .unwrap();
-        // The conflict must NOT be silently swallowed as error_message — the committed value wins.
-        assert!(
-            result.error_message.is_none(),
-            "conflict must be reconciled (not swallowed as error_message): {result:?}"
-        );
-        assert!(
-            RAFT_AUTHORITATIVE_APPLY_CONFLICTS_TOTAL.load(Ordering::Relaxed) > conflicts_before,
-            "authoritative apply conflict must increment the observability counter"
-        );
-        let row = db
-            .get_resource("v1", "ConfigMap", Some("default"), "observable-cm")
-            .await
-            .unwrap()
-            .expect("row must exist after authoritative PUT");
-        assert_eq!(
-            row.data.pointer("/data/state").and_then(|v| v.as_str()),
-            Some("authoritative"),
-            "row must reflect the committed value after conflict reconciliation"
         );
     }
 

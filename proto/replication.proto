@@ -246,6 +246,7 @@ message MetadataResponse {
   int64 leader_epoch = 2;
   int64 current_rv = 3;
   int64 current_log_index = 4;
+  uint64 supported_features = 5;
 }
 
 message ClusterMembershipRequest {}
@@ -542,6 +543,7 @@ message JoinAsControlplaneRequest {
   // node_registration. New clients send git_commit inside the typed snapshot.
   string node_git_commit = 11;
   NodeRegistrationSnapshot node_registration = 12;
+  uint64 supported_features = 13;
 }
 
 // Joiner-owned host facts used to construct the joining node's Kubernetes

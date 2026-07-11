@@ -91,10 +91,10 @@ mod tests {
     use serde_json::json;
 
     use crate::replication::grpc::generated::{
-        DataplanePeer, FollowerMessage, JoinAccepted, JoinRequest, JoinRole, LeaderMessage,
-        MetadataRequest, MetadataResponse, NodeExecRequest, NodeExecStreamFrame,
-        ObserveLeaderEndpointRequest, ObservedLeaderEndpoint, ReplicationEntry, StreamAck,
-        follower_message, leader_message,
+        DataplanePeer, FollowerMessage, JoinAccepted, JoinAsControlplaneRequest, JoinRequest,
+        JoinRole, LeaderMessage, MetadataRequest, MetadataResponse, NodeExecRequest,
+        NodeExecStreamFrame, ObserveLeaderEndpointRequest, ObservedLeaderEndpoint,
+        ReplicationEntry, StreamAck, follower_message, leader_message,
     };
     use crate::{
         datastore::command::{COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand},
@@ -120,6 +120,49 @@ mod tests {
             super::watch_replay_position_from_proto(&invalid),
             crate::datastore::WatchReplayPosition::default(),
             "untrusted wire cursors must be normalized to non-negative values"
+        );
+    }
+
+    #[test]
+    fn metadata_supported_features_defaults_to_zero_and_round_trips_v1() {
+        let legacy = MetadataResponse {
+            cluster_id: "legacy".to_string(),
+            leader_epoch: 1,
+            current_rv: 2,
+            current_log_index: 3,
+            supported_features: 0,
+        };
+        let legacy_bytes = legacy.encode_to_vec();
+        assert_eq!(
+            MetadataResponse::decode(legacy_bytes.as_slice())
+                .unwrap()
+                .supported_features,
+            0
+        );
+
+        let v1 = MetadataResponse {
+            supported_features: crate::replication::protocol::COMMITTED_APPLY_RV_V1,
+            ..legacy
+        };
+        assert_eq!(
+            MetadataResponse::decode(v1.encode_to_vec().as_slice())
+                .unwrap()
+                .supported_features,
+            crate::replication::protocol::COMMITTED_APPLY_RV_V1
+        );
+    }
+
+    #[test]
+    fn join_controlplane_supported_features_round_trip() {
+        let request = JoinAsControlplaneRequest {
+            supported_features: crate::replication::protocol::COMMITTED_APPLY_RV_V1,
+            ..Default::default()
+        };
+        assert_eq!(
+            JoinAsControlplaneRequest::decode(request.encode_to_vec().as_slice())
+                .unwrap()
+                .supported_features,
+            crate::replication::protocol::COMMITTED_APPLY_RV_V1
         );
     }
 
@@ -212,6 +255,7 @@ mod tests {
             leader_epoch: 1,
             current_rv: 42,
             current_log_index: 7,
+            supported_features: crate::replication::protocol::COMMITTED_APPLY_RV_V1,
         };
         let entry = ReplicationEntry {
             command_protobuf: vec![1, 2, 3],

@@ -1054,6 +1054,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             leader_epoch: metadata.leader_epoch,
             current_rv: metadata.current_rv,
             current_log_index: metadata.current_log_index,
+            supported_features: metadata.supported_features,
         }))
     }
 
@@ -1776,6 +1777,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     addr: raft_addr,
                     node_name: req.node_name,
                     as_learner: req.as_learner,
+                    supported_features: req.supported_features,
                     node_internal_ip,
                     node_registration,
                     legacy_node_git_commit: Some(req.node_git_commit)
@@ -3520,6 +3522,7 @@ mod tests {
                 addr,
                 node_name,
                 as_learner,
+                supported_features: _,
                 node_internal_ip,
                 node_registration,
                 legacy_node_git_commit,
@@ -4494,6 +4497,7 @@ mod tests {
                 node_internal_ip: "172.31.50.2".to_string(),
                 node_git_commit: "testhash1".to_string(),
                 node_registration: Some(test_node_registration_proto("testhash1")),
+                supported_features: 0,
             },
             "worker-1",
         );
@@ -4539,6 +4543,7 @@ mod tests {
             node_internal_ip: "172.31.20.2".to_string(),
             node_git_commit: "testhash2".to_string(),
             node_registration: Some(test_node_registration_proto("testhash2")),
+            supported_features: 0,
         };
 
         let mut mismatched_id = join_request.clone();
@@ -4894,6 +4899,7 @@ mod tests {
             node_internal_ip: "172.31.20.2".to_string(),
             node_git_commit: "testhash3".to_string(),
             node_registration: None,
+            supported_features: 0,
         });
 
         let response = client
@@ -4950,6 +4956,7 @@ mod tests {
             node_internal_ip: "172.31.14.2".to_string(),
             node_git_commit: "joinhash1".to_string(),
             node_registration: Some(test_node_registration_proto("joinhash1")),
+            supported_features: 0,
         });
 
         let response = client

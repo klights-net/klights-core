@@ -843,6 +843,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let node_lease_tracker = ds.node_lease_tracker;
     let control_plane_lease_client = ds.control_plane_lease_client;
     let raft_node = ds.raft_node;
+    let member_feature_probe = ds.member_feature_probe;
     if let Some(rn) = raft_node.as_ref() {
         let metrics = rn.raft.metrics().borrow().clone();
         tracing::info!(
@@ -962,6 +963,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         node_mode: &node_mode,
         node_ip: &node_ip,
         leader_election: leader_election.clone(),
+        member_feature_probe,
         skip_seed_bootstrap: ds.skip_seed_bootstrap,
         db_handle: &db_handle,
         kubelet_db_handle: &kubelet_db_handle,

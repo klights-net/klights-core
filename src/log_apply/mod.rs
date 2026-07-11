@@ -21,9 +21,30 @@ pub use mutation::*;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogApplyCommit {
     pub resource_version: i64,
+    /// Missing fields from pre-envelope JSON/protobuf payloads decode to the
+    /// legacy leader-assigned behavior.
+    #[serde(default)]
+    pub resource_version_assignment: ResourceVersionAssignment,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outbox_watermark: Option<OutboxStreamWatermark>,
     pub mutations: Vec<LogApplyMutation>,
+}
+
+/// Wire-stable source of a replicated commit's public resourceVersion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResourceVersionAssignment {
+    #[default]
+    LegacyLeaderAssigned,
+    CommittedApplyV1,
+}
+
+impl ResourceVersionAssignment {
+    pub const fn as_metadata_value(self) -> &'static str {
+        match self {
+            Self::LegacyLeaderAssigned => "legacy_leader_assigned",
+            Self::CommittedApplyV1 => "committed_apply_v1",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +58,7 @@ impl LogApplyCommit {
     pub fn new(resource_version: i64, mutations: Vec<LogApplyMutation>) -> Self {
         Self {
             resource_version,
+            resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
             outbox_watermark: None,
             mutations,
         }
@@ -45,6 +67,7 @@ impl LogApplyCommit {
     pub fn from_cluster_mutations(resource_version: i64, mutations: Vec<ClusterMutation>) -> Self {
         Self {
             resource_version,
+            resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
             outbox_watermark: None,
             mutations: mutations
                 .into_iter()
@@ -214,6 +237,53 @@ impl LogApplyCommit {
             resource_version,
             vec![LogApplyMutation::PutPodCleanupIntent(row.into())],
         )
+    }
+
+    /// Validate a live replicated commit before state-machine apply.
+    pub fn validate_live_resource_version_assignment(&self) -> Result<()> {
+        match self.resource_version_assignment {
+            ResourceVersionAssignment::LegacyLeaderAssigned if self.resource_version > 0 => Ok(()),
+            ResourceVersionAssignment::LegacyLeaderAssigned => {
+                anyhow::bail!("legacy leader-assigned live commit requires resourceVersion > 0")
+            }
+            ResourceVersionAssignment::CommittedApplyV1 if self.resource_version == 0 => Ok(()),
+            ResourceVersionAssignment::CommittedApplyV1 => {
+                anyhow::bail!("committed-apply-v1 live commit requires resourceVersion == 0")
+            }
+        }
+    }
+
+    /// Exact snapshot replay preserves historical RVs and never restamps them.
+    pub fn validate_snapshot_restore_resource_version_assignment(&self) -> Result<()> {
+        if self.resource_version_assignment != ResourceVersionAssignment::LegacyLeaderAssigned {
+            anyhow::bail!(
+                "snapshot restore requires legacy leader-assigned resourceVersion envelope"
+            );
+        }
+        Ok(())
+    }
+
+    /// Convert a proposal-time command materialization into a V1 template.
+    /// Preconditions are deliberately retained; every output RV is assigned
+    /// once by the committed SQLite Raft apply transaction.
+    pub fn into_committed_apply_v1_template(mut self) -> Self {
+        self.resource_version_assignment = ResourceVersionAssignment::CommittedApplyV1;
+        self.resource_version = 0;
+        for mutation in &mut self.mutations {
+            match mutation {
+                LogApplyMutation::PutResource(row) => row.resource_version = 0,
+                LogApplyMutation::PatchResourceLatest(row) => row.resource_version = 0,
+                LogApplyMutation::PutNamespace(row) => row.resource_version = 0,
+                LogApplyMutation::PutWatchEvent(row) => row.resource_version = 0,
+                LogApplyMutation::PutPodCleanupIntent(row) => row.resource_version = 0,
+                LogApplyMutation::PutAppliedOutbox(row) => row.applied_rv = None,
+                LogApplyMutation::AdvanceResourceVersion { resource_version } => {
+                    *resource_version = 0
+                }
+                _ => {}
+            }
+        }
+        self
     }
 }
 
@@ -489,6 +559,7 @@ pub fn decode_commit_json(bytes: &[u8]) -> Result<LogApplyCommit> {
         .map(LogApplyMutation::try_from)
         .collect::<Result<Vec<_>>>()?;
     let mut commit = LogApplyCommit::new(versioned.resource_version, mutations);
+    commit.resource_version_assignment = versioned.resource_version_assignment;
     commit.outbox_watermark = versioned.outbox_watermark;
     crate::datastore::diagnostics::log_slow_log_apply_decode(
         "json_legacy",
@@ -503,6 +574,8 @@ pub fn decode_commit_json(bytes: &[u8]) -> Result<LogApplyCommit> {
 #[derive(Deserialize)]
 struct VersionedLogApplyCommit {
     resource_version: i64,
+    #[serde(default)]
+    resource_version_assignment: ResourceVersionAssignment,
     #[serde(default)]
     outbox_watermark: Option<OutboxStreamWatermark>,
     mutations: Vec<VersionedClusterMutation>,
@@ -535,6 +608,14 @@ struct ProtoLogApplyCommit {
     mutations: Vec<ProtoLogApplyMutation>,
     #[prost(message, optional, tag = "3")]
     outbox_watermark: Option<ProtoOutboxStreamWatermark>,
+    #[prost(enumeration = "ProtoResourceVersionAssignment", tag = "4")]
+    resource_version_assignment: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, prost::Enumeration)]
+enum ProtoResourceVersionAssignment {
+    LegacyLeaderAssigned = 0,
+    CommittedApplyV1 = 1,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -857,6 +938,14 @@ impl From<LogApplyCommit> for ProtoLogApplyCommit {
             resource_version: commit.resource_version,
             mutations: commit.mutations.into_iter().map(Into::into).collect(),
             outbox_watermark: commit.outbox_watermark.map(Into::into),
+            resource_version_assignment: match commit.resource_version_assignment {
+                ResourceVersionAssignment::LegacyLeaderAssigned => {
+                    ProtoResourceVersionAssignment::LegacyLeaderAssigned as i32
+                }
+                ResourceVersionAssignment::CommittedApplyV1 => {
+                    ProtoResourceVersionAssignment::CommittedApplyV1 as i32
+                }
+            },
         }
     }
 }
@@ -865,8 +954,19 @@ impl TryFrom<ProtoLogApplyCommit> for LogApplyCommit {
     type Error = anyhow::Error;
 
     fn try_from(proto: ProtoLogApplyCommit) -> Result<Self> {
+        let resource_version_assignment =
+            ProtoResourceVersionAssignment::try_from(proto.resource_version_assignment)
+                .map_err(|value| anyhow::anyhow!("unknown resourceVersion assignment: {value}"))?;
         Ok(Self {
             resource_version: proto.resource_version,
+            resource_version_assignment: match resource_version_assignment {
+                ProtoResourceVersionAssignment::LegacyLeaderAssigned => {
+                    ResourceVersionAssignment::LegacyLeaderAssigned
+                }
+                ProtoResourceVersionAssignment::CommittedApplyV1 => {
+                    ResourceVersionAssignment::CommittedApplyV1
+                }
+            },
             outbox_watermark: proto.outbox_watermark.map(Into::into),
             mutations: proto
                 .mutations
@@ -1635,6 +1735,81 @@ mod parity_tests {
                 "{label}: JSON and protobuf decoded into different values"
             );
         }
+    }
+
+    #[test]
+    fn old_json_and_protobuf_commits_default_to_legacy_assignment() {
+        let old_json = br#"{"resource_version":9,"mutations":[]}"#;
+        let from_json = decode_commit_json(old_json).expect("decode old JSON commit");
+        assert_eq!(
+            from_json.resource_version_assignment,
+            ResourceVersionAssignment::LegacyLeaderAssigned
+        );
+
+        // The enum's zero value is omitted by protobuf, matching payloads
+        // written before tag 4 existed.
+        let old_proto = ProtoLogApplyCommit {
+            resource_version: 9,
+            mutations: Vec::new(),
+            outbox_watermark: None,
+            resource_version_assignment: 0,
+        }
+        .encode_to_vec();
+        let from_proto = decode_commit_protobuf(&old_proto).expect("decode old protobuf commit");
+        assert_eq!(
+            from_proto.resource_version_assignment,
+            ResourceVersionAssignment::LegacyLeaderAssigned
+        );
+    }
+
+    #[test]
+    fn committed_apply_v1_round_trips_json_and_protobuf() {
+        let mut commit = LogApplyCommit::new(0, Vec::new());
+        commit.resource_version_assignment = ResourceVersionAssignment::CommittedApplyV1;
+        assert_eq!(
+            decode_commit_json(&encode_commit_json(&commit).unwrap()).unwrap(),
+            commit
+        );
+        assert_eq!(
+            decode_commit_protobuf(&encode_commit_protobuf(&commit).unwrap()).unwrap(),
+            commit
+        );
+    }
+
+    #[test]
+    fn resource_version_assignment_rejects_invalid_live_and_snapshot_combinations() {
+        let legacy_zero = LogApplyCommit::new(0, Vec::new());
+        assert!(
+            legacy_zero
+                .validate_live_resource_version_assignment()
+                .is_err()
+        );
+
+        let mut v1_positive = LogApplyCommit::new(1, Vec::new());
+        v1_positive.resource_version_assignment = ResourceVersionAssignment::CommittedApplyV1;
+        assert!(
+            v1_positive
+                .validate_live_resource_version_assignment()
+                .is_err()
+        );
+        assert!(
+            v1_positive
+                .validate_snapshot_restore_resource_version_assignment()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_replay_preserves_assigned_resource_version() {
+        let commit = LogApplyCommit::new(73, Vec::new());
+        commit
+            .validate_snapshot_restore_resource_version_assignment()
+            .expect("legacy snapshot commit is preserved");
+        assert_eq!(commit.resource_version, 73);
+        assert_eq!(
+            commit.resource_version_assignment,
+            ResourceVersionAssignment::LegacyLeaderAssigned
+        );
     }
 
     #[test]

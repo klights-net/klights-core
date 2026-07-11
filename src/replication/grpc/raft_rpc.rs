@@ -77,6 +77,7 @@ pub struct ControlplaneJoinRequest {
     pub addr: String,
     pub node_name: String,
     pub as_learner: bool,
+    pub supported_features: u64,
     pub node_internal_ip: Option<String>,
     pub node_registration: Option<RemoteNodeRegistrationSnapshot>,
     /// Rolling-upgrade compatibility for a persisted member whose request

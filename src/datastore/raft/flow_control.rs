@@ -24,6 +24,13 @@ pub struct RaftCommitFlowControl {
     priority_in_flight: usize,
 }
 
+/// RAII drain of every proposal lane. Holding this guard prevents new normal
+/// and priority proposals while all previously acquired permits have drained.
+pub struct RaftCommitFlowControlDrain {
+    _normal: Vec<OwnedSemaphorePermit>,
+    _priority: OwnedSemaphorePermit,
+}
+
 impl RaftCommitFlowControl {
     pub fn new(max_in_flight: usize) -> Self {
         let priority_in_flight = usize::from(max_in_flight > 0);
@@ -47,6 +54,24 @@ impl RaftCommitFlowControl {
             .acquire_owned()
             .await
             .expect("flow-control semaphore must not be closed")
+    }
+
+    /// Exclusively drain normal and priority proposal lanes. This is a
+    /// one-shot semaphore wait, not a polling loop; the returned guard keeps
+    /// both lanes closed until the caller releases it.
+    pub async fn acquire_exclusive_drain(&self) -> RaftCommitFlowControlDrain {
+        let mut normal = Vec::with_capacity(self.max_in_flight);
+        for _ in 0..self.max_in_flight {
+            normal.push(self.acquire().await);
+        }
+        let priority = Arc::clone(&self.priority_semaphore)
+            .acquire_owned()
+            .await
+            .expect("priority flow-control semaphore must not be closed");
+        RaftCommitFlowControlDrain {
+            _normal: normal,
+            _priority: priority,
+        }
     }
 
     /// Attempt to acquire a permit without waiting. Returns None if all permits are in use.
@@ -135,5 +160,41 @@ mod tests {
 
         drop(priority);
         assert_eq!(fc.available_reserved_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn exclusive_drain_waits_for_inflight_and_blocks_new_proposals() {
+        let fc = Arc::new(RaftCommitFlowControl::new(1));
+        let inflight = fc.acquire().await;
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let drain_fc = fc.clone();
+        let drain = tokio::spawn(async move {
+            let guard = drain_fc.acquire_exclusive_drain().await;
+            drained_tx.send(()).unwrap();
+            let _ = release_rx.await;
+            drop(guard);
+        });
+
+        assert!(
+            fc.try_acquire().is_none(),
+            "inflight proposal occupies normal lane"
+        );
+        drop(inflight);
+        drained_rx.await.unwrap();
+        assert!(
+            fc.try_acquire().is_none(),
+            "exclusive drain blocks normal proposal"
+        );
+        assert!(
+            fc.try_acquire_priority().is_none(),
+            "exclusive drain blocks priority proposal"
+        );
+        release_tx.send(()).unwrap();
+        drain.await.unwrap();
+        assert!(
+            fc.try_acquire().is_some(),
+            "normal lane reopens after drain release"
+        );
     }
 }

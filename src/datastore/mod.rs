@@ -19,6 +19,7 @@ pub(crate) mod position_membership;
 pub mod raft;
 pub mod redb;
 pub mod replicated;
+pub mod resource_version_assignment;
 pub mod selector;
 pub mod snapshot;
 pub mod sqlite;

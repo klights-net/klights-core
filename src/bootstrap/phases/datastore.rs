@@ -47,6 +47,8 @@ pub struct DatastorePhase {
     /// ControlplaneJoinHandler — Step E) can subscribe to its state.
     /// `None` for non-raft leader topology boots or workers.
     pub raft_node: Option<Arc<crate::datastore::raft::node::RaftNode>>,
+    pub member_feature_probe:
+        Option<Arc<crate::bootstrap::raft_transport::ReplicationGrpcMemberFeatureProbe>>,
     /// True when this leader-class boot is a joining Raft controlplane.
     /// Later phases use this to skip seed-only bootstrap writes (default
     /// namespaces, RBAC, node registration) because raft delivers that
@@ -201,6 +203,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // a RaftNode. Single-node deployments run a single-voter raft cluster
     // (quorum = 1). Workers use SingleNode and route writes through the
     // outbox/leader proxy.
+    let member_feature_probe;
     let raft_node = match (role, node_local_sqlite.as_ref()) {
         (r, Some(sqlite)) if uses_leader_runtime(r) => {
             let node_id =
@@ -248,9 +251,15 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             let raft_factory = Arc::new(
                 crate::bootstrap::raft_transport::ReplicationGrpcRaftClientFactory::new(
                     supervisor.clone(),
-                    raft_template,
+                    raft_template.clone(),
                 ),
             );
+            member_feature_probe = Some(Arc::new(
+                crate::bootstrap::raft_transport::ReplicationGrpcMemberFeatureProbe::new(
+                    supervisor.clone(),
+                    raft_template,
+                ),
+            ));
             let is_join = matches!(
                 role,
                 crate::bootstrap::NodeRole::Controlplane { leader_endpoints, .. }
@@ -564,7 +573,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             }
             Some(raft)
         }
-        _ => None,
+        _ => {
+            member_feature_probe = None;
+            None
+        }
     };
 
     let outbox = {
@@ -672,6 +684,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         outbox,
         node_lease_tracker,
         raft_node,
+        member_feature_probe,
         skip_seed_bootstrap,
         control_plane_lease_client: remote_parts.lease_client,
     })
