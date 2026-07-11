@@ -258,7 +258,8 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                     cluster_id: String::new(),
                     leader_epoch: 0,
                     membership: None,
-                    resource_version_assignment_mode: Some(data.resource_version_assignment_mode),
+                    resource_version_assignment_mode: None,
+                    snapshot_assignment_mode: Some(data.resource_version_assignment_mode),
                 }),
             )
             .await

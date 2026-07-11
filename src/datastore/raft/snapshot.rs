@@ -39,8 +39,12 @@ pub struct RaftSnapshotData {
     pub current_rv: i64,
     /// Persisted assignment protocol. Missing from legacy envelopes means the
     /// historical leader-assigned RV behavior.
-    #[serde(default)]
-    pub resource_version_assignment_mode: crate::log_apply::ResourceVersionAssignment,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::datastore::resource_version_assignment::SnapshotAssignmentMode::is_absent_legacy"
+    )]
+    pub resource_version_assignment_mode:
+        crate::datastore::resource_version_assignment::SnapshotAssignmentMode,
     /// Durable watch-log allocator boundary. `None` identifies snapshots
     /// written by peers predating apply-order event IDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,7 +132,12 @@ impl RaftSnapshotData {
         encoder.write_all(b",\"current_rv\":")?;
         serde_json::to_writer(&mut encoder, &replay_position.resource_version)?;
         encoder.write_all(b",\"resource_version_assignment_mode\":")?;
-        serde_json::to_writer(&mut encoder, &resource_version_assignment_mode)?;
+        serde_json::to_writer(
+            &mut encoder,
+            &crate::datastore::resource_version_assignment::SnapshotAssignmentMode::explicit(
+                resource_version_assignment_mode,
+            ),
+        )?;
         encoder.write_all(b",\"watch_event_high_water\":")?;
         serde_json::to_writer(&mut encoder, &snapshot_position.event_id)?;
         encoder.write_all(b",\"watch_replay_floors\":")?;
@@ -300,13 +309,15 @@ mod tests {
         let decoded = RaftSnapshotData::deserialize_from_bytes(&snapshot.into_inner()).unwrap();
         assert_eq!(
             decoded.resource_version_assignment_mode,
-            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+            crate::datastore::resource_version_assignment::SnapshotAssignmentMode::Explicit(
+                crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+            )
         );
 
         let restored = test_support::in_memory().await;
         crate::datastore::resource_version_assignment::write_resource_version_assignment_mode(
             &restored,
-            decoded.resource_version_assignment_mode,
+            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1,
         )
         .await
         .unwrap();
@@ -339,7 +350,7 @@ mod tests {
         assert_eq!(decoded.watch_replay_floors, None);
         assert_eq!(
             decoded.resource_version_assignment_mode,
-            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
+            crate::datastore::resource_version_assignment::SnapshotAssignmentMode::AbsentLegacySnapshot
         );
     }
 }

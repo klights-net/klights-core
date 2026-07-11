@@ -65,6 +65,35 @@ fn replace_resource_state_in_conn(
     }
 
     let tx = conn.transaction()?;
+    let snapshot_assignment_mode = metadata.as_ref().and_then(|metadata| {
+        metadata.snapshot_assignment_mode.or_else(|| {
+            metadata.resource_version_assignment_mode.map(
+                crate::datastore::resource_version_assignment::SnapshotAssignmentMode::explicit,
+            )
+        })
+    });
+    let decided_snapshot_assignment_mode = snapshot_assignment_mode
+        .map(|source| {
+            crate::datastore::resource_version_assignment::decide_snapshot_assignment_mode(
+                Datastore::resource_version_assignment_mode_in_tx(&tx)?,
+                source,
+            )
+            .map_err(|error| other_error(error.to_string()))
+        })
+        .transpose()?;
+    // Apply the accepted mode before replaying snapshot commits. A V1
+    // snapshot may itself contain V1 commits, whose apply validation requires
+    // the persisted mode to be active. This remains in the replacement
+    // transaction, so a later restore failure rolls the transition back too.
+    if let Some(mode) = decided_snapshot_assignment_mode {
+        tx.execute(
+            queries::UPSERT_KLIGHTS_META,
+            rusqlite::params![
+                crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+                mode.as_metadata_value()
+            ],
+        )?;
+    }
     tx.execute(queries::REPLACE_STATE_DELETE_WATCH_EVENTS, [])?;
     tx.execute("DELETE FROM watch_replay_floors", [])?;
     // Snapshot replacement is authoritative. Reset the local allocator before
@@ -209,15 +238,6 @@ fn replace_resource_state_in_conn(
             tx.execute(
                 queries::UPSERT_KLIGHTS_META,
                 rusqlite::params![KEY_LEADER_EPOCH, metadata.leader_epoch.to_string()],
-            )?;
-        }
-        if let Some(mode) = metadata.resource_version_assignment_mode {
-            tx.execute(
-                queries::UPSERT_KLIGHTS_META,
-                rusqlite::params![
-                    crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
-                    mode.as_metadata_value()
-                ],
             )?;
         }
         if let Some(membership) = metadata.membership {
@@ -1061,11 +1081,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_replace_persists_v1_mode_and_preserves_legacy_rows() {
+    async fn snapshot_replace_activates_v1_before_replaying_v1_commits() {
         let db = Datastore::new_in_memory().await.unwrap();
-        let legacy = LogApplyCommit::new(10, vec![v1_resource("snapshot-legacy", "snapshot-uid")]);
+        let mut resource = v1_resource("snapshot-v1", "snapshot-uid");
+        if let LogApplyMutation::PutResource(row) = &mut resource {
+            row.resource_version = 10;
+        }
+        let snapshot_commit = committed_apply_v1(LogApplyCommit::new(10, vec![resource]));
         db.replace_replicated_resource_state(
-            vec![legacy],
+            vec![snapshot_commit],
             10,
             None,
             None,
@@ -1074,6 +1098,7 @@ mod tests {
                 leader_epoch: 0,
                 membership: None,
                 resource_version_assignment_mode: Some(ResourceVersionAssignment::CommittedApplyV1),
+                snapshot_assignment_mode: None,
             }),
         )
         .await
@@ -1087,7 +1112,7 @@ mod tests {
             ResourceVersionAssignment::CommittedApplyV1
         );
         assert_eq!(
-            db.get_resource("v1", "ConfigMap", Some("default"), "snapshot-legacy")
+            db.get_resource("v1", "ConfigMap", Some("default"), "snapshot-v1")
                 .await
                 .unwrap()
                 .unwrap()
@@ -1102,6 +1127,158 @@ mod tests {
             .await
             .unwrap();
         assert!(applied.applied_rv.unwrap() > 10);
+    }
+
+    #[tokio::test]
+    async fn snapshot_replace_rejects_absent_legacy_mode_without_mutating_v1_state() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        crate::datastore::resource_version_assignment::write_resource_version_assignment_mode(
+            &db,
+            ResourceVersionAssignment::CommittedApplyV1,
+        )
+        .await
+        .unwrap();
+        let created = db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "v1-must-not-downgrade",
+                serde_json::json!({
+                    "metadata": {"name": "v1-must-not-downgrade", "namespace": "default"},
+                    "data": {"preserved": "true"}
+                }),
+            )
+            .await
+            .unwrap();
+        let before_rv = db.get_current_resource_version().await.unwrap();
+        let before_events = db
+            .list_resources_modified_since("v1", "ConfigMap", Some("default"), 0)
+            .await
+            .unwrap();
+
+        let error = db
+            .replace_replicated_resource_state(
+                Vec::new(),
+                before_rv,
+                Some(before_events.len() as i64),
+                Some(Vec::new()),
+                Some(ReplicatedSnapshotMetadata {
+                    cluster_id: String::new(),
+                    leader_epoch: 0,
+                    membership: None,
+                    resource_version_assignment_mode: None,
+                    snapshot_assignment_mode: Some(
+                        crate::datastore::resource_version_assignment::SnapshotAssignmentMode::AbsentLegacySnapshot,
+                    ),
+                }),
+            )
+            .await
+            .expect_err("a V1 destination must reject an absent-mode legacy snapshot");
+        assert!(error.to_string().contains("cannot downgrade"));
+        assert_eq!(
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                &db
+            )
+            .await
+            .unwrap(),
+            ResourceVersionAssignment::CommittedApplyV1
+        );
+        assert_eq!(db.get_current_resource_version().await.unwrap(), before_rv);
+        assert_eq!(
+            db.get_resource("v1", "ConfigMap", Some("default"), "v1-must-not-downgrade")
+                .await
+                .unwrap()
+                .unwrap()
+                .resource_version,
+            created.resource_version
+        );
+        let after_events = db
+            .list_resources_modified_since("v1", "ConfigMap", Some("default"), 0)
+            .await
+            .unwrap();
+        assert_eq!(after_events.len(), before_events.len());
+        assert_eq!(
+            after_events
+                .iter()
+                .map(|event| {
+                    (
+                        event.event_type.clone(),
+                        event.resource.resource_version,
+                        event.resource.name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            before_events
+                .iter()
+                .map(|event| {
+                    (
+                        event.event_type.clone(),
+                        event.resource.resource_version,
+                        event.resource.name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_replace_rejects_explicit_legacy_mode_in_v1_state() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        enable_committed_apply_v1(&db).await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "explicit-legacy-must-not-downgrade",
+            serde_json::json!({
+                "metadata": {
+                    "name": "explicit-legacy-must-not-downgrade",
+                    "namespace": "default"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let error = db
+            .replace_replicated_resource_state(
+                Vec::new(),
+                0,
+                None,
+                None,
+                Some(ReplicatedSnapshotMetadata {
+                    cluster_id: String::new(),
+                    leader_epoch: 0,
+                    membership: None,
+                    resource_version_assignment_mode: Some(
+                        ResourceVersionAssignment::LegacyLeaderAssigned,
+                    ),
+                    snapshot_assignment_mode: None,
+                }),
+            )
+            .await
+            .expect_err("a V1 destination must reject an explicit legacy snapshot");
+        assert!(error.to_string().contains("cannot downgrade"));
+        assert_eq!(
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                &db
+            )
+            .await
+            .unwrap(),
+            ResourceVersionAssignment::CommittedApplyV1
+        );
+        assert!(
+            db.get_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "explicit-legacy-must-not-downgrade",
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[tokio::test]
