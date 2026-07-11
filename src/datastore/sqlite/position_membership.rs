@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
-use rusqlite::{OptionalExtension, ToSql};
+use rusqlite::ToSql;
 use serde_json::Value;
 
 use super::{Datastore, Resource, ResourceList, SnapshotAtRv, WatchReplayPosition, WatchTarget};
@@ -10,8 +10,6 @@ use crate::datastore::position_membership::{
     MembershipHistoryEvent, MembershipReconstructor, ReconstructedMembership,
     apply_membership_selectors, resource_from_history, sort_for_watch_targets,
 };
-
-const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 
 impl Datastore {
     pub async fn snapshot_resources_at_position(
@@ -96,49 +94,15 @@ fn position_expired(
     position: WatchReplayPosition,
 ) -> rusqlite::Result<bool> {
     for target in targets {
-        if (position.event_id > 0
-            && target_floor(conn, target, true)?.is_some_and(|floor| position.event_id < floor))
+        let floor = super::replay_floor::target_replay_floor(conn, target)?;
+        if (position.event_id > 0 && floor.is_some_and(|floor| position.event_id < floor.event_id))
             || ((position.event_id == 0 || position.resource_version_filter_through_event_id > 0)
-                && target_floor(conn, target, false)?
-                    .is_some_and(|floor| position.resource_version < floor))
+                && floor.is_some_and(|floor| position.resource_version < floor.resource_version))
         {
             return Ok(true);
         }
     }
     Ok(false)
-}
-
-fn target_floor(
-    conn: &rusqlite::Connection,
-    target: &WatchTarget,
-    event_id: bool,
-) -> rusqlite::Result<Option<i64>> {
-    let column = if event_id {
-        "floor_event_id"
-    } else {
-        "floor_rv"
-    };
-    match &target.scope {
-        WatchTargetScope::Cluster => conn
-            .query_row(
-                &format!("SELECT {column} FROM watch_replay_floors WHERE api_version = ?1 AND kind = ?2 AND namespace_key = ?3"),
-                rusqlite::params![target.api_version, target.kind, CLUSTER_NAMESPACE_KEY],
-                |row| row.get(0),
-            )
-            .optional(),
-        WatchTargetScope::Namespaced(Some(namespace)) => conn
-            .query_row(
-                &format!("SELECT {column} FROM watch_replay_floors WHERE api_version = ?1 AND kind = ?2 AND namespace_key = ?3"),
-                rusqlite::params![target.api_version, target.kind, namespace],
-                |row| row.get(0),
-            )
-            .optional(),
-        WatchTargetScope::Namespaced(None) => conn.query_row(
-            &format!("SELECT MAX({column}) FROM watch_replay_floors WHERE api_version = ?1 AND kind = ?2 AND namespace_key <> '#cluster'"),
-            rusqlite::params![target.api_version, target.kind],
-            |row| row.get(0),
-        ),
-    }
 }
 
 fn read_current_targets(

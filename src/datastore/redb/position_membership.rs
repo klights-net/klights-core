@@ -131,7 +131,7 @@ fn target_floor(
     } else {
         return target_rv_floor(read, target);
     };
-    match &target.scope {
+    let scoped: Result<Option<i64>> = match &target.scope {
         WatchTargetScope::Cluster => Ok(table
             .get(floor_key(&target.api_version, &target.kind, CLUSTER_NAMESPACE_KEY).as_slice())?
             .and_then(|value| decode_position_floor(value.value()))),
@@ -155,12 +155,16 @@ fn target_floor(
             }
             Ok(floor)
         }
-    }
+    };
+    let scoped = scoped?;
+    Ok(super::replay_floor::LegacyReplayFloor::read(read)?
+        .and_then(|legacy| legacy.merge_event_id(scoped))
+        .or(scoped))
 }
 
 fn target_rv_floor(read: &::redb::ReadTransaction, target: &WatchTarget) -> Result<Option<i64>> {
     let table = read.open_table(tables::WATCH_REPLAY_FLOORS)?;
-    match &target.scope {
+    let scoped: Result<Option<i64>> = match &target.scope {
         WatchTargetScope::Cluster => Ok(table
             .get(floor_key(&target.api_version, &target.kind, CLUSTER_NAMESPACE_KEY).as_slice())?
             .map(|value| value.value() as i64)),
@@ -183,7 +187,11 @@ fn target_rv_floor(read: &::redb::ReadTransaction, target: &WatchTarget) -> Resu
             }
             Ok(floor)
         }
-    }
+    };
+    let scoped = scoped?;
+    Ok(super::replay_floor::LegacyReplayFloor::read(read)?
+        .and_then(|legacy| legacy.merge_resource_version(scoped))
+        .or(scoped))
 }
 
 fn read_current_targets(

@@ -7,7 +7,6 @@ use crate::datastore::{
 use anyhow::Result;
 use std::collections::HashMap;
 
-const CLUSTER_NAMESPACE_KEY: &str = "#cluster";
 const DEFAULT_MIN_WATCH_EVENTS_PER_SCOPE: i64 = 1_024;
 const MIN_SCOPE_COUNT_BEFORE_EXPIRING_SCOPES: i64 = 16;
 
@@ -865,92 +864,14 @@ fn target_event_floor(
     conn: &rusqlite::Connection,
     target: &WatchTarget,
 ) -> rusqlite::Result<Option<i64>> {
-    let scoped = match &target.scope {
-        WatchTargetScope::Cluster => read_event_floor(
-            conn,
-            &target.api_version,
-            &target.kind,
-            CLUSTER_NAMESPACE_KEY,
-        ),
-        WatchTargetScope::Namespaced(Some(namespace)) => {
-            read_event_floor(conn, &target.api_version, &target.kind, namespace)
-        }
-        WatchTargetScope::Namespaced(None) => conn.query_row(
-            queries::WATCH_REPLAY_EVENT_FLOOR_FOR_NAMESPACED_ALL,
-            rusqlite::params![target.api_version, target.kind],
-            |row| row.get::<_, Option<i64>>(0),
-        ),
-    }?;
-    let legacy_global = read_event_floor(conn, "*", "*", "*")?;
-    Ok(match (scoped, legacy_global) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-        (left, right) => left.or(right),
-    })
-}
-
-fn read_event_floor(
-    conn: &rusqlite::Connection,
-    api_version: &str,
-    kind: &str,
-    namespace_key: &str,
-) -> rusqlite::Result<Option<i64>> {
-    conn.query_row(
-        queries::WATCH_REPLAY_EVENT_FLOOR_FOR_SCOPE,
-        rusqlite::params![api_version, kind, namespace_key],
-        |row| row.get::<_, i64>(0),
-    )
-    .optional()
+    Ok(super::replay_floor::target_replay_floor(conn, target)?.map(|floor| floor.event_id))
 }
 
 fn target_floor(
     conn: &rusqlite::Connection,
     target: &WatchTarget,
 ) -> rusqlite::Result<Option<i64>> {
-    let scoped = match &target.scope {
-        WatchTargetScope::Cluster => read_floor(
-            conn,
-            &target.api_version,
-            &target.kind,
-            CLUSTER_NAMESPACE_KEY,
-        ),
-        WatchTargetScope::Namespaced(Some(namespace)) => {
-            read_floor(conn, &target.api_version, &target.kind, namespace)
-        }
-        WatchTargetScope::Namespaced(None) => {
-            read_namespaced_all_floor(conn, &target.api_version, &target.kind)
-        }
-    }?;
-    let legacy_global = read_floor(conn, "*", "*", "*")?;
-    Ok(match (scoped, legacy_global) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-        (left, right) => left.or(right),
-    })
-}
-
-fn read_floor(
-    conn: &rusqlite::Connection,
-    api_version: &str,
-    kind: &str,
-    namespace_key: &str,
-) -> rusqlite::Result<Option<i64>> {
-    conn.query_row(
-        queries::WATCH_REPLAY_FLOOR_FOR_SCOPE,
-        rusqlite::params![api_version, kind, namespace_key],
-        |row| row.get::<_, i64>(0),
-    )
-    .optional()
-}
-
-fn read_namespaced_all_floor(
-    conn: &rusqlite::Connection,
-    api_version: &str,
-    kind: &str,
-) -> rusqlite::Result<Option<i64>> {
-    conn.query_row(
-        queries::WATCH_REPLAY_FLOOR_FOR_NAMESPACED_ALL,
-        rusqlite::params![api_version, kind],
-        |row| row.get::<_, Option<i64>>(0),
-    )
+    Ok(super::replay_floor::target_replay_floor(conn, target)?.map(|floor| floor.resource_version))
 }
 
 #[cfg(test)]

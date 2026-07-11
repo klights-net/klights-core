@@ -903,7 +903,7 @@ fn watch_event_matches_target(
 }
 
 fn target_floor(read_txn: &::redb::ReadTransaction, target: &WatchTarget) -> Result<Option<i64>> {
-    match &target.scope {
+    let scoped = match &target.scope {
         WatchTargetScope::Cluster => read_floor(
             read_txn,
             &target.api_version,
@@ -916,7 +916,10 @@ fn target_floor(read_txn: &::redb::ReadTransaction, target: &WatchTarget) -> Res
         WatchTargetScope::Namespaced(None) => {
             read_namespaced_all_floor(read_txn, &target.api_version, &target.kind)
         }
-    }
+    }?;
+    Ok(super::replay_floor::LegacyReplayFloor::read(read_txn)?
+        .and_then(|legacy| legacy.merge_resource_version(scoped))
+        .or(scoped))
 }
 
 fn position_expired_for_targets(
@@ -925,7 +928,7 @@ fn position_expired_for_targets(
     event_id: i64,
 ) -> Result<bool> {
     for target in targets {
-        let floor = match &target.scope {
+        let scoped = match &target.scope {
             WatchTargetScope::Cluster => read_position_floor(
                 read_txn,
                 &target.api_version,
@@ -939,6 +942,9 @@ fn position_expired_for_targets(
                 read_namespaced_all_position_floor(read_txn, &target.api_version, &target.kind)?
             }
         };
+        let floor = super::replay_floor::LegacyReplayFloor::read(read_txn)?
+            .and_then(|legacy| legacy.merge_event_id(scoped))
+            .or(scoped);
         if floor.is_some_and(|floor| event_id < floor) {
             return Ok(true);
         }
@@ -1283,6 +1289,56 @@ mod tests {
                 .await
                 .unwrap(),
             PositionedWatchReplayRead::Events(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_wildcard_floor_expires_unknown_positioned_scope() {
+        let s = store();
+        for rv in 1..=5 {
+            insert_watch_event(
+                &s,
+                rv,
+                "v1",
+                "Secret",
+                Some("seed"),
+                &format!("seed-{rv}"),
+                "ADDED",
+            );
+        }
+        let db = s.accessor.db().unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut rv_floors = write.open_table(tables::WATCH_REPLAY_FLOORS).unwrap();
+            let mut position_floors = write
+                .open_table(tables::WATCH_REPLAY_POSITION_FLOORS)
+                .unwrap();
+            let wildcard = floor_key("*", "*", "*");
+            rv_floors.insert(wildcard.as_slice(), 5).unwrap();
+            position_floors
+                .insert(wildcard.as_slice(), encode_position_floor(5, 5).as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+
+        let target = [WatchTarget::namespaced_in_namespace(
+            "example.test/v1",
+            "Unknown",
+            "default",
+        )];
+        assert!(matches!(
+            s.watch_list_positioned_checked_bounded(
+                &target,
+                WatchReplayPosition {
+                    resource_version: 4,
+                    event_id: 4,
+                    resource_version_filter_through_event_id: 0,
+                },
+                std::num::NonZeroUsize::new(8).unwrap(),
+            )
+            .await
+            .unwrap(),
+            PositionedWatchReplayRead::Expired
         ));
     }
 

@@ -130,19 +130,12 @@ pub(super) const WATCH_REPLAY_FLOOR_UPSERT: &str =
      DO UPDATE SET floor_rv = MAX(watch_replay_floors.floor_rv, excluded.floor_rv),
                    floor_event_id = MAX(watch_replay_floors.floor_event_id, excluded.floor_event_id)";
 
-pub(super) const WATCH_REPLAY_FLOOR_FOR_SCOPE: &str = "SELECT floor_rv FROM watch_replay_floors
+pub(super) const WATCH_REPLAY_RETENTION_FLOOR_FOR_SCOPE: &str =
+    "SELECT floor_rv, floor_event_id FROM watch_replay_floors
      WHERE api_version = ?1 AND kind = ?2 AND namespace_key = ?3";
 
-pub(super) const WATCH_REPLAY_FLOOR_FOR_NAMESPACED_ALL: &str =
-    "SELECT MAX(floor_rv) FROM watch_replay_floors
-     WHERE api_version = ?1 AND kind = ?2 AND namespace_key <> '#cluster'";
-
-pub(super) const WATCH_REPLAY_EVENT_FLOOR_FOR_SCOPE: &str =
-    "SELECT floor_event_id FROM watch_replay_floors
-     WHERE api_version = ?1 AND kind = ?2 AND namespace_key = ?3";
-
-pub(super) const WATCH_REPLAY_EVENT_FLOOR_FOR_NAMESPACED_ALL: &str =
-    "SELECT MAX(floor_event_id) FROM watch_replay_floors
+pub(super) const WATCH_REPLAY_RETENTION_FLOOR_FOR_NAMESPACED_ALL: &str =
+    "SELECT MAX(floor_rv), MAX(floor_event_id) FROM watch_replay_floors
      WHERE api_version = ?1 AND kind = ?2 AND namespace_key <> '#cluster'";
 
 pub(super) const WATCH_EVENTS_GC_CANDIDATES: &str =

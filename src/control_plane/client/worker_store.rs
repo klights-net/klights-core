@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -33,13 +33,6 @@ struct ReflectedResourceKey {
     kind: String,
     namespace: Option<String>,
     name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ReplayEventIdentity {
-    resource: ReflectedResourceKey,
-    uid: String,
-    resource_version: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -750,29 +743,6 @@ impl WorkerStoreAdapter {
         }
     }
 
-    async fn list_for_target(&self, target: &WatchTarget) -> Result<ResourceList> {
-        let namespace = match &target.scope {
-            WatchTargetScope::Cluster => None,
-            WatchTargetScope::Namespaced(namespace) => namespace.clone(),
-        };
-        let field_selector = if target.api_version == "v1" && target.kind == "Pod" {
-            Some(format!("spec.nodeName={}", self.node_name))
-        } else {
-            None
-        };
-        self.cluster_api
-            .list_resources(ListRequest {
-                api_version: target.api_version.clone(),
-                kind: target.kind.clone(),
-                namespace,
-                label_selector: None,
-                field_selector,
-                limit: None,
-                continue_token: None,
-            })
-            .await
-    }
-
     fn unsupported<T>(&self, operation: &str) -> Result<T> {
         Err(anyhow!(
             "worker-local store does not support direct cluster datastore operation {operation}"
@@ -889,19 +859,6 @@ fn catchup_resource_from_watch_event(event: &WatchEvent) -> Option<CatchUpResour
         },
         event_type: std::borrow::Cow::Owned(event.event_type.to_string()),
     })
-}
-
-fn replay_event_identity(resource: &Resource) -> ReplayEventIdentity {
-    ReplayEventIdentity {
-        resource: ReflectedResourceKey {
-            api_version: resource.api_version.clone(),
-            kind: resource.kind.clone(),
-            namespace: resource.namespace.clone(),
-            name: resource.name.clone(),
-        },
-        uid: resource.uid.clone(),
-        resource_version: resource.resource_version,
-    }
 }
 
 #[async_trait]
@@ -1410,28 +1367,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        let mut events = self.historical_watch_events_since(targets, since_rv);
-        let mut seen_events: HashSet<_> = events
-            .iter()
-            .map(|event| replay_event_identity(&event.resource))
-            .collect();
-        let event_type = Self::snapshot_replay_event_type(since_rv);
-        for target in targets {
-            let list = self.list_for_target(target).await?;
-            self.observe_rv(list.resource_version);
-            events.extend(
-                list.items
-                    .into_iter()
-                    .filter(|resource| resource.resource_version > since_rv)
-                    .filter(|resource| seen_events.insert(replay_event_identity(resource)))
-                    .map(|resource| CatchUpResource {
-                        resource,
-                        event_type: std::borrow::Cow::Borrowed(event_type),
-                    }),
-            );
-        }
-        events.sort_by_key(|event| event.resource.resource_version);
-        Ok(events)
+        Ok(self.historical_watch_events_since(targets, since_rv))
     }
 
     async fn list_watch_events_after_position_checked_bounded(
@@ -3139,6 +3075,18 @@ mod tests {
         .await
         .expect("open node-local");
         let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        for (index, name) in ["cm-a", "cm-b", "cm-c"].into_iter().enumerate() {
+            adapter.publish_watch(WatchEvent::added(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "namespace": "default",
+                    "name": name,
+                    "uid": format!("uid-{name}"),
+                    "resourceVersion": (index + 1).to_string()
+                }
+            })));
+        }
         let targets = [WatchTarget::namespaced_in_namespace(
             "v1",
             "ConfigMap",
@@ -3170,6 +3118,61 @@ mod tests {
         assert!(
             second_events.is_empty(),
             "resumed worker replay must not return resources at or below the resume RV"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_scalar_watch_replay_never_synthesizes_events_from_live_list_state() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        cluster_db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "not-durable-worker-history",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "not-durable-worker-history"
+                    }
+                }),
+            )
+            .await
+            .expect("create configmap");
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-no-scalar-snapshot-replay-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+
+        let replay = adapter
+            .list_watch_events_since(
+                &[WatchTarget::namespaced_in_namespace(
+                    "v1",
+                    "ConfigMap",
+                    "default",
+                )],
+                0,
+            )
+            .await
+            .expect("scalar replay");
+
+        assert!(
+            replay.is_empty(),
+            "worker scalar replay must expose only its local durable mirror history; live LIST synthesis is a second establishment algorithm"
         );
     }
 
@@ -3282,6 +3285,10 @@ mod tests {
         .await
         .expect("open node-local");
         let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        let mut created_event = (*created.data).clone();
+        created_event["metadata"]["resourceVersion"] =
+            serde_json::json!(created.resource_version.to_string());
+        adapter.publish_watch(WatchEvent::added(created_event));
         let targets = [WatchTarget::namespaced_in_namespace("v1", "Pod", "default")];
         let limit = std::num::NonZeroUsize::new(4).expect("non-zero limit");
 
@@ -3295,7 +3302,7 @@ mod tests {
         assert_eq!(first_events.len(), 1);
         assert_eq!(first_events[0].event_type.as_ref(), "ADDED");
 
-        cluster_db
+        let updated = cluster_db
             .update_resource(
                 "v1",
                 "Pod",
@@ -3322,6 +3329,10 @@ mod tests {
             )
             .await
             .expect("update pod");
+        let mut updated_event = (*updated.data).clone();
+        updated_event["metadata"]["resourceVersion"] =
+            serde_json::json!(updated.resource_version.to_string());
+        adapter.publish_watch(WatchEvent::modified(updated_event));
 
         let resumed = adapter
             .list_watch_events_since_checked_bounded(&targets, created.resource_version, limit)

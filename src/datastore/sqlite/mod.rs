@@ -19,6 +19,7 @@ pub(super) mod owner_ref_index;
 mod position_membership;
 mod queries;
 mod replay;
+mod replay_floor;
 mod resource_shape;
 mod rv_helpers;
 mod schema;

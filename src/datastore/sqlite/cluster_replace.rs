@@ -1262,6 +1262,21 @@ mod tests {
             .unwrap(),
             crate::datastore::WatchReplayRead::Expired
         ));
+        assert!(matches!(
+            db.snapshot_resources_at_position(
+                &target,
+                None,
+                None,
+                crate::datastore::WatchReplayPosition {
+                    resource_version: 9,
+                    event_id: 4,
+                    resource_version_filter_through_event_id: 0,
+                },
+            )
+            .await
+            .unwrap(),
+            crate::datastore::SnapshotAtRv::Expired
+        ));
     }
 
     #[tokio::test]

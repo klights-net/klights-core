@@ -60,6 +60,14 @@ pub enum GenericStaleStatusMode {
     },
 }
 
+/// Whether a generic kind's fresh status write is authoritative or must merge
+/// with fields owned by other actors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshStatusMode {
+    Replace,
+    Merge,
+}
+
 /// Parameterized merge policy for a generic kind. Table data, not enum variants:
 /// new generic kinds are expressed by adding a registry entry, not a new
 /// `StatusMergeProfileKind` variant.
@@ -68,6 +76,7 @@ pub struct GenericStatusMergePolicy {
     /// Condition `type`s whose presence (status `True`) marks the resource
     /// terminal; a terminal live status is preserved authoritatively.
     pub terminal_condition_types: &'static [&'static str],
+    pub fresh_mode: FreshStatusMode,
     pub stale_mode: GenericStaleStatusMode,
 }
 
@@ -102,6 +111,7 @@ impl StatusMergeRegistry {
             ("batch/v1", "Job") => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &["Complete", "Failed"],
+                    fresh_mode: FreshStatusMode::Replace,
                     stale_mode: GenericStaleStatusMode::Merge {
                         condition_merge: ConditionMergeMode::MergeByNewestTransitionTime,
                         field_merge: FieldMergeMode::PreserveUnmentioned,
@@ -111,6 +121,7 @@ impl StatusMergeRegistry {
             ("batch/v1", "CronJob") => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
+                    fresh_mode: FreshStatusMode::Replace,
                     stale_mode: GenericStaleStatusMode::Merge {
                         condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
                         field_merge: FieldMergeMode::PreserveUnmentioned,
@@ -120,6 +131,7 @@ impl StatusMergeRegistry {
             ("policy/v1", "PodDisruptionBudget") => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
+                    fresh_mode: FreshStatusMode::Replace,
                     stale_mode: GenericStaleStatusMode::Merge {
                         condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
                         field_merge: FieldMergeMode::PreserveUnmentioned,
@@ -129,6 +141,7 @@ impl StatusMergeRegistry {
             ("v1", "PersistentVolume") | ("v1", "PersistentVolumeClaim") => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
+                    fresh_mode: FreshStatusMode::Replace,
                     stale_mode: GenericStaleStatusMode::Merge {
                         condition_merge: ConditionMergeMode::PreserveLiveByType,
                         field_merge: FieldMergeMode::PreserveLive,
@@ -141,6 +154,7 @@ impl StatusMergeRegistry {
             | ("apps/v1", "DaemonSet") => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
+                    fresh_mode: FreshStatusMode::Replace,
                     stale_mode: GenericStaleStatusMode::Merge {
                         condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
                         field_merge: FieldMergeMode::PreserveUnmentioned,
@@ -150,6 +164,7 @@ impl StatusMergeRegistry {
             ("v1", "Service") => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
+                    fresh_mode: FreshStatusMode::Merge,
                     stale_mode: GenericStaleStatusMode::Merge {
                         condition_merge: ConditionMergeMode::PreserveUnmentionedByType,
                         field_merge: FieldMergeMode::PreserveUnmentioned,
@@ -159,6 +174,7 @@ impl StatusMergeRegistry {
             _ => {
                 StatusMergeProfile::new(StatusMergeProfileKind::Generic(GenericStatusMergePolicy {
                     terminal_condition_types: &[],
+                    fresh_mode: FreshStatusMode::Replace,
                     stale_mode: GenericStaleStatusMode::UseLiveStatus,
                 }))
             }
@@ -183,14 +199,17 @@ pub fn merge_status_for_apply(
     // kubelet-owned object, and Node status is a heartbeat where each reporter
     // sends partial conditions that must always be merged by transition time
     // (a stale worker Ready=True must not overwrite a fresher leader Unknown).
-    // Service is explicit exception: even fresh status writes must preserve
-    // external/live fields (loadBalancer, annotations, etc.) managed by other
-    // actors.
-    if freshness == StatusApplyFreshness::Fresh
-        && matches!(profile.kind, StatusMergeProfileKind::Generic(_))
-        && !(api_version == "v1" && kind == "Service")
-    {
-        return;
+    // Generic kinds declare fresh-write ownership in their registry policy;
+    // multi-writer status kinds merge even when the incoming RV is current.
+    if freshness == StatusApplyFreshness::Fresh {
+        match profile.kind {
+            StatusMergeProfileKind::Generic(policy)
+                if policy.fresh_mode == FreshStatusMode::Replace =>
+            {
+                return;
+            }
+            _ => {}
+        }
     }
 
     match profile.kind {
@@ -217,10 +236,9 @@ pub fn merge_status_for_apply(
 ///   registry's per-kind policy — Pod/Node typed merge, and for generic kinds
 ///   their registered `Merge` policy preserves live actor-owned
 ///   fields/conditions instead of clobbering them;
-/// - a **fresh** non-`Service` non-Pod apply is a no-op (the registry
-///   early-returns), so it is always safe to call this whenever a live row
-///   exists. Pod always merges (typed) regardless of freshness, and Service
-///   gets merge-based preservation for API-sourced status writes.
+/// - a **fresh** generic apply follows the registry's `FreshStatusMode`, so it
+///   is always safe to call this whenever a live row exists. Typed Pod/Node
+///   profiles retain their dedicated merge behavior.
 ///
 /// `kubelet_origin` is true when the command carries a kubelet status-outbox
 /// stamp (`observed_status_stamp.is_some()`); the origin is stamp-derived, not
@@ -653,6 +671,7 @@ mod tests {
             panic!("Job must use a Generic policy");
         };
         assert_eq!(policy.terminal_condition_types.len(), 2);
+        assert_eq!(policy.fresh_mode, FreshStatusMode::Replace);
         assert!(policy.terminal_condition_types.contains(&"Complete"));
         assert!(policy.terminal_condition_types.contains(&"Failed"));
         assert_eq!(
@@ -668,6 +687,7 @@ mod tests {
             panic!("CronJob must use a Generic policy");
         };
         assert!(policy.terminal_condition_types.is_empty());
+        assert_eq!(policy.fresh_mode, FreshStatusMode::Replace);
         assert_eq!(
             policy.stale_mode,
             GenericStaleStatusMode::Merge {
@@ -681,6 +701,7 @@ mod tests {
             panic!("Service must use a Generic policy");
         };
         assert!(policy.terminal_condition_types.is_empty());
+        assert_eq!(policy.fresh_mode, FreshStatusMode::Merge);
         assert_eq!(
             policy.stale_mode,
             GenericStaleStatusMode::Merge {
