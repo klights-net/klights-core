@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::KlightsConfig;
 use crate::bootstrap::NodeRole;
+use crate::bootstrap::credential_store::BootstrapCredentialStore;
 use crate::datastore::DatastoreHandle;
 use crate::datastore::replicated::RaftProposer;
 use crate::task_supervisor::TaskSupervisor;
@@ -407,6 +408,10 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 let join_namespace = config.containerd_namespace.clone();
                 let join_supervisor_for_loop = join_supervisor.clone();
                 let join_grpc_transport_policy = grpc_transport_policy.clone();
+                let join_credential_store =
+                    crate::bootstrap::credential_store::SupervisedBootstrapCredentialStore::new(
+                        join_supervisor.clone(),
+                    );
                 // Capture handles the join task needs to attach the
                 // RaftProposer to the datastore wrapper on success.
                 let join_raft = raft.clone();
@@ -498,11 +503,15 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                         );
                                         // Write CA material received from leader.
                                         // Always overwrite: the leader's CA is authoritative.
-                                        if !ca_cert_pem.is_empty() {
-                                            let ca_cert_path = crate::paths::ca_cert_path(&join_namespace);
-                                            if let Err(e) = std::fs::write(&ca_cert_path, &ca_cert_pem) {
-                                                tracing::warn!(error = %e, "failed to write ca.crt from join response");
-                                            }
+                                        if !ca_cert_pem.is_empty()
+                                            && let Err(e) = join_credential_store
+                                                .install_ca_certificate(
+                                                    &join_namespace,
+                                                    ca_cert_pem.into_bytes(),
+                                                )
+                                                .await
+                                        {
+                                            tracing::warn!(error = %e, "failed to write ca.crt from join response");
                                         }
                                         if let Err(err) =
                                             crate::kubelet::node::refresh_current_git_commit_annotation_via_leader(

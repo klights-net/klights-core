@@ -2,6 +2,7 @@ pub mod bootstrap_token;
 pub mod cluster_meta;
 pub mod config;
 pub mod controlplane_discovery;
+pub mod credential_store;
 pub mod init;
 pub mod leader_reconnect;
 pub mod logging;

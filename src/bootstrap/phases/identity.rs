@@ -3,6 +3,7 @@
 use anyhow::{Context, Result, anyhow};
 
 use super::config::ConfigPhase;
+use crate::bootstrap::credential_store::BootstrapCredentialStore;
 
 pub struct IdentityPhase {
     pub node_ip: String,
@@ -130,12 +131,19 @@ async fn resolve_csr_via_rpc(
         .await
         .context("SignControlplaneCsr RPC failed")?;
 
-    let local_ca_cert_path = crate::paths::ca_cert_path(&cfg.config.containerd_namespace);
-    let ca_key_path = crate::paths::ca_key_path(&cfg.config.containerd_namespace);
+    let credential_store =
+        crate::bootstrap::credential_store::SupervisedBootstrapCredentialStore::new(
+            cfg.supervisor.clone(),
+        );
     let server_cert_path = pending.etc_dir.join("server.crt");
 
     if !response.ca_cert_pem.is_empty() {
-        std::fs::write(&local_ca_cert_path, &response.ca_cert_pem)
+        credential_store
+            .install_ca_certificate(
+                &cfg.config.containerd_namespace,
+                response.ca_cert_pem.into_bytes(),
+            )
+            .await
             .context("failed to write ca.crt from CSR response")?;
     }
 
@@ -151,7 +159,9 @@ async fn resolve_csr_via_rpc(
             &nonce,
         )
         .context("failed to decrypt ca.key from CSR response")?;
-        std::fs::write(&ca_key_path, &ca_key_bytes)
+        credential_store
+            .install_ca_key(&cfg.config.containerd_namespace, ca_key_bytes)
+            .await
             .context("failed to write ca.key from CSR response")?;
     }
 
@@ -179,7 +189,9 @@ async fn resolve_csr_via_rpc(
     }
 
     if !response.signed_server_cert.is_empty() {
-        std::fs::write(&server_cert_path, &response.signed_server_cert)
+        credential_store
+            .install_server_certificate(server_cert_path, response.signed_server_cert.into_bytes())
+            .await
             .context("failed to write server.crt from CSR response")?;
     }
 
@@ -312,10 +324,10 @@ async fn ensure_local_node_client_certificate(cfg: &ConfigPhase) -> Result<()> {
         .run_blocking_file_keyed(
             "controlplane_node_client_ca_load",
             ca_cert_path.display().to_string(),
-            move || -> std::io::Result<(String, String)> {
+            move || -> Result<(String, String)> {
                 Ok((
-                    std::fs::read_to_string(&ca_cert_path_for_task)?,
-                    std::fs::read_to_string(&ca_key_path_for_task)?,
+                    crate::utils::read_utf8_file(&ca_cert_path_for_task)?,
+                    crate::utils::read_utf8_file(&ca_key_path_for_task)?,
                 ))
             },
         )
