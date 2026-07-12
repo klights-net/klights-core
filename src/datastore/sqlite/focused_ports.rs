@@ -1,6 +1,45 @@
 use super::*;
 
 #[async_trait::async_trait]
+impl crate::datastore::ResourceListStore for Datastore {
+    async fn list_resources_page(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        page: ListPageRequest,
+    ) -> anyhow::Result<ResourceList> {
+        crate::datastore::DatastoreBackend::list_resources_page(
+            self,
+            api_version,
+            kind,
+            namespace,
+            label_selector,
+            field_selector,
+            page,
+        )
+        .await
+    }
+
+    async fn list_resource_keys_for_scope(
+        &self,
+        api_version: String,
+        kind: String,
+        namespaced: bool,
+    ) -> anyhow::Result<Vec<(Option<String>, String)>> {
+        crate::datastore::DatastoreBackend::list_resource_keys_for_scope(
+            self,
+            api_version,
+            kind,
+            namespaced,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
 impl crate::datastore::NamespaceContentStore for Datastore {
     async fn list_namespace_resources(&self, namespace: &str) -> anyhow::Result<Vec<Resource>> {
         crate::datastore::DatastoreBackend::list_namespace_resources(self, namespace).await
@@ -28,6 +67,49 @@ impl crate::datastore::NamespaceContentStore for Datastore {
 
     async fn count_namespace_resources(&self, namespace: &str) -> anyhow::Result<i64> {
         crate::datastore::DatastoreBackend::count_namespace_resources(self, namespace).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::datastore::NamespaceStore for Datastore {
+    async fn create_namespace(&self, name: &str, data: Value) -> anyhow::Result<Resource> {
+        crate::datastore::DatastoreBackend::create_namespace(self, name, data).await
+    }
+
+    async fn get_namespace(&self, name: &str) -> anyhow::Result<Option<Resource>> {
+        crate::datastore::DatastoreBackend::get_namespace(self, name).await
+    }
+
+    async fn list_namespaces_page(
+        &self,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        page: ListPageRequest,
+    ) -> anyhow::Result<ResourceList> {
+        crate::datastore::DatastoreBackend::list_namespaces_page(
+            self,
+            label_selector,
+            field_selector,
+            page,
+        )
+        .await
+    }
+
+    async fn update_namespace(
+        &self,
+        name: &str,
+        data: Value,
+        expected_rv: i64,
+    ) -> anyhow::Result<Resource> {
+        crate::datastore::DatastoreBackend::update_namespace(self, name, data, expected_rv).await
+    }
+
+    async fn delete_namespace(&self, name: &str) -> anyhow::Result<()> {
+        crate::datastore::DatastoreBackend::delete_namespace(self, name).await
+    }
+
+    async fn delete_namespace_contents(&self, name: &str) -> anyhow::Result<()> {
+        crate::datastore::DatastoreBackend::delete_namespace_contents(self, name).await
     }
 }
 

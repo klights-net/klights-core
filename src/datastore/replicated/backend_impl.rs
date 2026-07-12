@@ -1414,6 +1414,88 @@ impl DatastoreBackend for ReplicatedDatastore {
 }
 
 #[async_trait]
+impl crate::datastore::ResourceListStore for ReplicatedDatastore {
+    async fn list_resources_page(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        page: ListPageRequest,
+    ) -> Result<ResourceList> {
+        crate::datastore::DatastoreBackend::list_resources_page(
+            self,
+            api_version,
+            kind,
+            namespace,
+            label_selector,
+            field_selector,
+            page,
+        )
+        .await
+    }
+
+    async fn list_resource_keys_for_scope(
+        &self,
+        api_version: String,
+        kind: String,
+        namespaced: bool,
+    ) -> Result<Vec<(Option<String>, String)>> {
+        crate::datastore::DatastoreBackend::list_resource_keys_for_scope(
+            self,
+            api_version,
+            kind,
+            namespaced,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl crate::datastore::NamespaceStore for ReplicatedDatastore {
+    async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource> {
+        crate::datastore::DatastoreBackend::create_namespace(self, name, data).await
+    }
+
+    async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
+        crate::datastore::DatastoreBackend::get_namespace(self, name).await
+    }
+
+    async fn list_namespaces_page(
+        &self,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        page: ListPageRequest,
+    ) -> Result<ResourceList> {
+        crate::datastore::DatastoreBackend::list_namespaces_page(
+            self,
+            label_selector,
+            field_selector,
+            page,
+        )
+        .await
+    }
+
+    async fn update_namespace(
+        &self,
+        name: &str,
+        data: Value,
+        expected_rv: i64,
+    ) -> Result<Resource> {
+        crate::datastore::DatastoreBackend::update_namespace(self, name, data, expected_rv).await
+    }
+
+    async fn delete_namespace(&self, name: &str) -> Result<()> {
+        crate::datastore::DatastoreBackend::delete_namespace(self, name).await
+    }
+
+    async fn delete_namespace_contents(&self, name: &str) -> Result<()> {
+        crate::datastore::DatastoreBackend::delete_namespace_contents(self, name).await
+    }
+}
+
+#[async_trait]
 impl crate::datastore::NamespaceContentStore for ReplicatedDatastore {
     async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
         crate::datastore::DatastoreBackend::list_namespace_resources(self, namespace).await

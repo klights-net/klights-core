@@ -1414,39 +1414,6 @@ pub trait ResourceListStore: Send + Sync {
     ) -> Result<Vec<(Option<String>, String)>>;
 }
 
-#[async_trait]
-impl<T: DatastoreBackend + ?Sized> ResourceListStore for T {
-    async fn list_resources_page(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        page: ListPageRequest,
-    ) -> Result<ResourceList> {
-        DatastoreBackend::list_resources_page(
-            self,
-            api_version,
-            kind,
-            namespace,
-            label_selector,
-            field_selector,
-            page,
-        )
-        .await
-    }
-
-    async fn list_resource_keys_for_scope(
-        &self,
-        api_version: String,
-        kind: String,
-        namespaced: bool,
-    ) -> Result<Vec<(Option<String>, String)>> {
-        DatastoreBackend::list_resource_keys_for_scope(self, api_version, kind, namespaced).await
-    }
-}
-
 /// Status-subresource writes.
 #[async_trait]
 pub trait StatusStore: Send + Sync {
@@ -2081,38 +2048,6 @@ pub trait NamespaceStore: Send + Sync {
     -> Result<Resource>;
     async fn delete_namespace(&self, name: &str) -> Result<()>;
     async fn delete_namespace_contents(&self, name: &str) -> Result<()>;
-}
-
-#[async_trait]
-impl<T: DatastoreBackend + ?Sized> NamespaceStore for T {
-    async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource> {
-        DatastoreBackend::create_namespace(self, name, data).await
-    }
-    async fn get_namespace(&self, name: &str) -> Result<Option<Resource>> {
-        DatastoreBackend::get_namespace(self, name).await
-    }
-    async fn list_namespaces_page(
-        &self,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        page: ListPageRequest,
-    ) -> Result<ResourceList> {
-        DatastoreBackend::list_namespaces_page(self, label_selector, field_selector, page).await
-    }
-    async fn update_namespace(
-        &self,
-        name: &str,
-        data: Value,
-        expected_rv: i64,
-    ) -> Result<Resource> {
-        DatastoreBackend::update_namespace(self, name, data, expected_rv).await
-    }
-    async fn delete_namespace(&self, name: &str) -> Result<()> {
-        DatastoreBackend::delete_namespace(self, name).await
-    }
-    async fn delete_namespace_contents(&self, name: &str) -> Result<()> {
-        DatastoreBackend::delete_namespace_contents(self, name).await
-    }
 }
 
 /// Namespace content enumeration and accounting.
