@@ -149,6 +149,7 @@ pub fn protobuf_watch_supported_for_request(
         crate::protobuf::supports_protobuf_resource(api_version, kind)
     } else {
         crate::protobuf::supports_raw_json_protobuf_resource(api_version, kind)
+            || crate::protobuf::supports_protobuf_resource(api_version, kind)
     }
 }
 
@@ -1466,15 +1467,11 @@ mod tests {
     }
 
     #[test]
-    fn raw_selectorless_protobuf_frame_encodes_enveloped_object() {
-        let row = RawWatchEvent {
-            api_version: "v1".to_string(),
-            kind: "ConfigMap".to_string(),
-            namespace: Some("default".to_string()),
-            name: "cm1".to_string(),
-            resource_version: 7,
-            event_type: std::borrow::Cow::Borrowed("ADDED"),
-            object_json: Bytes::from_static(
+    fn raw_selectorless_protobuf_frame_encodes_enveloped_objects() {
+        let cases: &[(&str, &str, &[u8])] = &[
+            (
+                "v1",
+                "ConfigMap",
                 br#"{
                     "apiVersion":"v1",
                     "kind":"ConfigMap",
@@ -1486,26 +1483,80 @@ mod tests {
                     "data":{"k":"v"}
                 }"#,
             ),
-        };
+            (
+                "v1",
+                "Pod",
+                br#"{
+                    "apiVersion":"v1",
+                    "kind":"Pod",
+                    "metadata":{
+                        "namespace":"default",
+                        "name":"pod1",
+                        "resourceVersion":"7"
+                    },
+                    "spec":{"containers":[{"name":"main","image":"busybox"}]},
+                    "status":{"phase":"Pending"}
+                }"#,
+            ),
+            (
+                "v1",
+                "Service",
+                br#"{
+                    "apiVersion":"v1",
+                    "kind":"Service",
+                    "metadata":{
+                        "namespace":"default",
+                        "name":"svc1",
+                        "resourceVersion":"7"
+                    },
+                    "spec":{"ports":[{"port":80,"protocol":"TCP"}]},
+                    "status":{"loadBalancer":{}}
+                }"#,
+            ),
+            (
+                "v1",
+                "Event",
+                br#"{
+                    "apiVersion":"v1",
+                    "kind":"Event",
+                    "metadata":{
+                        "namespace":"default",
+                        "name":"event1",
+                        "resourceVersion":"7"
+                    },
+                    "involvedObject":{"apiVersion":"v1","kind":"Pod","name":"pod1","namespace":"default"},
+                    "message":"created",
+                    "reason":"Created",
+                    "type":"Normal"
+                }"#,
+            ),
+        ];
 
-        let frame = serialize_raw_watch_event_for_stream(&row, WatchStreamFormat::Protobuf);
-        assert_ne!(frame.first(), Some(&b'{'));
-        let events = decode_length_prefixed_watch_events(&[frame]);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].r#type.as_deref(), Some("ADDED"));
-        let envelope = decode_watch_object_envelope(events.into_iter().next().unwrap());
-        assert_eq!(
-            envelope
-                .type_meta
-                .as_ref()
-                .map(|type_meta| (type_meta.api_version.as_str(), type_meta.kind.as_str())),
-            Some(("v1", "ConfigMap"))
-        );
-        let decoded = k8s_pb::api::core::v1::ConfigMap::decode(envelope.raw.as_slice()).unwrap();
-        assert_eq!(
-            decoded.metadata.and_then(|metadata| metadata.name),
-            Some("cm1".to_string())
-        );
+        for (api_version, kind, object_json) in cases {
+            let row = RawWatchEvent {
+                api_version: (*api_version).to_string(),
+                kind: (*kind).to_string(),
+                namespace: Some("default".to_string()),
+                name: format!("{}1", kind.to_ascii_lowercase()),
+                resource_version: 7,
+                event_type: std::borrow::Cow::Borrowed("ADDED"),
+                object_json: Bytes::from_static(object_json),
+            };
+
+            let frame = serialize_raw_watch_event_for_stream(&row, WatchStreamFormat::Protobuf);
+            assert_ne!(frame.first(), Some(&b'{'));
+            let events = decode_length_prefixed_watch_events(&[frame]);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].r#type.as_deref(), Some("ADDED"));
+            let envelope = decode_watch_object_envelope(events.into_iter().next().unwrap());
+            assert_eq!(
+                envelope
+                    .type_meta
+                    .as_ref()
+                    .map(|type_meta| (type_meta.api_version.as_str(), type_meta.kind.as_str())),
+                Some((*api_version, *kind))
+            );
+        }
     }
 
     #[test]
@@ -1607,14 +1658,22 @@ mod tests {
     }
 
     #[test]
-    fn protobuf_watch_support_uses_raw_codec_for_selectorless_requests() {
+    fn protobuf_watch_support_uses_typed_codec_for_selectorless_requests() {
         assert!(
             protobuf_watch_supported_for_request("v1", "ConfigMap", false, None, None),
             "selectorless ConfigMap protobuf watches can use the raw replay encoder"
         );
         assert!(
-            !protobuf_watch_supported_for_request("v1", "Pod", false, None, None),
-            "selectorless Pod protobuf watches must not fall back to parsed replay without a raw codec"
+            protobuf_watch_supported_for_request("v1", "Pod", false, None, None),
+            "selectorless Pod protobuf watches must be allowed when a typed protobuf codec exists"
+        );
+        assert!(
+            protobuf_watch_supported_for_request("v1", "Service", false, None, None),
+            "selectorless Service protobuf watches must be allowed when a typed protobuf codec exists"
+        );
+        assert!(
+            protobuf_watch_supported_for_request("v1", "Event", false, None, None),
+            "selectorless Event protobuf watches must be allowed when a typed protobuf codec exists"
         );
         assert!(
             protobuf_watch_supported_for_request("v1", "Pod", false, Some("app=guestbook"), None),

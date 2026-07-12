@@ -659,7 +659,7 @@ fn test_prefers_protobuf_explicit_json_returns_false() {
 }
 
 #[test]
-fn test_prefers_protobuf_mixed_accept_with_protobuf_returns_true() {
+fn test_prefers_protobuf_mixed_accept_honors_client_order() {
     let mut headers = HeaderMap::new();
     headers.insert(
         "accept",
@@ -667,7 +667,14 @@ fn test_prefers_protobuf_mixed_accept_with_protobuf_returns_true() {
             .parse()
             .unwrap(),
     );
-    // When protobuf is in the Accept header, prefer it
+    assert!(!prefers_protobuf(&headers));
+
+    headers.insert(
+        "accept",
+        "application/vnd.kubernetes.protobuf, application/json"
+            .parse()
+            .unwrap(),
+    );
     assert!(prefers_protobuf(&headers));
 }
 

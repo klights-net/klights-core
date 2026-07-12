@@ -181,6 +181,17 @@ macro_rules! encode_openapi_value_result_fn {
     };
 }
 
+macro_rules! encode_openapi_value_result_raw_fn {
+    ($fn_name:ident, $openapi_ty:ty, $converter:path) => {
+        fn $fn_name(_api_version: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let value: Value = serde_json::from_slice(data)?;
+            let openapi = <$openapi_ty as Deserialize>::deserialize(&value)?;
+            let pb = $converter(&openapi, &value)?;
+            encode_message_to_vec(&pb)
+        }
+    };
+}
+
 macro_rules! encode_openapi_plain_fn {
     ($fn_name:ident, $openapi_ty:ty, $converter:path) => {
         fn $fn_name(_api_version: &str, value: &Value) -> anyhow::Result<Vec<u8>> {
@@ -653,8 +664,18 @@ encode_openapi_result_raw_fn!(
     json_secret_to_pb
 );
 encode_openapi_value_result_fn!(encode_pod, k8s_openapi::api::core::v1::Pod, json_pod_to_pb);
+encode_openapi_value_result_raw_fn!(
+    encode_pod_raw,
+    k8s_openapi::api::core::v1::Pod,
+    json_pod_to_pb
+);
 encode_openapi_value_result_fn!(
     encode_service,
+    k8s_openapi::api::core::v1::Service,
+    json_service_to_pb
+);
+encode_openapi_value_result_raw_fn!(
+    encode_service_raw,
     k8s_openapi::api::core::v1::Service,
     json_service_to_pb
 );
@@ -1073,6 +1094,11 @@ fn encode_event(api_version: &str, value: &Value) -> anyhow::Result<Vec<u8>> {
     }
 }
 
+fn encode_event_raw(api_version: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let value: Value = serde_json::from_slice(data)?;
+    encode_event(api_version, &value)
+}
+
 fn encode_eventlist(api_version: &str, value: &Value) -> anyhow::Result<Vec<u8>> {
     if api_version_matches("events.k8s.io", api_version) {
         let pb = json_events_v1_eventlist_to_pb(value)?;
@@ -1091,6 +1117,8 @@ fn raw_encode_fn(api_version: &str, kind: &str) -> Option<RawEncodeFn> {
         ("", "Namespace") => Some(encode_namespace_raw),
         ("", "ConfigMap") => Some(encode_configmap_raw),
         ("", "Secret") => Some(encode_secret_raw),
+        ("", "Pod") => Some(encode_pod_raw),
+        ("", "Service") => Some(encode_service_raw),
         ("", "ServiceAccount") => Some(encode_serviceaccount_raw),
         ("", "Endpoints") => Some(encode_endpoints_raw),
         ("", "PersistentVolume") => Some(encode_persistentvolume_raw),
@@ -1100,6 +1128,8 @@ fn raw_encode_fn(api_version: &str, kind: &str) -> Option<RawEncodeFn> {
         ("", "ReplicationController") => Some(encode_replicationcontroller_raw),
         ("", "ResourceQuota") => Some(encode_resourcequota_raw),
         ("", "LimitRange") => Some(encode_limitrange_raw),
+        ("", "Event") => Some(encode_event_raw),
+        ("events.k8s.io", "Event") => Some(encode_event_raw),
         ("apps", "Deployment") => Some(encode_deployment_raw),
         ("apps", "ReplicaSet") => Some(encode_replicaset_raw),
         ("apps", "StatefulSet") => Some(encode_statefulset_raw),

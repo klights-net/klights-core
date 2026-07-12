@@ -9,12 +9,118 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
+const JSON_MEDIA_TYPE: &str = "application/json";
+const PROTOBUF_MEDIA_TYPE: &str = "application/vnd.kubernetes.protobuf";
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum UnaryResponseFormat {
+    Json,
+    Protobuf,
+}
+
+struct AcceptMatch {
+    format: UnaryResponseFormat,
+    q: u16,
+    order: usize,
+    specificity: u8,
+}
+
 pub fn prefers_protobuf(headers: &HeaderMap) -> bool {
-    headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.contains("application/vnd.kubernetes.protobuf"))
-        .unwrap_or(false)
+    preferred_unary_response_format(headers) == UnaryResponseFormat::Protobuf
+}
+
+fn preferred_unary_response_format(headers: &HeaderMap) -> UnaryResponseFormat {
+    let mut best: Option<AcceptMatch> = None;
+    let mut order = 0usize;
+    for accept in headers.get_all("accept") {
+        let Ok(accept) = accept.to_str() else {
+            continue;
+        };
+        for raw_part in accept.split(',') {
+            let part = raw_part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(candidate) = parse_unary_accept_part(part, order)
+                && best
+                    .as_ref()
+                    .is_none_or(|current| accept_match_precedes(&candidate, current))
+            {
+                best = Some(candidate);
+            }
+            order += 1;
+        }
+    }
+
+    best.map(|candidate| candidate.format)
+        .unwrap_or(UnaryResponseFormat::Json)
+}
+
+fn parse_unary_accept_part(part: &str, order: usize) -> Option<AcceptMatch> {
+    let mut segments = part.split(';');
+    let media_type = segments.next()?.trim().to_ascii_lowercase();
+    let mut q = 1000u16;
+
+    for segment in segments {
+        let Some((name, value)) = segment.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("q") {
+            q = parse_accept_q(value.trim());
+        }
+    }
+    if q == 0 {
+        return None;
+    }
+
+    let (format, specificity) = match media_type.as_str() {
+        PROTOBUF_MEDIA_TYPE => (UnaryResponseFormat::Protobuf, 2),
+        JSON_MEDIA_TYPE => (UnaryResponseFormat::Json, 2),
+        "application/*" | "*/*" => (UnaryResponseFormat::Json, 0),
+        _ => return None,
+    };
+
+    Some(AcceptMatch {
+        format,
+        q,
+        order,
+        specificity,
+    })
+}
+
+fn parse_accept_q(value: &str) -> u16 {
+    let value = value.trim_matches('"').trim();
+    if value == "1" || value == "1.0" || value == "1.00" || value == "1.000" {
+        return 1000;
+    }
+    if value == "0" {
+        return 0;
+    }
+    let Some(fraction) = value.strip_prefix("0.") else {
+        return 0;
+    };
+
+    let mut q = 0u16;
+    for (idx, byte) in fraction.bytes().take(3).enumerate() {
+        if !byte.is_ascii_digit() {
+            return 0;
+        }
+        let place = match idx {
+            0 => 100,
+            1 => 10,
+            _ => 1,
+        };
+        q += u16::from(byte - b'0') * place;
+    }
+    q
+}
+
+fn accept_match_precedes(candidate: &AcceptMatch, current: &AcceptMatch) -> bool {
+    candidate.q > current.q
+        || (candidate.q == current.q && candidate.specificity > current.specificity)
+        || (candidate.q == current.q
+            && candidate.specificity == current.specificity
+            && candidate.order < current.order)
 }
 
 pub fn wants_table_format(headers: &HeaderMap) -> Result<bool, AppError> {
@@ -999,6 +1105,62 @@ fn table_access_modes(modes: &Value) -> String {
         }
     }
     seen.join(",")
+}
+
+#[cfg(test)]
+mod response_negotiation_tests {
+    use super::*;
+
+    fn headers(accept: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", accept.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn unary_response_defaults_to_json_without_accept() {
+        assert!(!prefers_protobuf(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn unary_response_accepts_explicit_protobuf() {
+        assert!(prefers_protobuf(&headers(PROTOBUF_MEDIA_TYPE)));
+    }
+
+    #[test]
+    fn unary_response_rejects_protobuf_with_zero_quality() {
+        assert!(!prefers_protobuf(&headers(
+            "application/json;q=1, application/vnd.kubernetes.protobuf;q=0"
+        )));
+    }
+
+    #[test]
+    fn unary_response_honors_quality_ordering() {
+        assert!(!prefers_protobuf(&headers(
+            "application/vnd.kubernetes.protobuf;q=0.4, application/json;q=0.8"
+        )));
+        assert!(prefers_protobuf(&headers(
+            "application/json;q=0.2, application/vnd.kubernetes.protobuf;q=0.9"
+        )));
+    }
+
+    #[test]
+    fn unary_response_honors_client_order_on_tie() {
+        assert!(!prefers_protobuf(&headers(
+            "application/json, application/vnd.kubernetes.protobuf"
+        )));
+        assert!(prefers_protobuf(&headers(
+            "application/vnd.kubernetes.protobuf, application/json"
+        )));
+    }
+
+    #[test]
+    fn unary_response_wildcards_fall_back_to_json() {
+        assert!(!prefers_protobuf(&headers(
+            "application/*;q=1, application/vnd.kubernetes.protobuf;q=0.5"
+        )));
+        assert!(!prefers_protobuf(&headers("*/*")));
+    }
 }
 
 #[cfg(test)]
