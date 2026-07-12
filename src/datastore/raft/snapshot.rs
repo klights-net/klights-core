@@ -155,7 +155,7 @@ fn normalize_snapshot_floors(
     current_resource_version: i64,
 ) -> Vec<crate::datastore::WatchReplayFloor> {
     for floor in &mut floors {
-        if floor.floor_event_id > high_water_event_id {
+        if floor.position_is_exact && floor.floor_event_id > high_water_event_id {
             // GC may advance after the boundary was captured. Relative to this
             // snapshot every older cursor is compacted while the boundary
             // itself remains a valid empty replay position.

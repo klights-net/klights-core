@@ -18,6 +18,7 @@ pub mod pod_serviceaccount;
 pub(crate) mod position_membership;
 pub mod raft;
 pub mod redb;
+pub(crate) mod replay_retention;
 pub mod replicated;
 pub mod resource_version_assignment;
 pub mod selector;

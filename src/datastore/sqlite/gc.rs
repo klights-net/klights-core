@@ -299,12 +299,13 @@ impl Datastore {
                 return Ok(PositionedWatchReplayRead::Expired);
             }
             if position.event_id == 0
+                && position.resource_version_filter_through_event_id == 0
                 && watch_replay_expired_for_targets(conn, &targets, position.resource_version)?
             {
                 return Ok(PositionedWatchReplayRead::Expired);
             }
-            if position.event_id > 0
-                && watch_position_expired_for_targets(conn, &targets, position.event_id)?
+            if (position.event_id > 0 || position.resource_version_filter_through_event_id > 0)
+                && watch_position_expired_for_targets(conn, &targets, position)?
             {
                 return Ok(PositionedWatchReplayRead::Expired);
             }
@@ -393,12 +394,13 @@ impl Datastore {
                 return Ok(PositionedWatchReplayRead::Expired);
             }
             if position.event_id == 0
+                && position.resource_version_filter_through_event_id == 0
                 && watch_replay_expired_for_targets(conn, &targets, position.resource_version)?
             {
                 return Ok(PositionedWatchReplayRead::Expired);
             }
-            if position.event_id > 0
-                && watch_position_expired_for_targets(conn, &targets, position.event_id)?
+            if (position.event_id > 0 || position.resource_version_filter_through_event_id > 0)
+                && watch_position_expired_for_targets(conn, &targets, position)?
             {
                 return Ok(PositionedWatchReplayRead::Expired);
             }
@@ -729,7 +731,8 @@ impl Datastore {
         Ok(self
             .read_db_call("list_watch_replay_floors", |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT api_version, kind, namespace_key, floor_rv, floor_event_id
+                    "SELECT api_version, kind, namespace_key, floor_rv, floor_event_id,
+                         floor_position_exact
                  FROM watch_replay_floors
                  ORDER BY api_version, kind, namespace_key",
                 )?;
@@ -740,6 +743,7 @@ impl Datastore {
                         namespace_key: row.get(2)?,
                         floor_resource_version: row.get(3)?,
                         floor_event_id: row.get(4)?,
+                        position_is_exact: row.get(5)?,
                     })
                 })?;
                 Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -836,8 +840,10 @@ fn watch_replay_expired_for_targets(
     }
 
     for target in targets {
-        if let Some(floor_rv) = target_floor(conn, target)?
-            && since_rv < floor_rv
+        if crate::datastore::replay_retention::ReplayRetentionBoundary::classify_all(
+            super::replay_floor::target_replay_boundaries(conn, target)?,
+            WatchReplayPosition::from_resource_version(since_rv),
+        ) == crate::datastore::replay_retention::ReplayAvailability::Expired
         {
             return Ok(true);
         }
@@ -848,30 +854,18 @@ fn watch_replay_expired_for_targets(
 fn watch_position_expired_for_targets(
     conn: &rusqlite::Connection,
     targets: &[WatchTarget],
-    event_id: i64,
+    position: WatchReplayPosition,
 ) -> rusqlite::Result<bool> {
     for target in targets {
-        if let Some(floor_event_id) = target_event_floor(conn, target)?
-            && event_id < floor_event_id
+        if crate::datastore::replay_retention::ReplayRetentionBoundary::classify_all(
+            super::replay_floor::target_replay_boundaries(conn, target)?,
+            position,
+        ) == crate::datastore::replay_retention::ReplayAvailability::Expired
         {
             return Ok(true);
         }
     }
     Ok(false)
-}
-
-fn target_event_floor(
-    conn: &rusqlite::Connection,
-    target: &WatchTarget,
-) -> rusqlite::Result<Option<i64>> {
-    Ok(super::replay_floor::target_replay_floor(conn, target)?.map(|floor| floor.event_id))
-}
-
-fn target_floor(
-    conn: &rusqlite::Connection,
-    target: &WatchTarget,
-) -> rusqlite::Result<Option<i64>> {
-    Ok(super::replay_floor::target_replay_floor(conn, target)?.map(|floor| floor.resource_version))
 }
 
 #[cfg(test)]

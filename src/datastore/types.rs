@@ -129,6 +129,31 @@ pub struct WatchReplayFloor {
     pub namespace_key: String,
     pub floor_resource_version: i64,
     pub floor_event_id: i64,
+    /// Whether `floor_event_id` is an exact retained-history cursor. Missing
+    /// from snapshots produced before positioned replay is `false`, keeping
+    /// exact replay fail-closed until a relist establishes a safe cursor.
+    #[serde(default)]
+    pub position_is_exact: bool,
+}
+
+impl WatchReplayFloor {
+    pub const fn retention_boundary(
+        &self,
+    ) -> crate::datastore::replay_retention::ReplayRetentionBoundary {
+        if self.position_is_exact {
+            crate::datastore::replay_retention::ReplayRetentionBoundary::Exact(
+                WatchReplayPosition {
+                    resource_version: self.floor_resource_version,
+                    event_id: self.floor_event_id,
+                    resource_version_filter_through_event_id: 0,
+                },
+            )
+        } else {
+            crate::datastore::replay_retention::ReplayRetentionBoundary::LegacyRvOnly {
+                resource_version: self.floor_resource_version,
+            }
+        }
+    }
 }
 
 impl Resource {
@@ -1106,6 +1131,117 @@ mod pod_endpoint_mode_tests {
         assert_eq!(
             PodEndpointMode::parse("hostport").unwrap(),
             PodEndpointMode::Hostport
+        );
+    }
+}
+
+#[cfg(test)]
+mod replay_retention_tests {
+    use super::WatchReplayPosition;
+    use crate::datastore::replay_retention::{ReplayAvailability, ReplayRetentionBoundary};
+
+    #[test]
+    fn exact_and_legacy_retention_boundaries_classify_positions() {
+        let exact = ReplayRetentionBoundary::Exact(WatchReplayPosition {
+            resource_version: 10,
+            event_id: 40,
+            resource_version_filter_through_event_id: 0,
+        });
+        let legacy = ReplayRetentionBoundary::LegacyRvOnly {
+            resource_version: 10,
+        };
+
+        let cases = [
+            (
+                exact,
+                WatchReplayPosition {
+                    resource_version: 10,
+                    event_id: 39,
+                    resource_version_filter_through_event_id: 0,
+                },
+                ReplayAvailability::Expired,
+            ),
+            (
+                exact,
+                WatchReplayPosition {
+                    resource_version: 10,
+                    event_id: 40,
+                    resource_version_filter_through_event_id: 0,
+                },
+                ReplayAvailability::Available,
+            ),
+            (
+                exact,
+                WatchReplayPosition::from_resource_version(10),
+                ReplayAvailability::Available,
+            ),
+            (
+                legacy,
+                WatchReplayPosition::from_resource_version(9),
+                ReplayAvailability::Expired,
+            ),
+            (
+                legacy,
+                WatchReplayPosition::from_resource_version(10),
+                ReplayAvailability::Available,
+            ),
+            (
+                legacy,
+                WatchReplayPosition {
+                    resource_version: 10,
+                    event_id: 40,
+                    resource_version_filter_through_event_id: 0,
+                },
+                ReplayAvailability::Expired,
+            ),
+            // A resource-version-filtered-through cursor (resume from RV,
+            // filtering rows up to a later event id) expires when the RV
+            // anchor precedes the floor even though the filter-through event
+            // id is the subscription high-water and never precedes it.
+            (
+                exact,
+                WatchReplayPosition::from_resource_version_through_event_id(9, 100),
+                ReplayAvailability::Expired,
+            ),
+            // ... and when the event window itself precedes the floor.
+            (
+                exact,
+                WatchReplayPosition::from_resource_version_through_event_id(10, 39),
+                ReplayAvailability::Expired,
+            ),
+            // Both anchor and window at or above the floor stay available.
+            (
+                exact,
+                WatchReplayPosition::from_resource_version_through_event_id(10, 40),
+                ReplayAvailability::Available,
+            ),
+        ];
+
+        for (boundary, cursor, expected) in cases {
+            assert_eq!(boundary.classify(cursor), expected);
+        }
+
+        let newer_rv = ReplayRetentionBoundary::Exact(WatchReplayPosition {
+            resource_version: 20,
+            event_id: 5,
+            resource_version_filter_through_event_id: 0,
+        });
+        let newer_event = ReplayRetentionBoundary::Exact(WatchReplayPosition {
+            resource_version: 10,
+            event_id: 40,
+            resource_version_filter_through_event_id: 0,
+        });
+        assert_eq!(
+            ReplayRetentionBoundary::classify_all(
+                [newer_rv, newer_event],
+                WatchReplayPosition {
+                    resource_version: 10,
+                    event_id: 10,
+                    resource_version_filter_through_event_id: 0,
+                },
+            ),
+            ReplayAvailability::Expired,
+            "scope composition must keep real boundaries instead of pairing max RV with max event ID"
         );
     }
 }

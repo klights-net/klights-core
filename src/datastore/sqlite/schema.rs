@@ -226,11 +226,13 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
             namespace_key TEXT NOT NULL,
             floor_rv      INTEGER NOT NULL,
             floor_event_id INTEGER NOT NULL DEFAULT 0,
+            floor_position_exact INTEGER NOT NULL DEFAULT 1,
             PRIMARY KEY(api_version, kind, namespace_key)
         )",
         [],
     )?;
     migrate_watch_replay_floor_event_id(conn)?;
+    migrate_watch_replay_floor_position_exact(conn)?;
 
     // Applied outbox idempotency ledger. Leader-side outbox apply stores one
     // row in the same cluster datastore that owns the corresponding mutation,
@@ -489,6 +491,29 @@ fn migrate_watch_replay_floor_event_id(conn: &mut rusqlite::Connection) -> rusql
     if !has_floor_event_id {
         conn.execute(
             "ALTER TABLE watch_replay_floors ADD COLUMN floor_event_id INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_watch_replay_floor_position_exact(
+    conn: &mut rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    let has_floor_position_exact = {
+        let mut stmt = conn.prepare("PRAGMA table_info(watch_replay_floors)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "floor_position_exact")
+    };
+    if !has_floor_position_exact {
+        // Existing rows were persisted before the boundary encoded whether an
+        // event ID was exact. Preserve that unknownness instead of treating a
+        // historical `0` as a valid positioned floor.
+        conn.execute(
+            "ALTER TABLE watch_replay_floors
+             ADD COLUMN floor_position_exact INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }

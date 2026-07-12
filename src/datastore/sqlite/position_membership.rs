@@ -94,10 +94,10 @@ fn position_expired(
     position: WatchReplayPosition,
 ) -> rusqlite::Result<bool> {
     for target in targets {
-        let floor = super::replay_floor::target_replay_floor(conn, target)?;
-        if (position.event_id > 0 && floor.is_some_and(|floor| position.event_id < floor.event_id))
-            || ((position.event_id == 0 || position.resource_version_filter_through_event_id > 0)
-                && floor.is_some_and(|floor| position.resource_version < floor.resource_version))
+        if crate::datastore::replay_retention::ReplayRetentionBoundary::classify_all(
+            super::replay_floor::target_replay_boundaries(conn, target)?,
+            position,
+        ) == crate::datastore::replay_retention::ReplayAvailability::Expired
         {
             return Ok(true);
         }

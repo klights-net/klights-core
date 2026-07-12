@@ -717,6 +717,7 @@ impl RedbWatchStore {
                     namespace_key: String::from_utf8_lossy(namespace_key).into_owned(),
                     floor_resource_version: floor_resource_version as i64,
                     floor_event_id: floor_event_id as i64,
+                    position_is_exact: true,
                 });
             }
             floors.sort_by(|left, right| {

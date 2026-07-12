@@ -7545,6 +7545,74 @@ async fn positioned_watch_replay_expires_after_its_scope_position_is_pruned() {
     ));
 }
 
+/// A watch replay floor migrated from a pre-positioned-replay database does
+/// not carry a proven exact event cursor (`floor_position_exact = 0`). A
+/// positioned (event-ID) cursor cannot be validated against it and must fail
+/// closed, while a resource-version-only cursor at or above the floor stays
+/// available for scalar Kubernetes compatibility.
+#[tokio::test]
+async fn migrated_legacy_floor_fails_closed_for_positioned_replay() {
+    let db = Datastore::new_in_memory().await.unwrap();
+
+    let created = db
+        .create_resource(
+            "v1",
+            "ConfigMap",
+            Some("legacy"),
+            "anchor",
+            json!({"metadata": {"name": "anchor", "namespace": "legacy"}}),
+        )
+        .await
+        .unwrap();
+    let floor_rv = created.resource_version;
+
+    // Simulate a row migrated from a pre-positioned-replay database: the
+    // boundary's event ID was never proven exact, so it must be treated as a
+    // resource-version-only legacy floor rather than an exact cursor.
+    db.db_call("insert-legacy-floor", move |conn| {
+        Ok(conn.execute(
+            "INSERT INTO watch_replay_floors
+                (api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact)
+             VALUES ('v1', 'ConfigMap', 'legacy', ?1, 0, 0)",
+            rusqlite::params![floor_rv],
+        )?)
+    })
+    .await
+    .unwrap();
+
+    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+        "v1",
+        "ConfigMap",
+        "legacy",
+    )];
+
+    // A positioned cursor at the floor's RV cannot be honored: the boundary
+    // is resource-version-only and must relist instead of replaying.
+    let positioned =
+        crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(floor_rv, 1);
+    assert!(matches!(
+        db.list_watch_events_after_position_checked_bounded(
+            &target,
+            positioned,
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap(),
+        crate::datastore::PositionedWatchReplayRead::Expired
+    ));
+
+    // The same boundary still permits scalar resource-version replay at or
+    // above the floor, preserving Kubernetes RV compatibility.
+    let scalar = db
+        .list_watch_events_since_checked(&target, floor_rv)
+        .await
+        .unwrap();
+    assert!(
+        matches!(scalar, crate::datastore::WatchReplayRead::Events(_)),
+        "legacy RV-only floor must not expire an at-or-above scalar cursor"
+    );
+}
+
 // -----------------------------------------------------------------------
 // DSB-05 — restart-recovery and retention tests
 // -----------------------------------------------------------------------

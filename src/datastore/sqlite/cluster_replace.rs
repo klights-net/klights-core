@@ -168,12 +168,17 @@ fn replace_resource_state_in_conn(
     }
     if let Some(floors) = watch_replay_floors {
         for floor in floors {
-            if floor.floor_resource_version < 0 || floor.floor_event_id < 0 {
+            if floor.floor_resource_version < 0
+                || (floor.position_is_exact && floor.floor_event_id < 0)
+            {
                 return Err(other_error(
                     "snapshot watch replay floor must be non-negative",
                 ));
             }
-            if watch_event_high_water.is_some_and(|high_water| floor.floor_event_id > high_water) {
+            if floor.position_is_exact
+                && watch_event_high_water
+                    .is_some_and(|high_water| floor.floor_event_id > high_water)
+            {
                 return Err(other_error(format!(
                     "snapshot replay floor event ID {} exceeds allocator high-water {}",
                     floor.floor_event_id,
@@ -182,14 +187,15 @@ fn replace_resource_state_in_conn(
             }
             tx.execute(
                 "INSERT INTO watch_replay_floors
-                 (api_version, kind, namespace_key, floor_rv, floor_event_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     floor.api_version,
                     floor.kind,
                     floor.namespace_key,
                     floor.floor_resource_version,
                     floor.floor_event_id,
+                    floor.position_is_exact,
                 ],
             )?;
         }
@@ -204,14 +210,14 @@ fn replace_resource_state_in_conn(
         };
         tx.execute(
             "INSERT INTO watch_replay_floors
-             (api_version, kind, namespace_key, floor_rv, floor_event_id)
-             VALUES ('*', '*', '*', ?1, ?2)",
+             (api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact)
+             VALUES ('*', '*', '*', ?1, ?2, 0)",
             rusqlite::params![current_rv, legacy_event_floor],
         )?;
         tx.execute(
             "INSERT OR REPLACE INTO watch_replay_floors
-             (api_version, kind, namespace_key, floor_rv, floor_event_id)
-             SELECT api_version, kind, namespace_key, ?1, ?2 FROM (
+             (api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact)
+             SELECT api_version, kind, namespace_key, ?1, ?2, 0 FROM (
                  SELECT api_version, kind, COALESCE(namespace, '#cluster') AS namespace_key
                    FROM watch_events
                  UNION

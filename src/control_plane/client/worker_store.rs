@@ -12,6 +12,7 @@ use crate::control_plane::client::{LeaderApiClient, ListRequest, ResourceKey, Wa
 #[cfg(test)]
 use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::node_local::NodeLocalHandle;
+use crate::datastore::replay_retention::{ReplayAvailability, ReplayRetentionBoundary};
 use crate::datastore::{
     AppliedOutboxRecord, CatchUpResource, DatastoreBackend, ListPageRequest, NodeSubnet, PatchKind,
     PodCleanupIntent, PodEndpointEvent, PodEndpointRow, PodNetworkAllocationLink,
@@ -227,7 +228,31 @@ fn object_at_resource_version(object: &Arc<Value>, resource_version: i64) -> Arc
 #[derive(Default)]
 struct WorkerWatchHistory {
     events: VecDeque<(i64, WatchEvent)>,
-    floors: HashMap<(WatchTopic, Option<String>), i64>,
+    floors: HashMap<(WatchTopic, Option<String>), Vec<ReplayRetentionBoundary>>,
+}
+
+fn worker_replay_boundaries(
+    history: &WorkerWatchHistory,
+    target: &WatchTarget,
+) -> Vec<ReplayRetentionBoundary> {
+    let topic = WatchTopic::new(&target.api_version, &target.kind);
+    history
+        .floors
+        .iter()
+        .filter(|((floor_topic, namespace), _)| {
+            if floor_topic != &topic {
+                return false;
+            }
+            match &target.scope {
+                WatchTargetScope::Cluster => namespace.is_none(),
+                WatchTargetScope::Namespaced(Some(want)) => {
+                    namespace.as_deref() == Some(want.as_str())
+                }
+                WatchTargetScope::Namespaced(None) => namespace.is_some(),
+            }
+        })
+        .flat_map(|(_, boundaries)| boundaries.iter().copied())
+        .collect()
 }
 
 /// Worker-local compatibility store for legacy kubelet call sites.
@@ -663,11 +688,17 @@ impl WorkerStoreAdapter {
                     .pointer("/metadata/namespace")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                history
-                    .floors
-                    .entry((topic, namespace))
-                    .and_modify(|floor| *floor = (*floor).max(removed_id))
-                    .or_insert(removed_id);
+                if let Some(resource_version) = removed.resource_version() {
+                    let floor = history.floors.entry((topic, namespace)).or_default();
+                    ReplayRetentionBoundary::retain_exact(
+                        floor,
+                        WatchReplayPosition {
+                            resource_version,
+                            event_id: removed_id,
+                            resource_version_filter_through_event_id: 0,
+                        },
+                    );
+                }
             }
         }
     }
@@ -1381,31 +1412,12 @@ impl DatastoreBackend for WorkerStoreAdapter {
             .event_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if position.event_id > 0
-            && targets.iter().any(|target| {
-                let topic = WatchTopic::new(&target.api_version, &target.kind);
-                match &target.scope {
-                    WatchTargetScope::Cluster => history
-                        .floors
-                        .get(&(topic, None))
-                        .is_some_and(|floor| position.event_id < *floor),
-                    WatchTargetScope::Namespaced(Some(namespace)) => history
-                        .floors
-                        .get(&(topic, Some(namespace.clone())))
-                        .is_some_and(|floor| position.event_id < *floor),
-                    WatchTargetScope::Namespaced(None) => {
-                        history
-                            .floors
-                            .iter()
-                            .any(|((floor_topic, namespace), floor)| {
-                                floor_topic == &topic
-                                    && namespace.is_some()
-                                    && position.event_id < *floor
-                            })
-                    }
-                }
-            })
-        {
+        if targets.iter().any(|target| {
+            ReplayRetentionBoundary::classify_all(
+                worker_replay_boundaries(&history, target),
+                position,
+            ) == ReplayAvailability::Expired
+        }) {
             return Ok(PositionedWatchReplayRead::Expired);
         }
         let events: Vec<_> = history
@@ -1465,23 +1477,11 @@ impl DatastoreBackend for WorkerStoreAdapter {
             .event_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Once a target's initial mirror rows have been compacted, the worker
-        // no longer owns enough state to rebuild an arbitrary historical
-        // collection. Fail closed instead of mixing sequential leader LISTs.
         if targets.iter().any(|target| {
-            let topic = WatchTopic::new(&target.api_version, &target.kind);
-            history.floors.keys().any(|(floor_topic, namespace)| {
-                if floor_topic != &topic {
-                    return false;
-                }
-                match &target.scope {
-                    WatchTargetScope::Cluster => namespace.is_none(),
-                    WatchTargetScope::Namespaced(Some(want)) => {
-                        namespace.as_deref() == Some(want.as_str())
-                    }
-                    WatchTargetScope::Namespaced(None) => namespace.is_some(),
-                }
-            })
+            ReplayRetentionBoundary::classify_all(
+                worker_replay_boundaries(&history, target),
+                position,
+            ) == ReplayAvailability::Expired
         }) {
             return Ok(SnapshotAtRv::Expired);
         }
@@ -1938,6 +1938,40 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn worker_retention_boundary_keeps_newer_position_available() {
+        let topic = WatchTopic::new("v1", "ConfigMap");
+        let mut history = WorkerWatchHistory::default();
+        ReplayRetentionBoundary::retain_exact(
+            history
+                .floors
+                .entry((topic.clone(), Some("default".into())))
+                .or_default(),
+            WatchReplayPosition {
+                resource_version: 10,
+                event_id: 40,
+                resource_version_filter_through_event_id: 0,
+            },
+        );
+        let target = WatchTarget {
+            api_version: "v1".into(),
+            kind: "ConfigMap".into(),
+            scope: WatchTargetScope::Namespaced(Some("default".into())),
+        };
+
+        assert_eq!(
+            ReplayRetentionBoundary::classify_all(
+                worker_replay_boundaries(&history, &target),
+                WatchReplayPosition {
+                    resource_version: 10,
+                    event_id: 40,
+                    resource_version_filter_through_event_id: 0,
+                },
+            ),
+            ReplayAvailability::Available
+        );
     }
 
     struct FailingPodLifecycleBackend {

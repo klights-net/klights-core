@@ -124,18 +124,19 @@ pub(super) const WATCH_EVENTS_SCOPE_COUNT: &str = "SELECT COUNT(*) FROM (
      )";
 
 pub(super) const WATCH_REPLAY_FLOOR_UPSERT: &str =
-    "INSERT INTO watch_replay_floors (api_version, kind, namespace_key, floor_rv, floor_event_id)
-     VALUES (?1, ?2, ?3, ?4, ?5)
+    "INSERT INTO watch_replay_floors
+        (api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact)
+     VALUES (?1, ?2, ?3, ?4, ?5, 1)
      ON CONFLICT(api_version, kind, namespace_key)
      DO UPDATE SET floor_rv = MAX(watch_replay_floors.floor_rv, excluded.floor_rv),
                    floor_event_id = MAX(watch_replay_floors.floor_event_id, excluded.floor_event_id)";
 
 pub(super) const WATCH_REPLAY_RETENTION_FLOOR_FOR_SCOPE: &str =
-    "SELECT floor_rv, floor_event_id FROM watch_replay_floors
+    "SELECT floor_rv, floor_event_id, floor_position_exact FROM watch_replay_floors
      WHERE api_version = ?1 AND kind = ?2 AND namespace_key = ?3";
 
 pub(super) const WATCH_REPLAY_RETENTION_FLOOR_FOR_NAMESPACED_ALL: &str =
-    "SELECT MAX(floor_rv), MAX(floor_event_id) FROM watch_replay_floors
+    "SELECT floor_rv, floor_event_id, floor_position_exact FROM watch_replay_floors
      WHERE api_version = ?1 AND kind = ?2 AND namespace_key <> '#cluster'";
 
 pub(super) const WATCH_EVENTS_GC_CANDIDATES: &str =

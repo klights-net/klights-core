@@ -195,6 +195,56 @@ fn schema_domain_map_is_deferred_to_dsb_ha_00() {
     // Marker: DSB-HA-00 complete (left for historical reference).
 }
 
+/// A database written before positioned replay had no `floor_position_exact`
+/// column. Reopening it must add the column and preserve the unknownness of
+/// every existing floor as a legacy (resource-version-only) boundary so that
+/// positioned replay fails closed instead of trusting a historical `0` event
+/// ID as an exact cursor.
+#[test]
+fn migrated_replay_floor_column_defaults_to_legacy_inexact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.db");
+    let mut conn = rusqlite::Connection::open(&path).expect("open");
+    opener::apply_pragmas(&conn, opener::PragmaProfile::Plaintext).expect("pragmas");
+
+    // Stand up the pre-positioned-replay table shape and one retained floor.
+    conn.execute(
+        "CREATE TABLE watch_replay_floors (
+            api_version TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            namespace_key TEXT NOT NULL,
+            floor_rv INTEGER NOT NULL,
+            floor_event_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(api_version, kind, namespace_key)
+         )",
+        [],
+    )
+    .expect("create legacy table");
+    conn.execute(
+        "INSERT INTO watch_replay_floors
+            (api_version, kind, namespace_key, floor_rv, floor_event_id)
+         VALUES ('v1', 'ConfigMap', 'legacy', 12, 0)",
+        [],
+    )
+    .expect("insert legacy floor");
+
+    // Reopening runs the migration that introduces the exactness column.
+    opener::init_schema(&mut conn).expect("init schema migrates column");
+
+    let exact: i64 = conn
+        .query_row(
+            "SELECT floor_position_exact FROM watch_replay_floors
+             WHERE api_version = 'v1' AND kind = 'ConfigMap' AND namespace_key = 'legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query migrated floor");
+    assert_eq!(
+        exact, 0,
+        "migrated floor must remain legacy-inexact so positioned replay fails closed"
+    );
+}
+
 fn hash_table_marker(hasher: &mut Sha256, table: &str) {
     hasher.update(b"TABLE:");
     hash_str(hasher, table);
@@ -424,7 +474,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
         let rows = db
             .db_call("family-fingerprint-watch-replay-floors", |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT api_version, kind, namespace_key, floor_rv, floor_event_id FROM watch_replay_floors \
+                    "SELECT api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact FROM watch_replay_floors \
                      ORDER BY api_version, kind, namespace_key",
                 )?;
                 let rows = stmt
@@ -435,6 +485,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
                             row.get::<_, String>(2)?,
                             row.get::<_, i64>(3)?,
                             row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
                         ))
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -451,6 +502,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
             hash_str(hasher, &row.2);
             hash_i64(hasher, row.3);
             hash_i64(hasher, row.4);
+            hash_i64(hasher, row.5);
         }
         Ok(())
     }
