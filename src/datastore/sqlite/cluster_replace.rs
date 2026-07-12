@@ -1056,6 +1056,86 @@ mod tests {
         )
     }
 
+    fn watermarked_pod_status_commit_with_stamp(
+        idempotency_key: &str,
+        status_message: &str,
+        status_stamp: i64,
+        stream_seq: i64,
+        name: &str,
+        uid: &str,
+    ) -> LogApplyCommit {
+        let mut commit = committed_apply_v1(pod_status_commit_with_stamp(
+            idempotency_key,
+            status_message,
+            status_stamp,
+            name,
+            uid,
+        ));
+        commit.outbox_watermark = Some(OutboxStreamWatermark {
+            client_id: "worker-status-client".to_string(),
+            stream_id: 7,
+            stream_seq,
+        });
+        commit
+    }
+
+    struct PodStatusApplySnapshot {
+        current_rv: i64,
+        pod_rv: i64,
+        status_message: String,
+        watch_count: usize,
+        outbox_rows: Vec<AppliedOutboxRecord>,
+        watermarks: Vec<OutboxStreamWatermark>,
+    }
+
+    async fn pod_status_apply_snapshot(
+        db: &Datastore,
+        name: &str,
+        keys: &[&str],
+    ) -> PodStatusApplySnapshot {
+        let pod = db
+            .get_resource("v1", "Pod", Some("default"), name)
+            .await
+            .unwrap()
+            .expect("pod exists");
+        let status_message = pod
+            .data
+            .pointer("/status/message")
+            .and_then(|value| value.as_str())
+            .expect("status message")
+            .to_string();
+        let watch_count = db
+            .list_resources_modified_since("v1", "Pod", Some("default"), 0)
+            .await
+            .unwrap()
+            .len();
+        let mut outbox_rows = Vec::new();
+        for key in keys {
+            if let Some(row) = db.get_applied_outbox(key).await.unwrap() {
+                outbox_rows.push(row);
+            }
+        }
+        PodStatusApplySnapshot {
+            current_rv: db.get_current_resource_version().await.unwrap(),
+            pod_rv: pod.resource_version,
+            status_message,
+            watch_count,
+            outbox_rows,
+            watermarks: db.list_outbox_stream_watermarks().await.unwrap(),
+        }
+    }
+
+    fn applied_outbox_ack_rv(row: &AppliedOutboxRecord) -> i64 {
+        match crate::datastore::command::decode_response_protobuf(&row.result_proto)
+            .expect("decode applied-outbox response")
+        {
+            crate::datastore::command::StorageResponse::Ack { resource_version } => {
+                resource_version
+            }
+            other => panic!("expected Ack response, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn committed_apply_v1_allocates_one_rv_after_current_counter() {
         let db = Datastore::new_in_memory().await.unwrap();
@@ -1530,7 +1610,14 @@ mod tests {
 
     #[tokio::test]
     async fn committed_apply_v1_stale_pod_status_stamp_replay_updates_only_outbox() {
-        let db = Datastore::new_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_root = dir.path().join("db");
+        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let db = Datastore::new_persistent(&db_root, supervisor.clone(), None)
+            .await
+            .unwrap();
         enable_committed_apply_v1(&db).await;
 
         db.create_resource(
@@ -1552,124 +1639,201 @@ mod tests {
         .await
         .unwrap();
 
-        let watch_before = db
-            .list_resources_modified_since("v1", "Pod", Some("default"), 0)
-            .await
-            .unwrap()
-            .len();
+        let keys = ["fresh", "stale", "same", "newer"];
+        let before = pod_status_apply_snapshot(&db, "stamped-status", &keys).await;
+        assert_eq!(before.status_message, "origin");
+        assert!(
+            before.outbox_rows.is_empty(),
+            "test starts without applied outbox rows"
+        );
+        assert!(
+            before.watermarks.is_empty(),
+            "test starts without stream watermarks"
+        );
 
         let fresh = db
-            .apply_raft_log_apply_commit(committed_apply_v1(pod_status_commit_with_stamp(
+            .apply_raft_log_apply_commit(watermarked_pod_status_commit_with_stamp(
                 "fresh",
                 "fresh",
                 200,
+                1,
                 "stamped-status",
                 "stamped-status-uid",
-            )))
+            ))
             .await
             .unwrap();
         assert_eq!(fresh.error_message, None);
-        assert!(fresh.applied_rv.is_some());
+        let fresh_rv = fresh.applied_rv.expect("fresh status allocates an RV");
+        assert!(
+            fresh_rv > before.current_rv,
+            "fresh stamped status must allocate one committed RV"
+        );
 
-        let watch_after_fresh = db
-            .list_resources_modified_since("v1", "Pod", Some("default"), 0)
-            .await
-            .unwrap()
-            .len();
-        assert!(watch_after_fresh > watch_before);
+        let after_fresh = pod_status_apply_snapshot(&db, "stamped-status", &keys).await;
+        assert_eq!(after_fresh.current_rv, fresh_rv);
+        assert_eq!(after_fresh.pod_rv, fresh_rv);
+        assert_eq!(after_fresh.status_message, "fresh");
+        assert_eq!(after_fresh.watch_count, before.watch_count + 1);
+        assert_eq!(after_fresh.outbox_rows.len(), 1);
+        assert_eq!(after_fresh.outbox_rows[0].idempotency_key, "fresh");
+        assert_eq!(after_fresh.outbox_rows[0].applied_rv, Some(fresh_rv));
+        assert_eq!(after_fresh.outbox_rows[0].status_stamp, Some(200));
+        assert_eq!(applied_outbox_ack_rv(&after_fresh.outbox_rows[0]), fresh_rv);
         assert_eq!(
-            db.get_resource("v1", "Pod", Some("default"), "stamped-status")
-                .await
-                .unwrap()
-                .unwrap()
-                .data
-                .pointer("/status/message")
-                .and_then(|value| value.as_str()),
-            Some("fresh")
+            after_fresh.watermarks,
+            vec![OutboxStreamWatermark {
+                client_id: "worker-status-client".to_string(),
+                stream_id: 7,
+                stream_seq: 1,
+            }]
         );
 
         let stale = db
-            .apply_raft_log_apply_commit(committed_apply_v1(pod_status_commit_with_stamp(
+            .apply_raft_log_apply_commit(watermarked_pod_status_commit_with_stamp(
                 "stale",
                 "stale",
                 100,
+                2,
                 "stamped-status",
                 "stamped-status-uid",
-            )))
+            ))
             .await
             .unwrap();
         assert_eq!(stale.error_message, None);
-
-        let watch_after_stale = db
-            .list_resources_modified_since("v1", "Pod", Some("default"), 0)
-            .await
-            .unwrap()
-            .len();
-        assert_eq!(watch_after_fresh, watch_after_stale);
         assert_eq!(
-            db.get_resource("v1", "Pod", Some("default"), "stamped-status")
-                .await
-                .unwrap()
-                .unwrap()
-                .data
-                .pointer("/status/message")
-                .and_then(|value| value.as_str()),
-            Some("fresh")
+            stale.applied_rv,
+            Some(fresh_rv),
+            "stale stamp reports the current committed RV without allocating"
+        );
+
+        let after_stale = pod_status_apply_snapshot(&db, "stamped-status", &keys).await;
+        assert_eq!(after_stale.current_rv, fresh_rv);
+        assert_eq!(after_stale.pod_rv, fresh_rv);
+        assert_eq!(after_stale.status_message, "fresh");
+        assert_eq!(after_stale.watch_count, after_fresh.watch_count);
+        assert_eq!(after_stale.outbox_rows.len(), 2);
+        let stale_row = after_stale
+            .outbox_rows
+            .iter()
+            .find(|row| row.idempotency_key == "stale")
+            .expect("stale terminal ledger row");
+        assert_eq!(stale_row.applied_rv, Some(fresh_rv));
+        assert_eq!(stale_row.status_stamp, Some(100));
+        assert_eq!(applied_outbox_ack_rv(stale_row), fresh_rv);
+        assert_eq!(
+            after_stale.watermarks,
+            vec![OutboxStreamWatermark {
+                client_id: "worker-status-client".to_string(),
+                stream_id: 7,
+                stream_seq: 2,
+            }]
         );
 
         let same_stamp = db
-            .apply_raft_log_apply_commit(committed_apply_v1(pod_status_commit_with_stamp(
+            .apply_raft_log_apply_commit(watermarked_pod_status_commit_with_stamp(
                 "same",
                 "same",
                 200,
+                3,
                 "stamped-status",
                 "stamped-status-uid",
-            )))
+            ))
             .await
             .unwrap();
         assert_eq!(same_stamp.error_message, None);
-
-        let watch_after_same_stamp = db
-            .list_resources_modified_since("v1", "Pod", Some("default"), 0)
-            .await
-            .unwrap()
-            .len();
-        assert_eq!(watch_after_stale, watch_after_same_stamp);
         assert_eq!(
-            db.get_resource("v1", "Pod", Some("default"), "stamped-status")
-                .await
-                .unwrap()
-                .unwrap()
-                .data
-                .pointer("/status/message")
-                .and_then(|value| value.as_str()),
-            Some("fresh")
+            same_stamp.applied_rv,
+            Some(fresh_rv),
+            "equal stamp reports the current committed RV without allocating"
         );
 
-        assert!(
-            db.get_applied_outbox("fresh")
-                .await
-                .unwrap()
-                .expect("fresh stamped outbox row should exist")
-                .status_stamp
-                .is_some_and(|stamp| stamp == 200)
+        let after_same = pod_status_apply_snapshot(&db, "stamped-status", &keys).await;
+        assert_eq!(after_same.current_rv, fresh_rv);
+        assert_eq!(after_same.pod_rv, fresh_rv);
+        assert_eq!(after_same.status_message, "fresh");
+        assert_eq!(after_same.watch_count, after_stale.watch_count);
+        assert_eq!(after_same.outbox_rows.len(), 3);
+        let same_row = after_same
+            .outbox_rows
+            .iter()
+            .find(|row| row.idempotency_key == "same")
+            .expect("equal terminal ledger row");
+        assert_eq!(same_row.applied_rv, Some(fresh_rv));
+        assert_eq!(same_row.status_stamp, Some(200));
+        assert_eq!(applied_outbox_ack_rv(same_row), fresh_rv);
+        assert_eq!(
+            after_same.watermarks,
+            vec![OutboxStreamWatermark {
+                client_id: "worker-status-client".to_string(),
+                stream_id: 7,
+                stream_seq: 3,
+            }]
         );
+
+        let newer = db
+            .apply_raft_log_apply_commit(watermarked_pod_status_commit_with_stamp(
+                "newer",
+                "newer",
+                300,
+                4,
+                "stamped-status",
+                "stamped-status-uid",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(newer.error_message, None);
+        let newer_rv = newer.applied_rv.expect("newer status allocates an RV");
         assert!(
-            db.get_applied_outbox("stale")
-                .await
-                .unwrap()
-                .expect("stale stamped outbox row should exist")
-                .status_stamp
-                .is_some_and(|stamp| stamp == 100)
+            newer_rv > fresh_rv,
+            "newer stamp after stale/equal terminal rows must still apply"
         );
-        assert!(
-            db.get_applied_outbox("same")
-                .await
-                .unwrap()
-                .expect("same stamped outbox row should exist")
-                .status_stamp
-                .is_some_and(|stamp| stamp == 200)
+
+        let after_newer = pod_status_apply_snapshot(&db, "stamped-status", &keys).await;
+        assert_eq!(after_newer.current_rv, newer_rv);
+        assert_eq!(after_newer.pod_rv, newer_rv);
+        assert_eq!(after_newer.status_message, "newer");
+        assert_eq!(after_newer.watch_count, after_same.watch_count + 1);
+        assert_eq!(after_newer.outbox_rows.len(), 4);
+        let newer_row = after_newer
+            .outbox_rows
+            .iter()
+            .find(|row| row.idempotency_key == "newer")
+            .expect("newer ledger row");
+        assert_eq!(newer_row.applied_rv, Some(newer_rv));
+        assert_eq!(newer_row.status_stamp, Some(300));
+        assert_eq!(applied_outbox_ack_rv(newer_row), newer_rv);
+        assert_eq!(
+            after_newer.watermarks,
+            vec![OutboxStreamWatermark {
+                client_id: "worker-status-client".to_string(),
+                stream_id: 7,
+                stream_seq: 4,
+            }]
         );
+
+        drop(db);
+        let reopened = Datastore::new_persistent(&db_root, supervisor, None)
+            .await
+            .unwrap();
+        let after_reopen = pod_status_apply_snapshot(&reopened, "stamped-status", &keys).await;
+        assert_eq!(after_reopen.current_rv, after_newer.current_rv);
+        assert_eq!(after_reopen.pod_rv, after_newer.pod_rv);
+        assert_eq!(after_reopen.status_message, after_newer.status_message);
+        assert_eq!(after_reopen.watch_count, after_newer.watch_count);
+        assert_eq!(after_reopen.watermarks, after_newer.watermarks);
+        assert_eq!(
+            after_reopen.outbox_rows.len(),
+            after_newer.outbox_rows.len()
+        );
+        for row in &after_reopen.outbox_rows {
+            let expected_rv = if row.idempotency_key == "newer" {
+                newer_rv
+            } else {
+                fresh_rv
+            };
+            assert_eq!(row.applied_rv, Some(expected_rv));
+            assert_eq!(applied_outbox_ack_rv(row), expected_rv);
+        }
     }
 
     #[tokio::test]
