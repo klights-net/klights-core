@@ -238,7 +238,7 @@ use std::sync::Arc;
 
 use crate::kubelet::pod_cluster_runtime::{ClusterRuntimeView, NodeRuntimeView};
 use crate::kubelet::pod_runtime::cri::{
-    ContainerRuntimeControl, ContainerRuntimeState, CriRuntime, CriRuntimeContainerEventKind,
+    ContainerRuntimeControl, CriRuntime, CriRuntimeContainerEventKind,
     CriRuntimeContainerEventStream,
 };
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
@@ -257,12 +257,12 @@ use crate::kubelet::pod_runtime::probes::{ProbeRuntime, StartupFinalizationActio
 use crate::kubelet::pod_runtime::repository::{LivePodUidCheck, PodRuntimeRepository};
 use crate::kubelet::pod_runtime::status_emitter::PodStatusEmitter;
 use crate::kubelet::pod_runtime::status_helpers::{
-    EphemeralContainerStatusInput, build_ephemeral_container_status, cri_timestamp_from_ns,
-    pod_status_container_id_by_name, pod_status_container_name_by_id, pod_status_host_ip,
-    pod_status_ip, replace_container_status, restart_last_state_from_reconciled_status,
-    restart_last_state_from_runtime_status, restarted_running_container_status,
+    EphemeralContainerStatusInput, build_ephemeral_container_status,
+    pod_status_container_name_by_id, pod_status_host_ip, pod_status_ip, replace_container_status,
+    restart_last_state_from_reconciled_status, restarted_running_container_status,
     runtime_status_container_id,
 };
+use crate::kubelet::pod_runtime::status_projection;
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
 use crate::kubelet::pod_sandbox_config::build_sandbox_config_with_dns_policy;
@@ -270,9 +270,7 @@ use crate::kubelet::pod_startup_error::PodStartupErrorKind;
 use crate::kubelet::pod_status_builders::{
     build_initial_pending_status, build_pod_initializing_app_statuses,
 };
-use crate::kubelet::pod_termination::{
-    find_pod_container_spec, get_termination_message_path, termination_message_policy,
-};
+use crate::kubelet::pod_termination::{find_pod_container_spec, get_termination_message_path};
 use crate::task_supervisor::TaskSupervisor;
 
 const INIT_CONTAINER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -288,27 +286,14 @@ const POST_SANDBOX_VOLUME_SETUP_TIMEOUT: std::time::Duration = std::time::Durati
 #[cfg(test)]
 const POST_SANDBOX_VOLUME_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
-struct ContainerConfigBuildRequest<'a> {
-    key: &'a PodRuntimeKey,
-    pod: &'a serde_json::Value,
-    container: &'a serde_json::Value,
-    container_name: &'a str,
-    kubernetes_service_ip: &'a str,
-    volume_paths: &'a std::collections::HashMap<String, String>,
-    ignore_mount_errors: bool,
-}
-
-#[derive(Clone, Debug)]
-struct ReconcileContainerInfo {
-    container_id: String,
-    state: ContainerRuntimeState,
-    exit_code: i32,
-    started_at: i64,
-    finished_at: i64,
-    created_at: i64,
-    image: String,
-    image_ref: String,
-    termination_message: String,
+pub(super) struct ContainerConfigBuildRequest<'a> {
+    pub(super) key: &'a PodRuntimeKey,
+    pub(super) pod: &'a serde_json::Value,
+    pub(super) container: &'a serde_json::Value,
+    pub(super) container_name: &'a str,
+    pub(super) kubernetes_service_ip: &'a str,
+    pub(super) volume_paths: &'a std::collections::HashMap<String, String>,
+    pub(super) ignore_mount_errors: bool,
 }
 
 fn managed_hosts_file_path(
@@ -360,7 +345,7 @@ pub struct RealPodRuntimeService {
     pub(super) slot_admission: Arc<dyn PodSlotAdmission>,
     pub(super) repository: Arc<dyn PodRuntimeRepository>,
     pub(super) filesystem: Arc<dyn PodFilesystem>,
-    volumes: Arc<dyn PodVolumeRuntime>,
+    pub(super) volumes: Arc<dyn PodVolumeRuntime>,
     probes: Arc<dyn ProbeRuntime>,
     hostports: Arc<dyn HostPortRuntime>,
     events: Arc<dyn PodEventSink>,
@@ -368,7 +353,7 @@ pub struct RealPodRuntimeService {
     env_source: Arc<dyn crate::kubelet::pod_env::EnvSourceReader>,
     finalizer: Arc<dyn PodDeletionFinalizer>,
     supervisor: Arc<TaskSupervisor>,
-    config: RuntimeConfig,
+    pub(super) config: RuntimeConfig,
     node_view: Arc<dyn NodeRuntimeView>,
     cluster_view: Arc<dyn ClusterRuntimeView>,
     pub(super) status_emitter: PodStatusEmitter,
@@ -459,7 +444,7 @@ impl RealPodRuntimeService {
     /// Write Pod status through the cluster boundary `ClusterRuntimeView`.
     /// On the leader this resolves to a local repository write; on a worker it
     /// forwards to the leader — a single status path for every node role.
-    async fn write_pod_status(
+    pub(super) async fn write_pod_status(
         &self,
         key: &PodRuntimeKey,
         status: serde_json::Value,
@@ -483,7 +468,7 @@ impl RealPodRuntimeService {
         Ok(())
     }
 
-    async fn build_container_config_with_env(
+    pub(super) async fn build_container_config_with_env(
         &self,
         request: ContainerConfigBuildRequest<'_>,
     ) -> anyhow::Result<k8s_cri::v1::ContainerConfig> {
@@ -740,329 +725,6 @@ impl RealPodRuntimeService {
         }
 
         Ok(restarted.then_some(restarted_statuses))
-    }
-
-    async fn reconcile_container_statuses_from_pod_spec(
-        &self,
-        key: &PodRuntimeKey,
-        pod: &serde_json::Value,
-        observed: &[(String, ContainerRuntimeState)],
-    ) -> (String, Vec<serde_json::Value>) {
-        let spec_containers = pod
-            .pointer("/spec/containers")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let existing_statuses = pod
-            .pointer("/status/containerStatuses")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let spec_names: std::collections::HashSet<String> = spec_containers
-            .iter()
-            .filter_map(|container| {
-                container
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .map(ToString::to_string)
-            })
-            .collect();
-
-        let mut infos_by_name: std::collections::HashMap<String, ReconcileContainerInfo> =
-            std::collections::HashMap::new();
-        for (idx, (container_id, observed_state)) in observed.iter().enumerate() {
-            let status = match self.cri.container_status(container_id).await {
-                Ok(response) => response.status,
-                Err(e) => {
-                    tracing::warn!(
-                        container_id = container_id,
-                        "failed to inspect container during runtime reconcile: {}",
-                        e
-                    );
-                    None
-                }
-            };
-            let fallback_spec = spec_containers.get(idx);
-            // Prefer the CRI metadata name, then the existing status entry
-            // whose containerID references this container (so a CRI event
-            // container is never assigned to the wrong spec container when
-            // CRI omits the metadata name), then the spec index.
-            let cri_name = status
-                .as_ref()
-                .and_then(|status| status.metadata.as_ref())
-                .map(|metadata| metadata.name.as_str())
-                .filter(|name| !name.is_empty());
-            let existing_status_name = existing_statuses.iter().find_map(|existing| {
-                let matches_id = existing
-                    .get("containerID")
-                    .and_then(|id| id.as_str())
-                    .map(|id| id.strip_prefix("containerd://").unwrap_or(id) == container_id)
-                    .unwrap_or(false);
-                if matches_id {
-                    existing
-                        .get("name")
-                        .and_then(|name| name.as_str())
-                        .filter(|name| !name.is_empty())
-                } else {
-                    None
-                }
-            });
-            let spec_index_name = fallback_spec
-                .and_then(|container| container.get("name").and_then(|name| name.as_str()));
-            let container_name = cri_name
-                .or(existing_status_name)
-                .or(spec_index_name)
-                .unwrap_or("");
-            if container_name.is_empty() || !spec_names.contains(container_name) {
-                continue;
-            }
-
-            let image = status
-                .as_ref()
-                .and_then(|status| status.image.as_ref())
-                .map(|image| image.image.as_str())
-                .filter(|image| !image.is_empty())
-                .or_else(|| {
-                    fallback_spec.and_then(|container| {
-                        container.get("image").and_then(|image| image.as_str())
-                    })
-                })
-                .unwrap_or("nginx:latest")
-                .to_string();
-            let image_ref = status
-                .as_ref()
-                .map(|status| {
-                    if !status.image_ref.is_empty() {
-                        status.image_ref.clone()
-                    } else if !status.image_id.is_empty() {
-                        status.image_id.clone()
-                    } else {
-                        image.clone()
-                    }
-                })
-                .unwrap_or_else(|| image.clone());
-            let state = *observed_state;
-            let termination_message = match status.as_ref() {
-                Some(status) if !status.message.is_empty() => status.message.clone(),
-                _ if state == ContainerRuntimeState::Exited => {
-                    self.read_termination_message_for_container(
-                        key,
-                        pod,
-                        container_name,
-                        status.as_ref().map(|status| status.exit_code).unwrap_or(0),
-                    )
-                    .await
-                }
-                _ => String::new(),
-            };
-            let info = ReconcileContainerInfo {
-                container_id: container_id.clone(),
-                state,
-                exit_code: status.as_ref().map(|status| status.exit_code).unwrap_or(0),
-                started_at: status.as_ref().map(|status| status.started_at).unwrap_or(0),
-                finished_at: status
-                    .as_ref()
-                    .map(|status| status.finished_at)
-                    .unwrap_or(0),
-                created_at: status
-                    .as_ref()
-                    .map(|status| status.created_at)
-                    .unwrap_or(idx as i64),
-                image,
-                image_ref,
-                termination_message,
-            };
-
-            match infos_by_name.get(container_name) {
-                Some(existing) if existing.created_at > info.created_at => {}
-                _ => {
-                    infos_by_name.insert(container_name.to_string(), info);
-                }
-            }
-        }
-
-        let container_statuses = spec_containers
-            .iter()
-            .filter_map(|container| {
-                let container_name = container.get("name").and_then(|v| v.as_str())?;
-                let image = container
-                    .get("image")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("nginx:latest");
-                let existing = existing_statuses
-                    .iter()
-                    .find(|status| status.get("name").and_then(|v| v.as_str()) == Some(container_name));
-                let has_readiness_probe = container.get("readinessProbe").is_some();
-                let info = infos_by_name.get(container_name);
-                let running = info
-                    .map(|info| info.state.is_running())
-                    .unwrap_or(false);
-                let ready = running
-                    && if !has_readiness_probe {
-                        true
-                    } else {
-                        existing
-                            .and_then(|status| status.get("ready"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false)
-                    };
-                let started = info
-                    .map(|info| info.state.has_started())
-                    .unwrap_or(false);
-                let state_obj = match info {
-                    Some(info) if info.state == ContainerRuntimeState::Running => {
-                        let started_at = if info.started_at > 0 {
-                            cri_timestamp_from_ns(info.started_at)
-                        } else {
-                            existing
-                                .and_then(|status| status.pointer("/state/running/startedAt"))
-                                .and_then(|value| value.as_str())
-                                .map(ToString::to_string)
-                                .unwrap_or_else(crate::utils::k8s_timestamp)
-                        };
-                        serde_json::json!({ "running": { "startedAt": started_at } })
-                    }
-                    Some(info) if info.state == ContainerRuntimeState::Exited => {
-                        let mut terminated = serde_json::json!({
-                            "exitCode": info.exit_code,
-                            "reason": if info.exit_code == 0 { "Completed" } else { "Error" },
-                            "startedAt": cri_timestamp_from_ns(info.started_at),
-                            "finishedAt": cri_timestamp_from_ns(info.finished_at),
-                        });
-                        if !info.termination_message.is_empty() {
-                            terminated["message"] =
-                                serde_json::json!(info.termination_message.clone());
-                        }
-                        serde_json::json!({ "terminated": terminated })
-                    }
-                    _ => serde_json::json!({ "waiting": { "reason": "ContainerCreating" } }),
-                };
-                let mut status = serde_json::json!({
-                    "name": container_name,
-                    "containerID": info
-                        .map(|info| serde_json::json!(format!("containerd://{}", info.container_id)))
-                        .unwrap_or(serde_json::Value::Null),
-                    "ready": ready,
-                    "started": started,
-                    "restartCount": existing
-                        .and_then(|status| status.get("restartCount"))
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                    "state": state_obj,
-                    "image": info.map(|info| info.image.as_str()).unwrap_or(image),
-                    "imageID": info.map(|info| info.image_ref.as_str()).unwrap_or(image),
-                });
-                if let Some(last_state) = existing.and_then(|status| status.get("lastState"))
-                    && let Some(obj) = status.as_object_mut() {
-                        obj.insert("lastState".to_string(), last_state.clone());
-                    }
-                Some(status)
-            })
-            .collect();
-
-        let phase = Self::compute_reconciled_phase(&spec_containers, &infos_by_name, pod);
-        (phase, container_statuses)
-    }
-
-    async fn read_termination_message_for_container(
-        &self,
-        key: &PodRuntimeKey,
-        pod: &serde_json::Value,
-        container_name: &str,
-        exit_code: i32,
-    ) -> String {
-        let container_spec = find_pod_container_spec(pod, container_name);
-        let policy = termination_message_policy(container_spec);
-        self.filesystem
-            .read_termination_message(key, container_name, policy, exit_code)
-            .await
-    }
-
-    /// Read the CRI status for a specific container id and map it to the
-    /// runtime-reconcile state enum. Returns `None` when CRI cannot report
-    /// the container (already removed, unknown id) so the caller can decide
-    /// whether to fall back to ContainerCreating or skip the entry.
-    async fn runtime_state_from_container_status(
-        &self,
-        container_id: &str,
-    ) -> anyhow::Result<Option<ContainerRuntimeState>> {
-        let state = match self.cri.container_status(container_id).await {
-            Ok(response) => response
-                .status
-                .map(|status| ContainerRuntimeState::from_cri_state_i32(status.state)),
-            Err(e) => {
-                tracing::warn!(
-                    container_id = container_id,
-                    "failed to inspect hinted container during runtime reconcile: {}",
-                    e
-                );
-                None
-            }
-        };
-        Ok(state)
-    }
-
-    fn compute_reconciled_phase(
-        spec_containers: &[serde_json::Value],
-        infos_by_name: &std::collections::HashMap<String, ReconcileContainerInfo>,
-        pod: &serde_json::Value,
-    ) -> String {
-        if spec_containers.is_empty() || infos_by_name.is_empty() {
-            return "Pending".to_string();
-        }
-
-        let restart_policy = pod
-            .pointer("/spec/restartPolicy")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .unwrap_or("Always");
-        let mut any_running = false;
-        let mut any_exited_nonzero = false;
-        let mut all_exited_zero = true;
-
-        for container in spec_containers {
-            let Some(name) = container.get("name").and_then(|value| value.as_str()) else {
-                all_exited_zero = false;
-                continue;
-            };
-            let Some(info) = infos_by_name.get(name) else {
-                all_exited_zero = false;
-                continue;
-            };
-            match info.state {
-                ContainerRuntimeState::Running => {
-                    any_running = true;
-                    all_exited_zero = false;
-                }
-                ContainerRuntimeState::Exited => {
-                    if info.exit_code != 0 {
-                        any_exited_nonzero = true;
-                        all_exited_zero = false;
-                    }
-                }
-                _ => {
-                    all_exited_zero = false;
-                }
-            }
-        }
-
-        if any_running {
-            return "Running".to_string();
-        }
-        if restart_policy == "Always" {
-            return "Running".to_string();
-        }
-        if restart_policy == "OnFailure" && any_exited_nonzero {
-            return "Running".to_string();
-        }
-        if all_exited_zero && matches!(restart_policy, "Never" | "OnFailure") {
-            return "Succeeded".to_string();
-        }
-        if any_exited_nonzero && restart_policy == "Never" {
-            return "Failed".to_string();
-        }
-        "Pending".to_string()
     }
 
     fn pod_with_network_status(
@@ -2722,9 +2384,11 @@ impl PodRuntimeService for RealPodRuntimeService {
             if containers.iter().any(|(id, _)| id == container_id) {
                 continue; // Already present in the listing — skip the direct fetch.
             }
-            if let Some(state) = self
-                .runtime_state_from_container_status(container_id)
-                .await?
+            if let Some(state) = status_projection::runtime_state_from_container_status(
+                self.cri.as_ref(),
+                container_id,
+            )
+            .await?
             {
                 containers.push((container_id.to_string(), state));
             }
@@ -2733,8 +2397,14 @@ impl PodRuntimeService for RealPodRuntimeService {
         }
 
         // 3. Build phase and container statuses from CRI state plus the Pod spec.
-        let (mut phase, mut container_statuses) = self
-            .reconcile_container_statuses_from_pod_spec(&key, &resource.data, &containers)
+        let (mut phase, mut container_statuses) =
+            status_projection::reconcile_container_statuses_from_pod_spec(
+                self.cri.as_ref(),
+                self.filesystem.as_ref(),
+                &key,
+                &resource.data,
+                &containers,
+            )
             .await;
         if let Some(restarted_statuses) = self
             .restart_exited_containers_if_needed(
@@ -3219,223 +2889,8 @@ impl PodRuntimeService for RealPodRuntimeService {
     }
 
     async fn handle_lifecycle_command(&self, command: LifecycleCommand) -> anyhow::Result<()> {
-        use crate::kubelet::lifecycle::LifecycleCommand;
-
-        match &command {
-            LifecycleCommand::ReadinessChanged {
-                pod_uid,
-                namespace,
-                pod_name,
-                container_name,
-                ready,
-            } => {
-                self.handle_readiness_changed(namespace, pod_name, pod_uid, container_name, *ready)
-                    .await?;
-            }
-            LifecycleCommand::RestartRequested {
-                pod_uid,
-                namespace,
-                pod_name,
-                container_name,
-                reason,
-            } => {
-                tracing::info!(
-                    namespace = namespace,
-                    pod = pod_name,
-                    uid = pod_uid,
-                    container = container_name,
-                    reason = format!("{:?}", reason),
-                    "restart requested"
-                );
-                let key = PodRuntimeKey::new(namespace, pod_name, pod_uid);
-                let Some(pod_resource) = self
-                    .repository
-                    .get_pod_for_uid(namespace, pod_name, pod_uid)
-                    .await?
-                else {
-                    return Ok(());
-                };
-                let pod = pod_resource.data.as_ref().clone();
-                let Some(sandbox_id) = self.store.get_sandbox_id(&key).await? else {
-                    tracing::warn!(
-                        namespace = namespace,
-                        pod = pod_name,
-                        uid = pod_uid,
-                        "restart requested but sandbox id is missing"
-                    );
-                    return Ok(());
-                };
-
-                let observed_container_status = pod
-                    .pointer("/status/containerStatuses")
-                    .and_then(|value| value.as_array())
-                    .and_then(|statuses| {
-                        statuses
-                            .iter()
-                            .find(|status| {
-                                status.get("name").and_then(|value| value.as_str())
-                                    == Some(container_name.as_str())
-                            })
-                            .cloned()
-                    });
-                let mut old_container_id = pod_status_container_id_by_name(&pod, container_name);
-                if old_container_id.is_none() {
-                    let containers = self
-                        .container_control
-                        .list_containers(Some(&sandbox_id))
-                        .await
-                        .unwrap_or_default();
-                    for (candidate_id, _state) in containers {
-                        let runtime_name = self
-                            .cri
-                            .container_status(&candidate_id)
-                            .await
-                            .ok()
-                            .and_then(|response| response.status)
-                            .and_then(|status| status.metadata.map(|metadata| metadata.name))
-                            .filter(|name| !name.is_empty());
-                        if runtime_name.as_deref() == Some(container_name.as_str()) {
-                            old_container_id = Some(candidate_id);
-                            break;
-                        }
-                    }
-                }
-                let Some(old_container_id) = old_container_id else {
-                    tracing::warn!(
-                        namespace = namespace,
-                        pod = pod_name,
-                        uid = pod_uid,
-                        container = container_name,
-                        "restart requested but runtime container id is missing"
-                    );
-                    return Ok(());
-                };
-
-                let _ = self.cri.stop_container(&old_container_id, 10).await;
-                let stopped_status = self
-                    .cri
-                    .container_status(&old_container_id)
-                    .await
-                    .ok()
-                    .and_then(|response| response.status);
-                let last_state = restart_last_state_from_runtime_status(stopped_status.as_ref());
-                let _ = self
-                    .repository
-                    .note_container_restart_for_uid(
-                        namespace,
-                        pod_name,
-                        pod_uid,
-                        container_name,
-                        last_state.clone(),
-                        None,
-                    )
-                    .await;
-                self.cri.remove_container(&old_container_id).await?;
-
-                let volume_paths = self.volumes.process_volumes(&key, &pod).await?;
-                if pod
-                    .pointer("/spec/securityContext/fsGroup")
-                    .and_then(|v| v.as_u64())
-                    .is_some()
-                {
-                    let _ = self.filesystem.apply_fs_group(&key, &pod).await;
-                }
-
-                let Some(container) = find_pod_container_spec(&pod, container_name) else {
-                    tracing::warn!(
-                        namespace = namespace,
-                        pod = pod_name,
-                        uid = pod_uid,
-                        container = container_name,
-                        "restart requested but container spec is missing"
-                    );
-                    return Ok(());
-                };
-                let dns_ip =
-                    crate::controllers::coredns::derive_dns_service_ip(&self.config.service_cidr);
-                let kubernetes_service_ip =
-                    crate::controllers::kube_service::derive_kubernetes_service_ip(
-                        &self.config.service_cidr,
-                    );
-                let container_config = self
-                    .build_container_config_with_env(ContainerConfigBuildRequest {
-                        key: &key,
-                        pod: &pod,
-                        container,
-                        container_name,
-                        kubernetes_service_ip: &kubernetes_service_ip,
-                        volume_paths: &volume_paths,
-                        ignore_mount_errors: false,
-                    })
-                    .await?;
-                let default_spec = serde_json::json!({});
-                let pod_spec = pod.get("spec").unwrap_or(&default_spec);
-                let sandbox_config = build_sandbox_config_with_dns_policy(
-                    pod_name,
-                    namespace,
-                    pod_status_ip(&pod),
-                    pod_uid,
-                    &self.config.containerd_namespace,
-                    &dns_ip,
-                    pod_spec,
-                );
-
-                let new_container_id = self
-                    .cri
-                    .create_container(container_config, &sandbox_id, sandbox_config)
-                    .await?;
-                self.cri.start_container(&new_container_id).await?;
-                if let Some(observed_status) = observed_container_status.as_ref() {
-                    let mut container_statuses = pod
-                        .pointer("/status/containerStatuses")
-                        .and_then(|value| value.as_array())
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some(replacement) = restarted_running_container_status(
-                        &pod,
-                        container_name,
-                        &new_container_id,
-                        observed_status,
-                        &last_state,
-                    ) {
-                        replace_container_status(
-                            &mut container_statuses,
-                            container_name,
-                            replacement,
-                        );
-                        let mut status = serde_json::json!({
-                            "phase": "Running",
-                            "containerStatuses": container_statuses,
-                        });
-                        crate::pod_status_merge::merge_pod_status_for_update(
-                            "v1",
-                            "Pod",
-                            &pod,
-                            &mut status,
-                            crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
-                        );
-                        self.write_pod_status(&key, status).await?;
-                    }
-                }
-            }
-            LifecycleCommand::StartupPassed {
-                pod_uid,
-                namespace,
-                pod_name,
-                container_name,
-            } => {
-                tracing::info!(
-                    namespace = namespace,
-                    pod = pod_name,
-                    uid = pod_uid,
-                    container = container_name,
-                    "startup probe passed"
-                );
-                // Startup passed: the container is now ready for liveness probes.
-                // The probe manager handles this transition internally.
-            }
-        }
-        Ok(())
+        crate::kubelet::pod_runtime::lifecycle_commands::handle_lifecycle_command(self, command)
+            .await
     }
 
     async fn schedule_retry(

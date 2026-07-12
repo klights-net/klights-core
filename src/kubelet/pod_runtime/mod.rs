@@ -8,6 +8,7 @@ pub mod hooks;
 pub mod hostports;
 pub mod images;
 pub mod init_container_status;
+pub mod lifecycle_commands;
 pub mod network;
 pub mod observations;
 pub mod orphan_stop;
@@ -22,6 +23,7 @@ pub mod slot_admission;
 pub mod startup_finalization;
 pub mod status_emitter;
 pub mod status_helpers;
+pub mod status_projection;
 pub mod store;
 pub mod volumes;
 
