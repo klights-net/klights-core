@@ -67,6 +67,7 @@ pub struct BootstrapRunArgs<'a> {
     pub dataplane_health: &'a crate::networking::dataplane_health::DataplaneHealth,
     pub cri_for_pod_watcher: Option<CriClient>,
     pub cri_for_api: Option<Arc<tokio::sync::Mutex<CriClient>>>,
+    pub cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
     pub supervisor: Arc<TaskSupervisor>,
     pub grpc_transport_policy:
         crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
@@ -136,6 +137,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         dataplane_health,
         cri_for_pod_watcher,
         cri_for_api,
+        cni_readiness,
         supervisor,
         grpc_transport_policy,
         shutdown_token,
@@ -286,7 +288,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let runtime = Arc::new(crate::kubelet::pod_runtime::cri::SharedCriRuntime::new(
             SharedCriClient::new(cri),
         ));
-        crate::kubelet::pod_manager::PodWatcherRuntimePorts::new(runtime.clone(), runtime)
+        crate::kubelet::pod_manager::PodWatcherRuntimePorts::new(
+            runtime.clone(),
+            runtime,
+            cni_readiness.clone(),
+        )
     });
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {

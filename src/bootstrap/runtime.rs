@@ -488,6 +488,7 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
     let cni_rpc_handle = net.cni_rpc_handle;
     let cri_for_pod_watcher = net.cri_for_pod_watcher;
     let cri_for_api = net.cri_for_api;
+    let cni_readiness = net.cni_readiness;
     let dataplane_health = net.dataplane_health;
     // A worker is always multinode: start NetworkUnavailable=True until the
     // first successful peer-route sync confirms every Ready peer is reachable.
@@ -613,7 +614,11 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
         let runtime = std::sync::Arc::new(crate::kubelet::pod_runtime::cri::SharedCriRuntime::new(
             crate::kubelet::cri::SharedCriClient::new(cri),
         ));
-        crate::kubelet::pod_manager::PodWatcherRuntimePorts::new(runtime.clone(), runtime)
+        crate::kubelet::pod_manager::PodWatcherRuntimePorts::new(
+            runtime.clone(),
+            runtime,
+            cni_readiness.clone(),
+        )
     });
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {
@@ -944,6 +949,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let cni_rpc_handle = net.cni_rpc_handle;
     let cri_for_pod_watcher = net.cri_for_pod_watcher;
     let cri_for_api = net.cri_for_api;
+    let cni_readiness = net.cni_readiness;
     let dataplane_health = net.dataplane_health;
     let controlplane_leader_control_stream_handle =
         start_controlplane_leader_control_stream_if_needed(
@@ -983,6 +989,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         dataplane_health: &dataplane_health,
         cri_for_pod_watcher,
         cri_for_api: cri_for_api.clone(),
+        cni_readiness,
         supervisor: task_supervisor.clone(),
         grpc_transport_policy: grpc_transport_policy.clone(),
         shutdown_token: shutdown_token.clone(),

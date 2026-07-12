@@ -49,16 +49,19 @@ mod event_forwarder;
 pub struct PodWatcherRuntimePorts {
     cri_runtime: Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
     container_control: Arc<dyn crate::kubelet::pod_runtime::cri::ContainerRuntimeControl>,
+    cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
 }
 
 impl PodWatcherRuntimePorts {
     pub fn new(
         cri_runtime: Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
         container_control: Arc<dyn crate::kubelet::pod_runtime::cri::ContainerRuntimeControl>,
+        cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
     ) -> Self {
         Self {
             cri_runtime,
             container_control,
+            cni_readiness,
         }
     }
 }
@@ -195,6 +198,13 @@ async fn spawn_cri_event_forwarder(
         .await
 }
 
+async fn wait_for_cni_readiness(
+    readiness: crate::kubelet::cni_readiness::CniReadiness,
+    cancel_token: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    readiness.wait_ready(cancel_token).await
+}
+
 pub fn get_cached_host_ip() -> &'static str {
     HOST_IP.get().map(|s| s.as_str()).unwrap_or("127.0.0.1")
 }
@@ -293,44 +303,11 @@ async fn run_pod_watcher_with_runtime(
             .collect(),
     );
 
-    // Wait for CNI to be ready before creating any pods.
-    // CRI gRPC is ready but the CNI plugin may not have loaded its config yet.
-    // Probe by listing sandboxes — this is cheap and forces CNI plugin init.
+    if let Err(err) =
+        wait_for_cni_readiness(runtime_ports.cni_readiness.clone(), cancel_token.clone()).await
     {
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(30);
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            match cri_runtime.list_pod_sandboxes(None).await {
-                Ok(_) => {
-                    tracing::info!(
-                        "CNI ready after {} attempts ({:?})",
-                        attempt,
-                        start.elapsed()
-                    );
-                    break;
-                }
-                Err(e) => {
-                    if start.elapsed() >= timeout {
-                        tracing::warn!(
-                            "CNI readiness probe timed out after {}s: {:#}",
-                            timeout.as_secs(),
-                            e
-                        );
-                        break;
-                    }
-                    tracing::debug!("CNI readiness probe attempt {}: {:#}", attempt, e);
-                    let _ = state
-                        .task_supervisor
-                        .sleep(
-                            "pod_watcher_cni_readiness_retry",
-                            std::time::Duration::from_secs(1),
-                        )
-                        .await;
-                }
-            }
-        }
+        tracing::warn!("pod watcher exiting before CNI readiness: {err:#}");
+        return;
     }
 
     let pod_creation_tracker: PodCreationTracker = Arc::new(Mutex::new(HashSet::new()));

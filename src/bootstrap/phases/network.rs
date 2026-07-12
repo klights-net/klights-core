@@ -20,6 +20,7 @@ pub struct NetworkPhase {
     pub _containerd_manager: Option<crate::kubelet::ContainerdManager>,
     pub cri_for_pod_watcher: Option<crate::kubelet::CriClient>,
     pub cri_for_api: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
+    pub cni_readiness: crate::kubelet::cni_readiness::CniReadiness,
     pub dataplane_health: networking::dataplane_health::DataplaneHealth,
 }
 
@@ -54,6 +55,8 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         grpc_transport_policy,
         shutdown_token,
     } = args;
+    let (cni_readiness_publisher, cni_readiness) =
+        crate::kubelet::cni_readiness::CniReadiness::channel();
     let network_boot = match networking::NetworkBoot::boot(
         node_mode,
         config,
@@ -197,87 +200,38 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         unreachable!("containerd socket required")
     };
 
-    // CRI connect
-    let (mut cri_for_pod_watcher, cri_for_api) = {
-        let mut c1 = None;
-        let mut c2 = None;
-        for attempt in 1..=30 {
-            match crate::kubelet::CriClient::connect_with_policy(
-                socket,
-                &config.containerd_namespace,
-                grpc_transport_policy.as_ref(),
-            )
-            .await
-            {
-                Ok(c) => {
-                    c1 = Some(c);
-                    break;
-                }
-                Err(e) => {
-                    if attempt == 30 {
-                        tracing::warn!("CRI connect failed after 30 attempts: {}", e);
-                    } else {
-                        let _ = supervisor
-                            .sleep("cri_retry", std::time::Duration::from_millis(200))
-                            .await;
-                    }
-                }
-            }
+    let cri_for_pod_watcher = match crate::kubelet::CriClient::connect_with_policy(
+        socket,
+        &config.containerd_namespace,
+        grpc_transport_policy.as_ref(),
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(err) => {
+            cni_readiness_publisher.publish_failed("CRI connection unavailable after network boot");
+            return Err(err).context("CRI connection unavailable after network boot");
         }
-        if let Some(c1v) = c1 {
-            match crate::kubelet::CriClient::connect_with_policy(
-                socket,
-                &config.containerd_namespace,
-                grpc_transport_policy.as_ref(),
-            )
-            .await
-            {
-                Ok(c2v) => {
-                    tracing::info!("Connected to containerd (2 connections)");
-                    c2 = Some(Arc::new(tokio::sync::Mutex::new(c2v)));
-                    c1 = Some(c1v);
-                }
-                Err(e) => {
-                    tracing::warn!("Second CRI connect failed: {}", e);
-                    c1 = Some(c1v);
-                }
-            }
+    };
+    let cri_for_api = match crate::kubelet::CriClient::connect_with_policy(
+        socket,
+        &config.containerd_namespace,
+        grpc_transport_policy.as_ref(),
+    )
+    .await
+    {
+        Ok(client) => {
+            tracing::info!("Connected to containerd (2 connections)");
+            Some(Arc::new(tokio::sync::Mutex::new(client)))
         }
-        (c1, c2)
+        Err(err) => {
+            tracing::warn!("Second CRI connect failed: {}", err);
+            None
+        }
     };
 
-    // CRI health check
-    {
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(60);
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let ready = if let Some(ref mut c) = cri_for_pod_watcher {
-                c.list_pod_sandboxes(None).await.is_ok()
-            } else {
-                true
-            };
-            if ready {
-                tracing::info!(
-                    "CRI health check passed ({} attempts, {:?})",
-                    attempt,
-                    start.elapsed()
-                );
-                break;
-            }
-            if start.elapsed() >= timeout {
-                tracing::warn!("CRI health check timed out after {}s", timeout.as_secs());
-                break;
-            }
-            if attempt == 1 {
-                tracing::info!("Waiting for CRI...");
-            }
-            let _ = supervisor
-                .sleep("cri_hc", std::time::Duration::from_secs(1))
-                .await;
-        }
-    }
+    cni_readiness_publisher.publish_ready();
+    tracing::info!("CNI readiness published after network boot and CRI connection");
 
     Ok(NetworkPhase {
         network,
@@ -286,8 +240,9 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         cni_rpc_token,
         cni_rpc_handle,
         _containerd_manager: containerd_manager,
-        cri_for_pod_watcher,
+        cri_for_pod_watcher: Some(cri_for_pod_watcher),
         cri_for_api,
+        cni_readiness,
         dataplane_health: network_boot.health().clone(),
     })
 }
