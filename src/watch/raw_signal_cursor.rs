@@ -1,7 +1,8 @@
 use anyhow::Result;
+use std::sync::Arc;
 
 use crate::datastore::{
-    DatastoreHandle, PositionedWatchReplayRead, RawWatchEvent, WatchReplayPosition, WatchTarget,
+    PositionedWatchReplayRead, RawWatchEvent, RawWatchReplayStore, WatchReplayPosition, WatchTarget,
 };
 
 use super::signal_replay_cursor_core::{SignalReplayCursorCore, SignalReplayCursorSource};
@@ -14,7 +15,7 @@ pub struct RawSignalWatchCursor {
 impl RawSignalWatchCursor {
     pub fn new(
         signal_rx: impl Into<WatchSignalReceiver>,
-        db: DatastoreHandle,
+        replay_store: Arc<dyn RawWatchReplayStore>,
         targets: Vec<WatchTarget>,
         topic: WatchTopic,
         scope: WatchDeliveryScope,
@@ -22,7 +23,7 @@ impl RawSignalWatchCursor {
     ) -> Self {
         Self::new_at_position(
             signal_rx,
-            db,
+            replay_store,
             targets,
             topic,
             scope,
@@ -33,7 +34,7 @@ impl RawSignalWatchCursor {
 
     pub fn new_at_position(
         signal_rx: impl Into<WatchSignalReceiver>,
-        db: DatastoreHandle,
+        replay_store: Arc<dyn RawWatchReplayStore>,
         targets: Vec<WatchTarget>,
         topic: WatchTopic,
         scope: WatchDeliveryScope,
@@ -43,7 +44,10 @@ impl RawSignalWatchCursor {
         Self {
             core: SignalReplayCursorCore::new_at_position(
                 signal_rx,
-                RawWatchReplaySource { db, targets },
+                RawWatchReplaySource {
+                    replay_store,
+                    targets,
+                },
                 vec![topic],
                 scope,
                 accepted_rv,
@@ -71,7 +75,7 @@ impl RawSignalWatchCursor {
 }
 
 struct RawWatchReplaySource {
-    db: DatastoreHandle,
+    replay_store: Arc<dyn RawWatchReplayStore>,
     targets: Vec<WatchTarget>,
 }
 
@@ -82,7 +86,7 @@ impl SignalReplayCursorSource<RawWatchEvent> for RawWatchReplaySource {
         position: WatchReplayPosition,
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
-        self.db
+        self.replay_store
             .list_raw_watch_events_after_position_checked_bounded(&self.targets, position, limit)
             .await
     }

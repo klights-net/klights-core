@@ -2,7 +2,10 @@ use crate::api::watch_session::{WatchSessionBootstrap, WatchSessionConfig, Watch
 use crate::api::{AppError, watch_event_to_table};
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{CatchUpResource, RawWatchEvent};
-use crate::datastore::{DatastoreHandle, SnapshotAtRv, WatchReplayPosition, WatchTarget};
+use crate::datastore::{
+    DatastoreBackendWatchStore, DatastoreHandle, RawWatchReplayStore, SnapshotAtRv,
+    WatchReplayAnchorStore, WatchReplayPosition, WatchTarget,
+};
 use crate::label_selector::LabelSelector;
 use crate::watch::{
     EventType, RawSignalWatchCursor, WatchContentType, WatchCursorError, WatchDeliveryScope,
@@ -763,6 +766,7 @@ pub async fn recv_watch_timeout(rx: &mut Option<mpsc::Receiver<()>>) -> Option<(
 
 pub struct LabelSelectorWatchStreamRequest<'a> {
     pub db: DatastoreHandle,
+    pub watch_anchor: Arc<dyn WatchReplayAnchorStore>,
     pub signal_rx: WatchSignalReceiver,
     pub replay_start_position: WatchReplayPosition,
     pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
@@ -784,16 +788,24 @@ pub struct LabelSelectorWatchStreamRequest<'a> {
 /// Capture the durable replay boundary before subscribing to signal wakeups.
 /// Writes in the narrow boundary-to-subscribe interval remain visible through
 /// positioned replay, so correctness never depends on observing their signal.
+pub fn watch_replay_anchor_from_backend(db: &DatastoreHandle) -> Arc<dyn WatchReplayAnchorStore> {
+    Arc::new(DatastoreBackendWatchStore::new(db.clone()))
+}
+
 pub async fn subscribe_watch_handoff(
+    watch_anchor: &dyn WatchReplayAnchorStore,
     db: &DatastoreHandle,
     topics: Vec<WatchTopic>,
     requested_rv: i64,
 ) -> Result<(WatchSignalReceiver, WatchReplayPosition), AppError> {
-    let handoff_position = db.current_watch_replay_position().await.map_err(|err| {
-        AppError::InternalError(format!(
-            "failed to capture durable watch establishment position: {err}"
-        ))
-    })?;
+    let handoff_position = watch_anchor
+        .current_watch_replay_position()
+        .await
+        .map_err(|err| {
+            AppError::InternalError(format!(
+                "failed to capture durable watch establishment position: {err}"
+            ))
+        })?;
     let replay_start_position = if requested_rv <= 0 {
         handoff_position
     } else {
@@ -814,6 +826,7 @@ pub async fn subscribe_watch_handoff(
 pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamRequest<'_>) -> Body {
     let LabelSelectorWatchStreamRequest {
         db,
+        watch_anchor,
         signal_rx,
         replay_start_position,
         task_supervisor,
@@ -919,7 +932,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 None,
             );
             let baseline = if requested_rv > 0 {
-                match db
+                match watch_anchor
                     .snapshot_resources_at_position(
                         std::slice::from_ref(&replay_target),
                         label_selector.as_deref(),
@@ -1087,7 +1100,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         if use_raw_selectorless_stream {
             let mut cursor = RawSignalWatchCursor::new_at_position(
                 signal_rx,
-                db.clone(),
+                Arc::new(DatastoreBackendWatchStore::new(db.clone()))
+                    as Arc<dyn RawWatchReplayStore>,
                 vec![replay_target.clone()],
                 topic.clone(),
                 delivery_scope.clone(),
@@ -1815,6 +1829,7 @@ mod tests {
             db.close();
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
             let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
+                watch_anchor: watch_replay_anchor_from_backend(&db),
                 db,
                 signal_rx,
                 replay_start_position: WatchReplayPosition {
@@ -1876,6 +1891,7 @@ mod tests {
             let (signal_tx, signal_rx) = broadcast::channel(4);
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
             let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
+                watch_anchor: watch_replay_anchor_from_backend(&db),
                 db: db.clone(),
                 signal_rx: signal_rx.into(),
                 replay_start_position: WatchReplayPosition::default(),

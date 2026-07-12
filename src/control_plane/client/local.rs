@@ -16,7 +16,8 @@ use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::replicated::WriteRejection;
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{
-    DatastoreHandle, NodeSubnet, PodCleanupIntent, Resource, SnapshotAtRv, WatchTarget,
+    DatastoreBackendWatchStore, DatastoreHandle, NodeSubnet, PodCleanupIntent, Resource,
+    SnapshotAtRv, WatchReplayAnchorStore, WatchTarget,
 };
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{OutboxApplyClient, OutboxApplyError, OutboxApplyResult};
@@ -204,11 +205,12 @@ impl LeaderApiClient for LocalApiClient {
         let legacy_start_rv = req.start_resource_version.unwrap_or(0).max(0);
         let requested_position = req.start_watch_replay_position;
         let has_selector = super::watch_request_has_selector(&req);
+        let watch_anchor = DatastoreBackendWatchStore::new(self.db.clone());
         // Capture the durable handoff before any selector baseline await. No
         // await occurs between final establishment and signal subscription;
         // replay closes every interval beginning at this early anchor.
         let early_anchor = if requested_position.is_none() {
-            Some(self.db.current_watch_replay_position().await?)
+            Some(watch_anchor.current_watch_replay_position().await?)
         } else {
             None
         };
@@ -232,8 +234,7 @@ impl LeaderApiClient for LocalApiClient {
                 )
             };
             let baseline = if let Some(snapshot_position) = snapshot_position {
-                match self
-                    .db
+                match watch_anchor
                     .snapshot_resources_at_position(
                         std::slice::from_ref(&watch_target_for_request(&req)),
                         req.label_selector.as_deref(),

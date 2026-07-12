@@ -1065,7 +1065,9 @@ macro_rules! cluster_wide_list_handler {
                     .is_some_and(|rv| rv.trim() == "0");
                 let send_initial_events = query.send_initial_events.as_deref() == Some("true");
                 let db = state.db.clone();
+                let watch_anchor = crate::api::watch_stream::watch_replay_anchor_from_backend(&db);
                 let (signal_rx, replay_start_position) = subscribe_watch_handoff(
+                    watch_anchor.as_ref(),
                     &db,
                     vec![crate::watch::WatchTopic::new($api_version, &kind)],
                     requested_rv,
@@ -1074,6 +1076,7 @@ macro_rules! cluster_wide_list_handler {
 
                 let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
                     db,
+                    watch_anchor,
                     signal_rx,
                     replay_start_position,
                     task_supervisor: state.task_supervisor.clone(),

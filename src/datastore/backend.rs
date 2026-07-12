@@ -1583,6 +1583,31 @@ pub trait CurrentResourceVersionStore: Send + Sync {
     async fn get_current_resource_version(&self) -> Result<i64>;
 }
 
+/// Durable watch establishment anchors and positioned membership snapshots.
+#[async_trait]
+pub trait WatchReplayAnchorStore: Send + Sync {
+    async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition>;
+
+    async fn snapshot_resources_at_position(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        position: WatchReplayPosition,
+    ) -> Result<SnapshotAtRv>;
+}
+
+/// Raw watch replay rows for optimized selectorless streams.
+#[async_trait]
+pub trait RawWatchReplayStore: Send + Sync {
+    async fn list_raw_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>>;
+}
+
 /// Watch-event subscription, broadcast access, and replay queries.
 #[async_trait]
 pub trait WatchStore: Send + Sync {
@@ -1662,6 +1687,39 @@ impl DatastoreBackendWatchStore {
 impl CurrentResourceVersionStore for DatastoreBackendWatchStore {
     async fn get_current_resource_version(&self) -> Result<i64> {
         self.db.get_current_resource_version().await
+    }
+}
+
+#[async_trait]
+impl WatchReplayAnchorStore for DatastoreBackendWatchStore {
+    async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
+        self.db.current_watch_replay_position().await
+    }
+
+    async fn snapshot_resources_at_position(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        position: WatchReplayPosition,
+    ) -> Result<SnapshotAtRv> {
+        self.db
+            .snapshot_resources_at_position(targets, label_selector, field_selector, position)
+            .await
+    }
+}
+
+#[async_trait]
+impl RawWatchReplayStore for DatastoreBackendWatchStore {
+    async fn list_raw_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<RawWatchEvent>> {
+        self.db
+            .list_raw_watch_events_after_position_checked_bounded(targets, position, limit)
+            .await
     }
 }
 

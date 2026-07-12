@@ -714,8 +714,14 @@ async fn list_cr_inner(
 
         let watch_topics = crd_watch_topics(group, &kind, conversion.as_ref(), version);
         let db = state.db.clone();
-        let (signal_rx, replay_start_position) =
-            subscribe_watch_handoff(&db, watch_topics.clone(), requested_rv).await?;
+        let watch_anchor = crate::api::watch_stream::watch_replay_anchor_from_backend(&db);
+        let (signal_rx, replay_start_position) = subscribe_watch_handoff(
+            watch_anchor.as_ref(),
+            &db,
+            watch_topics.clone(),
+            requested_rv,
+        )
+        .await?;
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let stream_format =
             crate::api::watch_stream::negotiate_watch_stream_format(headers, false)?;
@@ -945,7 +951,7 @@ async fn list_cr_inner(
                 // RV, merge logical identities, convert, and seed keys without
                 // emitting. Legacy rows may still live under an older served
                 // API version until storage migration touches them.
-                let membership = match db
+                let membership = match watch_anchor
                     .snapshot_resources_at_position(
                         &replay_targets,
                         None,

@@ -2,8 +2,9 @@ use super::*;
 use crate::datastore::command::StorageCommand;
 use crate::datastore::{
     MetaStore, NamespaceContentStore, NetworkMetadataStore, OwnershipStore, PodWorkqueueStore,
-    ReplicationStore, ResourceBatchOperation, ResourceBatchPutMode, ResourceListStore,
-    ResourcePreconditions, StatusStore, WatchHistoryStore,
+    RawWatchReplayStore, ReplicationStore, ResourceBatchOperation, ResourceBatchPutMode,
+    ResourceListStore, ResourcePreconditions, StatusStore, WatchHistoryStore,
+    WatchReplayAnchorStore,
 };
 use crate::datastore::{PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState};
 use serde_json::json;
@@ -5487,9 +5488,13 @@ async fn focused_store_traits_cover_sqlite_backend() {
     assert_traits(&db);
 
     fn assert_watch_store<T: WatchStore>(_: &T) {}
+    fn assert_watch_anchor<T: WatchReplayAnchorStore>(_: &T) {}
+    fn assert_raw_watch_replay<T: RawWatchReplayStore>(_: &T) {}
     let handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let watch_store = crate::datastore::DatastoreBackendWatchStore::new(handle);
     assert_watch_store(&watch_store);
+    assert_watch_anchor(&watch_store);
+    assert_raw_watch_replay(&watch_store);
 }
 
 #[tokio::test]
@@ -6988,6 +6993,8 @@ async fn namespaced_same_kind_name_can_exist_in_different_api_versions() {
 
 fn accepts_resource_store(_store: &dyn crate::datastore::ResourceStore) {}
 fn accepts_watch_store(_store: &dyn crate::datastore::WatchStore) {}
+fn accepts_watch_anchor_store(_store: &dyn crate::datastore::WatchReplayAnchorStore) {}
+fn accepts_raw_watch_replay_store(_store: &dyn crate::datastore::RawWatchReplayStore) {}
 fn accepts_network_store(_store: &dyn crate::datastore::NetworkStore) {}
 fn accepts_namespace_store(_store: &dyn crate::datastore::NamespaceStore) {}
 
@@ -6998,6 +7005,8 @@ async fn datastore_implements_focused_backend_traits() {
     let handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
     let watch_store = crate::datastore::DatastoreBackendWatchStore::new(handle);
     accepts_watch_store(&watch_store);
+    accepts_watch_anchor_store(&watch_store);
+    accepts_raw_watch_replay_store(&watch_store);
     accepts_network_store(&db);
     accepts_namespace_store(&db);
 }
