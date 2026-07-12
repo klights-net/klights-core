@@ -55,6 +55,14 @@ pub async fn list_pods(
         let ns = namespace.clone();
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let table_format = wants_table_format(&headers)?;
+        let protobuf_supported = protobuf_watch_supported_for_request(
+            "v1",
+            "Pod",
+            table_format,
+            query.label_selector.as_deref(),
+            query.field_selector.as_deref(),
+        );
+        let stream_format = negotiate_watch_stream_format(&headers, protobuf_supported)?;
         let label_selector = query.label_selector.clone();
         let field_selector = query.field_selector.clone();
 
@@ -93,12 +101,13 @@ pub async fn list_pods(
             label_selector,
             field_selector,
             table_format,
+            stream_format,
             catch_up_mode: WatchCatchUpMode::NamespacedScoped,
             timeout_seconds: query.timeout_seconds,
             emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
         });
         return Ok(Response::builder()
-            .header("Content-Type", "application/json")
+            .header("Content-Type", stream_format.content_type())
             .header("Transfer-Encoding", "chunked")
             .body(body)
             .unwrap());
@@ -473,6 +482,14 @@ pub async fn list_all_pods(
         let kind = "Pod".to_string();
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let table_format = wants_table_format(&headers)?;
+        let protobuf_supported = protobuf_watch_supported_for_request(
+            "v1",
+            "Pod",
+            table_format,
+            query.label_selector.as_deref(),
+            query.field_selector.as_deref(),
+        );
+        let stream_format = negotiate_watch_stream_format(&headers, protobuf_supported)?;
         let label_selector = query.label_selector.clone();
         let field_selector = query.field_selector.clone();
 
@@ -508,12 +525,13 @@ pub async fn list_all_pods(
             label_selector,
             field_selector,
             table_format,
+            stream_format,
             catch_up_mode: WatchCatchUpMode::NamespacedScoped,
             timeout_seconds: query.timeout_seconds,
             emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
         });
         return Ok(Response::builder()
-            .header("Content-Type", "application/json")
+            .header("Content-Type", stream_format.content_type())
             .header("Transfer-Encoding", "chunked")
             .body(body)
             .unwrap());

@@ -153,7 +153,9 @@ use watch_session::{WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent
 use watch_stream::{
     LabelSelectorWatchStreamRequest, WatchCatchUpMode, build_label_selector_watch_stream,
     maybe_spawn_bookmark_tick_stream, maybe_spawn_watch_timeout_stream,
-    object_matches_field_selector, recv_bookmark_tick, recv_watch_timeout, subscribe_watch_handoff,
+    negotiate_watch_stream_format, object_matches_field_selector,
+    protobuf_watch_supported_for_request, recv_bookmark_tick, recv_watch_timeout,
+    subscribe_watch_handoff,
 };
 
 #[cfg(test)]

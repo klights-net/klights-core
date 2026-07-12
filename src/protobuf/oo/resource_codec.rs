@@ -33,6 +33,21 @@ pub trait ResourceProtoCodec: Send + Sync {
         value: &Value,
     ) -> anyhow::Result<Vec<u8>>;
 
+    /// Encode raw JSON object bytes into protobuf bytes without first
+    /// materializing a generic serde_json::Value.
+    fn encode_from_json_slice(
+        &self,
+        _api_version: &str,
+        _kind: &str,
+        _data: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("raw JSON protobuf encoding is not supported by this codec")
+    }
+
+    fn handles_raw_json_encoding(&self, _api_version: &str, _kind: &str) -> bool {
+        false
+    }
+
     fn handles(&self, api_version: &str, kind: &str) -> bool {
         let prefix = OoCodecRegistry::api_group_prefix(api_version);
         self.entry_keys()
@@ -94,9 +109,30 @@ impl OoCodecRegistry {
         }
     }
 
+    /// Encode raw JSON object bytes for a kind into protobuf bytes, or error.
+    pub fn encode_json_slice(
+        &self,
+        api_version: &str,
+        kind: &str,
+        data: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        match self.lookup(api_version, kind) {
+            Some(codec) => codec.encode_from_json_slice(api_version, kind, data),
+            None => anyhow::bail!("no OO codec for {api_version}/{kind}"),
+        }
+    }
+
     /// Check if any codec in this registry handles the given (apiVersion, kind) pair.
     pub fn handles(&self, api_version: &str, kind: &str) -> bool {
         self.codecs.iter().any(|c| c.handles(api_version, kind))
+    }
+
+    /// Check if any codec can encode raw JSON bytes for the given kind without
+    /// generic Value materialization.
+    pub fn handles_raw_json_encoding(&self, api_version: &str, kind: &str) -> bool {
+        self.codecs
+            .iter()
+            .any(|c| c.handles_raw_json_encoding(api_version, kind))
     }
 }
 

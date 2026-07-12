@@ -5,6 +5,7 @@ async fn test_cluster_endpoints_protobuf_list_resource_version_primes_watch() {
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use futures::StreamExt;
+    use prost::Message;
     use serde_json::json;
     use std::time::Duration;
     use tower::ServiceExt;
@@ -104,12 +105,23 @@ async fn test_cluster_endpoints_protobuf_list_resource_version_primes_watch() {
             Request::builder()
                 .method("GET")
                 .uri(watch_uri)
+                .header("accept", "application/vnd.kubernetes.protobuf")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(watch_resp.status(), StatusCode::OK);
+    let watch_content_type = watch_resp
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        watch_content_type.starts_with("application/vnd.kubernetes.protobuf")
+            && watch_content_type.contains("stream=watch"),
+        "protobuf watch response must use Kubernetes protobuf watch stream content type, got {watch_content_type:?}"
+    );
 
     let mut stream = watch_resp.into_body().into_data_stream();
     let chunk = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -117,12 +129,37 @@ async fn test_cluster_endpoints_protobuf_list_resource_version_primes_watch() {
         .expect("watch should replay the Endpoint created after the list RV")
         .expect("watch stream should yield a chunk")
         .expect("watch chunk should be ok");
-    let event: serde_json::Value = serde_json::from_slice(&chunk).unwrap();
-    assert_eq!(event["type"], "ADDED");
+    assert!(
+        chunk.len() > 4,
+        "protobuf watch chunk must contain length-prefixed WatchEvent frame"
+    );
+    let frame_len = u32::from_be_bytes(chunk[..4].try_into().unwrap()) as usize;
     assert_eq!(
-        event
-            .pointer("/object/metadata/name")
-            .and_then(|value| value.as_str()),
+        chunk.len(),
+        frame_len + 4,
+        "test expects one protobuf watch frame in the first replay chunk"
+    );
+    let event = k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(&chunk[4..]).unwrap();
+    assert_eq!(event.r#type.as_deref(), Some("ADDED"));
+    let object = event
+        .object
+        .and_then(|object| object.raw)
+        .expect("protobuf watch event must carry object bytes");
+    assert_eq!(&object[..4], b"k8s\0");
+    let envelope = crate::protobuf::Unknown::decode(&object[4..]).unwrap();
+    assert_eq!(
+        envelope
+            .type_meta
+            .as_ref()
+            .map(|type_meta| type_meta.kind.as_str()),
+        Some("Endpoints")
+    );
+    let event_object = k8s_pb::api::core::v1::Endpoints::decode(envelope.raw.as_slice()).unwrap();
+    assert_eq!(
+        event_object
+            .metadata
+            .and_then(|metadata| metadata.name)
+            .as_deref(),
         Some("testservice")
     );
 }
@@ -1438,10 +1475,7 @@ async fn test_cluster_scoped_selector_watch_from_list_rv_delivers_modified_witho
                 .uri(format!(
                     "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings?labelSelector={label_key}%3D{label_value}&resourceVersion={list_rv}&watch=true"
                 ))
-                .header(
-                    "accept",
-                    "application/vnd.kubernetes.protobuf,application/json",
-                )
+                .header("accept", "application/json")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6518,7 +6552,7 @@ async fn test_guestbook_selector_watch_observes_raft_pod_status_outbox_update() 
                 .uri(format!(
                     "/api/v1/namespaces/{namespace}/pods?watch=true&resourceVersion={list_rv}&labelSelector={selector}"
                 ))
-                .header("accept", "application/vnd.kubernetes.protobuf,application/json")
+                .header("accept", "application/json")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -6876,7 +6910,7 @@ async fn test_guestbook_selector_watchlist_delivers_ready_after_initial_events_e
                 .uri(format!(
                     "/api/v1/namespaces/{namespace}/pods?watch=true&sendInitialEvents=true&resourceVersionMatch=NotOlderThan&allowWatchBookmarks=true&labelSelector={selector}&timeoutSeconds=5"
                 ))
-                .header("accept", "application/vnd.kubernetes.protobuf,application/json")
+                .header("accept", "application/json")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -8946,6 +8980,70 @@ async fn test_crd_watch_resource_version_zero_emits_current_objects() {
     let event: serde_json::Value = serde_json::from_slice(&chunk).unwrap();
     assert_eq!(event["type"], "ADDED");
     assert_eq!(event["object"]["metadata"]["name"], "existing");
+}
+
+#[tokio::test]
+async fn test_crd_watch_protobuf_accept_uses_json_fallback_or_406() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let (app, db) = build_test_router_with_db().await;
+    register_selw_crd(&app).await;
+    db.create_resource(
+        "selwatch.example.com/v1",
+        "Selw",
+        Some("default"),
+        "existing",
+        serde_json::json!({
+            "apiVersion": "selwatch.example.com/v1",
+            "kind": "Selw",
+            "metadata": {"name": "existing", "namespace": "default"}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let protobuf_only = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/apis/selwatch.example.com/v1/namespaces/default/selws?watch=true&resourceVersion=0&timeoutSeconds=1")
+                .header("accept", "application/vnd.kubernetes.protobuf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        protobuf_only.status(),
+        StatusCode::NOT_ACCEPTABLE,
+        "CRDs have no Kubernetes protobuf resource schema; protobuf-only watch must 406 instead of labeling JSON as protobuf"
+    );
+
+    let json_fallback = app
+        .oneshot(
+            Request::builder()
+                .uri("/apis/selwatch.example.com/v1/namespaces/default/selws?watch=true&resourceVersion=0&timeoutSeconds=1")
+                .header(
+                    "accept",
+                    "application/vnd.kubernetes.protobuf,application/json",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_fallback.status(), StatusCode::OK);
+    let content_type = json_fallback
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("application/json"),
+        "CRD watch mixed Accept should fall back to JSON, got {content_type:?}"
+    );
 }
 
 #[tokio::test]

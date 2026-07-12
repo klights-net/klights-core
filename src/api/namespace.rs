@@ -18,6 +18,7 @@ pub async fn get_namespace(
 pub async fn list_namespaces(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, AppError> {
     if let Some(selector) = query
         .label_selector
@@ -42,6 +43,14 @@ pub async fn list_namespaces(
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let label_selector = query.label_selector.clone();
         let field_selector = query.field_selector.clone();
+        let protobuf_supported = protobuf_watch_supported_for_request(
+            "v1",
+            "Namespace",
+            false,
+            query.label_selector.as_deref(),
+            query.field_selector.as_deref(),
+        );
+        let stream_format = negotiate_watch_stream_format(&headers, protobuf_supported)?;
 
         let requested_rv: i64 = query
             .resource_version
@@ -75,12 +84,13 @@ pub async fn list_namespaces(
             label_selector,
             field_selector,
             table_format: false,
+            stream_format,
             catch_up_mode: WatchCatchUpMode::ClusterOnly,
             timeout_seconds: query.timeout_seconds,
             emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
         });
         return Ok(Response::builder()
-            .header("Content-Type", "application/json")
+            .header("Content-Type", stream_format.content_type())
             .header("Transfer-Encoding", "chunked")
             .body(body)
             .unwrap());
