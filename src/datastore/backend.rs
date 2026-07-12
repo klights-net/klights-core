@@ -1301,99 +1301,6 @@ pub trait ResourceStore: Send + Sync {
     async fn get_current_resource_version(&self) -> Result<i64>;
 }
 
-#[async_trait]
-impl<T: DatastoreBackend + ?Sized> ResourceStore for T {
-    async fn create_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
-    ) -> Result<Resource> {
-        DatastoreBackend::create_resource(self, api_version, kind, namespace, name, data).await
-    }
-    async fn get_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Result<Option<Resource>> {
-        DatastoreBackend::get_resource(self, api_version, kind, namespace, name).await
-    }
-    async fn delete_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-    ) -> Result<()> {
-        DatastoreBackend::delete_resource(self, api_version, kind, namespace, name).await
-    }
-    async fn delete_resource_with_preconditions(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        preconditions: ResourcePreconditions,
-    ) -> Result<()> {
-        DatastoreBackend::delete_resource_with_preconditions(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            preconditions,
-        )
-        .await
-    }
-    async fn update_resource(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
-        expected_rv: i64,
-    ) -> Result<Resource> {
-        DatastoreBackend::update_resource(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            expected_rv,
-        )
-        .await
-    }
-    async fn update_resource_with_preconditions(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
-        preconditions: ResourcePreconditions,
-    ) -> Result<Resource> {
-        DatastoreBackend::update_resource_with_preconditions(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            preconditions,
-        )
-        .await
-    }
-    async fn get_current_resource_version(&self) -> Result<i64> {
-        DatastoreBackend::get_current_resource_version(self).await
-    }
-}
-
 /// Resource list and selector queries.
 #[async_trait]
 pub trait ResourceListStore: Send + Sync {
@@ -1790,55 +1697,6 @@ pub trait PodWorkqueueStore: Send + Sync {
     async fn pod_workqueue_dead_letter(&self, id: i64, error: &str) -> Result<()>;
 }
 
-#[async_trait]
-impl<T: DatastoreBackend + ?Sized> PodWorkqueueStore for T {
-    async fn pod_workqueue_enqueue(
-        &self,
-        kind: PodWorkqueueKind,
-        pod: &crate::pod_identity::PodIdentity,
-        payload: Value,
-        attempt_count: i64,
-        min_delay_ms: i64,
-        last_error: Option<&str>,
-    ) -> Result<()> {
-        DatastoreBackend::pod_workqueue_enqueue(
-            self,
-            kind,
-            pod,
-            payload,
-            attempt_count,
-            min_delay_ms,
-            last_error,
-        )
-        .await
-    }
-
-    async fn pod_workqueue_peek_next_due(&self) -> Result<Option<i64>> {
-        DatastoreBackend::pod_workqueue_peek_next_due(self).await
-    }
-
-    async fn pod_workqueue_claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
-        DatastoreBackend::pod_workqueue_claim_due(self, now_ms).await
-    }
-
-    async fn pod_workqueue_complete(&self, id: i64) -> Result<()> {
-        DatastoreBackend::pod_workqueue_complete(self, id).await
-    }
-
-    async fn pod_workqueue_record_failure(
-        &self,
-        row: PodWorkqueueEntry,
-        min_delay_ms: i64,
-        error: &str,
-    ) -> Result<()> {
-        DatastoreBackend::pod_workqueue_record_failure(self, row, min_delay_ms, error).await
-    }
-
-    async fn pod_workqueue_dead_letter(&self, id: i64, error: &str) -> Result<()> {
-        DatastoreBackend::pod_workqueue_dead_letter(self, id, error).await
-    }
-}
-
 /// Namespace lifecycle (create, get, delete, list contents).
 #[async_trait]
 pub trait NamespaceStore: Send + Sync {
@@ -1896,48 +1754,6 @@ pub trait ReplicationStore: Send + Sync {
         &self,
         commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult>;
-}
-
-#[async_trait]
-impl<T: DatastoreBackend + ?Sized> ReplicationStore for T {
-    #[cfg(test)]
-    async fn apply_replicated_command(
-        &self,
-        command: StorageCommand,
-        meta: CommandMeta,
-    ) -> Result<()> {
-        DatastoreBackend::apply_replicated_command(self, command, meta).await
-    }
-
-    async fn replace_replicated_resource_state(
-        &self,
-        entries: Vec<crate::log_apply::LogApplyCommit>,
-        current_rv: i64,
-        watch_event_high_water: Option<i64>,
-        watch_replay_floors: Option<Vec<WatchReplayFloor>>,
-        metadata: Option<ReplicatedSnapshotMetadata>,
-    ) -> Result<()> {
-        DatastoreBackend::replace_replicated_resource_state(
-            self,
-            entries,
-            current_rv,
-            watch_event_high_water,
-            watch_replay_floors,
-            metadata,
-        )
-        .await
-    }
-
-    async fn apply_log_apply_commit(&self, commit: crate::log_apply::LogApplyCommit) -> Result<()> {
-        DatastoreBackend::apply_log_apply_commit(self, commit).await
-    }
-
-    async fn apply_raft_log_apply_commit(
-        &self,
-        commit: crate::log_apply::LogApplyCommit,
-    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
-        DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
-    }
 }
 
 #[async_trait]
