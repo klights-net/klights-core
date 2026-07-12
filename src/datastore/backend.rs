@@ -2132,33 +2132,6 @@ pub trait NamespaceContentStore: Send + Sync {
     async fn count_namespace_resources(&self, namespace: &str) -> Result<i64>;
 }
 
-#[async_trait]
-impl<T: DatastoreBackend + ?Sized> NamespaceContentStore for T {
-    async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
-        DatastoreBackend::list_namespace_resources(self, namespace).await
-    }
-
-    async fn list_namespace_resources_of_kind(
-        &self,
-        namespace: &str,
-        kind: &str,
-    ) -> Result<Vec<Resource>> {
-        DatastoreBackend::list_namespace_resources_of_kind(self, namespace, kind).await
-    }
-
-    async fn list_namespace_resources_excluding_kind(
-        &self,
-        namespace: &str,
-        kind: &str,
-    ) -> Result<Vec<Resource>> {
-        DatastoreBackend::list_namespace_resources_excluding_kind(self, namespace, kind).await
-    }
-
-    async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
-        DatastoreBackend::count_namespace_resources(self, namespace).await
-    }
-}
-
 /// Replication and snapshot-apply entry points.
 #[async_trait]
 pub trait ReplicationStore: Send + Sync {

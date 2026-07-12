@@ -1414,6 +1414,37 @@ impl DatastoreBackend for ReplicatedDatastore {
 }
 
 #[async_trait]
+impl crate::datastore::NamespaceContentStore for ReplicatedDatastore {
+    async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
+        crate::datastore::DatastoreBackend::list_namespace_resources(self, namespace).await
+    }
+
+    async fn list_namespace_resources_of_kind(
+        &self,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<Vec<Resource>> {
+        crate::datastore::DatastoreBackend::list_namespace_resources_of_kind(self, namespace, kind)
+            .await
+    }
+
+    async fn list_namespace_resources_excluding_kind(
+        &self,
+        namespace: &str,
+        kind: &str,
+    ) -> Result<Vec<Resource>> {
+        crate::datastore::DatastoreBackend::list_namespace_resources_excluding_kind(
+            self, namespace, kind,
+        )
+        .await
+    }
+
+    async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
+        crate::datastore::DatastoreBackend::count_namespace_resources(self, namespace).await
+    }
+}
+
+#[async_trait]
 impl crate::datastore::OwnershipStore for ReplicatedDatastore {
     async fn find_owned_resources(
         &self,
