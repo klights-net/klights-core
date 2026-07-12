@@ -26,12 +26,29 @@ struct AcceptMatch {
 }
 
 pub fn prefers_protobuf(headers: &HeaderMap) -> bool {
-    preferred_unary_response_format(headers) == UnaryResponseFormat::Protobuf
+    negotiate_unary_response_format(headers, true)
+        .is_ok_and(|format| format == UnaryResponseFormat::Protobuf)
 }
 
-fn preferred_unary_response_format(headers: &HeaderMap) -> UnaryResponseFormat {
+fn protobuf_supported_for_value(value: &Value) -> bool {
+    let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+    if kind == "Status" {
+        return true;
+    }
+    let api_version = value
+        .get("apiVersion")
+        .and_then(|api_version| api_version.as_str())
+        .unwrap_or("");
+    crate::protobuf::supports_protobuf_resource(api_version, kind)
+}
+
+fn negotiate_unary_response_format(
+    headers: &HeaderMap,
+    protobuf_supported: bool,
+) -> Result<UnaryResponseFormat, String> {
     let mut best: Option<AcceptMatch> = None;
     let mut order = 0usize;
+    let mut saw_accept = false;
     for accept in headers.get_all("accept") {
         let Ok(accept) = accept.to_str() else {
             continue;
@@ -41,7 +58,9 @@ fn preferred_unary_response_format(headers: &HeaderMap) -> UnaryResponseFormat {
             if part.is_empty() {
                 continue;
             }
+            saw_accept = true;
             if let Some(candidate) = parse_unary_accept_part(part, order)
+                && (candidate.format != UnaryResponseFormat::Protobuf || protobuf_supported)
                 && best
                     .as_ref()
                     .is_none_or(|current| accept_match_precedes(&candidate, current))
@@ -52,8 +71,13 @@ fn preferred_unary_response_format(headers: &HeaderMap) -> UnaryResponseFormat {
         }
     }
 
-    best.map(|candidate| candidate.format)
-        .unwrap_or(UnaryResponseFormat::Json)
+    if let Some(candidate) = best {
+        Ok(candidate.format)
+    } else if saw_accept {
+        Err("no acceptable response media type is supported".to_string())
+    } else {
+        Ok(UnaryResponseFormat::Json)
+    }
 }
 
 fn parse_unary_accept_part(part: &str, order: usize) -> Option<AcceptMatch> {
@@ -152,46 +176,52 @@ pub fn wants_table_format(headers: &HeaderMap) -> Result<bool, AppError> {
 
 pub struct K8sResponse {
     value: Value,
-    use_protobuf: bool,
+    format: Result<UnaryResponseFormat, String>,
 }
 
 impl K8sResponse {
     pub fn new(value: Value, headers: &HeaderMap) -> Self {
+        let protobuf_supported = protobuf_supported_for_value(&value);
         K8sResponse {
             value,
-            use_protobuf: prefers_protobuf(headers),
+            format: negotiate_unary_response_format(headers, protobuf_supported),
         }
     }
 }
 
 impl IntoResponse for K8sResponse {
     fn into_response(self) -> Response {
-        if self.use_protobuf {
-            let kind = self
-                .value
-                .get("kind")
-                .and_then(|k| k.as_str())
-                .unwrap_or("unknown");
-            match crate::protobuf::encode_protobuf(&self.value) {
-                Ok(bytes) => {
-                    let mut response = Response::new(Body::from(bytes));
-                    response.headers_mut().insert(
-                        "content-type",
-                        "application/vnd.kubernetes.protobuf".parse().unwrap(),
-                    );
-                    response
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to encode protobuf response for kind={}: {}",
-                        kind,
-                        e
-                    );
-                    Json(self.value).into_response()
+        match self.format {
+            Err(message) => AppError::NotAcceptable(message).into_response(),
+            Ok(UnaryResponseFormat::Json) => Json(self.value).into_response(),
+            Ok(UnaryResponseFormat::Protobuf) => {
+                let kind = self
+                    .value
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("unknown");
+                match crate::protobuf::encode_protobuf(&self.value) {
+                    Ok(bytes) => {
+                        let mut response = Response::new(Body::from(bytes));
+                        response.headers_mut().insert(
+                            "content-type",
+                            "application/vnd.kubernetes.protobuf".parse().unwrap(),
+                        );
+                        response
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to encode protobuf response for kind={}: {}",
+                            kind,
+                            e
+                        );
+                        AppError::InternalError(format!(
+                            "failed to encode protobuf response for {kind}"
+                        ))
+                        .into_response()
+                    }
                 }
             }
-        } else {
-            Json(self.value).into_response()
         }
     }
 }
@@ -1110,6 +1140,7 @@ fn table_access_modes(modes: &Value) -> String {
 #[cfg(test)]
 mod response_negotiation_tests {
     use super::*;
+    use axum::http::StatusCode;
 
     fn headers(accept: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1160,6 +1191,31 @@ mod response_negotiation_tests {
             "application/*;q=1, application/vnd.kubernetes.protobuf;q=0.5"
         )));
         assert!(!prefers_protobuf(&headers("*/*")));
+    }
+
+    #[test]
+    fn unary_response_negotiation_rejects_when_no_supported_media_remains() {
+        assert!(negotiate_unary_response_format(&headers("application/xml"), true).is_err());
+        assert!(negotiate_unary_response_format(&headers("application/json;q=0"), true).is_err());
+        assert!(
+            negotiate_unary_response_format(&headers(PROTOBUF_MEDIA_TYPE), false).is_err(),
+            "protobuf-only requests must fail when this resource has no protobuf codec"
+        );
+    }
+
+    #[test]
+    fn k8s_response_returns_not_acceptable_for_unsupported_explicit_accept() {
+        let response = K8sResponse::new(
+            serde_json::json!({
+                "apiVersion": "example.com/v1",
+                "kind": "Widget",
+                "metadata": {"name": "w1"}
+            }),
+            &headers(PROTOBUF_MEDIA_TYPE),
+        )
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
     }
 }
 

@@ -321,22 +321,34 @@ pub fn serialize_raw_watch_event_frame(event: &RawWatchEvent) -> anyhow::Result<
     Ok(frame)
 }
 
+#[cfg(test)]
 pub fn serialize_watch_event_for_stream(
     event: WatchEvent,
     kind: &str,
     table_format: bool,
     stream_format: WatchStreamFormat,
 ) -> Vec<u8> {
+    match try_serialize_watch_event_for_stream(event, kind, table_format, stream_format) {
+        Ok(frame) | Err(frame) => frame,
+    }
+}
+
+pub fn try_serialize_watch_event_for_stream(
+    event: WatchEvent,
+    kind: &str,
+    table_format: bool,
+    stream_format: WatchStreamFormat,
+) -> Result<Vec<u8>, Vec<u8>> {
     match stream_format {
-        WatchStreamFormat::Json => serialize_watch_event_line(event, kind, table_format),
+        WatchStreamFormat::Json => Ok(serialize_watch_event_line(event, kind, table_format)),
         WatchStreamFormat::Protobuf => match serialize_watch_event_frame(&event, kind) {
-            Ok(frame) => frame,
-            Err(err) => serialize_watch_status_for_stream(
+            Ok(frame) => Ok(frame),
+            Err(err) => Err(serialize_watch_status_for_stream(
                 stream_format,
                 500,
                 "InternalError",
                 &format!("failed to encode protobuf watch event: {err}"),
-            ),
+            )),
         },
     }
 }
@@ -352,20 +364,30 @@ pub fn serialize_raw_watch_event_line(event: &RawWatchEvent) -> Vec<u8> {
     line
 }
 
+#[cfg(test)]
 pub fn serialize_raw_watch_event_for_stream(
     event: &RawWatchEvent,
     stream_format: WatchStreamFormat,
 ) -> Vec<u8> {
+    match try_serialize_raw_watch_event_for_stream(event, stream_format) {
+        Ok(frame) | Err(frame) => frame,
+    }
+}
+
+pub fn try_serialize_raw_watch_event_for_stream(
+    event: &RawWatchEvent,
+    stream_format: WatchStreamFormat,
+) -> Result<Vec<u8>, Vec<u8>> {
     match stream_format {
-        WatchStreamFormat::Json => serialize_raw_watch_event_line(event),
+        WatchStreamFormat::Json => Ok(serialize_raw_watch_event_line(event)),
         WatchStreamFormat::Protobuf => match serialize_raw_watch_event_frame(event) {
-            Ok(frame) => frame,
-            Err(err) => serialize_watch_status_for_stream(
+            Ok(frame) => Ok(frame),
+            Err(err) => Err(serialize_watch_status_for_stream(
                 stream_format,
                 500,
                 "InternalError",
                 &format!("failed to encode raw protobuf watch event: {err}"),
-            ),
+            )),
         },
     }
 }
@@ -956,13 +978,20 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             for resource in baseline.items {
                 if requested_rv <= 0 {
                     let event = CatchUpResource::added(resource).into_watch_event();
-                    session_bootstrap.record_baseline_event(&event);
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_event_for_stream(
-                        event,
+                    let line = match try_serialize_watch_event_for_stream(
+                        event.clone(),
                         &kind,
                         table_format,
                         stream_format,
-                    ));
+                    ) {
+                        Ok(line) => line,
+                        Err(line) => {
+                            yield Ok::<_, std::convert::Infallible>(line);
+                            return;
+                        }
+                    };
+                    session_bootstrap.record_baseline_event(&event);
+                    yield Ok::<_, std::convert::Infallible>(line);
                 } else {
                     let event = CatchUpResource::added(resource).into_watch_event();
                     session_bootstrap.record_baseline_event(&event);
@@ -995,15 +1024,23 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             }
             let mut last_rv = requested_rv.max(list.resource_version);
             for resource in list.items {
-                last_rv = last_rv.max(resource.resource_version);
+                let resource_rv = resource.resource_version;
                 let event = CatchUpResource::added(resource).into_watch_event();
-                session_bootstrap.record_baseline_event(&event);
-                yield Ok::<_, std::convert::Infallible>(serialize_watch_event_for_stream(
-                    event,
+                let line = match try_serialize_watch_event_for_stream(
+                    event.clone(),
                     &kind,
                     table_format,
                     stream_format,
-                ));
+                ) {
+                    Ok(line) => line,
+                    Err(line) => {
+                        yield Ok::<_, std::convert::Infallible>(line);
+                        return;
+                    }
+                };
+                last_rv = last_rv.max(resource_rv);
+                session_bootstrap.record_baseline_event(&event);
+                yield Ok::<_, std::convert::Infallible>(line);
             }
                 // Anchor the initial-events-end bookmark (and the live-event
                 // floor) to the collection's snapshot resourceVersion, not
@@ -1023,12 +1060,18 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
 
             let bookmark_event =
                 WatchEvent::bookmark_initial_events_end(last_rv, &api_version, &kind);
-            yield Ok::<_, std::convert::Infallible>(serialize_watch_event_for_stream(
+            match try_serialize_watch_event_for_stream(
                 bookmark_event,
                 &kind,
                 table_format,
                 stream_format,
-            ));
+            ) {
+                Ok(line) => yield Ok::<_, std::convert::Infallible>(line),
+                Err(line) => {
+                    yield Ok::<_, std::convert::Infallible>(line);
+                    return;
+                }
+            }
         }
 
         let replay_source =
@@ -1108,10 +1151,17 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         };
 
                         let rv = event.resource_version;
-                        let line = serialize_raw_watch_event_for_stream(&event, stream_format);
-                        yield Ok::<_, std::convert::Infallible>(line);
-                        cursor.accept_event(rv);
-                        session_bootstrap.observe_delivered_rv(rv);
+                        match try_serialize_raw_watch_event_for_stream(&event, stream_format) {
+                            Ok(line) => {
+                                yield Ok::<_, std::convert::Infallible>(line);
+                                cursor.accept_event(rv);
+                                session_bootstrap.observe_delivered_rv(rv);
+                            }
+                            Err(line) => {
+                                yield Ok::<_, std::convert::Infallible>(line);
+                                break;
+                            }
+                        }
                     }
                     Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
                         let decision = resolve_periodic_bookmark_decision(PeriodicBookmarkContext {
@@ -1130,12 +1180,18 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         match decision {
                             PeriodicBookmarkDecision::Bookmark(rv) => {
                                 let event = WatchEvent::bookmark_typed(rv, &api_version, &kind);
-                                yield Ok::<_, std::convert::Infallible>(serialize_watch_event_for_stream(
+                                match try_serialize_watch_event_for_stream(
                                     event,
                                     &kind,
                                     table_format,
                                     stream_format,
-                                ));
+                                ) {
+                                    Ok(line) => yield Ok::<_, std::convert::Infallible>(line),
+                                    Err(line) => {
+                                        yield Ok::<_, std::convert::Infallible>(line);
+                                        break;
+                                    }
+                                }
                             }
                             PeriodicBookmarkDecision::Expired => {
                                 yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
@@ -1224,10 +1280,22 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         let source_rv = event.resource_version();
                         match session.classify_event(event, matches) {
                             WatchSessionEvent::Deliver(transitioned) => {
-                                let line = serialize_watch_event_for_stream(transitioned, &kind, table_format, stream_format);
-                                yield Ok::<_, std::convert::Infallible>(line);
-                                if let Some(rv) = source_rv {
-                                    session.accept_delivered_rv(rv);
+                                match try_serialize_watch_event_for_stream(
+                                    transitioned,
+                                    &kind,
+                                    table_format,
+                                    stream_format,
+                                ) {
+                                    Ok(line) => {
+                                        yield Ok::<_, std::convert::Infallible>(line);
+                                        if let Some(rv) = source_rv {
+                                            session.accept_delivered_rv(rv);
+                                        }
+                                    }
+                                    Err(line) => {
+                                        yield Ok::<_, std::convert::Infallible>(line);
+                                        break;
+                                    }
                                 }
                             }
                             WatchSessionEvent::Filtered => {}
@@ -1236,10 +1304,22 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         match session.classify_event(event, matches) {
                             WatchSessionEvent::Deliver(event) => {
                                 let rv = event.resource_version();
-                                let line = serialize_watch_event_for_stream(event, &kind, table_format, stream_format);
-                                yield Ok::<_, std::convert::Infallible>(line);
-                                if let Some(rv) = rv {
-                                    session.accept_delivered_rv(rv);
+                                match try_serialize_watch_event_for_stream(
+                                    event,
+                                    &kind,
+                                    table_format,
+                                    stream_format,
+                                ) {
+                                    Ok(line) => {
+                                        yield Ok::<_, std::convert::Infallible>(line);
+                                        if let Some(rv) = rv {
+                                            session.accept_delivered_rv(rv);
+                                        }
+                                    }
+                                    Err(line) => {
+                                        yield Ok::<_, std::convert::Infallible>(line);
+                                        break;
+                                    }
                                 }
                             }
                             WatchSessionEvent::Filtered => {}
@@ -1263,12 +1343,18 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                     match decision {
                         PeriodicBookmarkDecision::Bookmark(rv) => {
                             let event = WatchEvent::bookmark_typed(rv, &api_version, &kind);
-                            yield Ok::<_, std::convert::Infallible>(serialize_watch_event_for_stream(
+                            match try_serialize_watch_event_for_stream(
                                 event,
                                 &kind,
                                 table_format,
                                 stream_format,
-                            ));
+                            ) {
+                                Ok(line) => yield Ok::<_, std::convert::Infallible>(line),
+                                Err(line) => {
+                                    yield Ok::<_, std::convert::Infallible>(line);
+                                    break;
+                                }
+                            }
                         }
                         PeriodicBookmarkDecision::Expired => {
                             yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
@@ -1464,6 +1550,35 @@ mod tests {
                 .unwrap();
         assert_eq!(decoded.code, Some(410));
         assert_eq!(decoded.reason, Some("Expired".to_string()));
+    }
+
+    #[test]
+    fn protobuf_watch_encode_failure_returns_terminal_error_frame() {
+        let event = WatchEvent::from_type(
+            "ADDED",
+            serde_json::json!({
+                "apiVersion": "example.com/v1",
+                "kind": "Widget",
+                "metadata": {"name": "w1", "resourceVersion": "7"}
+            }),
+        );
+
+        let frame = try_serialize_watch_event_for_stream(
+            event,
+            "Widget",
+            false,
+            WatchStreamFormat::Protobuf,
+        )
+        .expect_err("unsupported protobuf resource should be terminal");
+        let decoded =
+            k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(&frame[4..]).unwrap();
+        assert_eq!(decoded.r#type.as_deref(), Some("ERROR"));
+        let envelope = decode_watch_object_envelope(decoded);
+        let status =
+            k8s_pb::apimachinery::pkg::apis::meta::v1::Status::decode(envelope.raw.as_slice())
+                .unwrap();
+        assert_eq!(status.code, Some(500));
+        assert_eq!(status.reason.as_deref(), Some("InternalError"));
     }
 
     #[test]
