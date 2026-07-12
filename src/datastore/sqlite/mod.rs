@@ -12,6 +12,7 @@ mod crud;
 mod executor;
 mod filters;
 mod fingerprint;
+mod focused_ports;
 mod gc;
 mod merge_patch;
 pub mod opener;

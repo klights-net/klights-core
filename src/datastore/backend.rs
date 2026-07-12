@@ -1470,50 +1470,6 @@ pub trait StatusStore: Send + Sync {
     ) -> Result<Resource>;
 }
 
-#[async_trait]
-impl<T: DatastoreBackend + ?Sized> StatusStore for T {
-    async fn update_status_only(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        status: Value,
-        expected_rv: Option<i64>,
-    ) -> Result<Resource> {
-        DatastoreBackend::update_status_only(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            status,
-            expected_rv,
-        )
-        .await
-    }
-    async fn update_status_only_with_preconditions(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        status: Value,
-        preconditions: ResourcePreconditions,
-    ) -> Result<Resource> {
-        DatastoreBackend::update_status_only_with_preconditions(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            status,
-            preconditions,
-        )
-        .await
-    }
-}
-
 /// Owner-reference indexes and ownership lookups.
 #[async_trait]
 pub trait OwnershipStore: Send + Sync {

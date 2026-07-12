@@ -1006,6 +1006,51 @@ impl DatastoreBackend for RedbDatastore {
 }
 
 #[async_trait]
+impl crate::datastore::StatusStore for RedbDatastore {
+    async fn update_status_only(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: Value,
+        expected_rv: Option<i64>,
+    ) -> Result<Resource> {
+        crate::datastore::DatastoreBackend::update_status_only(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            status,
+            expected_rv,
+        )
+        .await
+    }
+
+    async fn update_status_only_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        status: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource> {
+        crate::datastore::DatastoreBackend::update_status_only_with_preconditions(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            status,
+            preconditions,
+        )
+        .await
+    }
+}
+
+#[async_trait]
 impl crate::datastore::MetaStore for RedbDatastore {
     async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
         crate::datastore::DatastoreBackend::get_klights_meta(self, key).await
