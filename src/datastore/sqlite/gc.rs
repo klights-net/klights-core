@@ -304,7 +304,11 @@ impl Datastore {
             {
                 return Ok(PositionedWatchReplayRead::Expired);
             }
+            let cursor_covers_current = position.event_id >= high_water_event_id
+                || (position.resource_version_filter_through_event_id >= high_water_event_id
+                    && position.resource_version >= current_resource_version);
             if (position.event_id > 0 || position.resource_version_filter_through_event_id > 0)
+                && !cursor_covers_current
                 && watch_position_expired_for_targets(conn, &targets, position)?
             {
                 return Ok(PositionedWatchReplayRead::Expired);
@@ -399,7 +403,11 @@ impl Datastore {
             {
                 return Ok(PositionedWatchReplayRead::Expired);
             }
+            let cursor_covers_current = position.event_id >= high_water_event_id
+                || (position.resource_version_filter_through_event_id >= high_water_event_id
+                    && position.resource_version >= current_resource_version);
             if (position.event_id > 0 || position.resource_version_filter_through_event_id > 0)
+                && !cursor_covers_current
                 && watch_position_expired_for_targets(conn, &targets, position)?
             {
                 return Ok(PositionedWatchReplayRead::Expired);

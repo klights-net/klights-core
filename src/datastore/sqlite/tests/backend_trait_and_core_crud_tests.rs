@@ -7652,6 +7652,15 @@ async fn migrated_legacy_floor_fails_closed_for_positioned_replay() {
     })
     .await
     .unwrap();
+    db.create_resource(
+        "v1",
+        "Secret",
+        Some("legacy"),
+        "unrelated-after-floor",
+        json!({"metadata": {"name": "unrelated-after-floor", "namespace": "legacy"}}),
+    )
+    .await
+    .unwrap();
 
     let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
         "v1",
@@ -7684,6 +7693,87 @@ async fn migrated_legacy_floor_fails_closed_for_positioned_replay() {
         matches!(scalar, crate::datastore::WatchReplayRead::Events(_)),
         "legacy RV-only floor must not expire an at-or-above scalar cursor"
     );
+}
+
+#[tokio::test]
+async fn migrated_zero_event_floor_allows_fresh_positioned_handoff() {
+    let db = Datastore::new_in_memory().await.unwrap();
+
+    let created = db
+        .create_resource(
+            "v1",
+            "ConfigMap",
+            Some("quiet"),
+            "anchor",
+            json!({"metadata": {"name": "anchor", "namespace": "quiet"}}),
+        )
+        .await
+        .unwrap();
+    let floor_rv = created.resource_version;
+
+    db.db_call("insert-zero-event-legacy-floor", move |conn| {
+        Ok(conn.execute(
+            "INSERT INTO watch_replay_floors
+                (api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact)
+             VALUES ('v1', 'ConfigMap', 'quiet', ?1, 0, 0)",
+            rusqlite::params![floor_rv],
+        )?)
+    })
+    .await
+    .unwrap();
+    db.create_resource(
+        "v1",
+        "Secret",
+        Some("quiet"),
+        "unrelated-after-floor",
+        json!({"metadata": {"name": "unrelated-after-floor", "namespace": "quiet"}}),
+    )
+    .await
+    .unwrap();
+
+    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+        "v1",
+        "ConfigMap",
+        "quiet",
+    )];
+    let fresh = db.current_watch_replay_position().await.unwrap();
+    assert!(
+        fresh.event_id > 0,
+        "test requires a current positioned LIST-to-WATCH handoff"
+    );
+    assert!(matches!(
+        db.list_watch_events_after_position_checked_bounded(
+            &target,
+            fresh,
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap(),
+        crate::datastore::PositionedWatchReplayRead::Events(_)
+    ));
+    assert!(matches!(
+        db.list_raw_watch_events_after_position_checked_bounded(
+            &target,
+            fresh,
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap(),
+        crate::datastore::PositionedWatchReplayRead::Events(_)
+    ));
+
+    let stale =
+        crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(floor_rv, 1);
+    assert!(matches!(
+        db.list_watch_events_after_position_checked_bounded(
+            &target,
+            stale,
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap(),
+        crate::datastore::PositionedWatchReplayRead::Expired
+    ));
 }
 
 // -----------------------------------------------------------------------
