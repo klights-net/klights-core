@@ -4180,3 +4180,14 @@ impl DatastoreBackend for Datastore {
         Datastore::current_log_apply_index(self).await
     }
 }
+
+#[async_trait::async_trait]
+impl crate::datastore::MetaStore for Datastore {
+    async fn get_klights_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+        crate::datastore::DatastoreBackend::get_klights_meta(self, key).await
+    }
+
+    async fn set_klights_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        crate::datastore::DatastoreBackend::set_klights_meta(self, key, value).await
+    }
+}

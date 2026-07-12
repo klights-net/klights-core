@@ -1924,6 +1924,17 @@ impl DatastoreBackend for WorkerStoreAdapter {
     }
 }
 
+#[async_trait]
+impl crate::datastore::MetaStore for WorkerStoreAdapter {
+    async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
+        crate::datastore::DatastoreBackend::get_klights_meta(self, key).await
+    }
+
+    async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
+        crate::datastore::DatastoreBackend::set_klights_meta(self, key, value).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

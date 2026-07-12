@@ -1412,3 +1412,14 @@ impl DatastoreBackend for ReplicatedDatastore {
         self.inner.current_log_apply_index().await
     }
 }
+
+#[async_trait]
+impl crate::datastore::MetaStore for ReplicatedDatastore {
+    async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
+        crate::datastore::DatastoreBackend::get_klights_meta(self, key).await
+    }
+
+    async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
+        crate::datastore::DatastoreBackend::set_klights_meta(self, key, value).await
+    }
+}

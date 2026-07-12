@@ -2358,17 +2358,6 @@ pub trait MetaStore: Send + Sync {
     async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()>;
 }
 
-#[async_trait]
-impl<T: DatastoreBackend + ?Sized> MetaStore for T {
-    async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
-        DatastoreBackend::get_klights_meta(self, key).await
-    }
-
-    async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
-        DatastoreBackend::set_klights_meta(self, key, value).await
-    }
-}
-
 /// Selector for the watch-event publisher path used by a backend.
 ///
 /// Defined at the trait layer so every backend reads from one type and
