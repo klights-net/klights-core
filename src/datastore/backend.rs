@@ -1494,45 +1494,6 @@ pub trait OwnershipStore: Send + Sync {
     ) -> Result<Vec<Resource>>;
 }
 
-#[async_trait]
-impl<T: DatastoreBackend + ?Sized> OwnershipStore for T {
-    async fn find_owned_resources(
-        &self,
-        owner_uid: &str,
-        namespace: Option<&str>,
-    ) -> Result<Vec<Resource>> {
-        DatastoreBackend::find_owned_resources(self, owner_uid, namespace).await
-    }
-
-    async fn list_resources_by_owner_uid(
-        &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        owner_uid: &str,
-    ) -> Result<Vec<Resource>> {
-        DatastoreBackend::list_resources_by_owner_uid(self, api_version, kind, namespace, owner_uid)
-            .await
-    }
-
-    async fn find_owned_by_name_kind_empty_uid(
-        &self,
-        owner_api_version: &str,
-        owner_name: &str,
-        owner_kind: &str,
-        namespace: Option<&str>,
-    ) -> Result<Vec<Resource>> {
-        DatastoreBackend::find_owned_by_name_kind_empty_uid(
-            self,
-            owner_api_version,
-            owner_name,
-            owner_kind,
-            namespace,
-        )
-        .await
-    }
-}
-
 /// ResourceVersion read required to anchor watch bootstrap.
 #[async_trait]
 pub trait CurrentResourceVersionStore: Send + Sync {
