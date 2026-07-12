@@ -195,13 +195,11 @@ fn schema_domain_map_is_deferred_to_dsb_ha_00() {
     // Marker: DSB-HA-00 complete (left for historical reference).
 }
 
-/// A database written before positioned replay had no `floor_position_exact`
-/// column. Reopening it must add the column and preserve the unknownness of
-/// every existing floor as a legacy (resource-version-only) boundary so that
-/// positioned replay fails closed instead of trusting a historical `0` event
-/// ID as an exact cursor.
+/// A database written before `floor_position_exact` but after exact positioned
+/// floors had a nonzero `floor_event_id`. Reopening it must preserve those
+/// known exact boundaries while keeping zero event floors legacy-inexact.
 #[test]
-fn migrated_replay_floor_column_defaults_to_legacy_inexact() {
+fn migrated_replay_floor_column_preserves_nonzero_exact_event_floors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("state.db");
     let mut conn = rusqlite::Connection::open(&path).expect("open");
@@ -223,7 +221,14 @@ fn migrated_replay_floor_column_defaults_to_legacy_inexact() {
     conn.execute(
         "INSERT INTO watch_replay_floors
             (api_version, kind, namespace_key, floor_rv, floor_event_id)
-         VALUES ('v1', 'ConfigMap', 'legacy', 12, 0)",
+         VALUES ('v1', 'ConfigMap', 'stable-exact', 12, 34)",
+        [],
+    )
+    .expect("insert stable exact floor");
+    conn.execute(
+        "INSERT INTO watch_replay_floors
+            (api_version, kind, namespace_key, floor_rv, floor_event_id)
+         VALUES ('v1', 'Secret', 'legacy-inexact', 12, 0)",
         [],
     )
     .expect("insert legacy floor");
@@ -234,14 +239,27 @@ fn migrated_replay_floor_column_defaults_to_legacy_inexact() {
     let exact: i64 = conn
         .query_row(
             "SELECT floor_position_exact FROM watch_replay_floors
-             WHERE api_version = 'v1' AND kind = 'ConfigMap' AND namespace_key = 'legacy'",
+             WHERE api_version = 'v1' AND kind = 'ConfigMap' AND namespace_key = 'stable-exact'",
             [],
             |row| row.get(0),
         )
-        .expect("query migrated floor");
+        .expect("query migrated exact floor");
     assert_eq!(
-        exact, 0,
-        "migrated floor must remain legacy-inexact so positioned replay fails closed"
+        exact, 1,
+        "nonzero floor_event_id rows from the stable schema must stay exact"
+    );
+
+    let inexact: i64 = conn
+        .query_row(
+            "SELECT floor_position_exact FROM watch_replay_floors
+             WHERE api_version = 'v1' AND kind = 'Secret' AND namespace_key = 'legacy-inexact'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query migrated inexact floor");
+    assert_eq!(
+        inexact, 0,
+        "zero floor_event_id rows must remain legacy-inexact"
     );
 }
 

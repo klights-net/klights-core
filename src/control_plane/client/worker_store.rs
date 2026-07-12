@@ -2223,6 +2223,15 @@ mod tests {
             "typed replay-expired status must be detected through wrappers"
         );
 
+        let legacy = tonic::Status::out_of_range(
+            "WatchResources replay window expired: resume rv 42 requires relist",
+        );
+        let err = anyhow::Error::from(legacy).context("gRPC WatchResources stream failed");
+        assert!(
+            is_watch_window_expired(&err),
+            "exact legacy replay-expired status from pre-marker leaders must trigger a relist"
+        );
+
         let mut metadata = tonic::metadata::MetadataMap::new();
         metadata.insert(
             crate::replication::grpc::WATCH_REPLAY_EXPIRED_REASON_METADATA_KEY,

@@ -508,12 +508,18 @@ fn migrate_watch_replay_floor_position_exact(
             .any(|column| column == "floor_position_exact")
     };
     if !has_floor_position_exact {
-        // Existing rows were persisted before the boundary encoded whether an
-        // event ID was exact. Preserve that unknownness instead of treating a
-        // historical `0` as a valid positioned floor.
         conn.execute(
             "ALTER TABLE watch_replay_floors
              ADD COLUMN floor_position_exact INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        // Databases since the positioned LIST/WATCH handoff work already
+        // persisted exact floor_event_id values. Only older rows whose event
+        // floor is still zero remain legacy resource-version-only boundaries.
+        conn.execute(
+            "UPDATE watch_replay_floors
+             SET floor_position_exact = 1
+             WHERE floor_event_id > 0",
             [],
         )?;
     }

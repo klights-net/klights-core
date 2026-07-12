@@ -7266,6 +7266,79 @@ async fn gc_triggers_incremental_vacuum_after_sweep() {
 }
 
 #[tokio::test]
+async fn gc_promotes_inexact_replay_floor_to_exact_position() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    for i in 0..4 {
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("promote"),
+            &format!("cm-{i}"),
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "promote", "name": format!("cm-{i}")}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    db.db_call("seed-inexact-replay-floor", |conn| {
+        Ok(conn.execute(
+            "INSERT INTO watch_replay_floors
+                (api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact)
+             VALUES ('v1', 'ConfigMap', 'promote', 0, 0, 0)",
+            [],
+        )?)
+    })
+    .await
+    .unwrap();
+
+    let removed = db.gc_watch_events(1, 1000).await.unwrap();
+    assert!(removed > 0, "GC must remove rows and upsert an exact floor");
+
+    let (floor_event_id, floor_position_exact): (i64, i64) = db
+        .db_call("read-promoted-replay-floor", |conn| {
+            Ok(conn.query_row(
+                "SELECT floor_event_id, floor_position_exact FROM watch_replay_floors
+                 WHERE api_version = 'v1' AND kind = 'ConfigMap' AND namespace_key = 'promote'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(floor_event_id > 0);
+    assert_eq!(
+        floor_position_exact, 1,
+        "exact GC observations must promote legacy-inexact rows"
+    );
+
+    let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+        "v1",
+        "ConfigMap",
+        "promote",
+    )];
+    let current = db.current_watch_replay_position().await.unwrap();
+    let replay = db
+        .list_watch_events_after_position_checked_bounded(
+            &target,
+            current,
+            std::num::NonZeroUsize::new(3).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            replay,
+            crate::datastore::PositionedWatchReplayRead::Events(_)
+        ),
+        "fresh positioned handoff at the current event high-water must remain available"
+    );
+}
+
+#[tokio::test]
 async fn scoped_replay_floor_allows_retained_in_scope_event_after_unrelated_gc() {
     let db = crate::datastore::test_support::in_memory().await;
 

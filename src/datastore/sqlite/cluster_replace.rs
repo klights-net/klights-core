@@ -208,16 +208,17 @@ fn replace_resource_state_in_conn(
             Some(high_water) => high_water,
             None => Datastore::watch_event_allocator_high_water_in_conn(&tx)?,
         };
+        let legacy_floor_is_exact = i64::from(legacy_event_floor > 0);
         tx.execute(
             "INSERT INTO watch_replay_floors
              (api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact)
-             VALUES ('*', '*', '*', ?1, ?2, 0)",
-            rusqlite::params![current_rv, legacy_event_floor],
+             VALUES ('*', '*', '*', ?1, ?2, ?3)",
+            rusqlite::params![current_rv, legacy_event_floor, legacy_floor_is_exact],
         )?;
         tx.execute(
             "INSERT OR REPLACE INTO watch_replay_floors
              (api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact)
-             SELECT api_version, kind, namespace_key, ?1, ?2, 0 FROM (
+             SELECT api_version, kind, namespace_key, ?1, ?2, ?3 FROM (
                  SELECT api_version, kind, COALESCE(namespace, '#cluster') AS namespace_key
                    FROM watch_events
                  UNION
@@ -227,7 +228,7 @@ fn replace_resource_state_in_conn(
                  UNION
                  SELECT 'v1', 'Namespace', '#cluster' FROM namespaces
              )",
-            rusqlite::params![current_rv, legacy_event_floor],
+            rusqlite::params![current_rv, legacy_event_floor, legacy_floor_is_exact],
         )?;
     }
 
@@ -1375,6 +1376,50 @@ mod tests {
             .await
             .expect("authoritative snapshot must replace the local counter");
         assert_eq!(db.get_current_resource_version().await.unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_floor_allows_fresh_positioned_handoff() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.replace_replicated_resource_state(Vec::new(), 10, Some(5), None, None)
+            .await
+            .unwrap();
+
+        let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+            "v1",
+            "ConfigMap",
+            "default",
+        )];
+        let fresh =
+            crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(10, 5);
+        let replay = db
+            .list_watch_events_after_position_checked_bounded(
+                &target,
+                fresh,
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                replay,
+                crate::datastore::PositionedWatchReplayRead::Events(_)
+            ),
+            "fresh LIST-to-WATCH cursor at the snapshot high-water must not expire"
+        );
+
+        let stale =
+            crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(10, 4);
+        assert!(matches!(
+            db.list_watch_events_after_position_checked_bounded(
+                &target,
+                stale,
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )
+            .await
+            .unwrap(),
+            crate::datastore::PositionedWatchReplayRead::Expired
+        ));
     }
 
     #[tokio::test]

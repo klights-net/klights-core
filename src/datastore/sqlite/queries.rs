@@ -129,7 +129,8 @@ pub(super) const WATCH_REPLAY_FLOOR_UPSERT: &str =
      VALUES (?1, ?2, ?3, ?4, ?5, 1)
      ON CONFLICT(api_version, kind, namespace_key)
      DO UPDATE SET floor_rv = MAX(watch_replay_floors.floor_rv, excluded.floor_rv),
-                   floor_event_id = MAX(watch_replay_floors.floor_event_id, excluded.floor_event_id)";
+                   floor_event_id = MAX(watch_replay_floors.floor_event_id, excluded.floor_event_id),
+                   floor_position_exact = 1";
 
 pub(super) const WATCH_REPLAY_RETENTION_FLOOR_FOR_SCOPE: &str =
     "SELECT floor_rv, floor_event_id, floor_position_exact FROM watch_replay_floors

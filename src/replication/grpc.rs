@@ -23,6 +23,8 @@ mod ca_files;
 pub const JOIN_TOKEN_METADATA_KEY: &str = "x-klights-join-token";
 pub(crate) const WATCH_REPLAY_EXPIRED_REASON_METADATA_KEY: &str = "x-klights-watch-error";
 pub(crate) const WATCH_REPLAY_EXPIRED_REASON: &str = "watch-replay-expired";
+const LEGACY_WATCH_REPLAY_EXPIRED_PREFIX: &str = "WatchResources replay window expired: resume rv ";
+const LEGACY_WATCH_REPLAY_EXPIRED_SUFFIX: &str = " requires relist";
 
 pub(crate) fn watch_replay_position_to_proto(
     position: crate::datastore::WatchReplayPosition,
@@ -72,6 +74,13 @@ pub(crate) fn is_watch_replay_expired_status(status: &tonic::Status) -> bool {
     if status.code() != tonic::Code::OutOfRange {
         return false;
     }
+    if is_typed_watch_replay_expired_status(status) {
+        return true;
+    }
+    legacy_watch_replay_expired_status(status)
+}
+
+fn is_typed_watch_replay_expired_status(status: &tonic::Status) -> bool {
     let Some(reason) = status
         .metadata()
         .get(WATCH_REPLAY_EXPIRED_REASON_METADATA_KEY)
@@ -86,6 +95,20 @@ pub(crate) fn is_watch_replay_expired_status(status: &tonic::Status) -> bool {
         return false;
     };
     details.reason == WATCH_REPLAY_EXPIRED_REASON
+}
+
+fn legacy_watch_replay_expired_status(status: &tonic::Status) -> bool {
+    if !status.metadata().is_empty() || !status.details().is_empty() {
+        return false;
+    }
+    let Some(resume_rv) = status
+        .message()
+        .strip_prefix(LEGACY_WATCH_REPLAY_EXPIRED_PREFIX)
+        .and_then(|message| message.strip_suffix(LEGACY_WATCH_REPLAY_EXPIRED_SUFFIX))
+    else {
+        return false;
+    };
+    resume_rv.parse::<i64>().is_ok()
 }
 
 use crate::datastore::command::{
