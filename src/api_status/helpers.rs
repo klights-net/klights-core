@@ -1,7 +1,6 @@
 // Status subresource handlers
 
 use axum::{
-    Json,
     body::Bytes,
     extract::{Path, State},
     http::HeaderMap,
@@ -9,7 +8,7 @@ use axum::{
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::api::{AppError, AppState, LenientJson, inject_resource_version};
+use crate::api::{AppError, AppState, K8sResponse, LenientJson, inject_resource_version};
 use crate::api_status::{
     ApiSubresourceStatusMergePolicy, DatastoreStatusMutationWriter,
     LenientStatusResourceVersionPrecondition, ResourceStatusResponder, StatusMutationPipeline,
@@ -99,7 +98,8 @@ pub async fn update_status_subresource(
     namespace: String,
     name: String,
     body: Value,
-) -> Result<Json<Value>, AppError> {
+    headers: HeaderMap,
+) -> Result<K8sResponse, AppError> {
     let target = StatusMutationTarget::namespaced(&api_version, &kind, &namespace, &name);
     let pipeline = StatusMutationPipeline::new(
         DatastoreStatusMutationWriter::new(state.clone()),
@@ -125,7 +125,7 @@ pub async fn update_status_subresource(
         &outcome.final_resource.data,
     )
     .await;
-    Ok(Json(outcome.response))
+    Ok(K8sResponse::new(outcome.response, &headers))
 }
 
 pub async fn patch_status_subresource(
@@ -135,8 +135,9 @@ pub async fn patch_status_subresource(
     namespace: String,
     name: String,
     patch: Value,
-    content_type: Option<&str>,
-) -> Result<Json<Value>, AppError> {
+    headers: HeaderMap,
+) -> Result<K8sResponse, AppError> {
+    let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
     let target = StatusMutationTarget::namespaced(&api_version, &kind, &namespace, &name);
     let pipeline = StatusMutationPipeline::new(
         DatastoreStatusMutationWriter::new(state.clone()),
@@ -196,24 +197,44 @@ pub async fn patch_status_subresource(
         &outcome.final_resource.data,
     )
     .await;
-    Ok(Json(outcome.response))
+    Ok(K8sResponse::new(outcome.response, &headers))
 }
 
 // Generic cluster-scoped status helpers moved for cross-module re-use.
+/// Generic status GET handler for namespaced resources.
+pub async fn get_namespaced_status_subresource(
+    state: Arc<AppState>,
+    api_version: String,
+    kind: String,
+    namespace: String,
+    name: String,
+    headers: HeaderMap,
+) -> Result<K8sResponse, AppError> {
+    let resource = state
+        .db
+        .get_resource(&api_version, &kind, Some(&namespace), &name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind, name)))?;
+
+    let data = inject_resource_version(resource.data, resource.resource_version);
+    Ok(K8sResponse::new(data, &headers))
+}
+
 /// Generic status GET handler for cluster-scoped resources.
 pub async fn get_cluster_status_subresource(
     state: Arc<AppState>,
     api_version: String,
     kind: String,
     name: String,
-) -> Result<Json<Value>, AppError> {
+    headers: HeaderMap,
+) -> Result<K8sResponse, AppError> {
     let resource = state
         .db
         .get_resource(&api_version, &kind, None, &name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("{} {} not found", kind, name)))?;
     let result = inject_resource_version(resource.data, resource.resource_version);
-    Ok(Json(result))
+    Ok(K8sResponse::new(result, &headers))
 }
 
 /// Generic status PUT handler for cluster-scoped resources.
@@ -223,7 +244,26 @@ pub async fn update_cluster_status_subresource(
     kind: String,
     name: String,
     body: Value,
-) -> Result<Json<Value>, AppError> {
+) -> Result<K8sResponse, AppError> {
+    update_cluster_status_subresource_with_headers(
+        state,
+        api_version,
+        kind,
+        name,
+        body,
+        HeaderMap::new(),
+    )
+    .await
+}
+
+pub async fn update_cluster_status_subresource_with_headers(
+    state: Arc<AppState>,
+    api_version: String,
+    kind: String,
+    name: String,
+    body: Value,
+    headers: HeaderMap,
+) -> Result<K8sResponse, AppError> {
     let target = StatusMutationTarget::cluster(&api_version, &kind, &name);
     let pre_merge = (api_version == "v1" && kind == "Node")
         .then_some(preserve_node_extended_resources as fn(Option<&Value>, &mut Value));
@@ -236,7 +276,7 @@ pub async fn update_cluster_status_subresource(
     let outcome = pipeline
         .execute(&target, &StatusPutOperation::new(body))
         .await?;
-    Ok(Json(outcome.response))
+    Ok(K8sResponse::new(outcome.response, &headers))
 }
 
 pub fn preserve_node_extended_resources(existing_status: Option<&Value>, new_status: &mut Value) {
@@ -370,8 +410,9 @@ pub async fn patch_cluster_status_subresource(
     kind: String,
     name: String,
     patch: Value,
-    content_type: Option<&str>,
-) -> Result<Json<Value>, AppError> {
+    headers: HeaderMap,
+) -> Result<K8sResponse, AppError> {
+    let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
     let target = StatusMutationTarget::cluster(&api_version, &kind, &name);
     let pre_merge = (api_version == "v1" && kind == "Node")
         .then_some(preserve_node_extended_resources as fn(Option<&Value>, &mut Value));
@@ -387,7 +428,7 @@ pub async fn patch_cluster_status_subresource(
             &StatusPatchOperation::new(patch, content_type.map(str::to_string)),
         )
         .await?;
-    Ok(Json(outcome.response))
+    Ok(K8sResponse::new(outcome.response, &headers))
 }
 
 // Wrapper functions for specific resource types' status subresources
@@ -398,8 +439,9 @@ macro_rules! namespaced_status_update_handler {
         pub async fn $fn_name(
             State(state): State<Arc<AppState>>,
             Path((namespace, name)): Path<(String, String)>,
+            headers: HeaderMap,
             LenientJson(body): LenientJson<Value>,
-        ) -> Result<Json<Value>, AppError> {
+        ) -> Result<K8sResponse, AppError> {
             $crate::api_status::update_status_subresource(
                 state,
                 $api_version.to_string(),
@@ -407,6 +449,7 @@ macro_rules! namespaced_status_update_handler {
                 namespace,
                 name,
                 body,
+                headers,
             )
             .await
         }
@@ -421,8 +464,7 @@ macro_rules! namespaced_status_patch_handler {
             Path((namespace, name)): Path<(String, String)>,
             headers: HeaderMap,
             body: Bytes,
-        ) -> Result<Json<Value>, AppError> {
-            let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
+        ) -> Result<K8sResponse, AppError> {
             let patch: Value = $crate::api_status::decode_patch_body(&body)?;
             $crate::api_status::patch_status_subresource(
                 state,
@@ -431,7 +473,7 @@ macro_rules! namespaced_status_patch_handler {
                 namespace,
                 name,
                 patch,
-                content_type,
+                headers,
             )
             .await
         }
@@ -444,16 +486,17 @@ macro_rules! namespaced_status_get_handler {
         pub async fn $fn_name(
             State(state): State<Arc<AppState>>,
             Path((namespace, name)): Path<(String, String)>,
-        ) -> Result<Json<Value>, AppError> {
-            let resource = state
-                .db
-                .get_resource($api_version, $kind, Some(&namespace), &name)
-                .await?
-                .ok_or_else(|| AppError::NotFound(format!("{} {} not found", $kind, name)))?;
-
-            let data =
-                $crate::api::inject_resource_version(resource.data, resource.resource_version);
-            Ok(Json(data))
+            headers: HeaderMap,
+        ) -> Result<K8sResponse, AppError> {
+            $crate::api_status::get_namespaced_status_subresource(
+                state,
+                $api_version.to_string(),
+                $kind.to_string(),
+                namespace,
+                name,
+                headers,
+            )
+            .await
         }
     };
 }
@@ -464,12 +507,14 @@ macro_rules! cluster_status_get_handler {
         pub async fn $fn_name(
             State(state): State<Arc<AppState>>,
             Path(name): Path<String>,
-        ) -> Result<Json<Value>, AppError> {
+            headers: HeaderMap,
+        ) -> Result<K8sResponse, AppError> {
             $crate::api_status::get_cluster_status_subresource(
                 state,
                 $api_version.to_string(),
                 $kind.to_string(),
                 name,
+                headers,
             )
             .await
         }
@@ -482,14 +527,16 @@ macro_rules! cluster_status_update_handler {
         pub async fn $fn_name(
             State(state): State<Arc<AppState>>,
             Path(name): Path<String>,
+            headers: HeaderMap,
             LenientJson(body): LenientJson<Value>,
-        ) -> Result<Json<Value>, AppError> {
-            $crate::api_status::update_cluster_status_subresource(
+        ) -> Result<K8sResponse, AppError> {
+            $crate::api_status::update_cluster_status_subresource_with_headers(
                 state,
                 $api_version.to_string(),
                 $kind.to_string(),
                 name,
                 body,
+                headers,
             )
             .await
         }
@@ -504,8 +551,7 @@ macro_rules! cluster_status_patch_handler {
             Path(name): Path<String>,
             headers: HeaderMap,
             body: Bytes,
-        ) -> Result<Json<Value>, AppError> {
-            let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
+        ) -> Result<K8sResponse, AppError> {
             let patch: Value = $crate::api_status::decode_patch_body(&body)?;
             $crate::api_status::patch_cluster_status_subresource(
                 state,
@@ -513,7 +559,7 @@ macro_rules! cluster_status_patch_handler {
                 $kind.to_string(),
                 name,
                 patch,
-                content_type,
+                headers,
             )
             .await
         }
@@ -552,14 +598,16 @@ namespaced_status_patch_handler!(patch_ingress_status, "networking.k8s.io/v1", "
 pub async fn update_node_status(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     LenientJson(body): LenientJson<Value>,
-) -> Result<Json<Value>, AppError> {
-    crate::api_status::update_cluster_status_subresource(
+) -> Result<K8sResponse, AppError> {
+    crate::api_status::update_cluster_status_subresource_with_headers(
         state,
         "v1".to_string(),
         "Node".to_string(),
         name,
         body,
+        headers,
     )
     .await
 }

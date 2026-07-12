@@ -9,7 +9,8 @@ use axum::{
 use serde_json::Value;
 
 use crate::api::{
-    AppError, AppState, LenientJson, ensure_namespace_status_phase_active, inject_resource_version,
+    AppError, AppState, K8sResponse, LenientJson, ensure_namespace_status_phase_active,
+    inject_resource_version,
 };
 use crate::api_status::{
     ApiSubresourceStatusMergePolicy, CurrentNamespaceResourceVersionPrecondition,
@@ -19,7 +20,6 @@ use crate::api_status::{
     ResourceStatusResponder, StatusMutationPipeline, StatusMutationTarget, StatusPatchOperation,
     StatusPutOperation, decode_patch_body, get_cluster_status_subresource,
     patch_cluster_status_subresource, preserve_node_extended_resources,
-    update_cluster_status_subresource,
 };
 
 // Cluster subresource (status) authorization is enforced by the global
@@ -30,7 +30,7 @@ pub async fn patch_node_status(
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, AppError> {
+) -> Result<K8sResponse, AppError> {
     let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
     let patch: Value = decode_patch_body(&body)?;
     let target = StatusMutationTarget::cluster("v1", "Node", &name);
@@ -46,7 +46,7 @@ pub async fn patch_node_status(
             &StatusPatchOperation::status_only(patch, content_type.map(str::to_string)),
         )
         .await?;
-    Ok(Json(outcome.response))
+    Ok(K8sResponse::new(outcome.response, &headers))
 }
 
 crate::cluster_status_get_handler!(
@@ -236,12 +236,14 @@ crate::cluster_status_patch_handler!(
 pub async fn get_csr_approval(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-) -> Result<Json<Value>, AppError> {
+    headers: HeaderMap,
+) -> Result<K8sResponse, AppError> {
     get_cluster_status_subresource(
         state,
         "certificates.k8s.io/v1".to_string(),
         "CertificateSigningRequest".to_string(),
         name,
+        headers,
     )
     .await
 }
@@ -252,14 +254,16 @@ pub async fn get_csr_approval(
 pub async fn update_csr_approval(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     LenientJson(body): LenientJson<Value>,
-) -> Result<Json<Value>, AppError> {
-    update_cluster_status_subresource(
+) -> Result<K8sResponse, AppError> {
+    crate::api_status::update_cluster_status_subresource_with_headers(
         state,
         "certificates.k8s.io/v1".to_string(),
         "CertificateSigningRequest".to_string(),
         name,
         body,
+        headers,
     )
     .await
 }
@@ -269,8 +273,7 @@ pub async fn patch_csr_approval(
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, AppError> {
-    let content_type = headers.get("content-type").and_then(|h| h.to_str().ok());
+) -> Result<K8sResponse, AppError> {
     let patch = decode_patch_body(&body)?;
 
     patch_cluster_status_subresource(
@@ -279,7 +282,7 @@ pub async fn patch_csr_approval(
         "CertificateSigningRequest".to_string(),
         name,
         patch,
-        content_type,
+        headers,
     )
     .await
 }

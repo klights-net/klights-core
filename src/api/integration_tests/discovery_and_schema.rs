@@ -2142,6 +2142,334 @@ async fn test_service_status_lifecycle_patch_and_put() {
 }
 
 #[tokio::test]
+async fn test_service_status_subresource_preserves_fields_and_negotiates_json_protobuf() {
+    use crate::datastore::WatchTarget;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    struct StatusCase {
+        label: &'static str,
+        request_content_type: &'static str,
+        accept: &'static str,
+        request_body: serde_json::Value,
+        expect_protobuf: bool,
+    }
+
+    async fn decode_response(
+        response: axum::response::Response,
+        expect_protobuf: bool,
+    ) -> serde_json::Value {
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        if expect_protobuf {
+            assert!(
+                content_type.contains("application/vnd.kubernetes.protobuf"),
+                "protobuf Accept must return Service protobuf, got {content_type}"
+            );
+            crate::protobuf::decode_protobuf(&body[4..]).unwrap()
+        } else {
+            assert!(
+                content_type.starts_with("application/json"),
+                "JSON Accept must return JSON, got {content_type}"
+            );
+            serde_json::from_slice(&body).unwrap()
+        }
+    }
+
+    fn service_condition_status<'a>(
+        service: &'a serde_json::Value,
+        condition_type: &str,
+    ) -> Option<&'a str> {
+        service
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|condition| {
+                condition.get("type").and_then(serde_json::Value::as_str) == Some(condition_type)
+            })
+            .and_then(|condition| condition.get("status").and_then(serde_json::Value::as_str))
+    }
+
+    let (app, db) = build_test_router_with_db().await;
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "service-status-api",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": "service-status-api"}
+        }),
+    )
+    .await
+    .unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Service",
+            Some("service-status-api"),
+            "svc",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": "svc",
+                    "namespace": "service-status-api",
+                    "uid": "service-status-api-svc"
+                },
+                "spec": {
+                    "selector": {"app": "svc"},
+                    "ports": [{"name": "http", "protocol": "TCP", "port": 80, "targetPort": 8080}]
+                },
+                "status": {
+                    "loadBalancer": {
+                        "ingress": [{"ip": "198.51.100.10"}]
+                    },
+                    "conditions": [
+                        {
+                            "type": "Ready",
+                            "status": "False",
+                            "reason": "Seeded",
+                            "message": "seeded",
+                            "lastTransitionTime": "2026-07-01T00:00:00Z"
+                        },
+                        {
+                            "type": "ExternalTrafficPolicy",
+                            "status": "True",
+                            "reason": "Seeded",
+                            "message": "preserve me",
+                            "lastTransitionTime": "2026-07-01T00:00:00Z"
+                        }
+                    ],
+                    "metadataField": "from-live"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+    let cases = [
+        StatusCase {
+            label: "json PUT",
+            request_content_type: "application/json",
+            accept: "application/json",
+            request_body: json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": "svc",
+                    "namespace": "service-status-api",
+                    "resourceVersion": created.resource_version.to_string()
+                },
+                "status": {
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "StatusRoute",
+                        "message": "updated",
+                        "lastTransitionTime": "2026-07-01T00:01:00Z"
+                    }]
+                }
+            }),
+            expect_protobuf: false,
+        },
+        StatusCase {
+            label: "protobuf PUT",
+            request_content_type: "application/vnd.kubernetes.protobuf",
+            accept: "application/vnd.kubernetes.protobuf",
+            request_body: json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": "svc",
+                    "namespace": "service-status-api"
+                },
+                "status": {
+                    "loadBalancer": {
+                        "ingress": [{"ip": "198.51.100.20"}]
+                    }
+                }
+            }),
+            expect_protobuf: true,
+        },
+    ];
+
+    let mut last_rv = created.resource_version;
+    for case in cases {
+        let body = if case.request_content_type.contains("protobuf") {
+            Body::from(crate::protobuf::encode_protobuf(&case.request_body).unwrap())
+        } else {
+            Body::from(serde_json::to_vec(&case.request_body).unwrap())
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/namespaces/service-status-api/services/svc/status")
+                    .header("content-type", case.request_content_type)
+                    .header("accept", case.accept)
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{}", case.label);
+        let updated = decode_response(response, case.expect_protobuf).await;
+        if !case.expect_protobuf {
+            assert_eq!(
+                updated.pointer("/status/metadataField"),
+                Some(&json!("from-live")),
+                "{} must preserve unmentioned Service status fields",
+                case.label
+            );
+        }
+        assert_eq!(
+            service_condition_status(&updated, "ExternalTrafficPolicy"),
+            Some("True"),
+            "{} must preserve unmentioned Service conditions",
+            case.label
+        );
+        let updated_rv = updated
+            .pointer("/metadata/resourceVersion")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<i64>().ok())
+            .expect("status response must carry resourceVersion");
+        assert!(
+            updated_rv > last_rv,
+            "{} must advance resourceVersion",
+            case.label
+        );
+        last_rv = updated_rv;
+    }
+
+    let current = db
+        .get_resource("v1", "Service", Some("service-status-api"), "svc")
+        .await
+        .unwrap()
+        .expect("Service must exist");
+    assert_eq!(
+        current.data.pointer("/status/metadataField"),
+        Some(&json!("from-live")),
+        "protobuf Service /status update must preserve unmentioned persisted status fields"
+    );
+    let stale = json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": "svc",
+            "namespace": "service-status-api",
+            "resourceVersion": created.resource_version.to_string()
+        },
+        "status": {
+            "conditions": [{"type": "ExternalTrafficPolicy", "status": "False"}]
+        }
+    });
+    let stale_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/namespaces/service-status-api/services/svc/status")
+                .header("content-type", "application/json")
+                .header("accept", "application/vnd.kubernetes.protobuf")
+                .body(Body::from(serde_json::to_vec(&stale).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_response.status(),
+        StatusCode::CONFLICT,
+        "stale Service /status resourceVersion must conflict"
+    );
+    let _status = decode_response(stale_response, true).await;
+    let after_stale = db
+        .get_resource("v1", "Service", Some("service-status-api"), "svc")
+        .await
+        .unwrap()
+        .expect("Service must remain after stale status conflict");
+    assert_eq!(
+        after_stale.resource_version, current.resource_version,
+        "stale Service /status conflict must not advance resourceVersion"
+    );
+
+    let get_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/namespaces/service-status-api/services/svc/status")
+                .header("accept", "application/vnd.kubernetes.protobuf")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get_response.status(), StatusCode::OK);
+    let got = decode_response(get_response, true).await;
+    assert_eq!(
+        got.pointer("/status/loadBalancer/ingress/0/ip"),
+        Some(&json!("198.51.100.20")),
+        "GET /status protobuf response must carry the native Service status"
+    );
+
+    let events = db
+        .list_watch_events_since(
+            &[WatchTarget::namespaced_in_namespace(
+                "v1",
+                "Service",
+                "service-status-api",
+            )],
+            created.resource_version,
+        )
+        .await
+        .unwrap();
+    let modified: Vec<_> = events
+        .iter()
+        .filter(|event| event.resource.name == "svc" && event.event_type.as_ref() == "MODIFIED")
+        .collect();
+    assert_eq!(
+        modified.len(),
+        2,
+        "only the fresh JSON/protobuf Service /status writes should emit watch events: {events:?}"
+    );
+    assert_eq!(
+        modified[0]
+            .resource
+            .data
+            .pointer("/status/conditions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|condition| {
+                condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+            })
+            .count(),
+        1,
+        "watch history must contain the merged Service status without duplicate conditions"
+    );
+    assert_eq!(
+        modified[1]
+            .resource
+            .data
+            .pointer("/status/loadBalancer/ingress/0/ip"),
+        Some(&json!("198.51.100.20")),
+        "watch history must record the protobuf status response object"
+    );
+}
+
+#[tokio::test]
 async fn test_service_create_defaults_session_affinity_none() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
