@@ -15,6 +15,7 @@ pub mod raft_transport;
 pub mod runtime;
 pub mod worker_identity;
 pub mod worker_runtime;
+pub mod worker_store_adapter;
 
 pub use node_mode::NodeMode;
 pub use node_role::NodeRole;
