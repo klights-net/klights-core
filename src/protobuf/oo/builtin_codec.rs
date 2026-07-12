@@ -76,6 +76,24 @@ impl ResourceProtoCodec for BuiltinResourceCodec {
         })?;
         (entry.encode)(api_version, value)
     }
+
+    fn encode_from_json_slice(
+        &self,
+        api_version: &str,
+        kind: &str,
+        data: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        let encode = raw_encode_fn(api_version, kind).ok_or_else(|| {
+            anyhow::anyhow!(
+                "BuiltinResourceCodec: raw JSON encoding unsupported for {api_version}/{kind}"
+            )
+        })?;
+        encode(api_version, data)
+    }
+
+    fn handles_raw_json_encoding(&self, api_version: &str, kind: &str) -> bool {
+        raw_encode_fn(api_version, kind).is_some()
+    }
 }
 
 fn api_version_matches(prefix: &str, api_version: &str) -> bool {
@@ -128,6 +146,26 @@ macro_rules! encode_openapi_result_fn {
         fn $fn_name(_api_version: &str, value: &Value) -> anyhow::Result<Vec<u8>> {
             let openapi = <$openapi_ty as Deserialize>::deserialize(value)?;
             let pb = $converter(&openapi)?;
+            encode_message_to_vec(&pb)
+        }
+    };
+}
+
+macro_rules! encode_openapi_result_raw_fn {
+    ($fn_name:ident, $openapi_ty:ty, $converter:path) => {
+        fn $fn_name(_api_version: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let openapi: $openapi_ty = serde_json::from_slice(data)?;
+            let pb = $converter(&openapi)?;
+            encode_message_to_vec(&pb)
+        }
+    };
+}
+
+macro_rules! encode_openapi_plain_raw_fn {
+    ($fn_name:ident, $openapi_ty:ty, $converter:path) => {
+        fn $fn_name(_api_version: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let openapi: $openapi_ty = serde_json::from_slice(data)?;
+            let pb = $converter(&openapi);
             encode_message_to_vec(&pb)
         }
     };
@@ -589,13 +627,28 @@ encode_openapi_result_fn!(
     k8s_openapi::api::core::v1::Namespace,
     json_namespace_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_namespace_raw,
+    k8s_openapi::api::core::v1::Namespace,
+    json_namespace_to_pb
+);
 encode_openapi_result_fn!(
     encode_configmap,
     k8s_openapi::api::core::v1::ConfigMap,
     json_configmap_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_configmap_raw,
+    k8s_openapi::api::core::v1::ConfigMap,
+    json_configmap_to_pb
+);
 encode_openapi_result_fn!(
     encode_secret,
+    k8s_openapi::api::core::v1::Secret,
+    json_secret_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_secret_raw,
     k8s_openapi::api::core::v1::Secret,
     json_secret_to_pb
 );
@@ -610,8 +663,18 @@ encode_openapi_result_fn!(
     k8s_openapi::api::core::v1::ServiceAccount,
     json_serviceaccount_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_serviceaccount_raw,
+    k8s_openapi::api::core::v1::ServiceAccount,
+    json_serviceaccount_to_pb
+);
 encode_openapi_result_fn!(
     encode_podtemplate,
+    k8s_openapi::api::core::v1::PodTemplate,
+    json_podtemplate_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_podtemplate_raw,
     k8s_openapi::api::core::v1::PodTemplate,
     json_podtemplate_to_pb
 );
@@ -621,8 +684,18 @@ encode_openapi_result_fn!(
     k8s_openapi::api::core::v1::Endpoints,
     json_endpoints_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_endpoints_raw,
+    k8s_openapi::api::core::v1::Endpoints,
+    json_endpoints_to_pb
+);
 encode_openapi_result_fn!(
     encode_persistentvolume,
+    k8s_openapi::api::core::v1::PersistentVolume,
+    json_persistentvolume_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_persistentvolume_raw,
     k8s_openapi::api::core::v1::PersistentVolume,
     json_persistentvolume_to_pb
 );
@@ -631,8 +704,18 @@ encode_openapi_result_fn!(
     k8s_openapi::api::core::v1::PersistentVolumeClaim,
     json_persistentvolumeclaim_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_persistentvolumeclaim_raw,
+    k8s_openapi::api::core::v1::PersistentVolumeClaim,
+    json_persistentvolumeclaim_to_pb
+);
 encode_openapi_result_fn!(
     encode_node,
+    k8s_openapi::api::core::v1::Node,
+    json_node_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_node_raw,
     k8s_openapi::api::core::v1::Node,
     json_node_to_pb
 );
@@ -641,8 +724,18 @@ encode_openapi_result_fn!(
     k8s_openapi::api::apps::v1::Deployment,
     json_deployment_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_deployment_raw,
+    k8s_openapi::api::apps::v1::Deployment,
+    json_deployment_to_pb
+);
 encode_openapi_result_fn!(
     encode_replicaset,
+    k8s_openapi::api::apps::v1::ReplicaSet,
+    json_replicaset_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_replicaset_raw,
     k8s_openapi::api::apps::v1::ReplicaSet,
     json_replicaset_to_pb
 );
@@ -651,14 +744,34 @@ encode_openapi_result_fn!(
     k8s_openapi::api::apps::v1::StatefulSet,
     json_statefulset_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_statefulset_raw,
+    k8s_openapi::api::apps::v1::StatefulSet,
+    json_statefulset_to_pb
+);
 encode_openapi_result_fn!(
     encode_daemonset,
     k8s_openapi::api::apps::v1::DaemonSet,
     json_daemonset_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_daemonset_raw,
+    k8s_openapi::api::apps::v1::DaemonSet,
+    json_daemonset_to_pb
+);
 encode_openapi_result_fn!(encode_job, k8s_openapi::api::batch::v1::Job, json_job_to_pb);
+encode_openapi_result_raw_fn!(
+    encode_job_raw,
+    k8s_openapi::api::batch::v1::Job,
+    json_job_to_pb
+);
 encode_openapi_result_fn!(
     encode_apiservice,
+    k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService,
+    json_apiservice_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_apiservice_raw,
     k8s_openapi::kube_aggregator::pkg::apis::apiregistration::v1::APIService,
     json_apiservice_to_pb
 );
@@ -674,8 +787,18 @@ encode_openapi_result_fn!(
     k8s_openapi::api::coordination::v1::Lease,
     json_lease_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_lease_raw,
+    k8s_openapi::api::coordination::v1::Lease,
+    json_lease_to_pb
+);
 encode_openapi_result_fn!(
     encode_resourcequota,
+    k8s_openapi::api::core::v1::ResourceQuota,
+    json_resourcequota_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_resourcequota_raw,
     k8s_openapi::api::core::v1::ResourceQuota,
     json_resourcequota_to_pb
 );
@@ -684,8 +807,18 @@ encode_openapi_result_fn!(
     k8s_openapi::api::core::v1::LimitRange,
     json_limitrange_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_limitrange_raw,
+    k8s_openapi::api::core::v1::LimitRange,
+    json_limitrange_to_pb
+);
 encode_openapi_plain_fn!(
     encode_pdb,
+    k8s_openapi::api::policy::v1::PodDisruptionBudget,
+    json_pdb_to_pb
+);
+encode_openapi_plain_raw_fn!(
+    encode_pdb_raw,
     k8s_openapi::api::policy::v1::PodDisruptionBudget,
     json_pdb_to_pb
 );
@@ -694,8 +827,18 @@ encode_openapi_plain_fn!(
     k8s_openapi::api::batch::v1::CronJob,
     json_cronjob_to_pb
 );
+encode_openapi_plain_raw_fn!(
+    encode_cronjob_raw,
+    k8s_openapi::api::batch::v1::CronJob,
+    json_cronjob_to_pb
+);
 encode_openapi_plain_fn!(
     encode_priorityclass,
+    k8s_openapi::api::scheduling::v1::PriorityClass,
+    json_priorityclass_to_pb
+);
+encode_openapi_plain_raw_fn!(
+    encode_priorityclass_raw,
     k8s_openapi::api::scheduling::v1::PriorityClass,
     json_priorityclass_to_pb
 );
@@ -704,8 +847,18 @@ encode_openapi_plain_fn!(
     k8s_openapi::api::storage::v1::VolumeAttachment,
     json_volumeattachment_to_pb
 );
+encode_openapi_plain_raw_fn!(
+    encode_volumeattachment_raw,
+    k8s_openapi::api::storage::v1::VolumeAttachment,
+    json_volumeattachment_to_pb
+);
 encode_openapi_plain_fn!(
     encode_storageclass,
+    k8s_openapi::api::storage::v1::StorageClass,
+    json_storageclass_to_pb
+);
+encode_openapi_plain_raw_fn!(
+    encode_storageclass_raw,
     k8s_openapi::api::storage::v1::StorageClass,
     json_storageclass_to_pb
 );
@@ -714,8 +867,18 @@ encode_openapi_plain_fn!(
     k8s_openapi::api::storage::v1::CSIStorageCapacity,
     json_csistoragecapacity_to_pb
 );
+encode_openapi_plain_raw_fn!(
+    encode_csistoragecapacity_raw,
+    k8s_openapi::api::storage::v1::CSIStorageCapacity,
+    json_csistoragecapacity_to_pb
+);
 encode_openapi_plain_fn!(
     encode_csinode,
+    k8s_openapi::api::storage::v1::CSINode,
+    json_csinode_to_pb
+);
+encode_openapi_plain_raw_fn!(
+    encode_csinode_raw,
     k8s_openapi::api::storage::v1::CSINode,
     json_csinode_to_pb
 );
@@ -724,8 +887,18 @@ encode_openapi_plain_fn!(
     k8s_openapi::api::storage::v1::CSIDriver,
     json_csidriver_to_pb
 );
+encode_openapi_plain_raw_fn!(
+    encode_csidriver_raw,
+    k8s_openapi::api::storage::v1::CSIDriver,
+    json_csidriver_to_pb
+);
 encode_openapi_plain_fn!(
     encode_replicationcontroller,
+    k8s_openapi::api::core::v1::ReplicationController,
+    json_replicationcontroller_to_pb
+);
+encode_openapi_plain_raw_fn!(
+    encode_replicationcontroller_raw,
     k8s_openapi::api::core::v1::ReplicationController,
     json_replicationcontroller_to_pb
 );
@@ -738,9 +911,19 @@ encode_openapi_plain_fn!(
     k8s_openapi::api::node::v1::RuntimeClass,
     json_runtimeclass_to_pb
 );
+encode_openapi_plain_raw_fn!(
+    encode_runtimeclass_raw,
+    k8s_openapi::api::node::v1::RuntimeClass,
+    json_runtimeclass_to_pb
+);
 encode_value_plain_fn!(encode_scale, json_scale_to_pb);
 encode_openapi_plain_fn!(
     encode_endpointslice,
+    k8s_openapi::api::discovery::v1::EndpointSlice,
+    json_endpointslice_to_pb
+);
+encode_openapi_plain_raw_fn!(
+    encode_endpointslice_raw,
     k8s_openapi::api::discovery::v1::EndpointSlice,
     json_endpointslice_to_pb
 );
@@ -786,8 +969,18 @@ encode_openapi_result_fn!(
     k8s_openapi::api::networking::v1::Ingress,
     json_ingress_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_ingress_raw,
+    k8s_openapi::api::networking::v1::Ingress,
+    json_ingress_to_pb
+);
 encode_openapi_result_fn!(
     encode_ingressclass,
+    k8s_openapi::api::networking::v1::IngressClass,
+    json_ingressclass_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_ingressclass_raw,
     k8s_openapi::api::networking::v1::IngressClass,
     json_ingressclass_to_pb
 );
@@ -795,6 +988,11 @@ encode_value_result_fn!(encode_ingresslist, json_ingresslist_to_pb);
 encode_value_result_fn!(encode_ingressclasslist, json_ingressclasslist_to_pb);
 encode_openapi_result_fn!(
     encode_networkpolicy,
+    k8s_openapi::api::networking::v1::NetworkPolicy,
+    json_networkpolicy_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_networkpolicy_raw,
     k8s_openapi::api::networking::v1::NetworkPolicy,
     json_networkpolicy_to_pb
 );
@@ -807,8 +1005,18 @@ encode_openapi_result_fn!(
     k8s_openapi::api::admissionregistration::v1::ValidatingAdmissionPolicy,
     json_validating_admission_policy_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_validatingadmissionpolicy_raw,
+    k8s_openapi::api::admissionregistration::v1::ValidatingAdmissionPolicy,
+    json_validating_admission_policy_to_pb
+);
 encode_openapi_result_fn!(
     encode_validatingadmissionpolicybinding,
+    k8s_openapi::api::admissionregistration::v1::ValidatingAdmissionPolicyBinding,
+    json_validating_admission_policy_binding_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_validatingadmissionpolicybinding_raw,
     k8s_openapi::api::admissionregistration::v1::ValidatingAdmissionPolicyBinding,
     json_validating_admission_policy_binding_to_pb
 );
@@ -825,8 +1033,18 @@ encode_openapi_result_fn!(
     k8s_openapi::api::admissionregistration::v1::MutatingWebhookConfiguration,
     json_mutating_webhook_configuration_to_pb
 );
+encode_openapi_result_raw_fn!(
+    encode_mutatingwebhookconfiguration_raw,
+    k8s_openapi::api::admissionregistration::v1::MutatingWebhookConfiguration,
+    json_mutating_webhook_configuration_to_pb
+);
 encode_openapi_result_fn!(
     encode_validatingwebhookconfiguration,
+    k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration,
+    json_validating_webhook_configuration_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_validatingwebhookconfiguration_raw,
     k8s_openapi::api::admissionregistration::v1::ValidatingWebhookConfiguration,
     json_validating_webhook_configuration_to_pb
 );
@@ -862,6 +1080,59 @@ fn encode_eventlist(api_version: &str, value: &Value) -> anyhow::Result<Vec<u8>>
     } else {
         let pb = json_eventlist_to_pb(value)?;
         encode_message_to_vec(&pb)
+    }
+}
+
+type RawEncodeFn = fn(&str, &[u8]) -> anyhow::Result<Vec<u8>>;
+
+fn raw_encode_fn(api_version: &str, kind: &str) -> Option<RawEncodeFn> {
+    let prefix = OoCodecRegistry::api_group_prefix(api_version);
+    match (prefix, kind) {
+        ("", "Namespace") => Some(encode_namespace_raw),
+        ("", "ConfigMap") => Some(encode_configmap_raw),
+        ("", "Secret") => Some(encode_secret_raw),
+        ("", "ServiceAccount") => Some(encode_serviceaccount_raw),
+        ("", "Endpoints") => Some(encode_endpoints_raw),
+        ("", "PersistentVolume") => Some(encode_persistentvolume_raw),
+        ("", "PersistentVolumeClaim") => Some(encode_persistentvolumeclaim_raw),
+        ("", "Node") => Some(encode_node_raw),
+        ("", "PodTemplate") => Some(encode_podtemplate_raw),
+        ("", "ReplicationController") => Some(encode_replicationcontroller_raw),
+        ("", "ResourceQuota") => Some(encode_resourcequota_raw),
+        ("", "LimitRange") => Some(encode_limitrange_raw),
+        ("apps", "Deployment") => Some(encode_deployment_raw),
+        ("apps", "ReplicaSet") => Some(encode_replicaset_raw),
+        ("apps", "StatefulSet") => Some(encode_statefulset_raw),
+        ("apps", "DaemonSet") => Some(encode_daemonset_raw),
+        ("batch", "Job") => Some(encode_job_raw),
+        ("batch", "CronJob") => Some(encode_cronjob_raw),
+        ("apiregistration.k8s.io", "APIService") => Some(encode_apiservice_raw),
+        ("coordination.k8s.io", "Lease") => Some(encode_lease_raw),
+        ("policy", "PodDisruptionBudget") => Some(encode_pdb_raw),
+        ("scheduling.k8s.io", "PriorityClass") => Some(encode_priorityclass_raw),
+        ("storage.k8s.io", "VolumeAttachment") => Some(encode_volumeattachment_raw),
+        ("storage.k8s.io", "StorageClass") => Some(encode_storageclass_raw),
+        ("storage.k8s.io", "CSIStorageCapacity") => Some(encode_csistoragecapacity_raw),
+        ("storage.k8s.io", "CSINode") => Some(encode_csinode_raw),
+        ("storage.k8s.io", "CSIDriver") => Some(encode_csidriver_raw),
+        ("node.k8s.io", "RuntimeClass") => Some(encode_runtimeclass_raw),
+        ("discovery.k8s.io", "EndpointSlice") => Some(encode_endpointslice_raw),
+        ("networking.k8s.io", "Ingress") => Some(encode_ingress_raw),
+        ("networking.k8s.io", "IngressClass") => Some(encode_ingressclass_raw),
+        ("networking.k8s.io", "NetworkPolicy") => Some(encode_networkpolicy_raw),
+        ("admissionregistration.k8s.io", "ValidatingAdmissionPolicy") => {
+            Some(encode_validatingadmissionpolicy_raw)
+        }
+        ("admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding") => {
+            Some(encode_validatingadmissionpolicybinding_raw)
+        }
+        ("admissionregistration.k8s.io", "MutatingWebhookConfiguration") => {
+            Some(encode_mutatingwebhookconfiguration_raw)
+        }
+        ("admissionregistration.k8s.io", "ValidatingWebhookConfiguration") => {
+            Some(encode_validatingwebhookconfiguration_raw)
+        }
+        _ => None,
     }
 }
 

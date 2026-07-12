@@ -111,6 +111,7 @@ struct CustomResourceName<'a> {
 struct CustomResourceListRequest<'a> {
     scope: CustomResourceScope<'a>,
     query: &'a ListQuery,
+    headers: &'a HeaderMap,
 }
 
 struct CustomResourceCollectionDeleteRequest<'a> {
@@ -662,7 +663,11 @@ async fn list_cr_inner(
     state: &Arc<AppState>,
     request: CustomResourceListRequest<'_>,
 ) -> Result<Response, AppError> {
-    let CustomResourceListRequest { scope, query } = request;
+    let CustomResourceListRequest {
+        scope,
+        query,
+        headers,
+    } = request;
     let CustomResourceScope {
         resource_type,
         namespace: ns,
@@ -712,6 +717,8 @@ async fn list_cr_inner(
         let (signal_rx, replay_start_position) =
             subscribe_watch_handoff(&db, watch_topics.clone(), requested_rv).await?;
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
+        let stream_format =
+            crate::api::watch_stream::negotiate_watch_stream_format(headers, false)?;
         let task_supervisor = state.task_supervisor.clone();
         let label_selector = query.label_selector.clone();
         let field_selector = query.field_selector.clone();
@@ -1193,7 +1200,7 @@ async fn list_cr_inner(
 
         let body = Body::from_stream(stream);
         return Ok(Response::builder()
-            .header("Content-Type", "application/json")
+            .header("Content-Type", stream_format.content_type())
             .header("Transfer-Encoding", "chunked")
             .body(body)
             .unwrap());
@@ -1425,6 +1432,7 @@ pub async fn list_custom_resources(
         CustomResourceListRequest {
             scope: resource_type.scoped(ns, false),
             query: &query,
+            headers: &headers,
         },
     )
     .await
@@ -2669,6 +2677,7 @@ pub async fn list_cluster_custom_resources(
         CustomResourceListRequest {
             scope: resource_type.scoped(None, true),
             query: &query,
+            headers: &headers,
         },
     )
     .await

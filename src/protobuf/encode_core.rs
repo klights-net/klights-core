@@ -16,7 +16,7 @@ where
 /// Encode JSON resource to protobuf bytes for a specific kind.
 /// Converts JSON → k8s-openapi type → k8s-pb type → protobuf bytes.
 /// Returns protobuf-encoded bytes (NOT wrapped in Unknown envelope).
-pub fn encode_protobuf_resource(kind: &str, value: &Value) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn encode_protobuf_resource(kind: &str, value: &Value) -> anyhow::Result<Vec<u8>> {
     let api_version = value
         .get("apiVersion")
         .and_then(|v| v.as_str())
@@ -26,6 +26,46 @@ pub fn encode_protobuf_resource(kind: &str, value: &Value) -> anyhow::Result<Vec
         anyhow::bail!("Unknown kind for protobuf encoding: {api_version}/{kind}");
     }
     registry.encode(api_version, kind, value)
+}
+
+pub(crate) fn supports_protobuf_resource(api_version: &str, kind: &str) -> bool {
+    global_oo_registry().handles(api_version, kind)
+}
+
+pub(crate) fn supports_raw_json_protobuf_resource(api_version: &str, kind: &str) -> bool {
+    global_oo_registry().handles_raw_json_encoding(api_version, kind)
+}
+
+pub(crate) fn encode_protobuf_resource_from_json_bytes(
+    api_version: &str,
+    kind: &str,
+    data: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    global_oo_registry().encode_json_slice(api_version, kind, data)
+}
+
+pub(crate) fn wrap_protobuf_resource_envelope(
+    api_version: &str,
+    kind: &str,
+    raw: Vec<u8>,
+) -> anyhow::Result<Vec<u8>> {
+    use prost::Message;
+
+    let unknown = Unknown {
+        type_meta: Some(TypeMeta {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+        }),
+        raw,
+        content_encoding: String::new(),
+        content_type: String::new(),
+    };
+
+    let body_len = unknown.encoded_len();
+    let mut buf = Vec::with_capacity(4 + body_len);
+    buf.extend_from_slice(&[0x6b, 0x38, 0x73, 0x00]);
+    unknown.encode(&mut buf)?;
+    Ok(buf)
 }
 
 pub fn normalize_event_microtime_fields(value: &mut Value) {
@@ -38,8 +78,6 @@ pub fn normalize_event_microtime_fields(value: &mut Value) {
 /// All resource types (including lists) are wrapped in an Unknown envelope with the "k8s\0" magic
 /// prefix. This is the K8s protobuf wire format expected by the Go client for all response types.
 pub fn encode_protobuf(value: &Value) -> anyhow::Result<Vec<u8>> {
-    use prost::Message;
-
     // Extract apiVersion and kind from JSON
     let api_version = value
         .get("apiVersion")
@@ -64,35 +102,16 @@ pub fn encode_protobuf(value: &Value) -> anyhow::Result<Vec<u8>> {
         encode_protobuf_resource(&kind, value)
     }?;
 
-    // All resources (single and list) use Unknown envelope with k8s\0 magic prefix.
-    // The K8s Go client requires this format for ALL protobuf responses — it checks for
-    // the [107 56 115 0] ("k8s\0") prefix and rejects bare protobuf with
-    // "provided data does not appear to be a protobuf message".
-    let unknown = Unknown {
-        type_meta: Some(TypeMeta {
-            api_version: api_version.clone(),
-            kind: kind.clone(),
-        }),
-        raw: protobuf_bytes,
-        content_encoding: String::new(),
-        content_type: String::new(),
-    };
-
-    // K8s protobuf wire format: 4-byte magic prefix + Unknown envelope.
-    // F3-03: pre-size the buffer to (magic + encoded_len) so prost
-    // appends in place without growing the Vec. Helper isn't usable
-    // here because the prefix bytes must lead the buffer.
-    let body_len = unknown.encoded_len();
-    let mut buf = Vec::with_capacity(4 + body_len);
-    buf.extend_from_slice(&[0x6b, 0x38, 0x73, 0x00]); // "k8s\0"
-    unknown.encode(&mut buf)?;
-    Ok(buf)
+    // All resources (single, list, and watch RawExtension payloads) use the
+    // Unknown envelope with the k8s\0 magic prefix. The K8s Go client checks
+    // for this prefix before decoding typed protobuf resources.
+    wrap_protobuf_resource_envelope(&api_version, &kind, protobuf_bytes)
 }
 
 /// Encode a `metav1.Status` JSON Value into its protobuf wire bytes (the inner
 /// `raw` of the Unknown envelope). Used for error responses negotiated to
 /// `application/vnd.kubernetes.protobuf`.
-fn encode_status_protobuf(value: &Value) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn encode_status_protobuf(value: &Value) -> anyhow::Result<Vec<u8>> {
     use k8s_pb::apimachinery::pkg::apis::meta::v1 as metav1;
     use prost::Message;
 

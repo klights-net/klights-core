@@ -11,6 +11,10 @@ use crate::watch::{
 #[cfg(test)]
 use crate::watch::{event_key as watch_event_key, resource_key as resource_to_seen_key};
 use axum::body::Body;
+use axum::http::HeaderMap;
+use k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent as PbWatchEvent;
+use k8s_pb::apimachinery::pkg::runtime::RawExtension;
+use prost::Message;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +24,132 @@ use tokio::sync::{broadcast, mpsc};
 pub enum WatchCatchUpMode {
     NamespacedScoped,
     ClusterOnly,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WatchStreamFormat {
+    Json,
+    Protobuf,
+}
+
+impl WatchStreamFormat {
+    pub fn content_type(self) -> &'static str {
+        match self {
+            WatchStreamFormat::Json => "application/json",
+            WatchStreamFormat::Protobuf => "application/vnd.kubernetes.protobuf;stream=watch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptedWatchMedia {
+    Json,
+    Protobuf,
+    Any,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AcceptedWatchFormat {
+    media: AcceptedWatchMedia,
+    quality_millis: u16,
+    order: usize,
+}
+
+pub fn negotiate_watch_stream_format(
+    headers: &HeaderMap,
+    protobuf_supported: bool,
+) -> Result<WatchStreamFormat, AppError> {
+    let Some(accept) = headers.get("accept").and_then(|value| value.to_str().ok()) else {
+        return Ok(WatchStreamFormat::Json);
+    };
+    let mut accepted = Vec::new();
+    for (order, part) in accept.split(',').enumerate() {
+        let mut segments = part.split(';').map(str::trim);
+        let media = segments.next().unwrap_or_default().to_ascii_lowercase();
+        if media.is_empty() {
+            continue;
+        }
+        let mut quality_millis = 1000;
+        for parameter in segments {
+            if let Some(value) = parameter.strip_prefix("q=") {
+                quality_millis = parse_accept_quality_millis(value);
+            }
+        }
+        if quality_millis == 0 {
+            continue;
+        }
+        let media = match media.as_str() {
+            "application/json" => AcceptedWatchMedia::Json,
+            "application/vnd.kubernetes.protobuf" => AcceptedWatchMedia::Protobuf,
+            "*/*" | "application/*" => AcceptedWatchMedia::Any,
+            _ => AcceptedWatchMedia::Unsupported,
+        };
+        accepted.push(AcceptedWatchFormat {
+            media,
+            quality_millis,
+            order,
+        });
+    }
+    accepted.sort_by_key(|format| (std::cmp::Reverse(format.quality_millis), format.order));
+    for accepted in accepted {
+        match accepted.media {
+            AcceptedWatchMedia::Protobuf if protobuf_supported => {
+                return Ok(WatchStreamFormat::Protobuf);
+            }
+            AcceptedWatchMedia::Json => return Ok(WatchStreamFormat::Json),
+            AcceptedWatchMedia::Any => return Ok(WatchStreamFormat::Json),
+            AcceptedWatchMedia::Protobuf | AcceptedWatchMedia::Unsupported => {}
+        }
+    }
+    Err(AppError::NotAcceptable(
+        "no supported watch stream media type requested".to_string(),
+    ))
+}
+
+fn parse_accept_quality_millis(value: &str) -> u16 {
+    let value = value.trim();
+    if value == "1" || value == "1.0" || value == "1.00" || value == "1.000" {
+        return 1000;
+    }
+    if value == "0" {
+        return 0;
+    }
+    let Some(fraction) = value.strip_prefix("0.") else {
+        return 0;
+    };
+    let mut millis = 0u16;
+    for (idx, byte) in fraction.bytes().take(3).enumerate() {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        let place = match idx {
+            0 => 100,
+            1 => 10,
+            _ => 1,
+        };
+        millis += u16::from(byte - b'0') * place;
+    }
+    millis
+}
+
+pub fn protobuf_watch_supported_for_request(
+    api_version: &str,
+    kind: &str,
+    table_format: bool,
+    label_selector: Option<&str>,
+    field_selector: Option<&str>,
+) -> bool {
+    if table_format {
+        return false;
+    }
+    let has_selector = label_selector.is_some_and(|selector| !selector.trim().is_empty())
+        || field_selector.is_some_and(|selector| !selector.trim().is_empty());
+    if has_selector {
+        crate::protobuf::supports_protobuf_resource(api_version, kind)
+    } else {
+        crate::protobuf::supports_raw_json_protobuf_resource(api_version, kind)
+    }
 }
 
 /// Upper bound on how long a watch/list blocks waiting for the serving
@@ -142,6 +272,74 @@ pub fn serialize_watch_event_line(event: WatchEvent, kind: &str, table_format: b
     json
 }
 
+pub fn serialize_watch_event_frame(event: &WatchEvent, kind: &str) -> anyhow::Result<Vec<u8>> {
+    let object_kind = event
+        .object
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or(kind);
+    let raw = if object_kind == "Status" {
+        let raw = crate::protobuf::encode_status_protobuf(&event.object)?;
+        crate::protobuf::wrap_protobuf_resource_envelope("v1", "Status", raw)?
+    } else {
+        let api_version = event
+            .object
+            .get("apiVersion")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let raw = crate::protobuf::encode_protobuf_resource(object_kind, &event.object)?;
+        crate::protobuf::wrap_protobuf_resource_envelope(api_version, object_kind, raw)?
+    };
+    let pb_event = PbWatchEvent {
+        r#type: Some(event.event_type.to_string()),
+        object: Some(RawExtension { raw: Some(raw) }),
+    };
+    let event_bytes = pb_event.encode_to_vec();
+    let mut frame = Vec::with_capacity(4 + event_bytes.len());
+    frame.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
+    frame.extend(event_bytes);
+    Ok(frame)
+}
+
+pub fn serialize_raw_watch_event_frame(event: &RawWatchEvent) -> anyhow::Result<Vec<u8>> {
+    let raw = crate::protobuf::encode_protobuf_resource_from_json_bytes(
+        &event.api_version,
+        &event.kind,
+        &event.object_json,
+    )?;
+    let raw =
+        crate::protobuf::wrap_protobuf_resource_envelope(&event.api_version, &event.kind, raw)?;
+    let pb_event = PbWatchEvent {
+        r#type: Some(event.event_type.to_string()),
+        object: Some(RawExtension { raw: Some(raw) }),
+    };
+    let event_bytes = pb_event.encode_to_vec();
+    let mut frame = Vec::with_capacity(4 + event_bytes.len());
+    frame.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
+    frame.extend(event_bytes);
+    Ok(frame)
+}
+
+pub fn serialize_watch_event_for_stream(
+    event: WatchEvent,
+    kind: &str,
+    table_format: bool,
+    stream_format: WatchStreamFormat,
+) -> Vec<u8> {
+    match stream_format {
+        WatchStreamFormat::Json => serialize_watch_event_line(event, kind, table_format),
+        WatchStreamFormat::Protobuf => match serialize_watch_event_frame(&event, kind) {
+            Ok(frame) => frame,
+            Err(err) => serialize_watch_status_for_stream(
+                stream_format,
+                500,
+                "InternalError",
+                &format!("failed to encode protobuf watch event: {err}"),
+            ),
+        },
+    }
+}
+
 pub fn serialize_raw_watch_event_line(event: &RawWatchEvent) -> Vec<u8> {
     let event_type = event.event_type.as_ref();
     let mut line = Vec::with_capacity(event_type.len() + event.object_json.len() + 23);
@@ -151,6 +349,24 @@ pub fn serialize_raw_watch_event_line(event: &RawWatchEvent) -> Vec<u8> {
     line.extend_from_slice(&event.object_json);
     line.extend_from_slice(b"}\n");
     line
+}
+
+pub fn serialize_raw_watch_event_for_stream(
+    event: &RawWatchEvent,
+    stream_format: WatchStreamFormat,
+) -> Vec<u8> {
+    match stream_format {
+        WatchStreamFormat::Json => serialize_raw_watch_event_line(event),
+        WatchStreamFormat::Protobuf => match serialize_raw_watch_event_frame(event) {
+            Ok(frame) => frame,
+            Err(err) => serialize_watch_status_for_stream(
+                stream_format,
+                500,
+                "InternalError",
+                &format!("failed to encode raw protobuf watch event: {err}"),
+            ),
+        },
+    }
 }
 
 /// Serialize a mid-stream watch failure as a proper `ERROR` watch event:
@@ -174,6 +390,32 @@ pub fn serialize_watch_status_line(code: u16, reason: &str, message: &str) -> Ve
     json
 }
 
+pub fn serialize_watch_status_for_stream(
+    stream_format: WatchStreamFormat,
+    code: u16,
+    reason: &str,
+    message: &str,
+) -> Vec<u8> {
+    match stream_format {
+        WatchStreamFormat::Json => serialize_watch_status_line(code, reason, message),
+        WatchStreamFormat::Protobuf => {
+            let event = WatchEvent::from_type(
+                "ERROR",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "metadata": {},
+                    "status": "Failure",
+                    "code": code,
+                    "reason": reason,
+                    "message": message,
+                }),
+            );
+            serialize_watch_event_frame(&event, "Status").unwrap_or_default()
+        }
+    }
+}
+
 /// Convert any live cursor failure into the watch protocol's terminal frame.
 /// A closed signal channel ends cleanly; replay failures and expired history
 /// require the client to reconnect rather than parking with an undelivered row.
@@ -185,6 +427,27 @@ pub(crate) fn serialize_live_watch_cursor_error(error: &WatchCursorError) -> Opt
             "failed to replay live watch events",
         )),
         WatchCursorError::Expired => Some(serialize_watch_status_line(
+            410,
+            "Expired",
+            "too old resource version: watch fell behind the history window",
+        )),
+        WatchCursorError::Closed => None,
+    }
+}
+
+pub(crate) fn serialize_live_watch_cursor_error_for_stream(
+    error: &WatchCursorError,
+    stream_format: WatchStreamFormat,
+) -> Option<Vec<u8>> {
+    match error {
+        WatchCursorError::Replay(_) => Some(serialize_watch_status_for_stream(
+            stream_format,
+            500,
+            "InternalError",
+            "failed to replay live watch events",
+        )),
+        WatchCursorError::Expired => Some(serialize_watch_status_for_stream(
+            stream_format,
             410,
             "Expired",
             "too old resource version: watch fell behind the history window",
@@ -489,6 +752,7 @@ pub struct LabelSelectorWatchStreamRequest<'a> {
     pub label_selector: Option<String>,
     pub field_selector: Option<String>,
     pub table_format: bool,
+    pub stream_format: WatchStreamFormat,
     pub catch_up_mode: WatchCatchUpMode,
     pub timeout_seconds: Option<u64>,
     pub emit_initial_state_for_resource_version_zero: bool,
@@ -539,6 +803,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         label_selector,
         field_selector,
         table_format,
+        stream_format,
         catch_up_mode,
         timeout_seconds,
         emit_initial_state_for_resource_version_zero,
@@ -557,7 +822,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         let parsed_label_selector = match parsed_label_selector.as_ref() {
             Ok(parsed) => parsed,
             Err(err) => {
-                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                    stream_format,
                     400,
                     "BadRequest",
                     err,
@@ -567,7 +833,11 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         };
         let has_label_selector = parsed_label_selector.is_some();
         let has_selector = has_label_selector || field_selector.is_some();
-        let use_raw_selectorless_json = !has_selector && !table_format;
+        let use_raw_selectorless_stream =
+            !has_selector
+                && !table_format
+                && (stream_format == WatchStreamFormat::Json
+                    || crate::protobuf::supports_raw_json_protobuf_resource(&api_version, &kind));
         let replay_target = match (catch_up_mode, watch_namespace.clone()) {
             (WatchCatchUpMode::NamespacedScoped, Some(ns)) => {
                 WatchTarget::namespaced_in_namespace(api_version.clone(), kind.clone(), ns)
@@ -645,7 +915,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         )
                         .await,
                     Ok(SnapshotAtRv::Expired) => {
-                        yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                        yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                            stream_format,
                             410,
                             "Expired",
                             "too old resource version: selector membership snapshot expired",
@@ -667,7 +938,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 Ok(baseline) => baseline,
                 Err(err) => {
                     tracing::warn!(error = %err, "watch selector baseline LIST failed");
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                        stream_format,
                         500,
                         "InternalError",
                         "failed to establish watch selector baseline",
@@ -684,10 +956,11 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 if requested_rv <= 0 {
                     let event = CatchUpResource::added(resource).into_watch_event();
                     session_bootstrap.record_baseline_event(&event);
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
+                    yield Ok::<_, std::convert::Infallible>(serialize_watch_event_for_stream(
                         event,
                         &kind,
                         table_format,
+                        stream_format,
                     ));
                 } else {
                     let event = CatchUpResource::added(resource).into_watch_event();
@@ -707,7 +980,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 Ok(list) => list,
                 Err(err) => {
                     tracing::warn!(error = %err, "WatchList snapshot LIST failed");
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                        stream_format,
                         500,
                         "InternalError",
                         "failed to establish WatchList snapshot",
@@ -723,10 +997,11 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 last_rv = last_rv.max(resource.resource_version);
                 let event = CatchUpResource::added(resource).into_watch_event();
                 session_bootstrap.record_baseline_event(&event);
-                yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
+                yield Ok::<_, std::convert::Infallible>(serialize_watch_event_for_stream(
                     event,
                     &kind,
                     table_format,
+                    stream_format,
                 ));
             }
                 // Anchor the initial-events-end bookmark (and the live-event
@@ -747,10 +1022,11 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
 
             let bookmark_event =
                 WatchEvent::bookmark_initial_events_end(last_rv, &api_version, &kind);
-            yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
+            yield Ok::<_, std::convert::Infallible>(serialize_watch_event_for_stream(
                 bookmark_event,
                 &kind,
                 table_format,
+                stream_format,
             ));
         }
 
@@ -762,7 +1038,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             (WatchCatchUpMode::NamespacedScoped, Some(ns)) => WatchDeliveryScope::Namespaced(ns),
             (WatchCatchUpMode::NamespacedScoped, None) => WatchDeliveryScope::NamespacedAll,
         };
-        if use_raw_selectorless_json {
+        if use_raw_selectorless_stream {
             let mut cursor = RawSignalWatchCursor::new_at_position(
                 signal_rx,
                 db.clone(),
@@ -775,7 +1051,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             match cursor.prime_replay_or_expired().await {
                     Ok(_) => {}
                     Err(WatchCursorError::Expired) => {
-                        yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                        yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                            stream_format,
                             410,
                             "Expired",
                             "too old resource version: requested resourceVersion is older than the watch history window",
@@ -784,7 +1061,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                     }
                     Err(err) => {
                         tracing::warn!("Initial raw watch replay failed for {}: {:#?}", kind, err);
-                        yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                        yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                            stream_format,
                             500,
                             "InternalError",
                             "failed to establish initial watch replay",
@@ -821,7 +1099,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                                     Some(ns) => tracing::warn!("Raw watch terminated for {}/{}: {:#?}", ns, kind, err),
                                     None => tracing::warn!("Raw watch terminated for {}: {:#?}", kind, err),
                                 }
-                                if let Some(line) = serialize_live_watch_cursor_error(&err) {
+                                if let Some(line) = serialize_live_watch_cursor_error_for_stream(&err, stream_format) {
                                     yield Ok::<_, std::convert::Infallible>(line);
                                 }
                                 break;
@@ -829,7 +1107,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         };
 
                         let rv = event.resource_version;
-                        yield Ok::<_, std::convert::Infallible>(serialize_raw_watch_event_line(&event));
+                        let line = serialize_raw_watch_event_for_stream(&event, stream_format);
+                        yield Ok::<_, std::convert::Infallible>(line);
                         cursor.accept_event(rv);
                         session_bootstrap.observe_delivered_rv(rv);
                     }
@@ -850,14 +1129,16 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         match decision {
                             PeriodicBookmarkDecision::Bookmark(rv) => {
                                 let event = WatchEvent::bookmark_typed(rv, &api_version, &kind);
-                                yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
+                                yield Ok::<_, std::convert::Infallible>(serialize_watch_event_for_stream(
                                     event,
                                     &kind,
                                     table_format,
+                                    stream_format,
                                 ));
                             }
                             PeriodicBookmarkDecision::Expired => {
-                                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                                    stream_format,
                                     410,
                                     "Expired",
                                     "too old resource version: exact-name watch scope is absent and the watch cursor advanced",
@@ -881,7 +1162,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 Err(WatchCursorError::Expired) => {
                     // Resume point predates the retained watch-event window;
                     // tell the client to relist (HTTP 410 Gone semantics).
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                        stream_format,
                         410,
                         "Expired",
                         "too old resource version: requested resourceVersion is older than the watch history window",
@@ -890,7 +1172,8 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                 }
                 Err(err) => {
                     tracing::warn!("Initial watch replay failed for {}: {:#?}", kind, err);
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                        stream_format,
                         500,
                         "InternalError",
                         "failed to establish initial watch replay",
@@ -927,7 +1210,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                                 Some(ns) => tracing::warn!("Watch terminated for {}/{}: {:#?}", ns, kind, err),
                                 None => tracing::warn!("Watch terminated for {}: {:#?}", kind, err),
                             }
-                            if let Some(line) = serialize_live_watch_cursor_error(&err) {
+                            if let Some(line) = serialize_live_watch_cursor_error_for_stream(&err, stream_format) {
                                 yield Ok::<_, std::convert::Infallible>(line);
                             }
                             break;
@@ -940,7 +1223,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         let source_rv = event.resource_version();
                         match session.classify_event(event, matches) {
                             WatchSessionEvent::Deliver(transitioned) => {
-                                let line = serialize_watch_event_line(transitioned, &kind, table_format);
+                                let line = serialize_watch_event_for_stream(transitioned, &kind, table_format, stream_format);
                                 yield Ok::<_, std::convert::Infallible>(line);
                                 if let Some(rv) = source_rv {
                                     session.accept_delivered_rv(rv);
@@ -952,7 +1235,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         match session.classify_event(event, matches) {
                             WatchSessionEvent::Deliver(event) => {
                                 let rv = event.resource_version();
-                                let line = serialize_watch_event_line(event, &kind, table_format);
+                                let line = serialize_watch_event_for_stream(event, &kind, table_format, stream_format);
                                 yield Ok::<_, std::convert::Infallible>(line);
                                 if let Some(rv) = rv {
                                     session.accept_delivered_rv(rv);
@@ -979,14 +1262,16 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                     match decision {
                         PeriodicBookmarkDecision::Bookmark(rv) => {
                             let event = WatchEvent::bookmark_typed(rv, &api_version, &kind);
-                            yield Ok::<_, std::convert::Infallible>(serialize_watch_event_line(
+                            yield Ok::<_, std::convert::Infallible>(serialize_watch_event_for_stream(
                                 event,
                                 &kind,
                                 table_format,
+                                stream_format,
                             ));
                         }
                         PeriodicBookmarkDecision::Expired => {
-                            yield Ok::<_, std::convert::Infallible>(serialize_watch_status_line(
+                            yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                                stream_format,
                                 410,
                                 "Expired",
                                 "too old resource version: exact-name watch scope is absent and the watch cursor advanced",
@@ -1007,7 +1292,9 @@ mod tests {
     use super::*;
     use crate::task_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
     use crate::watch::{SelectorMembership, WatchSignal};
+    use bytes::Bytes;
     use futures::StreamExt;
+    use prost::Message;
     use std::sync::Arc;
 
     fn apply_selector_transition_event(
@@ -1016,6 +1303,238 @@ mod tests {
         membership: &mut SelectorMembership,
     ) -> Option<WatchEvent> {
         membership.transition(event, matches_selector)
+    }
+
+    fn decode_length_prefixed_watch_events(
+        chunks: &[Vec<u8>],
+    ) -> Vec<k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent> {
+        let mut pending = Vec::new();
+        let mut events = Vec::new();
+
+        for chunk in chunks {
+            pending.extend_from_slice(chunk);
+            while pending.len() >= 4 {
+                let frame_len = u32::from_be_bytes(
+                    pending[0..4]
+                        .try_into()
+                        .expect("frame length prefix must be 4 bytes"),
+                ) as usize;
+                let frame_end = 4 + frame_len;
+                if pending.len() < frame_end {
+                    break;
+                }
+
+                let payload = &pending[4..frame_end];
+                events.push(
+                    k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(payload)
+                        .unwrap_or_else(|_| panic!("frame should decode as a protobuf WatchEvent")),
+                );
+                pending.drain(0..frame_end);
+            }
+        }
+
+        events
+    }
+
+    fn decode_watch_object_envelope(
+        event: k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent,
+    ) -> crate::protobuf::Unknown {
+        let raw = event
+            .object
+            .and_then(|object| object.raw)
+            .expect("protobuf WatchEvent must carry RawExtension bytes");
+        assert_eq!(&raw[..4], b"k8s\0");
+        crate::protobuf::Unknown::decode(&raw[4..]).unwrap()
+    }
+
+    #[test]
+    fn watch_stream_negotiation_respects_q_value_ordering_and_ties() {
+        let mut headers = HeaderMap::new();
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;q=0.8, application/json;q=0.8, */*;q=0.8"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Protobuf,
+        );
+
+        headers.insert(
+            "accept",
+            "application/json;q=0.8, application/vnd.kubernetes.protobuf;q=0.8"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Json,
+        );
+
+        headers.insert(
+            "accept",
+            "application/*;q=0.9, application/json;q=0.9, application/vnd.kubernetes.protobuf;q=0.9"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Json,
+        );
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;q=0.2, application/json;q=0.8"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Json,
+        );
+    }
+
+    #[test]
+    fn serialize_watch_bookmark_event_is_length_prefixed_protobuf() {
+        let frame = serialize_watch_event_for_stream(
+            WatchEvent::bookmark_initial_events_end(99, "v1", "ConfigMap"),
+            "ConfigMap",
+            false,
+            WatchStreamFormat::Protobuf,
+        );
+        assert!(frame.len() > 4);
+        assert_eq!(
+            frame.len() as u64 - 4,
+            u32::from_be_bytes(frame[0..4].try_into().expect("frame length prefix")) as u64,
+        );
+
+        let event =
+            k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(&frame[4..]).unwrap();
+        assert_eq!(event.r#type.as_deref(), Some("BOOKMARK"));
+
+        let envelope = decode_watch_object_envelope(event);
+        assert_eq!(
+            envelope
+                .type_meta
+                .as_ref()
+                .map(|type_meta| (type_meta.api_version.as_str(), type_meta.kind.as_str())),
+            Some(("v1", "ConfigMap"))
+        );
+        let decoded = k8s_pb::api::core::v1::ConfigMap::decode(envelope.raw.as_slice()).unwrap();
+        assert_eq!(
+            decoded
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.annotations.get("k8s.io/initial-events-end")),
+            Some(&"true".to_string()),
+        );
+    }
+
+    #[test]
+    fn serialize_watch_status_is_length_prefixed_error_protobuf() {
+        let frame = serialize_watch_status_for_stream(
+            WatchStreamFormat::Protobuf,
+            410,
+            "Expired",
+            "too old resource version",
+        );
+        assert!(frame.len() > 4);
+        assert_eq!(
+            frame.len() as u64 - 4,
+            u32::from_be_bytes(frame[0..4].try_into().expect("frame length prefix")) as u64,
+        );
+
+        let event =
+            k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(&frame[4..]).unwrap();
+        assert_eq!(event.r#type.as_deref(), Some("ERROR"));
+
+        let envelope = decode_watch_object_envelope(event);
+        assert_eq!(
+            envelope
+                .type_meta
+                .as_ref()
+                .map(|type_meta| (type_meta.api_version.as_str(), type_meta.kind.as_str())),
+            Some(("v1", "Status"))
+        );
+        let decoded =
+            k8s_pb::apimachinery::pkg::apis::meta::v1::Status::decode(envelope.raw.as_slice())
+                .unwrap();
+        assert_eq!(decoded.code, Some(410));
+        assert_eq!(decoded.reason, Some("Expired".to_string()));
+    }
+
+    #[test]
+    fn raw_selectorless_protobuf_frame_encodes_enveloped_object() {
+        let row = RawWatchEvent {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "cm1".to_string(),
+            resource_version: 7,
+            event_type: std::borrow::Cow::Borrowed("ADDED"),
+            object_json: Bytes::from_static(
+                br#"{
+                    "apiVersion":"v1",
+                    "kind":"ConfigMap",
+                    "metadata":{
+                        "namespace":"default",
+                        "name":"cm1",
+                        "resourceVersion":"7"
+                    },
+                    "data":{"k":"v"}
+                }"#,
+            ),
+        };
+
+        let frame = serialize_raw_watch_event_for_stream(&row, WatchStreamFormat::Protobuf);
+        assert_ne!(frame.first(), Some(&b'{'));
+        let events = decode_length_prefixed_watch_events(&[frame]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].r#type.as_deref(), Some("ADDED"));
+        let envelope = decode_watch_object_envelope(events.into_iter().next().unwrap());
+        assert_eq!(
+            envelope
+                .type_meta
+                .as_ref()
+                .map(|type_meta| (type_meta.api_version.as_str(), type_meta.kind.as_str())),
+            Some(("v1", "ConfigMap"))
+        );
+        let decoded = k8s_pb::api::core::v1::ConfigMap::decode(envelope.raw.as_slice()).unwrap();
+        assert_eq!(
+            decoded.metadata.and_then(|metadata| metadata.name),
+            Some("cm1".to_string())
+        );
+    }
+
+    #[test]
+    fn decode_length_prefixed_watch_frames_is_boundary_agnostic() {
+        let added = serialize_watch_event_for_stream(
+            WatchEvent::from_type(
+                "ADDED",
+                serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"cm","namespace":"default","resourceVersion":"1"}}),
+            ),
+            "ConfigMap",
+            false,
+            WatchStreamFormat::Protobuf,
+        );
+        let bookmark = serialize_watch_event_for_stream(
+            WatchEvent::bookmark_typed(2, "v1", "ConfigMap"),
+            "ConfigMap",
+            false,
+            WatchStreamFormat::Protobuf,
+        );
+        let all = [added.as_slice(), bookmark.as_slice()].concat();
+        let frames = decode_length_prefixed_watch_events(&[
+            all[0..3].to_vec(),
+            all[3..all.len() - 5].to_vec(),
+            all[all.len() - 5..].to_vec(),
+        ]);
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].r#type.as_deref(), Some("ADDED"));
+        assert_eq!(frames[1].r#type.as_deref(), Some("BOOKMARK"));
     }
 
     #[test]
@@ -1029,6 +1548,82 @@ mod tests {
         assert_eq!(value["object"]["code"], 410);
         assert_eq!(value["object"]["reason"], "Expired");
         assert_eq!(value["object"]["status"], "Failure");
+    }
+
+    #[test]
+    fn watch_stream_negotiation_honors_q_values_and_json_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;q=0.4, application/json;q=0.8"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Json
+        );
+
+        headers.insert(
+            "accept",
+            "application/json;q=0.2, application/vnd.kubernetes.protobuf;q=0.9"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Protobuf
+        );
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf, application/json"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, false).unwrap(),
+            WatchStreamFormat::Json
+        );
+    }
+
+    #[test]
+    fn watch_stream_negotiation_rejects_when_no_supported_media_remains() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf".parse().unwrap(),
+        );
+        assert!(matches!(
+            negotiate_watch_stream_format(&headers, false),
+            Err(AppError::NotAcceptable(_))
+        ));
+
+        headers.insert("accept", "application/xml".parse().unwrap());
+        assert!(matches!(
+            negotiate_watch_stream_format(&headers, true),
+            Err(AppError::NotAcceptable(_))
+        ));
+    }
+
+    #[test]
+    fn protobuf_watch_support_uses_raw_codec_for_selectorless_requests() {
+        assert!(
+            protobuf_watch_supported_for_request("v1", "ConfigMap", false, None, None),
+            "selectorless ConfigMap protobuf watches can use the raw replay encoder"
+        );
+        assert!(
+            !protobuf_watch_supported_for_request("v1", "Pod", false, None, None),
+            "selectorless Pod protobuf watches must not fall back to parsed replay without a raw codec"
+        );
+        assert!(
+            protobuf_watch_supported_for_request("v1", "Pod", false, Some("app=guestbook"), None),
+            "selector Pod protobuf watches already need parsed selector inspection"
+        );
+        assert!(
+            !protobuf_watch_supported_for_request("v1", "ConfigMap", true, None, None),
+            "Table watch output remains JSON"
+        );
     }
 
     #[tokio::test]
@@ -1061,6 +1656,7 @@ mod tests {
                 label_selector: None,
                 field_selector: None,
                 table_format,
+                stream_format: WatchStreamFormat::Json,
                 catch_up_mode: WatchCatchUpMode::NamespacedScoped,
                 timeout_seconds: None,
                 emit_initial_state_for_resource_version_zero: false,
@@ -1117,6 +1713,7 @@ mod tests {
                 label_selector: None,
                 field_selector: None,
                 table_format,
+                stream_format: WatchStreamFormat::Json,
                 catch_up_mode: WatchCatchUpMode::NamespacedScoped,
                 timeout_seconds: None,
                 emit_initial_state_for_resource_version_zero: false,
