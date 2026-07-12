@@ -1,4 +1,5 @@
 use super::*;
+use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::kubelet::pod_sandbox_config::build_sandbox_config_with_dns_policy;
 
 #[test]
@@ -109,7 +110,7 @@ async fn pod_watcher_filtered_pod_event_does_not_advance_signal_cursor() {
 }
 
 #[tokio::test]
-async fn app_state_pod_watcher_disables_cluster_reconciliation_on_raft_follower() {
+async fn pod_watcher_runtime_context_disables_cluster_reconciliation_on_follower_path() {
     let mut state = crate::api::test_support::build_test_app_state().await;
     let (_lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(1);
     state.pod_lifecycle_rx = Some(std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -129,7 +130,31 @@ async fn app_state_pod_watcher_disables_cluster_reconciliation_on_raft_follower(
         crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
     ));
 
-    let context = PodWatcherRuntimeContext::from_app_state(&state);
+    let context = PodWatcherRuntimeContext {
+        pod_watch_source: std::sync::Arc::new(
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(state.db.clone()),
+        ),
+        cluster_api: state.cluster_api.clone(),
+        node_local: None,
+        config: state.config.clone(),
+        task_supervisor: state.task_supervisor.clone(),
+        pod_repository: state.pod_repository.clone(),
+        pod_lifecycle_router: state
+            .pod_lifecycle_router
+            .clone()
+            .expect("test router configured"),
+        persistent_volume_event_handler: std::sync::Arc::new(
+            crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
+                state.db.clone(),
+            ),
+        ),
+        cluster_reconciliation_enabled: false,
+        pod_lifecycle_rx: state
+            .pod_lifecycle_rx
+            .clone()
+            .expect("test lifecycle receiver configured"),
+        pod_start_retry_state: state.pod_start_retry_state.clone(),
+    };
 
     assert!(
         !context.cluster_reconciliation_enabled,

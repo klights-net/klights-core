@@ -40,6 +40,7 @@ pub mod pod_subsystem;
 pub mod pod_termination;
 pub mod pod_volume_manager;
 pub mod pod_watch_handlers;
+pub mod pod_watch_source;
 pub mod probe_manager;
 pub mod probes;
 pub mod projected_sa_token_refresh;
@@ -52,7 +53,6 @@ pub mod volumes;
 pub use containerd_manager::ContainerdManager;
 pub use cri::CriClient;
 pub use node::register_node;
-pub use pod_manager::run_pod_watcher;
 pub use probe_manager::ProbeManager;
 
 pub mod pod_lifecycle_actor;

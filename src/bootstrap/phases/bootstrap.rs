@@ -294,19 +294,27 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             cni_readiness.clone(),
         )
     });
-    let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
-        crate::kubelet::pod_subsystem::PodSubsystemConfig {
+    let pod_repository_parts = crate::kubelet::pod_repository::PodRepository::build_parts(
+        crate::kubelet::pod_repository::PodRepositoryBuildConfig {
             db: kubelet_db_handle.clone(),
             supervisor: supervisor.clone(),
             side_effects: side_effects.clone(),
             metrics: metrics.clone(),
+            network_events: crate::networking::global_pod_network_events(),
             scheduling_mode,
+            outbox: Some(outbox_runtime.clone()),
+            cluster_api: Some(cluster_api.clone()),
+        },
+    );
+    let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
+        crate::kubelet::pod_subsystem::PodSubsystemConfig {
+            repository_parts: pod_repository_parts,
+            supervisor: supervisor.clone(),
             outbox: Some(outbox_runtime.clone()),
             cluster_api: Some(cluster_api.clone()),
             node_name: config.node_name.clone(),
             service_cidr: config.service_cidr.clone(),
             lifecycle_concurrency: crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
-            network_events: crate::networking::global_pod_network_events(),
             cri: cri_for_pod_watcher.clone().map(SharedCriClient::new),
             containerd_ns: config.containerd_namespace.clone(),
             lifecycle_tx: pod_lifecycle_tx,
@@ -315,6 +323,21 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             service_router: Some(services.clone()),
             runtime_node_role,
             runtime_service: None,
+            runtime_store: Arc::new(
+                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
+                    kubelet_db_handle.clone(),
+                ),
+            ),
+            slot_admission: Arc::new(
+                crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
+                    kubelet_db_handle.clone(),
+                    config.node_name.clone(),
+                ),
+            ),
+            event_sink: Arc::new(crate::kubelet::pod_runtime::events::RealPodEventSink::new(
+                Some(outbox_runtime.clone()),
+                kubelet_db_handle.clone(),
+            )),
         },
     )
     .context("pod subsystem construction")?;
@@ -451,10 +474,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         pod_repository: api_pod_repository.clone(),
         outbox: outbox_runtime.clone(),
         node_lease_tracker: node_lease_tracker.clone(),
-        pod_lifecycle_router: Some(pod_lifecycle_router),
+        pod_lifecycle_router: Some(pod_lifecycle_router.clone()),
         pod_probe_manager: pod_subsystem.probe_manager.clone(),
-        pod_lifecycle_rx: Some(pod_lifecycle_rx),
-        pod_start_retry_state: Some(pod_start_retry_state),
+        pod_lifecycle_rx: Some(pod_lifecycle_rx.clone()),
+        pod_start_retry_state: Some(pod_start_retry_state.clone()),
         is_raft_leader_rx: raft_leader_proxy,
         authorizer: std::sync::Arc::new(
             crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
@@ -477,6 +500,24 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         .controller_dispatcher
         .set_pod_repository(api_pod_repository.clone())
         .await;
+    let kubelet_context = Arc::new(crate::kubelet::context::KubeletContext {
+        cluster_api: cluster_api.clone(),
+        node_local: _node_local.clone(),
+        outbox: outbox_runtime.clone(),
+        task_supervisor: supervisor.clone(),
+        config: Arc::clone(config),
+        node_mode: node_mode.clone(),
+        role: cli.role.clone(),
+        network: network.clone(),
+        pod_repository: pod_repository.clone(),
+        pod_lifecycle_router: pod_lifecycle_router.clone(),
+        pod_probe_manager: pod_subsystem
+            .probe_manager
+            .clone()
+            .expect("PodSubsystem must construct ProbeManager"),
+        pod_lifecycle_rx: pod_lifecycle_rx.clone(),
+        pod_start_retry_state: pod_start_retry_state.clone(),
+    });
 
     let node_lifecycle_start_resource_version = if has_leader_election {
         db.get_current_resource_version().await.unwrap_or(0)
@@ -794,22 +835,17 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     // Spawn pod watcher
     let pod_watcher_handle = if let Some(runtime_ports) = pod_watcher_runtime_ports {
-        let state = Arc::new(api::AppState {
-            db: kubelet_db_handle.clone(),
-            pod_repository: pod_repository.clone(),
-            authorizer: std::sync::Arc::new(
-                crate::auth::authorizer::AuthorizerChain::default_chain_with_rbac(
-                    kubelet_db_handle.clone(),
-                    pod_repository.clone(),
-                ),
+        let ctx = kubelet_context.clone();
+        let watch_source = Arc::new(
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
+                kubelet_db_handle.clone(),
             ),
-            rbac_policy_store: std::sync::Arc::new(
-                crate::auth::rbac_policy_store::DatastoreRbacPolicyStore::new(
-                    kubelet_db_handle.clone(),
-                ),
+        );
+        let volume_events = Arc::new(
+            crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
+                kubelet_db_handle.clone(),
             ),
-            ..(*watcher_state).clone()
-        });
+        );
         let cancel = shutdown_token.clone();
         Some(
             supervisor
@@ -817,7 +853,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     crate::task_supervisor::TaskCategory::Background,
                     "runtime_pod_watcher",
                     async move {
-                        kubelet::run_pod_watcher(runtime_ports, state, cancel).await;
+                        kubelet::pod_manager::run_pod_watcher_with_context(
+                            runtime_ports,
+                            ctx,
+                            watch_source,
+                            volume_events,
+                            cancel,
+                        )
+                        .await;
                     },
                 )
                 .await

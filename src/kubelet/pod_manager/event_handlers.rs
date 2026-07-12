@@ -15,7 +15,7 @@ pub(super) async fn enqueue_job_reconcile_for_terminal_watch_pod(
 }
 
 pub(super) struct WatchEventHandlerContext<'a> {
-    pub db: &'a dyn DatastoreBackend,
+    pub persistent_volume_event_handler: &'a Arc<dyn PersistentVolumeEventHandler>,
     pub cluster_api: &'a Arc<dyn crate::control_plane::client::LeaderApiClient>,
     pub node_name: &'a str,
     pub containerd_namespace: &'a str,
@@ -31,7 +31,7 @@ pub(super) struct WatchEventHandlerContext<'a> {
 
 pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, event: WatchEvent) {
     let WatchEventHandlerContext {
-        db,
+        persistent_volume_event_handler,
         cluster_api,
         node_name,
         containerd_namespace,
@@ -57,12 +57,16 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
 
     // Dispatch to appropriate handler
     if event_kind == "PersistentVolumeClaim" {
-        handle_pvc_event(db, &event, event_name, cluster_reconciliation_enabled).await;
+        persistent_volume_event_handler
+            .handle_pvc_event(&event, event_name, cluster_reconciliation_enabled)
+            .await;
         return;
     }
 
     if event_kind == "PersistentVolume" {
-        handle_pv_event(db, &event, event_name, cluster_reconciliation_enabled).await;
+        persistent_volume_event_handler
+            .handle_pv_event(&event, event_name, cluster_reconciliation_enabled)
+            .await;
         return;
     }
 
@@ -896,9 +900,14 @@ mod tests {
         std::fs::create_dir_all(&volume_path).expect("create mounted configmap volume");
         std::fs::write(format!("{volume_path}/data-1"), "value-1").expect("seed mounted data");
 
+        let persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler> = Arc::new(
+            crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
+                db_handle.clone(),
+            ),
+        );
         handle_watch_event(
             WatchEventHandlerContext {
-                db: db_handle.as_ref(),
+                persistent_volume_event_handler: &persistent_volume_event_handler,
                 cluster_api: &cluster_api,
                 node_name: "worker-a",
                 containerd_namespace: runtime_ns,

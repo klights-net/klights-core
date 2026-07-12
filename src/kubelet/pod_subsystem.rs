@@ -7,7 +7,6 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::control_plane::client::LeaderApiClient;
-use crate::datastore::DatastoreHandle;
 use crate::kubelet::ProbeManager;
 use crate::kubelet::pod_cluster_runtime::RuntimeNodeRole;
 use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
@@ -15,29 +14,25 @@ use crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::kubelet::pod_lifecycle_router::executor::{PodLifecycleExecutor, PodWorkExecutor};
 use crate::kubelet::pod_lifecycle_service::PodLifecycleService;
-use crate::kubelet::pod_repository::api::PodSchedulingMode;
+use crate::kubelet::pod_repository::PodRepository;
 use crate::kubelet::pod_repository::background::PodRepositoryBackground;
-use crate::kubelet::pod_repository::{PodRepository, PodRepositoryBuildConfig};
+use crate::kubelet::pod_repository::facade::PodRepositoryParts;
+use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::service::{
     PodRuntimeService, RealPodRuntimeService, RealPodRuntimeServiceDependencies,
 };
-use crate::networking::pod_network_events::PodNetworkEvents;
-use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
+use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use crate::task_supervisor::TaskSupervisor;
 
 /// Wiring inputs for PodSubsystem construction.
 pub struct PodSubsystemConfig {
-    pub db: DatastoreHandle,
+    pub repository_parts: PodRepositoryParts,
     pub supervisor: Arc<TaskSupervisor>,
-    pub side_effects: Arc<SideEffectRegistry>,
-    pub metrics: Arc<SideEffectMetrics>,
-    pub scheduling_mode: PodSchedulingMode,
     pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     pub cluster_api: Option<Arc<dyn LeaderApiClient>>,
     pub node_name: String,
     pub service_cidr: String,
     pub lifecycle_concurrency: PodLifecycleConcurrencyConfig,
-    pub network_events: PodNetworkEvents,
     // Task 19: runtime dependencies for RealPodRuntimeService construction (Task 24).
     pub cri: Option<crate::kubelet::cri::SharedCriClient>,
     pub containerd_ns: String,
@@ -47,13 +42,15 @@ pub struct PodSubsystemConfig {
     pub service_router: Option<Arc<dyn crate::networking::ServiceRouter>>,
     pub runtime_node_role: RuntimeNodeRole,
     pub runtime_service: Option<Arc<dyn PodRuntimeService>>,
+    pub runtime_store: Arc<dyn PodRuntimeStore>,
+    pub slot_admission: Arc<dyn PodSlotAdmission>,
+    pub event_sink: Arc<dyn PodEventSink>,
 }
 
 /// Composition root: owns the Pod repository, lifecycle router,
 /// background services, and runtime adapter dependencies (stored for
 /// Task 24 construction). Background work starts in explicit `start()`.
 pub struct PodSubsystem {
-    pub db: DatastoreHandle,
     pub supervisor: Arc<TaskSupervisor>,
     pub repository: Arc<PodRepository>,
     pub repository_background: PodRepositoryBackground,
@@ -70,11 +67,9 @@ pub struct PodSubsystem {
     pub runtime_node_role: RuntimeNodeRole,
     pub node_name: String,
     pub service_cidr: String,
-    pub outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
 }
 
 struct RuntimeServiceBuildRequest {
-    db: DatastoreHandle,
     supervisor: Arc<TaskSupervisor>,
     repository: Arc<PodRepository>,
     cri: Option<crate::kubelet::cri::SharedCriClient>,
@@ -82,22 +77,22 @@ struct RuntimeServiceBuildRequest {
     probe_manager: Arc<ProbeManager>,
     datapath: Option<Arc<dyn crate::networking::Datapath>>,
     service_router: Option<Arc<dyn crate::networking::ServiceRouter>>,
-    outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     node_name: String,
     service_cidr: String,
     runtime_node_role: RuntimeNodeRole,
     cluster_api: Option<Arc<dyn LeaderApiClient>>,
+    runtime_store: Arc<dyn PodRuntimeStore>,
+    slot_admission: Arc<dyn PodSlotAdmission>,
+    event_sink: Arc<dyn PodEventSink>,
 }
 
 impl PodSubsystem {
     /// Build repository parts and lifecycle router WITHOUT starting
     /// background work. Call `start()` after wiring is complete.
     pub fn new(config: PodSubsystemConfig) -> Result<Self> {
-        let db = config.db.clone();
         let supervisor = config.supervisor.clone();
         let node_name = config.node_name.clone();
         let service_cidr = config.service_cidr.clone();
-        let outbox = config.outbox.clone();
         let cri = config.cri.clone();
         let containerd_ns = config.containerd_ns.clone();
         let lifecycle_tx = config.lifecycle_tx.clone();
@@ -105,16 +100,8 @@ impl PodSubsystem {
         let service_router = config.service_router.clone();
         let cluster_api = config.cluster_api.clone();
         let runtime_node_role = config.runtime_node_role.clone();
-        let parts = PodRepository::build_parts(PodRepositoryBuildConfig {
-            db: config.db,
-            supervisor: config.supervisor.clone(),
-            side_effects: config.side_effects.clone(),
-            metrics: config.metrics.clone(),
-            network_events: config.network_events,
-            scheduling_mode: config.scheduling_mode,
-            outbox: config.outbox.clone(),
-            cluster_api: config.cluster_api.clone(),
-        });
+        let outbox = config.outbox.clone();
+        let parts = config.repository_parts;
 
         let registry = Arc::new(
             PodLifecycleRegistry::new(
@@ -144,7 +131,6 @@ impl PodSubsystem {
         let runtime = match config.runtime_service.clone() {
             Some(runtime_service) => runtime_service,
             None => Self::build_runtime_service(RuntimeServiceBuildRequest {
-                db: db.clone(),
                 supervisor: supervisor.clone(),
                 repository: repository.clone(),
                 cri: cri.clone(),
@@ -152,16 +138,17 @@ impl PodSubsystem {
                 probe_manager: probe_manager.clone(),
                 datapath: datapath.clone(),
                 service_router: service_router.clone(),
-                outbox: outbox.clone(),
                 node_name: node_name.clone(),
                 service_cidr: service_cidr.clone(),
                 runtime_node_role: runtime_node_role.clone(),
                 cluster_api: cluster_api.clone(),
+                runtime_store: config.runtime_store.clone(),
+                slot_admission: config.slot_admission.clone(),
+                event_sink: config.event_sink.clone(),
             })?,
         };
 
         Ok(Self {
-            db,
             supervisor,
             repository,
             repository_background: parts.background,
@@ -177,7 +164,6 @@ impl PodSubsystem {
             runtime_node_role,
             node_name,
             service_cidr,
-            outbox,
         })
     }
 
@@ -185,7 +171,6 @@ impl PodSubsystem {
         request: RuntimeServiceBuildRequest,
     ) -> Result<Arc<dyn PodRuntimeService>> {
         let RuntimeServiceBuildRequest {
-            db,
             supervisor,
             repository,
             cri,
@@ -193,11 +178,13 @@ impl PodSubsystem {
             probe_manager,
             datapath,
             service_router,
-            outbox,
             node_name,
             service_cidr,
             runtime_node_role,
             cluster_api,
+            runtime_store,
+            slot_admission,
+            event_sink,
         } = request;
         let cri =
             cri.ok_or_else(|| anyhow::anyhow!("missing PodRuntimeService dependencies: cri"))?;
@@ -236,8 +223,6 @@ impl PodSubsystem {
                     node_name.clone(),
                 ),
             );
-        let runtime_store =
-            Arc::new(crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(db.clone()));
         Ok(Arc::new(RealPodRuntimeService::new(
             RealPodRuntimeServiceDependencies {
                 cri: cri_runtime.clone(),
@@ -250,12 +235,7 @@ impl PodSubsystem {
                     ),
                 ),
                 store: runtime_store,
-                slot_admission: Arc::new(
-                    crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
-                        db.clone(),
-                        node_name.clone(),
-                    ),
-                ),
+                slot_admission,
                 repository: repository.clone(),
                 filesystem: Arc::new(
                     crate::kubelet::pod_runtime::filesystem::RealPodFilesystem::new(
@@ -279,10 +259,7 @@ impl PodSubsystem {
                     probe_manager,
                 )),
                 hostports,
-                events: Arc::new(crate::kubelet::pod_runtime::events::RealPodEventSink::new(
-                    outbox,
-                    db.clone(),
-                )),
+                events: event_sink,
                 hooks: Arc::new(crate::kubelet::pod_runtime::hooks::RealPodHookRuntime::new(
                     cri_runtime.clone(),
                     supervisor.clone(),
@@ -327,9 +304,10 @@ impl PodSubsystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datastore::DatastoreHandle;
     use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
     use crate::kubelet::pod_repository::api::PodSchedulingMode;
-    use crate::side_effects::SideEffectMetrics;
+    use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
 
     fn fixture_supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(
@@ -338,6 +316,13 @@ mod tests {
     }
 
     fn fixture_config(db: DatastoreHandle) -> PodSubsystemConfig {
+        fixture_config_with_scheduling_mode(db, PodSchedulingMode::InlineSingleNode)
+    }
+
+    fn fixture_config_with_scheduling_mode(
+        db: DatastoreHandle,
+        scheduling_mode: PodSchedulingMode,
+    ) -> PodSubsystemConfig {
         let (lifecycle_tx, _rx) =
             tokio::sync::mpsc::channel::<crate::kubelet::lifecycle::LifecycleCommand>(8);
         let cluster_api = Arc::new(crate::control_plane::client::local::LocalApiClient::new(
@@ -347,18 +332,28 @@ mod tests {
         ));
         let runtime_service =
             Arc::new(crate::kubelet::pod_runtime::test_support::MockPodRuntimeService::new());
+        let supervisor = fixture_supervisor();
+        let side_effects = Arc::new(SideEffectRegistry::new());
+        let metrics = SideEffectMetrics::new();
+        let repository_parts =
+            PodRepository::build_parts(crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+                db: db.clone(),
+                supervisor: supervisor.clone(),
+                side_effects,
+                metrics,
+                network_events: crate::networking::global_pod_network_events(),
+                scheduling_mode,
+                outbox: None,
+                cluster_api: Some(cluster_api.clone()),
+            });
         PodSubsystemConfig {
-            db,
-            supervisor: fixture_supervisor(),
-            side_effects: Arc::new(SideEffectRegistry::new()),
-            metrics: SideEffectMetrics::new(),
-            scheduling_mode: PodSchedulingMode::InlineSingleNode,
+            repository_parts,
+            supervisor,
             outbox: None,
             cluster_api: Some(cluster_api),
             node_name: "node-1".to_string(),
             service_cidr: "10.43.128.0/17".to_string(),
             lifecycle_concurrency: PodLifecycleConcurrencyConfig::production_default(),
-            network_events: crate::networking::global_pod_network_events(),
             cri: None,
             containerd_ns: "klights".to_string(),
             lifecycle_tx,
@@ -367,6 +362,18 @@ mod tests {
             service_router: None,
             runtime_node_role: RuntimeNodeRole::Worker,
             runtime_service: Some(runtime_service),
+            runtime_store: Arc::new(
+                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(db.clone()),
+            ),
+            slot_admission: Arc::new(
+                crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
+                    db.clone(),
+                    "node-1".to_string(),
+                ),
+            ),
+            event_sink: Arc::new(crate::kubelet::pod_runtime::events::RealPodEventSink::new(
+                None, db,
+            )),
         }
     }
 
@@ -378,11 +385,11 @@ mod tests {
         assert_eq!(config.node_name, "node-1");
         // Repository builder parameters are present.
         let _ = &config.supervisor;
-        let _ = &config.side_effects;
-        let _ = &config.metrics;
-        let _ = &config.scheduling_mode;
+        let _ = &config.repository_parts;
         let _ = &config.lifecycle_concurrency;
-        let _ = &config.network_events;
+        let _ = &config.runtime_store;
+        let _ = &config.slot_admission;
+        let _ = &config.event_sink;
     }
 
     /// Task 5.1: Construction produces repository and router without starting
@@ -390,10 +397,7 @@ mod tests {
     #[tokio::test]
     async fn pod_subsystem_constructs_repository_and_router_without_starting_background() {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        let config = PodSubsystemConfig {
-            db: db.clone(),
-            ..fixture_config(db)
-        };
+        let config = fixture_config(db);
 
         let subsystem = PodSubsystem::new(config).expect("PodSubsystem construction must succeed");
 
@@ -425,10 +429,7 @@ mod tests {
     #[tokio::test]
     async fn pod_subsystem_start_starts_repository_background_once() {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        let config = PodSubsystemConfig {
-            db: db.clone(),
-            ..fixture_config(db)
-        };
+        let config = fixture_config(db);
 
         let subsystem = PodSubsystem::new(config).unwrap();
 
@@ -450,11 +451,8 @@ mod tests {
         let injected =
             Arc::new(crate::kubelet::pod_runtime::test_support::MockPodRuntimeService::new())
                 as Arc<dyn PodRuntimeService>;
-        let config = PodSubsystemConfig {
-            db: db.clone(),
-            runtime_service: Some(injected.clone()),
-            ..fixture_config(db)
-        };
+        let mut config = fixture_config(db);
+        config.runtime_service = Some(injected.clone());
 
         let subsystem = PodSubsystem::new(config).expect("construction must succeed");
 
@@ -467,14 +465,11 @@ mod tests {
     #[tokio::test]
     async fn pod_subsystem_without_injected_runtime_requires_real_runtime_dependencies() {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        let config = PodSubsystemConfig {
-            db: db.clone(),
-            runtime_service: None,
-            cri: None,
-            datapath: None,
-            cluster_api: None,
-            ..fixture_config(db)
-        };
+        let mut config = fixture_config(db);
+        config.runtime_service = None;
+        config.cri = None;
+        config.datapath = None;
+        config.cluster_api = None;
 
         let err = match PodSubsystem::new(config) {
             Ok(_) => panic!("missing real runtime dependencies must fail construction"),
@@ -513,11 +508,8 @@ mod tests {
             RuntimeNodeRole::Worker,
             "default to Worker for single-node"
         );
-        // Storage on PodSubsystem works after construction.
-        let config2 = PodSubsystemConfig {
-            db: db.clone(),
-            ..fixture_config(db)
-        };
+        // Storage ports on PodSubsystem config work after construction.
+        let config2 = fixture_config(db);
         let subsystem = PodSubsystem::new(config2).expect("construction must succeed");
         assert_eq!(subsystem.containerd_ns, "klights");
         assert_eq!(subsystem.service_cidr, "10.43.128.0/17");
@@ -542,18 +534,15 @@ mod tests {
         let cri = crate::kubelet::CriClient::connect(&sock_path.to_string_lossy(), "klights")
             .await
             .expect("connect temp cri socket");
-        let config = PodSubsystemConfig {
-            db: db.clone(),
-            cri: Some(crate::kubelet::cri::SharedCriClient::new(cri)),
-            datapath: Some(Arc::new(
-                crate::networking::test_support::MockNetworkProvider::new(),
-            )),
-            service_router: Some(Arc::new(
-                crate::networking::test_support::MockServiceRouter::new(),
-            )),
-            runtime_service: None,
-            ..fixture_config(db)
-        };
+        let mut config = fixture_config(db);
+        config.cri = Some(crate::kubelet::cri::SharedCriClient::new(cri));
+        config.datapath = Some(Arc::new(
+            crate::networking::test_support::MockNetworkProvider::new(),
+        ));
+        config.service_router = Some(Arc::new(
+            crate::networking::test_support::MockServiceRouter::new(),
+        ));
+        config.runtime_service = None;
         let subsystem = PodSubsystem::new(config).expect("construction must succeed");
 
         let runtime = subsystem.runtime_service();
@@ -580,11 +569,8 @@ mod tests {
     #[tokio::test]
     async fn leader_bootstrap_constructs_pod_subsystem_with_leader_objects() {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        let config = PodSubsystemConfig {
-            db: db.clone(),
-            scheduling_mode: PodSchedulingMode::DeferredMultiNodeLeader,
-            ..fixture_config(db)
-        };
+        let config =
+            fixture_config_with_scheduling_mode(db, PodSchedulingMode::DeferredMultiNodeLeader);
 
         let subsystem = PodSubsystem::new(config).expect("PodSubsystem construction must succeed");
 
@@ -609,11 +595,7 @@ mod tests {
     #[tokio::test]
     async fn worker_bootstrap_constructs_pod_subsystem_with_worker_objects() {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        let config = PodSubsystemConfig {
-            db: db.clone(),
-            scheduling_mode: PodSchedulingMode::InlineSingleNode,
-            ..fixture_config(db)
-        };
+        let config = fixture_config_with_scheduling_mode(db, PodSchedulingMode::InlineSingleNode);
 
         let subsystem = PodSubsystem::new(config).expect("PodSubsystem construction must succeed");
 
@@ -637,10 +619,7 @@ mod tests {
     #[tokio::test]
     async fn pod_subsystem_bootstrap_wires_runtime_executor() {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        let config = PodSubsystemConfig {
-            db: db.clone(),
-            ..fixture_config(db)
-        };
+        let config = fixture_config(db);
 
         let subsystem = PodSubsystem::new(config).expect("PodSubsystem construction must succeed");
 

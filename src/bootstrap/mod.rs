@@ -4,6 +4,7 @@ pub mod config;
 pub mod controlplane_discovery;
 pub mod credential_store;
 pub mod init;
+pub mod kubelet_ports;
 pub mod leader_reconnect;
 pub mod logging;
 pub mod node_mode;

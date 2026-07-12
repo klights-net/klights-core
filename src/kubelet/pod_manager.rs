@@ -1,5 +1,4 @@
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{DatastoreBackend, DatastoreHandle, WatchTarget};
+use crate::datastore::WatchTarget;
 #[cfg(test)]
 use crate::kubelet::pod_creation_state::PodStartSource;
 use crate::kubelet::pod_creation_state::{
@@ -19,7 +18,8 @@ use crate::kubelet::pod_status_builders::{
 };
 #[cfg(test)]
 use crate::kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_restart};
-use crate::kubelet::pod_watch_handlers::{handle_pv_event, handle_pvc_event};
+use crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
+use crate::kubelet::pod_watch_source::PodWatchSource;
 use crate::watch::{
     EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
     WatchEventFilter, WatchSignalReceiver, WatchTopic, WindowPolicy,
@@ -68,13 +68,14 @@ impl PodWatcherRuntimePorts {
 
 #[derive(Clone)]
 struct PodWatcherRuntimeContext {
-    db: DatastoreHandle,
+    pod_watch_source: Arc<dyn PodWatchSource>,
     cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
     node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
     config: Arc<crate::KlightsConfig>,
     task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     pod_lifecycle_router: Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
+    persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
     cluster_reconciliation_enabled: bool,
     pod_lifecycle_rx: Arc<
         tokio::sync::Mutex<
@@ -85,42 +86,20 @@ struct PodWatcherRuntimeContext {
 }
 
 impl PodWatcherRuntimeContext {
-    fn from_app_state(state: &crate::api::AppState) -> Self {
-        Self {
-            db: state.db.clone(),
-            cluster_api: state.cluster_api.clone(),
-            node_local: None,
-            config: state.config.clone(),
-            task_supervisor: state.task_supervisor.clone(),
-            pod_repository: state.pod_repository.clone(),
-            pod_lifecycle_router: state
-                .pod_lifecycle_router
-                .clone()
-                .expect("pod_lifecycle_router must be set in AppState before run_pod_watcher"),
-            cluster_reconciliation_enabled: state
-                .is_raft_leader_rx
-                .as_ref()
-                .is_none_or(|proxy| proxy.is_leader()),
-            pod_lifecycle_rx: state
-                .pod_lifecycle_rx
-                .clone()
-                .expect("pod_lifecycle_rx must be set in AppState before run_pod_watcher"),
-            pod_start_retry_state: state.pod_start_retry_state.clone(),
-        }
-    }
-
     fn from_kubelet_context(
         context: &crate::kubelet::context::KubeletContext,
-        db: DatastoreHandle,
+        pod_watch_source: Arc<dyn PodWatchSource>,
+        persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
     ) -> Self {
         Self {
-            db,
+            pod_watch_source,
             cluster_api: context.cluster_api.clone(),
             node_local: Some(context.node_local.clone()),
             config: context.config.clone(),
             task_supervisor: context.task_supervisor.clone(),
             pod_repository: context.pod_repository.clone(),
             pod_lifecycle_router: context.pod_lifecycle_router.clone(),
+            persistent_volume_event_handler,
             cluster_reconciliation_enabled: false,
             pod_lifecycle_rx: context.pod_lifecycle_rx.clone(),
             pod_start_retry_state: Some(context.pod_start_retry_state.clone()),
@@ -225,28 +204,20 @@ async fn rotate_all_pod_logs(containerd_ns: &str) {
         .await;
 }
 
-pub async fn run_pod_watcher(
-    runtime_ports: PodWatcherRuntimePorts,
-    state: std::sync::Arc<crate::api::AppState>,
-    cancel_token: tokio_util::sync::CancellationToken,
-) {
-    run_pod_watcher_with_runtime(
-        runtime_ports,
-        PodWatcherRuntimeContext::from_app_state(state.as_ref()),
-        cancel_token,
-    )
-    .await;
-}
-
 pub async fn run_pod_watcher_with_context(
     runtime_ports: PodWatcherRuntimePorts,
     context: std::sync::Arc<crate::kubelet::context::KubeletContext>,
-    db: DatastoreHandle,
+    pod_watch_source: Arc<dyn PodWatchSource>,
+    persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
     cancel_token: tokio_util::sync::CancellationToken,
 ) {
     run_pod_watcher_with_runtime(
         runtime_ports,
-        PodWatcherRuntimeContext::from_kubelet_context(context.as_ref(), db),
+        PodWatcherRuntimeContext::from_kubelet_context(
+            context.as_ref(),
+            pod_watch_source,
+            persistent_volume_event_handler,
+        ),
         cancel_token,
     )
     .await;
@@ -261,9 +232,6 @@ async fn run_pod_watcher_with_runtime(
 
     let container_control = runtime_ports.container_control.clone();
     let cri_runtime = runtime_ports.cri_runtime.clone();
-
-    let db_handle = state.db.clone();
-    let db = db_handle.as_ref();
 
     // Compute and cache the host IP for pod status from the registered Node
     // InternalIP. Node names are Kubernetes identities, not DNS names.
@@ -299,7 +267,7 @@ async fn run_pod_watcher_with_runtime(
         watch_topics
             .iter()
             .cloned()
-            .map(|topic| state.db.subscribe_watch_signals(topic))
+            .map(|topic| state.pod_watch_source.subscribe_watch_signals(topic))
             .collect(),
     );
 
@@ -362,10 +330,16 @@ async fn run_pod_watcher_with_runtime(
     let event_filter = pod_watcher_node_event_filter(&config.node_name);
     let mut cursor = SignalWatchCursor::new_many(
         signal_rx,
-        DatastoreWatchReplaySource::new(db_handle.clone(), pod_watcher_replay_targets()),
+        state
+            .pod_watch_source
+            .replay_source(pod_watcher_replay_targets()),
         watch_topics,
         WatchDeliveryScope::All,
-        db.get_current_resource_version().await.unwrap_or(0),
+        state
+            .pod_watch_source
+            .current_resource_version()
+            .await
+            .unwrap_or(0),
         WindowPolicy::default_watch_delivery(),
     )
     .with_event_filter(event_filter);
@@ -470,7 +444,7 @@ async fn run_pod_watcher_with_runtime(
                 }
                 event_handlers::handle_watch_event(
                     event_handlers::WatchEventHandlerContext {
-                        db,
+                        persistent_volume_event_handler: &state.persistent_volume_event_handler,
                         cluster_api: &state.cluster_api,
                         node_name: &config.node_name,
                         containerd_namespace: &config.containerd_namespace,

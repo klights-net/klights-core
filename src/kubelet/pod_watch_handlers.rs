@@ -1,5 +1,65 @@
-use crate::datastore::DatastoreBackend;
+use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use crate::watch::{EventType, WatchEvent};
+
+#[async_trait::async_trait]
+pub trait PersistentVolumeEventHandler: Send + Sync {
+    async fn handle_pvc_event(
+        &self,
+        event: &WatchEvent,
+        event_name: &str,
+        cluster_reconciliation_enabled: bool,
+    );
+
+    async fn handle_pv_event(
+        &self,
+        event: &WatchEvent,
+        event_name: &str,
+        cluster_reconciliation_enabled: bool,
+    );
+}
+
+pub struct DatastorePersistentVolumeEventHandler {
+    db: DatastoreHandle,
+}
+
+impl DatastorePersistentVolumeEventHandler {
+    pub fn new(db: DatastoreHandle) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait]
+impl PersistentVolumeEventHandler for DatastorePersistentVolumeEventHandler {
+    async fn handle_pvc_event(
+        &self,
+        event: &WatchEvent,
+        event_name: &str,
+        cluster_reconciliation_enabled: bool,
+    ) {
+        handle_pvc_event(
+            self.db.as_ref(),
+            event,
+            event_name,
+            cluster_reconciliation_enabled,
+        )
+        .await;
+    }
+
+    async fn handle_pv_event(
+        &self,
+        event: &WatchEvent,
+        event_name: &str,
+        cluster_reconciliation_enabled: bool,
+    ) {
+        handle_pv_event(
+            self.db.as_ref(),
+            event,
+            event_name,
+            cluster_reconciliation_enabled,
+        )
+        .await;
+    }
+}
 
 /// Handle PersistentVolumeClaim ADDED/MODIFIED events
 pub async fn handle_pvc_event(

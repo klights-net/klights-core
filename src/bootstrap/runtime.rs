@@ -620,19 +620,28 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
             cni_readiness.clone(),
         )
     });
-    let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
-        crate::kubelet::pod_subsystem::PodSubsystemConfig {
+    let pod_repository_parts = crate::kubelet::pod_repository::PodRepository::build_parts(
+        crate::kubelet::pod_repository::PodRepositoryBuildConfig {
             db: db_handle.clone(),
             supervisor: task_supervisor.clone(),
             side_effects: side_effects.clone(),
             metrics: metrics.clone(),
-            scheduling_mode: crate::kubelet::pod_repository::api::PodSchedulingMode::DeferredMultiNodeLeader,
+            network_events: crate::networking::global_pod_network_events(),
+            scheduling_mode:
+                crate::kubelet::pod_repository::api::PodSchedulingMode::DeferredMultiNodeLeader,
+            outbox: Some(outbox.clone()),
+            cluster_api: Some(cluster_api.clone()),
+        },
+    );
+    let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
+        crate::kubelet::pod_subsystem::PodSubsystemConfig {
+            repository_parts: pod_repository_parts,
+            supervisor: task_supervisor.clone(),
             outbox: Some(outbox.clone()),
             cluster_api: Some(cluster_api.clone()),
             node_name: config.node_name.clone(),
             service_cidr: config.service_cidr.clone(),
             lifecycle_concurrency: crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig::production_default(),
-            network_events: crate::networking::global_pod_network_events(),
             cri: cri_for_pod_watcher.clone().map(crate::kubelet::cri::SharedCriClient::new),
             containerd_ns: config.containerd_namespace.clone(),
             lifecycle_tx: pod_lifecycle_tx,
@@ -641,6 +650,21 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
             service_router: Some(services.clone()),
             runtime_node_role: worker_pod_runtime_node_role(),
             runtime_service: None,
+            runtime_store: std::sync::Arc::new(
+                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(db_handle.clone()),
+            ),
+            slot_admission: std::sync::Arc::new(
+                crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
+                    db_handle.clone(),
+                    config.node_name.clone(),
+                ),
+            ),
+            event_sink: std::sync::Arc::new(
+                crate::kubelet::pod_runtime::events::RealPodEventSink::new(
+                    Some(outbox.clone()),
+                    db_handle.clone(),
+                ),
+            ),
         },
     )
     .context("pod subsystem construction")?;
@@ -682,9 +706,18 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
         )),
     });
 
-    let dbh = db_handle.clone();
+    let pod_watch_source = std::sync::Arc::new(
+        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(db_handle.clone()),
+    );
+    let persistent_volume_event_handler = std::sync::Arc::new(
+        crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
+            db_handle.clone(),
+        ),
+    );
     let pod_watcher_handle = if let Some(runtime_ports) = pod_watcher_runtime_ports {
         let ctx = kctx.clone();
+        let watch_source = pod_watch_source.clone();
+        let volume_events = persistent_volume_event_handler.clone();
         let c = shutdown_token.clone();
         Some(
             task_supervisor
@@ -695,7 +728,8 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
                         kubelet::pod_manager::run_pod_watcher_with_context(
                             runtime_ports,
                             ctx,
-                            dbh,
+                            watch_source,
+                            volume_events,
                             c,
                         )
                         .await;
