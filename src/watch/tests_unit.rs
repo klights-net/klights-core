@@ -1915,7 +1915,9 @@ async fn test_watch_cursor_recovers_namespace_events_from_datastore_replay_sourc
     let start_rv = db.get_current_resource_version().await.unwrap();
     let rx = watch_bus.subscribe(WatchTopic::new("v1", "Namespace"));
     let replay_source = DatastoreWatchReplaySource::new(
-        std::sync::Arc::new(db.clone()) as crate::datastore::DatastoreHandle,
+        std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+            std::sync::Arc::new(db.clone()) as crate::datastore::DatastoreHandle,
+        )),
         vec![WatchTarget::cluster("v1", "Namespace")],
     );
     let mut cursor = WatchCursor::new(rx, replay_source, start_rv);
@@ -1975,7 +1977,9 @@ async fn test_watch_bootstrap_preserves_pre_recovery_snapshot() {
     let bootstrap = WatchBootstrap::new(
         broadcast::channel(128).0.subscribe(),
         DatastoreWatchReplaySource::new(
-            std::sync::Arc::new(db.clone()) as crate::datastore::DatastoreHandle,
+            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                std::sync::Arc::new(db.clone()) as crate::datastore::DatastoreHandle,
+            )),
             vec![WatchTarget::namespaced("v1", "Pod")],
         ),
         start_rv,

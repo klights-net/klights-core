@@ -20,7 +20,7 @@ use crate::datastore::{
     PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodWorkqueueEntry,
     PodWorkqueueKind, PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead,
     RawWatchEvent, Resource, ResourceList, ResourcePatchRequest, ResourcePreconditions, SandboxRef,
-    SnapshotAtRv, WatchReplayPosition, WatchReplayRead, WatchTarget, WatchTargetScope,
+    SnapshotAtRv, WatchReplayPosition, WatchReplayRead, WatchStore, WatchTarget, WatchTargetScope,
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
@@ -896,6 +896,80 @@ fn catchup_resource_from_watch_event(event: &WatchEvent) -> Option<CatchUpResour
         },
         event_type: std::borrow::Cow::Owned(event.event_type.to_string()),
     })
+}
+
+#[async_trait]
+impl crate::datastore::CurrentResourceVersionStore for WorkerStoreAdapter {
+    async fn get_current_resource_version(&self) -> Result<i64> {
+        Ok(self.current_rv.load(Ordering::Relaxed))
+    }
+}
+
+#[async_trait]
+impl WatchStore for WorkerStoreAdapter {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+        self.watch_bus.subscribe_signals(topic)
+    }
+
+    #[cfg(test)]
+    fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<crate::watch::WatchEvent> {
+        self.watch_bus.subscribe(topic)
+    }
+
+    async fn list_watch_events_since(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> Result<Vec<CatchUpResource>> {
+        Ok(self.historical_watch_events_since(targets, since_rv))
+    }
+
+    async fn list_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        let high_water_event_id = self.next_event_id.load(Ordering::Relaxed).saturating_sub(1);
+        let history = self
+            .event_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if targets.iter().any(|target| {
+            ReplayRetentionBoundary::classify_all(
+                worker_replay_boundaries(&history, target),
+                position,
+            ) == ReplayAvailability::Expired
+        }) {
+            return Ok(PositionedWatchReplayRead::Expired);
+        }
+        let events: Vec<_> = history
+            .events
+            .iter()
+            .filter(|(event_id, event)| {
+                worker_replay_event_follows_position(position, *event_id, event)
+            })
+            .filter(|(_, event)| watch_event_matches_targets(event, targets))
+            .filter_map(|(event_id, event)| {
+                let resource_version = event.resource_version()?;
+                Some(PositionedWatchEvent {
+                    position: WatchReplayPosition {
+                        resource_version,
+                        event_id: *event_id,
+                        resource_version_filter_through_event_id: 0,
+                    },
+                    event: catchup_resource_from_watch_event(event)?,
+                })
+            })
+            .take(limit.get())
+            .collect();
+        let next_position =
+            WatchReplayPosition::after_page(position, &events, high_water_event_id, limit);
+        Ok(PositionedWatchReplayRead::Events(PositionedWatchReplay {
+            events,
+            next_position,
+        }))
+    }
 }
 
 #[async_trait]
@@ -3240,10 +3314,11 @@ mod tests {
         )];
         let limit = std::num::NonZeroUsize::new(3).expect("non-zero limit");
 
-        let first = adapter
-            .list_watch_events_since_checked_bounded(&targets, 0, limit)
-            .await
-            .expect("initial watch replay");
+        let first = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
+            &adapter, &targets, 0, limit,
+        )
+        .await
+        .expect("initial watch replay");
         let crate::datastore::WatchReplayRead::Events(first_events) = first else {
             panic!("worker adapter replay should not expire");
         };
@@ -3254,10 +3329,11 @@ mod tests {
             .max()
             .expect("initial replay should have a max rv");
 
-        let second = adapter
-            .list_watch_events_since_checked_bounded(&targets, max_rv, limit)
-            .await
-            .expect("resumed watch replay");
+        let second = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
+            &adapter, &targets, max_rv, limit,
+        )
+        .await
+        .expect("resumed watch replay");
         let crate::datastore::WatchReplayRead::Events(second_events) = second else {
             panic!("worker adapter replay should not expire");
         };
@@ -3371,17 +3447,17 @@ mod tests {
         .expect("open node-local");
         let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
 
-        let replay = adapter
-            .list_watch_events_since(
-                &[WatchTarget::namespaced_in_namespace(
-                    "v1",
-                    "ConfigMap",
-                    "default",
-                )],
-                0,
-            )
-            .await
-            .expect("scalar replay");
+        let replay = crate::datastore::WatchStore::list_watch_events_since(
+            &adapter,
+            &[WatchTarget::namespaced_in_namespace(
+                "v1",
+                "ConfigMap",
+                "default",
+            )],
+            0,
+        )
+        .await
+        .expect("scalar replay");
 
         assert!(
             replay.is_empty(),
@@ -3431,14 +3507,14 @@ mod tests {
             ),
         );
 
-        let replay = adapter
-            .list_watch_events_since_checked_bounded(
-                &[WatchTarget::namespaced("v1", "ConfigMap")],
-                0,
-                std::num::NonZeroUsize::new(8).expect("non-zero limit"),
-            )
-            .await
-            .expect("watch replay should succeed");
+        let replay = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
+            &adapter,
+            &[WatchTarget::namespaced("v1", "ConfigMap")],
+            0,
+            std::num::NonZeroUsize::new(8).expect("non-zero limit"),
+        )
+        .await
+        .expect("watch replay should succeed");
 
         let crate::datastore::WatchReplayRead::Events(events) = replay else {
             panic!("worker adapter replay should not expire");
@@ -3505,10 +3581,11 @@ mod tests {
         let targets = [WatchTarget::namespaced_in_namespace("v1", "Pod", "default")];
         let limit = std::num::NonZeroUsize::new(4).expect("non-zero limit");
 
-        let first = adapter
-            .list_watch_events_since_checked_bounded(&targets, 0, limit)
-            .await
-            .expect("initial watch replay");
+        let first = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
+            &adapter, &targets, 0, limit,
+        )
+        .await
+        .expect("initial watch replay");
         let crate::datastore::WatchReplayRead::Events(first_events) = first else {
             panic!("worker adapter replay should not expire");
         };
@@ -3547,10 +3624,14 @@ mod tests {
             serde_json::json!(updated.resource_version.to_string());
         adapter.publish_watch(WatchEvent::modified(updated_event));
 
-        let resumed = adapter
-            .list_watch_events_since_checked_bounded(&targets, created.resource_version, limit)
-            .await
-            .expect("resumed watch replay");
+        let resumed = crate::datastore::WatchStore::list_watch_events_since_checked_bounded(
+            &adapter,
+            &targets,
+            created.resource_version,
+            limit,
+        )
+        .await
+        .expect("resumed watch replay");
         let crate::datastore::WatchReplayRead::Events(resumed_events) = resumed else {
             panic!("worker adapter replay should not expire");
         };

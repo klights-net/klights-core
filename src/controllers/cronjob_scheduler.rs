@@ -329,7 +329,9 @@ impl CronJobScheduler {
         let mut cursor = SignalWatchCursor::new(
             self.db.subscribe_watch_signals(topic.clone()),
             DatastoreWatchReplaySource::new(
-                self.db.clone(),
+                std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                    self.db.clone(),
+                )),
                 vec![WatchTarget::namespaced("batch/v1", "CronJob")],
             ),
             topic,

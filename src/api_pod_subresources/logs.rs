@@ -357,7 +357,7 @@ pub async fn build_pod_log_follow_event_cursor(
     SignalWatchCursor::new(
         signal_rx,
         crate::datastore::sqlite::DatastoreWatchReplaySource::new(
-            db,
+            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(db)),
             vec![crate::datastore::WatchTarget::namespaced("v1", "Pod")],
         ),
         topic,

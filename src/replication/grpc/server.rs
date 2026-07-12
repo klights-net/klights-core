@@ -1171,8 +1171,12 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         // No await is permitted between the durable anchor above and this
         // subscription. Replay closes the anchor->subscribe interval.
         let signal_rx = self.db.subscribe_watch_signals(topic.clone());
-        let replay_source =
-            DatastoreWatchReplaySource::new(self.db.clone(), vec![watch_target_for_request(&req)]);
+        let replay_source = DatastoreWatchReplaySource::new(
+            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                self.db.clone(),
+            )),
+            vec![watch_target_for_request(&req)],
+        );
         let scope: crate::watch::WatchDeliveryScope = watch_delivery_scope_for_request(&req);
         let supervisor = self.service.task_supervisor();
         let heartbeat_interval = self.watch_heartbeat_interval;

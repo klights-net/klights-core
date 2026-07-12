@@ -5472,7 +5472,6 @@ async fn focused_store_traits_cover_sqlite_backend() {
             + ResourceListStore
             + StatusStore
             + OwnershipStore
-            + WatchStore
             + WatchHistoryStore
             + NamespaceStore
             + NamespaceContentStore
@@ -5486,6 +5485,11 @@ async fn focused_store_traits_cover_sqlite_backend() {
 
     let db = Datastore::new_in_memory().await.unwrap();
     assert_traits(&db);
+
+    fn assert_watch_store<T: WatchStore>(_: &T) {}
+    let handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
+    let watch_store = crate::datastore::DatastoreBackendWatchStore::new(handle);
+    assert_watch_store(&watch_store);
 }
 
 #[tokio::test]
@@ -6991,7 +6995,9 @@ fn accepts_namespace_store(_store: &dyn crate::datastore::NamespaceStore) {}
 async fn datastore_implements_focused_backend_traits() {
     let db = Datastore::new_in_memory().await.unwrap();
     accepts_resource_store(&db);
-    accepts_watch_store(&db);
+    let handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
+    let watch_store = crate::datastore::DatastoreBackendWatchStore::new(handle);
+    accepts_watch_store(&watch_store);
     accepts_network_store(&db);
     accepts_namespace_store(&db);
 }

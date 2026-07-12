@@ -837,9 +837,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let pod_watcher_handle = if let Some(runtime_ports) = pod_watcher_runtime_ports {
         let ctx = kubelet_context.clone();
         let watch_source = Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(
-                kubelet_db_handle.clone(),
-            ),
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
+                crate::datastore::DatastoreBackendWatchStore::new(kubelet_db_handle.clone()),
+            )),
         );
         let volume_events = Arc::new(
             crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(

@@ -707,7 +707,7 @@ pub(crate) async fn run_worker_with_flags(mut cli: CliFlags) -> anyhow::Result<(
     });
 
     let pod_watch_source = std::sync::Arc::new(
-        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(db_handle.clone()),
+        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(worker_store.clone()),
     );
     let persistent_volume_event_handler = std::sync::Arc::new(
         crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(

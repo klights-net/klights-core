@@ -286,8 +286,12 @@ impl LeaderApiClient for LocalApiClient {
         };
         let start_rv = legacy_start_rv.max(replay_position.resource_version);
         let signal_rx = self.db.subscribe_watch_signals(topic.clone());
-        let replay_source =
-            DatastoreWatchReplaySource::new(self.db.clone(), vec![watch_target_for_request(&req)]);
+        let replay_source = DatastoreWatchReplaySource::new(
+            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                self.db.clone(),
+            )),
+            vec![watch_target_for_request(&req)],
+        );
         let scope = watch_delivery_scope_for_request(&req);
         let stream = async_stream::stream! {
             let mut cursor = crate::watch::SignalWatchCursor::new_many_at_position(

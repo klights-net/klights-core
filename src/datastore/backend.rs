@@ -1577,6 +1577,12 @@ impl<T: DatastoreBackend + ?Sized> OwnershipStore for T {
     }
 }
 
+/// ResourceVersion read required to anchor watch bootstrap.
+#[async_trait]
+pub trait CurrentResourceVersionStore: Send + Sync {
+    async fn get_current_resource_version(&self) -> Result<i64>;
+}
+
 /// Watch-event subscription, broadcast access, and replay queries.
 #[async_trait]
 pub trait WatchStore: Send + Sync {
@@ -1588,23 +1594,130 @@ pub trait WatchStore: Send + Sync {
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>>;
+
+    async fn list_watch_events_since_checked(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> Result<WatchReplayRead> {
+        if since_rv > 0
+            && let Some(earliest) = self.earliest_watch_event_rv().await?
+            && since_rv + 1 < earliest
+        {
+            return Ok(WatchReplayRead::Expired);
+        }
+        self.list_watch_events_since(targets, since_rv)
+            .await
+            .map(WatchReplayRead::Events)
+    }
+
+    async fn list_watch_events_since_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead> {
+        match self
+            .list_watch_events_since_checked(targets, since_rv)
+            .await?
+        {
+            WatchReplayRead::Events(mut events) => {
+                events.truncate(limit.get());
+                Ok(WatchReplayRead::Events(events))
+            }
+            WatchReplayRead::Expired => Ok(WatchReplayRead::Expired),
+        }
+    }
+
+    async fn list_watch_events_after_position_checked_bounded(
+        &self,
+        _targets: &[WatchTarget],
+        _position: WatchReplayPosition,
+        _limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        Err(anyhow::anyhow!(
+            "watch store does not implement durable positioned watch replay"
+        ))
+    }
+
+    async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
+        Ok(None)
+    }
+}
+
+/// Transitional composition-root adapter from the legacy backend handle into
+/// the focused watch port. New consumers should store `Arc<dyn WatchStore>`,
+/// not `DatastoreHandle`.
+pub struct DatastoreBackendWatchStore {
+    db: DatastoreHandle,
+}
+
+impl DatastoreBackendWatchStore {
+    pub fn new(db: DatastoreHandle) -> Self {
+        Self { db }
+    }
 }
 
 #[async_trait]
-impl<T: DatastoreBackend + ?Sized> WatchStore for T {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
-        DatastoreBackend::subscribe_watch_signals(self, topic)
+impl CurrentResourceVersionStore for DatastoreBackendWatchStore {
+    async fn get_current_resource_version(&self) -> Result<i64> {
+        self.db.get_current_resource_version().await
     }
+}
+
+#[async_trait]
+impl WatchStore for DatastoreBackendWatchStore {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+        self.db.subscribe_watch_signals(topic)
+    }
+
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent> {
-        DatastoreBackend::subscribe_watch(self, topic)
+        self.db.subscribe_watch(topic)
     }
+
     async fn list_watch_events_since(
         &self,
         targets: &[WatchTarget],
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>> {
-        DatastoreBackend::list_watch_events_since(self, targets, since_rv).await
+        self.db.list_watch_events_since(targets, since_rv).await
+    }
+
+    async fn list_watch_events_since_checked(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+    ) -> Result<WatchReplayRead> {
+        self.db
+            .list_watch_events_since_checked(targets, since_rv)
+            .await
+    }
+
+    async fn list_watch_events_since_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead> {
+        self.db
+            .list_watch_events_since_checked_bounded(targets, since_rv, limit)
+            .await
+    }
+
+    async fn list_watch_events_after_position_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        position: WatchReplayPosition,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<PositionedWatchReplayRead<CatchUpResource>> {
+        self.db
+            .list_watch_events_after_position_checked_bounded(targets, position, limit)
+            .await
+    }
+
+    async fn earliest_watch_event_rv(&self) -> Result<Option<i64>> {
+        self.db.earliest_watch_event_rv().await
     }
 }
 

@@ -189,7 +189,12 @@ async fn run_peer_watch_with_components_inner(
     let topic = WatchTopic::new("v1", "Node");
     let mut cursor = SignalWatchCursor::new(
         db.subscribe_watch_signals(topic.clone()),
-        DatastoreWatchReplaySource::new(db.clone(), vec![WatchTarget::cluster("v1", "Node")]),
+        DatastoreWatchReplaySource::new(
+            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                db.clone(),
+            )),
+            vec![WatchTarget::cluster("v1", "Node")],
+        ),
         topic,
         WatchDeliveryScope::Cluster,
         db.get_current_resource_version().await.unwrap_or(0),

@@ -1033,7 +1033,12 @@ async fn list_cr_inner(
                 }
             }
 
-            let replay_source = DatastoreWatchReplaySource::new(db.clone(), replay_targets);
+            let replay_source = DatastoreWatchReplaySource::new(
+                std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                    db.clone(),
+                )),
+                replay_targets,
+            );
             let delivery_scope = if is_cluster_scope {
                 crate::watch::WatchDeliveryScope::Cluster
             } else if let Some(ns) = watch_ns.clone() {

@@ -1,17 +1,24 @@
 use std::sync::Arc;
 
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{DatastoreHandle, WatchTarget};
+use crate::datastore::{CurrentResourceVersionStore, WatchStore, WatchTarget};
 use crate::kubelet::pod_watch_source::{BoxedWatchReplaySource, PodWatchSource};
 use crate::watch::{WatchSignal, WatchTopic};
 
 pub struct DatastorePodWatchSource {
-    db: DatastoreHandle,
+    watch_store: Arc<dyn WatchStore>,
+    resource_versions: Arc<dyn CurrentResourceVersionStore>,
 }
 
 impl DatastorePodWatchSource {
-    pub fn new(db: DatastoreHandle) -> Self {
-        Self { db }
+    pub fn new<T>(store: Arc<T>) -> Self
+    where
+        T: WatchStore + CurrentResourceVersionStore + 'static,
+    {
+        Self {
+            watch_store: store.clone(),
+            resource_versions: store,
+        }
     }
 }
 
@@ -21,17 +28,17 @@ impl PodWatchSource for DatastorePodWatchSource {
         &self,
         topic: WatchTopic,
     ) -> tokio::sync::broadcast::Receiver<WatchSignal> {
-        self.db.subscribe_watch_signals(topic)
+        self.watch_store.subscribe_watch_signals(topic)
     }
 
     fn replay_source(&self, targets: Vec<WatchTarget>) -> BoxedWatchReplaySource {
         BoxedWatchReplaySource::new(Arc::new(DatastoreWatchReplaySource::new(
-            self.db.clone(),
+            self.watch_store.clone(),
             targets,
         )))
     }
 
     async fn current_resource_version(&self) -> anyhow::Result<i64> {
-        self.db.get_current_resource_version().await
+        self.resource_versions.get_current_resource_version().await
     }
 }

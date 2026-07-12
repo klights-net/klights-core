@@ -4,19 +4,25 @@ use async_trait::async_trait;
 
 use crate::watch::{WatchEvent, WatchReplaySource};
 
-use super::{CatchUpResource, DatastoreHandle, WatchReplayRead, WatchTarget};
+use std::sync::Arc;
+
+use super::{CatchUpResource, WatchReplayRead, WatchTarget};
 use crate::datastore::{
     PositionedWatchEvent, PositionedWatchReplay, PositionedWatchReplayRead, WatchReplayPosition,
+    WatchStore,
 };
 
 pub struct DatastoreWatchReplaySource {
-    db: DatastoreHandle,
+    watch_store: Arc<dyn WatchStore>,
     targets: Vec<WatchTarget>,
 }
 
 impl DatastoreWatchReplaySource {
-    pub fn new(db: DatastoreHandle, targets: Vec<WatchTarget>) -> Self {
-        Self { db, targets }
+    pub fn new(watch_store: Arc<dyn WatchStore>, targets: Vec<WatchTarget>) -> Self {
+        Self {
+            watch_store,
+            targets,
+        }
     }
 }
 
@@ -24,7 +30,7 @@ impl DatastoreWatchReplaySource {
 impl WatchReplaySource for DatastoreWatchReplaySource {
     async fn replay_since(&self, since_rv: i64) -> Result<Vec<WatchEvent>> {
         let replay = self
-            .db
+            .watch_store
             .list_watch_events_since(&self.targets, since_rv)
             .await?;
         Ok(replay
@@ -39,7 +45,7 @@ impl WatchReplaySource for DatastoreWatchReplaySource {
         limit: std::num::NonZeroUsize,
     ) -> Result<WatchReplayRead<WatchEvent>> {
         match self
-            .db
+            .watch_store
             .list_watch_events_since_checked_bounded(&self.targets, since_rv, limit)
             .await?
         {
@@ -59,7 +65,7 @@ impl WatchReplaySource for DatastoreWatchReplaySource {
         limit: std::num::NonZeroUsize,
     ) -> Result<PositionedWatchReplayRead<WatchEvent>> {
         match self
-            .db
+            .watch_store
             .list_watch_events_after_position_checked_bounded(&self.targets, position, limit)
             .await?
         {
@@ -81,6 +87,6 @@ impl WatchReplaySource for DatastoreWatchReplaySource {
     }
 
     async fn earliest_retained_rv(&self) -> Result<Option<i64>> {
-        self.db.earliest_watch_event_rv().await
+        self.watch_store.earliest_watch_event_rv().await
     }
 }

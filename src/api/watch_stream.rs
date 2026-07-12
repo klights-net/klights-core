@@ -1074,8 +1074,10 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             }
         }
 
-        let replay_source =
-            DatastoreWatchReplaySource::new(db.clone(), vec![replay_target.clone()]);
+        let replay_source = DatastoreWatchReplaySource::new(
+            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(db.clone())),
+            vec![replay_target.clone()],
+        );
         let topic = WatchTopic::new(&api_version, &kind);
         let delivery_scope = match (catch_up_mode, watch_namespace.clone()) {
             (WatchCatchUpMode::ClusterOnly, _) => WatchDeliveryScope::Cluster,

@@ -55,7 +55,7 @@ async fn pod_watcher_filtered_pod_event_does_not_advance_signal_cursor() {
     let mut cursor = SignalWatchCursor::new(
         rx,
         DatastoreWatchReplaySource::new(
-            db_handle,
+            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(db_handle)),
             vec![crate::datastore::WatchTarget::namespaced("v1", "Pod")],
         ),
         WatchTopic::new("v1", "Pod"),
@@ -132,7 +132,9 @@ async fn pod_watcher_runtime_context_disables_cluster_reconciliation_on_follower
 
     let context = PodWatcherRuntimeContext {
         pod_watch_source: std::sync::Arc::new(
-            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(state.db.clone()),
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
+                crate::datastore::DatastoreBackendWatchStore::new(state.db.clone()),
+            )),
         ),
         cluster_api: state.cluster_api.clone(),
         node_local: None,

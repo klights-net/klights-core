@@ -199,7 +199,9 @@ pub async fn run_crd_registry_watch_with_components(
     let mut cursor = SignalWatchCursor::new(
         db.subscribe_watch_signals(topic.clone()),
         crate::datastore::sqlite::DatastoreWatchReplaySource::new(
-            db.clone(),
+            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                db.clone(),
+            )),
             vec![WatchTarget::cluster(
                 "apiextensions.k8s.io/v1",
                 "CustomResourceDefinition",

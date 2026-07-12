@@ -371,7 +371,9 @@ pub async fn run_node_lifecycle_controller(
     let mut cursor = SignalWatchCursor::new_many(
         signal_rx,
         DatastoreWatchReplaySource::new(
-            db.clone(),
+            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                db.clone(),
+            )),
             vec![
                 WatchTarget::cluster("v1", "Node"),
                 WatchTarget::cluster("coordination.k8s.io/v1", "Lease"),
