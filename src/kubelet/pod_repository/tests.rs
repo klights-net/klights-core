@@ -2493,18 +2493,23 @@ impl crate::datastore::replicated::RaftProposer for StatusRacingRaftProposer {
     async fn propose_command(
         &self,
         command: crate::datastore::command::StorageCommand,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
         let key = format!("status-race-{}", uuid::Uuid::new_v4());
-        self.apply_command(
-            command,
-            &key,
-            crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
-            "status-race-leader",
-            None,
-        )
-        .await
-        .map_err(|err| anyhow::anyhow!("status race raft propose: {err}"))?;
-        Ok(())
+        let outcome = self
+            .apply_command(
+                command,
+                &key,
+                crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
+                "status-race-leader",
+                None,
+            )
+            .await
+            .map_err(|err| anyhow::anyhow!("status race raft propose: {err}"))?;
+        Ok(crate::datastore::raft::types::StorageCommandResult {
+            applied_rv: outcome.applied_resource_version(),
+            error_message: None,
+            applied_mutation: None,
+        })
     }
 
     async fn propose_outbox_command(
@@ -12334,11 +12339,12 @@ impl crate::datastore::replicated::RaftProposer for DeleteCasRacingRaftProposer 
     async fn propose_command(
         &self,
         command: crate::datastore::command::StorageCommand,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
         if self.targets_delete_of_pod(&command) {
             self.race_before_delete().await;
         }
-        self.apply_command_to_inner(command).await
+        self.apply_command_to_inner(command).await?;
+        Ok(crate::datastore::raft::types::StorageCommandResult::default())
     }
 
     async fn propose_outbox_command(

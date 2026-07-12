@@ -698,7 +698,10 @@ mod tests {
 
         #[async_trait::async_trait]
         impl RaftProposer for FollowerProposer {
-            async fn propose_command(&self, _command: StorageCommand) -> anyhow::Result<()> {
+            async fn propose_command(
+                &self,
+                _command: StorageCommand,
+            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
                 anyhow::bail!("not the leader")
             }
 

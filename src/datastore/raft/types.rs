@@ -27,6 +27,8 @@ use openraft::declare_raft_types;
 use openraft::impls::OneshotResponder;
 use serde::{Deserialize, Serialize};
 
+use crate::datastore::Resource;
+
 pub type NodeId = u64;
 
 pub fn raft_node_id_for_node_name(node_name: &str) -> NodeId {
@@ -51,10 +53,16 @@ impl StorageCommandPayload {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum AppliedMutation {
+    Resource(Resource),
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StorageCommandResult {
     pub applied_rv: Option<i64>,
     pub error_message: Option<String>,
+    pub applied_mutation: Option<AppliedMutation>,
 }
 
 /// P3-11d: snapshot of cluster shape used by the shape-driven role-label

@@ -21,10 +21,13 @@ async fn make_raft_resourcequota_datastore() -> (
 
     #[async_trait]
     impl crate::datastore::replicated::RaftProposer for InlineProposer {
-        async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+        async fn propose_command(
+            &self,
+            command: StorageCommand,
+        ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
             let payload = OutboxPayload::from_command(command).encode_protobuf()?;
             let key = format!("resource-quota-inline-{}", uuid::Uuid::new_v4());
-            crate::datastore::raft::state_machine::propose_outbox_on_backend(
+            let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                 self.inner.as_ref(),
                 &key,
                 OutboxOperation::PodStatus,
@@ -33,7 +36,11 @@ async fn make_raft_resourcequota_datastore() -> (
             )
             .await
             .map_err(|err| anyhow::anyhow!("inline resource quota propose: {err}"))?;
-            Ok(())
+            Ok(crate::datastore::raft::types::StorageCommandResult {
+                applied_rv: outcome.applied_resource_version(),
+                error_message: None,
+                applied_mutation: None,
+            })
         }
 
         async fn propose_outbox_command(

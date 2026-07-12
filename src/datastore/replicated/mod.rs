@@ -55,7 +55,10 @@ pub trait RaftProposer: Send + Sync {
     /// openraft has committed the entry and the state machine has applied
     /// it to the local backend. Non-leader voters refuse before local
     /// commit materialization; callers must route writes to the leader.
-    async fn propose_command(&self, command: StorageCommand) -> Result<()>;
+    async fn propose_command(
+        &self,
+        command: StorageCommand,
+    ) -> Result<crate::datastore::raft::types::StorageCommandResult>;
 
     /// T6 step 4c: propose an outbox-flavored write through raft.
     /// Same end result as `propose_command` (build LogApplyCommit →
@@ -217,7 +220,7 @@ impl ReplicatedDatastore {
         &self,
         proposer: &Arc<dyn RaftProposer>,
         command: StorageCommand,
-    ) -> Result<()> {
+    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         proposer.propose_command(command).await
     }
 }

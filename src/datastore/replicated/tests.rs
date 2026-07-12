@@ -31,15 +31,29 @@ mod cases {
 
         #[async_trait]
         impl super::super::RaftProposer for InlineProposer {
-            async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+            async fn propose_command(
+                &self,
+                command: StorageCommand,
+            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
                 self.calls
                     .lock()
                     .unwrap()
                     .push(command.variant_name().to_string());
+                if matches!(command, StorageCommand::DeleteResourceWithTombstone { .. }) {
+                    let commit = self
+                        .inner
+                        .build_log_apply_commit_for_command(
+                            command,
+                            crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                            "inline-proposer",
+                        )
+                        .await?;
+                    return self.inner.apply_raft_log_apply_commit(commit).await;
+                }
                 let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()?;
                 let key = format!("inline-{}", uuid::Uuid::new_v4());
-                crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     &key,
                     crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
@@ -48,7 +62,11 @@ mod cases {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("inline propose: {e}"))?;
-                Ok(())
+                Ok(crate::datastore::raft::types::StorageCommandResult {
+                    applied_rv: outcome.applied_resource_version(),
+                    error_message: None,
+                    applied_mutation: None,
+                })
             }
 
             async fn propose_outbox_command(
@@ -211,8 +229,7 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn raft_mode_delete_without_watch_with_tombstone_removes_resource_and_returns_marked_row()
-    {
+    async fn raft_mode_delete_without_watch_with_tombstone_returns_committed_deleted_object() {
         let (ds, calls) = make_ds_with_inline_proposer().await;
         let created = ds
             .create_resource(
@@ -268,6 +285,72 @@ mod cases {
                 .and_then(Value::as_i64),
             Some(30),
             "response should include deletion grace"
+        );
+        let current_rv = ds.inner.get_current_resource_version().await.unwrap();
+        assert_eq!(
+            deleted.resource_version, current_rv,
+            "tombstone delete response must carry the committed RV"
+        );
+        assert_eq!(
+            deleted
+                .data
+                .pointer("/metadata/resourceVersion")
+                .and_then(Value::as_str),
+            Some(current_rv.to_string().as_str()),
+            "response object metadata.resourceVersion must match the committed RV"
+        );
+
+        let deleted_events = ds
+            .list_all_watch_events_since(0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "DELETED" && event.resource.name == "mark-without-watch"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deleted_events.len(),
+            1,
+            "tombstone delete must emit exactly one deleted event"
+        );
+        let event_resource = &deleted_events[0].resource;
+        assert_eq!(
+            event_resource.resource_version, deleted.resource_version,
+            "response and deleted event must share the committed RV"
+        );
+        assert_eq!(
+            event_resource
+                .data
+                .pointer("/metadata/resourceVersion")
+                .and_then(Value::as_str),
+            deleted
+                .data
+                .pointer("/metadata/resourceVersion")
+                .and_then(Value::as_str),
+            "response and deleted event must share one committed object"
+        );
+        assert_eq!(
+            event_resource
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str),
+            deleted
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str),
+            "response and deleted event must share deletionTimestamp"
+        );
+        assert_eq!(
+            event_resource
+                .data
+                .pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(Value::as_i64),
+            deleted
+                .data
+                .pointer("/metadata/deletionGracePeriodSeconds")
+                .and_then(Value::as_i64),
+            "response and deleted event must share deletion grace"
         );
 
         assert!(
@@ -2145,12 +2228,15 @@ mod cases {
 
         #[async_trait]
         impl super::super::RaftProposer for InlineProposer {
-            async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+            async fn propose_command(
+                &self,
+                command: StorageCommand,
+            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
                 self.calls.lock().unwrap().push(command.clone());
                 let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
                     .encode_protobuf()?;
                 let key = format!("inline-{}", uuid::Uuid::new_v4());
-                crate::datastore::raft::state_machine::propose_outbox_on_backend(
+                let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                     self.inner.as_ref(),
                     &key,
                     crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
@@ -2159,7 +2245,11 @@ mod cases {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("inline propose apply: {e}"))?;
-                Ok(())
+                Ok(crate::datastore::raft::types::StorageCommandResult {
+                    applied_rv: outcome.applied_resource_version(),
+                    error_message: None,
+                    applied_mutation: None,
+                })
             }
 
             async fn propose_outbox_command(
@@ -2245,9 +2335,12 @@ mod cases {
 
         #[async_trait]
         impl super::super::RaftProposer for RecordingProposer {
-            async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+            async fn propose_command(
+                &self,
+                command: StorageCommand,
+            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
                 self.calls.lock().unwrap().push(command);
-                Ok(())
+                Ok(crate::datastore::raft::types::StorageCommandResult::default())
             }
 
             async fn propose_outbox_command(
@@ -2410,7 +2503,10 @@ mod cases {
 
         #[async_trait]
         impl super::super::RaftProposer for InlineProposer {
-            async fn propose_command(&self, _command: StorageCommand) -> anyhow::Result<()> {
+            async fn propose_command(
+                &self,
+                _command: StorageCommand,
+            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
                 unreachable!("outbox routing test should use propose_outbox_command")
             }
 
@@ -2559,7 +2655,10 @@ mod cases {
 
         #[async_trait]
         impl super::super::RaftProposer for InlineProposer {
-            async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+            async fn propose_command(
+                &self,
+                command: StorageCommand,
+            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
                 self.calls.lock().unwrap().push(command.variant_name());
                 apply_command_to_backend(
                     self.inner.as_ref(),
@@ -2573,7 +2672,8 @@ mod cases {
                         authoring_node: "raft-inline".into(),
                     },
                 )
-                .await
+                .await?;
+                Ok(crate::datastore::raft::types::StorageCommandResult::default())
             }
 
             async fn propose_outbox_command(
@@ -2957,7 +3057,7 @@ mod cases {
             async fn propose_command(
                 &self,
                 _command: crate::datastore::command::StorageCommand,
-            ) -> anyhow::Result<()> {
+            ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
                 Err(anyhow::anyhow!(
                     "not the leader; forward to current raft leader"
                 ))

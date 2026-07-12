@@ -633,11 +633,25 @@ mod tests {
                     })
         }
 
-        async fn apply_inline(&self, command: StorageCommand) -> anyhow::Result<()> {
+        async fn apply_inline(
+            &self,
+            command: StorageCommand,
+        ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
+            if matches!(command, StorageCommand::DeleteResourceWithTombstone { .. }) {
+                let commit = self
+                    .inner
+                    .build_log_apply_commit_for_command(
+                        command,
+                        crate::kubelet::outbox::payload::OutboxOperation::PodStatus.as_str(),
+                        "orphan-race-proposer",
+                    )
+                    .await?;
+                return self.inner.apply_raft_log_apply_commit(commit).await;
+            }
             let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
                 .encode_protobuf()?;
             let key = format!("orphan-race-{}", uuid::Uuid::new_v4());
-            crate::datastore::raft::state_machine::propose_outbox_on_backend(
+            let outcome = crate::datastore::raft::state_machine::propose_outbox_on_backend(
                 self.inner.as_ref(),
                 &key,
                 crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
@@ -646,7 +660,11 @@ mod tests {
             )
             .await
             .map_err(|err| anyhow::anyhow!("inline propose: {err}"))?;
-            Ok(())
+            Ok(crate::datastore::raft::types::StorageCommandResult {
+                applied_rv: outcome.applied_resource_version(),
+                error_message: None,
+                applied_mutation: None,
+            })
         }
 
         async fn reinsert_orphan_finalizer(&self) -> anyhow::Result<()> {
@@ -678,14 +696,17 @@ mod tests {
 
     #[async_trait]
     impl crate::datastore::replicated::RaftProposer for OrphanFinalizerReinjectingProposer {
-        async fn propose_command(&self, command: StorageCommand) -> anyhow::Result<()> {
+        async fn propose_command(
+            &self,
+            command: StorageCommand,
+        ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
             let should_reinject = Self::should_reinject_orphan_finalizer(&command)
                 && !self.reinjected.swap(true, Ordering::SeqCst);
-            self.apply_inline(command).await?;
+            let result = self.apply_inline(command).await?;
             if should_reinject {
                 self.reinsert_orphan_finalizer().await?;
             }
-            Ok(())
+            Ok(result)
         }
 
         async fn propose_outbox_command(

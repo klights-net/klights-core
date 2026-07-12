@@ -310,7 +310,8 @@ impl DatastoreBackend for ReplicatedDatastore {
         }
         let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::ApplyResourceBatch { operations };
-        self.propose_command_via_raft(&proposer, command).await
+        self.propose_command_via_raft(&proposer, command).await?;
+        Ok(())
     }
 
     async fn update_status_only(
@@ -506,26 +507,6 @@ impl DatastoreBackend for ReplicatedDatastore {
         preconditions: ResourcePreconditions,
         grace_seconds: i64,
     ) -> Result<Resource> {
-        let Some(current) = self
-            .inner
-            .get_resource(api_version, kind, namespace, name)
-            .await?
-        else {
-            return Err(DatastoreError::not_found(format!(
-                "delete_resource_without_watch_with_tombstone: {api_version}/{kind}/{name} not found"
-            ))
-            .into());
-        };
-        let mut data = (*current.data).clone();
-        if data.get("metadata").and_then(Value::as_object).is_none() {
-            return Err(anyhow::anyhow!(
-                "delete_resource_without_watch_with_tombstone: {api_version}/{kind}/{name} is missing metadata"
-            ));
-        };
-        ensure_mark_delete_timestamps(&mut data, grace_seconds);
-        let mut updated = current;
-        updated.data = std::sync::Arc::new(data);
-
         let proposer = self.require_raft_proposer()?;
         let command = StorageCommand::DeleteResourceWithTombstone {
             api_version: api_version.to_string(),
@@ -535,8 +516,15 @@ impl DatastoreBackend for ReplicatedDatastore {
             preconditions,
             grace_seconds,
         };
-        self.propose_command_via_raft(&proposer, command).await?;
-        Ok(updated)
+        let applied = self.propose_command_via_raft(&proposer, command).await?;
+        match applied.applied_mutation {
+            Some(crate::datastore::raft::types::AppliedMutation::Resource(resource)) => {
+                Ok(resource)
+            }
+            None => Err(anyhow::anyhow!(
+                "raft-routed delete_resource_without_watch_with_tombstone: committed tombstone result missing for {api_version}/{kind}/{name}"
+            )),
+        }
     }
 
     async fn get_current_resource_version(&self) -> Result<i64> {
@@ -1240,7 +1228,8 @@ impl DatastoreBackend for ReplicatedDatastore {
             key: key.to_string(),
             value: value.to_string(),
         };
-        self.propose_command_via_raft(&proposer, command).await
+        self.propose_command_via_raft(&proposer, command).await?;
+        Ok(())
     }
 
     async fn list_outbox_stream_watermarks(

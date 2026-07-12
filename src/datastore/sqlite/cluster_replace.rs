@@ -4,7 +4,9 @@ use crate::bootstrap::cluster_meta::{
     KEY_CLUSTER_ID, KEY_LEADER_EPOCH, KEY_RAFT_LEADER_HINT, KEY_RAFT_TERM, KEY_RAFT_VOTERS,
 };
 use crate::datastore::sqlite::cluster_state_apply::ResourcePreconditionMode;
-use crate::datastore::types::{AppliedOutboxRecord, PendingWatchEvent, ReplicatedSnapshotMetadata};
+use crate::datastore::types::{
+    AppliedOutboxRecord, PendingWatchEvent, ReplicatedSnapshotMetadata, Resource,
+};
 use crate::log_apply::{
     ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark,
     ResourceVersionAssignment,
@@ -138,12 +140,13 @@ fn replace_resource_state_in_conn(
                 commit.resource_version, current_rv
             )));
         }
-        let (_applied_rv, commit_pending) = apply_commit_in_tx_with_watch_events(
-            &tx,
-            commit,
-            emit_synthetic_watch_events,
-            resource_precondition_mode,
-        )?;
+        let (_applied_rv, commit_pending, _applied_mutation) =
+            apply_commit_in_tx_with_watch_events(
+                &tx,
+                commit,
+                emit_synthetic_watch_events,
+                resource_precondition_mode,
+            )?;
         pending.extend(commit_pending);
     }
     if has_explicit_watch_history {
@@ -397,6 +400,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             result: crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: Some(Datastore::current_resource_version_in_tx(tx)?),
                 error_message: None,
+                applied_mutation: None,
             },
             pending: Vec::new(),
         });
@@ -420,7 +424,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
         )?;
 
         if last_applied_stamp.is_some_and(|last| incoming_stamp <= last) {
-            let (applied_rv, pending) = apply_commit_in_tx_with_watch_events(
+            let (applied_rv, pending, _applied_mutation) = apply_commit_in_tx_with_watch_events(
                 tx,
                 {
                     let mut outbox_commit = commit_with_outbox_rows_only(commit);
@@ -434,6 +438,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                 result: crate::datastore::raft::types::StorageCommandResult {
                     applied_rv: Some(applied_rv),
                     error_message: None,
+                    applied_mutation: None,
                 },
                 pending,
             });
@@ -441,13 +446,14 @@ pub(crate) fn apply_commit_in_tx_for_raft(
     }
 
     tx.execute("SAVEPOINT raft_apply_attempt", [])?;
-    match apply_commit_in_tx_returning_rv(tx, commit, resource_precondition_mode) {
-        Ok((rv, pending)) => {
+    match apply_commit_in_tx_returning_rv_and_mutation(tx, commit, resource_precondition_mode) {
+        Ok((rv, pending, applied_mutation)) => {
             tx.execute("RELEASE raft_apply_attempt", [])?;
             Ok(RaftLogApplyOutcome {
                 result: crate::datastore::raft::types::StorageCommandResult {
                     applied_rv: Some(rv),
                     error_message: None,
+                    applied_mutation,
                 },
                 pending,
             })
@@ -473,6 +479,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                 result: crate::datastore::raft::types::StorageCommandResult {
                     applied_rv: None,
                     error_message: Some(message),
+                    applied_mutation: None,
                 },
                 pending: Vec::new(),
             })
@@ -539,6 +546,20 @@ pub(crate) fn apply_commit_in_tx_returning_rv(
     commit: LogApplyCommit,
     resource_precondition_mode: ResourcePreconditionMode,
 ) -> tokio_rusqlite::Result<(i64, Vec<PendingWatchEvent>)> {
+    let (applied_rv, pending, _applied_mutation) =
+        apply_commit_in_tx_returning_rv_and_mutation(tx, commit, resource_precondition_mode)?;
+    Ok((applied_rv, pending))
+}
+
+fn apply_commit_in_tx_returning_rv_and_mutation(
+    tx: &rusqlite::Transaction<'_>,
+    commit: LogApplyCommit,
+    resource_precondition_mode: ResourcePreconditionMode,
+) -> tokio_rusqlite::Result<(
+    i64,
+    Vec<PendingWatchEvent>,
+    Option<crate::datastore::raft::types::AppliedMutation>,
+)> {
     let has_explicit_watch_history = commit
         .mutations
         .iter()
@@ -556,7 +577,11 @@ fn apply_commit_in_tx_with_watch_events(
     commit: LogApplyCommit,
     emit_watch_events: bool,
     resource_precondition_mode: ResourcePreconditionMode,
-) -> tokio_rusqlite::Result<(i64, Vec<PendingWatchEvent>)> {
+) -> tokio_rusqlite::Result<(
+    i64,
+    Vec<PendingWatchEvent>,
+    Option<crate::datastore::raft::types::AppliedMutation>,
+)> {
     if commit.resource_version < 0 {
         return Err(other_error(
             "log_apply commit resourceVersion must be non-negative",
@@ -571,12 +596,12 @@ fn apply_commit_in_tx_with_watch_events(
             upsert_outbox_watermark_in_tx(tx, watermark)?;
         }
         advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
-        return Ok((applied_rv, Vec::new()));
+        return Ok((applied_rv, Vec::new(), None));
     }
     match outbox_watermark_decision_in_tx(tx, watermark.as_ref())? {
         OutboxWatermarkDecision::Duplicate => {
             advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
-            return Ok((applied_rv, Vec::new()));
+            return Ok((applied_rv, Vec::new(), None));
         }
         OutboxWatermarkDecision::Gap { last_seq, next_seq } => {
             return Err(other_error(format!(
@@ -586,6 +611,7 @@ fn apply_commit_in_tx_with_watch_events(
         OutboxWatermarkDecision::Apply => {}
     }
     let mutation_count = commit.mutations.len();
+    let applied_mutation = applied_mutation_from_stamped_commit(&commit)?;
     let apply_start = std::time::Instant::now();
     let mut effects = ApplyEffects::new();
     let mut applier = RaftClusterStateApplier::new(tx);
@@ -610,7 +636,45 @@ fn apply_commit_in_tx_with_watch_events(
         pending.len(),
         emit_watch_events,
     );
-    Ok((applied_rv, pending))
+    Ok((applied_rv, pending, applied_mutation))
+}
+
+fn applied_mutation_from_stamped_commit(
+    commit: &LogApplyCommit,
+) -> tokio_rusqlite::Result<Option<crate::datastore::raft::types::AppliedMutation>> {
+    let Some(deleted_key) = commit.mutations.iter().find_map(|mutation| match mutation {
+        LogApplyMutation::DeleteResource(key) => Some(key),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    let Some(watch_row) = commit.mutations.iter().find_map(|mutation| match mutation {
+        LogApplyMutation::PutWatchEvent(row)
+            if row.event_type == "DELETED"
+                && row.api_version == deleted_key.api_version
+                && row.kind == deleted_key.kind
+                && row.namespace == deleted_key.namespace
+                && row.name == deleted_key.name
+                && row.resource_version == commit.resource_version =>
+        {
+            Some(row)
+        }
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        crate::datastore::raft::types::AppliedMutation::Resource(Resource {
+            id: 0,
+            api_version: watch_row.api_version.clone(),
+            kind: watch_row.kind.clone(),
+            namespace: watch_row.namespace.clone(),
+            name: watch_row.name.clone(),
+            uid: Resource::uid_from_data(&watch_row.data),
+            resource_version: watch_row.resource_version,
+            data: std::sync::Arc::new(watch_row.data.clone()),
+        }),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -862,11 +926,13 @@ fn storage_result_from_applied_outbox(
             Ok(crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: row.applied_rv,
                 error_message: Some(message),
+                applied_mutation: None,
             })
         }
         Ok(_) => Ok(crate::datastore::raft::types::StorageCommandResult {
             applied_rv: row.applied_rv,
             error_message: None,
+            applied_mutation: None,
         }),
         Err(err) => Err(other_error(format!(
             "failed to decode applied_outbox result: {err}"

@@ -683,7 +683,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
     async fn propose_command(
         &self,
         command: crate::datastore::command::StorageCommand,
-    ) -> Result<()> {
+    ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         self.ensure_local_leader_for_commit_materialization()?;
         let operation = derive_operation_label(&command);
         // Flow-control gate: acquire a permit BEFORE commit materialization. The
@@ -708,7 +708,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
         if let Some(message) = apply_result.error_message {
             return Err(anyhow::anyhow!(message));
         }
-        Ok(())
+        Ok(apply_result)
     }
 
     /// T6 step 4c: propose an outbox-flavored write through raft.
