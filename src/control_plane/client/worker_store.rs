@@ -1483,13 +1483,14 @@ impl DatastoreBackend for WorkerStoreAdapter {
             .event_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if targets.iter().any(|target| {
-            ReplayRetentionBoundary::classify_all(
-                worker_replay_boundaries(&history, target),
-                position,
-            ) == ReplayAvailability::Expired
-        }) {
-            return Ok(SnapshotAtRv::Expired);
+        for target in targets {
+            let boundaries = worker_replay_boundaries(&history, target);
+            if ReplayRetentionBoundary::classify_all(boundaries.iter().copied(), position)
+                == ReplayAvailability::Expired
+                || !boundaries.is_empty()
+            {
+                return Ok(SnapshotAtRv::Expired);
+            }
         }
 
         let mut resources = HashMap::<ReflectedResourceKey, Resource>::new();
@@ -3263,6 +3264,73 @@ mod tests {
         assert!(
             second_events.is_empty(),
             "resumed worker replay must not return resources at or below the resume RV"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_snapshot_expires_after_compaction_can_hide_unchanged_live_objects() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-snapshot-compaction-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+        adapter.publish_watch(WatchEvent::added(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "namespace": "default",
+                "name": "unchanged-live",
+                "uid": "uid-unchanged-live",
+                "resourceVersion": "1"
+            }
+        })));
+
+        for index in 0..WORKER_WATCH_EVENT_HISTORY_CAPACITY {
+            let rv = index + 2;
+            adapter.publish_watch(WatchEvent::added(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "namespace": "default",
+                    "name": format!("noise-{index}"),
+                    "uid": format!("uid-noise-{index}"),
+                    "resourceVersion": rv.to_string()
+                }
+            })));
+        }
+
+        let target = [WatchTarget::namespaced_in_namespace(
+            "v1",
+            "ConfigMap",
+            "default",
+        )];
+        let position = adapter
+            .current_watch_replay_position()
+            .await
+            .expect("worker replay position");
+        assert!(
+            position.event_id > WORKER_WATCH_EVENT_HISTORY_CAPACITY as i64,
+            "test must force worker watch-history compaction"
+        );
+        let snapshot = adapter
+            .snapshot_resources_at_position(&target, None, None, position)
+            .await
+            .expect("worker snapshot");
+        assert!(
+            matches!(snapshot, SnapshotAtRv::Expired),
+            "worker snapshots must fail closed after compaction because unchanged live objects can have no retained establishing event"
         );
     }
 
