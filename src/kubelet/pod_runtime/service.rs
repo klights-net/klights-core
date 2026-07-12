@@ -257,7 +257,9 @@ use crate::kubelet::pod_runtime::probes::{ProbeRuntime, StartupFinalizationActio
 use crate::kubelet::pod_runtime::repository::{LivePodUidCheck, PodRuntimeRepository};
 use crate::kubelet::pod_runtime::status_emitter::PodStatusEmitter;
 use crate::kubelet::pod_runtime::status_helpers::{
-    replace_container_status, restart_last_state_from_reconciled_status,
+    EphemeralContainerStatusInput, build_ephemeral_container_status, cri_timestamp_from_ns,
+    pod_status_container_id_by_name, pod_status_container_name_by_id, pod_status_host_ip,
+    pod_status_ip, replace_container_status, restart_last_state_from_reconciled_status,
     restart_last_state_from_runtime_status, restarted_running_container_status,
     runtime_status_container_id,
 };
@@ -309,76 +311,6 @@ struct ReconcileContainerInfo {
     termination_message: String,
 }
 
-fn pod_status_container_name_by_id(
-    pod: &serde_json::Value,
-) -> std::collections::HashMap<String, String> {
-    let mut name_by_id = std::collections::HashMap::new();
-    let Some(statuses) = pod
-        .pointer("/status/containerStatuses")
-        .and_then(|v| v.as_array())
-    else {
-        return name_by_id;
-    };
-
-    for status in statuses {
-        let id = status
-            .get("containerID")
-            .and_then(|id| id.as_str())
-            .map(|id| id.strip_prefix("containerd://").unwrap_or(id).to_string());
-        let name = status
-            .get("name")
-            .and_then(|name| name.as_str())
-            .map(str::to_string);
-        if let (Some(id), Some(name)) = (id, name) {
-            name_by_id.insert(id, name);
-        }
-    }
-    name_by_id
-}
-
-fn pod_status_container_id_by_name(
-    pod: &serde_json::Value,
-    container_name: &str,
-) -> Option<String> {
-    pod.pointer("/status/containerStatuses")
-        .and_then(|v| v.as_array())
-        .and_then(|statuses| {
-            statuses.iter().find(|status| {
-                status.get("name").and_then(|name| name.as_str()) == Some(container_name)
-            })
-        })
-        .and_then(|status| status.get("containerID"))
-        .and_then(|id| id.as_str())
-        .map(|id| id.strip_prefix("containerd://").unwrap_or(id).to_string())
-        .filter(|id| !id.is_empty())
-}
-
-fn pod_status_ip(pod: &serde_json::Value) -> &str {
-    pod.pointer("/status/podIP")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            pod.pointer("/status/podIPs")
-                .and_then(|v| v.as_array())
-                .and_then(|ips| ips.first())
-                .and_then(|entry| entry.get("ip"))
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("")
-}
-
-fn pod_status_host_ip(pod: &serde_json::Value) -> Option<&str> {
-    pod.pointer("/status/hostIP")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            pod.pointer("/status/hostIPs")
-                .and_then(|v| v.as_array())
-                .and_then(|ips| ips.first())
-                .and_then(|entry| entry.get("ip"))
-                .and_then(|v| v.as_str())
-        })
-        .filter(|ip| !ip.trim().is_empty())
-}
-
 fn managed_hosts_file_path(
     containerd_namespace: &str,
     key: &PodRuntimeKey,
@@ -416,80 +348,6 @@ fn append_managed_hosts_mount(mounts: &mut Vec<k8s_cri::v1::Mount>, hosts_file_p
         recursive_read_only: false,
     });
 }
-fn cri_timestamp_from_ns(ns: i64) -> String {
-    if ns <= 0 {
-        return crate::utils::k8s_timestamp();
-    }
-    let secs = ns / 1_000_000_000;
-    let sub_ns = (ns % 1_000_000_000) as u32;
-    chrono::DateTime::from_timestamp(secs, sub_ns)
-        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.%fZ").to_string())
-        .unwrap_or_else(crate::utils::k8s_timestamp)
-}
-
-struct EphemeralContainerStatusInput<'a> {
-    container_name: &'a str,
-    container_id: Option<&'a str>,
-    state: i32,
-    started_at_ns: i64,
-    finished_at_ns: i64,
-    exit_code: i32,
-    image: &'a str,
-    image_ref: &'a str,
-}
-
-fn build_ephemeral_container_status(input: EphemeralContainerStatusInput<'_>) -> serde_json::Value {
-    let EphemeralContainerStatusInput {
-        container_name,
-        container_id,
-        state,
-        started_at_ns,
-        finished_at_ns,
-        exit_code,
-        image,
-        image_ref,
-    } = input;
-    let state_obj = match state {
-        state if state == k8s_cri::v1::ContainerState::ContainerRunning as i32 => {
-            serde_json::json!({
-                "running": {
-                    "startedAt": cri_timestamp_from_ns(started_at_ns)
-                }
-            })
-        }
-        state if state == k8s_cri::v1::ContainerState::ContainerExited as i32 => {
-            serde_json::json!({
-                "terminated": {
-                    "exitCode": exit_code,
-                    "reason": if exit_code == 0 { "Completed" } else { "Error" },
-                    "startedAt": cri_timestamp_from_ns(started_at_ns),
-                    "finishedAt": cri_timestamp_from_ns(finished_at_ns),
-                }
-            })
-        }
-        _ => serde_json::json!({
-            "waiting": {
-                "reason": "ContainerCreating"
-            }
-        }),
-    };
-
-    let mut status = serde_json::json!({
-        "name": container_name,
-        "state": state_obj,
-        "ready": state == k8s_cri::v1::ContainerState::ContainerRunning as i32,
-        "started": state == k8s_cri::v1::ContainerState::ContainerRunning as i32
-            || state == k8s_cri::v1::ContainerState::ContainerExited as i32,
-        "restartCount": 0,
-        "image": image,
-        "imageID": image_ref,
-    });
-    if let Some(id) = container_id {
-        status["containerID"] = serde_json::json!(format!("containerd://{}", id));
-    }
-    status
-}
-
 /// Production `PodRuntimeService` orchestrating CRI, CNI, volumes,
 /// filesystem, probes, hostports, events, and actor-owned deletion.
 pub struct RealPodRuntimeService {
