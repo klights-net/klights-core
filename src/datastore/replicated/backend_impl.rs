@@ -1496,6 +1496,64 @@ impl crate::datastore::NamespaceStore for ReplicatedDatastore {
 }
 
 #[async_trait]
+impl crate::datastore::WatchHistoryStore for ReplicatedDatastore {
+    async fn list_cluster_resources_modified_since(
+        &self,
+        api_version: &str,
+        kind: &str,
+        since_rv: i64,
+    ) -> Result<Vec<CatchUpResource>> {
+        crate::datastore::DatastoreBackend::list_cluster_resources_modified_since(
+            self,
+            api_version,
+            kind,
+            since_rv,
+        )
+        .await
+    }
+
+    async fn list_resources_modified_since(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        since_rv: i64,
+    ) -> Result<Vec<CatchUpResource>> {
+        crate::datastore::DatastoreBackend::list_resources_modified_since(
+            self,
+            api_version,
+            kind,
+            namespace,
+            since_rv,
+        )
+        .await
+    }
+
+    async fn list_all_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
+        crate::datastore::DatastoreBackend::list_all_watch_events_since(self, since_rv).await
+    }
+
+    async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
+        crate::datastore::DatastoreBackend::list_deleted_watch_events_since(self, since_rv).await
+    }
+
+    async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64> {
+        crate::datastore::DatastoreBackend::advance_resource_version_after(self, min_rv).await
+    }
+
+    async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
+        crate::datastore::DatastoreBackend::watch_events_gc_prunable_count(
+            self, max_rows, batch_cap,
+        )
+        .await
+    }
+
+    async fn gc_watch_events(&self, max_rows: i64, batch_cap: i64) -> Result<usize> {
+        crate::datastore::DatastoreBackend::gc_watch_events(self, max_rows, batch_cap).await
+    }
+}
+
+#[async_trait]
 impl crate::datastore::NamespaceContentStore for ReplicatedDatastore {
     async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
         crate::datastore::DatastoreBackend::list_namespace_resources(self, namespace).await
@@ -1624,5 +1682,186 @@ impl crate::datastore::MetaStore for ReplicatedDatastore {
 
     async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
         crate::datastore::DatastoreBackend::set_klights_meta(self, key, value).await
+    }
+}
+
+#[async_trait]
+impl crate::datastore::NetworkStore for ReplicatedDatastore {
+    async fn record_sandbox(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        sandbox_id: &str,
+    ) -> Result<()> {
+        crate::datastore::DatastoreBackend::record_sandbox(
+            self, namespace, pod_name, pod_uid, sandbox_id,
+        )
+        .await
+    }
+
+    async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
+        crate::datastore::DatastoreBackend::get_sandbox(self, namespace, pod_name).await
+    }
+
+    async fn delete_sandbox(&self, namespace: &str, pod_name: &str) -> Result<()> {
+        crate::datastore::DatastoreBackend::delete_sandbox(self, namespace, pod_name).await
+    }
+
+    async fn delete_sandbox_for_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        sandbox_id: &str,
+    ) -> Result<()> {
+        crate::datastore::DatastoreBackend::delete_sandbox_for_uid(
+            self, namespace, pod_name, pod_uid, sandbox_id,
+        )
+        .await
+    }
+
+    async fn delete_pod_network(&self, sandbox_id: &str) -> Result<()> {
+        crate::datastore::DatastoreBackend::delete_pod_network(self, sandbox_id).await
+    }
+
+    async fn get_pod_network(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<crate::datastore::PodNetworkEndpoint>> {
+        crate::datastore::DatastoreBackend::get_pod_network(self, sandbox_id).await
+    }
+}
+
+#[async_trait]
+impl crate::datastore::NetworkMetadataStore for ReplicatedDatastore {
+    async fn get_sandbox_for_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<String>> {
+        crate::datastore::DatastoreBackend::get_sandbox_for_uid(self, namespace, pod_name, pod_uid)
+            .await
+    }
+
+    async fn get_pod_network_for_pod(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<crate::datastore::PodNetworkEndpoint>> {
+        crate::datastore::DatastoreBackend::get_pod_network_for_pod(
+            self, namespace, pod_name, pod_uid,
+        )
+        .await
+    }
+
+    async fn ipam_allocate_and_record_pod_network(
+        &self,
+        sandbox_id: &str,
+        pod: &crate::pod_identity::PodIdentity,
+        subnet_base_int: u32,
+        subnet_size: u32,
+        veth_host: &str,
+        netns_path: &str,
+    ) -> Result<(String, u32)> {
+        crate::datastore::DatastoreBackend::ipam_allocate_and_record_pod_network(
+            self,
+            sandbox_id,
+            pod,
+            subnet_base_int,
+            subnet_size,
+            veth_host,
+            netns_path,
+        )
+        .await
+    }
+
+    async fn list_sandboxes(&self) -> Result<Vec<crate::datastore::SandboxRef>> {
+        crate::datastore::DatastoreBackend::list_sandboxes(self).await
+    }
+
+    async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
+        crate::datastore::DatastoreBackend::list_pod_network_sandbox_ids(self).await
+    }
+
+    async fn allocate_node_subnet(
+        &self,
+        node_name: &str,
+        cluster_cidr: &str,
+        node_ip: &str,
+    ) -> Result<crate::datastore::NodeSubnet> {
+        crate::datastore::DatastoreBackend::allocate_node_subnet(
+            self,
+            node_name,
+            cluster_cidr,
+            node_ip,
+        )
+        .await
+    }
+
+    async fn update_node_peer_attributes(
+        &self,
+        node_name: &str,
+        mode: crate::controllers::annotations::NodePeerMode,
+        hostport_range: Option<crate::networking::types::HostPortRange>,
+    ) -> Result<()> {
+        crate::datastore::DatastoreBackend::update_node_peer_attributes(
+            self,
+            node_name,
+            mode,
+            hostport_range,
+        )
+        .await
+    }
+
+    async fn update_node_dataplane(
+        &self,
+        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+    ) -> Result<()> {
+        crate::datastore::DatastoreBackend::update_node_dataplane(self, metadata).await
+    }
+
+    async fn get_node_dataplane(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+        crate::datastore::DatastoreBackend::get_node_dataplane(self, node_name).await
+    }
+
+    async fn get_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<crate::datastore::NodeSubnet>> {
+        crate::datastore::DatastoreBackend::get_node_subnet(self, node_name).await
+    }
+
+    async fn list_peer_subnets(
+        &self,
+        my_node_name: &str,
+    ) -> Result<Vec<crate::datastore::NodeSubnet>> {
+        crate::datastore::DatastoreBackend::list_peer_subnets(self, my_node_name).await
+    }
+
+    async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
+        crate::datastore::DatastoreBackend::delete_node_subnet(self, node_name).await
+    }
+
+    async fn pod_endpoint_get_by_pod_ip(
+        &self,
+        pod_ip: std::net::Ipv4Addr,
+    ) -> Result<Option<crate::datastore::PodEndpointRow>> {
+        crate::datastore::DatastoreBackend::pod_endpoint_get_by_pod_ip(self, pod_ip).await
+    }
+
+    async fn pod_endpoint_list_all(&self) -> Result<Vec<crate::datastore::PodEndpointRow>> {
+        crate::datastore::DatastoreBackend::pod_endpoint_list_all(self).await
+    }
+
+    fn subscribe_pod_endpoints(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::datastore::PodEndpointEvent> {
+        crate::datastore::DatastoreBackend::subscribe_pod_endpoints(self)
     }
 }
