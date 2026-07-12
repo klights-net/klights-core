@@ -379,6 +379,7 @@ impl WorkerStoreAdapter {
         // a sustained leader/WAN outage cannot become a fixed-interval
         // reconnect storm across every watch scope.
         let mut reconnect_attempt: u32 = 0;
+        let mut immediate_expiry_relist_available = true;
         loop {
             if cancel.is_cancelled() {
                 return;
@@ -428,6 +429,7 @@ impl WorkerStoreAdapter {
                                 match event {
                                     Some(Ok(event)) => {
                                         reconnect_attempt = 0;
+                                        immediate_expiry_relist_available = true;
                                         let event_rv = event.event.resource_version();
                                         let resume_position = event.resume_position;
                                         let matches = super::watch_request_matches_event(
@@ -487,26 +489,27 @@ impl WorkerStoreAdapter {
                                     }
                                     Some(Err(err)) => {
                                         if is_watch_window_expired(&err) {
-                                            // Replay-window expiration (gRPC
-                                            // OUT_OF_RANGE, the K8s "too old
-                                            // resource version" / HTTP 410
-                                            // contract): the leader GC'd past
-                                            // our resume bookmark and the
-                                            // in-scope events in the gap are
-                                            // gone. Relist from a fresh
-                                            // snapshot instead of reconnecting
-                                            // at the stale bookmark, which
-                                            // would loop on the same
-                                            // expiration and never recover the
-                                            // missing events.
+                                            // Replay-window expiration: the
+                                            // leader GC'd past our resume
+                                            // bookmark and the in-scope events
+                                            // in the gap are gone. Relist from
+                                            // a fresh snapshot once immediately
+                                            // instead of retrying the stale
+                                            // bookmark, then use reconnect
+                                            // backoff if the leader keeps
+                                            // declaring the fresh handoff
+                                            // expired.
                                             tracing::info!(
                                                 error = %err,
                                                 "worker store watch mirror replay window expired; relisting"
                                             );
                                             next_resource_version = None;
                                             next_watch_replay_position = None;
-                                            reconnect_attempt = 0;
-                                            relist_required = true;
+                                            if immediate_expiry_relist_available {
+                                                immediate_expiry_relist_available = false;
+                                                reconnect_attempt = 0;
+                                                relist_required = true;
+                                            }
                                             break;
                                         }
                                         tracing::warn!(error = %err, "worker store watch mirror failed");
@@ -532,8 +535,11 @@ impl WorkerStoreAdapter {
                         );
                         next_resource_version = None;
                         next_watch_replay_position = None;
-                        reconnect_attempt = 0;
-                        continue;
+                        if immediate_expiry_relist_available {
+                            immediate_expiry_relist_available = false;
+                            reconnect_attempt = 0;
+                            continue;
+                        }
                     }
                     tracing::warn!(error = %err, "worker store watch mirror could not open stream");
                 }
@@ -796,11 +802,11 @@ async fn sleep_before_watch_mirror_reconnect(
 }
 
 /// True when a worker watch-stream error is a replay-window expiration
-/// (gRPC `OUT_OF_RANGE`, the Kubernetes "too old resource version" / HTTP 410
-/// contract). The leader returns it from `replay_watch_events_after` when the
-/// durable `watch_events` window no longer covers the worker's resume bookmark;
-/// the reflector must relist from a fresh snapshot rather than retry the stale
-/// bookmark, which would loop on the same expiration.
+/// (the Kubernetes "too old resource version" / HTTP 410 contract). The leader
+/// returns a typed WatchResources marker when the durable `watch_events` window
+/// no longer covers the worker's resume bookmark; the reflector must relist
+/// from a fresh snapshot rather than retry the stale bookmark, which would loop
+/// on the same expiration.
 ///
 /// The tonic::Status is carried as the error source by the gRPC client (see
 /// `watch_resources_rpc`), so walk the anyhow chain to find and inspect it.
@@ -808,7 +814,7 @@ fn is_watch_window_expired(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<tonic::Status>()
-            .is_some_and(|s| s.code() == tonic::Code::OutOfRange)
+            .is_some_and(crate::replication::grpc::is_watch_replay_expired_status)
     })
 }
 
@@ -2200,27 +2206,60 @@ mod tests {
     }
 
     #[test]
-    fn is_watch_window_expired_detects_out_of_range_in_error_chain() {
-        // OutOfRange (replay window expired) carried as the error source ->
-        // relist required. The gRPC client preserves the tonic::Status as the
-        // chain source, so it must be found even when wrapped in a context.
-        let err = anyhow::Error::from(tonic::Status::out_of_range("expired"))
+    fn is_watch_window_expired_requires_typed_replay_marker() {
+        let marked = crate::replication::grpc::watch_replay_expired_status(41, "expired");
+        let err = anyhow::Error::from(marked).context("gRPC WatchResources stream failed");
+        assert!(
+            is_watch_window_expired(&err),
+            "typed replay-expired status must trigger a relist"
+        );
+
+        let wrapped = crate::replication::grpc::watch_replay_expired_status(42, "expired");
+        let err = anyhow::Error::from(wrapped)
+            .context("inner wrapper")
             .context("gRPC WatchResources stream failed");
         assert!(
             is_watch_window_expired(&err),
-            "OutOfRange status must trigger a relist"
+            "typed replay-expired status must be detected through wrappers"
         );
 
-        // Any other gRPC code is a transport/processing error, not an
-        // expiration: keep the bookmark and reconnect (with backoff).
-        let err = anyhow::Error::from(tonic::Status::unavailable("transport gone"))
-            .context("gRPC WatchResources stream failed");
-        assert!(
-            !is_watch_window_expired(&err),
-            "non-OutOfRange gRPC errors must not trigger a relist"
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            crate::replication::grpc::WATCH_REPLAY_EXPIRED_REASON_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(
+                crate::replication::grpc::WATCH_REPLAY_EXPIRED_REASON,
+            ),
+        );
+        let malformed_marker = tonic::Status::with_details_and_metadata(
+            tonic::Code::OutOfRange,
+            "expired",
+            bytes::Bytes::from_static(b"not protobuf"),
+            metadata,
         );
 
-        // A plain non-tonic error is not an expiration.
+        let cases = [
+            (
+                tonic::Status::out_of_range("expired but unmarked"),
+                "unmarked OutOfRange",
+            ),
+            (
+                tonic::Status::out_of_range("message exceeds configured maximum size"),
+                "message-size OutOfRange",
+            ),
+            (
+                tonic::Status::unavailable("transport gone"),
+                "non-OutOfRange gRPC error",
+            ),
+            (malformed_marker, "malformed replay-expired details"),
+        ];
+        for (status, name) in cases {
+            let err = anyhow::Error::from(status).context("gRPC WatchResources stream failed");
+            assert!(
+                !is_watch_window_expired(&err),
+                "{name} must not trigger a relist"
+            );
+        }
+
         assert!(
             !is_watch_window_expired(&anyhow!("some other failure")),
             "non-tonic errors must not trigger a relist"
@@ -2662,10 +2701,53 @@ mod tests {
         let _ = handle.join().await;
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Copy)]
+    enum OpenExpiryMode {
+        TypedOnce,
+        TypedAlways,
+        UnmarkedOnce,
+    }
+
     struct OpenExpiredThenRelistLeaderApi {
         list_count: AtomicUsize,
         watch_count: AtomicUsize,
+        watch_attempted: tokio::sync::Notify,
+        expiry_mode: OpenExpiryMode,
+    }
+
+    impl OpenExpiredThenRelistLeaderApi {
+        fn typed_expiry() -> Self {
+            Self {
+                list_count: AtomicUsize::new(0),
+                watch_count: AtomicUsize::new(0),
+                watch_attempted: tokio::sync::Notify::new(),
+                expiry_mode: OpenExpiryMode::TypedOnce,
+            }
+        }
+
+        fn repeated_typed_expiry() -> Self {
+            Self {
+                list_count: AtomicUsize::new(0),
+                watch_count: AtomicUsize::new(0),
+                watch_attempted: tokio::sync::Notify::new(),
+                expiry_mode: OpenExpiryMode::TypedAlways,
+            }
+        }
+
+        fn unmarked_out_of_range() -> Self {
+            Self {
+                list_count: AtomicUsize::new(0),
+                watch_count: AtomicUsize::new(0),
+                watch_attempted: tokio::sync::Notify::new(),
+                expiry_mode: OpenExpiryMode::UnmarkedOnce,
+            }
+        }
+
+        async fn wait_for_watch_attempts(&self, expected: usize) {
+            while self.watch_count.load(Ordering::SeqCst) < expected {
+                self.watch_attempted.notified().await;
+            }
+        }
     }
 
     #[async_trait]
@@ -2740,14 +2822,34 @@ mod tests {
                 Some("spec.nodeName=worker-a")
             );
             let attempt = self.watch_count.fetch_add(1, Ordering::SeqCst);
-            if attempt == 0 {
-                assert_eq!(req.start_resource_version, Some(41));
-                return Err(anyhow::Error::from(tonic::Status::out_of_range(
-                    "WatchResources replay window expired: resume rv 41 requires relist",
-                ))
-                .context("gRPC WatchResources failed"));
+            self.watch_attempted.notify_waiters();
+            let should_expire =
+                attempt == 0 || matches!(self.expiry_mode, OpenExpiryMode::TypedAlways);
+            if should_expire {
+                let expected_rv = if attempt == 0 { 41 } else { 52 };
+                assert_eq!(req.start_resource_version, Some(expected_rv));
+                let status = match self.expiry_mode {
+                    OpenExpiryMode::TypedOnce | OpenExpiryMode::TypedAlways => {
+                        crate::replication::grpc::watch_replay_expired_status(
+                            expected_rv,
+                            format!(
+                                "WatchResources replay window expired: resume rv {expected_rv} requires relist"
+                            ),
+                        )
+                    }
+                    OpenExpiryMode::UnmarkedOnce => {
+                        tonic::Status::out_of_range("message exceeds configured maximum size")
+                    }
+                };
+                return Err(anyhow::Error::from(status).context("gRPC WatchResources failed"));
             }
-            assert_eq!(req.start_resource_version, Some(52));
+            assert_eq!(
+                req.start_resource_version,
+                Some(match self.expiry_mode {
+                    OpenExpiryMode::TypedOnce | OpenExpiryMode::TypedAlways => 52,
+                    OpenExpiryMode::UnmarkedOnce => 41,
+                })
+            );
             Ok(Box::pin(futures::stream::pending()))
         }
 
@@ -3628,7 +3730,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_mirror_relists_after_open_time_replay_window_expiration() {
-        let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::default());
+        let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::typed_expiry());
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
@@ -3693,7 +3795,142 @@ mod tests {
         );
         assert!(
             cluster_api.list_count.load(Ordering::SeqCst) >= 2,
-            "open-time OutOfRange must force a fresh LIST"
+            "open-time typed replay expiry must force a fresh LIST"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_mirror_unmarked_out_of_range_reconnects_without_relist() {
+        let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::unmarked_out_of_range());
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor.clone(),
+            None,
+            "sqlite:worker-store-watch-unmarked-out-of-range-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = Arc::new(WorkerStoreAdapter::new(
+            cluster_api.clone(),
+            node_local,
+            "worker-a".to_string(),
+        ));
+        configure_successful_pod_router(&adapter);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let driver_adapter = adapter.clone();
+        let driver_supervisor = supervisor.clone();
+        let driver_cancel = cancel.clone();
+        let handle = supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::Network,
+                "worker_store_watch_unmarked_out_of_range_test",
+                async move {
+                    driver_adapter
+                        .run_watch_mirror(
+                            WatchRequest {
+                                api_version: "v1".to_string(),
+                                kind: "Pod".to_string(),
+                                namespace: None,
+                                label_selector: None,
+                                field_selector: Some("spec.nodeName=worker-a".to_string()),
+                                start_resource_version: None,
+                                start_watch_replay_position: None,
+                            },
+                            driver_supervisor,
+                            driver_cancel,
+                        )
+                        .await;
+                },
+            )
+            .await
+            .expect("spawn mirror driver");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cluster_api.wait_for_watch_attempts(2),
+        )
+        .await
+        .expect("unmarked OutOfRange should reconnect without requiring a relist");
+        cancel.cancel();
+        let _ = handle.join().await;
+
+        assert_eq!(
+            cluster_api.list_count.load(Ordering::SeqCst),
+            1,
+            "unmarked OutOfRange must keep the safe resume position and avoid authoritative LIST"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_mirror_repeated_expiry_backs_off_before_next_relist() {
+        let cluster_api = Arc::new(OpenExpiredThenRelistLeaderApi::repeated_typed_expiry());
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor.clone(),
+            None,
+            "sqlite:worker-store-watch-repeated-expiry-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = Arc::new(WorkerStoreAdapter::new(
+            cluster_api.clone(),
+            node_local,
+            "worker-a".to_string(),
+        ));
+        configure_successful_pod_router(&adapter);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let driver_adapter = adapter.clone();
+        let driver_supervisor = supervisor.clone();
+        let driver_cancel = cancel.clone();
+        let handle = supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::Network,
+                "worker_store_watch_repeated_expiry_test",
+                async move {
+                    driver_adapter
+                        .run_watch_mirror(
+                            WatchRequest {
+                                api_version: "v1".to_string(),
+                                kind: "Pod".to_string(),
+                                namespace: None,
+                                label_selector: None,
+                                field_selector: Some("spec.nodeName=worker-a".to_string()),
+                                start_resource_version: None,
+                                start_watch_replay_position: None,
+                            },
+                            driver_supervisor,
+                            driver_cancel,
+                        )
+                        .await;
+                },
+            )
+            .await
+            .expect("spawn mirror driver");
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            cluster_api.wait_for_watch_attempts(2),
+        )
+        .await
+        .expect("second typed expiry should be observed");
+        assert_eq!(
+            cluster_api.list_count.load(Ordering::SeqCst),
+            2,
+            "first typed expiry should get exactly one immediate relist"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        let _ = handle.join().await;
+
+        assert_eq!(
+            cluster_api.list_count.load(Ordering::SeqCst),
+            2,
+            "second consecutive typed expiry must back off instead of immediately relisting again"
         );
     }
 

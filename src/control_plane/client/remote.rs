@@ -314,6 +314,7 @@ impl RemoteApiClient {
                 Err(err) => {
                     if watch_error_requires_relist(&err) {
                         next_resource_version = None;
+                        next_watch_replay_position = None;
                     }
                     tracing::warn!(
                         api_version = %req.api_version,
@@ -410,8 +411,11 @@ fn resource_event_version(event: &ResourceEvent) -> Option<i64> {
 }
 
 fn watch_error_requires_relist(err: &anyhow::Error) -> bool {
-    let message = err.to_string().to_ascii_lowercase();
-    message.contains("410") || message.contains("gone") || message.contains("outofrange")
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(crate::replication::grpc::is_watch_replay_expired_status)
+    })
 }
 
 #[async_trait]
@@ -699,6 +703,7 @@ impl OutboxApplyClient for RemoteApiClient {
 mod tests {
     use std::sync::Arc;
 
+    use anyhow::anyhow;
     use bytes::Bytes;
     use futures::StreamExt as _;
     use serde_json::json;
@@ -859,6 +864,67 @@ mod tests {
                 .encode_protobuf()
                 .expect("encode outbox payload"),
         )
+    }
+
+    #[test]
+    fn watch_error_requires_relist_requires_typed_replay_marker() {
+        let marked = crate::replication::grpc::watch_replay_expired_status(51, "expired");
+        let err = anyhow::Error::from(marked).context("gRPC WatchResources failed");
+        assert!(
+            super::watch_error_requires_relist(&err),
+            "typed replay-expired status must trigger relist"
+        );
+
+        let wrapped = crate::replication::grpc::watch_replay_expired_status(52, "expired");
+        let err = anyhow::Error::from(wrapped)
+            .context("inner wrapper")
+            .context("gRPC WatchResources stream failed");
+        assert!(
+            super::watch_error_requires_relist(&err),
+            "typed replay-expired status must be detected through wrappers"
+        );
+
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            crate::replication::grpc::WATCH_REPLAY_EXPIRED_REASON_METADATA_KEY,
+            tonic::metadata::MetadataValue::from_static(
+                crate::replication::grpc::WATCH_REPLAY_EXPIRED_REASON,
+            ),
+        );
+        let malformed_marker = tonic::Status::with_details_and_metadata(
+            tonic::Code::OutOfRange,
+            "expired",
+            Bytes::from_static(b"not protobuf"),
+            metadata,
+        );
+
+        let cases = [
+            (
+                tonic::Status::out_of_range("expired but unmarked"),
+                "unmarked OutOfRange",
+            ),
+            (
+                tonic::Status::out_of_range("message exceeds configured maximum size"),
+                "message-size OutOfRange",
+            ),
+            (
+                tonic::Status::unavailable("transport gone"),
+                "non-OutOfRange gRPC error",
+            ),
+            (malformed_marker, "malformed replay-expired details"),
+        ];
+        for (status, name) in cases {
+            let err = anyhow::Error::from(status).context("gRPC WatchResources stream failed");
+            assert!(
+                !super::watch_error_requires_relist(&err),
+                "{name} must not trigger relist"
+            );
+        }
+
+        assert!(
+            !super::watch_error_requires_relist(&anyhow!("410 Gone: too old resourceVersion")),
+            "display text alone must not trigger relist"
+        );
     }
 
     #[tokio::test]

@@ -328,6 +328,12 @@ message WatchReplayPosition {
   int64 resource_version_filter_through_event_id = 3;
 }
 
+// Typed grpc-status-details payload for WatchResources replay-window expiry.
+message WatchReplayExpiredDetails {
+  string reason = 1;
+  int64 accepted_resource_version = 2;
+}
+
 message WatchResourcesRequest {
   string api_version = 1;
   string kind = 2;

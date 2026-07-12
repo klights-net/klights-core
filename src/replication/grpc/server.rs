@@ -15,8 +15,8 @@ use crate::metrics::{
 };
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use crate::replication::grpc::{
-    JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, watch_replay_position_from_proto,
-    watch_replay_position_to_proto,
+    JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, watch_replay_expired_status,
+    watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
 use crate::replication::protocol::{
     ExecStreamChannel, FollowerControlMessage, JoinResponse, JoinRole, NodeExecRequest,
@@ -2062,9 +2062,12 @@ fn watch_heartbeat_proto(
 
 fn watch_cursor_error_to_status(err: crate::watch::WatchCursorError, accepted_rv: i64) -> Status {
     match err {
-        crate::watch::WatchCursorError::Expired => Status::out_of_range(format!(
-            "WatchResources replay window expired: resume rv {accepted_rv} requires relist"
-        )),
+        crate::watch::WatchCursorError::Expired => watch_replay_expired_status(
+            accepted_rv,
+            format!(
+                "WatchResources replay window expired: resume rv {accepted_rv} requires relist"
+            ),
+        ),
         crate::watch::WatchCursorError::Replay(err) => {
             Status::internal(format!("replay WatchResources failed: {err}"))
         }
@@ -3339,8 +3342,8 @@ mod tests {
             .expect_err("expired replay must be surfaced as an error");
         assert_eq!(status.code(), tonic::Code::OutOfRange);
         assert!(
-            status.message().contains("requires relist"),
-            "status should tell the worker to relist, got {status:?}"
+            crate::replication::grpc::is_watch_replay_expired_status(&status),
+            "status should carry the typed replay-expired marker, got {status:?}"
         );
     }
 

@@ -896,9 +896,9 @@ mod cases {
             err.chain().any(|cause| {
                 cause
                     .downcast_ref::<tonic::Status>()
-                    .is_some_and(|status| status.code() == tonic::Code::OutOfRange)
+                    .is_some_and(crate::replication::grpc::is_watch_replay_expired_status)
             }),
-            "worker relist detection depends on preserving the tonic OutOfRange source: {err:#}"
+            "worker relist detection depends on preserving the typed replay-expired status: {err:#}"
         );
 
         stale_handle.abort();
