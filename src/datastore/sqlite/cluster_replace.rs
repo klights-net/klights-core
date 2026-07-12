@@ -168,14 +168,13 @@ fn replace_resource_state_in_conn(
     }
     if let Some(floors) = watch_replay_floors {
         for floor in floors {
-            if floor.floor_resource_version < 0
-                || (floor.position_is_exact && floor.floor_event_id < 0)
-            {
+            let position_is_exact = floor.position_is_exact || floor.floor_event_id > 0;
+            if floor.floor_resource_version < 0 || (position_is_exact && floor.floor_event_id < 0) {
                 return Err(other_error(
                     "snapshot watch replay floor must be non-negative",
                 ));
             }
-            if floor.position_is_exact
+            if position_is_exact
                 && watch_event_high_water
                     .is_some_and(|high_water| floor.floor_event_id > high_water)
             {
@@ -195,7 +194,7 @@ fn replace_resource_state_in_conn(
                     floor.namespace_key,
                     floor.floor_resource_version,
                     floor.floor_event_id,
-                    floor.position_is_exact,
+                    position_is_exact,
                 ],
             )?;
         }
@@ -208,7 +207,7 @@ fn replace_resource_state_in_conn(
             Some(high_water) => high_water,
             None => Datastore::watch_event_allocator_high_water_in_conn(&tx)?,
         };
-        let legacy_floor_is_exact = i64::from(legacy_event_floor > 0);
+        let legacy_floor_is_exact = 1;
         tx.execute(
             "INSERT INTO watch_replay_floors
              (api_version, kind, namespace_key, floor_rv, floor_event_id, floor_position_exact)
@@ -1419,6 +1418,108 @@ mod tests {
             .await
             .unwrap(),
             crate::datastore::PositionedWatchReplayRead::Expired
+        ));
+    }
+
+    #[tokio::test]
+    async fn stable_snapshot_floor_missing_exact_flag_keeps_positioned_handoff() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.replace_replicated_resource_state(
+            Vec::new(),
+            10,
+            Some(5),
+            Some(vec![crate::datastore::WatchReplayFloor {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace_key: "default".to_string(),
+                floor_resource_version: 10,
+                floor_event_id: 5,
+                position_is_exact: false,
+            }]),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+            "v1",
+            "ConfigMap",
+            "default",
+        )];
+        let fresh =
+            crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(10, 5);
+        assert!(matches!(
+            db.list_watch_events_after_position_checked_bounded(
+                &target,
+                fresh,
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )
+            .await
+            .unwrap(),
+            crate::datastore::PositionedWatchReplayRead::Events(_)
+        ));
+
+        let stale =
+            crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(10, 4);
+        assert!(matches!(
+            db.list_watch_events_after_position_checked_bounded(
+                &target,
+                stale,
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )
+            .await
+            .unwrap(),
+            crate::datastore::PositionedWatchReplayRead::Expired
+        ));
+    }
+
+    #[tokio::test]
+    async fn zero_high_water_legacy_snapshot_does_not_block_future_positioned_handoff() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.replace_replicated_resource_state(Vec::new(), 10, None, None, None)
+            .await
+            .unwrap();
+        let created = db
+            .create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                "after-legacy",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"namespace": "default", "name": "after-legacy"}
+                }),
+            )
+            .await
+            .unwrap();
+        let position = db.current_watch_replay_position().await.unwrap();
+        assert!(position.event_id > 0);
+
+        let target = [crate::datastore::WatchTarget::namespaced_in_namespace(
+            "v1",
+            "ConfigMap",
+            "default",
+        )];
+        assert!(matches!(
+            db.list_watch_events_after_position_checked_bounded(
+                &target,
+                position,
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )
+            .await
+            .unwrap(),
+            crate::datastore::PositionedWatchReplayRead::Events(_)
+        ));
+        assert!(matches!(
+            db.list_watch_events_since_checked_bounded(
+                &target,
+                created.resource_version - 2,
+                std::num::NonZeroUsize::new(3).unwrap(),
+            )
+            .await
+            .unwrap(),
+            crate::datastore::WatchReplayRead::Expired
         ));
     }
 

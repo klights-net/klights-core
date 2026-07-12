@@ -130,8 +130,8 @@ pub struct WatchReplayFloor {
     pub floor_resource_version: i64,
     pub floor_event_id: i64,
     /// Whether `floor_event_id` is an exact retained-history cursor. Missing
-    /// from snapshots produced before positioned replay is `false`, keeping
-    /// exact replay fail-closed until a relist establishes a safe cursor.
+    /// from older snapshots decodes as `false`; restore normalizes nonzero
+    /// event floors from stable snapshots back to exact boundaries.
     #[serde(default)]
     pub position_is_exact: bool,
 }
