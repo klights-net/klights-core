@@ -13,12 +13,10 @@ use serde_json::json;
 
 /// Encode a WatchEvent to a Kubernetes protobuf stream frame.
 ///
-/// Format: 4-byte big-endian length prefix + the complete outer Kubernetes
-/// envelope (`k8s\0` + `runtime.Unknown` identifying `meta.k8s.io/v1,
-/// Kind=WatchEvent`), whose raw payload is the encoded `WatchEvent` whose
-/// object is itself an enveloped resource. Mirrors the production encoder so
-/// these tests validate the Kubernetes wire contract, not klights' internal
-/// shape.
+/// Format: 4-byte big-endian length prefix + a bare encoded `WatchEvent` whose
+/// object is itself an enveloped resource. Kubernetes uses its raw protobuf
+/// serializer for stream frames and its normal serializer for the embedded
+/// object.
 fn encode_watch_event_frame(event: &WatchEvent) -> anyhow::Result<Vec<u8>> {
     let kind = event
         .object
@@ -39,41 +37,28 @@ fn encode_watch_event_frame(event: &WatchEvent) -> anyhow::Result<Vec<u8>> {
         }),
     };
     let event_bytes = pb_event.encode_to_vec();
-    let outer = wrap_protobuf_resource_envelope(api_version, "WatchEvent", event_bytes)?;
-    let mut frame = Vec::with_capacity(4 + outer.len());
-    frame.extend_from_slice(&(outer.len() as u32).to_be_bytes());
-    frame.extend(outer);
+    let mut frame = Vec::with_capacity(4 + event_bytes.len());
+    frame.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
+    frame.extend(event_bytes);
     Ok(frame)
 }
 
-/// Decode a length-prefixed Kubernetes protobuf watch frame through the outer
-/// `runtime.Unknown` envelope, exactly as client-go consumes it. Decoding
-/// `frame[4..]` directly as a bare `WatchEvent` validates klights' internal
-/// shape rather than the Kubernetes wire contract.
+/// Decode a length-prefixed Kubernetes protobuf watch frame exactly as
+/// client-go's raw stream serializer consumes it.
 fn decode_k8s_watch_event(frame: &[u8]) -> PbWatchEvent {
     assert!(frame.len() > 4, "frame should have length prefix + data");
     let mut buf = &frame[..];
     let len = buf.get_u32() as usize;
     assert_eq!(frame.len(), 4 + len, "frame length should match prefix");
-    let payload = &frame[4..];
-    assert_eq!(
-        &payload[..4],
-        b"k8s\0",
-        "protobuf watch frame must begin with the k8s\\0 outer-envelope magic"
-    );
-    let outer = crate::protobuf::Unknown::decode(&payload[4..])
-        .expect("outer frame payload must decode as runtime.Unknown");
-    let type_meta = outer
-        .type_meta
+    let event = PbWatchEvent::decode(&frame[4..])
+        .expect("frame payload must decode directly as a protobuf WatchEvent");
+    let object = event
+        .object
         .as_ref()
-        .expect("outer WatchEvent envelope must carry type metadata");
-    assert_eq!(
-        type_meta.kind.as_str(),
-        "WatchEvent",
-        "outer watch envelope must identify a WatchEvent"
-    );
-    PbWatchEvent::decode(outer.raw.as_slice())
-        .expect("outer envelope raw payload must decode as meta.k8s.io WatchEvent")
+        .and_then(|object| object.raw.as_ref())
+        .expect("WatchEvent must carry an embedded object");
+    assert_eq!(&object[..4], b"k8s\0", "embedded object must be enveloped");
+    event
 }
 
 #[cfg(test)]
@@ -111,7 +96,7 @@ mod tests {
         // Verify frame structure
         assert!(frame.len() > 4, "frame should have length prefix + data");
 
-        // Verify the frame round-trips through the Kubernetes outer envelope.
+        // Verify the raw stream frame and embedded object envelope round-trip.
         let pb_event = decode_k8s_watch_event(&frame);
         assert_eq!(pb_event.r#type, Some("ADDED".to_string()));
         assert!(pb_event.object.is_some(), "object should be present");
@@ -247,10 +232,8 @@ mod tests {
             4 + len,
             "frame should be exactly length prefix + data"
         );
-        // The length covers the complete outer Kubernetes envelope, which must
-        // begin with the k8s\0 magic and identify a WatchEvent in the watched
-        // resource's group/version.
-        assert_eq!(&frame[4..8], b"k8s\0");
+        // The length covers the bare WatchEvent consumed by the raw stream
+        // serializer; decode verifies its embedded object remains enveloped.
         let pb_event = decode_k8s_watch_event(&frame);
         assert_eq!(pb_event.r#type, Some("ADDED".to_string()));
     }

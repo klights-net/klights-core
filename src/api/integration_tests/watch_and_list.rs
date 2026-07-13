@@ -139,29 +139,10 @@ async fn test_cluster_endpoints_protobuf_list_resource_version_primes_watch() {
         frame_len + 4,
         "test expects one protobuf watch frame in the first replay chunk"
     );
-    // Kubernetes protobuf stream readers strip the frame length and pass the
-    // remaining bytes to the serializer, which requires the outer
-    // watched-resource `group/version, Kind=WatchEvent` runtime.Unknown envelope.
-    assert_eq!(
-        &chunk[4..8],
-        b"k8s\0",
-        "protobuf watch frame must begin with the k8s\\0 outer-envelope magic"
-    );
-    let outer = crate::protobuf::Unknown::decode(&chunk[8..]).unwrap();
-    let outer_type_meta = outer
-        .type_meta
-        .as_ref()
-        .expect("outer watch envelope must carry type metadata");
-    assert_eq!(
-        (
-            outer_type_meta.api_version.as_str(),
-            outer_type_meta.kind.as_str()
-        ),
-        ("v1", "WatchEvent"),
-        "outer watch envelope must identify the core/v1 watched API version"
-    );
-    let event = k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(outer.raw.as_slice())
-        .unwrap();
+    // Kubernetes strips the frame length and decodes the remaining bytes with
+    // its raw protobuf stream serializer. Only the embedded resource uses the
+    // normal k8s runtime.Unknown envelope.
+    let event = k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(&chunk[4..]).unwrap();
     assert_eq!(event.r#type.as_deref(), Some("ADDED"));
     let object = event
         .object
