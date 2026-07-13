@@ -115,6 +115,7 @@ pub struct RuntimeConfig {
 use std::sync::Arc;
 
 use crate::kubelet::pod_cluster_runtime::{ClusterRuntimeView, NodeRuntimeView};
+use crate::kubelet::pod_runtime::active_deadline::ActiveDeadlineEnforcer;
 use crate::kubelet::pod_runtime::cri::{
     ContainerRuntimeControl, CriRuntime, CriRuntimeContainerEventKind,
     CriRuntimeContainerEventStream,
@@ -235,88 +236,30 @@ pub struct RealPodRuntimeService {
     node_view: Arc<dyn NodeRuntimeView>,
     cluster_view: Arc<dyn ClusterRuntimeView>,
     pub(super) status_emitter: PodStatusEmitter,
+    active_deadline: ActiveDeadlineEnforcer,
 }
 
 impl RealPodRuntimeService {
-    fn exceeded_active_deadline_seconds(pod: &serde_json::Value) -> Option<i64> {
-        let deadline_secs = pod
-            .pointer("/spec/activeDeadlineSeconds")
-            .and_then(|v| v.as_i64())?;
-
-        let start_ts = pod
-            .pointer("/status/startTime")
-            .and_then(|v| v.as_str())
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.timestamp())
-            .or_else(|| {
-                pod.pointer("/metadata/creationTimestamp")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.timestamp())
-            })?;
-
-        let now = chrono::Utc::now().timestamp();
-        if now - start_ts >= deadline_secs {
-            Some(deadline_secs)
-        } else {
-            None
-        }
-    }
-
     async fn enforce_active_deadline_if_exceeded(
         &self,
         key: &PodRuntimeKey,
         pod: &serde_json::Value,
         resource_version: i64,
     ) -> anyhow::Result<bool> {
-        let Some(deadline_secs) = Self::exceeded_active_deadline_seconds(pod) else {
+        let Some(deadline_secs) =
+            crate::kubelet::pod_runtime::active_deadline::exceeded_active_deadline_seconds(pod)
+        else {
             return Ok(false);
         };
 
-        tracing::info!(
-            namespace = key.namespace,
-            name = key.name,
-            uid = key.uid,
-            deadline_secs,
-            "pod exceeded activeDeadlineSeconds, terminating containers"
-        );
-
-        if self.node_view.owns_pod_runtime(pod)
-            && let Some(sandbox_id) = self.resolve_sandbox_id_for_stop(key, pod).await
-            && let Ok(containers) = self
-                .container_control
-                .list_containers(Some(&sandbox_id))
-                .await
-        {
-            for (container_id, _) in containers {
-                let _ = self.cri.stop_container(&container_id, 0).await;
-            }
-        }
-
-        let message = format!(
-            "Pod was active on the node longer than the specified deadline ({}s)",
-            deadline_secs
-        );
-        if let Err(e) = self
-            .repository
-            .set_deadline_exceeded_for_uid(
-                &key.namespace,
-                &key.name,
-                &key.uid,
-                message,
-                Some(resource_version),
-            )
+        let sandbox_id = if self.node_view.owns_pod_runtime(pod) {
+            self.resolve_sandbox_id_for_stop(key, pod).await
+        } else {
+            None
+        };
+        self.active_deadline
+            .enforce_exceeded(key, resource_version, deadline_secs, sandbox_id.as_deref())
             .await
-        {
-            tracing::warn!(
-                namespace = key.namespace,
-                name = key.name,
-                uid = key.uid,
-                "Failed to mark pod as DeadlineExceeded: {e:#}"
-            );
-        }
-
-        Ok(true)
     }
 
     /// Write Pod status through the cluster boundary `ClusterRuntimeView`.
@@ -738,6 +681,8 @@ impl RealPodRuntimeService {
             node_view,
             cluster_view,
         } = dependencies;
+        let active_deadline =
+            ActiveDeadlineEnforcer::new(cri.clone(), container_control.clone(), repository.clone());
         Self {
             cri,
             container_control,
@@ -758,6 +703,7 @@ impl RealPodRuntimeService {
             node_view,
             cluster_view,
             status_emitter: PodStatusEmitter::default(),
+            active_deadline,
         }
     }
 

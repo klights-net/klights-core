@@ -1,5 +1,6 @@
 // Pod runtime service module.
 
+pub mod active_deadline;
 pub mod cri;
 pub mod deletion_finalizer;
 pub mod events;
