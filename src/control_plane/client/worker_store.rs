@@ -1928,21 +1928,13 @@ impl DatastoreBackend for WorkerStoreAdapter {
 impl crate::datastore::ResourceStore for WorkerStoreAdapter {
     async fn create_resource(
         &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _data: Value,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::create_resource(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-        )
-        .await
+        self.unsupported("create_resource")
     }
 
     async fn get_resource(
@@ -1952,86 +1944,69 @@ impl crate::datastore::ResourceStore for WorkerStoreAdapter {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        crate::datastore::DatastoreBackend::get_resource(self, api_version, kind, namespace, name)
-            .await
+        let key = ResourceKey {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: namespace.map(str::to_string),
+            name: name.to_string(),
+        };
+        let resource = self.cluster_api.get_resource(key).await?;
+        if Self::is_pod_resource(api_version, kind)
+            && resource
+                .as_ref()
+                .is_some_and(|resource| !self.pod_belongs_to_local_node(resource))
+        {
+            return Ok(None);
+        }
+        if let Some(resource) = &resource {
+            self.observe_rv(resource.resource_version);
+        }
+        Ok(resource)
     }
 
     async fn delete_resource(
         &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_resource(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-        )
-        .await
+        self.unsupported("delete_resource")
     }
 
     async fn delete_resource_with_preconditions(
         &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        preconditions: ResourcePreconditions,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _preconditions: ResourcePreconditions,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::delete_resource_with_preconditions(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            preconditions,
-        )
-        .await
+        self.unsupported("delete_resource_with_preconditions")
     }
 
     async fn update_resource(
         &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
-        expected_rv: i64,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _data: Value,
+        _expected_rv: i64,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::update_resource(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            expected_rv,
-        )
-        .await
+        self.unsupported("update_resource")
     }
 
     async fn update_resource_with_preconditions(
         &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
-        preconditions: ResourcePreconditions,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _data: Value,
+        _preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::update_resource_with_preconditions(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            preconditions,
-        )
-        .await
+        self.unsupported("update_resource_with_preconditions")
     }
 }
 
@@ -2046,16 +2021,29 @@ impl crate::datastore::ResourceListStore for WorkerStoreAdapter {
         field_selector: Option<&str>,
         page: ListPageRequest,
     ) -> Result<ResourceList> {
-        crate::datastore::DatastoreBackend::list_resources_page(
-            self,
-            api_version,
-            kind,
-            namespace,
-            label_selector,
-            field_selector,
-            page,
-        )
-        .await
+        let field_selector = if Self::is_pod_resource(api_version, kind) {
+            Some(self.local_pod_field_selector(field_selector))
+        } else {
+            field_selector.map(str::to_string)
+        };
+        let mut list = self
+            .cluster_api
+            .list_resources(ListRequest {
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: namespace.map(str::to_string),
+                label_selector: label_selector.map(str::to_string),
+                field_selector,
+                limit: None,
+                continue_token: None,
+            })
+            .await?;
+        self.observe_rv(list.resource_version);
+        if page.limit().is_some() || page.continue_token().is_some() {
+            list.items.sort_by(|a, b| a.name.cmp(&b.name));
+            list = page.apply_to_sorted_resource_list(list);
+        }
+        Ok(list)
     }
 
     async fn list_resource_keys_for_scope(
@@ -2064,13 +2052,26 @@ impl crate::datastore::ResourceListStore for WorkerStoreAdapter {
         kind: String,
         namespaced: bool,
     ) -> Result<Vec<(Option<String>, String)>> {
-        crate::datastore::DatastoreBackend::list_resource_keys_for_scope(
+        let list = crate::datastore::ResourceListStore::list_resources_page(
             self,
-            api_version,
-            kind,
-            namespaced,
+            &api_version,
+            &kind,
+            None,
+            None,
+            None,
+            ListPageRequest::unbounded(),
         )
-        .await
+        .await?;
+        Ok(list
+            .items
+            .into_iter()
+            .map(|resource| {
+                (
+                    namespaced.then_some(resource.namespace).flatten(),
+                    resource.name,
+                )
+            })
+            .collect())
     }
 }
 
@@ -2079,66 +2080,52 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
     #[cfg(test)]
     async fn apply_replicated_command(
         &self,
-        command: StorageCommand,
-        meta: CommandMeta,
+        _command: StorageCommand,
+        _meta: CommandMeta,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::apply_replicated_command(self, command, meta).await
+        self.unsupported("apply_replicated_command")
     }
 
     async fn replace_replicated_resource_state(
         &self,
-        entries: Vec<crate::log_apply::LogApplyCommit>,
-        current_rv: i64,
-        watch_event_high_water: Option<i64>,
-        watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
-        metadata: Option<crate::datastore::ReplicatedSnapshotMetadata>,
+        _entries: Vec<crate::log_apply::LogApplyCommit>,
+        _current_rv: i64,
+        _watch_event_high_water: Option<i64>,
+        _watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
+        _metadata: Option<crate::datastore::ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::replace_replicated_resource_state(
-            self,
-            entries,
-            current_rv,
-            watch_event_high_water,
-            watch_replay_floors,
-            metadata,
-        )
-        .await
+        self.unsupported("replace_replicated_resource_state")
     }
 
-    async fn apply_log_apply_commit(&self, commit: crate::log_apply::LogApplyCommit) -> Result<()> {
-        crate::datastore::DatastoreBackend::apply_log_apply_commit(self, commit).await
+    async fn apply_log_apply_commit(
+        &self,
+        _commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<()> {
+        self.unsupported("apply_log_apply_commit")
     }
 
     async fn apply_raft_log_apply_commit(
         &self,
-        commit: crate::log_apply::LogApplyCommit,
+        _commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
-        crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
+        self.unsupported("apply_raft_log_apply_commit")
     }
 
     async fn current_log_apply_index(&self) -> Result<i64> {
-        crate::datastore::DatastoreBackend::current_log_apply_index(self).await
+        Ok(0)
     }
 
     #[cfg(test)]
     async fn apply_replicated_create_resource(
         &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        data: Value,
-        options: crate::datastore::types::ReplicatedCreateOptions,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _data: Value,
+        _options: crate::datastore::types::ReplicatedCreateOptions,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::apply_replicated_create_resource(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            data,
-            options,
-        )
-        .await
+        self.unsupported("apply_replicated_create_resource")
     }
 }
 
@@ -2153,28 +2140,21 @@ impl crate::datastore::PodWorkqueueStore for WorkerStoreAdapter {
         min_delay_ms: i64,
         last_error: Option<&str>,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_enqueue(
-            self,
-            kind,
-            pod,
-            payload,
-            attempt_count,
-            min_delay_ms,
-            last_error,
-        )
-        .await
+        self.node_local
+            .enqueue_workqueue(kind, pod, payload, attempt_count, min_delay_ms, last_error)
+            .await
     }
 
     async fn pod_workqueue_peek_next_due(&self) -> Result<Option<i64>> {
-        crate::datastore::DatastoreBackend::pod_workqueue_peek_next_due(self).await
+        self.node_local.peek_workqueue_next_due().await
     }
 
     async fn pod_workqueue_claim_due(&self, now_ms: i64) -> Result<Option<PodWorkqueueEntry>> {
-        crate::datastore::DatastoreBackend::pod_workqueue_claim_due(self, now_ms).await
+        self.node_local.claim_workqueue_due(now_ms).await
     }
 
     async fn pod_workqueue_complete(&self, id: i64) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_complete(self, id).await
+        self.node_local.complete_workqueue(id).await
     }
 
     async fn pod_workqueue_record_failure(
@@ -2183,24 +2163,28 @@ impl crate::datastore::PodWorkqueueStore for WorkerStoreAdapter {
         min_delay_ms: i64,
         error: &str,
     ) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_record_failure(
-            self,
-            row,
-            min_delay_ms,
-            error,
-        )
-        .await
+        let pod = crate::pod_identity::PodIdentity::new(&row.namespace, &row.name, &row.uid);
+        self.node_local
+            .enqueue_workqueue(
+                row.kind,
+                &pod,
+                row.payload,
+                row.attempt_count.saturating_add(1),
+                min_delay_ms,
+                Some(error),
+            )
+            .await
     }
 
-    async fn pod_workqueue_dead_letter(&self, id: i64, error: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::pod_workqueue_dead_letter(self, id, error).await
+    async fn pod_workqueue_dead_letter(&self, id: i64, _error: &str) -> Result<()> {
+        self.node_local.complete_workqueue(id).await
     }
 }
 
 #[async_trait]
 impl crate::datastore::NamespaceContentStore for WorkerStoreAdapter {
-    async fn list_namespace_resources(&self, namespace: &str) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::list_namespace_resources(self, namespace).await
+    async fn list_namespace_resources(&self, _namespace: &str) -> Result<Vec<Resource>> {
+        Ok(Vec::new())
     }
 
     async fn list_namespace_resources_of_kind(
@@ -2208,23 +2192,33 @@ impl crate::datastore::NamespaceContentStore for WorkerStoreAdapter {
         namespace: &str,
         kind: &str,
     ) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::list_namespace_resources_of_kind(self, namespace, kind)
-            .await
+        Ok(crate::datastore::ResourceListStore::list_resources_page(
+            self,
+            "v1",
+            kind,
+            Some(namespace),
+            None,
+            None,
+            ListPageRequest::unbounded(),
+        )
+        .await?
+        .items)
     }
 
     async fn list_namespace_resources_excluding_kind(
         &self,
-        namespace: &str,
-        kind: &str,
+        _namespace: &str,
+        _kind: &str,
     ) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::list_namespace_resources_excluding_kind(
-            self, namespace, kind,
-        )
-        .await
+        Ok(Vec::new())
     }
 
     async fn count_namespace_resources(&self, namespace: &str) -> Result<i64> {
-        crate::datastore::DatastoreBackend::count_namespace_resources(self, namespace).await
+        Ok(
+            crate::datastore::NamespaceContentStore::list_namespace_resources(self, namespace)
+                .await?
+                .len() as i64,
+        )
     }
 }
 
@@ -2235,41 +2229,28 @@ impl crate::datastore::OwnershipStore for WorkerStoreAdapter {
         owner_uid: &str,
         namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::find_owned_resources(self, owner_uid, namespace).await
+        let _ = (owner_uid, namespace);
+        Ok(Vec::new())
     }
 
     async fn list_resources_by_owner_uid(
         &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        owner_uid: &str,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _owner_uid: &str,
     ) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::list_resources_by_owner_uid(
-            self,
-            api_version,
-            kind,
-            namespace,
-            owner_uid,
-        )
-        .await
+        Ok(Vec::new())
     }
 
     async fn find_owned_by_name_kind_empty_uid(
         &self,
-        owner_api_version: &str,
-        owner_name: &str,
-        owner_kind: &str,
-        namespace: Option<&str>,
+        _owner_api_version: &str,
+        _owner_name: &str,
+        _owner_kind: &str,
+        _namespace: Option<&str>,
     ) -> Result<Vec<Resource>> {
-        crate::datastore::DatastoreBackend::find_owned_by_name_kind_empty_uid(
-            self,
-            owner_api_version,
-            owner_name,
-            owner_kind,
-            namespace,
-        )
-        .await
+        Ok(Vec::new())
     }
 }
 
@@ -2277,55 +2258,37 @@ impl crate::datastore::OwnershipStore for WorkerStoreAdapter {
 impl crate::datastore::StatusStore for WorkerStoreAdapter {
     async fn update_status_only(
         &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        status: Value,
-        expected_rv: Option<i64>,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _status: Value,
+        _expected_rv: Option<i64>,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::update_status_only(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            status,
-            expected_rv,
-        )
-        .await
+        self.unsupported("update_status_only")
     }
 
     async fn update_status_only_with_preconditions(
         &self,
-        api_version: &str,
-        kind: &str,
-        namespace: Option<&str>,
-        name: &str,
-        status: Value,
-        preconditions: ResourcePreconditions,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _name: &str,
+        _status: Value,
+        _preconditions: ResourcePreconditions,
     ) -> Result<Resource> {
-        crate::datastore::DatastoreBackend::update_status_only_with_preconditions(
-            self,
-            api_version,
-            kind,
-            namespace,
-            name,
-            status,
-            preconditions,
-        )
-        .await
+        self.unsupported("update_status_only_with_preconditions")
     }
 }
 
 #[async_trait]
 impl crate::datastore::MetaStore for WorkerStoreAdapter {
     async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
-        crate::datastore::DatastoreBackend::get_klights_meta(self, key).await
+        self.node_local.get_node_meta(key).await
     }
 
     async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
-        crate::datastore::DatastoreBackend::set_klights_meta(self, key, value).await
+        self.node_local.set_node_meta(key, value).await
     }
 }
 

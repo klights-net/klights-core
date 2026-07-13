@@ -117,25 +117,3 @@ pub(crate) async fn start_worker_store_adapter(
 
     Ok(worker_store)
 }
-
-pub(crate) fn worker_store_handle(
-    worker_store: std::sync::Arc<crate::control_plane::client::worker_store::WorkerStoreAdapter>,
-) -> crate::datastore::DatastoreHandle {
-    worker_store
-}
-
-pub(crate) fn worker_store_backend(
-    handle: &crate::datastore::DatastoreHandle,
-) -> &dyn crate::datastore::DatastoreBackend {
-    handle.as_ref()
-}
-
-pub(crate) fn kubelet_datastore_watch_source(
-    handle: &crate::datastore::DatastoreHandle,
-) -> std::sync::Arc<crate::bootstrap::kubelet_ports::DatastorePodWatchSource> {
-    std::sync::Arc::new(
-        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
-            crate::datastore::DatastoreBackendWatchStore::new(handle.clone()),
-        )),
-    )
-}

@@ -21,10 +21,7 @@ use super::init::dataplane::*;
 use super::init::host::print_ready_message;
 use super::init::leader_control_stream::start_worker_leader_control_stream;
 use super::runtime::resolve_token_file_if_present;
-use super::worker_store_adapter::{
-    kubelet_datastore_watch_source, start_worker_store_adapter, worker_store_backend,
-    worker_store_handle,
-};
+use super::worker_store_adapter::start_worker_store_adapter;
 
 fn worker_pod_runtime_node_role() -> crate::kubelet::pod_cluster_runtime::RuntimeNodeRole {
     crate::kubelet::pod_cluster_runtime::RuntimeNodeRole::Worker
@@ -242,8 +239,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     )
     .await?;
 
-    let db_handle = worker_store_handle(worker_store.clone());
-    let db = worker_store_backend(&db_handle);
+    let db = worker_store.clone();
 
     let net = phases::network::boot(phases::network::NetworkBootArgs {
         config: &config,
@@ -251,7 +247,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         node_ip: &node_ip,
         cluster_api: cluster_api.clone(),
         node_local: node_local.clone(),
-        db,
+        db: &*db,
         network_cleanup: &network_cleanup,
         containerd_data_dir: &containerd_data_dir,
         containerd_state_dir: &containerd_state_dir,
@@ -300,7 +296,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     )
     .await;
     if let Err(e) = kubelet::node::register_node_snapshot(
-        db,
+        &*db,
         Some(outbox.as_ref()),
         Some(cluster_api.clone()),
         Some(&dataplane_health),
@@ -336,7 +332,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             crate::replication::grpc::client::LocalPodLogHandler::new_with_pod_event_store(
                 config.containerd_namespace.clone(),
                 task_supervisor.clone(),
-                db_handle.clone(),
+                db.clone(),
             ),
         ))
         .await;
@@ -348,7 +344,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     .await
     .context("worker control stream")?;
     let node_subnet_watch_handle = {
-        let dbh = db_handle.clone();
+        let dbh = db.clone();
         let node_name = config.node_name.clone();
         let cluster_cidr = config.cluster_cidr.clone();
         let peering = network.peering.clone();
@@ -383,7 +379,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         metrics.clone(),
         Some(services.clone()),
         Some(task_supervisor.clone()),
-        Some(db_handle.clone()),
+        Some(db.clone()),
     ));
     let (pod_lifecycle_tx, pod_lifecycle_rx) =
         tokio::sync::mpsc::channel::<crate::kubelet::lifecycle::LifecycleCommand>(128);
@@ -400,7 +396,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     });
     let pod_repository_parts = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {
-            db: db_handle.clone(),
+            db: db.clone(),
             supervisor: task_supervisor.clone(),
             side_effects: side_effects.clone(),
             metrics: metrics.clone(),
@@ -429,18 +425,18 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             runtime_node_role: worker_pod_runtime_node_role(),
             runtime_service: None,
             runtime_store: std::sync::Arc::new(
-                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(db_handle.clone()),
+                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(db.clone()),
             ),
             slot_admission: std::sync::Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
-                    db_handle.clone(),
+                    db.clone(),
                     config.node_name.clone(),
                 ),
             ),
             event_sink: std::sync::Arc::new(
                 crate::kubelet::pod_runtime::events::RealPodEventSink::new(
                     Some(outbox.clone()),
-                    db_handle.clone(),
+                    db.clone(),
                 ),
             ),
         },
@@ -488,9 +484,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(worker_store.clone()),
     );
     let persistent_volume_event_handler = std::sync::Arc::new(
-        crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
-            db_handle.clone(),
-        ),
+        crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(db.clone()),
     );
     let pod_watcher_handle = if let Some(runtime_ports) = pod_watcher_runtime_ports {
         let ctx = kctx.clone();
@@ -520,7 +514,9 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         None
     };
     let heartbeat_handle = {
-        let watch_source = kubelet_datastore_watch_source(&db_handle);
+        let watch_source = std::sync::Arc::new(
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(worker_store.clone()),
+        );
         let cfc = std::sync::Arc::clone(&config);
         let c = shutdown_token.clone();
         let s = task_supervisor.clone();
@@ -558,7 +554,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     shutdown_signal.await;
     tracing::info!("Worker soft shutdown");
     shutdown_token.cancel();
-    db_handle.close();
+    node_local.close();
     let to = std::time::Duration::from_secs(10);
     if let Some(h) = pod_watcher_handle {
         let _ = task_supervisor.timeout("wp", to, h.join()).await;
