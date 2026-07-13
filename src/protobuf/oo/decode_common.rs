@@ -204,27 +204,62 @@ pub fn meta_to_json(meta: &k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta
         obj["ownerReferences"] = json!(owner_refs);
     }
     if let Some(creation_timestamp) = &meta.creation_timestamp
-        && let Some(seconds) = creation_timestamp.seconds
+        && let Some(formatted) = protobuf_time_to_rfc3339(creation_timestamp)
     {
-        // Convert to RFC3339 format
-        if let Ok(dt) = time::OffsetDateTime::from_unix_timestamp(seconds)
-            && let Ok(formatted) = dt.format(&time::format_description::well_known::Rfc3339)
-        {
-            obj["creationTimestamp"] = json!(formatted);
-        }
+        obj["creationTimestamp"] = json!(formatted);
     }
     if let Some(deletion_timestamp) = &meta.deletion_timestamp
-        && let Some(seconds) = deletion_timestamp.seconds
+        && let Some(formatted) = protobuf_time_to_rfc3339(deletion_timestamp)
     {
-        // Convert to RFC3339 format
-        if let Ok(dt) = time::OffsetDateTime::from_unix_timestamp(seconds)
-            && let Ok(formatted) = dt.format(&time::format_description::well_known::Rfc3339)
-        {
-            obj["deletionTimestamp"] = json!(formatted);
-        }
+        obj["deletionTimestamp"] = json!(formatted);
     }
 
     obj
+}
+
+fn protobuf_time_to_rfc3339(
+    timestamp: &k8s_pb::apimachinery::pkg::apis::meta::v1::Time,
+) -> Option<String> {
+    let seconds = timestamp.seconds?;
+    let nanos = timestamp.nanos.unwrap_or_default();
+    if !(0..1_000_000_000).contains(&nanos) {
+        return None;
+    }
+    let unix_nanos = i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
+    time::OffsetDateTime::from_unix_timestamp_nanos(unix_nanos)
+        .ok()?
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::meta_to_json;
+
+    #[test]
+    fn object_meta_timestamps_preserve_protobuf_nanoseconds() {
+        let meta = k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+            creation_timestamp: Some(k8s_pb::apimachinery::pkg::apis::meta::v1::Time {
+                seconds: Some(1_768_000_000),
+                nanos: Some(140_659_233),
+            }),
+            deletion_timestamp: Some(k8s_pb::apimachinery::pkg::apis::meta::v1::Time {
+                seconds: Some(1_768_000_001),
+                nanos: Some(987_654_321),
+            }),
+            ..Default::default()
+        };
+
+        let decoded = meta_to_json(&meta);
+        assert_eq!(
+            decoded["creationTimestamp"],
+            "2026-01-09T23:06:40.140659233Z"
+        );
+        assert_eq!(
+            decoded["deletionTimestamp"],
+            "2026-01-09T23:06:41.987654321Z"
+        );
+    }
 }
 
 // Convert protobuf ConfigMap to JSON
