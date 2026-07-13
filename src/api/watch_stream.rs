@@ -363,7 +363,11 @@ pub fn serialize_watch_event_line(event: WatchEvent, kind: &str, table_format: b
     json
 }
 
-pub fn serialize_watch_event_frame(event: &WatchEvent, kind: &str) -> anyhow::Result<Vec<u8>> {
+pub fn serialize_watch_event_frame(
+    event: &WatchEvent,
+    kind: &str,
+    watch_api_version: &str,
+) -> anyhow::Result<Vec<u8>> {
     let object_kind = event
         .object
         .get("kind")
@@ -385,7 +389,7 @@ pub fn serialize_watch_event_frame(event: &WatchEvent, kind: &str) -> anyhow::Re
         r#type: Some(event.event_type.to_string()),
         object: Some(RawExtension { raw: Some(raw) }),
     };
-    encode_k8s_watch_event_frame(&pb_event)
+    encode_k8s_watch_event_frame(&pb_event, watch_api_version)
 }
 
 pub fn serialize_raw_watch_event_frame(event: &RawWatchEvent) -> anyhow::Result<Vec<u8>> {
@@ -400,24 +404,28 @@ pub fn serialize_raw_watch_event_frame(event: &RawWatchEvent) -> anyhow::Result<
         r#type: Some(event.event_type.to_string()),
         object: Some(RawExtension { raw: Some(raw) }),
     };
-    encode_k8s_watch_event_frame(&pb_event)
+    encode_k8s_watch_event_frame(&pb_event, &event.api_version)
 }
 
-/// Encode a protobuf `meta.k8s.io/v1 WatchEvent` into a length-prefixed
+/// Encode a protobuf WatchEvent into a length-prefixed
 /// Kubernetes stream frame.
 ///
 /// Kubernetes protobuf stream readers remove the four-byte frame length and
 /// hand the remaining bytes to the Kubernetes serializer. That serializer
 /// requires the payload to start with `k8s\0` and contain a `runtime.Unknown`
-/// envelope whose type metadata identifies `meta.k8s.io/v1, Kind=WatchEvent`.
+/// envelope whose type metadata identifies the watched resource's group/version
+/// and `Kind=WatchEvent`.
 /// The inner resource envelope (built by each caller and stored in
 /// `WatchEvent.object.raw`) is necessary but does not replace this required
 /// outer WatchEvent envelope. Both protobuf watch entry points delegate
 /// final framing here so every emitted frame shares one correct shape.
-fn encode_k8s_watch_event_frame(pb_event: &PbWatchEvent) -> anyhow::Result<Vec<u8>> {
+fn encode_k8s_watch_event_frame(
+    pb_event: &PbWatchEvent,
+    watch_api_version: &str,
+) -> anyhow::Result<Vec<u8>> {
     let event_bytes = pb_event.encode_to_vec();
     let outer = crate::protobuf::wrap_protobuf_resource_envelope(
-        "meta.k8s.io/v1",
+        watch_api_version,
         "WatchEvent",
         event_bytes,
     )?;
@@ -447,15 +455,23 @@ pub fn try_serialize_watch_event_for_stream(
 ) -> Result<Vec<u8>, Vec<u8>> {
     match stream_format {
         WatchStreamFormat::Json => Ok(serialize_watch_event_line(event, kind, table_format)),
-        WatchStreamFormat::Protobuf => match serialize_watch_event_frame(&event, kind) {
-            Ok(frame) => Ok(frame),
-            Err(err) => Err(serialize_watch_status_for_stream(
-                stream_format,
-                500,
-                "InternalError",
-                &format!("failed to encode protobuf watch event: {err}"),
-            )),
-        },
+        WatchStreamFormat::Protobuf => {
+            let watch_api_version = event
+                .object
+                .get("apiVersion")
+                .and_then(Value::as_str)
+                .unwrap_or("v1");
+            match serialize_watch_event_frame(&event, kind, watch_api_version) {
+                Ok(frame) => Ok(frame),
+                Err(err) => Err(serialize_watch_status_for_stream(
+                    stream_format,
+                    500,
+                    "InternalError",
+                    &format!("failed to encode protobuf watch event: {err}"),
+                    watch_api_version,
+                )),
+            }
+        }
     }
 }
 
@@ -493,6 +509,7 @@ pub fn try_serialize_raw_watch_event_for_stream(
                 500,
                 "InternalError",
                 &format!("failed to encode raw protobuf watch event: {err}"),
+                &event.api_version,
             )),
         },
     }
@@ -524,6 +541,7 @@ pub fn serialize_watch_status_for_stream(
     code: u16,
     reason: &str,
     message: &str,
+    watch_api_version: &str,
 ) -> Vec<u8> {
     match stream_format {
         WatchStreamFormat::Json => serialize_watch_status_line(code, reason, message),
@@ -540,7 +558,7 @@ pub fn serialize_watch_status_for_stream(
                     "message": message,
                 }),
             );
-            serialize_watch_event_frame(&event, "Status").unwrap_or_default()
+            serialize_watch_event_frame(&event, "Status", watch_api_version).unwrap_or_default()
         }
     }
 }
@@ -567,6 +585,7 @@ pub(crate) fn serialize_live_watch_cursor_error(error: &WatchCursorError) -> Opt
 pub(crate) fn serialize_live_watch_cursor_error_for_stream(
     error: &WatchCursorError,
     stream_format: WatchStreamFormat,
+    watch_api_version: &str,
 ) -> Option<Vec<u8>> {
     match error {
         WatchCursorError::Replay(_) => Some(serialize_watch_status_for_stream(
@@ -574,12 +593,14 @@ pub(crate) fn serialize_live_watch_cursor_error_for_stream(
             500,
             "InternalError",
             "failed to replay live watch events",
+            watch_api_version,
         )),
         WatchCursorError::Expired => Some(serialize_watch_status_for_stream(
             stream_format,
             410,
             "Expired",
             "too old resource version: watch fell behind the history window",
+            watch_api_version,
         )),
         WatchCursorError::Closed => None,
     }
@@ -966,6 +987,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                     400,
                     "BadRequest",
                     err,
+                    &api_version,
                 ));
                 return;
             }
@@ -1059,6 +1081,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                             410,
                             "Expired",
                             "too old resource version: selector membership snapshot expired",
+                            &api_version,
                         ));
                         return;
                     }
@@ -1082,6 +1105,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         500,
                         "InternalError",
                         "failed to establish watch selector baseline",
+                        &api_version,
                     ));
                     return;
                 }
@@ -1131,6 +1155,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         500,
                         "InternalError",
                         "failed to establish WatchList snapshot",
+                        &api_version,
                     ));
                     return;
                 }
@@ -1219,6 +1244,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                             410,
                             "Expired",
                             "too old resource version: requested resourceVersion is older than the watch history window",
+                            &api_version,
                         ));
                         return;
                     }
@@ -1229,6 +1255,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                             500,
                             "InternalError",
                             "failed to establish initial watch replay",
+                            &api_version,
                         ));
                         return;
                     }
@@ -1262,7 +1289,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                                     Some(ns) => tracing::warn!("Raw watch terminated for {}/{}: {:#?}", ns, kind, err),
                                     None => tracing::warn!("Raw watch terminated for {}: {:#?}", kind, err),
                                 }
-                                if let Some(line) = serialize_live_watch_cursor_error_for_stream(&err, stream_format) {
+                                if let Some(line) = serialize_live_watch_cursor_error_for_stream(&err, stream_format, &api_version) {
                                     yield Ok::<_, std::convert::Infallible>(line);
                                 }
                                 break;
@@ -1318,6 +1345,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                                     410,
                                     "Expired",
                                     "too old resource version: exact-name watch scope is absent and the watch cursor advanced",
+                                    &api_version,
                                 ));
                                 break;
                             }
@@ -1343,6 +1371,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         410,
                         "Expired",
                         "too old resource version: requested resourceVersion is older than the watch history window",
+                        &api_version,
                     ));
                     return;
                 }
@@ -1353,6 +1382,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                         500,
                         "InternalError",
                         "failed to establish initial watch replay",
+                        &api_version,
                     ));
                     return;
                 }
@@ -1386,7 +1416,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                                 Some(ns) => tracing::warn!("Watch terminated for {}/{}: {:#?}", ns, kind, err),
                                 None => tracing::warn!("Watch terminated for {}: {:#?}", kind, err),
                             }
-                            if let Some(line) = serialize_live_watch_cursor_error_for_stream(&err, stream_format) {
+                            if let Some(line) = serialize_live_watch_cursor_error_for_stream(&err, stream_format, &api_version) {
                                 yield Ok::<_, std::convert::Infallible>(line);
                             }
                             break;
@@ -1481,6 +1511,7 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
                                 410,
                                 "Expired",
                                 "too old resource version: exact-name watch scope is absent and the watch cursor advanced",
+                                &api_version,
                             ));
                             break;
                         }
@@ -1515,6 +1546,7 @@ mod tests {
     /// contract, exactly as client-go's protobuf stream reader consumes it.
     struct DecodedProtobufWatchFrame {
         event_type: String,
+        outer_api_version: String,
         inner_api_version: String,
         inner_kind: String,
         inner_raw: Vec<u8>,
@@ -1526,7 +1558,8 @@ mod tests {
     /// client-go removes the four-byte frame length and passes the remaining
     /// bytes to the Kubernetes protobuf serializer, which requires the payload
     /// to begin with `k8s\0` and carry a `runtime.Unknown` envelope whose type
-    /// metadata identifies `meta.k8s.io/v1, Kind=WatchEvent`. Decoding
+    /// metadata identifies the watched resource group/version and
+    /// `Kind=WatchEvent`. Decoding
     /// `frame[4..]` directly as a bare `WatchEvent` validates klights' internal
     /// shape rather than the Kubernetes wire contract, so this helper validates
     /// the outer envelope and then the inner resource envelope exactly as
@@ -1561,12 +1594,12 @@ mod tests {
                     .as_ref()
                     .expect("outer WatchEvent envelope must carry type metadata");
                 assert_eq!(
-                    (
-                        outer_type_meta.api_version.as_str(),
-                        outer_type_meta.kind.as_str()
-                    ),
-                    ("meta.k8s.io/v1", "WatchEvent"),
-                    "outer watch envelope must identify meta.k8s.io/v1 WatchEvent",
+                    outer_type_meta.kind, "WatchEvent",
+                    "outer watch envelope must identify a WatchEvent",
+                );
+                assert!(
+                    !outer_type_meta.api_version.is_empty(),
+                    "outer WatchEvent envelope must identify the watched API version",
                 );
                 let pb_event = k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(
                     outer.raw.as_slice(),
@@ -1589,6 +1622,7 @@ mod tests {
                     .expect("inner object envelope must carry type metadata");
                 frames.push(DecodedProtobufWatchFrame {
                     event_type: pb_event.r#type.unwrap_or_default(),
+                    outer_api_version: outer_type_meta.api_version.clone(),
                     inner_api_version: inner_type_meta.api_version.clone(),
                     inner_kind: inner_type_meta.kind.clone(),
                     inner_raw: inner.raw.clone(),
@@ -1709,6 +1743,7 @@ mod tests {
             410,
             "Expired",
             "too old resource version",
+            "admissionregistration.k8s.io/v1",
         );
         assert!(frame.len() > 4);
         assert_eq!(
@@ -1719,6 +1754,10 @@ mod tests {
         let frames = decode_k8s_protobuf_watch_frames(&[frame]);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].event_type, "ERROR");
+        assert_eq!(
+            frames[0].outer_api_version,
+            "admissionregistration.k8s.io/v1"
+        );
         assert_eq!(frames[0].inner_api_version, "v1");
         assert_eq!(frames[0].inner_kind, "Status");
         let decoded = k8s_pb::apimachinery::pkg::apis::meta::v1::Status::decode(
@@ -1879,7 +1918,7 @@ mod tests {
     fn protobuf_watch_event_types_table_drive_through_outer_envelope() {
         // Table-drive ADDED, MODIFIED, DELETED, BOOKMARK, and ERROR through the
         // same Kubernetes envelope decoder. Each frame must carry the outer
-        // meta.k8s.io/v1 WatchEvent envelope and a correctly typed inner
+        // watched-resource group/version WatchEvent envelope and a correctly typed inner
         // resource/Status envelope.
         let added = WatchEvent::from_type(
             "ADDED",
@@ -1932,7 +1971,13 @@ mod tests {
                 false,
                 WatchStreamFormat::Protobuf,
             ),
-            serialize_watch_status_for_stream(WatchStreamFormat::Protobuf, 410, "Expired", "gone"),
+            serialize_watch_status_for_stream(
+                WatchStreamFormat::Protobuf,
+                410,
+                "Expired",
+                "gone",
+                "v1",
+            ),
         ];
         let decoded = decode_k8s_protobuf_watch_frames(&frames);
         assert_eq!(decoded.len(), 5);
@@ -1988,6 +2033,63 @@ mod tests {
                 cm.metadata.as_ref().and_then(|m| m.name.as_deref()),
                 Some("cm1")
             );
+        }
+    }
+
+    #[test]
+    fn raw_protobuf_replay_encodes_conformance_service_and_vap_rows() {
+        let cases = [
+            (
+                "v1",
+                "Service",
+                Some("services-8388"),
+                "test-service-c6wqx",
+                "ADDED",
+                serde_json::json!({
+                    "apiVersion":"v1","kind":"Service",
+                    "metadata":{"labels":{"test-service-static":"true"},"name":"test-service-c6wqx","namespace":"services-8388","resourceVersion":"254"},
+                    "spec":{"clusterIP":"10.51.0.3","clusterIPs":["10.51.0.3"],"externalName":"","ipFamilies":["IPv4"],"ipFamilyPolicy":"SingleStack","ports":[{"name":"http","nodePort":30000,"port":80,"protocol":"TCP","targetPort":80}],"sessionAffinity":"None","type":"LoadBalancer"},
+                    "status":{"loadBalancer":{"ingress":[]}}
+                }),
+            ),
+            (
+                "admissionregistration.k8s.io/v1",
+                "ValidatingAdmissionPolicy",
+                None,
+                "e2e-example-vap-hdyic",
+                "MODIFIED",
+                serde_json::json!({
+                    "apiVersion":"admissionregistration.k8s.io/v1","kind":"ValidatingAdmissionPolicy",
+                    "metadata":{"annotations":{"patched":"true"},"labels":{"example-e2e-vap-label":"rp4xtt7j"},"name":"e2e-example-vap-hdyic","resourceVersion":"258"},
+                    "spec":{"failurePolicy":"Ignore","matchConstraints":{"resourceRules":[{"apiGroups":["apps"],"apiVersions":["v1"],"operations":["CREATE"],"resources":["deployments"]}]},"validations":[{"expression":"object.spec.replicas <= 100"}]},
+                    "status":{"typeChecking":{"expressionWarnings":[]}}
+                }),
+            ),
+        ];
+
+        for (api_version, kind, namespace, name, event_type, object) in cases {
+            let row = RawWatchEvent {
+                api_version: api_version.to_string(),
+                kind: kind.to_string(),
+                namespace: namespace.map(str::to_string),
+                name: name.to_string(),
+                resource_version: object["metadata"]["resourceVersion"]
+                    .as_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+                event_type: std::borrow::Cow::Borrowed(event_type),
+                object_json: Bytes::from(serde_json::to_vec(&object).unwrap()),
+            };
+            let frame = try_serialize_raw_watch_event_for_stream(&row, WatchStreamFormat::Protobuf)
+                .unwrap_or_else(|_| panic!("{kind} replay row must encode as protobuf"));
+            let decoded = decode_k8s_protobuf_watch_frames(&[frame]);
+            assert_eq!(decoded[0].event_type, event_type, "{kind}");
+            assert_eq!(
+                decoded[0].outer_api_version, api_version,
+                "the WatchEvent envelope must use the watched resource group/version so client-go can resolve it"
+            );
+            assert_eq!(decoded[0].inner_kind, kind, "{kind}");
         }
     }
 

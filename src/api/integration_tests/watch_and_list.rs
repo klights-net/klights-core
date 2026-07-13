@@ -141,7 +141,7 @@ async fn test_cluster_endpoints_protobuf_list_resource_version_primes_watch() {
     );
     // Kubernetes protobuf stream readers strip the frame length and pass the
     // remaining bytes to the serializer, which requires the outer
-    // `meta.k8s.io/v1, Kind=WatchEvent` runtime.Unknown envelope.
+    // watched-resource `group/version, Kind=WatchEvent` runtime.Unknown envelope.
     assert_eq!(
         &chunk[4..8],
         b"k8s\0",
@@ -157,8 +157,8 @@ async fn test_cluster_endpoints_protobuf_list_resource_version_primes_watch() {
             outer_type_meta.api_version.as_str(),
             outer_type_meta.kind.as_str()
         ),
-        ("meta.k8s.io/v1", "WatchEvent"),
-        "outer watch envelope must identify meta.k8s.io/v1 WatchEvent"
+        ("v1", "WatchEvent"),
+        "outer watch envelope must identify the core/v1 watched API version"
     );
     let event = k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(outer.raw.as_slice())
         .unwrap();

@@ -39,7 +39,7 @@ fn encode_watch_event_frame(event: &WatchEvent) -> anyhow::Result<Vec<u8>> {
         }),
     };
     let event_bytes = pb_event.encode_to_vec();
-    let outer = wrap_protobuf_resource_envelope("meta.k8s.io/v1", "WatchEvent", event_bytes)?;
+    let outer = wrap_protobuf_resource_envelope(api_version, "WatchEvent", event_bytes)?;
     let mut frame = Vec::with_capacity(4 + outer.len());
     frame.extend_from_slice(&(outer.len() as u32).to_be_bytes());
     frame.extend(outer);
@@ -68,9 +68,9 @@ fn decode_k8s_watch_event(frame: &[u8]) -> PbWatchEvent {
         .as_ref()
         .expect("outer WatchEvent envelope must carry type metadata");
     assert_eq!(
-        (type_meta.api_version.as_str(), type_meta.kind.as_str()),
-        ("meta.k8s.io/v1", "WatchEvent"),
-        "outer watch envelope must identify meta.k8s.io/v1 WatchEvent"
+        type_meta.kind.as_str(),
+        "WatchEvent",
+        "outer watch envelope must identify a WatchEvent"
     );
     PbWatchEvent::decode(outer.raw.as_slice())
         .expect("outer envelope raw payload must decode as meta.k8s.io WatchEvent")
@@ -248,7 +248,8 @@ mod tests {
             "frame should be exactly length prefix + data"
         );
         // The length covers the complete outer Kubernetes envelope, which must
-        // begin with the k8s\0 magic and identify meta.k8s.io/v1 WatchEvent.
+        // begin with the k8s\0 magic and identify a WatchEvent in the watched
+        // resource's group/version.
         assert_eq!(&frame[4..8], b"k8s\0");
         let pb_event = decode_k8s_watch_event(&frame);
         assert_eq!(pb_event.r#type, Some("ADDED".to_string()));
