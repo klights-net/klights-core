@@ -148,8 +148,7 @@ pub fn is_binary_quantity_resource(resource_key: &str) -> bool {
 }
 
 pub fn parse_memory_bytes(raw: &str) -> Option<i64> {
-    let raw = raw.trim();
-    if raw.is_empty() {
+    if raw.is_empty() || raw.trim() != raw {
         return None;
     }
 
@@ -212,8 +211,7 @@ pub fn format_resource_quantity(resource_key: &str, value: i64) -> String {
 }
 
 fn parse_quantity_with_suffixes(raw: &str, suffixes: &[Suffix], final_div: i128) -> Option<i64> {
-    let raw = raw.trim();
-    if raw.is_empty() {
+    if raw.is_empty() || raw.trim() != raw {
         return None;
     }
 
@@ -451,6 +449,10 @@ mod tests {
         assert_eq!(parse_resource_quantity("storage", "-1Gi"), None);
         assert_eq!(parse_resource_quantity("storage", "1GiB"), None);
         assert_eq!(parse_resource_quantity("storage", ""), None);
+        assert_eq!(parse_resource_quantity("storage", " 1Gi"), None);
+        assert_eq!(parse_resource_quantity("storage", "1Gi "), None);
+        assert_eq!(parse_resource_quantity("cpu", " 1"), None);
+        assert_eq!(parse_resource_quantity("memory", "1Gi "), None);
         assert_eq!(
             parse_resource_quantity("storage", "1e-9223372036854775808"),
             None
