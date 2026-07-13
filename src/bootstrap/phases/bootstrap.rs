@@ -335,6 +335,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             cluster_api: Some(cluster_api.clone()),
         },
     );
+    let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
+        kubelet_db_handle.clone(),
+    ));
     let pod_subsystem = crate::kubelet::pod_subsystem::PodSubsystem::new(
         crate::kubelet::pod_subsystem::PodSubsystemConfig {
             repository_parts: pod_repository_parts,
@@ -354,12 +357,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             runtime_service: None,
             runtime_store: Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
-                    kubelet_db_handle.clone(),
+                    pod_runtime_store.clone(),
                 ),
             ),
             slot_admission: Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
-                    kubelet_db_handle.clone(),
+                    pod_runtime_store,
                     config.node_name.clone(),
                 ),
             ),

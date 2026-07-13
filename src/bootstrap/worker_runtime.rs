@@ -332,7 +332,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             crate::replication::grpc::client::LocalPodLogHandler::new_with_pod_event_store(
                 config.containerd_namespace.clone(),
                 task_supervisor.clone(),
-                db.clone(),
+                crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(db.clone()),
             ),
         ))
         .await;

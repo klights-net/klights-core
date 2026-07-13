@@ -119,7 +119,11 @@ async fn start_controlplane_leader_control_stream_if_needed(
             crate::replication::grpc::client::LocalPodLogHandler::new_with_pod_event_store(
                 config.containerd_namespace.clone(),
                 task_supervisor.clone(),
-                pod_event_db,
+                crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(
+                    std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                        pod_event_db,
+                    )),
+                ),
             ),
         ))
         .await;

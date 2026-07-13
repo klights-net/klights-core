@@ -2119,6 +2119,259 @@ impl MetaStore for DatastoreBackendMetaStore<'_> {
     }
 }
 
+/// Explicit owned adapter from a legacy backend handle into the pod-runtime
+/// focused datastore ports. This is used only at composition roots that have
+/// not yet been split away from `DatastoreHandle`.
+pub struct DatastoreBackendPodRuntimeStore {
+    db: std::sync::Arc<dyn DatastoreBackend>,
+}
+
+impl DatastoreBackendPodRuntimeStore {
+    pub fn new(db: std::sync::Arc<dyn DatastoreBackend>) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl NetworkStore for DatastoreBackendPodRuntimeStore {
+    async fn record_sandbox(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        sandbox_id: &str,
+    ) -> Result<()> {
+        self.db
+            .record_sandbox(namespace, pod_name, pod_uid, sandbox_id)
+            .await
+    }
+
+    async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
+        self.db.get_sandbox(namespace, pod_name).await
+    }
+
+    async fn delete_sandbox(&self, namespace: &str, pod_name: &str) -> Result<()> {
+        self.db.delete_sandbox(namespace, pod_name).await
+    }
+
+    async fn delete_sandbox_for_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        sandbox_id: &str,
+    ) -> Result<()> {
+        self.db
+            .delete_sandbox_for_uid(namespace, pod_name, pod_uid, sandbox_id)
+            .await
+    }
+
+    async fn delete_pod_network(&self, sandbox_id: &str) -> Result<()> {
+        self.db.delete_pod_network(sandbox_id).await
+    }
+
+    async fn get_pod_network(&self, sandbox_id: &str) -> Result<Option<PodNetworkEndpoint>> {
+        self.db.get_pod_network(sandbox_id).await
+    }
+}
+
+#[async_trait]
+impl NetworkMetadataStore for DatastoreBackendPodRuntimeStore {
+    async fn get_sandbox_for_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<String>> {
+        self.db
+            .get_sandbox_for_uid(namespace, pod_name, pod_uid)
+            .await
+    }
+
+    async fn get_pod_network_for_pod(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<PodNetworkEndpoint>> {
+        self.db
+            .get_pod_network_for_pod(namespace, pod_name, pod_uid)
+            .await
+    }
+
+    async fn ipam_allocate_and_record_pod_network(
+        &self,
+        sandbox_id: &str,
+        pod: &crate::pod_identity::PodIdentity,
+        subnet_base_int: u32,
+        subnet_size: u32,
+        veth_host: &str,
+        netns_path: &str,
+    ) -> Result<(String, u32)> {
+        self.db
+            .ipam_allocate_and_record_pod_network(
+                sandbox_id,
+                pod,
+                subnet_base_int,
+                subnet_size,
+                veth_host,
+                netns_path,
+            )
+            .await
+    }
+
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRef>> {
+        self.db.list_sandboxes().await
+    }
+
+    async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
+        self.db.list_pod_network_sandbox_ids().await
+    }
+
+    async fn allocate_node_subnet(
+        &self,
+        node_name: &str,
+        cluster_cidr: &str,
+        node_ip: &str,
+    ) -> Result<NodeSubnet> {
+        self.db
+            .allocate_node_subnet(node_name, cluster_cidr, node_ip)
+            .await
+    }
+
+    async fn update_node_peer_attributes(
+        &self,
+        node_name: &str,
+        mode: crate::controllers::annotations::NodePeerMode,
+        hostport_range: Option<crate::networking::types::HostPortRange>,
+    ) -> Result<()> {
+        self.db
+            .update_node_peer_attributes(node_name, mode, hostport_range)
+            .await
+    }
+
+    async fn update_node_dataplane(
+        &self,
+        metadata: crate::networking::wireguard::DataplanePeerMetadata,
+    ) -> Result<()> {
+        self.db.update_node_dataplane(metadata).await
+    }
+
+    async fn get_node_dataplane(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+        self.db.get_node_dataplane(node_name).await
+    }
+
+    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+        self.db.get_node_subnet(node_name).await
+    }
+
+    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
+        self.db.list_peer_subnets(my_node_name).await
+    }
+
+    async fn delete_node_subnet(&self, node_name: &str) -> Result<()> {
+        self.db.delete_node_subnet(node_name).await
+    }
+
+    async fn pod_endpoint_get_by_pod_ip(
+        &self,
+        pod_ip: std::net::Ipv4Addr,
+    ) -> Result<Option<PodEndpointRow>> {
+        self.db.pod_endpoint_get_by_pod_ip(pod_ip).await
+    }
+
+    async fn pod_endpoint_list_all(&self) -> Result<Vec<PodEndpointRow>> {
+        self.db.pod_endpoint_list_all().await
+    }
+
+    fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
+        self.db.subscribe_pod_endpoints()
+    }
+}
+
+#[async_trait]
+impl PodCleanupStore for DatastoreBackendPodRuntimeStore {
+    async fn move_pod_to_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.db
+            .move_pod_to_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
+            .await
+    }
+
+    async fn list_pod_cleanup_intents_for_node(
+        &self,
+        node_name: &str,
+    ) -> Result<Vec<PodCleanupIntent>> {
+        self.db.list_pod_cleanup_intents_for_node(node_name).await
+    }
+
+    async fn delete_pod_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.db
+            .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
+            .await
+    }
+
+    async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
+        self.db.delete_pod_cleanup_intents_for_node(node_name).await
+    }
+
+    async fn pod_slot_try_admit(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotAdmissionResult> {
+        self.db
+            .pod_slot_try_admit(namespace, pod_name, pod_uid, node_name)
+            .await
+    }
+
+    async fn pod_slot_mark_terminating(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<()> {
+        self.db
+            .pod_slot_mark_terminating(namespace, pod_name, pod_uid, node_name)
+            .await
+    }
+
+    async fn pod_slot_clear_if_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<()> {
+        self.db
+            .pod_slot_clear_if_uid(namespace, pod_name, pod_uid, node_name)
+            .await
+    }
+
+    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
+        self.db.subscribe_pod_slot_admissions()
+    }
+}
+
 /// Selector for the watch-event publisher path used by a backend.
 ///
 /// Defined at the trait layer so every backend reads from one type and

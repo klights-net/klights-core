@@ -346,6 +346,9 @@ mod tests {
                 outbox: None,
                 cluster_api: Some(cluster_api.clone()),
             });
+        let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
+            db.clone(),
+        ));
         PodSubsystemConfig {
             repository_parts,
             supervisor,
@@ -363,11 +366,13 @@ mod tests {
             runtime_node_role: RuntimeNodeRole::Worker,
             runtime_service: Some(runtime_service),
             runtime_store: Arc::new(
-                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(db.clone()),
+                crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(
+                    pod_runtime_store.clone(),
+                ),
             ),
             slot_admission: Arc::new(
                 crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
-                    db.clone(),
+                    pod_runtime_store,
                     "node-1".to_string(),
                 ),
             ),

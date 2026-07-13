@@ -1954,7 +1954,9 @@ mod cases {
         let handler = LocalPodLogHandler::new_with_pod_event_store(
             runtime_ns.clone(),
             supervisor.clone(),
-            pod_event_db.clone(),
+            crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
+                crate::datastore::DatastoreBackendWatchStore::new(pod_event_db.clone()),
+            )),
         );
         let mut stream = handler.follow_logs(PodLogRequest {
             request_id: "log-follow-delete".to_string(),

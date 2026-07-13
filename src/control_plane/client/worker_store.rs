@@ -2292,6 +2292,272 @@ impl crate::datastore::MetaStore for WorkerStoreAdapter {
     }
 }
 
+#[async_trait]
+impl crate::datastore::NetworkStore for WorkerStoreAdapter {
+    async fn record_sandbox(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        sandbox_id: &str,
+    ) -> Result<()> {
+        self.node_local
+            .admit_pod_runtime(pod_uid, namespace, pod_name, &self.node_name)
+            .await?;
+        self.node_local.record_sandbox(pod_uid, sandbox_id).await
+    }
+
+    async fn get_sandbox(&self, namespace: &str, pod_name: &str) -> Result<Option<String>> {
+        Ok(self
+            .node_local
+            .list_pod_runtime_by_namespace(namespace)
+            .await?
+            .into_iter()
+            .find(|row| row.pod_name == pod_name)
+            .and_then(|row| row.sandbox_id))
+    }
+
+    async fn delete_sandbox(&self, namespace: &str, pod_name: &str) -> Result<()> {
+        for row in self
+            .node_local
+            .list_pod_runtime_by_namespace(namespace)
+            .await?
+            .into_iter()
+            .filter(|row| row.pod_name == pod_name)
+        {
+            self.node_local
+                .delete_pod_runtime_for_uid(&row.pod_uid)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_sandbox_for_uid(
+        &self,
+        _namespace: &str,
+        _pod_name: &str,
+        pod_uid: &str,
+        _sandbox_id: &str,
+    ) -> Result<()> {
+        self.node_local.delete_pod_runtime_for_uid(pod_uid).await
+    }
+
+    async fn delete_pod_network(&self, sandbox_id: &str) -> Result<()> {
+        self.node_local.delete_network_for_sandbox(sandbox_id).await
+    }
+
+    async fn get_pod_network(&self, sandbox_id: &str) -> Result<Option<PodNetworkEndpoint>> {
+        self.node_local.get_network_for_sandbox(sandbox_id).await
+    }
+}
+
+#[async_trait]
+impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
+    async fn get_sandbox_for_uid(
+        &self,
+        _namespace: &str,
+        _pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .node_local
+            .get_pod_runtime(pod_uid)
+            .await?
+            .and_then(|row| row.sandbox_id))
+    }
+
+    async fn get_pod_network_for_pod(
+        &self,
+        _namespace: &str,
+        _pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<Option<PodNetworkEndpoint>> {
+        self.node_local.get_network_for_uid(pod_uid).await
+    }
+
+    async fn ipam_allocate_and_record_pod_network(
+        &self,
+        sandbox_id: &str,
+        pod: &crate::pod_identity::PodIdentity,
+        subnet_base_int: u32,
+        subnet_size: u32,
+        veth_host: &str,
+        netns_path: &str,
+    ) -> Result<(String, u32)> {
+        self.node_local
+            .reserve_ip_and_insert_network(PodNetworkAllocationRequest::new(
+                sandbox_id,
+                PodNetworkAllocationPod::new(&pod.namespace, &pod.name, &pod.uid),
+                PodNetworkAllocationSubnet::new(subnet_base_int, subnet_size),
+                PodNetworkAllocationLink::new(veth_host, netns_path),
+            ))
+            .await
+    }
+
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxRef>> {
+        Ok(self
+            .node_local
+            .list_pod_runtime()
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                Some(SandboxRef {
+                    namespace: row.namespace,
+                    pod_name: row.pod_name,
+                    pod_uid: row.pod_uid,
+                    sandbox_id: row.sandbox_id?,
+                })
+            })
+            .collect())
+    }
+
+    async fn list_pod_network_sandbox_ids(&self) -> Result<Vec<String>> {
+        self.node_local.list_networks().await
+    }
+
+    async fn allocate_node_subnet(
+        &self,
+        node_name: &str,
+        cluster_cidr: &str,
+        node_ip: &str,
+    ) -> Result<NodeSubnet> {
+        self.cluster_api
+            .allocate_node_subnet(node_name, cluster_cidr, node_ip)
+            .await
+    }
+
+    async fn update_node_peer_attributes(
+        &self,
+        _node_name: &str,
+        _mode: crate::controllers::annotations::NodePeerMode,
+        _hostport_range: Option<crate::networking::types::HostPortRange>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn update_node_dataplane(
+        &self,
+        _metadata: crate::networking::wireguard::DataplanePeerMetadata,
+    ) -> Result<()> {
+        self.unsupported("update_node_dataplane")
+    }
+
+    async fn get_node_dataplane(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
+        self.cluster_api.get_node_dataplane(node_name).await
+    }
+
+    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+        self.cluster_api.get_node_subnet(node_name).await
+    }
+
+    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
+        self.cluster_api.list_peer_subnets(my_node_name).await
+    }
+
+    async fn delete_node_subnet(&self, _node_name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn pod_endpoint_get_by_pod_ip(
+        &self,
+        pod_ip: std::net::Ipv4Addr,
+    ) -> Result<Option<PodEndpointRow>> {
+        self.node_local.get_endpoint_by_pod_ip(pod_ip).await
+    }
+
+    async fn pod_endpoint_list_all(&self) -> Result<Vec<PodEndpointRow>> {
+        self.node_local.list_endpoints_all().await
+    }
+
+    fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
+        self.node_local.subscribe_pod_endpoints()
+    }
+}
+
+#[async_trait]
+impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
+    async fn move_pod_to_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let _ = (node_name, namespace, pod_name, pod_uid, reason);
+        self.unsupported("move_pod_to_cleanup_intent")
+    }
+
+    async fn list_pod_cleanup_intents_for_node(
+        &self,
+        node_name: &str,
+    ) -> Result<Vec<PodCleanupIntent>> {
+        self.cluster_api
+            .list_pod_cleanup_intents_for_node(node_name)
+            .await
+    }
+
+    async fn delete_pod_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.cluster_api
+            .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
+            .await
+    }
+
+    async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
+        let _ = node_name;
+        Ok(())
+    }
+
+    async fn pod_slot_try_admit(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotAdmissionResult> {
+        self.node_local
+            .admit_pod_runtime(pod_uid, namespace, pod_name, node_name)
+            .await?;
+        Ok(PodSlotAdmissionResult::Admitted {
+            resource_version: 0,
+        })
+    }
+
+    async fn pod_slot_mark_terminating(
+        &self,
+        _namespace: &str,
+        _pod_name: &str,
+        _pod_uid: &str,
+        _node_name: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn pod_slot_clear_if_uid(
+        &self,
+        _namespace: &str,
+        _pod_name: &str,
+        pod_uid: &str,
+        _node_name: &str,
+    ) -> Result<()> {
+        self.node_local.delete_pod_runtime_for_uid(pod_uid).await
+    }
+
+    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
+        self.node_local.subscribe_pod_slot_admissions()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

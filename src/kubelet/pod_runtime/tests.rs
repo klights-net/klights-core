@@ -502,7 +502,11 @@ async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_matc
     );
     let repository = Arc::new(parts.repository);
     let datapath = Arc::new(crate::networking::test_support::MockNetworkProvider::new());
-    let store = Arc::new(crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(db.clone()));
+    let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
+        db.clone(),
+    ));
+    let store =
+        Arc::new(crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(pod_runtime_store));
     let runtime = crate::kubelet::pod_runtime::network::RealPodNetworkRuntime::new(
         datapath.clone(),
         repository,
@@ -4820,7 +4824,10 @@ async fn shared_cri_runtime_implements_container_runtime_control_with_parity() {
 async fn real_pod_runtime_store_records_and_retrieves_sandbox() {
     let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
     std::mem::forget(ds);
-    let store = crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(handle.clone());
+    let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
+        handle.clone(),
+    ));
+    let store = crate::kubelet::pod_runtime::store::RealPodRuntimeStore::new(pod_runtime_store);
     let key = PodRuntimeKey::new("ns", "test-pod", "uid-1");
 
     // Record sandbox.
@@ -4847,8 +4854,11 @@ async fn real_pod_runtime_store_records_and_retrieves_sandbox() {
 async fn real_pod_slot_admission_admits_and_clears_slot() {
     let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
     std::mem::forget(ds);
-    let admission = crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
+    let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
         handle.clone(),
+    ));
+    let admission = crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
+        pod_runtime_store,
         "node-1".into(),
     );
     let key = PodRuntimeKey::new("ns", "slot-pod", "uid-1");
@@ -4875,8 +4885,11 @@ async fn real_pod_slot_admission_admits_and_clears_slot() {
 async fn real_pod_slot_admission_blocks_duplicate_re_admit() {
     let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
     std::mem::forget(ds);
-    let admission = crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
+    let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
         handle.clone(),
+    ));
+    let admission = crate::kubelet::pod_runtime::store::RealPodSlotAdmission::new(
+        pod_runtime_store,
         "node-1".into(),
     );
     let key = PodRuntimeKey::new("ns", "dup-pod", "uid-1");

@@ -1,7 +1,12 @@
 use std::sync::Arc;
 
-use crate::datastore::DatastoreBackend;
+use crate::datastore::{NetworkMetadataStore, NetworkStore, PodCleanupStore};
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
+
+/// Focused datastore capability required by pod runtime sandbox persistence.
+pub trait PodRuntimeNetworkStore: NetworkStore + NetworkMetadataStore {}
+
+impl<T> PodRuntimeNetworkStore for T where T: NetworkStore + NetworkMetadataStore {}
 
 /// Node-local runtime persistence port for sandbox rows, pod network rows,
 /// and pod slot admission.
@@ -49,11 +54,11 @@ pub trait PodSlotAdmission: Send + Sync {
 
 /// Production runtime store adapter over the datastore backend.
 pub struct RealPodRuntimeStore {
-    db: Arc<dyn DatastoreBackend>,
+    db: Arc<dyn PodRuntimeNetworkStore>,
 }
 
 impl RealPodRuntimeStore {
-    pub fn new(db: Arc<dyn DatastoreBackend>) -> Self {
+    pub fn new(db: Arc<dyn PodRuntimeNetworkStore>) -> Self {
         Self { db }
     }
 }
@@ -99,12 +104,12 @@ impl PodRuntimeStore for RealPodRuntimeStore {
 
 /// Production slot admission adapter over the datastore backend.
 pub struct RealPodSlotAdmission {
-    db: Arc<dyn DatastoreBackend>,
+    db: Arc<dyn PodCleanupStore>,
     node_name: String,
 }
 
 impl RealPodSlotAdmission {
-    pub fn new(db: Arc<dyn DatastoreBackend>, node_name: String) -> Self {
+    pub fn new(db: Arc<dyn PodCleanupStore>, node_name: String) -> Self {
         Self { db, node_name }
     }
 }

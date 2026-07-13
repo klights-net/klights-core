@@ -206,7 +206,7 @@ impl CriNodeMetricsHandler {
 pub struct LocalPodLogHandler {
     containerd_namespace: String,
     task_supervisor: Arc<TaskSupervisor>,
-    pod_event_db: Option<crate::datastore::DatastoreHandle>,
+    pod_log_follow_watch: Option<crate::api_pod_subresources::logs::PodLogFollowWatchSource>,
 }
 
 impl LocalPodLogHandler {
@@ -214,19 +214,19 @@ impl LocalPodLogHandler {
         Self {
             containerd_namespace,
             task_supervisor,
-            pod_event_db: None,
+            pod_log_follow_watch: None,
         }
     }
 
-    pub fn new_with_pod_event_store(
+    pub(crate) fn new_with_pod_event_store(
         containerd_namespace: String,
         task_supervisor: Arc<TaskSupervisor>,
-        pod_event_db: crate::datastore::DatastoreHandle,
+        pod_log_follow_watch: crate::api_pod_subresources::logs::PodLogFollowWatchSource,
     ) -> Self {
         Self {
             containerd_namespace,
             task_supervisor,
-            pod_event_db: Some(pod_event_db),
+            pod_log_follow_watch: Some(pod_log_follow_watch),
         }
     }
 
@@ -321,29 +321,27 @@ impl PodLogHandler for LocalPodLogHandler {
             insecure_skip_tls_verify_backend: false,
         };
         let byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-            if let Some(pod_event_db) = self.pod_event_db.clone() {
+            if let Some(pod_log_follow_watch) = self.pod_log_follow_watch.clone() {
                 let task_supervisor = self.task_supervisor.clone();
                 let stream = async_stream::stream! {
-                    let pod_events =
-                        crate::api_pod_subresources::logs::build_pod_log_follow_event_cursor(
-                            pod_event_db,
-                        )
-                        .await;
-                let termination = crate::api_pod_subresources::logs::PodLogFollowTermination::new(
-                    pod_events,
-                    namespace,
-                    pod_name,
-                    pod_uid,
-                    container_name,
-                    false,
-                );
+                    let pod_events = crate::api_pod_subresources::logs::build_pod_log_follow_event_cursor(
+                        &pod_log_follow_watch,
+                    ).await;
+                    let termination = crate::api_pod_subresources::logs::PodLogFollowTermination::new(
+                        pod_events,
+                        namespace,
+                        pod_name,
+                        pod_uid,
+                        container_name,
+                        false,
+                    );
                     let mut logs = Box::pin(
-                    crate::api_pod_subresources::logs::follow_log_file_with_termination_watch(
-                        log_path,
-                        params,
+                        crate::api_pod_subresources::logs::follow_log_file_with_termination_watch(
+                            log_path,
+                            params,
                             task_supervisor,
                         termination,
-                    ),
+                        ),
                     );
                     while let Some(item) = logs.next().await {
                         yield item;

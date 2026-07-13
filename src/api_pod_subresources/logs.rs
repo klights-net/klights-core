@@ -1,4 +1,5 @@
 use super::*;
+use crate::datastore::{CurrentResourceVersionStore, WatchStore};
 use crate::replication::protocol::PodLogRequest;
 use crate::watch::{
     EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
@@ -6,6 +7,7 @@ use crate::watch::{
 };
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
+use std::sync::Arc;
 use std::{fs as blocking_fs, path::PathBuf};
 #[cfg(test)]
 use tokio::sync::broadcast;
@@ -52,6 +54,24 @@ struct RemotePodLogWebSocketRequest {
     params: LogQuery,
     node_name: String,
     req: Request,
+}
+
+#[derive(Clone)]
+pub(crate) struct PodLogFollowWatchSource {
+    watch_store: Arc<dyn WatchStore>,
+    resource_version_store: Arc<dyn CurrentResourceVersionStore>,
+}
+
+impl PodLogFollowWatchSource {
+    pub(crate) fn new<T>(db: Arc<T>) -> Self
+    where
+        T: WatchStore + CurrentResourceVersionStore + Send + Sync + 'static,
+    {
+        Self {
+            watch_store: db.clone(),
+            resource_version_store: db,
+        }
+    }
 }
 
 /// All container names declared in a Pod spec (regular, init, ephemeral).
@@ -285,7 +305,10 @@ async fn build_pod_log_follow_termination(
     pod_uid: &str,
     container_name: &str,
 ) -> Result<PodLogFollowTermination, AppError> {
-    let pod_events = build_pod_log_follow_event_cursor(state.db.clone()).await;
+    let pod_event_store = PodLogFollowWatchSource::new(Arc::new(
+        crate::datastore::DatastoreBackendWatchStore::new(state.db.clone()),
+    ));
+    let pod_events = build_pod_log_follow_event_cursor(&pod_event_store).await;
     let current = crate::kubelet::pod_repository::PodReader::get_pod(
         state.pod_repository.as_ref(),
         namespace,
@@ -348,16 +371,22 @@ async fn build_pod_log_follow_termination(
     ))
 }
 
-pub async fn build_pod_log_follow_event_cursor(
-    db: crate::datastore::DatastoreHandle,
+pub(crate) async fn build_pod_log_follow_event_cursor(
+    pod_event_store: &PodLogFollowWatchSource,
 ) -> SignalWatchCursor<crate::datastore::sqlite::DatastoreWatchReplaySource> {
     let topic = WatchTopic::new("v1", "Pod");
-    let signal_rx = db.subscribe_watch_signals(topic.clone());
-    let start_rv = db.get_current_resource_version().await.unwrap_or(0);
+    let signal_rx = pod_event_store
+        .watch_store
+        .subscribe_watch_signals(topic.clone());
+    let start_rv = pod_event_store
+        .resource_version_store
+        .get_current_resource_version()
+        .await
+        .unwrap_or(0);
     SignalWatchCursor::new(
         signal_rx,
         crate::datastore::sqlite::DatastoreWatchReplaySource::new(
-            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(db)),
+            pod_event_store.watch_store.clone(),
             vec![crate::datastore::WatchTarget::namespaced("v1", "Pod")],
         ),
         topic,
