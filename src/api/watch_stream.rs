@@ -385,11 +385,7 @@ pub fn serialize_watch_event_frame(event: &WatchEvent, kind: &str) -> anyhow::Re
         r#type: Some(event.event_type.to_string()),
         object: Some(RawExtension { raw: Some(raw) }),
     };
-    let event_bytes = pb_event.encode_to_vec();
-    let mut frame = Vec::with_capacity(4 + event_bytes.len());
-    frame.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
-    frame.extend(event_bytes);
-    Ok(frame)
+    encode_k8s_watch_event_frame(&pb_event)
 }
 
 pub fn serialize_raw_watch_event_frame(event: &RawWatchEvent) -> anyhow::Result<Vec<u8>> {
@@ -404,10 +400,30 @@ pub fn serialize_raw_watch_event_frame(event: &RawWatchEvent) -> anyhow::Result<
         r#type: Some(event.event_type.to_string()),
         object: Some(RawExtension { raw: Some(raw) }),
     };
+    encode_k8s_watch_event_frame(&pb_event)
+}
+
+/// Encode a protobuf `meta.k8s.io/v1 WatchEvent` into a length-prefixed
+/// Kubernetes stream frame.
+///
+/// Kubernetes protobuf stream readers remove the four-byte frame length and
+/// hand the remaining bytes to the Kubernetes serializer. That serializer
+/// requires the payload to start with `k8s\0` and contain a `runtime.Unknown`
+/// envelope whose type metadata identifies `meta.k8s.io/v1, Kind=WatchEvent`.
+/// The inner resource envelope (built by each caller and stored in
+/// `WatchEvent.object.raw`) is necessary but does not replace this required
+/// outer WatchEvent envelope. Both protobuf watch entry points delegate
+/// final framing here so every emitted frame shares one correct shape.
+fn encode_k8s_watch_event_frame(pb_event: &PbWatchEvent) -> anyhow::Result<Vec<u8>> {
     let event_bytes = pb_event.encode_to_vec();
-    let mut frame = Vec::with_capacity(4 + event_bytes.len());
-    frame.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
-    frame.extend(event_bytes);
+    let outer = crate::protobuf::wrap_protobuf_resource_envelope(
+        "meta.k8s.io/v1",
+        "WatchEvent",
+        event_bytes,
+    )?;
+    let mut frame = Vec::with_capacity(4 + outer.len());
+    frame.extend_from_slice(&(outer.len() as u32).to_be_bytes());
+    frame.extend(outer);
     Ok(frame)
 }
 
@@ -1495,11 +1511,29 @@ mod tests {
         membership.transition(event, matches_selector)
     }
 
-    fn decode_length_prefixed_watch_events(
-        chunks: &[Vec<u8>],
-    ) -> Vec<k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent> {
+    /// A protobuf watch frame decoded through the full Kubernetes envelope
+    /// contract, exactly as client-go's protobuf stream reader consumes it.
+    struct DecodedProtobufWatchFrame {
+        event_type: String,
+        inner_api_version: String,
+        inner_kind: String,
+        inner_raw: Vec<u8>,
+    }
+
+    /// Kubernetes protobuf watch-frame decoder shared by every watch-stream
+    /// test.
+    ///
+    /// client-go removes the four-byte frame length and passes the remaining
+    /// bytes to the Kubernetes protobuf serializer, which requires the payload
+    /// to begin with `k8s\0` and carry a `runtime.Unknown` envelope whose type
+    /// metadata identifies `meta.k8s.io/v1, Kind=WatchEvent`. Decoding
+    /// `frame[4..]` directly as a bare `WatchEvent` validates klights' internal
+    /// shape rather than the Kubernetes wire contract, so this helper validates
+    /// the outer envelope and then the inner resource envelope exactly as
+    /// client-go would. It also rejects a length-prefixed bare `WatchEvent`.
+    fn decode_k8s_protobuf_watch_frames(chunks: &[Vec<u8>]) -> Vec<DecodedProtobufWatchFrame> {
         let mut pending = Vec::new();
-        let mut events = Vec::new();
+        let mut frames = Vec::new();
 
         for chunk in chunks {
             pending.extend_from_slice(chunk);
@@ -1515,26 +1549,78 @@ mod tests {
                 }
 
                 let payload = &pending[4..frame_end];
-                events.push(
-                    k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(payload)
-                        .unwrap_or_else(|_| panic!("frame should decode as a protobuf WatchEvent")),
+                assert_eq!(
+                    &payload[..4],
+                    b"k8s\0",
+                    "protobuf watch frame must begin with the k8s\\0 outer-envelope magic",
                 );
+                let outer = crate::protobuf::Unknown::decode(&payload[4..])
+                    .expect("outer frame payload must decode as runtime.Unknown");
+                let outer_type_meta = outer
+                    .type_meta
+                    .as_ref()
+                    .expect("outer WatchEvent envelope must carry type metadata");
+                assert_eq!(
+                    (
+                        outer_type_meta.api_version.as_str(),
+                        outer_type_meta.kind.as_str()
+                    ),
+                    ("meta.k8s.io/v1", "WatchEvent"),
+                    "outer watch envelope must identify meta.k8s.io/v1 WatchEvent",
+                );
+                let pb_event = k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(
+                    outer.raw.as_slice(),
+                )
+                .expect("outer envelope raw payload must decode as meta.k8s.io WatchEvent");
+                let object_raw = pb_event
+                    .object
+                    .and_then(|object| object.raw)
+                    .expect("WatchEvent must carry an enveloped object RawExtension");
+                assert_eq!(
+                    &object_raw[..4],
+                    b"k8s\0",
+                    "inner watch object must begin with the k8s\\0 envelope magic",
+                );
+                let inner = crate::protobuf::Unknown::decode(&object_raw[4..])
+                    .expect("inner object payload must decode as runtime.Unknown");
+                let inner_type_meta = inner
+                    .type_meta
+                    .as_ref()
+                    .expect("inner object envelope must carry type metadata");
+                frames.push(DecodedProtobufWatchFrame {
+                    event_type: pb_event.r#type.unwrap_or_default(),
+                    inner_api_version: inner_type_meta.api_version.clone(),
+                    inner_kind: inner_type_meta.kind.clone(),
+                    inner_raw: inner.raw.clone(),
+                });
                 pending.drain(0..frame_end);
             }
         }
 
-        events
+        frames
     }
 
-    fn decode_watch_object_envelope(
-        event: k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent,
-    ) -> crate::protobuf::Unknown {
-        let raw = event
-            .object
-            .and_then(|object| object.raw)
-            .expect("protobuf WatchEvent must carry RawExtension bytes");
-        assert_eq!(&raw[..4], b"k8s\0");
-        crate::protobuf::Unknown::decode(&raw[4..]).unwrap()
+    /// Assert the Kubernetes envelope decoder rejects a length-prefixed bare
+    /// `WatchEvent` (the pre-fix malformed frame shape).
+    #[test]
+    fn k8s_envelope_decoder_rejects_length_prefixed_bare_watch_event() {
+        use prost::Message;
+        let pb_event = k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent {
+            r#type: Some("ADDED".to_string()),
+            object: Some(k8s_pb::apimachinery::pkg::runtime::RawExtension {
+                raw: Some(Vec::new()),
+            }),
+        };
+        let event_bytes = pb_event.encode_to_vec();
+        let mut bare = Vec::with_capacity(4 + event_bytes.len());
+        bare.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
+        bare.extend(event_bytes);
+
+        let result = std::panic::catch_unwind(|| decode_k8s_protobuf_watch_frames(&[bare]));
+        assert!(
+            result.is_err(),
+            "Kubernetes envelope decoder must reject a length-prefixed bare WatchEvent"
+        );
     }
 
     #[test]
@@ -1600,19 +1686,13 @@ mod tests {
             u32::from_be_bytes(frame[0..4].try_into().expect("frame length prefix")) as u64,
         );
 
-        let event =
-            k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(&frame[4..]).unwrap();
-        assert_eq!(event.r#type.as_deref(), Some("BOOKMARK"));
-
-        let envelope = decode_watch_object_envelope(event);
-        assert_eq!(
-            envelope
-                .type_meta
-                .as_ref()
-                .map(|type_meta| (type_meta.api_version.as_str(), type_meta.kind.as_str())),
-            Some(("v1", "ConfigMap"))
-        );
-        let decoded = k8s_pb::api::core::v1::ConfigMap::decode(envelope.raw.as_slice()).unwrap();
+        let frames = decode_k8s_protobuf_watch_frames(&[frame]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event_type, "BOOKMARK");
+        assert_eq!(frames[0].inner_api_version, "v1");
+        assert_eq!(frames[0].inner_kind, "ConfigMap");
+        let decoded =
+            k8s_pb::api::core::v1::ConfigMap::decode(frames[0].inner_raw.as_slice()).unwrap();
         assert_eq!(
             decoded
                 .metadata
@@ -1636,21 +1716,15 @@ mod tests {
             u32::from_be_bytes(frame[0..4].try_into().expect("frame length prefix")) as u64,
         );
 
-        let event =
-            k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(&frame[4..]).unwrap();
-        assert_eq!(event.r#type.as_deref(), Some("ERROR"));
-
-        let envelope = decode_watch_object_envelope(event);
-        assert_eq!(
-            envelope
-                .type_meta
-                .as_ref()
-                .map(|type_meta| (type_meta.api_version.as_str(), type_meta.kind.as_str())),
-            Some(("v1", "Status"))
-        );
-        let decoded =
-            k8s_pb::apimachinery::pkg::apis::meta::v1::Status::decode(envelope.raw.as_slice())
-                .unwrap();
+        let frames = decode_k8s_protobuf_watch_frames(&[frame]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event_type, "ERROR");
+        assert_eq!(frames[0].inner_api_version, "v1");
+        assert_eq!(frames[0].inner_kind, "Status");
+        let decoded = k8s_pb::apimachinery::pkg::apis::meta::v1::Status::decode(
+            frames[0].inner_raw.as_slice(),
+        )
+        .unwrap();
         assert_eq!(decoded.code, Some(410));
         assert_eq!(decoded.reason, Some("Expired".to_string()));
     }
@@ -1673,13 +1747,14 @@ mod tests {
             WatchStreamFormat::Protobuf,
         )
         .expect_err("unsupported protobuf resource should be terminal");
-        let decoded =
-            k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent::decode(&frame[4..]).unwrap();
-        assert_eq!(decoded.r#type.as_deref(), Some("ERROR"));
-        let envelope = decode_watch_object_envelope(decoded);
-        let status =
-            k8s_pb::apimachinery::pkg::apis::meta::v1::Status::decode(envelope.raw.as_slice())
-                .unwrap();
+        let frames = decode_k8s_protobuf_watch_frames(&[frame]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event_type, "ERROR");
+        assert_eq!(frames[0].inner_kind, "Status");
+        let status = k8s_pb::apimachinery::pkg::apis::meta::v1::Status::decode(
+            frames[0].inner_raw.as_slice(),
+        )
+        .unwrap();
         assert_eq!(status.code, Some(500));
         assert_eq!(status.reason.as_deref(), Some("InternalError"));
     }
@@ -1763,17 +1838,11 @@ mod tests {
 
             let frame = serialize_raw_watch_event_for_stream(&row, WatchStreamFormat::Protobuf);
             assert_ne!(frame.first(), Some(&b'{'));
-            let events = decode_length_prefixed_watch_events(&[frame]);
-            assert_eq!(events.len(), 1);
-            assert_eq!(events[0].r#type.as_deref(), Some("ADDED"));
-            let envelope = decode_watch_object_envelope(events.into_iter().next().unwrap());
-            assert_eq!(
-                envelope
-                    .type_meta
-                    .as_ref()
-                    .map(|type_meta| (type_meta.api_version.as_str(), type_meta.kind.as_str())),
-                Some((*api_version, *kind))
-            );
+            let frames = decode_k8s_protobuf_watch_frames(&[frame]);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].event_type, "ADDED");
+            assert_eq!(frames[0].inner_api_version, *api_version);
+            assert_eq!(frames[0].inner_kind, *kind);
         }
     }
 
@@ -1795,15 +1864,192 @@ mod tests {
             WatchStreamFormat::Protobuf,
         );
         let all = [added.as_slice(), bookmark.as_slice()].concat();
-        let frames = decode_length_prefixed_watch_events(&[
+        let frames = decode_k8s_protobuf_watch_frames(&[
             all[0..3].to_vec(),
             all[3..all.len() - 5].to_vec(),
             all[all.len() - 5..].to_vec(),
         ]);
 
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].r#type.as_deref(), Some("ADDED"));
-        assert_eq!(frames[1].r#type.as_deref(), Some("BOOKMARK"));
+        assert_eq!(frames[0].event_type, "ADDED");
+        assert_eq!(frames[1].event_type, "BOOKMARK");
+    }
+
+    #[test]
+    fn protobuf_watch_event_types_table_drive_through_outer_envelope() {
+        // Table-drive ADDED, MODIFIED, DELETED, BOOKMARK, and ERROR through the
+        // same Kubernetes envelope decoder. Each frame must carry the outer
+        // meta.k8s.io/v1 WatchEvent envelope and a correctly typed inner
+        // resource/Status envelope.
+        let added = WatchEvent::from_type(
+            "ADDED",
+            serde_json::json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"cm","namespace":"default","resourceVersion":"3"},
+                "data":{"k":"v"}
+            }),
+        );
+        let modified = WatchEvent::from_type(
+            "MODIFIED",
+            serde_json::json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"cm","namespace":"default","resourceVersion":"4"},
+                "data":{"k":"v2"}
+            }),
+        );
+        let deleted = WatchEvent::from_type(
+            "DELETED",
+            serde_json::json!({
+                "apiVersion":"v1","kind":"ConfigMap",
+                "metadata":{"name":"cm","namespace":"default","resourceVersion":"5"},
+                "data":{"k":"v2"}
+            }),
+        );
+        let bookmark = WatchEvent::bookmark_typed(6, "v1", "ConfigMap");
+
+        let frames = [
+            serialize_watch_event_for_stream(
+                added,
+                "ConfigMap",
+                false,
+                WatchStreamFormat::Protobuf,
+            ),
+            serialize_watch_event_for_stream(
+                modified,
+                "ConfigMap",
+                false,
+                WatchStreamFormat::Protobuf,
+            ),
+            serialize_watch_event_for_stream(
+                deleted,
+                "ConfigMap",
+                false,
+                WatchStreamFormat::Protobuf,
+            ),
+            serialize_watch_event_for_stream(
+                bookmark,
+                "ConfigMap",
+                false,
+                WatchStreamFormat::Protobuf,
+            ),
+            serialize_watch_status_for_stream(WatchStreamFormat::Protobuf, 410, "Expired", "gone"),
+        ];
+        let decoded = decode_k8s_protobuf_watch_frames(&frames);
+        assert_eq!(decoded.len(), 5);
+        let event_types: Vec<&str> = decoded.iter().map(|f| f.event_type.as_str()).collect();
+        assert_eq!(
+            event_types,
+            ["ADDED", "MODIFIED", "DELETED", "BOOKMARK", "ERROR"]
+        );
+        for frame in &decoded {
+            assert_eq!(frame.inner_api_version, "v1");
+        }
+        assert_eq!(decoded[0].inner_kind, "ConfigMap");
+        assert_eq!(decoded[3].inner_kind, "ConfigMap");
+        assert_eq!(decoded[4].inner_kind, "Status");
+        let status = k8s_pb::apimachinery::pkg::apis::meta::v1::Status::decode(
+            decoded[4].inner_raw.as_slice(),
+        )
+        .unwrap();
+        assert_eq!(status.code, Some(410));
+    }
+
+    #[test]
+    fn raw_selectorless_protobuf_event_types_drive_through_outer_envelope() {
+        let object_json = serde_json::json!({
+            "apiVersion":"v1","kind":"ConfigMap",
+            "metadata":{"namespace":"default","name":"cm1","resourceVersion":"7"},
+            "data":{"k":"v"}
+        })
+        .to_string();
+        for event_type in ["ADDED", "MODIFIED", "DELETED"] {
+            let row = RawWatchEvent {
+                api_version: "v1".to_string(),
+                kind: "ConfigMap".to_string(),
+                namespace: Some("default".to_string()),
+                name: "cm1".to_string(),
+                resource_version: 7,
+                event_type: std::borrow::Cow::Borrowed(event_type),
+                object_json: Bytes::from(object_json.clone().into_bytes()),
+            };
+            let frame = serialize_raw_watch_event_for_stream(&row, WatchStreamFormat::Protobuf);
+            let decoded = decode_k8s_protobuf_watch_frames(&[frame]);
+            assert_eq!(
+                decoded.len(),
+                1,
+                "{event_type} must produce one outer-enveloped frame"
+            );
+            assert_eq!(decoded[0].event_type, event_type);
+            assert_eq!(decoded[0].inner_api_version, "v1");
+            assert_eq!(decoded[0].inner_kind, "ConfigMap");
+            let cm =
+                k8s_pb::api::core::v1::ConfigMap::decode(decoded[0].inner_raw.as_slice()).unwrap();
+            assert_eq!(
+                cm.metadata.as_ref().and_then(|m| m.name.as_deref()),
+                Some("cm1")
+            );
+        }
+    }
+
+    #[test]
+    fn protobuf_watch_frames_split_across_chunks_decode_by_declared_length() {
+        // Framing must depend on the declared frame length, not body chunk
+        // boundaries: coalesce two frames and split them at arbitrary offsets.
+        let first = serialize_watch_event_for_stream(
+            WatchEvent::from_type(
+                "ADDED",
+                serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a","namespace":"default","resourceVersion":"1"}}),
+            ),
+            "ConfigMap",
+            false,
+            WatchStreamFormat::Protobuf,
+        );
+        let second = serialize_watch_event_for_stream(
+            WatchEvent::bookmark_typed(2, "v1", "ConfigMap"),
+            "ConfigMap",
+            false,
+            WatchStreamFormat::Protobuf,
+        );
+        let combined = [first.as_slice(), second.as_slice()].concat();
+        let split = combined.len() / 2;
+        let decoded = decode_k8s_protobuf_watch_frames(&[
+            combined[..split].to_vec(),
+            combined[split..].to_vec(),
+        ]);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].event_type, "ADDED");
+        assert_eq!(decoded[1].event_type, "BOOKMARK");
+    }
+
+    #[test]
+    fn default_client_go_accept_header_yields_enveloped_protobuf_watch() {
+        // A default client-go Accept header must negotiate protobuf and the
+        // resulting frame must be consumable by the Kubernetes envelope
+        // decoder without forcing JSON.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf, application/json;q=0.5"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Protobuf,
+        );
+        let frame = serialize_watch_event_for_stream(
+            WatchEvent::from_type(
+                "ADDED",
+                serde_json::json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"x","namespace":"default","resourceVersion":"9"}}),
+            ),
+            "ConfigMap",
+            false,
+            WatchStreamFormat::Protobuf,
+        );
+        let decoded = decode_k8s_protobuf_watch_frames(&[frame]);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].event_type, "ADDED");
+        assert_eq!(decoded[0].inner_kind, "ConfigMap");
     }
 
     #[test]

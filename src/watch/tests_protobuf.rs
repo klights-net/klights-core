@@ -3,7 +3,7 @@
 //! Tests that ADDED / MODIFIED / DELETED / BOOKMARK events can be encoded
 //! to protobuf frames and decoded back, preserving event type and resource.
 
-use crate::protobuf::encode_protobuf_resource;
+use crate::protobuf::{encode_protobuf_resource, wrap_protobuf_resource_envelope};
 use crate::watch::WatchEvent;
 use bytes::{Buf, BytesMut};
 use k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent as PbWatchEvent;
@@ -11,36 +11,69 @@ use k8s_pb::apimachinery::pkg::runtime::RawExtension;
 use prost::Message;
 use serde_json::json;
 
-/// Encode a WatchEvent to a protobuf frame.
-/// Format: 4-byte big-endian length prefix + protobuf WatchEvent message.
+/// Encode a WatchEvent to a Kubernetes protobuf stream frame.
+///
+/// Format: 4-byte big-endian length prefix + the complete outer Kubernetes
+/// envelope (`k8s\0` + `runtime.Unknown` identifying `meta.k8s.io/v1,
+/// Kind=WatchEvent`), whose raw payload is the encoded `WatchEvent` whose
+/// object is itself an enveloped resource. Mirrors the production encoder so
+/// these tests validate the Kubernetes wire contract, not klights' internal
+/// shape.
 fn encode_watch_event_frame(event: &WatchEvent) -> anyhow::Result<Vec<u8>> {
-    // Get the object kind
     let kind = event
         .object
         .get("kind")
         .and_then(|k| k.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing kind"))?;
-
-    // Encode the object to protobuf
+    let api_version = event
+        .object
+        .get("apiVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let object_pb = encode_protobuf_resource(kind, &event.object)?;
-
-    // Build the WatchEvent protobuf message
+    let enveloped_object = wrap_protobuf_resource_envelope(api_version, kind, object_pb)?;
     let pb_event = PbWatchEvent {
         r#type: Some(event.event_type.to_string()),
         object: Some(RawExtension {
-            raw: Some(object_pb),
+            raw: Some(enveloped_object),
         }),
     };
-
-    // Encode the WatchEvent
     let event_bytes = pb_event.encode_to_vec();
-
-    // Prepend 4-byte big-endian length
-    let mut frame = Vec::with_capacity(4 + event_bytes.len());
-    frame.extend_from_slice(&(event_bytes.len() as u32).to_be_bytes());
-    frame.extend(event_bytes);
-
+    let outer = wrap_protobuf_resource_envelope("meta.k8s.io/v1", "WatchEvent", event_bytes)?;
+    let mut frame = Vec::with_capacity(4 + outer.len());
+    frame.extend_from_slice(&(outer.len() as u32).to_be_bytes());
+    frame.extend(outer);
     Ok(frame)
+}
+
+/// Decode a length-prefixed Kubernetes protobuf watch frame through the outer
+/// `runtime.Unknown` envelope, exactly as client-go consumes it. Decoding
+/// `frame[4..]` directly as a bare `WatchEvent` validates klights' internal
+/// shape rather than the Kubernetes wire contract.
+fn decode_k8s_watch_event(frame: &[u8]) -> PbWatchEvent {
+    assert!(frame.len() > 4, "frame should have length prefix + data");
+    let mut buf = &frame[..];
+    let len = buf.get_u32() as usize;
+    assert_eq!(frame.len(), 4 + len, "frame length should match prefix");
+    let payload = &frame[4..];
+    assert_eq!(
+        &payload[..4],
+        b"k8s\0",
+        "protobuf watch frame must begin with the k8s\\0 outer-envelope magic"
+    );
+    let outer = crate::protobuf::Unknown::decode(&payload[4..])
+        .expect("outer frame payload must decode as runtime.Unknown");
+    let type_meta = outer
+        .type_meta
+        .as_ref()
+        .expect("outer WatchEvent envelope must carry type metadata");
+    assert_eq!(
+        (type_meta.api_version.as_str(), type_meta.kind.as_str()),
+        ("meta.k8s.io/v1", "WatchEvent"),
+        "outer watch envelope must identify meta.k8s.io/v1 WatchEvent"
+    );
+    PbWatchEvent::decode(outer.raw.as_slice())
+        .expect("outer envelope raw payload must decode as meta.k8s.io WatchEvent")
 }
 
 #[cfg(test)]
@@ -78,13 +111,8 @@ mod tests {
         // Verify frame structure
         assert!(frame.len() > 4, "frame should have length prefix + data");
 
-        // Decode length prefix
-        let mut buf = &frame[..];
-        let len = buf.get_u32() as usize;
-        assert_eq!(frame.len(), 4 + len, "frame length should match prefix");
-
-        // Verify we can decode the protobuf WatchEvent
-        let pb_event = PbWatchEvent::decode(&frame[4..]).expect("decode protobuf WatchEvent");
+        // Verify the frame round-trips through the Kubernetes outer envelope.
+        let pb_event = decode_k8s_watch_event(&frame);
         assert_eq!(pb_event.r#type, Some("ADDED".to_string()));
         assert!(pb_event.object.is_some(), "object should be present");
     }
@@ -109,7 +137,7 @@ mod tests {
         let event = WatchEvent::modified(cm);
         let frame = encode_watch_event_frame(&event).expect("encode watch event frame");
 
-        let pb_event = PbWatchEvent::decode(&frame[4..]).expect("decode protobuf WatchEvent");
+        let pb_event = decode_k8s_watch_event(&frame);
         assert_eq!(pb_event.r#type, Some("MODIFIED".to_string()));
     }
 
@@ -129,7 +157,7 @@ mod tests {
         let event = WatchEvent::deleted(node);
         let frame = encode_watch_event_frame(&event).expect("encode watch event frame");
 
-        let pb_event = PbWatchEvent::decode(&frame[4..]).expect("decode protobuf WatchEvent");
+        let pb_event = decode_k8s_watch_event(&frame);
         assert_eq!(pb_event.r#type, Some("DELETED".to_string()));
     }
 
@@ -140,7 +168,7 @@ mod tests {
 
         let frame = encode_watch_event_frame(&bookmark).expect("encode bookmark frame");
 
-        let pb_event = PbWatchEvent::decode(&frame[4..]).expect("decode protobuf WatchEvent");
+        let pb_event = decode_k8s_watch_event(&frame);
         assert_eq!(pb_event.r#type, Some("BOOKMARK".to_string()));
     }
 
@@ -178,16 +206,15 @@ mod tests {
         let data = buffer.freeze();
 
         while offset < data.len() {
-            let pb_event = {
-                let len = u32::from_be_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
-                ]) as usize;
-                PbWatchEvent::decode(&data[offset + 4..offset + 4 + len]).expect("decode event")
-            };
-            offset += 4 + pb_event.encoded_len();
+            let len = u32::from_be_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            let frame_end = offset + 4 + len;
+            let pb_event = decode_k8s_watch_event(&data[offset..frame_end]);
+            offset = frame_end;
 
             match decoded_count {
                 0 => assert_eq!(pb_event.r#type, Some("ADDED".to_string())),
@@ -215,18 +242,15 @@ mod tests {
 
         // Extract and verify length prefix
         let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
-
-        // The length should be the size of the protobuf WatchEvent
-        let pb_event = PbWatchEvent::decode(&frame[4..]).unwrap();
-        assert_eq!(
-            len,
-            pb_event.encoded_len(),
-            "length prefix should match encoded size"
-        );
         assert_eq!(
             frame.len(),
             4 + len,
             "frame should be exactly length prefix + data"
         );
+        // The length covers the complete outer Kubernetes envelope, which must
+        // begin with the k8s\0 magic and identify meta.k8s.io/v1 WatchEvent.
+        assert_eq!(&frame[4..8], b"k8s\0");
+        let pb_event = decode_k8s_watch_event(&frame);
+        assert_eq!(pb_event.r#type, Some("ADDED".to_string()));
     }
 }
