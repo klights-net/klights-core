@@ -14,6 +14,7 @@ pub mod node_leader_labels;
 pub mod node_registration;
 pub mod node_role_labels;
 pub mod node_status_merge;
+pub mod node_status_projection;
 pub mod outbox;
 pub mod pod_cluster_runtime;
 pub mod pod_container_config;
