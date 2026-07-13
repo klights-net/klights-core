@@ -109,7 +109,10 @@ impl crate::datastore::ResourceStore for Datastore {
         )
         .await
     }
+}
 
+#[async_trait::async_trait]
+impl crate::datastore::CurrentResourceVersionStore for Datastore {
     async fn get_current_resource_version(&self) -> anyhow::Result<i64> {
         crate::datastore::DatastoreBackend::get_current_resource_version(self).await
     }
@@ -195,6 +198,20 @@ impl crate::datastore::NamespaceStore for Datastore {
         crate::datastore::DatastoreBackend::get_namespace(self, name).await
     }
 
+    #[cfg(test)]
+    async fn seed_namespace_for_test(&self, name: &str) {
+        crate::datastore::DatastoreBackend::seed_namespace_for_test(self, name).await
+    }
+
+    async fn list_namespaces(
+        &self,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+    ) -> anyhow::Result<ResourceList> {
+        crate::datastore::DatastoreBackend::list_namespaces(self, label_selector, field_selector)
+            .await
+    }
+
     async fn list_namespaces_page(
         &self,
         label_selector: Option<&str>,
@@ -221,6 +238,10 @@ impl crate::datastore::NamespaceStore for Datastore {
 
     async fn delete_namespace(&self, name: &str) -> anyhow::Result<()> {
         crate::datastore::DatastoreBackend::delete_namespace(self, name).await
+    }
+
+    async fn delete_namespace_observed_rv(&self, name: &str) -> anyhow::Result<i64> {
+        crate::datastore::DatastoreBackend::delete_namespace_observed_rv(self, name).await
     }
 
     async fn delete_namespace_contents(&self, name: &str) -> anyhow::Result<()> {
@@ -679,5 +700,31 @@ impl crate::datastore::ReplicationStore for Datastore {
         commit: crate::log_apply::LogApplyCommit,
     ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
+    }
+
+    async fn current_log_apply_index(&self) -> anyhow::Result<i64> {
+        crate::datastore::DatastoreBackend::current_log_apply_index(self).await
+    }
+
+    #[cfg(test)]
+    async fn apply_replicated_create_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        options: crate::datastore::types::ReplicatedCreateOptions,
+    ) -> anyhow::Result<Resource> {
+        crate::datastore::DatastoreBackend::apply_replicated_create_resource(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            options,
+        )
+        .await
     }
 }

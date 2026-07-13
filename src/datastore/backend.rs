@@ -1298,7 +1298,6 @@ pub trait ResourceStore: Send + Sync {
         data: Value,
         preconditions: ResourcePreconditions,
     ) -> Result<Resource>;
-    async fn get_current_resource_version(&self) -> Result<i64>;
 }
 
 /// Resource list and selector queries.
@@ -1710,6 +1709,13 @@ pub trait PodWorkqueueStore: Send + Sync {
 pub trait NamespaceStore: Send + Sync {
     async fn create_namespace(&self, name: &str, data: Value) -> Result<Resource>;
     async fn get_namespace(&self, name: &str) -> Result<Option<Resource>>;
+    #[cfg(test)]
+    async fn seed_namespace_for_test(&self, name: &str);
+    async fn list_namespaces(
+        &self,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+    ) -> Result<ResourceList>;
     async fn list_namespaces_page(
         &self,
         label_selector: Option<&str>,
@@ -1719,6 +1725,7 @@ pub trait NamespaceStore: Send + Sync {
     async fn update_namespace(&self, name: &str, data: Value, expected_rv: i64)
     -> Result<Resource>;
     async fn delete_namespace(&self, name: &str) -> Result<()>;
+    async fn delete_namespace_observed_rv(&self, name: &str) -> Result<i64>;
     async fn delete_namespace_contents(&self, name: &str) -> Result<()>;
 }
 
@@ -1762,6 +1769,17 @@ pub trait ReplicationStore: Send + Sync {
         &self,
         commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult>;
+    async fn current_log_apply_index(&self) -> Result<i64>;
+    #[cfg(test)]
+    async fn apply_replicated_create_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        options: ReplicatedCreateOptions,
+    ) -> Result<Resource>;
 }
 
 #[async_trait]
@@ -1804,6 +1822,271 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         self.as_ref().apply_raft_log_apply_commit(commit).await
     }
+
+    async fn current_log_apply_index(&self) -> Result<i64> {
+        self.as_ref().current_log_apply_index().await
+    }
+
+    #[cfg(test)]
+    async fn apply_replicated_create_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        options: ReplicatedCreateOptions,
+    ) -> Result<Resource> {
+        self.as_ref()
+            .apply_replicated_create_resource(api_version, kind, namespace, name, data, options)
+            .await
+    }
+}
+
+/// Backend lifecycle hooks owned by bootstrap and replication composition roots.
+#[async_trait]
+pub trait BackendLifecycleStore: Send + Sync {
+    async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>>;
+    async fn acquire_snapshot_mutation_fence(&self) -> Result<Option<SnapshotMutationFence>>;
+    fn close(&self);
+    fn attach_raft_proposer(
+        &self,
+        proposer: std::sync::Arc<dyn crate::datastore::replicated::RaftProposer>,
+    );
+}
+
+/// Test-only watch bus controls.
+#[cfg(test)]
+pub trait TestWatchStore: Send + Sync {
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> WatchReceiver;
+    fn broadcast_watch_event(&self, pending: PendingWatchEvent);
+}
+
+/// Broad read queries used by leader-side controllers and API helpers.
+#[async_trait]
+pub trait ClusterResourceQueryStore: Send + Sync {
+    async fn list_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+    ) -> Result<Vec<Resource>>;
+    async fn list_resources_for_watch_targets(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        page: ListPageRequest,
+    ) -> Result<ResourceList>;
+    async fn list_cluster_resources(&self) -> Result<Vec<Resource>>;
+}
+
+/// Leader-owned mutations that must not leak into worker/kubelet code.
+#[allow(clippy::too_many_arguments)]
+#[async_trait]
+pub trait LeaderResourceMutationStore: Send + Sync {
+    async fn update_main_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource>;
+    async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()>;
+    async fn delete_resource_with_preconditions_observed_rv(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+    ) -> Result<i64>;
+    async fn mark_for_delete_without_watch(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        expected_rv: i64,
+        deletion_timestamp: String,
+        grace_period_seconds: i64,
+    ) -> Result<Resource>;
+    async fn delete_resource_without_watch_with_tombstone(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        tombstone_data: Option<Value>,
+        observed_rv: i64,
+    ) -> Result<()>;
+    async fn patch_resource_latest(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        patch_kind: PatchKind,
+        patch: Value,
+    ) -> Result<Option<Resource>>;
+    async fn patch_resource_latest_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        request: ResourcePatchRequest,
+    ) -> Result<Option<Resource>>;
+}
+
+/// Durable watch history queries that are not part of live watch bootstrap.
+#[async_trait]
+pub trait WatchMaintenanceStore: Send + Sync {
+    async fn list_raw_watch_events_since_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WatchReplayRead>;
+    async fn snapshot_resources_at_rv(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+        field_selector: Option<&str>,
+        resource_version: i64,
+    ) -> Result<SnapshotAtRv>;
+    async fn list_all_watch_events_after_id_bounded(
+        &self,
+        after_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>>;
+}
+
+/// Actor-owned Pod cleanup and same-name slot admission state.
+#[allow(clippy::too_many_arguments)]
+#[async_trait]
+pub trait PodCleanupStore: Send + Sync {
+    async fn move_pod_to_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        sandbox_id: Option<&str>,
+        container_ids: Vec<String>,
+        reason: &str,
+    ) -> Result<PodCleanupIntent>;
+    async fn list_pod_cleanup_intents_for_node(
+        &self,
+        node_name: &str,
+    ) -> Result<Vec<PodCleanupIntent>>;
+    async fn delete_pod_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<()>;
+    async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()>;
+    async fn pod_slot_try_admit(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<PodSlotAdmissionResult>;
+    async fn pod_slot_mark_terminating(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+    ) -> Result<()>;
+    async fn pod_slot_clear_if_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<()>;
+    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent>;
+}
+
+/// Applied-outbox ledger and commit-building state.
+#[async_trait]
+pub trait AppliedOutboxStore: Send + Sync {
+    async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize>;
+    async fn list_outbox_stream_watermarks(
+        &self,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>>;
+    async fn get_applied_outbox(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<AppliedOutboxRecord>>;
+    async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool>;
+    async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>>;
+    async fn list_applied_outbox_paged(
+        &self,
+        after_key: Option<&str>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<AppliedOutboxRecord>>;
+    async fn delete_uncommitted_applied_outbox_placeholder(
+        &self,
+        idempotency_key: &str,
+        reserved_rv: i64,
+    ) -> Result<bool>;
+    async fn apply_outbox_transactionally(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    >;
+    async fn apply_outbox_transactionally_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    >;
+    async fn build_log_apply_commit_for_command(
+        &self,
+        command: StorageCommand,
+        operation: &str,
+        authoring_node: &str,
+    ) -> Result<crate::log_apply::LogApplyCommit>;
+    async fn build_log_apply_commit_for_outbox(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+    ) -> std::result::Result<
+        crate::datastore::sqlite::BuildOutboxOutcome,
+        crate::kubelet::outbox::OutboxApplyError,
+    >;
+    async fn build_log_apply_commit_for_outbox_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::datastore::sqlite::BuildOutboxOutcome,
+        crate::kubelet::outbox::OutboxApplyError,
+    >;
+    async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize>;
 }
 
 /// Backend-local metadata keys.

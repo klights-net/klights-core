@@ -2033,10 +2033,6 @@ impl crate::datastore::ResourceStore for WorkerStoreAdapter {
         )
         .await
     }
-
-    async fn get_current_resource_version(&self) -> Result<i64> {
-        crate::datastore::DatastoreBackend::get_current_resource_version(self).await
-    }
 }
 
 #[async_trait]
@@ -2117,6 +2113,32 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
         commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
+    }
+
+    async fn current_log_apply_index(&self) -> Result<i64> {
+        crate::datastore::DatastoreBackend::current_log_apply_index(self).await
+    }
+
+    #[cfg(test)]
+    async fn apply_replicated_create_resource(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        options: crate::datastore::types::ReplicatedCreateOptions,
+    ) -> Result<Resource> {
+        crate::datastore::DatastoreBackend::apply_replicated_create_resource(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            options,
+        )
+        .await
     }
 }
 

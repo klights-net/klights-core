@@ -1,10 +1,10 @@
 use super::*;
 use crate::datastore::command::StorageCommand;
 use crate::datastore::{
-    MetaStore, NamespaceContentStore, NetworkMetadataStore, OwnershipStore, PodWorkqueueStore,
-    RawWatchReplayStore, ReplicationStore, ResourceBatchOperation, ResourceBatchPutMode,
-    ResourceListStore, ResourcePreconditions, StatusStore, WatchHistoryStore,
-    WatchReplayAnchorStore,
+    CurrentResourceVersionStore, MetaStore, NamespaceContentStore, NetworkMetadataStore,
+    OwnershipStore, PodWorkqueueStore, RawWatchReplayStore, ReplicationStore,
+    ResourceBatchOperation, ResourceBatchPutMode, ResourceListStore, ResourcePreconditions,
+    StatusStore, WatchHistoryStore, WatchReplayAnchorStore,
 };
 use crate::datastore::{PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState};
 use serde_json::json;
@@ -5480,6 +5480,7 @@ async fn focused_store_traits_cover_sqlite_backend() {
             + NetworkStore
             + NetworkMetadataStore
             + ReplicationStore
+            + CurrentResourceVersionStore
             + MetaStore,
     {
     }
