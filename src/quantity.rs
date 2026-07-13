@@ -360,8 +360,9 @@ fn apply_quantity(
             numerator *= pow10_big(exp.try_into().ok()?)?;
         }
         exp if exp < 0 => {
-            let magnitude = u32::try_from(exp.checked_neg()?).ok()?;
-            if magnitude > 4096 {
+            let magnitude = exp.checked_neg()?.try_into().ok()?;
+            let numerator_scale_digits: u32 = numerator.to_str_radix(10).len().try_into().ok()?;
+            if magnitude > numerator_scale_digits + 4096 {
                 return if numerator.is_zero() {
                     Some(0)
                 } else {
@@ -397,9 +398,6 @@ fn bounded_big_i64(value: &BigInt) -> Option<i64> {
 }
 
 fn pow10_big(exp: u32) -> Option<BigInt> {
-    if exp > 4096 {
-        return None;
-    }
     let mut value = BigInt::one();
     for _ in 0..exp {
         value *= 10;
@@ -523,6 +521,11 @@ mod tests {
         assert_eq!(parse_resource_quantity("storage", "1e39"), Some(i64::MAX));
         assert_eq!(parse_resource_quantity("storage", "1e5000"), Some(i64::MAX));
         assert_eq!(parse_resource_quantity("storage", "1e-5000"), Some(1));
+        let large_coefficient_with_negative_exponent = format!("1{}e-5000", "0".repeat(5004));
+        assert_eq!(
+            parse_resource_quantity("storage", &large_coefficient_with_negative_exponent),
+            Some(10_000)
+        );
         assert_eq!(parse_resource_quantity("cpu", "0e5000"), Some(0));
         assert_eq!(
             parse_resource_quantity("storage", "10000000000000000000000Ei"),

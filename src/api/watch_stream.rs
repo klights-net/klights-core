@@ -90,15 +90,21 @@ pub fn negotiate_watch_stream_format(
             let mut quality_millis = 1000;
             let mut valid_stream_parameter = true;
             for parameter in segments {
-                if let Some((name, value)) = parameter.split_once('=') {
-                    let name = name.trim();
-                    if name.eq_ignore_ascii_case("q") {
-                        quality_millis = parse_accept_quality_millis(value);
-                    } else if name.eq_ignore_ascii_case("stream")
-                        && !value.trim().eq_ignore_ascii_case("watch")
-                    {
-                        valid_stream_parameter = false;
-                    }
+                let parameter = parameter.trim();
+                if parameter.is_empty() {
+                    continue;
+                }
+                let Some((name, value)) = parameter.split_once('=') else {
+                    valid_stream_parameter = false;
+                    continue;
+                };
+                let name = name.trim();
+                if name.eq_ignore_ascii_case("q") {
+                    quality_millis = parse_accept_quality_millis(value);
+                } else if name.eq_ignore_ascii_case("stream")
+                    && !value.trim().eq_ignore_ascii_case("watch")
+                {
+                    valid_stream_parameter = false;
                 }
             }
             let media = match media.as_str() {
@@ -1986,6 +1992,26 @@ mod tests {
         headers.insert(
             "accept",
             "application/json;stream=wrong;q=1".parse().unwrap(),
+        );
+        assert!(matches!(
+            negotiate_watch_stream_format(&headers, true),
+            Err(AppError::NotAcceptable(_))
+        ));
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;q".parse().unwrap(),
+        );
+        assert!(matches!(
+            negotiate_watch_stream_format(&headers, true),
+            Err(AppError::NotAcceptable(_))
+        ));
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;stream"
+                .parse()
+                .unwrap(),
         );
         assert!(matches!(
             negotiate_watch_stream_format(&headers, true),

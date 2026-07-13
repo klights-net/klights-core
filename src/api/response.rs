@@ -86,9 +86,7 @@ fn parse_unary_accept_part(part: &str, order: usize) -> Option<AcceptMatch> {
     let mut q = 1000u16;
 
     for segment in segments {
-        let Some((name, value)) = segment.trim().split_once('=') else {
-            continue;
-        };
+        let (name, value) = segment.trim().split_once('=')?;
         if name.trim().eq_ignore_ascii_case("q") {
             q = parse_accept_q(value.trim());
         }
@@ -114,8 +112,15 @@ fn parse_unary_accept_part(part: &str, order: usize) -> Option<AcceptMatch> {
 
 fn parse_accept_q(value: &str) -> u16 {
     let value = value.trim_matches('"').trim();
-    if value == "1" || value == "1.0" || value == "1.00" || value == "1.000" {
+    if value == "1" {
         return 1000;
+    }
+    if let Some(fraction) = value.strip_prefix("1.") {
+        return if fraction.len() <= 3 && fraction.bytes().all(|byte| byte == b'0') {
+            1000
+        } else {
+            0
+        };
     }
     if value == "0" {
         return 0;
@@ -124,11 +129,11 @@ fn parse_accept_q(value: &str) -> u16 {
         return 0;
     };
 
+    if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return 0;
+    }
     let mut q = 0u16;
-    for (idx, byte) in fraction.bytes().take(3).enumerate() {
-        if !byte.is_ascii_digit() {
-            return 0;
-        }
+    for (idx, byte) in fraction.bytes().enumerate() {
         let place = match idx {
             0 => 100,
             1 => 10,
@@ -1173,6 +1178,22 @@ mod response_negotiation_tests {
         assert!(prefers_protobuf(&headers(
             "application/json;q=0.2, application/vnd.kubernetes.protobuf;q=0.9"
         )));
+        assert!(prefers_protobuf(&headers(
+            "application/vnd.kubernetes.protobuf;q=1., application/json;q=0.5"
+        )));
+        assert!(!prefers_protobuf(&headers(
+            "application/vnd.kubernetes.protobuf;q=0., application/json;q=0.5"
+        )));
+        assert!(!prefers_protobuf(&headers(
+            "application/vnd.kubernetes.protobuf;q=0.123junk, application/json;q=0.5"
+        )));
+        assert!(
+            negotiate_unary_response_format(
+                &headers("application/vnd.kubernetes.protobuf;q=0.123junk"),
+                true
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1197,6 +1218,7 @@ mod response_negotiation_tests {
     fn unary_response_negotiation_rejects_when_no_supported_media_remains() {
         assert!(negotiate_unary_response_format(&headers("application/xml"), true).is_err());
         assert!(negotiate_unary_response_format(&headers("application/json;q=0"), true).is_err());
+        assert!(negotiate_unary_response_format(&headers("application/json;q"), true).is_err());
         assert!(
             negotiate_unary_response_format(&headers(PROTOBUF_MEDIA_TYPE), false).is_err(),
             "protobuf-only requests must fail when this resource has no protobuf codec"
