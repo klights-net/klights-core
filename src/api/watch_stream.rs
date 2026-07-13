@@ -185,11 +185,14 @@ fn parse_accept_quality_millis(value: &str) -> u16 {
     let Some(fraction) = value.strip_prefix("0.") else {
         return 0;
     };
+    if fraction.is_empty()
+        || fraction.len() > 3
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return 0;
+    }
     let mut millis = 0u16;
-    for (idx, byte) in fraction.bytes().take(3).enumerate() {
-        if !byte.is_ascii_digit() {
-            break;
-        }
+    for (idx, byte) in fraction.bytes().enumerate() {
         let place = match idx {
             0 => 100,
             1 => 10,
@@ -1892,6 +1895,17 @@ mod tests {
         assert_eq!(
             negotiate_watch_stream_format(&headers, true).unwrap(),
             WatchStreamFormat::Protobuf
+        );
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;q=0.8junk, application/json;q=0.5"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Json
         );
 
         headers.insert("accept", "application/json;Q=0, */*;q=0".parse().unwrap());

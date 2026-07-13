@@ -1,4 +1,5 @@
-const MAX_I64: i128 = i64::MAX as i128;
+use num_bigint::BigInt;
+use num_traits::{One, ToPrimitive, Zero};
 
 #[derive(Clone, Copy)]
 struct Suffix {
@@ -7,10 +8,10 @@ struct Suffix {
     den: i128,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct QuantityRational {
-    numerator: i128,
-    denominator: i128,
+    numerator: BigInt,
+    denominator: BigInt,
     exponent10: i32,
 }
 
@@ -249,7 +250,7 @@ fn parse_decimal_rational(raw: &str) -> Option<QuantityRational> {
     })
 }
 
-fn parse_decimal_rational_no_exponent(raw: &str) -> Option<(i128, i128)> {
+fn parse_decimal_rational_no_exponent(raw: &str) -> Option<(BigInt, BigInt)> {
     let (int_part, mut frac_part) = match raw.split_once('.') {
         Some((int_part, frac_part)) => (int_part, frac_part),
         None => (raw, ""),
@@ -266,29 +267,29 @@ fn parse_decimal_rational_no_exponent(raw: &str) -> Option<(i128, i128)> {
     if frac_part.chars().any(|c| !c.is_ascii_digit()) {
         return None;
     }
-    let int_value: i128 = if int_part.is_empty() {
-        0
+    let int_value: BigInt = if int_part.is_empty() {
+        BigInt::zero()
     } else {
         parse_decimal_digits(int_part)?
     };
-    let frac_scale = pow10(frac_part.len().try_into().ok()?)?;
+    let frac_scale = pow10_big(frac_part.len().try_into().ok()?)?;
     let frac_value = if frac_part.is_empty() {
-        0
+        BigInt::zero()
     } else {
         parse_decimal_digits(frac_part)?
     };
-    let numerator = int_value.checked_mul(frac_scale)?.checked_add(frac_value)?;
+    let numerator = int_value * &frac_scale + frac_value;
     Some((numerator, frac_scale))
 }
 
-fn parse_decimal_digits(raw: &str) -> Option<i128> {
-    let mut value = 0_i128;
+fn parse_decimal_digits(raw: &str) -> Option<BigInt> {
+    let mut value = BigInt::zero();
     for byte in raw.bytes() {
-        let digit = i128::from(byte.checked_sub(b'0')?);
+        let digit = byte.checked_sub(b'0')?;
         if digit > 9 {
             return None;
         }
-        value = value.checked_mul(10)?.checked_add(digit)?;
+        value = value * 10 + BigInt::from(digit);
     }
     Some(value)
 }
@@ -334,140 +335,49 @@ fn apply_quantity(
     suffix: Option<&Suffix>,
     final_div: i128,
 ) -> Option<i64> {
-    let mut numerators = vec![
-        rational.numerator,
-        1000,
-        suffix.map_or(1, |suffix| suffix.num),
-    ];
-    let mut denominators = vec![
-        rational.denominator,
-        final_div,
-        suffix.map_or(1, |suffix| suffix.den),
-    ];
-
-    reduce_factor_sets(&mut numerators, &mut denominators);
-    let denominator_too_large =
-        apply_decimal_exponent(&mut numerators, &mut denominators, rational.exponent10)?;
-    reduce_factor_sets(&mut numerators, &mut denominators);
-
-    let numerator = checked_product(&numerators)?;
-    let denominator = match checked_product(&denominators) {
-        Some(denominator) if !denominator_too_large => denominator,
-        Some(_) | None if numerator == 0 => return Some(0),
-        Some(_) | None => return Some(1),
-    };
-    let scaled = ceil_div_positive(numerator, denominator)?;
-    bounded_i64(scaled)
-}
-
-fn reduce_factor_sets(numerators: &mut [i128], denominators: &mut [i128]) {
-    for numerator in numerators {
-        for denominator in &mut *denominators {
-            reduce_positive_pair(numerator, denominator);
+    let mut numerator = rational.numerator
+        * BigInt::from(1000_i128)
+        * BigInt::from(suffix.map_or(1, |suffix| suffix.num));
+    let mut denominator = rational.denominator
+        * BigInt::from(final_div)
+        * BigInt::from(suffix.map_or(1, |suffix| suffix.den));
+    match rational.exponent10 {
+        exp if exp > 0 => {
+            numerator *= pow10_big(exp.try_into().ok()?)?;
         }
-    }
-}
-
-fn apply_decimal_exponent(
-    numerators: &mut Vec<i128>,
-    denominators: &mut Vec<i128>,
-    exponent: i32,
-) -> Option<bool> {
-    if exponent == 0 {
-        return Some(false);
-    }
-    let mut twos = exponent.unsigned_abs();
-    let mut fives = exponent.unsigned_abs();
-    if exponent > 0 {
-        cancel_prime_from_factors(&mut twos, denominators, 2);
-        cancel_prime_from_factors(&mut fives, denominators, 5);
-        numerators.push(checked_prime_power_product(twos, fives)?);
-        Some(false)
-    } else {
-        cancel_prime_from_factors(&mut twos, numerators, 2);
-        cancel_prime_from_factors(&mut fives, numerators, 5);
-        match checked_prime_power_product(twos, fives) {
-            Some(factor) => {
-                denominators.push(factor);
-                Some(false)
-            }
-            None => Some(true),
+        exp if exp < 0 => {
+            denominator *= pow10_big(u32::try_from(exp.checked_neg()?).ok()?)?;
         }
+        _ => {}
     }
+
+    let scaled = ceil_div_bigint(&numerator, &denominator)?;
+    bounded_big_i64(&scaled)
 }
 
-fn cancel_prime_from_factors(count: &mut u32, factors: &mut [i128], prime: i128) {
-    for factor in factors {
-        while *count > 0 && *factor > 0 && *factor % prime == 0 {
-            *factor /= prime;
-            *count -= 1;
-        }
-    }
-}
-
-fn checked_prime_power_product(twos: u32, fives: u32) -> Option<i128> {
-    let mut product = 1_i128;
-    for _ in 0..twos {
-        product = product.checked_mul(2)?;
-    }
-    for _ in 0..fives {
-        product = product.checked_mul(5)?;
-    }
-    Some(product)
-}
-
-fn reduce_positive_pair(numerator: &mut i128, denominator: &mut i128) {
-    if *numerator <= 1 || *denominator <= 1 {
-        return;
-    }
-    let factor = gcd_positive(*numerator, *denominator);
-    if factor > 1 {
-        *numerator /= factor;
-        *denominator /= factor;
-    }
-}
-
-fn checked_product(values: &[i128]) -> Option<i128> {
-    let mut product = 1_i128;
-    for value in values {
-        product = product.checked_mul(*value)?;
-    }
-    Some(product)
-}
-
-fn gcd_positive(mut left: i128, mut right: i128) -> i128 {
-    debug_assert!(left > 0);
-    debug_assert!(right > 0);
-    while right != 0 {
-        let remainder = left % right;
-        left = right;
-        right = remainder;
-    }
-    left
-}
-
-fn ceil_div_positive(value: i128, divisor: i128) -> Option<i128> {
-    debug_assert!(divisor > 0);
-    debug_assert!(value >= 0);
-    if divisor <= 0 || value < 0 {
+fn ceil_div_bigint(value: &BigInt, divisor: &BigInt) -> Option<BigInt> {
+    if value < &BigInt::zero() || divisor <= &BigInt::zero() {
         return None;
     }
     let quotient = value / divisor;
-    if value % divisor == 0 {
+    if value % divisor == BigInt::zero() {
         Some(quotient)
     } else {
-        quotient.checked_add(1)
+        Some(quotient + BigInt::one())
     }
 }
 
-fn bounded_i64(value: i128) -> Option<i64> {
-    (0..=MAX_I64).contains(&value).then_some(value as i64)
+fn bounded_big_i64(value: &BigInt) -> Option<i64> {
+    value.to_i64().filter(|value| *value >= 0)
 }
 
-fn pow10(exp: u32) -> Option<i128> {
-    let mut value = 1_i128;
+fn pow10_big(exp: u32) -> Option<BigInt> {
+    if exp > 4096 {
+        return None;
+    }
+    let mut value = BigInt::one();
     for _ in 0..exp {
-        value = value.checked_mul(10)?;
+        value *= 10;
     }
     Some(value)
 }
@@ -513,6 +423,10 @@ mod tests {
         assert_eq!(parse_resource_quantity("memory", ".000Gi"), Some(0));
         assert_eq!(parse_resource_quantity("memory", "+.0Gi"), Some(0));
         assert_eq!(parse_resource_quantity("storage", "1e-39Gi"), Some(1));
+        assert_eq!(
+            parse_resource_quantity("storage", "1000000000000000000000000000000000000000e-39"),
+            Some(1)
+        );
         assert_eq!(
             parse_resource_quantity("storage", "1.2345Gi"),
             Some(1_325_534_282)

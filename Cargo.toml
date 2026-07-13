@@ -42,6 +42,8 @@ bytes = "1"
 futures = "0.3"
 anyhow = "1"
 thiserror = "2"
+num-bigint = "0.4"
+num-traits = "0.2"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
