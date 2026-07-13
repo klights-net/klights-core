@@ -335,6 +335,14 @@ pub(crate) fn compute_reconciled_phase(
     if all_exited_zero && matches!(restart_policy, "Never" | "OnFailure") {
         return "Succeeded".to_string();
     }
+    // restartPolicy=Never with any container that terminated with a non-zero
+    // exit code and no container still running transitions the Pod to
+    // "Failed". This is the Kubernetes phase contract exercised by the
+    // Conformance test "Container Runtime blackbox test on terminated
+    // container ... TerminationMessagePolicy FallbackToLogsOnError".
+    if any_exited_nonzero && restart_policy == "Never" {
+        return "Failed".to_string();
+    }
     "Pending".to_string()
 }
 
@@ -374,6 +382,97 @@ mod tests {
             .unwrap_or_default();
         let phase = compute_reconciled_phase(&containers, &infos, &pod);
         assert_eq!(phase, "Running");
+    }
+
+    #[test]
+    fn reconciled_phase_returns_failed_when_never_and_nonzero_exit() {
+        // Kubernetes phase contract: a Pod with spec.restartPolicy=Never whose
+        // container terminates with a non-zero exit code transitions to phase
+        // "Failed". This is required for the Conformance test
+        // "[sig-node] Container Runtime blackbox test on terminated container
+        //  should report termination message from log output if
+        //  TerminationMessagePolicy FallbackToLogsOnError is set".
+        let pod = serde_json::json!({
+            "spec": {
+                "restartPolicy": "Never",
+                "containers": [
+                    { "name": "app" }
+                ]
+            }
+        });
+        let mut infos = std::collections::HashMap::new();
+        infos.insert(
+            "app".to_string(),
+            ReconcileContainerInfo {
+                container_id: "cid".to_string(),
+                state: ContainerRuntimeState::Exited,
+                exit_code: 1,
+                started_at: 0,
+                finished_at: 0,
+                created_at: 0,
+                image: "nginx:latest".to_string(),
+                image_ref: "nginx:latest".to_string(),
+                termination_message: String::new(),
+            },
+        );
+        let containers = pod
+            .pointer("/spec/containers")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let phase = compute_reconciled_phase(&containers, &infos, &pod);
+        assert_eq!(phase, "Failed");
+    }
+
+    #[test]
+    fn reconciled_phase_returns_failed_when_never_and_mixed_exits_has_nonzero() {
+        // Even when some containers exited 0, a Never pod with any non-zero
+        // container exit and no running container must be "Failed".
+        let pod = serde_json::json!({
+            "spec": {
+                "restartPolicy": "Never",
+                "containers": [
+                    { "name": "app" },
+                    { "name": "sidecar" },
+                ]
+            }
+        });
+        let containers = pod
+            .pointer("/spec/containers")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut infos = std::collections::HashMap::new();
+        infos.insert(
+            "app".to_string(),
+            ReconcileContainerInfo {
+                container_id: "cid-app".to_string(),
+                state: ContainerRuntimeState::Exited,
+                exit_code: 0,
+                started_at: 0,
+                finished_at: 0,
+                created_at: 0,
+                image: "nginx:latest".to_string(),
+                image_ref: "nginx:latest".to_string(),
+                termination_message: String::new(),
+            },
+        );
+        infos.insert(
+            "sidecar".to_string(),
+            ReconcileContainerInfo {
+                container_id: "cid-sidecar".to_string(),
+                state: ContainerRuntimeState::Exited,
+                exit_code: 2,
+                started_at: 0,
+                finished_at: 0,
+                created_at: 0,
+                image: "busybox:latest".to_string(),
+                image_ref: "busybox:latest".to_string(),
+                termination_message: String::new(),
+            },
+        );
+        let phase = compute_reconciled_phase(&containers, &infos, &pod);
+        assert_eq!(phase, "Failed");
     }
 
     #[test]
