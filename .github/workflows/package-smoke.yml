@@ -2,6 +2,10 @@ name: package-smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'klights version to smoke-test, without the leading v (e.g. 0.9.12)'
+        required: true
 
 permissions:
   contents: read
@@ -40,7 +44,7 @@ jobs:
             kubectl_arch: arm64
             container_name: klights-ubuntu-2604-arm64
     env:
-      EXPECTED_KLIGHTS_VERSION: 0.9.10
+      EXPECTED_KLIGHTS_VERSION: ${{ inputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -223,7 +227,7 @@ jobs:
             kubectl_arch: arm64
             container_name: klights-rhel10-arm64
     env:
-      EXPECTED_KLIGHTS_VERSION: 0.9.10
+      EXPECTED_KLIGHTS_VERSION: ${{ inputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
