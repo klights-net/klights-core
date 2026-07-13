@@ -1386,53 +1386,31 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
 
                     let matches = event.matches_filter_parsed(&kind, watch_namespace.as_deref(), parsed_label_selector.as_ref())
                         && event.matches_field_selector(field_selector.as_deref());
-                    if has_selector {
-                        let source_rv = event.resource_version();
-                        match session.classify_event(event, matches) {
-                            WatchSessionEvent::Deliver(transitioned) => {
-                                match try_serialize_watch_event_for_stream(
-                                    transitioned,
-                                    &kind,
-                                    table_format,
-                                    stream_format,
-                                ) {
-                                    Ok(line) => {
-                                        yield Ok::<_, std::convert::Infallible>(line);
-                                        if let Some(rv) = source_rv {
-                                            session.accept_delivered_rv(rv);
-                                        }
-                                    }
-                                    Err(line) => {
-                                        yield Ok::<_, std::convert::Infallible>(line);
-                                        break;
+                    let source_rv = event.resource_version();
+                    match session.classify_event(event, matches) {
+                        WatchSessionEvent::Deliver(event) => {
+                            match try_serialize_watch_event_for_stream(
+                                event,
+                                &kind,
+                                table_format,
+                                stream_format,
+                            ) {
+                                Ok(line) => {
+                                    yield Ok::<_, std::convert::Infallible>(line);
+                                    if let Some(rv) = source_rv {
+                                        session.accept_delivered_rv(rv);
                                     }
                                 }
+                                Err(line) => {
+                                    yield Ok::<_, std::convert::Infallible>(line);
+                                    break;
+                                }
                             }
-                            WatchSessionEvent::Filtered => {}
                         }
-                    } else {
-                        match session.classify_event(event, matches) {
-                            WatchSessionEvent::Deliver(event) => {
-                                let rv = event.resource_version();
-                                match try_serialize_watch_event_for_stream(
-                                    event,
-                                    &kind,
-                                    table_format,
-                                    stream_format,
-                                ) {
-                                    Ok(line) => {
-                                        yield Ok::<_, std::convert::Infallible>(line);
-                                        if let Some(rv) = rv {
-                                            session.accept_delivered_rv(rv);
-                                        }
-                                    }
-                                    Err(line) => {
-                                        yield Ok::<_, std::convert::Infallible>(line);
-                                        break;
-                                    }
-                                }
+                        WatchSessionEvent::Filtered => {
+                            if let Some(rv) = source_rv {
+                                session.accept_filtered_rv(rv);
                             }
-                            WatchSessionEvent::Filtered => {}
                         }
                     }
                 }

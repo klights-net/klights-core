@@ -2543,7 +2543,11 @@ async fn test_label_selector_watch_emits_synthetic_deleted_when_label_stops_matc
     assert_eq!(watch_resp.status(), StatusCode::OK);
     let mut stream = watch_resp.into_body().into_data_stream();
 
-    async fn drain_until<S>(stream: &mut S, seen: &mut Vec<String>, target: &str) -> bool
+    async fn drain_until<S>(
+        stream: &mut S,
+        seen: &mut Vec<String>,
+        target: &str,
+    ) -> Option<serde_json::Value>
     where
         S: futures::Stream<Item = Result<axum::body::Bytes, axum::Error>> + Unpin,
     {
@@ -2551,7 +2555,7 @@ async fn test_label_selector_watch_emits_synthetic_deleted_when_label_stops_matc
             let chunk = match tokio::time::timeout(Duration::from_millis(500), stream.next()).await
             {
                 Ok(Some(Ok(bytes))) => bytes,
-                _ => return false,
+                _ => return None,
             };
             for line in chunk.split(|b| *b == b'\n') {
                 if line.is_empty() {
@@ -2565,11 +2569,11 @@ async fn test_label_selector_watch_emits_synthetic_deleted_when_label_stops_matc
                 let hit = t == target;
                 seen.push(t);
                 if hit {
-                    return true;
+                    return Some(event);
                 }
             }
         }
-        false
+        None
     }
 
     let mut seen_types = Vec::<String>::new();
@@ -2596,10 +2600,10 @@ async fn test_label_selector_watch_emits_synthetic_deleted_when_label_stops_matc
         .await
         .unwrap();
     assert_eq!(create_resp.status(), StatusCode::CREATED);
-    assert!(
-        drain_until(&mut stream, &mut seen_types, "ADDED").await,
-        "expected ADDED for matching create; got {seen_types:?}"
-    );
+    let first_added = drain_until(&mut stream, &mut seen_types, "ADDED")
+        .await
+        .expect("expected ADDED for matching create");
+    assert_eq!(first_added["type"], "ADDED");
 
     // Change the label value to one that doesn't match — via a merge-patch
     // (what `kubectl label` / the conformance client uses for label changes).
@@ -2622,9 +2626,63 @@ async fn test_label_selector_watch_emits_synthetic_deleted_when_label_stops_matc
         .unwrap();
     assert_eq!(patch_resp.status(), StatusCode::OK);
 
+    let deleted = drain_until(&mut stream, &mut seen_types, "DELETED")
+        .await
+        .expect("expected synthetic DELETED when label stops matching selector");
+    assert_eq!(deleted["type"], "DELETED");
+
+    // Exercise an out-of-scope update before re-entry. The cursor must
+    // acknowledge this filtered event internally; otherwise it can replay the
+    // same row forever and hide the later matching update.
+    let filtered_patch = serde_json::json!({"data": {"mutation": "while-filtered"}});
+    let filtered_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/namespaces/watch-label-stops/configmaps/e2e-watch-test-label-changed")
+                .header("content-type", "application/merge-patch+json")
+                .body(Body::from(serde_json::to_vec(&filtered_patch).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered_resp.status(), StatusCode::OK);
     assert!(
-        drain_until(&mut stream, &mut seen_types, "DELETED").await,
-        "expected synthetic DELETED when label stops matching selector; got {seen_types:?}"
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            drain_until(&mut stream, &mut seen_types, "MODIFIED")
+        )
+        .await
+        .is_err(),
+        "out-of-scope update must not be delivered"
+    );
+
+    let restore_patch = serde_json::json!({
+        "metadata": {"labels": {"watch-this-configmap": "label-changed-and-restored"}}
+    });
+    let restore_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/namespaces/watch-label-stops/configmaps/e2e-watch-test-label-changed")
+                .header("content-type", "application/merge-patch+json")
+                .body(Body::from(serde_json::to_vec(&restore_patch).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restore_resp.status(), StatusCode::OK);
+
+    let reentered = drain_until(&mut stream, &mut seen_types, "ADDED")
+        .await
+        .expect("expected ADDED when label resumes matching selector");
+    assert_eq!(reentered["type"], "ADDED");
+    assert_eq!(
+        reentered["object"]["metadata"]["name"].as_str(),
+        Some("e2e-watch-test-label-changed"),
+        "re-entry ADDED should reference the same ConfigMap"
     );
 }
 

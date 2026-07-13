@@ -173,6 +173,15 @@ impl<S: WatchReplaySource> WatchSession<S> {
         self.last_delivered_scoped_rv = self.last_delivered_scoped_rv.max(rv);
     }
 
+    /// A filtered event still advances the durable cursor position, but it
+    /// must not advance the selector-scoped resourceVersion exposed through
+    /// bookmarks. Without this acknowledgement the cursor can replay the same
+    /// out-of-scope event indefinitely and hide a later event that re-enters
+    /// the selector.
+    pub(crate) fn accept_filtered_rv(&mut self, rv: i64) {
+        self.cursor.accept_event(rv);
+    }
+
     pub(crate) fn accepted_rv(&self) -> i64 {
         self.cursor.accepted_rv()
     }
@@ -587,6 +596,30 @@ mod tests {
             let visible = session.next_event().await.unwrap();
             assert_eq!(event_key(&visible).unwrap().1, "visible", "{adapter}");
         }
+    }
+
+    #[tokio::test]
+    async fn filtered_event_advances_cursor_without_advancing_scoped_frontier() {
+        let bootstrap = WatchSessionBootstrap::new(WatchSessionConfig {
+            requested_rv: 10,
+            has_selector: true,
+        });
+        let source = ReplaySource {
+            events: vec![event(EventType::Modified, "default", "filtered", 11)],
+            expired: false,
+        };
+        let mut session = establish(bootstrap, source);
+        session.prime_replay_or_expired().await.unwrap();
+
+        let filtered = session.next_event().await.unwrap();
+        assert!(matches!(
+            session.classify_event(filtered, false),
+            WatchSessionEvent::Filtered
+        ));
+        session.accept_filtered_rv(11);
+
+        assert_eq!(session.accepted_rv(), 11);
+        assert_eq!(session.last_delivered_scoped_rv(), 10);
     }
 
     #[tokio::test]

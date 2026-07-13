@@ -113,6 +113,25 @@ pub fn json_replicaset_to_pb(
                 ready_replicas: status.ready_replicas,
                 available_replicas: status.available_replicas,
                 observed_generation: status.observed_generation,
+                conditions: status
+                    .conditions
+                    .as_ref()
+                    .map(|conditions| {
+                        conditions
+                            .iter()
+                            .map(|condition| k8s_pb::api::apps::v1::ReplicaSetCondition {
+                                r#type: Some(condition.type_.clone()),
+                                status: Some(condition.status.clone()),
+                                last_transition_time: condition
+                                    .last_transition_time
+                                    .as_ref()
+                                    .map(json_time_to_pb),
+                                reason: condition.reason.clone(),
+                                message: condition.message.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 ..Default::default()
             }),
     })
@@ -172,7 +191,25 @@ pub fn json_statefulset_to_pb(
                 update_revision: status.update_revision.clone(),
                 collision_count: status.collision_count,
                 available_replicas: status.available_replicas,
-                ..Default::default()
+                conditions: status
+                    .conditions
+                    .as_ref()
+                    .map(|conditions| {
+                        conditions
+                            .iter()
+                            .map(|condition| k8s_pb::api::apps::v1::StatefulSetCondition {
+                                r#type: Some(condition.type_.clone()),
+                                status: Some(condition.status.clone()),
+                                last_transition_time: condition
+                                    .last_transition_time
+                                    .as_ref()
+                                    .map(json_time_to_pb),
+                                reason: condition.reason.clone(),
+                                message: condition.message.clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }),
     })
 }

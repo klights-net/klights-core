@@ -367,6 +367,30 @@ fn service_status_conditions_encode_for_single_and_list_responses() {
 }
 
 #[test]
+fn missing_condition_transition_time_roundtrips_as_kubernetes_zero_time() {
+    let crd = json!({
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": "tests.example.com"},
+        "spec": {
+            "group": "example.com",
+            "names": {"kind": "Test", "plural": "tests"},
+            "scope": "Namespaced",
+            "versions": [{"name": "v1", "served": true, "storage": true,
+                "schema": {"openAPIV3Schema": {"type": "object"}}}]
+        },
+        "status": {"conditions": [{"message": "updated"}]}
+    });
+
+    let encoded = encode_protobuf(&crd).expect("zero-time CRD condition must encode");
+    let decoded = decode_protobuf(&encoded).expect("zero-time CRD condition must decode");
+    assert_eq!(
+        decoded["status"]["conditions"][0]["lastTransitionTime"],
+        "0001-01-01T00:00:00+00:00"
+    );
+}
+
+#[test]
 fn validating_admission_policy_status_roundtrips_for_single_and_list_responses() {
     let policy = json!({
         "apiVersion": "admissionregistration.k8s.io/v1",
@@ -860,4 +884,50 @@ fn cronjob_protobuf_roundtrip() {
         decoded["status"]["lastSuccessfulTime"],
         "2026-05-01T18:00:30+00:00"
     );
+}
+
+#[test]
+fn controllerrevision_single_resource_protobuf_roundtrip_preserves_raw_data() {
+    let revision = json!({
+        "apiVersion": "apps/v1",
+        "kind": "ControllerRevision",
+        "metadata": {
+            "name": "daemon-set-7f4d9b6c",
+            "namespace": "default",
+            "labels": {"controller-revision-hash": "7f4d9b6c"}
+        },
+        "data": {
+            "spec": {
+                "template": {
+                    "$patch": "replace",
+                    "metadata": {"labels": {"app": "daemon"}},
+                    "spec": {
+                        "containers": [{
+                            "name": "app",
+                            "image": "registry.k8s.io/pause:3.10",
+                            "resources": {}
+                        }]
+                    }
+                }
+            }
+        },
+        "revision": 2
+    });
+
+    let bytes = encode_protobuf(&revision)
+        .expect("single ControllerRevision must have a concrete protobuf encoder");
+    let decoded = decode_protobuf(&bytes).expect("ControllerRevision protobuf must decode");
+
+    assert_eq!(decoded["kind"], "ControllerRevision");
+    assert_eq!(decoded["revision"], 2);
+    assert_eq!(decoded["data"], revision["data"]);
+
+    let raw_json = serde_json::to_vec(&revision).unwrap();
+    let raw_protobuf =
+        encode_protobuf_resource_from_json_bytes("apps/v1", "ControllerRevision", &raw_json)
+            .expect("ControllerRevision watch replay must support byte-first protobuf encoding");
+    let raw_decoded =
+        decode_protobuf_resource("apps/v1", "ControllerRevision", &raw_protobuf).unwrap();
+    assert_eq!(raw_decoded["revision"], 2);
+    assert_eq!(raw_decoded["data"], revision["data"]);
 }

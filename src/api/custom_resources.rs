@@ -1159,7 +1159,12 @@ async fn list_cr_inner(
                         let source_rv = event.resource_version();
                         let event = match session.classify_event(event, matches_selector) {
                             WatchSessionEvent::Deliver(event) => event,
-                            WatchSessionEvent::Filtered => continue,
+                            WatchSessionEvent::Filtered => {
+                                if let Some(source_rv) = source_rv {
+                                    session.accept_filtered_rv(source_rv);
+                                }
+                                continue;
+                            }
                         };
                         let mut json = serde_json::to_vec(&event).unwrap_or_default();
                         json.push(b'\n');

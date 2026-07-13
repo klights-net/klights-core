@@ -437,6 +437,123 @@ pub fn test_replicaset_protobuf_roundtrip_preserves_template_priority_and_extend
 }
 
 #[test]
+pub fn test_replicaset_protobuf_roundtrip_preserves_status_conditions() {
+    use serde_json::{Value, json};
+
+    let rs_json = json!({
+        "apiVersion": "apps/v1",
+        "kind": "ReplicaSet",
+        "metadata": {"name": "rs-conditions", "namespace": "default"},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": "rs-cond"}},
+            "template": {
+                "metadata": {"labels": {"app": "rs-cond"}},
+                "spec": {
+                    "containers": [{
+                        "name": "pod1",
+                        "image": "registry.k8s.io/pause:3.10.1"
+                    }]
+                }
+            }
+        },
+        "status": {
+            "replicas": 1,
+            "readyReplicas": 0,
+            "availableReplicas": 0,
+            "fullyLabeledReplicas": 0,
+            "observedGeneration": 17,
+            "conditions": [{
+                "type": "ReplicaFailure",
+                "status": "True",
+                "lastTransitionTime": "2026-07-12T12:00:00Z",
+                "reason": "ProgressDeadlineExceeded",
+                "message": "Replica set not progressing"
+            }]
+        }
+    });
+
+    let protobuf_bytes = encode_protobuf(&rs_json).unwrap();
+    let decoded = decode_protobuf(&protobuf_bytes[4..]).unwrap();
+
+    let conditions = decoded
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .expect("status.conditions must roundtrip as array");
+    assert_eq!(
+        conditions.len(),
+        1,
+        "ReplicaSet status conditions must be preserved"
+    );
+    assert_eq!(conditions[0]["type"], "ReplicaFailure");
+    assert_eq!(conditions[0]["status"], "True");
+    assert_eq!(conditions[0]["lastTransitionTime"], "2026-07-12T12:00:00Z");
+    assert_eq!(conditions[0]["reason"], "ProgressDeadlineExceeded");
+    assert_eq!(conditions[0]["message"], "Replica set not progressing");
+}
+
+#[test]
+pub fn test_statefulset_protobuf_roundtrip_preserves_status_conditions() {
+    use serde_json::{Value, json};
+
+    let sts_json = json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {"name": "sts-conditions", "namespace": "default"},
+        "spec": {
+            "replicas": 1,
+            "serviceName": "sts-svc",
+            "selector": {"matchLabels": {"app": "sts-cond"}},
+            "template": {
+                "metadata": {"labels": {"app": "sts-cond"}},
+                "spec": {
+                    "containers": [{
+                        "name": "pod1",
+                        "image": "registry.k8s.io/pause:3.10.1"
+                    }]
+                }
+            }
+        },
+        "status": {
+            "replicas": 1,
+            "readyReplicas": 1,
+            "currentReplicas": 1,
+            "updatedReplicas": 1,
+            "currentRevision": "sts-conditions-1",
+            "updateRevision": "sts-conditions-1",
+            "collisionCount": 0,
+            "availableReplicas": 1,
+            "observedGeneration": 42,
+            "conditions": [{
+                "type": "CurrentReplicasInferred",
+                "status": "True",
+                "lastTransitionTime": "2026-07-12T12:00:00Z",
+                "reason": "Successful",
+                "message": "StatefulSet is healthy"
+            }]
+        }
+    });
+
+    let protobuf_bytes = encode_protobuf(&sts_json).unwrap();
+    let decoded = decode_protobuf(&protobuf_bytes[4..]).unwrap();
+
+    let conditions = decoded
+        .pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .expect("status.conditions must roundtrip as array");
+    assert_eq!(
+        conditions.len(),
+        1,
+        "StatefulSet status conditions must be preserved"
+    );
+    assert_eq!(conditions[0]["type"], "CurrentReplicasInferred");
+    assert_eq!(conditions[0]["status"], "True");
+    assert_eq!(conditions[0]["lastTransitionTime"], "2026-07-12T12:00:00Z");
+    assert_eq!(conditions[0]["reason"], "Successful");
+    assert_eq!(conditions[0]["message"], "StatefulSet is healthy");
+}
+
+#[test]
 pub fn test_encode_protobuf_pod_conditions_roundtrip() {
     use serde_json::json;
 

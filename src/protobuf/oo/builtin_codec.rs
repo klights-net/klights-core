@@ -125,7 +125,10 @@ pub(in crate::protobuf) fn sanitize_condition_transition_times(value: &mut Value
         if needs_fix && let Some(obj) = cond.as_object_mut() {
             obj.insert(
                 "lastTransitionTime".to_string(),
-                Value::String("1970-01-01T00:00:00Z".to_string()),
+                // Go's zero `metav1.Time{}` is year 1, not the Unix epoch.
+                // Preserve that wire identity so protobuf GET/status responses
+                // compare equal to the condition the client submitted.
+                Value::String("0001-01-01T00:00:00Z".to_string()),
             );
         }
     }
@@ -855,6 +858,16 @@ encode_openapi_result_raw_fn!(
     k8s_openapi::api::apps::v1::DaemonSet,
     json_daemonset_to_pb
 );
+encode_openapi_result_fn!(
+    encode_controllerrevision,
+    k8s_openapi::api::apps::v1::ControllerRevision,
+    json_controllerrevision_to_pb
+);
+encode_openapi_result_raw_fn!(
+    encode_controllerrevision_raw,
+    k8s_openapi::api::apps::v1::ControllerRevision,
+    json_controllerrevision_to_pb
+);
 encode_openapi_result_fn!(encode_job, k8s_openapi::api::batch::v1::Job, json_job_to_pb);
 encode_openapi_result_raw_fn!(
     encode_job_raw,
@@ -1209,6 +1222,7 @@ fn raw_encode_fn(api_version: &str, kind: &str) -> Option<RawEncodeFn> {
         ("apps", "ReplicaSet") => Some(encode_replicaset_raw),
         ("apps", "StatefulSet") => Some(encode_statefulset_raw),
         ("apps", "DaemonSet") => Some(encode_daemonset_raw),
+        ("apps", "ControllerRevision") => Some(encode_controllerrevision_raw),
         ("batch", "Job") => Some(encode_job_raw),
         ("batch", "CronJob") => Some(encode_cronjob_raw),
         ("apiregistration.k8s.io", "APIService") => Some(encode_apiservice_raw),
@@ -1430,7 +1444,7 @@ static BUILTIN_ENTRIES: &[BuiltinCodecEntry] = &[
         api_version_prefix: "apps",
         kind: "ControllerRevision",
         decode: decode_controllerrevision,
-        encode: unsupported_encode,
+        encode: encode_controllerrevision,
     },
     BuiltinCodecEntry {
         api_version_prefix: "batch",
