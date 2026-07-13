@@ -1462,6 +1462,100 @@ async fn test_pvc_binding_prefers_smallest_sufficient_pv_then_name() {
 }
 
 #[tokio::test]
+async fn test_pvc_binding_skips_invalid_pv_capacity_candidate() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    for (name, storage) in [("bad-pv", "not-a-quantity"), ("good-pv", "1Gi")] {
+        let pv = json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {"name": name},
+            "spec": {
+                "capacity": {"storage": storage},
+                "accessModes": ["ReadWriteOnce"],
+                "hostPath": {"path": format!("/mnt/{name}")}
+            },
+            "status": {"phase": "Available"}
+        });
+        db.create_resource("v1", "PersistentVolume", None, name, pv)
+            .await
+            .unwrap();
+    }
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "skip-bad-pv-pvc", "namespace": "default"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Gi"}}
+        }
+    });
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "skip-bad-pv-pvc",
+        pvc,
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "skip-bad-pv-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pvc = get_pvc(&db, "default", "skip-bad-pv-pvc").await;
+    assert_eq!(pvc["status"]["phase"], "Bound");
+    assert_eq!(pvc["status"]["volumeName"], "good-pv");
+}
+
+#[tokio::test]
+async fn test_pvc_binding_preserves_fractional_binary_quantity_ordering() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    let pv = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {"name": "fractional-pv"},
+        "spec": {
+            "capacity": {"storage": "1.2345Gi"},
+            "accessModes": ["ReadWriteOnce"],
+            "hostPath": {"path": "/mnt/fractional-pv"}
+        },
+        "status": {"phase": "Available"}
+    });
+    db.create_resource("v1", "PersistentVolume", None, "fractional-pv", pv)
+        .await
+        .unwrap();
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "fractional-pvc", "namespace": "default"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1.2348Gi"}}
+        }
+    });
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "fractional-pvc",
+        pvc,
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "fractional-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pvc = get_pvc(&db, "default", "fractional-pvc").await;
+    assert_eq!(pvc["status"]["phase"], "Pending");
+    assert!(pvc.pointer("/status/volumeName").is_none());
+}
+
+#[tokio::test]
 async fn test_pvc_subset_access_modes_bind() {
     // PVC requesting ReadWriteOnce should bind to PV with [ReadWriteOnce, ReadOnlyMany]
     let db = crate::datastore::test_support::in_memory().await;

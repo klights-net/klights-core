@@ -48,6 +48,7 @@ impl WatchStreamFormat {
 enum AcceptedWatchMedia {
     Json,
     Protobuf,
+    ApplicationWildcard,
     Any,
     Unsupported,
 }
@@ -57,6 +58,14 @@ struct AcceptedWatchFormat {
     media: AcceptedWatchMedia,
     quality_millis: u16,
     order: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CandidateWatchFormat {
+    format: WatchStreamFormat,
+    quality_millis: u16,
+    order: usize,
+    preference: usize,
 }
 
 pub fn negotiate_watch_stream_format(
@@ -84,14 +93,11 @@ pub fn negotiate_watch_stream_format(
                     quality_millis = parse_accept_quality_millis(value);
                 }
             }
-            if quality_millis == 0 {
-                order += 1;
-                continue;
-            }
             let media = match media.as_str() {
                 "application/json" => AcceptedWatchMedia::Json,
                 "application/vnd.kubernetes.protobuf" => AcceptedWatchMedia::Protobuf,
-                "*/*" | "application/*" => AcceptedWatchMedia::Any,
+                "application/*" => AcceptedWatchMedia::ApplicationWildcard,
+                "*/*" => AcceptedWatchMedia::Any,
                 _ => AcceptedWatchMedia::Unsupported,
             };
             accepted.push(AcceptedWatchFormat {
@@ -102,20 +108,68 @@ pub fn negotiate_watch_stream_format(
             order += 1;
         }
     }
-    accepted.sort_by_key(|format| (std::cmp::Reverse(format.quality_millis), format.order));
-    for accepted in accepted {
-        match accepted.media {
-            AcceptedWatchMedia::Protobuf if protobuf_supported => {
-                return Ok(WatchStreamFormat::Protobuf);
-            }
-            AcceptedWatchMedia::Json => return Ok(WatchStreamFormat::Json),
-            AcceptedWatchMedia::Any => return Ok(WatchStreamFormat::Json),
-            AcceptedWatchMedia::Protobuf | AcceptedWatchMedia::Unsupported => {}
-        }
+
+    let mut candidates = Vec::new();
+    if let Some((quality_millis, order)) =
+        best_watch_accept_match(WatchStreamFormat::Json, &accepted)
+        && quality_millis > 0
+    {
+        candidates.push(CandidateWatchFormat {
+            format: WatchStreamFormat::Json,
+            quality_millis,
+            order,
+            preference: 0,
+        });
+    }
+    if protobuf_supported
+        && let Some((quality_millis, order)) =
+            best_watch_accept_match(WatchStreamFormat::Protobuf, &accepted)
+        && quality_millis > 0
+    {
+        candidates.push(CandidateWatchFormat {
+            format: WatchStreamFormat::Protobuf,
+            quality_millis,
+            order,
+            preference: 1,
+        });
+    }
+    candidates.sort_by_key(|candidate| {
+        (
+            std::cmp::Reverse(candidate.quality_millis),
+            candidate.order,
+            candidate.preference,
+        )
+    });
+    if let Some(candidate) = candidates.first() {
+        return Ok(candidate.format);
     }
     Err(AppError::NotAcceptable(
         "no supported watch stream media type requested".to_string(),
     ))
+}
+
+fn best_watch_accept_match(
+    format: WatchStreamFormat,
+    accepted: &[AcceptedWatchFormat],
+) -> Option<(u16, usize)> {
+    accepted
+        .iter()
+        .filter_map(|accepted| {
+            let specificity = match (format, accepted.media) {
+                (WatchStreamFormat::Json, AcceptedWatchMedia::Json)
+                | (WatchStreamFormat::Protobuf, AcceptedWatchMedia::Protobuf) => 2,
+                (_, AcceptedWatchMedia::ApplicationWildcard) => 1,
+                (_, AcceptedWatchMedia::Any) => 0,
+                _ => return None,
+            };
+            Some((
+                specificity,
+                accepted.quality_millis,
+                std::cmp::Reverse(accepted.order),
+            ))
+        })
+        .max()
+        .map(|(_specificity, quality_millis, std::cmp::Reverse(order))| (quality_millis, order))
 }
 
 fn parse_accept_quality_millis(value: &str) -> u16 {
@@ -1788,6 +1842,31 @@ mod tests {
 
         assert_eq!(
             negotiate_watch_stream_format(&headers, false).unwrap(),
+            WatchStreamFormat::Json
+        );
+    }
+
+    #[test]
+    fn watch_stream_negotiation_honors_explicit_q0_exclusions() {
+        let mut headers = HeaderMap::new();
+        headers.insert("accept", "application/json;q=0, */*;q=1".parse().unwrap());
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Protobuf
+        );
+        assert!(matches!(
+            negotiate_watch_stream_format(&headers, false),
+            Err(AppError::NotAcceptable(_))
+        ));
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;q=0, */*;q=1"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
             WatchStreamFormat::Json
         );
     }

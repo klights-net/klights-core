@@ -248,25 +248,31 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         }
 
         // Check capacity
-        let pv_capacity = pv
+        let Some(pv_capacity) = pv
             .data
             .get("spec")
             .and_then(|s| s.get("capacity"))
             .and_then(|c| c.get("storage"))
             .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("PV missing spec.capacity.storage"))?;
-        let pv_capacity = crate::quantity::parse_resource_quantity("storage", pv_capacity)
-            .ok_or_else(|| anyhow::anyhow!("PV capacity is not a valid quantity"))?;
+        else {
+            continue;
+        };
+        let Some(pv_capacity) = crate::quantity::parse_resource_quantity("storage", pv_capacity)
+        else {
+            continue;
+        };
         if pv_capacity < requested_storage_size {
             continue;
         }
 
-        let pv_name = pv
+        let Some(pv_name) = pv
             .data
             .get("metadata")
             .and_then(|m| m.get("name"))
             .and_then(|n| n.as_str())
-            .ok_or_else(|| anyhow::anyhow!("PV missing name"))?;
+        else {
+            continue;
+        };
 
         let pv_storage_class = pv
             .data

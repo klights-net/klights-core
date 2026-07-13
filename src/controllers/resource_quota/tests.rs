@@ -262,16 +262,24 @@ fn test_parse_resource_quantity_storage_matches_kubernetes_semantics() {
 fn test_parse_resource_quantity_storage_rejects_malformed_or_invalid_values() {
     assert_eq!(
         parse_resource_quantity("storage", "1.2345Gi"),
-        Some(1_326_071_153),
-        "Kubernetes quantity precision beyond three decimal places rounds up"
+        Some(1_325_534_282),
+        "Kubernetes quantity precision is preserved through suffix scaling"
     );
+    assert_eq!(
+        parse_resource_quantity("storage", "+1Gi"),
+        Some(1_073_741_824),
+        "Kubernetes quantities permit a leading plus sign"
+    );
+    assert_eq!(parse_resource_quantity("storage", "1k"), Some(1000));
     for raw in [
         "1GiB",
         "-1Gi",
+        "1K",
         "",
         "1.2.3",
         "abc",
         "++1Gi",
+        "1e-9223372036854775808",
         "18446744073709551616",
     ] {
         assert_eq!(

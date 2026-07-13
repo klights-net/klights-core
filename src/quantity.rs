@@ -116,39 +116,6 @@ const BINARY_SUFFIXES: [Suffix; 6] = [
     },
 ];
 
-const BINARY_DECIMAL_SUFFIXES: [Suffix; 6] = [
-    Suffix {
-        text: "E",
-        num: 1_000_000_000_000_000_000,
-        den: 1,
-    },
-    Suffix {
-        text: "K",
-        num: 1000,
-        den: 1,
-    },
-    Suffix {
-        text: "M",
-        num: 1_000_000,
-        den: 1,
-    },
-    Suffix {
-        text: "G",
-        num: 1_000_000_000,
-        den: 1,
-    },
-    Suffix {
-        text: "T",
-        num: 1_000_000_000_000,
-        den: 1,
-    },
-    Suffix {
-        text: "P",
-        num: 1_000_000_000_000_000,
-        den: 1,
-    },
-];
-
 pub fn parse_cpu_milli(raw: &str) -> Option<i64> {
     parse_quantity_with_suffixes(raw, &CPU_SUFFIXES, 1)
 }
@@ -167,16 +134,10 @@ pub fn parse_memory_bytes(raw: &str) -> Option<i64> {
     }
 
     if let Some((number, suffix)) = split_suffix(raw, &BINARY_SUFFIXES) {
-        return apply_post_scale(
-            apply_multiplier(parse_decimal_to_milli(number)?, suffix, 1000)?,
-            1,
-        );
+        return apply_quantity(parse_decimal_rational(number)?, Some(suffix), 1000);
     }
-    if let Some((number, suffix)) = split_suffix(raw, &BINARY_DECIMAL_SUFFIXES) {
-        return apply_post_scale(
-            apply_multiplier(parse_decimal_to_milli(number)?, suffix, 1000)?,
-            1,
-        );
+    if let Some((number, suffix)) = split_suffix(raw, &DECIMAL_SUFFIXES) {
+        return apply_quantity(parse_decimal_rational(number)?, Some(suffix), 1000);
     }
 
     parse_quantity_with_suffixes(raw, &[], 1000)
@@ -241,44 +202,34 @@ fn parse_quantity_with_suffixes(raw: &str, suffixes: &[Suffix], final_div: i128)
         None => (raw, None),
     };
 
-    let numeric = parse_decimal_to_milli(number)?;
-    let numeric = if let Some(suffix) = suffix {
-        apply_multiplier(numeric, suffix, 1)?
-    } else {
-        numeric
-    };
-    apply_post_scale(numeric, final_div)
+    apply_quantity(parse_decimal_rational(number)?, suffix, final_div)
 }
 
-fn parse_decimal_to_milli(raw: &str) -> Option<i128> {
+fn parse_decimal_rational(raw: &str) -> Option<(i128, i128)> {
     if raw.is_empty() || raw.starts_with('-') {
         return None;
     }
 
-    if raw.starts_with('+') {
-        return None;
-    }
-
-    let raw = raw.trim_start_matches('+');
+    let raw = raw.strip_prefix('+').unwrap_or(raw);
     if raw.is_empty() {
         return None;
     }
 
     let (number, exponent) = split_exponent(raw)?;
-    let numeric = parse_decimal_to_milli_no_exponent(number)?;
+    let (mut numerator, mut denominator) = parse_decimal_rational_no_exponent(number)?;
     match exponent {
         exp if exp >= 0 => {
-            let scaled = numeric.checked_mul(pow10(exp.try_into().ok()?)?)?;
-            Some(scaled)
+            numerator = numerator.checked_mul(pow10(exp.try_into().ok()?)?)?;
         }
         exp => {
-            let divisor = pow10(u32::try_from(-exp).ok()?)?;
-            Some(ceil_div_positive(numeric, divisor))
+            let divisor = pow10(u32::try_from(exp.checked_neg()?).ok()?)?;
+            denominator = denominator.checked_mul(divisor)?;
         }
     }
+    Some((numerator, denominator))
 }
 
-fn parse_decimal_to_milli_no_exponent(raw: &str) -> Option<i128> {
+fn parse_decimal_rational_no_exponent(raw: &str) -> Option<(i128, i128)> {
     let (int_part, frac_part) = match raw.split_once('.') {
         Some((int_part, frac_part)) => (int_part, frac_part),
         None => (raw, ""),
@@ -296,30 +247,31 @@ fn parse_decimal_to_milli_no_exponent(raw: &str) -> Option<i128> {
     let int_value: i128 = if int_part.is_empty() {
         0
     } else {
-        int_part.parse().ok()?
+        parse_decimal_digits(int_part)?
     };
-    let frac_value: i128 = if frac_part.is_empty() {
+    let frac_scale = pow10(frac_part.len().try_into().ok()?)?;
+    let frac_value = if frac_part.is_empty() {
         0
     } else {
-        let (kept, extra) = if frac_part.len() > 3 {
-            frac_part.split_at(3)
-        } else {
-            (frac_part, "")
-        };
-        let mut value: i128 = kept.parse().ok()?;
-        for _ in 0..3usize.saturating_sub(kept.len()) {
-            value = value.checked_mul(10)?;
-        }
-        if extra.bytes().any(|byte| byte != b'0') {
-            value = value.checked_add(1)?;
-        }
-        value
+        parse_decimal_digits(frac_part)?
     };
-
-    int_value.checked_mul(1000)?.checked_add(frac_value)
+    let numerator = int_value.checked_mul(frac_scale)?.checked_add(frac_value)?;
+    Some((numerator, frac_scale))
 }
 
-fn split_exponent(raw: &str) -> Option<(&str, i64)> {
+fn parse_decimal_digits(raw: &str) -> Option<i128> {
+    let mut value = 0_i128;
+    for byte in raw.bytes() {
+        let digit = i128::from(byte.checked_sub(b'0')?);
+        if digit > 9 {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(digit)?;
+    }
+    Some(value)
+}
+
+fn split_exponent(raw: &str) -> Option<(&str, i32)> {
     let mut marker: Option<usize> = None;
     for (idx, ch) in raw.char_indices() {
         if ch == 'e' || ch == 'E' {
@@ -339,7 +291,7 @@ fn split_exponent(raw: &str) -> Option<(&str, i64)> {
         return None;
     }
 
-    let exponent = exponent_text[1..].parse::<i64>().ok()?;
+    let exponent = exponent_text[1..].parse::<i32>().ok()?;
     Some((number, exponent))
 }
 
@@ -355,33 +307,37 @@ fn split_suffix<'a>(raw: &'a str, suffixes: &'a [Suffix]) -> Option<(&'a str, &'
     None
 }
 
-fn apply_multiplier(value: i128, multiplier: &Suffix, final_div: i128) -> Option<i128> {
-    let scaled = value.checked_mul(multiplier.num)?;
-    let scaled = if multiplier.den == 1 {
-        scaled
+fn apply_quantity(
+    (numerator, denominator): (i128, i128),
+    suffix: Option<&Suffix>,
+    final_div: i128,
+) -> Option<i64> {
+    let numerator = numerator.checked_mul(1000)?;
+    let (numerator, denominator) = if let Some(suffix) = suffix {
+        (
+            numerator.checked_mul(suffix.num)?,
+            denominator.checked_mul(suffix.den)?,
+        )
     } else {
-        ceil_div_positive(scaled, multiplier.den)
+        (numerator, denominator)
     };
-    if final_div == 1 {
-        Some(scaled)
-    } else {
-        Some(ceil_div_positive(scaled, final_div))
-    }
-}
-
-fn apply_post_scale(value: i128, final_div: i128) -> Option<i64> {
-    let scaled = if final_div == 1 {
-        value
-    } else {
-        ceil_div_positive(value, final_div)
-    };
+    let denominator = denominator.checked_mul(final_div)?;
+    let scaled = ceil_div_positive(numerator, denominator)?;
     bounded_i64(scaled)
 }
 
-fn ceil_div_positive(value: i128, divisor: i128) -> i128 {
+fn ceil_div_positive(value: i128, divisor: i128) -> Option<i128> {
     debug_assert!(divisor > 0);
     debug_assert!(value >= 0);
-    (value + divisor - 1) / divisor
+    if divisor <= 0 || value < 0 {
+        return None;
+    }
+    let quotient = value / divisor;
+    if value % divisor == 0 {
+        Some(quotient)
+    } else {
+        quotient.checked_add(1)
+    }
 }
 
 fn bounded_i64(value: i128) -> Option<i64> {
@@ -434,8 +390,19 @@ mod tests {
         );
         assert_eq!(
             parse_resource_quantity("storage", "1.2345Gi"),
-            Some(1_326_071_153)
+            Some(1_325_534_282)
         );
+        assert_eq!(
+            parse_resource_quantity("storage", "1.2348Gi"),
+            Some(1_325_856_405)
+        );
+        assert_eq!(
+            parse_resource_quantity("storage", "+1Gi"),
+            Some(1_073_741_824)
+        );
+        assert_eq!(parse_resource_quantity("storage", "1k"), Some(1000));
+        assert_eq!(parse_resource_quantity("storage", "1m"), Some(1));
+        assert_eq!(parse_resource_quantity("storage", "1K"), None);
         assert_eq!(
             parse_resource_quantity("storage", "1P"),
             Some(1_000_000_000_000_000)
@@ -452,7 +419,15 @@ mod tests {
         assert_eq!(parse_resource_quantity("storage", "1GiB"), None);
         assert_eq!(parse_resource_quantity("storage", ""), None);
         assert_eq!(
+            parse_resource_quantity("storage", "1e-9223372036854775808"),
+            None
+        );
+        assert_eq!(
             parse_resource_quantity("storage", "18446744073709551616"),
+            None
+        );
+        assert_eq!(
+            parse_resource_quantity("storage", "170141183460469231731687303715884105727"),
             None
         );
     }
