@@ -403,27 +403,27 @@ pub(super) const CLUSTER_PATCH_WATCH_INSERT: &str = "INSERT INTO watch_events
 // node_subnets
 // ---------------------------------------------------------------------------
 
-pub(super) const NODE_SUBNET_SELECT_BY_NAME: &str = "SELECT node_name, subnet, subnet_base_int, vtep_ip, \
+pub(super) const NODE_SUBNET_SELECT_BY_NAME: &str = "SELECT node_name, subnet, subnet_base_int, gateway_ip, \
                 node_ip, mode, hostport_range \
          FROM node_subnets WHERE node_name = ?1";
 
 pub(super) const NODE_SUBNET_INSERT_OR_IGNORE: &str = "INSERT OR IGNORE INTO node_subnets \
-         (node_name, subnet, subnet_base_int, vtep_ip, \
+         (node_name, subnet, subnet_base_int, gateway_ip, \
           node_ip, mode, hostport_range, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, 'root', NULL, ?6)";
 pub(super) const NODE_SUBNET_UPSERT_EXACT: &str = "INSERT INTO node_subnets \
-         (node_name, subnet, subnet_base_int, vtep_ip, \
+         (node_name, subnet, subnet_base_int, gateway_ip, \
           node_ip, mode, hostport_range, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0) \
          ON CONFLICT(node_name) DO UPDATE SET \
          subnet = excluded.subnet, \
          subnet_base_int = excluded.subnet_base_int, \
-         vtep_ip = excluded.vtep_ip, \
+         gateway_ip = excluded.gateway_ip, \
          node_ip = excluded.node_ip, \
          mode = excluded.mode, \
          hostport_range = excluded.hostport_range";
 
-pub(super) const NODE_SUBNET_LIST_PEERS: &str = "SELECT node_name, subnet, subnet_base_int, vtep_ip, \
+pub(super) const NODE_SUBNET_LIST_PEERS: &str = "SELECT node_name, subnet, subnet_base_int, gateway_ip, \
                 node_ip, mode, hostport_range \
          FROM node_subnets WHERE node_name != ?1";
 

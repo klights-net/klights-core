@@ -319,7 +319,7 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
 
     // node_subnets: one row per klights node in the cluster.
     // Populated by the node_subnet controller at startup.
-    // vtep_ip is the first address of the allocated subnet, retained for
+    // gateway_ip is the first address of the allocated subnet, retained for
     // compatibility with existing row shape.
     // node_ip is the host's primary InternalIP.
     // mode is the peer mode projected from klights.io/mode annotation (F2-04).
@@ -329,7 +329,7 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
             node_name       TEXT PRIMARY KEY,
             subnet          TEXT NOT NULL UNIQUE,
             subnet_base_int INTEGER NOT NULL,
-            vtep_ip         TEXT NOT NULL,
+            gateway_ip      TEXT NOT NULL,
             node_ip         TEXT NOT NULL,
             mode            TEXT NOT NULL DEFAULT 'root',
             hostport_range  TEXT,
@@ -337,6 +337,7 @@ pub(super) fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::
         )",
         [],
     )?;
+    migrate_node_subnets_gateway_ip(conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_node_subnets_subnet ON node_subnets(subnet)",
         [],
@@ -526,22 +527,40 @@ fn migrate_watch_replay_floor_position_exact(
     Ok(())
 }
 
+fn migrate_node_subnets_gateway_ip(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(node_subnets)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_gateway_ip = columns.iter().any(|column| column == "gateway_ip");
+    let has_legacy_vtep_ip = columns.iter().any(|column| column == "vtep_ip");
+    if !has_gateway_ip && has_legacy_vtep_ip {
+        conn.execute(
+            "ALTER TABLE node_subnets RENAME COLUMN vtep_ip TO gateway_ip",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeSubnet> {
     use crate::controllers::annotations::{NodePeerMode, parse_node_peer_mode};
     use crate::networking::types::HostPortRange;
 
     let node_name_str: String = row.get(0)?;
     let subnet_str: String = row.get(1)?;
-    let vtep_ip_str: String = row.get(3)?;
+    let gateway_ip_str: String = row.get(3)?;
     let node_ip_str: String = row.get(4)?;
     let mode_str: String = row.get(5).unwrap_or_else(|_| "root".to_string());
     let hostport_range_opt: Option<String> = row.get(6).unwrap_or(None);
 
     let node_name = NodeName::parse(&node_name_str).map_err(parse_err(0))?;
     let subnet = PodSubnet::parse(&subnet_str).map_err(parse_err(1))?;
-    let vtep_ip: Ipv4Addr = vtep_ip_str.parse().map_err(|e: std::net::AddrParseError| {
-        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
-    })?;
+    let gateway_ip: Ipv4Addr = gateway_ip_str
+        .parse()
+        .map_err(|e: std::net::AddrParseError| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     let node_ip: Ipv4Addr = node_ip_str.parse().map_err(|e: std::net::AddrParseError| {
         rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
     })?;
@@ -555,7 +574,7 @@ pub(super) fn row_to_node_subnet(row: &rusqlite::Row<'_>) -> rusqlite::Result<No
         node_name,
         subnet,
         subnet_base_int: row.get::<_, i64>(2)? as u32,
-        vtep_ip,
+        gateway_ip,
         node_ip,
         mode,
         hostport_range,
@@ -609,6 +628,62 @@ mod tests {
         )
         .unwrap_or(0)
             == 1
+    }
+
+    fn table_columns(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare table_info");
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect columns")
+    }
+
+    #[test]
+    fn fresh_node_subnets_schema_uses_gateway_ip_not_legacy_vtep_ip() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        init_schema_in_conn(&mut conn).expect("init schema");
+
+        let columns = table_columns(&conn, "node_subnets");
+        assert!(columns.iter().any(|column| column == "gateway_ip"));
+        assert!(!columns.iter().any(|column| column == "vtep_ip"));
+    }
+
+    #[test]
+    fn migrates_legacy_node_subnets_vtep_ip_column_to_gateway_ip() {
+        let mut conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch(
+            "CREATE TABLE node_subnets (
+                node_name       TEXT PRIMARY KEY,
+                subnet          TEXT NOT NULL UNIQUE,
+                subnet_base_int INTEGER NOT NULL,
+                vtep_ip         TEXT NOT NULL,
+                node_ip         TEXT NOT NULL,
+                mode            TEXT NOT NULL DEFAULT 'root',
+                hostport_range  TEXT,
+                created_at      INTEGER NOT NULL
+            );
+            INSERT INTO node_subnets
+                (node_name, subnet, subnet_base_int, vtep_ip, node_ip, mode, hostport_range, created_at)
+            VALUES
+                ('node-a', '10.42.1.0/24', 170524928, '10.42.1.0', '192.168.1.10', 'root', NULL, 7);",
+        )
+        .expect("seed legacy node_subnets");
+
+        init_schema_in_conn(&mut conn).expect("migrate schema");
+
+        let columns = table_columns(&conn, "node_subnets");
+        assert!(columns.iter().any(|column| column == "gateway_ip"));
+        assert!(!columns.iter().any(|column| column == "vtep_ip"));
+        let gateway_ip: String = conn
+            .query_row(
+                "SELECT gateway_ip FROM node_subnets WHERE node_name = 'node-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migrated gateway_ip");
+        assert_eq!(gateway_ip, "10.42.1.0");
     }
 
     #[test]

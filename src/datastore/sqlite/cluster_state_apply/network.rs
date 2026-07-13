@@ -26,7 +26,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
                 row.node_name,
                 row.subnet,
                 i64::from(row.subnet_base_int),
-                row.vtep_ip,
+                row.gateway_ip,
                 row.node_ip,
                 row.mode,
                 row.hostport_range
@@ -119,7 +119,7 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
                         node_name: row.get(0)?,
                         subnet: row.get(1)?,
                         subnet_base_int: row.get::<_, i64>(2)? as u32,
-                        vtep_ip: row.get(3)?,
+                        gateway_ip: row.get(3)?,
                         node_ip: row.get(4)?,
                         mode: row.get(5)?,
                         hostport_range: row.get(6)?,
@@ -152,12 +152,12 @@ impl<'tx, 'conn> NetworkStateApplier<'tx, 'conn> {
             }
             let subnet_typed = PodSubnet::parse(&format!("{}/24", Ipv4Addr::from(base)))
                 .expect("constructed /24 must parse");
-            let vtep_ip = Ipv4Addr::from(base);
+            let gateway_ip = Ipv4Addr::from(base);
             return Ok(LogApplyNodeSubnetRow {
                 node_name: node_name_typed.as_str().to_string(),
                 subnet: subnet_typed.to_string(),
                 subnet_base_int: base,
-                vtep_ip: vtep_ip.to_string(),
+                gateway_ip: gateway_ip.to_string(),
                 node_ip: node_ip_typed.to_string(),
                 mode: "root".to_string(),
                 hostport_range: None,

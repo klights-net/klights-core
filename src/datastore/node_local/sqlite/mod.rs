@@ -1805,7 +1805,7 @@ fn row_to_pod_network_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodN
 fn row_to_pod_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodEndpointRow> {
     let mode: String = row.get(4)?;
     let mode = match mode.as_str() {
-        "encrypted_direct" | "vxlan" => PodEndpointMode::EncryptedDirect,
+        "encrypted_direct" => PodEndpointMode::EncryptedDirect,
         "hostport" => PodEndpointMode::Hostport,
         other => {
             return Err(rusqlite::Error::FromSqlConversionFailure(

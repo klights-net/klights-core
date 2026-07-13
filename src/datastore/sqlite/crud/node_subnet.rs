@@ -56,8 +56,8 @@ impl Datastore {
                 let subnet_typed = PodSubnet::parse(&format!("{}/24", Ipv4Addr::from(base)))
                     .expect("constructed /24 must parse");
                 let subnet_cidr = subnet_typed.to_string();
-                let vtep_ip_typed = Ipv4Addr::from(base);
-                let vtep_ip_str = vtep_ip_typed.to_string();
+                let gateway_ip_typed = Ipv4Addr::from(base);
+                let gateway_ip_str = gateway_ip_typed.to_string();
 
                 // mode + hostport_range default to root / unknown and are
                 // reconciled from Node annotations by run_peer_watch.
@@ -67,7 +67,7 @@ impl Datastore {
                         node_name_str,
                         subnet_cidr,
                         base as i64,
-                        vtep_ip_str,
+                        gateway_ip_str,
                         node_ip_str,
                         0i64
                     ],
@@ -78,7 +78,7 @@ impl Datastore {
                         node_name: NodeName::parse(&node_name_str).expect("validated"),
                         subnet: subnet_typed,
                         subnet_base_int: base,
-                        vtep_ip: vtep_ip_typed,
+                        gateway_ip: gateway_ip_typed,
                         node_ip: node_ip_typed,
                         mode: crate::controllers::annotations::NodePeerMode::Root,
                         hostport_range: None,

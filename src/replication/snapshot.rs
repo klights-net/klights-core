@@ -651,7 +651,7 @@ fn cluster_network_mutation_from_subnet(row: &NodeSubnet) -> ClusterMutation {
         node_name: row.node_name.as_str().to_string(),
         subnet: row.subnet.to_string(),
         subnet_base_int: row.subnet_base_int,
-        vtep_ip: row.vtep_ip.to_string(),
+        gateway_ip: row.gateway_ip.to_string(),
         node_ip: row.node_ip.to_string(),
         mode: match row.mode {
             crate::controllers::annotations::NodePeerMode::Root => "root".to_string(),

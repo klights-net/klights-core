@@ -732,7 +732,7 @@ impl From<StorageResponse> for ProtoStorageResponse {
                 node_name,
                 subnet,
                 subnet_base_int,
-                vtep_ip,
+                gateway_ip,
                 node_ip,
                 mode,
                 hostport_range,
@@ -740,7 +740,7 @@ impl From<StorageResponse> for ProtoStorageResponse {
                 node_name,
                 subnet,
                 subnet_base_int,
-                vtep_ip,
+                gateway_ip,
                 node_ip,
                 mode,
                 hostport_range,
@@ -775,7 +775,7 @@ impl TryFrom<ProtoStorageResponse> for StorageResponse {
                 node_name: p.node_name,
                 subnet: p.subnet,
                 subnet_base_int: p.subnet_base_int,
-                vtep_ip: p.vtep_ip,
+                gateway_ip: p.gateway_ip,
                 node_ip: p.node_ip,
                 mode: p.mode,
                 hostport_range: p.hostport_range,
@@ -1200,7 +1200,7 @@ mod tests {
                     node_name: "node-1".into(),
                     subnet: "10.42.1.0/24".into(),
                     subnet_base_int: 0x0a2a0100,
-                    vtep_ip: "10.42.1.1".into(),
+                    gateway_ip: "10.42.1.1".into(),
                     node_ip: "192.168.1.10".into(),
                     mode: "rootless".into(),
                     hostport_range: Some("32000-32767".into()),
@@ -1500,7 +1500,7 @@ mod tests {
                 "node_name": "node-1",
                 "subnet": "10.42.1.0/24",
                 "subnet_base_int": 170403840,
-                "vtep_ip": "10.42.1.1",
+                "gateway_ip": "10.42.1.1",
                 "node_ip": "192.168.1.10",
                 "mode": "rootless",
                 "hostport_range": "32000-32767"
@@ -1515,14 +1515,14 @@ mod tests {
                 node_name,
                 subnet,
                 subnet_base_int,
-                vtep_ip,
+                gateway_ip,
                 node_ip,
                 mode,
                 hostport_range,
             } => {
                 assert_eq!(node_name, "node-1");
                 assert_eq!(subnet, "10.42.1.0/24");
-                assert_eq!(vtep_ip, "10.42.1.1");
+                assert_eq!(gateway_ip, "10.42.1.1");
                 assert_eq!(node_ip, "192.168.1.10");
                 assert_eq!(mode, "rootless");
                 assert_eq!(hostport_range.as_deref(), Some("32000-32767"));

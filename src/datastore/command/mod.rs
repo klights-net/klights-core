@@ -500,7 +500,7 @@ pub enum StorageResponse {
         node_name: String,
         subnet: String,
         subnet_base_int: u32,
-        vtep_ip: String,
+        gateway_ip: String,
         node_ip: String,
         mode: String,
         hostport_range: Option<String>,

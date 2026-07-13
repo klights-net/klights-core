@@ -150,7 +150,7 @@ impl LogApplyCommit {
                 node_name: row.node_name.as_str().to_string(),
                 subnet: row.subnet.to_string(),
                 subnet_base_int: row.subnet_base_int,
-                vtep_ip: row.vtep_ip.to_string(),
+                gateway_ip: row.gateway_ip.to_string(),
                 node_ip: row.node_ip.to_string(),
                 mode: match row.mode {
                     crate::controllers::annotations::NodePeerMode::Root => "root".to_string(),
@@ -413,7 +413,7 @@ pub struct LogApplyNodeSubnetRow {
     pub node_name: String,
     pub subnet: String,
     pub subnet_base_int: u32,
-    pub vtep_ip: String,
+    pub gateway_ip: String,
     pub node_ip: String,
     pub mode: String,
     pub hostport_range: Option<String>,
@@ -807,7 +807,7 @@ struct ProtoLogApplyNodeSubnetRow {
     #[prost(uint32, tag = "3")]
     subnet_base_int: u32,
     #[prost(string, tag = "4")]
-    vtep_ip: String,
+    gateway_ip: String,
     #[prost(string, tag = "6")]
     node_ip: String,
     #[prost(string, tag = "7")]
@@ -1260,7 +1260,7 @@ impl From<LogApplyNodeSubnetRow> for ProtoLogApplyNodeSubnetRow {
             node_name: row.node_name,
             subnet: row.subnet,
             subnet_base_int: row.subnet_base_int,
-            vtep_ip: row.vtep_ip,
+            gateway_ip: row.gateway_ip,
             node_ip: row.node_ip,
             mode: row.mode,
             hostport_range: row.hostport_range,
@@ -1274,7 +1274,7 @@ impl From<ProtoLogApplyNodeSubnetRow> for LogApplyNodeSubnetRow {
             node_name: row.node_name,
             subnet: row.subnet,
             subnet_base_int: row.subnet_base_int,
-            vtep_ip: row.vtep_ip,
+            gateway_ip: row.gateway_ip,
             node_ip: row.node_ip,
             mode: row.mode,
             hostport_range: row.hostport_range,
@@ -1507,7 +1507,7 @@ mod parity_tests {
                 node_name: "node-1".to_string(),
                 subnet: "10.42.1.0/24".to_string(),
                 subnet_base_int: 0x0a2a0100,
-                vtep_ip: "10.42.1.0".to_string(),
+                gateway_ip: "10.42.1.0".to_string(),
                 node_ip: "192.168.0.10".to_string(),
                 mode: "root".to_string(),
                 hostport_range: Some("30000-32767".to_string()),

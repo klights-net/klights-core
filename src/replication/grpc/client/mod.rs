@@ -2987,7 +2987,7 @@ fn node_subnet_from_proto(subnet: generated::NodeSubnetObject) -> Result<NodeSub
         node_name: subnet.node_name,
         subnet: subnet.subnet,
         subnet_base_int: subnet.subnet_base_int,
-        vtep_ip: subnet.vtep_ip,
+        gateway_ip: subnet.gateway_ip,
         node_ip: subnet.node_ip,
         mode: subnet.mode,
         hostport_range: subnet.hostport_range,

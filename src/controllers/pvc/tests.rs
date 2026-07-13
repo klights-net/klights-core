@@ -1027,7 +1027,7 @@ async fn test_pvc_binds_to_pv_without_status() {
 
 #[tokio::test]
 async fn test_pvc_capacity_mismatch_no_bind() {
-    // PV with 5Gi should NOT bind to PVC requesting 1Gi (exact match required)
+    // PV with 1023Mi should NOT bind to PVC requesting 1Gi (one unit below)
     let db = crate::datastore::test_support::in_memory().await;
 
     let pv = json!({
@@ -1035,7 +1035,7 @@ async fn test_pvc_capacity_mismatch_no_bind() {
         "kind": "PersistentVolume",
         "metadata": {"name": "big-pv"},
         "spec": {
-            "capacity": {"storage": "5Gi"},
+            "capacity": {"storage": "1023Mi"},
             "accessModes": ["ReadWriteOnce"],
             "hostPath": {"path": "/mnt/data"}
         },
@@ -1069,9 +1069,297 @@ async fn test_pvc_capacity_mismatch_no_bind() {
     let pvc = get_pvc(&db, "default", "small-pvc").await;
     reconcile_pvc(&db, &pvc).await.unwrap();
 
-    // Should remain Pending — exact capacity match required (Phase 1)
+    // Should remain Pending — no PV has capacity >= requested storage
     let pvc = get_pvc(&db, "default", "small-pvc").await;
     assert_eq!(pvc["status"]["phase"], "Pending");
+}
+
+#[tokio::test]
+async fn test_pvc_binds_when_pv_capacity_exceeds_storage_request() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    let pv = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {"name": "large-pv"},
+        "spec": {
+            "capacity": {"storage": "1Gi"},
+            "accessModes": ["ReadWriteOnce"],
+            "hostPath": {"path": "/mnt/data"}
+        },
+        "status": {"phase": "Available"}
+    });
+
+    db.create_resource("v1", "PersistentVolume", None, "large-pv", pv)
+        .await
+        .unwrap();
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "half-pvc", "namespace": "default"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "512Mi"}}
+        }
+    });
+
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "half-pvc",
+        pvc,
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "half-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pvc = get_pvc(&db, "default", "half-pvc").await;
+    assert_eq!(pvc["status"]["phase"], "Bound");
+    assert_eq!(pvc["status"]["volumeName"], "large-pv");
+}
+
+#[tokio::test]
+async fn test_pvc_binds_when_request_equals_larger_pv_units() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    let pv = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {"name": "equal-pv"},
+        "spec": {
+            "capacity": {"storage": "1024Mi"},
+            "accessModes": ["ReadWriteOnce"],
+            "hostPath": {"path": "/mnt/data"}
+        },
+        "status": {"phase": "Available"}
+    });
+
+    db.create_resource("v1", "PersistentVolume", None, "equal-pv", pv)
+        .await
+        .unwrap();
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "equal-pvc", "namespace": "default"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Gi"}}
+        }
+    });
+
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "equal-pvc",
+        pvc,
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "equal-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pvc = get_pvc(&db, "default", "equal-pvc").await;
+    assert_eq!(pvc["status"]["phase"], "Bound");
+    assert_eq!(pvc["status"]["volumeName"], "equal-pv");
+}
+
+#[tokio::test]
+async fn test_pvc_does_not_bind_when_decimal_and_binary_units_do_not_match_semantics() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    let pv = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {"name": "decimal-vs-binary-pv"},
+        "spec": {
+            "capacity": {"storage": "1G"},
+            "accessModes": ["ReadWriteOnce"],
+            "hostPath": {"path": "/mnt/data"}
+        },
+        "status": {"phase": "Available"}
+    });
+
+    db.create_resource("v1", "PersistentVolume", None, "decimal-vs-binary-pv", pv)
+        .await
+        .unwrap();
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "decimal-vs-binary-pvc", "namespace": "default"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Gi"}}
+        }
+    });
+
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "decimal-vs-binary-pvc",
+        pvc,
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "decimal-vs-binary-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pvc = get_pvc(&db, "default", "decimal-vs-binary-pvc").await;
+    assert_eq!(pvc["status"]["phase"], "Pending");
+}
+
+#[tokio::test]
+async fn test_pvc_binding_requires_matching_storage_class_and_volume_mode_and_selector() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    let pv = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {
+            "name": "annotated-pv",
+            "labels": {"zone": "us-west-1", "tier": "gold"}
+        },
+        "spec": {
+            "capacity": {"storage": "1Gi"},
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": "fast",
+            "volumeMode": "Filesystem",
+            "hostPath": {"path": "/mnt/data"}
+        },
+        "status": {"phase": "Available"}
+    });
+
+    db.create_resource("v1", "PersistentVolume", None, "annotated-pv", pv)
+        .await
+        .unwrap();
+
+    let invalid = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "invalid-pvc", "namespace": "default"},
+        "spec": {
+            "storageClassName": "slow",
+            "volumeMode": "Block",
+            "selector": {"matchLabels": {"tier": "gold"}},
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Gi"}}
+        }
+    });
+
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "invalid-pvc",
+        invalid,
+    )
+    .await
+    .unwrap();
+
+    let invalid_pvc = get_pvc(&db, "default", "invalid-pvc").await;
+    reconcile_pvc(&db, &invalid_pvc).await.unwrap();
+
+    let invalid_pvc = get_pvc(&db, "default", "invalid-pvc").await;
+    assert_eq!(invalid_pvc["status"]["phase"], "Pending");
+
+    let mut valid = invalid_pvc.clone();
+    valid["spec"]["storageClassName"] = json!("fast");
+    valid["spec"]["volumeMode"] = json!("Filesystem");
+    let valid_rv = valid["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+
+    db.update_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "invalid-pvc",
+        valid,
+        valid_rv,
+    )
+    .await
+    .unwrap();
+
+    let valid_pvc = get_pvc(&db, "default", "invalid-pvc").await;
+    reconcile_pvc(&db, &valid_pvc).await.unwrap();
+
+    let valid_pvc = get_pvc(&db, "default", "invalid-pvc").await;
+    assert_eq!(valid_pvc["status"]["phase"], "Bound");
+    assert_eq!(valid_pvc["status"]["volumeName"], "annotated-pv");
+}
+
+#[tokio::test]
+async fn test_pvc_binding_is_deterministic_by_pv_name() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    let pv_z = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {"name": "pv-z"},
+        "spec": {
+            "capacity": {"storage": "1Gi"},
+            "accessModes": ["ReadWriteOnce"],
+            "hostPath": {"path": "/mnt/data-z"}
+        },
+        "status": {"phase": "Available"}
+    });
+    let pv_a = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {"name": "pv-a"},
+        "spec": {
+            "capacity": {"storage": "1Gi"},
+            "accessModes": ["ReadWriteOnce"],
+            "hostPath": {"path": "/mnt/data-a"}
+        },
+        "status": {"phase": "Available"}
+    });
+
+    // Create out of lexical order to verify deterministic selection is enforced.
+    db.create_resource("v1", "PersistentVolume", None, "pv-z", pv_z)
+        .await
+        .unwrap();
+    db.create_resource("v1", "PersistentVolume", None, "pv-a", pv_a)
+        .await
+        .unwrap();
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "sorted-pvc", "namespace": "default"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Gi"}}
+        }
+    });
+
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "sorted-pvc",
+        pvc,
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "sorted-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pvc = get_pvc(&db, "default", "sorted-pvc").await;
+    assert_eq!(pvc["status"]["phase"], "Bound");
+    assert_eq!(pvc["status"]["volumeName"], "pv-a");
 }
 
 #[tokio::test]

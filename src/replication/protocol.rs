@@ -296,7 +296,7 @@ pub struct ForwardedNodeSubnet {
     pub node_name: String,
     pub subnet: String,
     pub subnet_base_int: u32,
-    pub vtep_ip: String,
+    pub gateway_ip: String,
     pub node_ip: String,
     pub mode: String,
     pub hostport_range: Option<String>,
@@ -308,7 +308,7 @@ impl From<NodeSubnet> for ForwardedNodeSubnet {
             node_name: subnet.node_name.to_string(),
             subnet: subnet.subnet.to_string(),
             subnet_base_int: subnet.subnet_base_int,
-            vtep_ip: subnet.vtep_ip.to_string(),
+            gateway_ip: subnet.gateway_ip.to_string(),
             node_ip: subnet.node_ip.to_string(),
             mode: match subnet.mode {
                 crate::controllers::annotations::NodePeerMode::Root => "root",
@@ -326,10 +326,10 @@ impl ForwardedNodeSubnet {
             .map_err(|err| anyhow!("invalid forwarded node name '{}': {}", self.node_name, err))?;
         let subnet = PodSubnet::parse(&self.subnet)
             .map_err(|err| anyhow!("invalid forwarded pod subnet '{}': {}", self.subnet, err))?;
-        let vtep_ip: Ipv4Addr = self
-            .vtep_ip
+        let gateway_ip: Ipv4Addr = self
+            .gateway_ip
             .parse()
-            .with_context(|| format!("invalid forwarded VTEP IP '{}'", self.vtep_ip))?;
+            .with_context(|| format!("invalid forwarded gateway IP '{}'", self.gateway_ip))?;
         let node_ip: Ipv4Addr = self
             .node_ip
             .parse()
@@ -347,7 +347,7 @@ impl ForwardedNodeSubnet {
             node_name,
             subnet,
             subnet_base_int: self.subnet_base_int,
-            vtep_ip,
+            gateway_ip,
             node_ip,
             mode,
             hostport_range,

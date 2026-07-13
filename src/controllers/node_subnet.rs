@@ -118,10 +118,10 @@ pub async fn ensure_local_node_subnet(
         .context("Failed to allocate node subnet")?;
 
     tracing::info!(
-        "node_subnet: node={} subnet={} vtep_ip={}",
+        "node_subnet: node={} subnet={} gateway_ip={}",
         node_name,
         subnet.subnet,
-        subnet.vtep_ip,
+        subnet.gateway_ip,
     );
 
     Ok(subnet)
@@ -443,7 +443,7 @@ pub async fn sync_peer_routes(
             .map(|old| {
                 let s = &old.subnet;
                 s.subnet != peer.subnet
-                    || s.vtep_ip != peer.vtep_ip
+                    || s.gateway_ip != peer.gateway_ip
                     || s.node_ip != peer.node_ip
                     || s.mode != peer.mode
                     || s.hostport_range != peer.hostport_range
@@ -640,7 +640,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(subnet.subnet.to_string(), "10.42.0.0/24");
-        assert_eq!(subnet.vtep_ip.to_string(), "10.42.0.0");
+        assert_eq!(subnet.gateway_ip.to_string(), "10.42.0.0");
         assert_eq!(subnet.node_ip.to_string(), "192.168.1.1");
         assert_eq!(subnet.node_name.as_str(), "node-a");
     }
@@ -656,7 +656,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(subnet_b.subnet.to_string(), "10.42.1.0/24");
-        assert_eq!(subnet_b.vtep_ip.to_string(), "10.42.1.0");
+        assert_eq!(subnet_b.gateway_ip.to_string(), "10.42.1.0");
     }
 
     #[tokio::test]

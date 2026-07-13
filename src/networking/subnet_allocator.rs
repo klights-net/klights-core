@@ -285,7 +285,7 @@ mod tests {
             node_name: NodeName::parse("node-a").unwrap(),
             subnet: PodSubnet::parse("10.50.1.0/24").unwrap(),
             subnet_base_int: u32::from(Ipv4Addr::new(10, 50, 1, 0)),
-            vtep_ip: Ipv4Addr::new(10, 50, 1, 1),
+            gateway_ip: Ipv4Addr::new(10, 50, 1, 1),
             node_ip: Ipv4Addr::new(192, 0, 2, 10),
             mode: crate::controllers::annotations::NodePeerMode::Root,
             hostport_range: None,

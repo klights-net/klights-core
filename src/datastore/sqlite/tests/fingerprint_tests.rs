@@ -532,7 +532,7 @@ async fn fingerprint_db_family_state(db: &Datastore) -> String {
         let rows = db
             .db_call("family-fingerprint-node-subnets", |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT node_name, subnet, subnet_base_int, vtep_ip, node_ip, mode, \
+                    "SELECT node_name, subnet, subnet_base_int, gateway_ip, node_ip, mode, \
                      hostport_range, created_at FROM node_subnets ORDER BY node_name",
                 )?;
                 let rows = stmt
@@ -850,7 +850,7 @@ async fn raft_mixed_family_apply_converges_to_identical_fingerprint() {
                 node_name: "mixed-family-node-a".to_string(),
                 subnet: "10.42.0.0/24".to_string(),
                 subnet_base_int: 1_762_000_000,
-                vtep_ip: "10.42.0.1".to_string(),
+                gateway_ip: "10.42.0.1".to_string(),
                 node_ip: "192.0.2.10".to_string(),
                 mode: "root".to_string(),
                 hostport_range: Some("30000-30010".to_string()),

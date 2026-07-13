@@ -5707,7 +5707,7 @@ async fn raft_allocate_node_subnet_commits_distinct_per_node_24s() {
     let rows: Vec<(String, String, i64, String, String)> = db
         .db_call("test_select_raft_allocated_node_subnets", |conn| {
             let mut stmt = conn.prepare(
-                "SELECT node_name, subnet, subnet_base_int, vtep_ip, mode \
+                "SELECT node_name, subnet, subnet_base_int, gateway_ip, mode \
                  FROM node_subnets ORDER BY node_name",
             )?;
             let rows = stmt

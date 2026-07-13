@@ -893,7 +893,7 @@ pub struct NodeSubnet {
     pub subnet_base_int: u32,
     /// First address of the subnet, retained for row-shape compatibility with
     /// older node-subnet allocation code.
-    pub vtep_ip: Ipv4Addr,
+    pub gateway_ip: Ipv4Addr,
     /// Host's primary underlay IP used for direct/WireGuard peer routing.
     pub node_ip: Ipv4Addr,
     /// Peer mode projected from the node's `klights.io/mode` annotation
@@ -991,7 +991,7 @@ impl PodEndpointMode {
 
     pub fn parse(s: &str) -> Result<Self> {
         match s {
-            "encrypted_direct" | "vxlan" => Ok(PodEndpointMode::EncryptedDirect),
+            "encrypted_direct" => Ok(PodEndpointMode::EncryptedDirect),
             "hostport" => Ok(PodEndpointMode::Hostport),
             other => Err(anyhow!("unknown pod_endpoint mode: {}", other)),
         }
@@ -1115,7 +1115,7 @@ mod pod_endpoint_mode_tests {
     use super::PodEndpointMode;
 
     #[test]
-    fn encrypted_direct_is_live_pod_endpoint_label_with_legacy_alias() {
+    fn encrypted_direct_is_live_pod_endpoint_label() {
         assert_eq!(
             PodEndpointMode::EncryptedDirect.as_str(),
             "encrypted_direct"
@@ -1124,10 +1124,7 @@ mod pod_endpoint_mode_tests {
             PodEndpointMode::parse("encrypted_direct").unwrap(),
             PodEndpointMode::EncryptedDirect
         );
-        assert_eq!(
-            PodEndpointMode::parse("vxlan").unwrap(),
-            PodEndpointMode::EncryptedDirect
-        );
+        assert!(PodEndpointMode::parse("vxlan").is_err());
         assert_eq!(
             PodEndpointMode::parse("hostport").unwrap(),
             PodEndpointMode::Hostport

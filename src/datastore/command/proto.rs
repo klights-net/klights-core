@@ -100,7 +100,7 @@ pub struct ProtoNodeSubnetResp {
     #[prost(uint32, tag = "3")]
     pub subnet_base_int: u32,
     #[prost(string, tag = "4")]
-    pub vtep_ip: String,
+    pub gateway_ip: String,
     #[prost(string, tag = "5")]
     pub node_ip: String,
     #[prost(string, tag = "6")]

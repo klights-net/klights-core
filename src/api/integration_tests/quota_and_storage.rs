@@ -1684,6 +1684,239 @@ async fn test_pv_status_defaults_phase_available_on_create() {
 }
 
 #[tokio::test]
+async fn test_pvc_binding_result_is_same_for_json_and_protobuf_creation() {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use k8s_pb::api::core::v1::{
+        PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeSpec,
+        PersistentVolumeStatus, VolumeResourceRequirements,
+    };
+    use k8s_pb::apimachinery::pkg::api::resource::Quantity;
+    use k8s_pb::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use prost::Message;
+    use std::collections::BTreeMap;
+    use tower::ServiceExt;
+
+    async fn fetch_resource_with_rv(
+        db: &crate::datastore::DatastoreHandle,
+        api: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> serde_json::Value {
+        let resource = db
+            .get_resource(api, kind, namespace, name)
+            .await
+            .unwrap()
+            .expect("resource should exist");
+
+        let mut data = (*resource.data).clone();
+        if let Some(meta) = data.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+            meta.insert(
+                "resourceVersion".to_string(),
+                json!(resource.resource_version.to_string()),
+            );
+        }
+        data
+    }
+
+    fn build_envelope(raw: Vec<u8>, kind: &str) -> Vec<u8> {
+        let envelope = crate::protobuf::Unknown {
+            type_meta: Some(crate::protobuf::TypeMeta {
+                api_version: "v1".to_string(),
+                kind: kind.to_string(),
+            }),
+            raw,
+            content_encoding: String::new(),
+            content_type: String::new(),
+        };
+
+        let mut body = b"k8s\0".to_vec();
+        envelope.encode(&mut body).unwrap();
+        body
+    }
+
+    let state = crate::api::test_support::build_test_app_state().await;
+    let db = state.db.clone();
+    let app = crate::api::build_router(state);
+
+    let ns_body = r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"pvc-bind-parity"}}"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces")
+        .header("content-type", "application/json")
+        .body(Body::from(ns_body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json_pv = r#"{
+        "apiVersion":"v1",
+        "kind":"PersistentVolume",
+        "metadata":{"name":"json-pv"},
+        "spec":{"capacity":{"storage":"1Gi"},"accessModes":["ReadWriteOnce"],"persistentVolumeReclaimPolicy":"Retain"},
+        "status":{"phase":"Available"}
+    }"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/persistentvolumes")
+        .header("content-type", "application/json")
+        .body(Body::from(json_pv))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json_pvc = r#"{
+        "apiVersion":"v1",
+        "kind":"PersistentVolumeClaim",
+        "metadata":{"name":"json-pvc","namespace":"pvc-bind-parity"},
+        "spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}}
+    }"#;
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/pvc-bind-parity/persistentvolumeclaims")
+        .header("content-type", "application/json")
+        .body(Body::from(json_pvc))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let mut json_pv_capacity = BTreeMap::new();
+    json_pv_capacity.insert(
+        "storage".to_string(),
+        Quantity {
+            string: Some("1Gi".to_string()),
+        },
+    );
+    let mut proto_pv = Vec::new();
+    PersistentVolume {
+        metadata: Some(ObjectMeta {
+            name: Some("proto-pv".to_string()),
+            ..Default::default()
+        }),
+        spec: Some(PersistentVolumeSpec {
+            capacity: json_pv_capacity.clone(),
+            access_modes: vec!["ReadWriteOnce".to_string()],
+            persistent_volume_reclaim_policy: Some("Retain".to_string()),
+            ..Default::default()
+        }),
+        status: Some(PersistentVolumeStatus {
+            phase: Some("Available".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+    .encode(&mut proto_pv)
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/persistentvolumes")
+        .header("content-type", "application/vnd.kubernetes.protobuf")
+        .body(Body::from(build_envelope(proto_pv, "PersistentVolume")))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let mut proto_pvc_requests = BTreeMap::new();
+    proto_pvc_requests.insert(
+        "storage".to_string(),
+        Quantity {
+            string: Some("1Gi".to_string()),
+        },
+    );
+    let mut proto_pvc_body = Vec::new();
+    PersistentVolumeClaim {
+        metadata: Some(ObjectMeta {
+            name: Some("proto-pvc".to_string()),
+            namespace: Some("pvc-bind-parity".to_string()),
+            ..Default::default()
+        }),
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: vec!["ReadWriteOnce".to_string()],
+            resources: Some(VolumeResourceRequirements {
+                requests: proto_pvc_requests,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+    .encode(&mut proto_pvc_body)
+    .unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/namespaces/pvc-bind-parity/persistentvolumeclaims")
+        .header("content-type", "application/vnd.kubernetes.protobuf")
+        .body(Body::from(build_envelope(
+            proto_pvc_body,
+            "PersistentVolumeClaim",
+        )))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let json_pvc_snapshot = fetch_resource_with_rv(
+        &db,
+        "v1",
+        "PersistentVolumeClaim",
+        Some("pvc-bind-parity"),
+        "json-pvc",
+    )
+    .await;
+    let proto_pvc_snapshot = fetch_resource_with_rv(
+        &db,
+        "v1",
+        "PersistentVolumeClaim",
+        Some("pvc-bind-parity"),
+        "proto-pvc",
+    )
+    .await;
+
+    let _ = crate::controllers::pvc::reconcile_pvc(db.as_ref(), &json_pvc_snapshot)
+        .await
+        .unwrap();
+    let _ = crate::controllers::pvc::reconcile_pvc(db.as_ref(), &proto_pvc_snapshot)
+        .await
+        .unwrap();
+
+    let json_pvc_bound = fetch_resource_with_rv(
+        &db,
+        "v1",
+        "PersistentVolumeClaim",
+        Some("pvc-bind-parity"),
+        "json-pvc",
+    )
+    .await;
+    let proto_pvc_bound = fetch_resource_with_rv(
+        &db,
+        "v1",
+        "PersistentVolumeClaim",
+        Some("pvc-bind-parity"),
+        "proto-pvc",
+    )
+    .await;
+
+    assert_eq!(
+        json_pvc_bound.pointer("/status/phase"),
+        Some(&json!("Bound"))
+    );
+    assert_eq!(
+        json_pvc_bound.pointer("/status/volumeName"),
+        Some(&json!("json-pv"))
+    );
+    assert_eq!(
+        proto_pvc_bound.pointer("/status/phase"),
+        Some(&json!("Bound"))
+    );
+    assert_eq!(
+        proto_pvc_bound.pointer("/status/volumeName"),
+        Some(&json!("proto-pv"))
+    );
+}
+
+#[tokio::test]
 async fn test_runtimeclass_crud() {
     use axum::{
         body::Body,

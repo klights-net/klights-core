@@ -101,7 +101,7 @@ mod tests {
             node_name: "n1".into(),
             subnet: "10.244.0.0/24".into(),
             subnet_base_int: 7,
-            vtep_ip: "10.244.0.1".into(),
+            gateway_ip: "10.244.0.1".into(),
             node_ip: "192.168.1.1".into(),
             mode: "Root".into(),
             hostport_range: None,

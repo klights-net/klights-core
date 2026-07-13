@@ -224,15 +224,58 @@ impl crate::kubelet::pod_repository::PodReader for ResourceQuotaStatusConflictPo
 }
 
 #[test]
-fn test_parse_scalar_resource_accepts_decimal_si_suffix() {
-    assert_eq!(
-        parse_resource_quantity("example.com/fakecpu", "1k"),
-        Some(1000)
-    );
-    assert_eq!(
-        parse_resource_quantity("example.com/fakecpu", "1.5k"),
-        Some(1500)
-    );
+fn test_parse_resource_quantity_storage_matches_kubernetes_semantics() {
+    let equal_pairs = [
+        ("1Gi", "1024Mi", 1_073_741_824),
+        ("512Mi", "0.5Gi", 536_870_912),
+    ];
+    for (left, right, expected) in equal_pairs {
+        assert_eq!(
+            parse_resource_quantity("storage", left),
+            Some(expected),
+            "{left} should parse to {expected}"
+        );
+        assert_eq!(
+            parse_resource_quantity("storage", right),
+            Some(expected),
+            "{right} should parse to {expected}"
+        );
+    }
+
+    let ordered_pairs = [("1Gi", "512Mi"), ("1024Mi", "1Gi"), ("2Gi", "1024Mi")];
+    for (left, right) in ordered_pairs {
+        let left_qty = parse_resource_quantity("storage", left).expect("left quantity parses");
+        let right_qty = parse_resource_quantity("storage", right).expect("right quantity parses");
+        assert!(
+            left_qty >= right_qty,
+            "storage quantity ordering must be normalized: {left} >= {right}"
+        );
+    }
+
+    let one_g = parse_resource_quantity("storage", "1G").expect("1G parses");
+    let one_gi = parse_resource_quantity("storage", "1Gi").expect("1Gi parses");
+    assert_ne!(one_g, one_gi);
+    assert!(one_g < one_gi, "1G must be less than 1Gi");
+}
+
+#[test]
+fn test_parse_resource_quantity_storage_rejects_malformed_or_invalid_values() {
+    for raw in [
+        "1GiB",
+        "1.2345Gi",
+        "-1Gi",
+        "",
+        "1.2.3",
+        "abc",
+        "++1Gi",
+        "18446744073709551616",
+    ] {
+        assert_eq!(
+            parse_resource_quantity("storage", raw),
+            None,
+            "storage quantity '{raw}' should be rejected"
+        );
+    }
 }
 
 #[test]

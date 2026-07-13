@@ -1,4 +1,5 @@
 use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
+use crate::label_selector::LabelSelector;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
@@ -187,11 +188,23 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         .get("storage")
         .and_then(|s| s.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing storage request"))?;
+    let requested_storage_size =
+        crate::quantity::parse_resource_quantity("storage", requested_storage)
+            .ok_or_else(|| anyhow::anyhow!("Invalid storage request '{requested_storage}'"))?;
 
     let access_modes = spec
         .get("accessModes")
         .and_then(|a| a.as_array())
         .ok_or_else(|| anyhow::anyhow!("Missing accessModes"))?;
+    let requested_storage_class = spec
+        .get("storageClassName")
+        .and_then(|value| value.as_str());
+    let requested_volume_mode = spec.get("volumeMode").and_then(|value| value.as_str());
+    let requested_selector = spec
+        .get("selector")
+        .map(LabelSelector::from_k8s_selector)
+        .transpose()
+        .with_context(|| "Invalid PVC selector")?;
 
     // Build claimRef for the PV spec
     let mut claim_ref = json!({
@@ -208,16 +221,30 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
     }
 
     // Find an available PV that matches capacity and accessModes
-    let pvs = db
+    let mut pvs = db
         .list_resources(
             "v1",
             "PersistentVolume",
             None,
             crate::datastore::ResourceListQuery::all(),
         )
-        .await?;
+        .await?
+        .items;
+    pvs.sort_by(|left, right| {
+        let left_name = left
+            .data
+            .pointer("/metadata/name")
+            .and_then(|name| name.as_str())
+            .unwrap_or("");
+        let right_name = right
+            .data
+            .pointer("/metadata/name")
+            .and_then(|name| name.as_str())
+            .unwrap_or("");
+        left_name.cmp(right_name)
+    });
 
-    for pv in &pvs.items {
+    for pv in &pvs {
         // Check if PV is Available
         if let Some(phase) = pv
             .data
@@ -233,21 +260,52 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         }
 
         // Check capacity
-        // TODO(Phase 2): PV capacity >= PVC request, not exact match
-        if let Some(pv_capacity) = pv
+        let pv_capacity = pv
             .data
             .get("spec")
             .and_then(|s| s.get("capacity"))
             .and_then(|c| c.get("storage"))
             .and_then(|s| s.as_str())
-        {
-            if pv_capacity != requested_storage {
-                continue;
-            }
-        } else {
+            .ok_or_else(|| anyhow::anyhow!("PV missing spec.capacity.storage"))?;
+        let pv_capacity = crate::quantity::parse_resource_quantity("storage", pv_capacity)
+            .ok_or_else(|| anyhow::anyhow!("PV capacity is not a valid quantity"))?;
+        if pv_capacity < requested_storage_size {
             continue;
         }
 
+        let pv_storage_class = pv
+            .data
+            .get("spec")
+            .and_then(|s| s.get("storageClassName"))
+            .and_then(|v| v.as_str());
+        if let Some(requested_class) = requested_storage_class
+            && pv_storage_class != Some(requested_class)
+        {
+            continue;
+        }
+
+        let pv_volume_mode = pv
+            .data
+            .get("spec")
+            .and_then(|s| s.get("volumeMode"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("Filesystem");
+        match requested_volume_mode {
+            Some(mode) if mode != pv_volume_mode => continue,
+            None if pv_volume_mode != "Filesystem" => continue,
+            _ => {}
+        }
+
+        if let Some(selector) = requested_selector.as_ref()
+            && !selector.matches_resource(&pv.data)
+        {
+            continue;
+        }
+
+        let pvc_modes: Vec<String> = access_modes
+            .iter()
+            .filter_map(|m| m.as_str().map(String::from))
+            .collect();
         // Check access modes
         if let Some(pv_access_modes) = pv
             .data
@@ -256,10 +314,6 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
             .and_then(|a| a.as_array())
         {
             let pv_modes: Vec<String> = pv_access_modes
-                .iter()
-                .filter_map(|m| m.as_str().map(String::from))
-                .collect();
-            let pvc_modes: Vec<String> = access_modes
                 .iter()
                 .filter_map(|m| m.as_str().map(String::from))
                 .collect();

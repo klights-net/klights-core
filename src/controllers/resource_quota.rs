@@ -396,110 +396,12 @@ pub fn resource_quota_has_pod_scope_constraints(resource_quota: &serde_json::Val
     has_scope || has_scope_selector
 }
 
-fn parse_cpu_milli(q: &str) -> Option<i64> {
-    if let Some(stripped) = q.strip_suffix('m') {
-        return stripped.parse::<i64>().ok();
-    }
-    if let Ok(whole) = q.parse::<i64>() {
-        return Some(whole * 1000);
-    }
-    let as_float = q.parse::<f64>().ok()?;
-    Some((as_float * 1000.0).round() as i64)
-}
-
-fn format_cpu_milli(milli: i64) -> String {
-    if milli % 1000 == 0 {
-        (milli / 1000).to_string()
-    } else {
-        format!("{milli}m")
-    }
-}
-
-fn parse_memory_bytes(q: &str) -> Option<i64> {
-    let units: [(&str, i64); 10] = [
-        ("Ki", 1024_i64),
-        ("Mi", 1024_i64.pow(2)),
-        ("Gi", 1024_i64.pow(3)),
-        ("Ti", 1024_i64.pow(4)),
-        ("Pi", 1024_i64.pow(5)),
-        ("Ei", 1024_i64.pow(6)),
-        ("K", 1000_i64),
-        ("M", 1000_i64.pow(2)),
-        ("G", 1000_i64.pow(3)),
-        ("T", 1000_i64.pow(4)),
-    ];
-    for (suffix, mult) in units {
-        if let Some(stripped) = q.strip_suffix(suffix) {
-            let value = stripped.parse::<f64>().ok()?;
-            return Some((value * mult as f64).round() as i64);
-        }
-    }
-    q.parse::<i64>().ok()
-}
-
-fn format_memory_bytes(bytes: i64) -> String {
-    for (suffix, mult) in [
-        ("Ei", 1024_i64.pow(6)),
-        ("Pi", 1024_i64.pow(5)),
-        ("Ti", 1024_i64.pow(4)),
-        ("Gi", 1024_i64.pow(3)),
-        ("Mi", 1024_i64.pow(2)),
-        ("Ki", 1024_i64),
-    ] {
-        if bytes % mult == 0 && bytes >= mult {
-            return format!("{}{}", bytes / mult, suffix);
-        }
-    }
-    bytes.to_string()
-}
-
-fn is_binary_quantity_resource(resource_key: &str) -> bool {
-    resource_key == "memory"
-        || resource_key == "ephemeral-storage"
-        || resource_key.contains("storage")
-        || resource_key.starts_with("hugepages-")
-}
-
-fn parse_decimal_si_quantity(q: &str) -> Option<i64> {
-    let units: [(&str, f64); 7] = [
-        ("E", 1_000_000_000_000_000_000_f64),
-        ("P", 1_000_000_000_000_000_f64),
-        ("T", 1_000_000_000_000_f64),
-        ("G", 1_000_000_000_f64),
-        ("M", 1_000_000_f64),
-        ("k", 1_000_f64),
-        ("m", 0.001_f64),
-    ];
-    for (suffix, mult) in units {
-        if let Some(stripped) = q.strip_suffix(suffix) {
-            let value = stripped.parse::<f64>().ok()?;
-            if !value.is_finite() {
-                return None;
-            }
-            return Some((value * mult).ceil() as i64);
-        }
-    }
-    q.parse::<i64>().ok()
-}
-
 pub fn parse_resource_quantity(resource_key: &str, quantity: &str) -> Option<i64> {
-    if resource_key == "cpu" {
-        parse_cpu_milli(quantity)
-    } else if is_binary_quantity_resource(resource_key) {
-        parse_memory_bytes(quantity)
-    } else {
-        parse_decimal_si_quantity(quantity)
-    }
+    crate::quantity::parse_resource_quantity(resource_key, quantity)
 }
 
 pub fn format_resource_quantity(resource_key: &str, value: i64) -> String {
-    if resource_key == "cpu" {
-        format_cpu_milli(value)
-    } else if is_binary_quantity_resource(resource_key) {
-        format_memory_bytes(value)
-    } else {
-        value.to_string()
-    }
+    crate::quantity::format_resource_quantity(resource_key, value)
 }
 
 pub fn calculate_pod_effective_resource_for_key(

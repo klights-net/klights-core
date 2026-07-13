@@ -31,6 +31,7 @@ pub mod pod_identity;
 pub mod pod_status_merge;
 pub mod portforward;
 pub mod protobuf;
+pub mod quantity;
 pub mod replication;
 pub mod resource_semantics;
 pub mod scheduler;
