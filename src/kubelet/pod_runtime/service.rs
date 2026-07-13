@@ -1,47 +1,12 @@
 use crate::kubelet::lifecycle::LifecycleCommand;
-use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
 use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 pub use crate::kubelet::pod_runtime::service_dependencies::RealPodRuntimeServiceDependencies;
 pub use crate::kubelet::pod_runtime::slot_admission::PodSlotAdmissionRequest;
+pub use crate::kubelet::pod_runtime::types::{
+    PodDeletionFinalizeResult, PodFinalizeStartupResult, PodOwnershipError, PodRuntimeKey,
+    PodStartResult, pod_volume_dir_id,
+};
 use tokio_util::sync::CancellationToken;
-
-/// UID-bearing identity key for runtime operations.
-/// Every mutating runtime call below the API admission layer must carry
-/// one of these; name-only lookup is forbidden.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct PodRuntimeKey {
-    pub namespace: String,
-    pub name: String,
-    pub uid: String,
-}
-
-impl PodRuntimeKey {
-    pub fn new(namespace: &str, name: &str, uid: &str) -> Self {
-        Self {
-            namespace: namespace.to_string(),
-            name: name.to_string(),
-            uid: uid.to_string(),
-        }
-    }
-
-    pub fn volume_dir_id(&self) -> String {
-        pod_volume_dir_id(&self.namespace, &self.name, &self.uid)
-    }
-}
-
-pub fn pod_volume_dir_id(namespace: &str, name: &str, uid: &str) -> String {
-    format!("{namespace}_{name}_{uid}")
-}
-
-impl From<&PodLifecycleKey> for PodRuntimeKey {
-    fn from(key: &PodLifecycleKey) -> Self {
-        Self {
-            namespace: key.namespace.clone(),
-            name: key.name.clone(),
-            uid: key.uid.clone(),
-        }
-    }
-}
 
 fn append_service_envs(
     config: &mut k8s_cri::v1::ContainerConfig,
@@ -54,93 +19,6 @@ fn append_service_envs(
         });
     }
 }
-
-/// Outcome of a pod start attempt through the runtime service.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PodStartResult {
-    /// Pod started successfully. `sandbox_id` is the recorded CRI sandbox ID
-    /// if the runtime recorded one; `None` means actor state should already
-    /// have it (e.g. from a previous start_pod call).
-    Started { sandbox_id: Option<String> },
-    /// Pod start was cancelled before completion.
-    Cancelled,
-    /// Pod start failed with a retryable error (e.g. image pull, CRI
-    /// unavailable). The actor may retry after a backoff.
-    Failed(String),
-    /// Pod start failed with a terminal error (e.g. InvalidPodSpec,
-    /// InitContainerFailed with restartPolicy=Never). The actor must
-    /// not retry and should transition the pod to Failed phase.
-    Terminal(String),
-}
-
-/// Outcome of actor-owned pod deletion finalization.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PodDeletionFinalizeResult {
-    /// Pod row was deleted or was already gone.
-    DeletedOrAlreadyGone,
-    /// Finalizers are still pending; deletion was deferred.
-    FinalizersPending,
-}
-
-/// Outcome of startup finalization. `Unconfirmed` keeps the actor's
-/// startup-finalized bit false so the next Running+podIP watch echo can retry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PodFinalizeStartupResult {
-    Confirmed { sandbox_id: String },
-    Unconfirmed,
-}
-
-/// Typed error raised by runtime cleanup paths (e.g. [`PodRuntimeService::stop_pod`])
-/// when the local node does not own a Pod's runtime.
-///
-/// This MUST NOT be classified as a retryable kubelet-lifecycle failure: the
-/// local node has no CRI/CNI/volume state for a Pod it does not own, so retrying
-/// `StopPod` locally can never succeed and would spin the lifecycle actor
-/// forever. Row cleanup is owned by `PodStore::delete_unscheduled_with_uid`
-/// (unscheduled Pods, HR#11 exception) or the owning node's lifecycle actor
-/// (node-assigned Pods).
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PodOwnershipError {
-    /// Node performing the (refused) cleanup.
-    pub local_node: String,
-    /// Node that owns the Pod, or `None` when `spec.nodeName` is absent (the
-    /// Pod was never scheduled / picked up by any kubelet).
-    pub target_node: Option<String>,
-}
-
-impl PodOwnershipError {
-    /// Build the ownership error from the local node name and the Pod's
-    /// `spec.nodeName` value (parsed from the raw Pod JSON).
-    pub fn from_pod_node_name(local_node: impl Into<String>, pod: &serde_json::Value) -> Self {
-        let target_node = pod
-            .pointer("/spec/nodeName")
-            .and_then(|value| value.as_str())
-            .map(|s| s.to_string());
-        Self {
-            local_node: local_node.into(),
-            target_node,
-        }
-    }
-}
-
-impl std::fmt::Display for PodOwnershipError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.target_node {
-            Some(target) => write!(
-                f,
-                "pod runtime is owned by node {target}, not by local node {}",
-                self.local_node
-            ),
-            None => write!(
-                f,
-                "pod has no assigned node; local node {} cannot own runtime cleanup",
-                self.local_node
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PodOwnershipError {}
 
 /// Hint carried from a CRI container event into deferred runtime reconcile.
 ///

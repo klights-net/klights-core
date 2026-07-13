@@ -33,3 +33,4 @@ pub mod parity;
 pub mod test_support;
 #[cfg(test)]
 pub mod tests;
+pub mod types;
