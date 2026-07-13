@@ -45,10 +45,15 @@ const CPU_SUFFIXES: [Suffix; 7] = [
     },
 ];
 
-const DECIMAL_SUFFIXES: [Suffix; 6] = [
+const DECIMAL_SUFFIXES: [Suffix; 7] = [
+    Suffix {
+        text: "E",
+        num: 1_000_000_000_000_000_000,
+        den: 1,
+    },
     Suffix {
         text: "P",
-        num: 1_000_000_000_000_000_000,
+        num: 1_000_000_000_000_000,
         den: 1,
     },
     Suffix {
@@ -111,7 +116,12 @@ const BINARY_SUFFIXES: [Suffix; 6] = [
     },
 ];
 
-const BINARY_DECIMAL_SUFFIXES: [Suffix; 5] = [
+const BINARY_DECIMAL_SUFFIXES: [Suffix; 6] = [
+    Suffix {
+        text: "E",
+        num: 1_000_000_000_000_000_000,
+        den: 1,
+    },
     Suffix {
         text: "K",
         num: 1000,
@@ -283,22 +293,25 @@ fn parse_decimal_to_milli_no_exponent(raw: &str) -> Option<i128> {
     if frac_part.chars().any(|c| !c.is_ascii_digit()) {
         return None;
     }
-    if frac_part.len() > 3 {
-        return None;
-    }
-
     let int_value: i128 = if int_part.is_empty() {
         0
     } else {
         int_part.parse().ok()?
     };
-    let frac_pad = 3usize.saturating_sub(frac_part.len());
     let frac_value: i128 = if frac_part.is_empty() {
         0
     } else {
-        let mut value: i128 = frac_part.parse().ok()?;
-        for _ in 0..frac_pad {
+        let (kept, extra) = if frac_part.len() > 3 {
+            frac_part.split_at(3)
+        } else {
+            (frac_part, "")
+        };
+        let mut value: i128 = kept.parse().ok()?;
+        for _ in 0..3usize.saturating_sub(kept.len()) {
             value = value.checked_mul(10)?;
+        }
+        if extra.bytes().any(|byte| byte != b'0') {
+            value = value.checked_add(1)?;
         }
         value
     };
@@ -419,13 +432,24 @@ mod tests {
             parse_resource_quantity("storage", ".25Gi"),
             Some(268_435_456)
         );
+        assert_eq!(
+            parse_resource_quantity("storage", "1.2345Gi"),
+            Some(1_326_071_153)
+        );
+        assert_eq!(
+            parse_resource_quantity("storage", "1P"),
+            Some(1_000_000_000_000_000)
+        );
+        assert_eq!(
+            parse_resource_quantity("storage", "1E"),
+            Some(1_000_000_000_000_000_000)
+        );
     }
 
     #[test]
     fn parse_storage_rejects_negative_malformed_or_overflow() {
         assert_eq!(parse_resource_quantity("storage", "-1Gi"), None);
         assert_eq!(parse_resource_quantity("storage", "1GiB"), None);
-        assert_eq!(parse_resource_quantity("storage", "1.2345Gi"), None);
         assert_eq!(parse_resource_quantity("storage", ""), None);
         assert_eq!(
             parse_resource_quantity("storage", "18446744073709551616"),
@@ -446,6 +470,8 @@ mod tests {
     fn parse_decimal_scalar_ceil_behavior() {
         assert_eq!(parse_resource_quantity("example", "1.5k"), Some(1500));
         assert_eq!(parse_resource_quantity("example", "1.5"), Some(2));
+        assert_eq!(parse_resource_quantity("example", "1.0001"), Some(2));
+        assert_eq!(parse_resource_quantity("example", "1.2345"), Some(2));
     }
 
     #[test]

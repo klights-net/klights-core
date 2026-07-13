@@ -1363,6 +1363,105 @@ async fn test_pvc_binding_is_deterministic_by_pv_name() {
 }
 
 #[tokio::test]
+async fn test_pvc_binding_empty_storage_class_matches_omitted_pv_class() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    let pv = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {"name": "classless-pv"},
+        "spec": {
+            "capacity": {"storage": "1Gi"},
+            "accessModes": ["ReadWriteOnce"],
+            "hostPath": {"path": "/mnt/classless"}
+        },
+        "status": {"phase": "Available"}
+    });
+    db.create_resource("v1", "PersistentVolume", None, "classless-pv", pv)
+        .await
+        .unwrap();
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "classless-pvc", "namespace": "default"},
+        "spec": {
+            "storageClassName": "",
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Gi"}}
+        }
+    });
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "classless-pvc",
+        pvc,
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "classless-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pvc = get_pvc(&db, "default", "classless-pvc").await;
+    assert_eq!(pvc["status"]["phase"], "Bound");
+    assert_eq!(pvc["status"]["volumeName"], "classless-pv");
+}
+
+#[tokio::test]
+async fn test_pvc_binding_prefers_smallest_sufficient_pv_then_name() {
+    let db = crate::datastore::test_support::in_memory().await;
+
+    for (name, storage) in [
+        ("a-oversized", "100Gi"),
+        ("b-exact", "1Gi"),
+        ("z-also-exact", "1Gi"),
+    ] {
+        let pv = json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {"name": name},
+            "spec": {
+                "capacity": {"storage": storage},
+                "accessModes": ["ReadWriteOnce"],
+                "hostPath": {"path": format!("/mnt/{name}")}
+            },
+            "status": {"phase": "Available"}
+        });
+        db.create_resource("v1", "PersistentVolume", None, name, pv)
+            .await
+            .unwrap();
+    }
+
+    let pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "smallest-pvc", "namespace": "default"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1Gi"}}
+        }
+    });
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "smallest-pvc",
+        pvc,
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "smallest-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pvc = get_pvc(&db, "default", "smallest-pvc").await;
+    assert_eq!(pvc["status"]["phase"], "Bound");
+    assert_eq!(pvc["status"]["volumeName"], "b-exact");
+}
+
+#[tokio::test]
 async fn test_pvc_subset_access_modes_bind() {
     // PVC requesting ReadWriteOnce should bind to PV with [ReadWriteOnce, ReadOnlyMany]
     let db = crate::datastore::test_support::in_memory().await;

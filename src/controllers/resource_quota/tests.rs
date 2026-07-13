@@ -260,9 +260,13 @@ fn test_parse_resource_quantity_storage_matches_kubernetes_semantics() {
 
 #[test]
 fn test_parse_resource_quantity_storage_rejects_malformed_or_invalid_values() {
+    assert_eq!(
+        parse_resource_quantity("storage", "1.2345Gi"),
+        Some(1_326_071_153),
+        "Kubernetes quantity precision beyond three decimal places rounds up"
+    );
     for raw in [
         "1GiB",
-        "1.2345Gi",
         "-1Gi",
         "",
         "1.2.3",

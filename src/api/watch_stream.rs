@@ -63,36 +63,44 @@ pub fn negotiate_watch_stream_format(
     headers: &HeaderMap,
     protobuf_supported: bool,
 ) -> Result<WatchStreamFormat, AppError> {
-    let Some(accept) = headers.get("accept").and_then(|value| value.to_str().ok()) else {
+    if headers.get("accept").is_none() {
         return Ok(WatchStreamFormat::Json);
-    };
+    }
     let mut accepted = Vec::new();
-    for (order, part) in accept.split(',').enumerate() {
-        let mut segments = part.split(';').map(str::trim);
-        let media = segments.next().unwrap_or_default().to_ascii_lowercase();
-        if media.is_empty() {
+    let mut order = 0usize;
+    for accept in headers.get_all("accept") {
+        let Ok(accept) = accept.to_str() else {
             continue;
-        }
-        let mut quality_millis = 1000;
-        for parameter in segments {
-            if let Some(value) = parameter.strip_prefix("q=") {
-                quality_millis = parse_accept_quality_millis(value);
-            }
-        }
-        if quality_millis == 0 {
-            continue;
-        }
-        let media = match media.as_str() {
-            "application/json" => AcceptedWatchMedia::Json,
-            "application/vnd.kubernetes.protobuf" => AcceptedWatchMedia::Protobuf,
-            "*/*" | "application/*" => AcceptedWatchMedia::Any,
-            _ => AcceptedWatchMedia::Unsupported,
         };
-        accepted.push(AcceptedWatchFormat {
-            media,
-            quality_millis,
-            order,
-        });
+        for part in accept.split(',') {
+            let mut segments = part.split(';').map(str::trim);
+            let media = segments.next().unwrap_or_default().to_ascii_lowercase();
+            if media.is_empty() {
+                continue;
+            }
+            let mut quality_millis = 1000;
+            for parameter in segments {
+                if let Some(value) = parameter.strip_prefix("q=") {
+                    quality_millis = parse_accept_quality_millis(value);
+                }
+            }
+            if quality_millis == 0 {
+                order += 1;
+                continue;
+            }
+            let media = match media.as_str() {
+                "application/json" => AcceptedWatchMedia::Json,
+                "application/vnd.kubernetes.protobuf" => AcceptedWatchMedia::Protobuf,
+                "*/*" | "application/*" => AcceptedWatchMedia::Any,
+                _ => AcceptedWatchMedia::Unsupported,
+            };
+            accepted.push(AcceptedWatchFormat {
+                media,
+                quality_millis,
+                order,
+            });
+            order += 1;
+        }
     }
     accepted.sort_by_key(|format| (std::cmp::Reverse(format.quality_millis), format.order));
     for accepted in accepted {
@@ -1763,6 +1771,21 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, false).unwrap(),
+            WatchStreamFormat::Json
+        );
+    }
+
+    #[test]
+    fn watch_stream_negotiation_considers_repeated_accept_headers() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "accept",
+            "application/vnd.kubernetes.protobuf".parse().unwrap(),
+        );
+        headers.append("accept", "application/json".parse().unwrap());
+
         assert_eq!(
             negotiate_watch_stream_format(&headers, false).unwrap(),
             WatchStreamFormat::Json

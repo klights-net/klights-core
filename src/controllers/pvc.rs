@@ -221,7 +221,7 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
     }
 
     // Find an available PV that matches capacity and accessModes
-    let mut pvs = db
+    let pvs = db
         .list_resources(
             "v1",
             "PersistentVolume",
@@ -230,20 +230,8 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         )
         .await?
         .items;
-    pvs.sort_by(|left, right| {
-        let left_name = left
-            .data
-            .pointer("/metadata/name")
-            .and_then(|name| name.as_str())
-            .unwrap_or("");
-        let right_name = right
-            .data
-            .pointer("/metadata/name")
-            .and_then(|name| name.as_str())
-            .unwrap_or("");
-        left_name.cmp(right_name)
-    });
 
+    let mut best_pv = None;
     for pv in &pvs {
         // Check if PV is Available
         if let Some(phase) = pv
@@ -273,15 +261,26 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
             continue;
         }
 
+        let pv_name = pv
+            .data
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| anyhow::anyhow!("PV missing name"))?;
+
         let pv_storage_class = pv
             .data
             .get("spec")
             .and_then(|s| s.get("storageClassName"))
             .and_then(|v| v.as_str());
-        if let Some(requested_class) = requested_storage_class
-            && pv_storage_class != Some(requested_class)
-        {
-            continue;
+        match requested_storage_class {
+            Some("") => {
+                if pv_storage_class.is_some_and(|class| !class.is_empty()) {
+                    continue;
+                }
+            }
+            Some(requested_class) if pv_storage_class != Some(requested_class) => continue,
+            _ => {}
         }
 
         let pv_volume_mode = pv
@@ -326,14 +325,19 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
             continue;
         }
 
-        // Found a matching PV - bind it
-        let pv_name = pv
-            .data
-            .get("metadata")
-            .and_then(|m| m.get("name"))
-            .and_then(|n| n.as_str())
-            .ok_or_else(|| anyhow::anyhow!("PV missing name"))?;
+        let should_replace =
+            best_pv
+                .as_ref()
+                .is_none_or(|(_, best_capacity, best_name): &(_, i64, String)| {
+                    pv_capacity < *best_capacity
+                        || (pv_capacity == *best_capacity && pv_name < best_name.as_str())
+                });
+        if should_replace {
+            best_pv = Some((pv, pv_capacity, pv_name.to_string()));
+        }
+    }
 
+    if let Some((pv, _pv_capacity, pv_name)) = best_pv {
         // Inject resourceVersion into PV metadata
         let mut updated_pv: Value = (*pv.data).clone();
         inject_resource_version(&mut updated_pv, pv.resource_version);
@@ -377,7 +381,7 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
             "v1",
             "PersistentVolume",
             None,
-            pv_name,
+            &pv_name,
             updated_pv,
             ResourcePreconditions::from_resource(pv),
         )
