@@ -314,6 +314,96 @@ fn single_resource_roundtrip_service() {
     assert_eq!(decoded["spec"]["ports"][0]["port"], 80);
 }
 
+#[test]
+fn service_status_conditions_encode_for_single_and_list_responses() {
+    let service = |last_transition_time: Option<Value>| {
+        let mut condition = json!({
+            "type": "Available", "status": "True", "reason": "OK", "message": "ok"
+        });
+        if let Some(value) = last_transition_time {
+            condition["lastTransitionTime"] = value;
+        }
+        json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "svc-status", "namespace": "default"},
+            "spec": {
+                "clusterIP": "10.51.0.224", "clusterIPs": ["10.51.0.224"],
+                "ipFamilies": ["IPv4"], "ipFamilyPolicy": "SingleStack",
+                "ports": [{"name": "http", "nodePort": 30080, "port": 80, "protocol": "TCP", "targetPort": 80}],
+                "selector": {"app": "demo"}, "sessionAffinity": "None", "type": "LoadBalancer"
+            },
+            "status": {
+                "conditions": [condition],
+                "loadBalancer": {"ingress": [{"ip": "203.0.113.1"}]}
+            }
+        })
+    };
+
+    let single_missing = service(None);
+    let single_null = service(Some(Value::Null));
+    let list = json!({
+        "apiVersion": "v1", "kind": "ServiceList",
+        "metadata": {"resourceVersion": "1"}, "items": [single_null.clone()]
+    });
+    for (name, value, condition_pointer) in [
+        (
+            "single missing time",
+            single_missing,
+            "/status/conditions/0",
+        ),
+        ("single null time", single_null, "/status/conditions/0"),
+        ("list item null time", list, "/items/0/status/conditions/0"),
+    ] {
+        let encoded = encode_protobuf(&value)
+            .unwrap_or_else(|error| panic!("{name} must encode as protobuf: {error}"));
+        let decoded = decode_protobuf(&encoded).unwrap();
+        let condition = decoded
+            .pointer(condition_pointer)
+            .unwrap_or_else(|| panic!("{name} must preserve its status condition"));
+        assert_eq!(condition["type"], "Available", "{name}");
+        assert_eq!(condition["status"], "True", "{name}");
+    }
+}
+
+#[test]
+fn validating_admission_policy_status_roundtrips_for_single_and_list_responses() {
+    let policy = json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingAdmissionPolicy",
+        "metadata": {"name": "vap-status-rt"},
+        "status": {
+            "observedGeneration": 3,
+            "typeChecking": {"expressionWarnings": [{"fieldRef": "spec.validations[0].expression", "warning": "type error"}]},
+            "conditions": [{"type": "Ready", "status": "True", "observedGeneration": 3, "lastTransitionTime": "2026-07-13T16:50:00Z", "reason": "OK", "message": "ok"}]
+        }
+    });
+    let list = json!({
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingAdmissionPolicyList",
+        "metadata": {"resourceVersion": "1"},
+        "items": [policy.clone()]
+    });
+    for (name, value, status_pointer) in [
+        ("single policy", policy, "/status"),
+        ("policy list item", list, "/items/0/status"),
+    ] {
+        let encoded = encode_protobuf(&value)
+            .unwrap_or_else(|error| panic!("{name} must encode as protobuf: {error}"));
+        let decoded = decode_protobuf(&encoded).unwrap();
+        let status = decoded
+            .pointer(status_pointer)
+            .unwrap_or_else(|| panic!("{name} must preserve status"));
+        assert_eq!(status["observedGeneration"], 3, "{name}");
+        assert_eq!(status["conditions"][0]["type"], "Ready", "{name}");
+        assert_eq!(
+            status["typeChecking"]["expressionWarnings"][0]["fieldRef"],
+            "spec.validations[0].expression",
+            "{name}"
+        );
+    }
+}
+
 // =============================================================================
 // List resource protobuf roundtrip tests
 // =============================================================================

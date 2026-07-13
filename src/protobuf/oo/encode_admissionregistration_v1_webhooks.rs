@@ -1,4 +1,4 @@
-/// Encode ValidatingAdmissionPolicy to protobuf (minimal implementation)
+/// Encode ValidatingAdmissionPolicy to protobuf.
 use crate::protobuf::*;
 pub fn json_validating_admission_policy_to_pb(
     vap: &k8s_openapi::api::admissionregistration::v1::ValidatingAdmissionPolicy,
@@ -12,7 +12,50 @@ pub fn json_validating_admission_policy_to_pb(
             .map(|_| admissionv1::ValidatingAdmissionPolicySpec {
                 ..Default::default()
             }),
-        status: None,
+        status: vap
+            .status
+            .as_ref()
+            .map(|status| admissionv1::ValidatingAdmissionPolicyStatus {
+                observed_generation: status.observed_generation,
+                type_checking: status.type_checking.as_ref().map(|type_checking| {
+                    admissionv1::TypeChecking {
+                        expression_warnings: type_checking
+                            .expression_warnings
+                            .as_ref()
+                            .map(|warnings| {
+                                warnings
+                                    .iter()
+                                    .map(|warning| admissionv1::ExpressionWarning {
+                                        field_ref: Some(warning.field_ref.clone()),
+                                        warning: Some(warning.warning.clone()),
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    }
+                }),
+                conditions: status
+                    .conditions
+                    .as_ref()
+                    .map(|conditions| {
+                        conditions
+                            .iter()
+                            .map(
+                                |condition| k8s_pb::apimachinery::pkg::apis::meta::v1::Condition {
+                                    r#type: Some(condition.type_.clone()),
+                                    status: Some(condition.status.clone()),
+                                    observed_generation: condition.observed_generation,
+                                    last_transition_time: Some(json_time_to_pb(
+                                        &condition.last_transition_time,
+                                    )),
+                                    reason: Some(condition.reason.clone()),
+                                    message: Some(condition.message.clone()),
+                                },
+                            )
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }),
     })
 }
 

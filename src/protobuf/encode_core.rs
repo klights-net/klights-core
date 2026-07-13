@@ -25,7 +25,12 @@ pub(crate) fn encode_protobuf_resource(kind: &str, value: &Value) -> anyhow::Res
     if !registry.handles(api_version, kind) {
         anyhow::bail!("Unknown kind for protobuf encoding: {api_version}/{kind}");
     }
-    registry.encode(api_version, kind, value)
+    // Tolerate null/missing condition `lastTransitionTime` (Go metav1.Time{}
+    // zero value) for both single resources and list items so valid K8s
+    // condition shapes do not yield HTTP 500 on protobuf responses. No clone
+    // when nothing needs sanitizing.
+    let value = sanitize_conditions_for_encode(value);
+    registry.encode(api_version, kind, &value)
 }
 
 pub(crate) fn supports_protobuf_resource(api_version: &str, kind: &str) -> bool {

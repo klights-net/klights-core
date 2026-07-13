@@ -103,6 +103,73 @@ fn api_version_matches(prefix: &str, api_version: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Fill in a default `lastTransitionTime` for any condition whose
+/// `lastTransitionTime` is missing or `null`.
+///
+/// `k8s_openapi`'s generated `Condition` type treats `last_transition_time` as
+/// a required (non-`Option`) field, so serde fails when the JSON lacks the key
+/// or sends `null` — which is exactly what Go's `metav1.Time{}` zero value
+/// serializes to. Real K8s clients (and the Service status-lifecycle
+/// conformance test) can PUT conditions without a meaningful transition time,
+/// so the protobuf encoder must tolerate that shape rather than returning
+/// HTTP 500.
+pub(in crate::protobuf) fn sanitize_condition_transition_times(value: &mut Value) {
+    let Some(conditions) = value.pointer_mut("/status/conditions") else {
+        return;
+    };
+    let Some(arr) = conditions.as_array_mut() else {
+        return;
+    };
+    for cond in arr.iter_mut() {
+        let needs_fix = cond.get("lastTransitionTime").is_none_or(Value::is_null);
+        if needs_fix && let Some(obj) = cond.as_object_mut() {
+            obj.insert(
+                "lastTransitionTime".to_string(),
+                Value::String("1970-01-01T00:00:00Z".to_string()),
+            );
+        }
+    }
+}
+
+/// `true` if a single resource has any condition whose `lastTransitionTime` is
+/// missing or `null` and therefore needs sanitizing before protobuf encoding.
+fn item_needs_condition_sanitize(item: &Value) -> bool {
+    item.pointer("/status/conditions")
+        .and_then(|c| c.as_array())
+        .is_some_and(|conds| {
+            conds
+                .iter()
+                .any(|c| c.get("lastTransitionTime").is_none_or(Value::is_null))
+        })
+}
+
+/// Sanitize null/missing condition `lastTransitionTime` for a single resource OR
+/// a list of resources, returning a value safe for k8s_openapi deserialization.
+/// Used at the protobuf encode chokepoint so a valid Go `metav1.Time{}` shape
+/// (null/missing condition transition time) does not produce HTTP 500 on GET /
+/// LIST / status-subresource responses negotiated as protobuf. Borrows when no
+/// sanitization is required (the common case) so the response path pays no clone.
+pub(in crate::protobuf) fn sanitize_conditions_for_encode<'a>(
+    value: &'a Value,
+) -> std::borrow::Cow<'a, Value> {
+    let needs = match value.get("items").and_then(|v| v.as_array()) {
+        Some(items) => items.iter().any(item_needs_condition_sanitize),
+        None => item_needs_condition_sanitize(value),
+    };
+    if !needs {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut out = value.clone();
+    if let Some(items) = out.get_mut("items").and_then(|v| v.as_array_mut()) {
+        for item in items.iter_mut() {
+            sanitize_condition_transition_times(item);
+        }
+    } else {
+        sanitize_condition_transition_times(&mut out);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 fn has_events_v1_only_fields(decoded: &Value) -> bool {
     decoded.get("reportingController").is_some()
         || decoded.get("reportingInstance").is_some()
@@ -174,7 +241,11 @@ macro_rules! encode_openapi_plain_raw_fn {
 macro_rules! encode_openapi_value_result_fn {
     ($fn_name:ident, $openapi_ty:ty, $converter:path) => {
         fn $fn_name(_api_version: &str, value: &Value) -> anyhow::Result<Vec<u8>> {
-            let openapi = <$openapi_ty as Deserialize>::deserialize(value)?;
+            let openapi = <$openapi_ty as Deserialize>::deserialize(value).or_else(|_| {
+                let mut sanitized = value.clone();
+                sanitize_condition_transition_times(&mut sanitized);
+                <$openapi_ty as Deserialize>::deserialize(&sanitized)
+            })?;
             let pb = $converter(&openapi, value)?;
             encode_message_to_vec(&pb)
         }
@@ -185,7 +256,11 @@ macro_rules! encode_openapi_value_result_raw_fn {
     ($fn_name:ident, $openapi_ty:ty, $converter:path) => {
         fn $fn_name(_api_version: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
             let value: Value = serde_json::from_slice(data)?;
-            let openapi = <$openapi_ty as Deserialize>::deserialize(&value)?;
+            let openapi = <$openapi_ty as Deserialize>::deserialize(&value).or_else(|_| {
+                let mut sanitized = value.clone();
+                sanitize_condition_transition_times(&mut sanitized);
+                <$openapi_ty as Deserialize>::deserialize(&sanitized)
+            })?;
             let pb = $converter(&openapi, &value)?;
             encode_message_to_vec(&pb)
         }

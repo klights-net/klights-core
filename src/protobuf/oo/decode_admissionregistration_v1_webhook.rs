@@ -9,14 +9,8 @@ pub fn pb_validatingadmissionpolicylist_to_json(
     let items: Vec<Value> = list
         .items
         .iter()
-        .map(|item| {
-            json!({
-                "apiVersion": "admissionregistration.k8s.io/v1",
-                "kind": "ValidatingAdmissionPolicy",
-                "metadata": item.metadata.as_ref().map(meta_to_json).unwrap_or_default(),
-            })
-        })
-        .collect();
+        .map(pb_validating_admission_policy_to_json)
+        .collect::<anyhow::Result<_>>()?;
     obj["items"] = json!(items);
     Ok(obj)
 }
