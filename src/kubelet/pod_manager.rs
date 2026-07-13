@@ -18,6 +18,8 @@ use crate::kubelet::pod_status_builders::{
 };
 #[cfg(test)]
 use crate::kubelet::pod_status_logic::{ContainerInfo, compute_pod_phase, should_restart};
+#[cfg(test)]
+use crate::kubelet::pod_watch_handlers::NoopPersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_source::PodWatchSource;
 use crate::watch::{
@@ -76,7 +78,6 @@ struct PodWatcherRuntimeContext {
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     pod_lifecycle_router: Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
     persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
-    cluster_reconciliation_enabled: bool,
     pod_lifecycle_rx: Arc<
         tokio::sync::Mutex<
             Option<tokio::sync::mpsc::Receiver<crate::kubelet::lifecycle::LifecycleCommand>>,
@@ -100,7 +101,6 @@ impl PodWatcherRuntimeContext {
             pod_repository: context.pod_repository.clone(),
             pod_lifecycle_router: context.pod_lifecycle_router.clone(),
             persistent_volume_event_handler,
-            cluster_reconciliation_enabled: false,
             pod_lifecycle_rx: context.pod_lifecycle_rx.clone(),
             pod_start_retry_state: Some(context.pod_start_retry_state.clone()),
         }
@@ -448,7 +448,6 @@ async fn run_pod_watcher_with_runtime(
                         cluster_api: &state.cluster_api,
                         node_name: &config.node_name,
                         containerd_namespace: &config.containerd_namespace,
-                        cluster_reconciliation_enabled: state.cluster_reconciliation_enabled,
                         pod_repo: &state.pod_repository,
                         pod_creation_tracker: &pod_creation_tracker,
                         retry_state: &pod_start_retry_state,

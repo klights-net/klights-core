@@ -19,7 +19,6 @@ pub(super) struct WatchEventHandlerContext<'a> {
     pub cluster_api: &'a Arc<dyn crate::control_plane::client::LeaderApiClient>,
     pub node_name: &'a str,
     pub containerd_namespace: &'a str,
-    pub cluster_reconciliation_enabled: bool,
     pub pod_repo: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
     pub pod_creation_tracker: &'a PodCreationTracker,
     pub retry_state: &'a PodStartRetryTracker,
@@ -35,7 +34,6 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         cluster_api,
         node_name,
         containerd_namespace,
-        cluster_reconciliation_enabled,
         pod_repo,
         pod_creation_tracker,
         retry_state,
@@ -58,14 +56,14 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
     // Dispatch to appropriate handler
     if event_kind == "PersistentVolumeClaim" {
         persistent_volume_event_handler
-            .handle_pvc_event(&event, event_name, cluster_reconciliation_enabled)
+            .handle_pvc_event(&event, event_name)
             .await;
         return;
     }
 
     if event_kind == "PersistentVolume" {
         persistent_volume_event_handler
-            .handle_pv_event(&event, event_name, cluster_reconciliation_enabled)
+            .handle_pv_event(&event, event_name)
             .await;
         return;
     }
@@ -900,18 +898,14 @@ mod tests {
         std::fs::create_dir_all(&volume_path).expect("create mounted configmap volume");
         std::fs::write(format!("{volume_path}/data-1"), "value-1").expect("seed mounted data");
 
-        let persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler> = Arc::new(
-            crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
-                db_handle.clone(),
-            ),
-        );
+        let persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler> =
+            Arc::new(NoopPersistentVolumeEventHandler::new());
         handle_watch_event(
             WatchEventHandlerContext {
                 persistent_volume_event_handler: &persistent_volume_event_handler,
                 cluster_api: &cluster_api,
                 node_name: "worker-a",
                 containerd_namespace: runtime_ns,
-                cluster_reconciliation_enabled: false,
                 pod_repo: &pod_repo,
                 pod_creation_tracker: &pod_creation_tracker,
                 retry_state: &retry_state,

@@ -877,6 +877,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let volume_events = Arc::new(
             crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
                 kubelet_db_handle.clone(),
+                is_leader_rx.clone(),
             ),
         );
         let cancel = shutdown_token.clone();

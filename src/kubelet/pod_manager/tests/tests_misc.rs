@@ -110,7 +110,7 @@ async fn pod_watcher_filtered_pod_event_does_not_advance_signal_cursor() {
 }
 
 #[tokio::test]
-async fn pod_watcher_runtime_context_disables_cluster_reconciliation_on_follower_path() {
+async fn pod_watcher_runtime_context_delegates_reconciliation_to_leadership_aware_handler() {
     let mut state = crate::api::test_support::build_test_app_state().await;
     let (_lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::channel(1);
     state.pod_lifecycle_rx = Some(std::sync::Arc::new(tokio::sync::Mutex::new(Some(
@@ -123,12 +123,54 @@ async fn pod_watcher_runtime_context_disables_cluster_reconciliation_on_follower
         ),
     ));
 
-    let (_is_leader_tx, is_leader_rx) = tokio::sync::watch::channel(false);
+    let (is_leader_tx, is_leader_rx) = tokio::sync::watch::channel(false);
+
     let (_leader_addr_tx, leader_addr_rx) =
         tokio::sync::watch::channel(Some("https://10.99.0.10:7679".to_string()));
     state.is_raft_leader_rx = Some(std::sync::Arc::new(
-        crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx, leader_addr_rx, None),
+        crate::api::raft_proxy::RaftLeaderProxy::new(is_leader_rx.clone(), leader_addr_rx, None),
     ));
+
+    // Seed a Pending PVC with no matching PV yet, then create the matching PV.
+    let pvc = state
+        .db
+        .create_resource(
+            "v1",
+            "PersistentVolumeClaim",
+            Some("default"),
+            "ctx-pvc",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": {"name": "ctx-pvc", "namespace": "default"},
+                "spec": {
+                    "resources": {"requests": {"storage": "1Gi"}},
+                    "accessModes": ["ReadWriteOnce"]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let pv = state
+        .db
+        .create_resource(
+            "v1",
+            "PersistentVolume",
+            None,
+            "ctx-pv",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolume",
+                "metadata": {"name": "ctx-pv"},
+                "spec": {
+                    "capacity": {"storage": "1Gi"},
+                    "accessModes": ["ReadWriteOnce"]
+                },
+                "status": {"phase": "Available"}
+            }),
+        )
+        .await
+        .unwrap();
 
     let context = PodWatcherRuntimeContext {
         pod_watch_source: std::sync::Arc::new(
@@ -148,9 +190,9 @@ async fn pod_watcher_runtime_context_disables_cluster_reconciliation_on_follower
         persistent_volume_event_handler: std::sync::Arc::new(
             crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
                 state.db.clone(),
+                is_leader_rx,
             ),
         ),
-        cluster_reconciliation_enabled: false,
         pod_lifecycle_rx: state
             .pod_lifecycle_rx
             .clone()
@@ -158,9 +200,51 @@ async fn pod_watcher_runtime_context_disables_cluster_reconciliation_on_follower
         pod_start_retry_state: state.pod_start_retry_state.clone(),
     };
 
-    assert!(
-        !context.cluster_reconciliation_enabled,
-        "raft followers must not run leader-owned PVC/PV reconciliation from the AppState watcher"
+    // The runtime context no longer carries a reconciliation boolean;
+    // leadership is expressed through the injected handler. While not leader,
+    // a PV event must not originate a binding write.
+    context
+        .persistent_volume_event_handler
+        .handle_pv_event(
+            &crate::watch::WatchEvent::added((*pv.data).clone()),
+            "ctx-pv",
+        )
+        .await;
+    let pvc_as_follower = state
+        .db
+        .get_resource("v1", "PersistentVolumeClaim", Some("default"), "ctx-pvc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        pvc_as_follower
+            .data
+            .pointer("/status/phase")
+            .and_then(|phase| phase.as_str()),
+        Some("Bound")
+    );
+
+    // A live leadership transition (no restart) lets the same handler bind.
+    is_leader_tx.send(true).unwrap();
+    context
+        .persistent_volume_event_handler
+        .handle_pvc_event(
+            &crate::watch::WatchEvent::added((*pvc.data).clone()),
+            "ctx-pvc",
+        )
+        .await;
+    let pvc_as_leader = state
+        .db
+        .get_resource("v1", "PersistentVolumeClaim", Some("default"), "ctx-pvc")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pvc_as_leader
+            .data
+            .pointer("/status/phase")
+            .and_then(|phase| phase.as_str()),
+        Some("Bound")
     );
 }
 
