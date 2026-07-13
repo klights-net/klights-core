@@ -1,9 +1,9 @@
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{DatastoreHandle, WatchTarget};
+use crate::datastore::WatchTarget;
+use crate::kubelet::pod_watch_source::BoxedWatchReplaySource;
 use crate::utils::k8s_microtime_now;
 use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
-    WindowPolicy,
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchSignal,
+    WatchTopic, WindowPolicy,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -45,6 +45,18 @@ pub(crate) fn build_lease(node_name: &str) -> serde_json::Value {
 #[async_trait]
 pub trait NodeLeaseRenewClient: Send + Sync {
     async fn renew_node_lease(&self, node_name: &str, lease: &serde_json::Value) -> Result<()>;
+}
+
+#[async_trait]
+pub trait NodeHeartbeatWatchSource: Send + Sync {
+    fn subscribe_watch_signals(
+        &self,
+        topic: WatchTopic,
+    ) -> tokio::sync::broadcast::Receiver<WatchSignal>;
+
+    fn replay_source(&self, targets: Vec<WatchTarget>) -> BoxedWatchReplaySource;
+
+    async fn current_resource_version(&self) -> Result<i64>;
 }
 
 #[async_trait]
@@ -126,14 +138,14 @@ pub(crate) const NODE_HEARTBEAT_INTERVAL: Duration =
 /// is the only production heartbeat entry point; it never writes a Lease to
 /// cluster.db.
 pub async fn run_heartbeat_with_lease_client(
-    db: DatastoreHandle,
+    watch_source: std::sync::Arc<dyn NodeHeartbeatWatchSource>,
     lease_client: std::sync::Arc<dyn NodeLeaseRenewClient>,
     node_name: String,
     cancel_token: tokio_util::sync::CancellationToken,
     task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
 ) {
     run_heartbeat_with_interval(
-        db,
+        watch_source,
         lease_client,
         node_name,
         cancel_token,
@@ -144,7 +156,7 @@ pub async fn run_heartbeat_with_lease_client(
 }
 
 pub(crate) async fn run_heartbeat_with_interval(
-    db: DatastoreHandle,
+    watch_source: std::sync::Arc<dyn NodeHeartbeatWatchSource>,
     lease_client: std::sync::Arc<dyn NodeLeaseRenewClient>,
     node_name: String,
     cancel_token: tokio_util::sync::CancellationToken,
@@ -156,7 +168,8 @@ pub(crate) async fn run_heartbeat_with_interval(
     // Memory-only heartbeat (T6): renew via the lease client (worker -> leader
     // RPC, or the leader's local NodeLeaseTracker). This path never writes a
     // Lease to cluster.db; the dead outbox/direct-db renewal helpers were
-    // removed. `db` is retained only to drive the Node watch cursor below.
+    // removed. The watch source is retained only to drive the Node watch
+    // cursor below.
     if let Err(err) = renew_lease_with_client(lease_client.as_ref(), &node_name).await {
         tracing::warn!("Failed to send initial node heartbeat: {}", err);
     }
@@ -164,16 +177,11 @@ pub(crate) async fn run_heartbeat_with_interval(
     // Event-driven heartbeat: renew the lease on node watch events.
     let topic = WatchTopic::new("v1", "Node");
     let mut cursor = SignalWatchCursor::new(
-        db.subscribe_watch_signals(topic.clone()),
-        DatastoreWatchReplaySource::new(
-            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                db.clone(),
-            )),
-            vec![WatchTarget::cluster("v1", "Node")],
-        ),
+        watch_source.subscribe_watch_signals(topic.clone()),
+        watch_source.replay_source(vec![WatchTarget::cluster("v1", "Node")]),
         topic,
         WatchDeliveryScope::Cluster,
-        db.get_current_resource_version().await.unwrap_or(0),
+        watch_source.current_resource_version().await.unwrap_or(0),
         WindowPolicy::default_watch_delivery(),
     );
     match cursor.prime_replay_or_expired().await {

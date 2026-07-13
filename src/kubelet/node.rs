@@ -2018,8 +2018,13 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         let client = std::sync::Arc::new(RecordingLeaseRenewClient::new());
         let cancel = tokio_util::sync::CancellationToken::new();
+        let watch_source = std::sync::Arc::new(
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
+                crate::datastore::DatastoreBackendWatchStore::new(std::sync::Arc::new(db.clone())),
+            )),
+        );
         let handle = tokio::spawn(run_heartbeat_with_interval(
-            std::sync::Arc::new(db.clone()),
+            watch_source,
             client.clone(),
             "test-node".to_string(),
             cancel.clone(),

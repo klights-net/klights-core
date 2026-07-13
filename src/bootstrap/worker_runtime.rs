@@ -22,7 +22,8 @@ use super::init::host::print_ready_message;
 use super::init::leader_control_stream::start_worker_leader_control_stream;
 use super::runtime::resolve_token_file_if_present;
 use super::worker_store_adapter::{
-    start_worker_store_adapter, worker_store_backend, worker_store_handle,
+    kubelet_datastore_watch_source, start_worker_store_adapter, worker_store_backend,
+    worker_store_handle,
 };
 
 fn worker_pod_runtime_node_role() -> crate::kubelet::pod_cluster_runtime::RuntimeNodeRole {
@@ -519,7 +520,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         None
     };
     let heartbeat_handle = {
-        let dbc = db_handle.clone();
+        let watch_source = kubelet_datastore_watch_source(&db_handle);
         let cfc = std::sync::Arc::clone(&config);
         let c = shutdown_token.clone();
         let s = task_supervisor.clone();
@@ -531,7 +532,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                 "worker_node_heartbeat",
                 async move {
                     kubelet::node::run_heartbeat_with_lease_client(
-                        dbc,
+                        watch_source,
                         lease_client,
                         cfc.node_name.clone(),
                         c,

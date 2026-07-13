@@ -129,3 +129,13 @@ pub(crate) fn worker_store_backend(
 ) -> &dyn crate::datastore::DatastoreBackend {
     handle.as_ref()
 }
+
+pub(crate) fn kubelet_datastore_watch_source(
+    handle: &crate::datastore::DatastoreHandle,
+) -> std::sync::Arc<crate::bootstrap::kubelet_ports::DatastorePodWatchSource> {
+    std::sync::Arc::new(
+        crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(std::sync::Arc::new(
+            crate::datastore::DatastoreBackendWatchStore::new(handle.clone()),
+        )),
+    )
+}

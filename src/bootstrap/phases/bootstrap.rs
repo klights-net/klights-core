@@ -874,7 +874,11 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     let is_leader_rx_for_heartbeat = is_leader_rx.clone();
     let control_plane_lease_client_for_heartbeat = control_plane_lease_client.clone();
     let heartbeat_handle = {
-        let dbc = db_handle.clone();
+        let watch_source = Arc::new(
+            crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
+                crate::datastore::DatastoreBackendWatchStore::new(db_handle.clone()),
+            )),
+        );
         let cfg = Arc::clone(config);
         let cancel = shutdown_token.clone();
         let s = supervisor.clone();
@@ -893,7 +897,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 "runtime_node_heartbeat",
                 async move {
                     kubelet::node::run_heartbeat_with_lease_client(
-                        dbc,
+                        watch_source,
                         lease_client,
                         cfg.node_name.clone(),
                         cancel,
