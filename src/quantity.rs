@@ -331,18 +331,53 @@ fn apply_quantity(
     suffix: Option<&Suffix>,
     final_div: i128,
 ) -> Option<i64> {
-    let numerator = numerator.checked_mul(1000)?;
-    let (numerator, denominator) = if let Some(suffix) = suffix {
-        (
-            numerator.checked_mul(suffix.num)?,
-            denominator.checked_mul(suffix.den)?,
-        )
-    } else {
-        (numerator, denominator)
-    };
-    let denominator = denominator.checked_mul(final_div)?;
+    let mut numerators = [numerator, 1000, suffix.map_or(1, |suffix| suffix.num)];
+    let mut denominators = [
+        denominator,
+        final_div,
+        suffix.map_or(1, |suffix| suffix.den),
+    ];
+
+    for numerator in &mut numerators {
+        for denominator in &mut denominators {
+            reduce_positive_pair(numerator, denominator);
+        }
+    }
+
+    let numerator = checked_product(&numerators)?;
+    let denominator = checked_product(&denominators)?;
     let scaled = ceil_div_positive(numerator, denominator)?;
     bounded_i64(scaled)
+}
+
+fn reduce_positive_pair(numerator: &mut i128, denominator: &mut i128) {
+    if *numerator <= 1 || *denominator <= 1 {
+        return;
+    }
+    let factor = gcd_positive(*numerator, *denominator);
+    if factor > 1 {
+        *numerator /= factor;
+        *denominator /= factor;
+    }
+}
+
+fn checked_product(values: &[i128]) -> Option<i128> {
+    let mut product = 1_i128;
+    for value in values {
+        product = product.checked_mul(*value)?;
+    }
+    Some(product)
+}
+
+fn gcd_positive(mut left: i128, mut right: i128) -> i128 {
+    debug_assert!(left > 0);
+    debug_assert!(right > 0);
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn ceil_div_positive(value: i128, divisor: i128) -> Option<i128> {
@@ -441,6 +476,10 @@ mod tests {
         assert_eq!(
             parse_resource_quantity("storage", "1E"),
             Some(1_000_000_000_000_000_000)
+        );
+        assert_eq!(
+            parse_resource_quantity("storage", "0.12345678901234567890123456789012345678E"),
+            Some(123_456_789_012_345_679)
         );
     }
 
