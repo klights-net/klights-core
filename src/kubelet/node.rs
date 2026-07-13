@@ -6,8 +6,8 @@ use crate::kubelet::outbox::{
 };
 use crate::utils::k8s_time_now;
 use anyhow::{Context, Result};
-use std::sync::Arc;
 
+pub(crate) use crate::kubelet::node_leader_labels::clear_leader_label_from_other_nodes;
 pub(crate) use crate::kubelet::node_registration::register_node_snapshot;
 pub use crate::kubelet::node_registration::{
     NodeRegistrationAddresses, NodeRegistrationHostFacts, NodeRegistrationSnapshot, register_node,
@@ -529,59 +529,6 @@ fn stamp_current_git_commit_annotation(node: &mut serde_json::Value) -> bool {
         serde_json::json!(crate::version::GIT_COMMIT_SHORT),
     );
     true
-}
-
-/// Remove stale `node-role.kubernetes.io/leader` labels from every node
-/// except the current local node. The local leader election is responsible
-/// for stamping its own leader label; this keeps old leader labels from a
-/// previous leader visible only until the leader changes and the new leader
-/// has observed that transition.
-pub(crate) async fn clear_leader_label_from_other_nodes(
-    db: &dyn DatastoreBackend,
-    local_node_name: &str,
-) -> Result<()> {
-    let nodes = db
-        .list_resources(
-            "v1",
-            "Node",
-            None,
-            crate::datastore::ResourceListQuery::all(),
-        )
-        .await?;
-    for node in nodes.items {
-        if node.name == local_node_name {
-            continue;
-        }
-        let mut data = Arc::unwrap_or_clone(node.data.clone());
-        let Some(labels) = data
-            .pointer_mut("/metadata/labels")
-            .and_then(|labels| labels.as_object_mut())
-        else {
-            continue;
-        };
-        if labels.remove("node-role.kubernetes.io/leader").is_none() {
-            continue;
-        }
-        if let Err(err) = db
-            .update_resource_with_preconditions(
-                "v1",
-                "Node",
-                None,
-                &node.name,
-                data,
-                ResourcePreconditions::from_resource(&node),
-            )
-            .await
-        {
-            tracing::warn!(
-                error = %err,
-                node_name = %node.name,
-                local_node_name,
-                "failed to clear stale node leader label"
-            );
-        }
-    }
-    Ok(())
 }
 
 fn epoch_ms() -> i64 {

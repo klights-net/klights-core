@@ -92,6 +92,35 @@ pub struct BootstrapRunArgs<'a> {
     pub is_leader_rx: tokio::sync::watch::Receiver<bool>,
 }
 
+struct BootstrapNodeLeaderLabelStore {
+    db: DatastoreHandle,
+}
+
+#[async_trait::async_trait]
+impl crate::kubelet::node_leader_labels::NodeLeaderLabelStore for BootstrapNodeLeaderLabelStore {
+    async fn list_nodes(&self) -> Result<crate::datastore::ResourceList> {
+        self.db
+            .list_resources(
+                "v1",
+                "Node",
+                None,
+                crate::datastore::ResourceListQuery::all(),
+            )
+            .await
+    }
+
+    async fn update_node_with_preconditions(
+        &self,
+        name: &str,
+        data: serde_json::Value,
+        preconditions: crate::datastore::ResourcePreconditions,
+    ) -> Result<crate::datastore::Resource> {
+        self.db
+            .update_resource_with_preconditions("v1", "Node", None, name, data, preconditions)
+            .await
+    }
+}
+
 async fn activate_committed_apply_rv_v1_if_possible(
     raft: &crate::datastore::raft::node::RaftNode,
     probe: Option<&Arc<crate::bootstrap::raft_transport::ReplicationGrpcMemberFeatureProbe>>,
@@ -737,12 +766,13 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                             );
                         }
                         if shape.is_leader
-                            && let Err(err) =
-                                crate::kubelet::node::clear_leader_label_from_other_nodes(
-                                    db_handle_task.as_ref(),
-                                    &node_name,
-                                )
-                                .await
+                            && let Err(err) = crate::kubelet::node::clear_leader_label_from_other_nodes(
+                                &BootstrapNodeLeaderLabelStore {
+                                    db: db_handle_task.clone(),
+                                },
+                                &node_name,
+                            )
+                            .await
                         {
                             tracing::warn!(
                                 error = %err,

@@ -10,6 +10,7 @@ pub mod lifecycle;
 pub mod log_rotation;
 pub mod node;
 pub mod node_ip;
+pub mod node_leader_labels;
 pub mod node_registration;
 pub mod node_role_labels;
 pub mod node_status_merge;
