@@ -16,7 +16,13 @@ fn inject_create_metadata_namespaced_stamps_namespace_name_and_uid() {
     assert_eq!(body["metadata"]["namespace"], "default");
     assert_eq!(body["metadata"]["name"], "my-pod");
     assert!(body["metadata"]["uid"].as_str().unwrap().len() >= 32);
-    assert!(body["metadata"]["creationTimestamp"].is_string());
+    let creation_timestamp = body["metadata"]["creationTimestamp"].as_str().unwrap();
+    assert_eq!(creation_timestamp.len(), 20);
+    assert!(creation_timestamp.ends_with('Z'));
+    assert!(
+        !creation_timestamp.contains('.'),
+        "metav1.Time creationTimestamp must use Kubernetes second precision: {creation_timestamp}"
+    );
     assert_eq!(body["metadata"]["generation"], 1);
 }
 

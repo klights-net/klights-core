@@ -247,7 +247,7 @@ pub async fn create_namespace(
             {
                 meta_obj.insert(
                     "creationTimestamp".to_string(),
-                    serde_json::Value::String(crate::utils::k8s_timestamp()),
+                    serde_json::Value::String(crate::utils::k8s_time_now()),
                 );
             }
         }

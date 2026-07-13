@@ -63,7 +63,7 @@ pub fn inject_create_metadata(ns: Option<&str>, body: &mut Value, resource_name:
     {
         meta_obj.insert(
             "creationTimestamp".to_string(),
-            Value::String(crate::utils::k8s_timestamp()),
+            Value::String(crate::utils::k8s_time_now()),
         );
     }
     let r#gen = meta_obj

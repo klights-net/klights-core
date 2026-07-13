@@ -2760,18 +2760,19 @@ async fn test_create_resource_sets_creation_timestamp() {
     let timestamp = resource.data["metadata"]["creationTimestamp"].as_str();
     assert!(timestamp.is_some(), "creationTimestamp should be set");
 
-    // Verify format: YYYY-MM-DDTHH:MM:SS.fffffffffZ (with nanoseconds)
+    // Kubernetes metav1.Time metadata uses second precision so JSON and
+    // protobuf create/watch objects remain semantically equal.
     let ts = timestamp.unwrap();
     assert!(ts.ends_with("Z"), "Timestamp should end with Z");
     assert!(ts.contains("T"), "Timestamp should contain T separator");
     assert!(
-        ts.contains("."),
-        "Timestamp should contain fractional seconds"
+        !ts.contains("."),
+        "Timestamp should not contain fractional seconds"
     );
     assert_eq!(
         ts.len(),
-        30,
-        "Timestamp should be 30 chars (RFC 3339 with nanoseconds)"
+        20,
+        "Timestamp should be 20 chars (RFC 3339 second precision)"
     );
 }
 

@@ -139,7 +139,7 @@ pub(crate) async fn create_self_subject_access_review(
         "apiVersion": "authorization.k8s.io/v1",
         "kind": "SelfSubjectAccessReview",
         "metadata": {
-            "creationTimestamp": crate::utils::k8s_timestamp()
+            "creationTimestamp": crate::utils::k8s_time_now()
         },
         "spec": spec,
         "status": decision_status(&decision),
@@ -200,7 +200,7 @@ pub(crate) async fn create_subject_access_review(
         "apiVersion": "authorization.k8s.io/v1",
         "kind": "SubjectAccessReview",
         "metadata": {
-            "creationTimestamp": crate::utils::k8s_timestamp()
+            "creationTimestamp": crate::utils::k8s_time_now()
         },
         "spec": spec,
         "status": decision_status(&decision),
@@ -256,7 +256,7 @@ pub(crate) async fn create_self_subject_rules_review(
         "apiVersion": "authorization.k8s.io/v1",
         "kind": "SelfSubjectRulesReview",
         "metadata": {
-            "creationTimestamp": crate::utils::k8s_timestamp()
+            "creationTimestamp": crate::utils::k8s_time_now()
         },
         "spec": spec,
         "status": {
@@ -325,7 +325,7 @@ pub(crate) async fn create_local_subject_access_review(
         "apiVersion": "authorization.k8s.io/v1",
         "kind": "LocalSubjectAccessReview",
         "metadata": {
-            "creationTimestamp": crate::utils::k8s_timestamp(),
+            "creationTimestamp": crate::utils::k8s_time_now(),
             "namespace": namespace
         },
         "spec": spec,

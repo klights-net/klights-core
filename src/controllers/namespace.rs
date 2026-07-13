@@ -91,7 +91,7 @@ pub async fn create_default_service_account(
         "metadata": {
             "name": "default",
             "namespace": namespace,
-            "creationTimestamp": crate::utils::k8s_timestamp(),
+            "creationTimestamp": crate::utils::k8s_time_now(),
             "uid": uuid::Uuid::new_v4().to_string()
         },
         "secrets": []
@@ -137,7 +137,7 @@ pub async fn create_kube_root_ca_configmap(
         "metadata": {
             "name": "kube-root-ca.crt",
             "namespace": namespace,
-            "creationTimestamp": crate::utils::k8s_timestamp(),
+            "creationTimestamp": crate::utils::k8s_time_now(),
             "uid": uuid::Uuid::new_v4().to_string()
         },
         "data": {
@@ -338,7 +338,7 @@ fn extension_apiserver_authentication_configmap(ca_cert_pem: &str) -> serde_json
         "metadata": {
             "name": "extension-apiserver-authentication",
             "namespace": "kube-system",
-            "creationTimestamp": crate::utils::k8s_timestamp(),
+            "creationTimestamp": crate::utils::k8s_time_now(),
             "uid": uuid::Uuid::new_v4().to_string()
         },
         "data": {
@@ -780,7 +780,7 @@ mod tests {
                     "name": "extension-apiserver-authentication",
                     "namespace": "kube-system",
                     "uid": uuid::Uuid::new_v4().to_string(),
-                    "creationTimestamp": crate::utils::k8s_timestamp()
+                    "creationTimestamp": crate::utils::k8s_time_now()
                 },
                 "data": {
                     "client-ca-file": ca_pem,

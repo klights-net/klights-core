@@ -351,7 +351,7 @@ impl PodApiService {
             {
                 meta_obj.insert(
                     "creationTimestamp".to_string(),
-                    Value::String(crate::utils::k8s_timestamp()),
+                    Value::String(crate::utils::k8s_time_now()),
                 );
             }
             let generation = meta_obj
