@@ -2145,3 +2145,487 @@ impl crate::datastore::ReplicationStore for ReplicatedDatastore {
         .await
     }
 }
+
+#[async_trait]
+impl crate::datastore::BackendLifecycleStore for ReplicatedDatastore {
+    async fn acquire_snapshot_exclusive_fence(
+        &self,
+    ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
+        crate::datastore::DatastoreBackend::acquire_snapshot_exclusive_fence(self).await
+    }
+
+    async fn acquire_snapshot_mutation_fence(
+        &self,
+    ) -> Result<Option<crate::datastore::backend::SnapshotMutationFence>> {
+        crate::datastore::DatastoreBackend::acquire_snapshot_mutation_fence(self).await
+    }
+
+    fn close(&self) {
+        crate::datastore::DatastoreBackend::close(self);
+    }
+
+    fn attach_raft_proposer(&self, proposer: std::sync::Arc<dyn super::RaftProposer>) {
+        crate::datastore::DatastoreBackend::attach_raft_proposer(self, proposer);
+    }
+}
+
+#[cfg(test)]
+impl crate::datastore::TestWatchStore for ReplicatedDatastore {
+    fn subscribe_watch_many(&self, topics: Vec<WatchTopic>) -> crate::watch::WatchReceiver {
+        crate::datastore::DatastoreBackend::subscribe_watch_many(self, topics)
+    }
+
+    fn broadcast_watch_event(&self, pending: PendingWatchEvent) {
+        crate::datastore::DatastoreBackend::broadcast_watch_event(self, pending);
+    }
+}
+
+#[async_trait]
+impl crate::datastore::ClusterResourceQueryStore for ReplicatedDatastore {
+    async fn list_resources(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        query: ResourceListQuery<'_>,
+    ) -> Result<ResourceList> {
+        crate::datastore::DatastoreBackend::list_resources(
+            self,
+            api_version,
+            kind,
+            namespace,
+            query,
+        )
+        .await
+    }
+
+    async fn list_resources_for_watch_targets(
+        &self,
+        targets: &[WatchTarget],
+        label_selector: Option<&str>,
+    ) -> Result<ResourceList> {
+        crate::datastore::DatastoreBackend::list_resources_for_watch_targets(
+            self,
+            targets,
+            label_selector,
+        )
+        .await
+    }
+
+    async fn list_cluster_resources(&self) -> Result<Vec<Resource>> {
+        crate::datastore::DatastoreBackend::list_cluster_resources(self).await
+    }
+}
+
+#[async_trait]
+impl crate::datastore::LeaderResourceMutationStore for ReplicatedDatastore {
+    async fn update_main_resource_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        data: Value,
+        preconditions: ResourcePreconditions,
+    ) -> Result<Resource> {
+        crate::datastore::DatastoreBackend::update_main_resource_with_preconditions(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            preconditions,
+        )
+        .await
+    }
+
+    async fn apply_resource_batch(&self, operations: Vec<ResourceBatchOperation>) -> Result<()> {
+        crate::datastore::DatastoreBackend::apply_resource_batch(self, operations).await
+    }
+
+    async fn delete_resource_with_preconditions_observed_rv(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+    ) -> Result<i64> {
+        crate::datastore::DatastoreBackend::delete_resource_with_preconditions_observed_rv(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+        )
+        .await
+    }
+
+    async fn mark_for_delete_without_watch(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Option<Resource>> {
+        crate::datastore::DatastoreBackend::mark_for_delete_without_watch(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+            grace_seconds,
+        )
+        .await
+    }
+
+    async fn delete_resource_without_watch_with_tombstone(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Resource> {
+        crate::datastore::DatastoreBackend::delete_resource_without_watch_with_tombstone(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+            grace_seconds,
+        )
+        .await
+    }
+
+    async fn patch_resource_latest(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        patch_kind: PatchKind,
+        patch: Value,
+    ) -> Result<Option<Resource>> {
+        crate::datastore::DatastoreBackend::patch_resource_latest(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            patch_kind,
+            patch,
+        )
+        .await
+    }
+
+    async fn patch_resource_latest_with_preconditions(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        name: &str,
+        request: ResourcePatchRequest,
+    ) -> Result<Option<Resource>> {
+        crate::datastore::DatastoreBackend::patch_resource_latest_with_preconditions(
+            self,
+            api_version,
+            kind,
+            namespace,
+            name,
+            request,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl crate::datastore::WatchMaintenanceStore for ReplicatedDatastore {
+    async fn list_raw_watch_events_since_checked_bounded(
+        &self,
+        targets: &[WatchTarget],
+        since_rv: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::datastore::WatchReplayRead<RawWatchEvent>> {
+        crate::datastore::DatastoreBackend::list_raw_watch_events_since_checked_bounded(
+            self, targets, since_rv, limit,
+        )
+        .await
+    }
+
+    async fn snapshot_resources_at_rv(
+        &self,
+        api_version: &str,
+        kind: &str,
+        namespace: Option<&str>,
+        query: ResourceListQuery<'_>,
+        snapshot_rv: i64,
+    ) -> Result<SnapshotAtRv> {
+        crate::datastore::DatastoreBackend::snapshot_resources_at_rv(
+            self,
+            api_version,
+            kind,
+            namespace,
+            query,
+            snapshot_rv,
+        )
+        .await
+    }
+
+    async fn list_all_watch_events_after_id_bounded(
+        &self,
+        after_id: i64,
+        through_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        crate::datastore::DatastoreBackend::list_all_watch_events_after_id_bounded(
+            self, after_id, through_id, limit,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl crate::datastore::PodCleanupStore for ReplicatedDatastore {
+    async fn move_pod_to_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> Result<()> {
+        crate::datastore::DatastoreBackend::move_pod_to_cleanup_intent(
+            self, node_name, namespace, pod_name, pod_uid, reason,
+        )
+        .await
+    }
+
+    async fn list_pod_cleanup_intents_for_node(
+        &self,
+        node_name: &str,
+    ) -> Result<Vec<PodCleanupIntent>> {
+        crate::datastore::DatastoreBackend::list_pod_cleanup_intents_for_node(self, node_name).await
+    }
+
+    async fn delete_pod_cleanup_intent(
+        &self,
+        node_name: &str,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        reason: &str,
+    ) -> Result<()> {
+        crate::datastore::DatastoreBackend::delete_pod_cleanup_intent(
+            self, node_name, namespace, pod_name, pod_uid, reason,
+        )
+        .await
+    }
+
+    async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
+        crate::datastore::DatastoreBackend::delete_pod_cleanup_intents_for_node(self, node_name)
+            .await
+    }
+
+    async fn pod_slot_try_admit(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<PodSlotAdmissionResult> {
+        crate::datastore::DatastoreBackend::pod_slot_try_admit(
+            self, namespace, pod_name, pod_uid, node_name,
+        )
+        .await
+    }
+
+    async fn pod_slot_mark_terminating(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<()> {
+        crate::datastore::DatastoreBackend::pod_slot_mark_terminating(
+            self, namespace, pod_name, pod_uid, node_name,
+        )
+        .await
+    }
+
+    async fn pod_slot_clear_if_uid(
+        &self,
+        namespace: &str,
+        pod_name: &str,
+        pod_uid: &str,
+        node_name: &str,
+    ) -> Result<()> {
+        crate::datastore::DatastoreBackend::pod_slot_clear_if_uid(
+            self, namespace, pod_name, pod_uid, node_name,
+        )
+        .await
+    }
+
+    fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {
+        crate::datastore::DatastoreBackend::subscribe_pod_slot_admissions(self)
+    }
+}
+
+#[async_trait]
+impl crate::datastore::AppliedOutboxStore for ReplicatedDatastore {
+    async fn applied_outbox_gc_prunable_count(&self, cutoff_ms: i64) -> Result<usize> {
+        crate::datastore::DatastoreBackend::applied_outbox_gc_prunable_count(self, cutoff_ms).await
+    }
+
+    async fn list_outbox_stream_watermarks(
+        &self,
+    ) -> Result<Vec<crate::log_apply::OutboxStreamWatermark>> {
+        crate::datastore::DatastoreBackend::list_outbox_stream_watermarks(self).await
+    }
+
+    async fn get_applied_outbox(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<AppliedOutboxRecord>> {
+        crate::datastore::DatastoreBackend::get_applied_outbox(self, idempotency_key).await
+    }
+
+    async fn insert_applied_outbox(&self, record: AppliedOutboxRecord) -> Result<bool> {
+        crate::datastore::DatastoreBackend::insert_applied_outbox(self, record).await
+    }
+
+    async fn list_applied_outbox(&self) -> Result<Vec<AppliedOutboxRecord>> {
+        crate::datastore::DatastoreBackend::list_applied_outbox(self).await
+    }
+
+    async fn list_applied_outbox_paged(
+        &self,
+        after_key: Option<&str>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<AppliedOutboxRecord>> {
+        crate::datastore::DatastoreBackend::list_applied_outbox_paged(self, after_key, limit).await
+    }
+
+    async fn delete_uncommitted_applied_outbox_placeholder(
+        &self,
+        idempotency_key: &str,
+        reserved_rv: i64,
+    ) -> Result<bool> {
+        crate::datastore::DatastoreBackend::delete_uncommitted_applied_outbox_placeholder(
+            self,
+            idempotency_key,
+            reserved_rv,
+        )
+        .await
+    }
+
+    async fn apply_outbox_transactionally(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        crate::datastore::DatastoreBackend::apply_outbox_transactionally(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+        )
+        .await
+    }
+
+    async fn apply_outbox_transactionally_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+            watermark,
+        )
+        .await
+    }
+
+    async fn build_log_apply_commit_for_command(
+        &self,
+        command: StorageCommand,
+        operation: &str,
+        authoring_node: &str,
+    ) -> Result<crate::log_apply::LogApplyCommit> {
+        crate::datastore::DatastoreBackend::build_log_apply_commit_for_command(
+            self,
+            command,
+            operation,
+            authoring_node,
+        )
+        .await
+    }
+
+    async fn build_log_apply_commit_for_outbox(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+    ) -> std::result::Result<
+        crate::datastore::sqlite::BuildOutboxOutcome,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        crate::datastore::DatastoreBackend::build_log_apply_commit_for_outbox(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+        )
+        .await
+    }
+
+    async fn build_log_apply_commit_for_outbox_with_watermark(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        crate::datastore::sqlite::BuildOutboxOutcome,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        crate::datastore::DatastoreBackend::build_log_apply_commit_for_outbox_with_watermark(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+            watermark,
+        )
+        .await
+    }
+
+    async fn gc_applied_outbox(&self, now_ms: i64, ttl_ms: i64) -> Result<usize> {
+        crate::datastore::DatastoreBackend::gc_applied_outbox(self, now_ms, ttl_ms).await
+    }
+}

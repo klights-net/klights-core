@@ -1851,7 +1851,7 @@ pub trait BackendLifecycleStore: Send + Sync {
     fn close(&self);
     fn attach_raft_proposer(
         &self,
-        proposer: std::sync::Arc<dyn crate::datastore::replicated::RaftProposer>,
+        _proposer: std::sync::Arc<dyn crate::datastore::replicated::RaftProposer>,
     );
 }
 
@@ -1870,15 +1870,12 @@ pub trait ClusterResourceQueryStore: Send + Sync {
         api_version: &str,
         kind: &str,
         namespace: Option<&str>,
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-    ) -> Result<Vec<Resource>>;
+        query: ResourceListQuery<'_>,
+    ) -> Result<ResourceList>;
     async fn list_resources_for_watch_targets(
         &self,
-        targets: &[WatchTarget],
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        page: ListPageRequest,
+        _targets: &[WatchTarget],
+        _label_selector: Option<&str>,
     ) -> Result<ResourceList>;
     async fn list_cluster_resources(&self) -> Result<Vec<Resource>>;
 }
@@ -1911,10 +1908,9 @@ pub trait LeaderResourceMutationStore: Send + Sync {
         kind: &str,
         namespace: Option<&str>,
         name: &str,
-        expected_rv: i64,
-        deletion_timestamp: String,
-        grace_period_seconds: i64,
-    ) -> Result<Resource>;
+        preconditions: ResourcePreconditions,
+        grace_seconds: i64,
+    ) -> Result<Option<Resource>>;
     async fn delete_resource_without_watch_with_tombstone(
         &self,
         api_version: &str,
@@ -1922,9 +1918,8 @@ pub trait LeaderResourceMutationStore: Send + Sync {
         namespace: Option<&str>,
         name: &str,
         preconditions: ResourcePreconditions,
-        tombstone_data: Option<Value>,
-        observed_rv: i64,
-    ) -> Result<()>;
+        grace_seconds: i64,
+    ) -> Result<Resource>;
     async fn patch_resource_latest(
         &self,
         api_version: &str,
@@ -1952,17 +1947,19 @@ pub trait WatchMaintenanceStore: Send + Sync {
         targets: &[WatchTarget],
         since_rv: i64,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WatchReplayRead>;
+    ) -> Result<WatchReplayRead<RawWatchEvent>>;
     async fn snapshot_resources_at_rv(
         &self,
-        targets: &[WatchTarget],
-        label_selector: Option<&str>,
-        field_selector: Option<&str>,
-        resource_version: i64,
+        _api_version: &str,
+        _kind: &str,
+        _namespace: Option<&str>,
+        _query: ResourceListQuery<'_>,
+        snapshot_rv: i64,
     ) -> Result<SnapshotAtRv>;
     async fn list_all_watch_events_after_id_bounded(
         &self,
         after_id: i64,
+        through_id: i64,
         limit: std::num::NonZeroUsize,
     ) -> Result<Vec<(i64, CatchUpResource)>>;
 }
@@ -1977,10 +1974,8 @@ pub trait PodCleanupStore: Send + Sync {
         namespace: &str,
         pod_name: &str,
         pod_uid: &str,
-        sandbox_id: Option<&str>,
-        container_ids: Vec<String>,
         reason: &str,
-    ) -> Result<PodCleanupIntent>;
+    ) -> Result<()>;
     async fn list_pod_cleanup_intents_for_node(
         &self,
         node_name: &str,
@@ -1991,6 +1986,7 @@ pub trait PodCleanupStore: Send + Sync {
         namespace: &str,
         pod_name: &str,
         pod_uid: &str,
+        reason: &str,
     ) -> Result<()>;
     async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()>;
     async fn pod_slot_try_admit(
@@ -1998,12 +1994,14 @@ pub trait PodCleanupStore: Send + Sync {
         namespace: &str,
         pod_name: &str,
         pod_uid: &str,
+        node_name: &str,
     ) -> Result<PodSlotAdmissionResult>;
     async fn pod_slot_mark_terminating(
         &self,
         namespace: &str,
         pod_name: &str,
         pod_uid: &str,
+        node_name: &str,
     ) -> Result<()>;
     async fn pod_slot_clear_if_uid(
         &self,

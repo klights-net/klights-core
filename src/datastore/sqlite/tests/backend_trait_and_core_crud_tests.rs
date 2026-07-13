@@ -1,10 +1,14 @@
 use super::*;
+#[cfg(test)]
+use crate::datastore::TestWatchStore;
 use crate::datastore::command::StorageCommand;
 use crate::datastore::{
-    CurrentResourceVersionStore, MetaStore, NamespaceContentStore, NetworkMetadataStore,
-    OwnershipStore, PodWorkqueueStore, RawWatchReplayStore, ReplicationStore,
-    ResourceBatchOperation, ResourceBatchPutMode, ResourceListStore, ResourcePreconditions,
-    StatusStore, WatchHistoryStore, WatchReplayAnchorStore,
+    AppliedOutboxStore, BackendLifecycleStore, ClusterResourceQueryStore,
+    CurrentResourceVersionStore, LeaderResourceMutationStore, MetaStore, NamespaceContentStore,
+    NetworkMetadataStore, OwnershipStore, PodCleanupStore, PodWorkqueueStore, RawWatchReplayStore,
+    ReplicationStore, ResourceBatchOperation, ResourceBatchPutMode, ResourceListStore,
+    ResourcePreconditions, StatusStore, WatchHistoryStore, WatchMaintenanceStore,
+    WatchReplayAnchorStore,
 };
 use crate::datastore::{PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState};
 use serde_json::json;
@@ -5481,7 +5485,14 @@ async fn focused_store_traits_cover_sqlite_backend() {
             + NetworkMetadataStore
             + ReplicationStore
             + CurrentResourceVersionStore
-            + MetaStore,
+            + MetaStore
+            + BackendLifecycleStore
+            + ClusterResourceQueryStore
+            + LeaderResourceMutationStore
+            + WatchMaintenanceStore
+            + PodCleanupStore
+            + AppliedOutboxStore
+            + TestWatchStore,
     {
     }
 
