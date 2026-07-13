@@ -1648,6 +1648,27 @@ impl crate::datastore::WatchHistoryStore for ReplicatedDatastore {
         crate::datastore::DatastoreBackend::list_all_watch_events_since(self, since_rv).await
     }
 
+    async fn list_all_watch_events_since_paged(
+        &self,
+        since_rv: i64,
+        after_resource_version: i64,
+        after_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>> {
+        crate::datastore::DatastoreBackend::list_all_watch_events_since_paged(
+            self,
+            since_rv,
+            after_resource_version,
+            after_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>> {
+        crate::datastore::DatastoreBackend::list_watch_replay_floors(self).await
+    }
+
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>> {
         crate::datastore::DatastoreBackend::list_deleted_watch_events_since(self, since_rv).await
     }

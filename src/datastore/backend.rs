@@ -1587,6 +1587,14 @@ pub trait WatchHistoryStore: Send + Sync {
         since_rv: i64,
     ) -> Result<Vec<CatchUpResource>>;
     async fn list_all_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>>;
+    async fn list_all_watch_events_since_paged(
+        &self,
+        since_rv: i64,
+        after_resource_version: i64,
+        after_id: i64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<(i64, CatchUpResource)>>;
+    async fn list_watch_replay_floors(&self) -> Result<Vec<WatchReplayFloor>>;
     async fn list_deleted_watch_events_since(&self, since_rv: i64) -> Result<Vec<CatchUpResource>>;
     async fn advance_resource_version_after(&self, min_rv: i64) -> Result<i64>;
     async fn watch_events_gc_prunable_count(&self, max_rows: i64, batch_cap: i64) -> Result<usize>;
