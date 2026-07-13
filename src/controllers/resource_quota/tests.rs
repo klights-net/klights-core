@@ -280,7 +280,7 @@ fn test_parse_resource_quantity_storage_rejects_malformed_or_invalid_values() {
         "abc",
         "++1Gi",
         "1e-9223372036854775808",
-        "18446744073709551616",
+        "1e3Gi",
     ] {
         assert_eq!(
             parse_resource_quantity("storage", raw),
@@ -288,6 +288,11 @@ fn test_parse_resource_quantity_storage_rejects_malformed_or_invalid_values() {
             "storage quantity '{raw}' should be rejected"
         );
     }
+    assert_eq!(
+        parse_resource_quantity("storage", "18446744073709551616"),
+        Some(i64::MAX),
+        "oversized valid storage quantities should cap to the Kubernetes maximum"
+    );
 }
 
 #[test]

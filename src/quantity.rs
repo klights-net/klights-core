@@ -161,10 +161,10 @@ pub fn parse_memory_bytes(raw: &str) -> Option<i64> {
     }
 
     if let Some((number, suffix)) = split_suffix(raw, &BINARY_SUFFIXES) {
-        return apply_quantity(parse_decimal_rational(number)?, Some(suffix), 1000);
+        return apply_quantity(parse_decimal_rational(number, false)?, Some(suffix), 1000);
     }
     if let Some((number, suffix)) = split_suffix(raw, &DECIMAL_SUFFIXES) {
-        return apply_quantity(parse_decimal_rational(number)?, Some(suffix), 1000);
+        return apply_quantity(parse_decimal_rational(number, false)?, Some(suffix), 1000);
     }
 
     parse_quantity_with_suffixes(raw, &[], 1000)
@@ -228,16 +228,23 @@ fn parse_quantity_with_suffixes(raw: &str, suffixes: &[Suffix], final_div: i128)
         None => (raw, None),
     };
 
-    apply_quantity(parse_decimal_rational(number)?, suffix, final_div)
+    apply_quantity(
+        parse_decimal_rational(number, suffix.is_none())?,
+        suffix,
+        final_div,
+    )
 }
 
-fn parse_decimal_rational(raw: &str) -> Option<QuantityRational> {
+fn parse_decimal_rational(raw: &str, allow_exponent: bool) -> Option<QuantityRational> {
     if raw.is_empty() || raw.starts_with('-') {
         return None;
     }
 
     let raw = raw.strip_prefix('+').unwrap_or(raw);
     if raw.is_empty() {
+        return None;
+    }
+    if !allow_exponent && raw.bytes().any(|byte| matches!(byte, b'e' | b'E')) {
         return None;
     }
 
@@ -343,10 +350,25 @@ fn apply_quantity(
         * BigInt::from(suffix.map_or(1, |suffix| suffix.den));
     match rational.exponent10 {
         exp if exp > 0 => {
+            if exp > 4096 {
+                return if numerator.is_zero() {
+                    Some(0)
+                } else {
+                    Some(i64::MAX)
+                };
+            }
             numerator *= pow10_big(exp.try_into().ok()?)?;
         }
         exp if exp < 0 => {
-            denominator *= pow10_big(u32::try_from(exp.checked_neg()?).ok()?)?;
+            let magnitude = u32::try_from(exp.checked_neg()?).ok()?;
+            if magnitude > 4096 {
+                return if numerator.is_zero() {
+                    Some(0)
+                } else {
+                    Some(1)
+                };
+            }
+            denominator *= pow10_big(magnitude)?;
         }
         _ => {}
     }
@@ -368,7 +390,10 @@ fn ceil_div_bigint(value: &BigInt, divisor: &BigInt) -> Option<BigInt> {
 }
 
 fn bounded_big_i64(value: &BigInt) -> Option<i64> {
-    value.to_i64().filter(|value| *value >= 0)
+    if value < &BigInt::zero() {
+        return None;
+    }
+    Some(value.to_i64().unwrap_or(i64::MAX))
 }
 
 fn pow10_big(exp: u32) -> Option<BigInt> {
@@ -422,7 +447,9 @@ mod tests {
         assert_eq!(parse_resource_quantity("storage", "+.0"), Some(0));
         assert_eq!(parse_resource_quantity("memory", ".000Gi"), Some(0));
         assert_eq!(parse_resource_quantity("memory", "+.0Gi"), Some(0));
-        assert_eq!(parse_resource_quantity("storage", "1e-39Gi"), Some(1));
+        assert_eq!(parse_resource_quantity("storage", "1e-39Gi"), None);
+        assert_eq!(parse_resource_quantity("storage", "1e3M"), None);
+        assert_eq!(parse_resource_quantity("cpu", "1e3m"), None);
         assert_eq!(
             parse_resource_quantity("storage", "1000000000000000000000000000000000000000e-39"),
             Some(1)
@@ -469,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_storage_rejects_negative_malformed_or_overflow() {
+    fn parse_storage_rejects_malformed_and_caps_overflow() {
         assert_eq!(parse_resource_quantity("storage", "-1Gi"), None);
         assert_eq!(parse_resource_quantity("storage", "1GiB"), None);
         assert_eq!(parse_resource_quantity("storage", ""), None);
@@ -477,20 +504,31 @@ mod tests {
         assert_eq!(parse_resource_quantity("storage", "1Gi "), None);
         assert_eq!(parse_resource_quantity("cpu", " 1"), None);
         assert_eq!(parse_resource_quantity("memory", "1Gi "), None);
+        assert_eq!(parse_resource_quantity("memory", "1e3Gi"), None);
+        assert_eq!(parse_resource_quantity("example", "1e3M"), None);
+        assert_eq!(parse_resource_quantity("cpu", "1e-6m"), None);
         assert_eq!(
             parse_resource_quantity("storage", "1e-9223372036854775808"),
             None
         );
         assert_eq!(
             parse_resource_quantity("storage", "18446744073709551616"),
-            None
+            Some(i64::MAX)
         );
         assert_eq!(
             parse_resource_quantity("storage", "170141183460469231731687303715884105727"),
-            None
+            Some(i64::MAX)
         );
-        assert_eq!(parse_resource_quantity("cpu", "1e39"), None);
-        assert_eq!(parse_resource_quantity("storage", "1e39"), None);
+        assert_eq!(parse_resource_quantity("cpu", "1e39"), Some(i64::MAX));
+        assert_eq!(parse_resource_quantity("storage", "1e39"), Some(i64::MAX));
+        assert_eq!(parse_resource_quantity("storage", "1e5000"), Some(i64::MAX));
+        assert_eq!(parse_resource_quantity("storage", "1e-5000"), Some(1));
+        assert_eq!(parse_resource_quantity("cpu", "0e5000"), Some(0));
+        assert_eq!(
+            parse_resource_quantity("storage", "10000000000000000000000Ei"),
+            Some(i64::MAX)
+        );
+        assert_eq!(parse_resource_quantity("storage", "10Ei"), Some(i64::MAX));
     }
 
     #[test]

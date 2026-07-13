@@ -88,18 +88,28 @@ pub fn negotiate_watch_stream_format(
                 continue;
             }
             let mut quality_millis = 1000;
+            let mut valid_stream_parameter = true;
             for parameter in segments {
-                if let Some((name, value)) = parameter.split_once('=')
-                    && name.trim().eq_ignore_ascii_case("q")
-                {
-                    quality_millis = parse_accept_quality_millis(value);
+                if let Some((name, value)) = parameter.split_once('=') {
+                    let name = name.trim();
+                    if name.eq_ignore_ascii_case("q") {
+                        quality_millis = parse_accept_quality_millis(value);
+                    } else if name.eq_ignore_ascii_case("stream")
+                        && !value.trim().eq_ignore_ascii_case("watch")
+                    {
+                        valid_stream_parameter = false;
+                    }
                 }
             }
             let media = match media.as_str() {
-                "application/json" => AcceptedWatchMedia::Json,
-                "application/vnd.kubernetes.protobuf" => AcceptedWatchMedia::Protobuf,
-                "application/*" => AcceptedWatchMedia::ApplicationWildcard,
-                "*/*" => AcceptedWatchMedia::Any,
+                "application/json" if valid_stream_parameter => AcceptedWatchMedia::Json,
+                "application/vnd.kubernetes.protobuf" if valid_stream_parameter => {
+                    AcceptedWatchMedia::Protobuf
+                }
+                "application/*" if valid_stream_parameter => {
+                    AcceptedWatchMedia::ApplicationWildcard
+                }
+                "*/*" if valid_stream_parameter => AcceptedWatchMedia::Any,
                 _ => AcceptedWatchMedia::Unsupported,
             };
             accepted.push(AcceptedWatchFormat {
@@ -176,8 +186,15 @@ fn best_watch_accept_match(
 
 fn parse_accept_quality_millis(value: &str) -> u16 {
     let value = value.trim();
-    if value == "1" || value == "1.0" || value == "1.00" || value == "1.000" {
+    if value == "1" {
         return 1000;
+    }
+    if let Some(fraction) = value.strip_prefix("1.") {
+        return if fraction.len() <= 3 && fraction.bytes().all(|byte| byte == b'0') {
+            1000
+        } else {
+            0
+        };
     }
     if value == "0" {
         return 0;
@@ -185,10 +202,7 @@ fn parse_accept_quality_millis(value: &str) -> u16 {
     let Some(fraction) = value.strip_prefix("0.") else {
         return 0;
     };
-    if fraction.is_empty()
-        || fraction.len() > 3
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
+    if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
         return 0;
     }
     let mut millis = 0u16;
@@ -1908,7 +1922,71 @@ mod tests {
             WatchStreamFormat::Json
         );
 
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;q=1., application/json;q=0.5"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Protobuf
+        );
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;q=0., application/json;q=0.5"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Json
+        );
+
         headers.insert("accept", "application/json;Q=0, */*;q=0".parse().unwrap());
+        assert!(matches!(
+            negotiate_watch_stream_format(&headers, true),
+            Err(AppError::NotAcceptable(_))
+        ));
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;stream=watch;q=1"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Protobuf
+        );
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;stream=wrong;q=1, application/json;q=0.5"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Json
+        );
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;stream=wrong;q=1"
+                .parse()
+                .unwrap(),
+        );
+        assert!(matches!(
+            negotiate_watch_stream_format(&headers, true),
+            Err(AppError::NotAcceptable(_))
+        ));
+
+        headers.insert(
+            "accept",
+            "application/json;stream=wrong;q=1".parse().unwrap(),
+        );
         assert!(matches!(
             negotiate_watch_stream_format(&headers, true),
             Err(AppError::NotAcceptable(_))
