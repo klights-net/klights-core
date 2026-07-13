@@ -200,6 +200,8 @@ mod tests {
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
         let cancel = tokio_util::sync::CancellationToken::new();
+        let node_subnet_store =
+            crate::networking::subnet_allocator::DatastoreNodeSubnetAllocationStore::new(&db);
         let user_netns = std::path::PathBuf::from("/proc/self/ns/user");
         let mode = NodeMode::Rootless {
             user_netns,
@@ -211,7 +213,7 @@ mod tests {
             &cfg,
             NetworkBootStores::new(
                 cluster_api_for_test(db.clone(), &cfg.node_name),
-                &db,
+                &node_subnet_store,
                 node_local,
             ),
             "192.168.1.6",

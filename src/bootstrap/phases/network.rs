@@ -57,10 +57,16 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     } = args;
     let (cni_readiness_publisher, cni_readiness) =
         crate::kubelet::cni_readiness::CniReadiness::channel();
+    let node_subnet_store =
+        crate::networking::subnet_allocator::DatastoreNodeSubnetAllocationStore::new(db);
     let network_boot = match networking::NetworkBoot::boot(
         node_mode,
         config,
-        networking::boot::NetworkBootStores::new(cluster_api.clone(), db, node_local.clone()),
+        networking::boot::NetworkBootStores::new(
+            cluster_api.clone(),
+            &node_subnet_store,
+            node_local.clone(),
+        ),
         node_ip,
         shutdown_token.clone(),
         supervisor.clone(),

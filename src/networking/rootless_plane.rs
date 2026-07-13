@@ -537,11 +537,13 @@ mod tests {
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
         let cancel = tokio_util::sync::CancellationToken::new();
+        let node_subnet_store =
+            crate::networking::subnet_allocator::DatastoreNodeSubnetAllocationStore::new(&db);
         let plane = RootlessNetworkPlane::boot(
             &cfg,
             crate::networking::boot::NetworkBootStores::new(
                 cluster_api_for_test(db.clone(), &cfg.node_name),
-                &db,
+                &node_subnet_store,
                 node_local,
             ),
             "192.168.1.5",
@@ -573,11 +575,13 @@ mod tests {
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
         let cancel = tokio_util::sync::CancellationToken::new();
+        let node_subnet_store =
+            crate::networking::subnet_allocator::DatastoreNodeSubnetAllocationStore::new(&db);
         let plane = RootlessNetworkPlane::boot(
             &cfg,
             crate::networking::boot::NetworkBootStores::new(
                 cluster_api_for_test(db.clone(), &cfg.node_name),
-                &db,
+                &node_subnet_store,
                 node_local,
             ),
             "192.168.77.9",
@@ -623,11 +627,13 @@ mod tests {
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
         let cancel = tokio_util::sync::CancellationToken::new();
+        let node_subnet_store =
+            crate::networking::subnet_allocator::DatastoreNodeSubnetAllocationStore::new(&db);
         let plane = RootlessNetworkPlane::boot(
             &cfg,
             crate::networking::boot::NetworkBootStores::new(
                 cluster_api_for_test(db.clone(), &cfg.node_name),
-                &db,
+                &node_subnet_store,
                 node_local,
             ),
             "192.168.1.5",
