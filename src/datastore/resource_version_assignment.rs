@@ -3,7 +3,7 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::datastore::DatastoreBackend;
+use crate::datastore::MetaStore;
 use crate::log_apply::ResourceVersionAssignment;
 
 pub const KEY_RESOURCE_VERSION_ASSIGNMENT_MODE: &str = "resource_version_assignment_mode";
@@ -149,7 +149,7 @@ mod snapshot_assignment_mode_tests {
 }
 
 pub async fn read_resource_version_assignment_mode(
-    store: &(impl DatastoreBackend + ?Sized),
+    store: &(impl MetaStore + ?Sized),
 ) -> Result<ResourceVersionAssignment> {
     let Some(value) = store
         .get_klights_meta(KEY_RESOURCE_VERSION_ASSIGNMENT_MODE)
@@ -161,7 +161,7 @@ pub async fn read_resource_version_assignment_mode(
 }
 
 pub async fn write_resource_version_assignment_mode(
-    store: &(impl DatastoreBackend + ?Sized),
+    store: &(impl MetaStore + ?Sized),
     mode: ResourceVersionAssignment,
 ) -> Result<()> {
     store

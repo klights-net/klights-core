@@ -416,9 +416,10 @@ impl RaftNode {
         if !self.is_leader() {
             return Err(ResourceVersionV1ActivationError::NotLeader);
         }
+        let meta_store = crate::datastore::DatastoreBackendMetaStore::new(self.backend.as_ref());
         let mode =
             crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
-                self.backend.as_ref(),
+                &meta_store,
             )
             .await
             .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
@@ -428,9 +429,10 @@ impl RaftNode {
         let _preflight = self.preflight_committed_apply_rv_v1(probe).await?;
         // Re-read while membership and proposal lanes are frozen. A second
         // activation caller sees the committed mode and emits no extra entry.
+        let meta_store = crate::datastore::DatastoreBackendMetaStore::new(self.backend.as_ref());
         let mode =
             crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
-                self.backend.as_ref(),
+                &meta_store,
             )
             .await
             .map_err(|err| ResourceVersionV1ActivationError::Apply(err.to_string()))?;
@@ -1178,9 +1180,11 @@ impl crate::replication::grpc::raft_rpc::ControlplaneJoinHandler for RaftNodeJoi
                 },
             });
         }
+        let meta_store =
+            crate::datastore::DatastoreBackendMetaStore::new(self.node.backend.as_ref());
         let assignment_mode =
             crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
-                self.node.backend.as_ref(),
+                &meta_store,
             )
             .await
             .map_err(|err| RaftRpcRouterError::Dispatch(err.to_string()))?;
@@ -1372,9 +1376,10 @@ mod tests {
                 .collect(),
         };
         node.activate_committed_apply_rv_v1(&probe).await.unwrap();
+        let meta_store = crate::datastore::DatastoreBackendMetaStore::new(backend.as_ref());
         assert_eq!(
             crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
-                backend.as_ref()
+                &meta_store
             )
             .await
             .unwrap(),
@@ -1401,9 +1406,10 @@ mod tests {
             not_leader.activate_committed_apply_rv_v1(&probe).await,
             Err(ResourceVersionV1ActivationError::NotLeader)
         ));
+        let meta_store = crate::datastore::DatastoreBackendMetaStore::new(backend.as_ref());
         assert_eq!(
             crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
-                backend.as_ref()
+                &meta_store
             )
             .await
             .unwrap(),
@@ -1428,9 +1434,10 @@ mod tests {
                 ResourceVersionV1PreflightError::Unsupported { .. }
             ))
         ));
+        let meta_store = crate::datastore::DatastoreBackendMetaStore::new(backend.as_ref());
         assert_eq!(
             crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
-                backend.as_ref()
+                &meta_store
             )
             .await
             .unwrap(),

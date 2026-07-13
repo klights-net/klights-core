@@ -1813,6 +1813,31 @@ pub trait MetaStore: Send + Sync {
     async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()>;
 }
 
+/// Transitional borrowed adapter from the legacy backend trait into the
+/// focused metadata port. Composition roots that still hold `&dyn
+/// DatastoreBackend` can opt into metadata-only authority without making every
+/// backend blanket-implement `MetaStore`.
+pub struct DatastoreBackendMetaStore<'a> {
+    db: &'a dyn DatastoreBackend,
+}
+
+impl<'a> DatastoreBackendMetaStore<'a> {
+    pub fn new(db: &'a dyn DatastoreBackend) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl MetaStore for DatastoreBackendMetaStore<'_> {
+    async fn get_klights_meta(&self, key: &str) -> Result<Option<String>> {
+        self.db.get_klights_meta(key).await
+    }
+
+    async fn set_klights_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.db.set_klights_meta(key, value).await
+    }
+}
+
 /// Selector for the watch-event publisher path used by a backend.
 ///
 /// Defined at the trait layer so every backend reads from one type and

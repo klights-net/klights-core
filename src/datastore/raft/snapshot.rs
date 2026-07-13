@@ -119,9 +119,10 @@ impl RaftSnapshotData {
         )
         .await?;
         let replay_position = db.current_watch_replay_position().await?;
+        let meta_store = crate::datastore::DatastoreBackendMetaStore::new(db);
         let resource_version_assignment_mode =
             crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
-                db,
+                &meta_store,
             )
             .await?;
         let floors = normalize_snapshot_floors(
