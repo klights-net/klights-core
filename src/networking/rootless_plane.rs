@@ -527,6 +527,20 @@ mod tests {
         ))
     }
 
+    struct TestNodeSubnetStore {
+        db: crate::datastore::sqlite::Datastore,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::networking::subnet_allocator::NodeSubnetAllocationStore for TestNodeSubnetStore {
+        async fn get_node_subnet(
+            &self,
+            node_name: &str,
+        ) -> anyhow::Result<Option<crate::datastore::NodeSubnet>> {
+            self.db.get_node_subnet(node_name).await
+        }
+    }
+
     #[tokio::test]
     async fn boot_rootless_does_not_create_vxlan_or_write_vtep() {
         let db = crate::datastore::test_support::in_memory().await;
@@ -537,8 +551,7 @@ mod tests {
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
         let cancel = tokio_util::sync::CancellationToken::new();
-        let node_subnet_store =
-            crate::networking::subnet_allocator::DatastoreNodeSubnetAllocationStore::new(&db);
+        let node_subnet_store = TestNodeSubnetStore { db: db.clone() };
         let plane = RootlessNetworkPlane::boot(
             &cfg,
             crate::networking::boot::NetworkBootStores::new(
@@ -575,8 +588,7 @@ mod tests {
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
         let cancel = tokio_util::sync::CancellationToken::new();
-        let node_subnet_store =
-            crate::networking::subnet_allocator::DatastoreNodeSubnetAllocationStore::new(&db);
+        let node_subnet_store = TestNodeSubnetStore { db: db.clone() };
         let plane = RootlessNetworkPlane::boot(
             &cfg,
             crate::networking::boot::NetworkBootStores::new(
@@ -627,8 +639,7 @@ mod tests {
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
         let cancel = tokio_util::sync::CancellationToken::new();
-        let node_subnet_store =
-            crate::networking::subnet_allocator::DatastoreNodeSubnetAllocationStore::new(&db);
+        let node_subnet_store = TestNodeSubnetStore { db: db.clone() };
         let plane = RootlessNetworkPlane::boot(
             &cfg,
             crate::networking::boot::NetworkBootStores::new(

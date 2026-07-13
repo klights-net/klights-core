@@ -40,6 +40,22 @@ pub struct NetworkBootArgs<'a> {
     pub shutdown_token: CancellationToken,
 }
 
+struct NetworkPhaseNodeSubnetStore<'a> {
+    db: &'a dyn crate::datastore::DatastoreBackend,
+}
+
+#[async_trait::async_trait]
+impl crate::networking::subnet_allocator::NodeSubnetAllocationStore
+    for NetworkPhaseNodeSubnetStore<'_>
+{
+    async fn get_node_subnet(
+        &self,
+        node_name: &str,
+    ) -> Result<Option<crate::datastore::NodeSubnet>> {
+        crate::datastore::DatastoreBackend::get_node_subnet(self.db, node_name).await
+    }
+}
+
 pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let NetworkBootArgs {
         config,
@@ -57,8 +73,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     } = args;
     let (cni_readiness_publisher, cni_readiness) =
         crate::kubelet::cni_readiness::CniReadiness::channel();
-    let node_subnet_store =
-        crate::networking::subnet_allocator::DatastoreNodeSubnetAllocationStore::new(db);
+    let node_subnet_store = NetworkPhaseNodeSubnetStore { db };
     let network_boot = match networking::NetworkBoot::boot(
         node_mode,
         config,

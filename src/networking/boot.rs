@@ -191,6 +191,20 @@ mod tests {
         ))
     }
 
+    struct TestNodeSubnetStore {
+        db: crate::datastore::sqlite::Datastore,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::networking::subnet_allocator::NodeSubnetAllocationStore for TestNodeSubnetStore {
+        async fn get_node_subnet(
+            &self,
+            node_name: &str,
+        ) -> anyhow::Result<Option<crate::datastore::NodeSubnet>> {
+            self.db.get_node_subnet(node_name).await
+        }
+    }
+
     #[tokio::test]
     async fn network_boot_dispatches_rootless_mode_to_rootless_plane() {
         let db = crate::datastore::test_support::in_memory().await;
@@ -200,8 +214,7 @@ mod tests {
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
         let cancel = tokio_util::sync::CancellationToken::new();
-        let node_subnet_store =
-            crate::networking::subnet_allocator::DatastoreNodeSubnetAllocationStore::new(&db);
+        let node_subnet_store = TestNodeSubnetStore { db: db.clone() };
         let user_netns = std::path::PathBuf::from("/proc/self/ns/user");
         let mode = NodeMode::Rootless {
             user_netns,

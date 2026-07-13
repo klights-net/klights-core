@@ -23,24 +23,6 @@ pub(crate) trait NodeSubnetAllocationStore: Send + Sync {
     async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>>;
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct DatastoreNodeSubnetAllocationStore<'a> {
-    db: &'a dyn crate::datastore::DatastoreBackend,
-}
-
-impl<'a> DatastoreNodeSubnetAllocationStore<'a> {
-    pub(crate) fn new(db: &'a dyn crate::datastore::DatastoreBackend) -> Self {
-        Self { db }
-    }
-}
-
-#[async_trait::async_trait]
-impl NodeSubnetAllocationStore for DatastoreNodeSubnetAllocationStore<'_> {
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-        crate::datastore::DatastoreBackend::get_node_subnet(self.db, node_name).await
-    }
-}
-
 struct LeaderApiNodeSubnetAllocationClient {
     inner: Arc<dyn LeaderApiClient>,
 }
@@ -359,27 +341,6 @@ mod tests {
 
         assert_eq!(row.node_name.as_str(), "node-a");
         assert_eq!(store.calls(), 1);
-        assert_eq!(client.calls(), 0);
-    }
-
-    #[tokio::test]
-    async fn datastore_adapter_reuses_existing_subnet_without_allocating_new_one() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let stored = db
-            .allocate_node_subnet("node-a", "10.50.0.0/16", "192.0.2.10")
-            .await
-            .expect("node subnet allocator store should materialize row in test DB");
-
-        let client = FakeAllocationClient::new(vec![Outcome::Ok(subnet_row())]);
-        let allocator = test_allocator(client.clone());
-        let store = DatastoreNodeSubnetAllocationStore::new(&db);
-
-        let row = allocator
-            .allocate_or_reuse_existing(&store, "node-a", "10.50.0.0/16", "192.0.2.10")
-            .await
-            .expect("existing local row must be reused");
-
-        assert_eq!(row.subnet, stored.subnet);
         assert_eq!(client.calls(), 0);
     }
 
