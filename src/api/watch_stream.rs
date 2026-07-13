@@ -89,7 +89,9 @@ pub fn negotiate_watch_stream_format(
             }
             let mut quality_millis = 1000;
             for parameter in segments {
-                if let Some(value) = parameter.strip_prefix("q=") {
+                if let Some((name, value)) = parameter.split_once('=')
+                    && name.trim().eq_ignore_ascii_case("q")
+                {
                     quality_millis = parse_accept_quality_millis(value);
                 }
             }
@@ -1869,6 +1871,34 @@ mod tests {
             negotiate_watch_stream_format(&headers, true).unwrap(),
             WatchStreamFormat::Json
         );
+
+        headers.insert(
+            "accept",
+            "application/vnd.kubernetes.protobuf;Q=0, application/json;q=0.5"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Json
+        );
+
+        headers.insert(
+            "accept",
+            "application/json;Q=0, application/vnd.kubernetes.protobuf;q=0.5"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            negotiate_watch_stream_format(&headers, true).unwrap(),
+            WatchStreamFormat::Protobuf
+        );
+
+        headers.insert("accept", "application/json;Q=0, */*;q=0".parse().unwrap());
+        assert!(matches!(
+            negotiate_watch_stream_format(&headers, true),
+            Err(AppError::NotAcceptable(_))
+        ));
     }
 
     #[test]

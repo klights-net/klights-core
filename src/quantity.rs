@@ -7,7 +7,17 @@ struct Suffix {
     den: i128,
 }
 
-const CPU_SUFFIXES: [Suffix; 7] = [
+const CPU_SUFFIXES: [Suffix; 9] = [
+    Suffix {
+        text: "n",
+        num: 1,
+        den: 1_000_000_000,
+    },
+    Suffix {
+        text: "u",
+        num: 1,
+        den: 1_000_000,
+    },
     Suffix {
         text: "m",
         num: 1,
@@ -45,7 +55,7 @@ const CPU_SUFFIXES: [Suffix; 7] = [
     },
 ];
 
-const DECIMAL_SUFFIXES: [Suffix; 7] = [
+const DECIMAL_SUFFIXES: [Suffix; 9] = [
     Suffix {
         text: "E",
         num: 1_000_000_000_000_000_000,
@@ -80,6 +90,16 @@ const DECIMAL_SUFFIXES: [Suffix; 7] = [
         text: "m",
         num: 1,
         den: 1000,
+    },
+    Suffix {
+        text: "u",
+        num: 1,
+        den: 1_000_000,
+    },
+    Suffix {
+        text: "n",
+        num: 1,
+        den: 1_000_000_000,
     },
 ];
 
@@ -230,10 +250,11 @@ fn parse_decimal_rational(raw: &str) -> Option<(i128, i128)> {
 }
 
 fn parse_decimal_rational_no_exponent(raw: &str) -> Option<(i128, i128)> {
-    let (int_part, frac_part) = match raw.split_once('.') {
+    let (int_part, mut frac_part) = match raw.split_once('.') {
         Some((int_part, frac_part)) => (int_part, frac_part),
         None => (raw, ""),
     };
+    frac_part = frac_part.trim_end_matches('0');
 
     if int_part.is_empty() && frac_part.is_empty() {
         return None;
@@ -402,7 +423,19 @@ mod tests {
         );
         assert_eq!(parse_resource_quantity("storage", "1k"), Some(1000));
         assert_eq!(parse_resource_quantity("storage", "1m"), Some(1));
+        assert_eq!(parse_resource_quantity("storage", "1u"), Some(1));
+        assert_eq!(parse_resource_quantity("storage", "1n"), Some(1));
         assert_eq!(parse_resource_quantity("storage", "1K"), None);
+        assert_eq!(parse_resource_quantity("storage", "1U"), None);
+        assert_eq!(parse_resource_quantity("storage", "1N"), None);
+        assert_eq!(
+            parse_resource_quantity("storage", "1.000000000000000000000000000000000000000Gi"),
+            Some(1_073_741_824)
+        );
+        assert_eq!(
+            parse_resource_quantity("memory", "1.000000000000000000000000000000000000000Gi"),
+            Some(1_073_741_824)
+        );
         assert_eq!(
             parse_resource_quantity("storage", "1P"),
             Some(1_000_000_000_000_000)
@@ -436,6 +469,10 @@ mod tests {
     fn parse_cpu_examples_are_integer_milli() {
         assert_eq!(parse_resource_quantity("cpu", "1"), Some(1000));
         assert_eq!(parse_resource_quantity("cpu", "500m"), Some(500));
+        assert_eq!(parse_resource_quantity("cpu", "1u"), Some(1));
+        assert_eq!(parse_resource_quantity("cpu", "1n"), Some(1));
+        assert_eq!(parse_resource_quantity("memory", "1u"), Some(1));
+        assert_eq!(parse_resource_quantity("memory", "1n"), Some(1));
         assert_eq!(parse_resource_quantity("cpu", "2.5"), Some(2500));
         assert_eq!(parse_resource_quantity("cpu", "1.5k"), Some(1_500_000));
         assert_eq!(parse_resource_quantity("cpu", "1e-3"), Some(1));
