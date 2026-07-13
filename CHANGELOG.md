@@ -86,6 +86,23 @@ removed from the list.
   inference rather than a schema-driven engine, CRD apply does not produce
   `managedFields`, and protobuf responses omit `managedFields` (JSON-only).
 
+### Binary packages
+
+This release publishes:
+
+- Static binaries: `klights-linux-x86_64-static`, `klights-linux-arm64-static`
+- Ubuntu 24.04 (noble): `klights_0.9.12-1~noble_amd64.deb`, `klights_0.9.12-1~noble_arm64.deb`
+- Ubuntu 26.04 (resolute): `klights_0.9.12-1~resolute_amd64.deb`, `klights_0.9.12-1~resolute_arm64.deb`
+- RHEL 9: `klights-0.9.12-1.el9.x86_64.rpm`, `klights-0.9.12-1.el9.aarch64.rpm`
+- RHEL 10: `klights-0.9.12-1.el10.x86_64.rpm`, `klights-0.9.12-1.el10.aarch64.rpm`
+- RHEL runtime dependencies: `containerd-2.3.2-1.el9.x86_64.rpm`, `containerd-2.3.2-1.el9.aarch64.rpm`, `containerd-2.3.2-1.el10.x86_64.rpm`, `containerd-2.3.2-1.el10.aarch64.rpm`, `runc-1.5.0-1.el9.x86_64.rpm`, `runc-1.5.0-1.el9.aarch64.rpm`, `runc-1.5.0-1.el10.x86_64.rpm`, `runc-1.5.0-1.el10.aarch64.rpm`
+
+Package repositories are published from the `package-repo` branch:
+
+- APT: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt
+- RPM: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm
+- Public key: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc
+
 ## [0.9.11] - 2026-07-05
 
 This release introduces the `metrics.k8s.io` API surface, substantially
@@ -163,6 +180,23 @@ implemented and VXLAN dataplane removal substantially complete.
   inference rather than a schema-driven engine, CRD apply does not produce
   `managedFields`, and protobuf responses omit `managedFields` (JSON-only).
 
+### Binary packages
+
+This release publishes:
+
+- Static binaries: `klights-linux-x86_64-static`, `klights-linux-arm64-static`
+- Ubuntu 24.04 (noble): `klights_0.9.11-1~noble_amd64.deb`, `klights_0.9.11-1~noble_arm64.deb`
+- Ubuntu 26.04 (resolute): `klights_0.9.11-1~resolute_amd64.deb`, `klights_0.9.11-1~resolute_arm64.deb`
+- RHEL 9: `klights-0.9.11-1.el9.x86_64.rpm`, `klights-0.9.11-1.el9.aarch64.rpm`
+- RHEL 10: `klights-0.9.11-1.el10.x86_64.rpm`, `klights-0.9.11-1.el10.aarch64.rpm`
+- RHEL runtime dependencies: `containerd-2.3.2-1.el9.x86_64.rpm`, `containerd-2.3.2-1.el9.aarch64.rpm`, `containerd-2.3.2-1.el10.x86_64.rpm`, `containerd-2.3.2-1.el10.aarch64.rpm`, `runc-1.5.0-1.el9.x86_64.rpm`, `runc-1.5.0-1.el9.aarch64.rpm`, `runc-1.5.0-1.el10.x86_64.rpm`, `runc-1.5.0-1.el10.aarch64.rpm`
+
+Package repositories are published from the `package-repo` branch:
+
+- APT: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt
+- RPM: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm
+- Public key: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc
+
 ## [0.9.10] - 2026-06-28
 
 First public beta release of `klights-core`.
@@ -228,6 +262,23 @@ yet a complete Kubernetes replacement and still has known conformance gaps.
   `managedFields`, and protobuf responses omit `managedFields` (JSON-only).
 - VXLAN removal is still in progress. WireGuard is the intended encrypted
   dataplane; remaining VXLAN references are legacy cleanup work.
+
+### Binary packages
+
+This release publishes:
+
+- Static binaries: `klights-linux-x86_64-static`, `klights-linux-arm64-static`
+- Ubuntu 24.04 (noble): `klights_0.9.10-1~noble_amd64.deb`, `klights_0.9.10-1~noble_arm64.deb`
+- Ubuntu 26.04 (resolute): `klights_0.9.10-1~resolute_amd64.deb`, `klights_0.9.10-1~resolute_arm64.deb`
+- RHEL 9: `klights-0.9.10-1.el9.x86_64.rpm`, `klights-0.9.10-1.el9.aarch64.rpm`
+- RHEL 10: `klights-0.9.10-1.el10.x86_64.rpm`, `klights-0.9.10-1.el10.aarch64.rpm`
+- RHEL runtime dependencies: `containerd-2.3.2-1.el9.x86_64.rpm`, `containerd-2.3.2-1.el9.aarch64.rpm`, `containerd-2.3.2-1.el10.x86_64.rpm`, `containerd-2.3.2-1.el10.aarch64.rpm`, `runc-1.5.0-1.el9.x86_64.rpm`, `runc-1.5.0-1.el9.aarch64.rpm`, `runc-1.5.0-1.el10.x86_64.rpm`, `runc-1.5.0-1.el10.aarch64.rpm`
+
+Package repositories are published from the `package-repo` branch:
+
+- APT: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt
+- RPM: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm
+- Public key: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc
 
 ### Notes
 
