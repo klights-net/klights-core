@@ -7,6 +7,13 @@ struct Suffix {
     den: i128,
 }
 
+#[derive(Clone, Copy)]
+struct QuantityRational {
+    numerator: i128,
+    denominator: i128,
+    exponent10: i32,
+}
+
 const CPU_SUFFIXES: [Suffix; 9] = [
     Suffix {
         text: "n",
@@ -223,7 +230,7 @@ fn parse_quantity_with_suffixes(raw: &str, suffixes: &[Suffix], final_div: i128)
     apply_quantity(parse_decimal_rational(number)?, suffix, final_div)
 }
 
-fn parse_decimal_rational(raw: &str) -> Option<(i128, i128)> {
+fn parse_decimal_rational(raw: &str) -> Option<QuantityRational> {
     if raw.is_empty() || raw.starts_with('-') {
         return None;
     }
@@ -234,17 +241,12 @@ fn parse_decimal_rational(raw: &str) -> Option<(i128, i128)> {
     }
 
     let (number, exponent) = split_exponent(raw)?;
-    let (mut numerator, mut denominator) = parse_decimal_rational_no_exponent(number)?;
-    match exponent {
-        exp if exp >= 0 => {
-            numerator = numerator.checked_mul(pow10(exp.try_into().ok()?)?)?;
-        }
-        exp => {
-            let divisor = pow10(u32::try_from(exp.checked_neg()?).ok()?)?;
-            denominator = denominator.checked_mul(divisor)?;
-        }
-    }
-    Some((numerator, denominator))
+    let (numerator, denominator) = parse_decimal_rational_no_exponent(number)?;
+    Some(QuantityRational {
+        numerator,
+        denominator,
+        exponent10: exponent,
+    })
 }
 
 fn parse_decimal_rational_no_exponent(raw: &str) -> Option<(i128, i128)> {
@@ -252,9 +254,10 @@ fn parse_decimal_rational_no_exponent(raw: &str) -> Option<(i128, i128)> {
         Some((int_part, frac_part)) => (int_part, frac_part),
         None => (raw, ""),
     };
+    let frac_was_empty = frac_part.is_empty();
     frac_part = frac_part.trim_end_matches('0');
 
-    if int_part.is_empty() && frac_part.is_empty() {
+    if int_part.is_empty() && frac_part.is_empty() && (!raw.contains('.') || frac_was_empty) {
         return None;
     }
     if int_part.chars().any(|c| !c.is_ascii_digit()) {
@@ -327,27 +330,90 @@ fn split_suffix<'a>(raw: &'a str, suffixes: &'a [Suffix]) -> Option<(&'a str, &'
 }
 
 fn apply_quantity(
-    (numerator, denominator): (i128, i128),
+    rational: QuantityRational,
     suffix: Option<&Suffix>,
     final_div: i128,
 ) -> Option<i64> {
-    let mut numerators = [numerator, 1000, suffix.map_or(1, |suffix| suffix.num)];
-    let mut denominators = [
-        denominator,
+    let mut numerators = vec![
+        rational.numerator,
+        1000,
+        suffix.map_or(1, |suffix| suffix.num),
+    ];
+    let mut denominators = vec![
+        rational.denominator,
         final_div,
         suffix.map_or(1, |suffix| suffix.den),
     ];
 
-    for numerator in &mut numerators {
-        for denominator in &mut denominators {
+    reduce_factor_sets(&mut numerators, &mut denominators);
+    let denominator_too_large =
+        apply_decimal_exponent(&mut numerators, &mut denominators, rational.exponent10)?;
+    reduce_factor_sets(&mut numerators, &mut denominators);
+
+    let numerator = checked_product(&numerators)?;
+    let denominator = match checked_product(&denominators) {
+        Some(denominator) if !denominator_too_large => denominator,
+        Some(_) | None if numerator == 0 => return Some(0),
+        Some(_) | None => return Some(1),
+    };
+    let scaled = ceil_div_positive(numerator, denominator)?;
+    bounded_i64(scaled)
+}
+
+fn reduce_factor_sets(numerators: &mut [i128], denominators: &mut [i128]) {
+    for numerator in numerators {
+        for denominator in &mut *denominators {
             reduce_positive_pair(numerator, denominator);
         }
     }
+}
 
-    let numerator = checked_product(&numerators)?;
-    let denominator = checked_product(&denominators)?;
-    let scaled = ceil_div_positive(numerator, denominator)?;
-    bounded_i64(scaled)
+fn apply_decimal_exponent(
+    numerators: &mut Vec<i128>,
+    denominators: &mut Vec<i128>,
+    exponent: i32,
+) -> Option<bool> {
+    if exponent == 0 {
+        return Some(false);
+    }
+    let mut twos = exponent.unsigned_abs();
+    let mut fives = exponent.unsigned_abs();
+    if exponent > 0 {
+        cancel_prime_from_factors(&mut twos, denominators, 2);
+        cancel_prime_from_factors(&mut fives, denominators, 5);
+        numerators.push(checked_prime_power_product(twos, fives)?);
+        Some(false)
+    } else {
+        cancel_prime_from_factors(&mut twos, numerators, 2);
+        cancel_prime_from_factors(&mut fives, numerators, 5);
+        match checked_prime_power_product(twos, fives) {
+            Some(factor) => {
+                denominators.push(factor);
+                Some(false)
+            }
+            None => Some(true),
+        }
+    }
+}
+
+fn cancel_prime_from_factors(count: &mut u32, factors: &mut [i128], prime: i128) {
+    for factor in factors {
+        while *count > 0 && *factor > 0 && *factor % prime == 0 {
+            *factor /= prime;
+            *count -= 1;
+        }
+    }
+}
+
+fn checked_prime_power_product(twos: u32, fives: u32) -> Option<i128> {
+    let mut product = 1_i128;
+    for _ in 0..twos {
+        product = product.checked_mul(2)?;
+    }
+    for _ in 0..fives {
+        product = product.checked_mul(5)?;
+    }
+    Some(product)
 }
 
 fn reduce_positive_pair(numerator: &mut i128, denominator: &mut i128) {
@@ -442,6 +508,11 @@ mod tests {
             parse_resource_quantity("storage", ".25Gi"),
             Some(268_435_456)
         );
+        assert_eq!(parse_resource_quantity("storage", ".0Gi"), Some(0));
+        assert_eq!(parse_resource_quantity("storage", "+.0"), Some(0));
+        assert_eq!(parse_resource_quantity("memory", ".000Gi"), Some(0));
+        assert_eq!(parse_resource_quantity("memory", "+.0Gi"), Some(0));
+        assert_eq!(parse_resource_quantity("storage", "1e-39Gi"), Some(1));
         assert_eq!(
             parse_resource_quantity("storage", "1.2345Gi"),
             Some(1_325_534_282)
@@ -504,6 +575,8 @@ mod tests {
             parse_resource_quantity("storage", "170141183460469231731687303715884105727"),
             None
         );
+        assert_eq!(parse_resource_quantity("cpu", "1e39"), None);
+        assert_eq!(parse_resource_quantity("storage", "1e39"), None);
     }
 
     #[test]
@@ -517,6 +590,15 @@ mod tests {
         assert_eq!(parse_resource_quantity("cpu", "2.5"), Some(2500));
         assert_eq!(parse_resource_quantity("cpu", "1.5k"), Some(1_500_000));
         assert_eq!(parse_resource_quantity("cpu", "1e-3"), Some(1));
+        assert_eq!(parse_resource_quantity("cpu", "1e-39"), Some(1));
+        assert_eq!(
+            parse_resource_quantity("cpu", "0.99999999999999999999999999999999999999e1"),
+            Some(10_000)
+        );
+        assert_eq!(
+            parse_resource_quantity("cpu", "0.0000000000000000000001e36"),
+            Some(100_000_000_000_000_000)
+        );
     }
 
     #[test]
