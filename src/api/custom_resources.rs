@@ -753,7 +753,7 @@ async fn list_cr_inner(
         // A scoped watch (namespace and/or label/field selector) must anchor its
         // periodic BOOKMARK to the highest RV it has actually emitted for that
         // scope, not the global cursor/collection RV. See
-        // `resolve_periodic_bookmark_decision` for the invariant.
+        // `resolve_periodic_bookmark_rv` for the invariant.
         let has_scope_filter = watch_ns.is_some() || has_selector;
         let watch_versions =
             crd_watch_versions(conversion_for_watch.as_ref(), &requested_version_for_watch);
@@ -1174,7 +1174,7 @@ async fn list_cr_inner(
                         }
                     }
                     Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
-                        let decision = crate::api::watch_stream::resolve_periodic_bookmark_decision(
+                        let rv = crate::api::watch_stream::resolve_periodic_bookmark_rv(
                             crate::api::watch_stream::PeriodicBookmarkContext {
                                 db: &db,
                                 api_version: &av,
@@ -1189,26 +1189,12 @@ async fn list_cr_inner(
                             },
                         )
                         .await;
-                        match decision {
-                            crate::api::watch_stream::PeriodicBookmarkDecision::Bookmark(rv) => {
-                                let event = WatchEvent::bookmark_typed(rv, &av, &kind);
-                                yield Ok::<_, std::convert::Infallible>(
-                                    crate::api::watch_stream::serialize_watch_event_line(
-                                        event, &kind, false,
-                                    ),
-                                );
-                            }
-                            crate::api::watch_stream::PeriodicBookmarkDecision::Expired => {
-                                yield Ok::<_, std::convert::Infallible>(
-                                    crate::api::watch_stream::serialize_watch_status_line(
-                                        410,
-                                        "Expired",
-                                        "too old resource version: exact-name watch scope is absent and the watch cursor advanced",
-                                    ),
-                                );
-                                break;
-                            }
-                        }
+                        let event = WatchEvent::bookmark_typed(rv, &av, &kind);
+                        yield Ok::<_, std::convert::Infallible>(
+                            crate::api::watch_stream::serialize_watch_event_line(
+                                event, &kind, false,
+                            ),
+                        );
                     }
                 }
             }
