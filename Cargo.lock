@@ -2093,6 +2093,90 @@ dependencies = [
 ]
 
 [[package]]
+name = "klights-apiserver"
+version = "0.0.0"
+
+[[package]]
+name = "klights-auth"
+version = "0.0.0"
+
+[[package]]
+name = "klights-cluster-core"
+version = "0.0.0"
+
+[[package]]
+name = "klights-cluster-datastore"
+version = "0.0.0"
+
+[[package]]
+name = "klights-cluster-store"
+version = "0.0.0"
+
+[[package]]
+name = "klights-controllers"
+version = "0.0.0"
+
+[[package]]
+name = "klights-internal-protobuf"
+version = "0.0.0"
+
+[[package]]
+name = "klights-kube-protobuf"
+version = "0.0.0"
+
+[[package]]
+name = "klights-kubelet"
+version = "0.0.0"
+
+[[package]]
+name = "klights-leader-api"
+version = "0.0.0"
+
+[[package]]
+name = "klights-network-api"
+version = "0.0.0"
+
+[[package]]
+name = "klights-networking"
+version = "0.0.0"
+
+[[package]]
+name = "klights-node-api"
+version = "0.0.0"
+
+[[package]]
+name = "klights-node-datastore"
+version = "0.0.0"
+
+[[package]]
+name = "klights-node-store"
+version = "0.0.0"
+
+[[package]]
+name = "klights-pod-api"
+version = "0.0.0"
+
+[[package]]
+name = "klights-reconcile-api"
+version = "0.0.0"
+
+[[package]]
+name = "klights-replication"
+version = "0.0.0"
+
+[[package]]
+name = "klights-supervisor"
+version = "0.0.0"
+
+[[package]]
+name = "klights-types"
+version = "0.0.0"
+
+[[package]]
+name = "klights-watch"
+version = "0.0.0"
+
+[[package]]
 name = "kube"
 version = "0.98.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

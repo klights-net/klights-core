@@ -14,6 +14,29 @@ categories = ["command-line-utilities", "network-programming"]
 
 [workspace]
 resolver = "3"
+members = [
+    "crates/klights-types",
+    "crates/klights-cluster-core",
+    "crates/klights-supervisor",
+    "crates/klights-internal-protobuf",
+    "crates/klights-kube-protobuf",
+    "crates/klights-cluster-store",
+    "crates/klights-node-store",
+    "crates/klights-node-api",
+    "crates/klights-pod-api",
+    "crates/klights-reconcile-api",
+    "crates/klights-network-api",
+    "crates/klights-leader-api",
+    "crates/klights-watch",
+    "crates/klights-cluster-datastore",
+    "crates/klights-node-datastore",
+    "crates/klights-replication",
+    "crates/klights-networking",
+    "crates/klights-kubelet",
+    "crates/klights-auth",
+    "crates/klights-controllers",
+    "crates/klights-apiserver",
+]
 
 [build-dependencies]
 vergen = { version = "8", features = ["build", "cargo", "git", "gitcl", "rustc", "si"] }

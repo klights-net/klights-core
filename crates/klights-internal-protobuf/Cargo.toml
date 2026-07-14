@@ -1,0 +1,4 @@
+[package]
+name = "klights-internal-protobuf"
+version = "0.0.0"
+edition = "2024"
