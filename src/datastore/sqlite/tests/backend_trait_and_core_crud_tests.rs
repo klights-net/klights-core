@@ -313,6 +313,53 @@ async fn build_log_apply_commit_for_command_has_no_applied_outbox_mutation() {
 }
 
 #[tokio::test]
+async fn raft_status_command_materialization_skips_unchanged_merged_status() {
+    use crate::log_apply::LogApplyMutation;
+
+    let db = Datastore::new_in_memory().await.unwrap();
+    let created = db
+        .create_resource(
+            "v1",
+            "Node",
+            None,
+            "legacy-node",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "legacy-node", "uid": "legacy-node-uid"},
+                "status": {
+                    "conditions": [{"type": "Ready", "status": "True", "reason": "E2E"}]
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    let command = StorageCommand::UpdateStatus {
+        api_version: "v1".to_string(),
+        kind: "Node".to_string(),
+        namespace: None,
+        name: "legacy-node".to_string(),
+        status: created.data.get("status").cloned().unwrap(),
+        expected_rv: Some(created.resource_version),
+        preconditions: ResourcePreconditions::from_resource(&created),
+        observed_status_stamp: None,
+    };
+
+    let commit = db
+        .build_log_apply_commit_for_command(command, "NodeStatus", "leader")
+        .await
+        .expect("materialize unchanged Node status");
+
+    assert!(
+        commit
+            .mutations
+            .iter()
+            .all(|mutation| !matches!(mutation, LogApplyMutation::PutResource(_))),
+        "an unchanged post-merge status must not allocate an RV or emit a watch mutation"
+    );
+}
+
+#[tokio::test]
 async fn ordinary_raft_command_materialization_uses_persisted_rv_assignment_mode() {
     use crate::datastore::command::StorageCommand;
     use crate::log_apply::ResourceVersionAssignment;

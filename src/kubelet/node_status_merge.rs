@@ -326,7 +326,12 @@ fn condition_is_strictly_newer(a: &serde_json::Value, b: &serde_json::Value) -> 
             (Some(a_dt), Some(b_dt)) => a_dt > b_dt,
             _ => a_str > b_str,
         },
-        _ => false,
+        // Legacy or externally-created Node conditions may omit
+        // lastTransitionTime. A timestamped transition has positive ordering
+        // evidence and must supersede such a condition; otherwise controllers
+        // can never move the Node to a new state.
+        (Some(_), None) => true,
+        (None, Some(_) | None) => false,
     }
 }
 
@@ -373,5 +378,41 @@ fn merge_metadata_object_field(
         for (key, value) in overlay {
             entry_obj.insert(key.clone(), value.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamped_node_condition_replaces_legacy_condition_without_timestamp() {
+        let existing = serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "E2E"
+                }]
+            }
+        });
+        let mut incoming = serde_json::json!({
+            "conditions": [{
+                "type": "Ready",
+                "status": "Unknown",
+                "reason": "NodeStatusUnknown",
+                "lastTransitionTime": "2026-07-14T11:38:22Z"
+            }]
+        });
+
+        merge_node_status_for_update(&mut incoming, &existing);
+
+        assert_eq!(
+            incoming
+                .pointer("/conditions/0/status")
+                .and_then(|v| v.as_str()),
+            Some("Unknown"),
+            "a timestamped controller transition must supersede a legacy condition with no timestamp"
+        );
     }
 }

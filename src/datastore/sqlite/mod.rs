@@ -639,6 +639,21 @@ impl Datastore {
                     live_rv,
                     observed_status_stamp.is_some(),
                 );
+                if live.get("status") == Some(&next_status) {
+                    crate::datastore::diagnostics::log_noop_resource_write(
+                        crate::datastore::diagnostics::NoopResourceWrite {
+                            operation: "build_raft_status_commit",
+                            api_version: &api_version,
+                            kind: &kind,
+                            namespace: namespace.as_deref(),
+                            name: &name,
+                            uid: &live_uid,
+                            resource_version: live_rv,
+                            reason: "merged status unchanged",
+                        },
+                    );
+                    return Ok((LogApplyCommit::new(rv, Vec::new()), rv));
+                }
                 live["status"] = next_status;
                 ensure_resource_type_meta(&mut live, &api_version, &kind);
                 let uid = ensure_metadata_uid(&mut live);
