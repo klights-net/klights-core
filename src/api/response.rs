@@ -18,11 +18,43 @@ enum UnaryResponseFormat {
     Protobuf,
 }
 
-struct AcceptMatch {
-    format: UnaryResponseFormat,
+/// A parsed Accept media range, representation-independent.
+///
+/// Each server-supported representation derives its effective quality from
+/// its most-specific matching range, so a wildcard is evaluated for every
+/// representation rather than being encoded as a JSON-specific candidate.
+#[derive(Clone, Copy)]
+struct AcceptRange {
+    media: AcceptMedia,
     q: u16,
     order: usize,
-    specificity: u8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AcceptMedia {
+    /// `application/json`
+    ExactJson,
+    /// `application/vnd.kubernetes.protobuf`
+    ExactProtobuf,
+    /// `application/*`
+    ApplicationWildcard,
+    /// `*/*`
+    Any,
+}
+
+impl AcceptMedia {
+    /// Specificity with which this range matches the given representation, or
+    /// `None` when it does not match. Exact media type beats `application/*`
+    /// beats `*/*`.
+    fn specificity_for(self, format: UnaryResponseFormat) -> Option<u8> {
+        match (self, format) {
+            (AcceptMedia::ExactJson, UnaryResponseFormat::Json) => Some(2),
+            (AcceptMedia::ExactProtobuf, UnaryResponseFormat::Protobuf) => Some(2),
+            (AcceptMedia::ApplicationWildcard, _) => Some(1),
+            (AcceptMedia::Any, _) => Some(0),
+            _ => None,
+        }
+    }
 }
 
 pub fn prefers_protobuf(headers: &HeaderMap) -> bool {
@@ -46,7 +78,7 @@ fn negotiate_unary_response_format(
     headers: &HeaderMap,
     protobuf_supported: bool,
 ) -> Result<UnaryResponseFormat, String> {
-    let mut best: Option<AcceptMatch> = None;
+    let mut ranges: Vec<AcceptRange> = Vec::new();
     let mut order = 0usize;
     let mut saw_accept = false;
     for accept in headers.get_all("accept") {
@@ -59,55 +91,108 @@ fn negotiate_unary_response_format(
                 continue;
             }
             saw_accept = true;
-            if let Some(candidate) = parse_unary_accept_part(part, order)
-                && (candidate.format != UnaryResponseFormat::Protobuf || protobuf_supported)
-                && best
-                    .as_ref()
-                    .is_none_or(|current| accept_match_precedes(&candidate, current))
-            {
-                best = Some(candidate);
+            if let Some(range) = parse_unary_accept_part(part, order) {
+                ranges.push(range);
             }
             order += 1;
         }
     }
 
-    if let Some(candidate) = best {
-        Ok(candidate.format)
-    } else if saw_accept {
-        Err("no acceptable response media type is supported".to_string())
-    } else {
-        Ok(UnaryResponseFormat::Json)
+    // For each server-supported representation, derive the effective quality
+    // from its most-specific matching range. A representation whose
+    // controlling quality is zero (an explicit exclusion) is removed; that
+    // exclusion overrides a less-specific wildcard for this representation
+    // while leaving the other representation acceptable.
+    let supported_formats = [UnaryResponseFormat::Json]
+        .into_iter()
+        .chain(protobuf_supported.then_some(UnaryResponseFormat::Protobuf));
+    let mut candidates: Vec<(u16, usize, u8, UnaryResponseFormat)> = Vec::new();
+    for format in supported_formats {
+        let Some((q, controlling_order)) = effective_quality(format, &ranges) else {
+            continue;
+        };
+        if q == 0 {
+            continue;
+        }
+        // Server preference is the final tie-break only: JSON (0) before
+        // protobuf (1).
+        let preference = match format {
+            UnaryResponseFormat::Json => 0,
+            UnaryResponseFormat::Protobuf => 1,
+        };
+        candidates.push((q, controlling_order, preference, format));
     }
+
+    if candidates.is_empty() {
+        return if saw_accept {
+            Err("no acceptable response media type is supported".to_string())
+        } else {
+            Ok(UnaryResponseFormat::Json)
+        };
+    }
+    // Choose by highest quality, then earliest client order, then server
+    // preference (lower is preferred).
+    candidates
+        .sort_by_key(|(q, order, preference, _)| (std::cmp::Reverse(*q), *order, *preference));
+    Ok(candidates[0].3)
 }
 
-fn parse_unary_accept_part(part: &str, order: usize) -> Option<AcceptMatch> {
+/// Compute the effective `(quality, order)` for a representation from its
+/// controlling range: the most-specific matching range, tie-broken by higher
+/// quality then earlier client order.
+fn effective_quality(format: UnaryResponseFormat, ranges: &[AcceptRange]) -> Option<(u16, usize)> {
+    let mut best: Option<(u8, u16, std::cmp::Reverse<usize>)> = None;
+    for range in ranges {
+        let Some(specificity) = range.media.specificity_for(format) else {
+            continue;
+        };
+        let candidate = (specificity, range.q, std::cmp::Reverse(range.order));
+        match best {
+            None => best = Some(candidate),
+            Some(current) if candidate > current => best = Some(candidate),
+            _ => {}
+        }
+    }
+    best.map(|(_, q, std::cmp::Reverse(order))| (q, order))
+}
+
+fn parse_unary_accept_part(part: &str, order: usize) -> Option<AcceptRange> {
     let mut segments = part.split(';');
     let media_type = segments.next()?.trim().to_ascii_lowercase();
     let mut q = 1000u16;
+    let mut well_formed_params = true;
 
     for segment in segments {
-        let (name, value) = segment.trim().split_once('=')?;
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        // A parameter without `=` is a malformed range; reject the whole range
+        // rather than silently tolerating or excluding it.
+        let Some((name, value)) = segment.split_once('=') else {
+            well_formed_params = false;
+            continue;
+        };
         if name.trim().eq_ignore_ascii_case("q") {
             q = parse_accept_q(value.trim());
         }
     }
-    if q == 0 {
+    if !well_formed_params {
         return None;
     }
 
-    let (format, specificity) = match media_type.as_str() {
-        PROTOBUF_MEDIA_TYPE => (UnaryResponseFormat::Protobuf, 2),
-        JSON_MEDIA_TYPE => (UnaryResponseFormat::Json, 2),
-        "application/*" | "*/*" => (UnaryResponseFormat::Json, 0),
+    // Do NOT discard q=0: it is an explicit exclusion that may override a
+    // less-specific wildcard for one representation. Do NOT map application/*
+    // or */* to JSON: a wildcard must be evaluated for every representation.
+    let media = match media_type.as_str() {
+        PROTOBUF_MEDIA_TYPE => AcceptMedia::ExactProtobuf,
+        JSON_MEDIA_TYPE => AcceptMedia::ExactJson,
+        "application/*" => AcceptMedia::ApplicationWildcard,
+        "*/*" => AcceptMedia::Any,
         _ => return None,
     };
 
-    Some(AcceptMatch {
-        format,
-        q,
-        order,
-        specificity,
-    })
+    Some(AcceptRange { media, q, order })
 }
 
 fn parse_accept_q(value: &str) -> u16 {
@@ -142,14 +227,6 @@ fn parse_accept_q(value: &str) -> u16 {
         q += u16::from(byte - b'0') * place;
     }
     q
-}
-
-fn accept_match_precedes(candidate: &AcceptMatch, current: &AcceptMatch) -> bool {
-    candidate.q > current.q
-        || (candidate.q == current.q && candidate.specificity > current.specificity)
-        || (candidate.q == current.q
-            && candidate.specificity == current.specificity
-            && candidate.order < current.order)
 }
 
 pub fn wants_table_format(headers: &HeaderMap) -> Result<bool, AppError> {
@@ -1146,6 +1223,7 @@ fn table_access_modes(modes: &Value) -> String {
 mod response_negotiation_tests {
     use super::*;
     use axum::http::StatusCode;
+    use prost::Message;
 
     fn headers(accept: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -1214,6 +1292,128 @@ mod response_negotiation_tests {
         assert!(!prefers_protobuf(&headers("*/*")));
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Expected {
+        Json,
+        Protobuf,
+        NotAcceptable,
+    }
+
+    /// Table-driven negotiation matrix. Each representation derives its
+    /// effective quality from its most-specific matching range; an exact q=0
+    /// exclusion overrides a less-specific wildcard for that representation
+    /// while leaving the other representation acceptable. Tie-break order is
+    /// higher quality, then earlier client order, then server preference
+    /// (JSON before protobuf).
+    #[test]
+    fn unary_accept_negotiation_matrix() {
+        // (accept header or None, protobuf_supported, expected)
+        #[allow(clippy::type_complexity)]
+        let cases: &[(&str, bool, Expected)] = &[
+            // no Accept header -> JSON default
+            ("\0NO_ACCEPT\0", true, Expected::Json),
+            // exact media types
+            ("application/json", true, Expected::Json),
+            (
+                "application/vnd.kubernetes.protobuf",
+                true,
+                Expected::Protobuf,
+            ),
+            (
+                "application/vnd.kubernetes.protobuf",
+                false,
+                Expected::NotAcceptable,
+            ),
+            // unequal q-values
+            (
+                "application/json;q=0.8, application/vnd.kubernetes.protobuf;q=0.9",
+                true,
+                Expected::Protobuf,
+            ),
+            (
+                "application/json;q=0.9, application/vnd.kubernetes.protobuf;q=0.8",
+                true,
+                Expected::Json,
+            ),
+            // exact JSON excluded, wildcard independently accepts protobuf
+            ("application/json;q=0, */*;q=1", true, Expected::Protobuf),
+            (
+                "application/json;q=0, */*;q=1",
+                false,
+                Expected::NotAcceptable,
+            ),
+            // exact protobuf excluded, wildcard independently accepts JSON
+            (
+                "application/vnd.kubernetes.protobuf;q=0, */*;q=1",
+                true,
+                Expected::Json,
+            ),
+            // exact JSON at lower q controls JSON; wildcard controls protobuf
+            ("application/json;q=0.5, */*;q=1", true, Expected::Protobuf),
+            // exact protobuf at lower q; wildcard independently controls JSON
+            (
+                "application/vnd.kubernetes.protobuf;q=0.5, */*;q=1",
+                true,
+                Expected::Json,
+            ),
+            // application/* and */* with both available -> tie -> JSON
+            ("application/*;q=0.9, */*;q=0.5", true, Expected::Json),
+            ("application/*", true, Expected::Json),
+            ("*/*", true, Expected::Json),
+            // client-order tie breaks
+            (
+                "application/json, application/vnd.kubernetes.protobuf",
+                true,
+                Expected::Json,
+            ),
+            (
+                "application/vnd.kubernetes.protobuf, application/json",
+                true,
+                Expected::Protobuf,
+            ),
+            // explicit q=0 for both representations -> 406
+            (
+                "application/json;q=0, application/vnd.kubernetes.protobuf;q=0",
+                true,
+                Expected::NotAcceptable,
+            ),
+            // unsupported media types and malformed ranges -> 406
+            ("application/xml", true, Expected::NotAcceptable),
+            ("application/json;q", true, Expected::NotAcceptable),
+            ("application/json;q=0", true, Expected::NotAcceptable),
+            (
+                "application/vnd.kubernetes.protobuf;q=0.123junk, application/json;q=0.5",
+                true,
+                Expected::Json,
+            ),
+            // quoted qvalues and case-insensitive q name
+            (
+                "application/json;Q=\"0.5\", application/vnd.kubernetes.protobuf;q=\"0.9\"",
+                true,
+                Expected::Protobuf,
+            ),
+        ];
+
+        for (accept, protobuf_supported, expected) in cases {
+            let header_map = if *accept == "\0NO_ACCEPT\0" {
+                HeaderMap::new()
+            } else {
+                headers(accept)
+            };
+            let result = negotiate_unary_response_format(&header_map, *protobuf_supported);
+            let actual = match result {
+                Ok(UnaryResponseFormat::Json) => Expected::Json,
+                Ok(UnaryResponseFormat::Protobuf) => Expected::Protobuf,
+                Err(_) => Expected::NotAcceptable,
+            };
+            assert_eq!(
+                actual, *expected,
+                "accept={accept:?}, protobuf_supported={protobuf_supported}: \
+                 expected {expected:?}, got {actual:?}",
+            );
+        }
+    }
+
     #[test]
     fn unary_response_negotiation_rejects_when_no_supported_media_remains() {
         assert!(negotiate_unary_response_format(&headers("application/xml"), true).is_err());
@@ -1238,6 +1438,85 @@ mod response_negotiation_tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    /// HTTP-level: a JSON exclusion (`application/json;q=0`) with a wildcard
+    /// must select protobuf for a protobuf-supported resource, returning the
+    /// Kubernetes protobuf content-type and a decodable envelope body.
+    #[tokio::test]
+    async fn k8s_response_selects_protobuf_when_json_excluded_by_q0() {
+        let response = K8sResponse::new(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "cm", "namespace": "default", "resourceVersion": "1"},
+                "data": {"k": "v"}
+            }),
+            &headers("application/json;q=0, */*;q=1"),
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/vnd.kubernetes.protobuf"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..4],
+            b"k8s\0",
+            "body must be a Kubernetes protobuf envelope"
+        );
+        let envelope = crate::protobuf::Unknown::decode(&body[4..]).unwrap();
+        let type_meta = envelope.type_meta.as_ref().unwrap();
+        assert_eq!(type_meta.kind, "ConfigMap");
+        assert_eq!(type_meta.api_version, "v1");
+    }
+
+    /// HTTP-level: the same JSON exclusion must yield 406 when the resource
+    /// has no protobuf codec, proving the 406 result propagates rather than
+    /// defaulting to JSON.
+    #[tokio::test]
+    async fn k8s_response_returns_406_when_json_excluded_and_protobuf_unsupported() {
+        let response = K8sResponse::new(
+            serde_json::json!({
+                "apiVersion": "example.com/v1",
+                "kind": "Widget",
+                "metadata": {"name": "w1"}
+            }),
+            &headers("application/json;q=0, */*;q=1"),
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE);
+    }
+
+    /// HTTP-level: a Status response honors the same negotiation, selecting
+    /// protobuf when JSON is excluded by q=0.
+    #[tokio::test]
+    async fn k8s_status_response_selects_protobuf_when_json_excluded_by_q0() {
+        let response = K8sResponse::new(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Status",
+                "metadata": {},
+                "status": "Success",
+                "code": 200
+            }),
+            &headers("application/json;q=0, */*;q=1"),
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "application/vnd.kubernetes.protobuf"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..4], b"k8s\0");
+        let envelope = crate::protobuf::Unknown::decode(&body[4..]).unwrap();
+        assert_eq!(envelope.type_meta.as_ref().unwrap().kind, "Status");
     }
 }
 
