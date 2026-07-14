@@ -1,12 +1,14 @@
 [package]
 name = "klights"
-edition = "2024"
-rust-version = "1.95.0"
-authors = ["klights-core copyright holders <lapcchan@gmail.com>"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
 description = "A resource-efficient, event-driven Kubernetes-compatible cluster runtime."
 readme = "README.md"
-license = "AGPL-3.0-or-later"
-repository = "https://github.com/klights-net/klights-core"
+license.workspace = true
+repository.workspace = true
 homepage = "https://github.com/klights-net/klights-core"
 documentation = "https://github.com/klights-net/klights-core/blob/main/README.md"
 keywords = ["kubernetes", "k8s", "rust", "containerd", "control-plane"]
@@ -38,11 +40,18 @@ members = [
     "crates/klights-apiserver",
 ]
 
-[build-dependencies]
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95.0"
+authors = ["klights-core copyright holders <lapcchan@gmail.com>"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/klights-net/klights-core"
+publish = false
+
+[workspace.dependencies]
 vergen = { version = "8", features = ["build", "cargo", "git", "gitcl", "rustc", "si"] }
 tonic-prost-build = "0.14"
-
-[dependencies]
 tokio = { version = ">=1.51.0, <1.52.0", features = ["rt", "rt-multi-thread", "macros", "time", "signal", "sync", "net", "process", "fs", "io-util"] }
 tokio-util = "0.7"
 axum = { version = "0.8", features = ["ws"] }
@@ -129,11 +138,6 @@ aes-gcm = "0.10.3"
 # the background purge thread, returns dirty pages to the OS proactively.
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
-
-[profile.dev]
-debug = 1
-
-[dev-dependencies]
 tempfile = "3"
 rstest = "0.25"
 proptest = "1.11.0"
@@ -141,6 +145,143 @@ syn = { version = "2", features = ["full", "visit", "extra-traits"] }
 walkdir = "2"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 
+[workspace.lints.rust]
+warnings = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.metadata.klights.feature-matrix.root-default]
+package = "klights"
+default-features = true
+features = []
+
+[workspace.metadata.klights.feature-matrix.root-full]
+package = "klights"
+default-features = false
+features = ["full"]
+
+[workspace.metadata.klights.feature-matrix.root-sqlcipher]
+package = "klights"
+default-features = false
+features = ["full", "sqlcipher"]
+
+[workspace.metadata.klights.feature-matrix.workspace-unit]
+package = "*"
+default-features = false
+features = []
+
+[build-dependencies]
+vergen = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+axum = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+rusqlite = { workspace = true }
+tokio-rusqlite = { workspace = true }
+redb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_ignored = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true }
+json-patch = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-stream = { workspace = true }
+uuid = { workspace = true }
+hyper = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+hyper-util = { workspace = true }
+time = { workspace = true }
+x509-parser = { workspace = true }
+base64 = { workspace = true }
+hostname = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tonic-reflection = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+prost-reflect = { workspace = true }
+k8s-pb = { workspace = true }
+async-trait = { workspace = true }
+k8s-cri = { workspace = true }
+chrono = { workspace = true }
+jsonwebtoken = { workspace = true }
+native-tls = { workspace = true }
+reqwest = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+urlencoding = { workspace = true }
+toml = { workspace = true }
+sha1 = { workspace = true }
+tokio-tungstenite = { workspace = true }
+sha2 = { workspace = true }
+serde_yaml = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+nix = { workspace = true }
+rtnetlink = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+rsa = { workspace = true }
+inotify = { workspace = true }
+paste = { workspace = true }
+h2 = { workspace = true }
+rust-cel-parser = { workspace = true }
+cel = { workspace = true }
+nftnl = { workspace = true }
+mnl = { workspace = true }
+cron = { workspace = true }
+netlink-packet-core = { workspace = true }
+netlink-packet-core-08 = { workspace = true }
+netlink-packet-generic-04 = { workspace = true }
+netlink-packet-route = { workspace = true }
+netlink-sys = { workspace = true }
+genetlink = { workspace = true }
+netlink-packet-wireguard = { workspace = true }
+x25519-dalek = { workspace = true }
+openraft = { workspace = true }
+aes-gcm = { workspace = true }
+# memory: jemalloc global allocator. Replaces glibc malloc, whose per-thread
+# arenas retain freed memory under churn and never return it to the OS
+# (multi-GB RSS that never shrinks). jemalloc fragments far less and, with
+# the background purge thread, returns dirty pages to the OS proactively.
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+
+[profile.dev]
+debug = 1
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rstest = { workspace = true }
+proptest = { workspace = true }
+syn = { workspace = true }
+walkdir = { workspace = true }
+proc-macro2 = { workspace = true }
+
+[lints]
+workspace = true
+
 [features]
-default = []
-sqlcipher = ["rusqlite/bundled-sqlcipher-vendored-openssl"]
+default = ["full"]
+full = ["sqlite", "redb", "linux-network", "containerd"]
+sqlite = []
+redb = []
+linux-network = []
+containerd = []
+sqlcipher = ["sqlite", "rusqlite/bundled-sqlcipher-vendored-openssl"]
