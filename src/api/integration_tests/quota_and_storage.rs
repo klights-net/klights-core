@@ -473,7 +473,12 @@ async fn test_resourcequota_requests_storage_counts_pvc_requests() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    for (name, storage) in [("data-a", "1Gi"), ("data-b", "1536Mi")] {
+    let one_long = format!("0.{}1e5000", "0".repeat(4999));
+    for (name, storage) in [
+        ("data-a", "1Gi".to_string()),
+        ("data-b", "1536Mi".to_string()),
+        ("data-c", one_long),
+    ] {
         let pvc = json!({
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
@@ -510,8 +515,8 @@ async fn test_resourcequota_requests_storage_counts_pvc_requests() {
         .unwrap();
     assert_eq!(
         quota.data.pointer("/status/used/requests.storage"),
-        Some(&json!("2560Mi")),
-        "ResourceQuota status.used requests.storage must sum PVC requested storage"
+        Some(&json!("2684354561")),
+        "ResourceQuota status.used requests.storage must include the normalized long-exponent PVC value"
     );
 }
 
@@ -1741,6 +1746,7 @@ async fn test_pvc_binding_result_is_same_for_json_and_protobuf_creation() {
     let state = crate::api::test_support::build_test_app_state().await;
     let db = state.db.clone();
     let app = crate::api::build_router(state);
+    let one_long = format!("0.{}1e5000", "0".repeat(4999));
 
     let ns_body = r#"{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"pvc-bind-parity"}}"#;
     let req = Request::builder()
@@ -1752,33 +1758,40 @@ async fn test_pvc_binding_result_is_same_for_json_and_protobuf_creation() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    let json_pv = r#"{
-        "apiVersion":"v1",
-        "kind":"PersistentVolume",
-        "metadata":{"name":"json-pv"},
-        "spec":{"capacity":{"storage":"1Gi"},"accessModes":["ReadWriteOnce"],"persistentVolumeReclaimPolicy":"Retain"},
-        "status":{"phase":"Available"}
-    }"#;
+    let json_pv = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {"name": "json-pv"},
+        "spec": {
+            "capacity": {"storage": one_long.clone()},
+            "accessModes": ["ReadWriteOnce"],
+            "persistentVolumeReclaimPolicy": "Retain"
+        },
+        "status": {"phase": "Available"}
+    });
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/persistentvolumes")
         .header("content-type", "application/json")
-        .body(Body::from(json_pv))
+        .body(Body::from(json_pv.to_string()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    let json_pvc = r#"{
-        "apiVersion":"v1",
-        "kind":"PersistentVolumeClaim",
-        "metadata":{"name":"json-pvc","namespace":"pvc-bind-parity"},
-        "spec":{"accessModes":["ReadWriteOnce"],"resources":{"requests":{"storage":"1Gi"}}}
-    }"#;
+    let json_pvc = json!({
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": {"name": "json-pvc", "namespace": "pvc-bind-parity"},
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": "1"}}
+        }
+    });
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/namespaces/pvc-bind-parity/persistentvolumeclaims")
         .header("content-type", "application/json")
-        .body(Body::from(json_pvc))
+        .body(Body::from(json_pvc.to_string()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -1787,7 +1800,7 @@ async fn test_pvc_binding_result_is_same_for_json_and_protobuf_creation() {
     json_pv_capacity.insert(
         "storage".to_string(),
         Quantity {
-            string: Some("1Gi".to_string()),
+            string: Some("1".to_string()),
         },
     );
     let mut proto_pv = Vec::new();
@@ -1823,7 +1836,7 @@ async fn test_pvc_binding_result_is_same_for_json_and_protobuf_creation() {
     proto_pvc_requests.insert(
         "storage".to_string(),
         Quantity {
-            string: Some("1Gi".to_string()),
+            string: Some(one_long),
         },
     );
     let mut proto_pvc_body = Vec::new();

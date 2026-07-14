@@ -1231,6 +1231,14 @@ mod response_negotiation_tests {
         headers
     }
 
+    fn repeated_headers(accepts: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for accept in accepts {
+            headers.append("accept", accept.parse().unwrap());
+        }
+        headers
+    }
+
     #[test]
     fn unary_response_defaults_to_json_without_accept() {
         assert!(!prefers_protobuf(&HeaderMap::new()));
@@ -1324,6 +1332,11 @@ mod response_negotiation_tests {
                 false,
                 Expected::NotAcceptable,
             ),
+            (
+                "application/vnd.kubernetes.protobuf, application/json;q=0.5",
+                false,
+                Expected::Json,
+            ),
             // unequal q-values
             (
                 "application/json;q=0.8, application/vnd.kubernetes.protobuf;q=0.9",
@@ -1380,6 +1393,7 @@ mod response_negotiation_tests {
             // unsupported media types and malformed ranges -> 406
             ("application/xml", true, Expected::NotAcceptable),
             ("application/json;q", true, Expected::NotAcceptable),
+            ("application/json;q=0.1234", true, Expected::NotAcceptable),
             ("application/json;q=0", true, Expected::NotAcceptable),
             (
                 "application/vnd.kubernetes.protobuf;q=0.123junk, application/json;q=0.5",
@@ -1389,6 +1403,11 @@ mod response_negotiation_tests {
             // quoted qvalues and case-insensitive q name
             (
                 "application/json;Q=\"0.5\", application/vnd.kubernetes.protobuf;q=\"0.9\"",
+                true,
+                Expected::Protobuf,
+            ),
+            (
+                "Application/Json;q=0.5, Application/Vnd.Kubernetes.Protobuf;q=0.9",
                 true,
                 Expected::Protobuf,
             ),
@@ -1412,6 +1431,23 @@ mod response_negotiation_tests {
                  expected {expected:?}, got {actual:?}",
             );
         }
+    }
+
+    #[test]
+    fn unary_accept_negotiation_preserves_repeated_header_order() {
+        let protobuf_first =
+            repeated_headers(&["application/vnd.kubernetes.protobuf", "application/json"]);
+        assert!(
+            negotiate_unary_response_format(&protobuf_first, true)
+                .is_ok_and(|format| format == UnaryResponseFormat::Protobuf)
+        );
+
+        let json_first =
+            repeated_headers(&["application/json", "application/vnd.kubernetes.protobuf"]);
+        assert!(
+            negotiate_unary_response_format(&json_first, true)
+                .is_ok_and(|format| format == UnaryResponseFormat::Json)
+        );
     }
 
     #[test]

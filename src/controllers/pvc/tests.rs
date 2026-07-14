@@ -183,6 +183,71 @@ async fn test_pvc_binds_to_matching_pv() {
 }
 
 #[tokio::test]
+async fn test_pvc_long_exponent_quantity_selects_exact_smallest_sufficient_pv() {
+    let db = crate::datastore::test_support::in_memory().await;
+    let one_long = format!("0.{}1e5000", "0".repeat(4999));
+
+    for (name, capacity) in [
+        ("too-small", "0".to_string()),
+        ("exact-long", one_long),
+        ("larger", "2".to_string()),
+    ] {
+        db.create_resource(
+            "v1",
+            "PersistentVolume",
+            None,
+            name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolume",
+                "metadata": {"name": name},
+                "spec": {
+                    "capacity": {"storage": capacity},
+                    "accessModes": ["ReadWriteOnce"],
+                    "persistentVolumeReclaimPolicy": "Retain"
+                },
+                "status": {"phase": "Available"}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    db.create_resource(
+        "v1",
+        "PersistentVolumeClaim",
+        Some("default"),
+        "long-quantity-pvc",
+        json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {"name": "long-quantity-pvc", "namespace": "default"},
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "resources": {"requests": {"storage": "1"}}
+            }
+        }),
+    )
+    .await
+    .unwrap();
+
+    let pvc = get_pvc(&db, "default", "long-quantity-pvc").await;
+    reconcile_pvc(&db, &pvc).await.unwrap();
+
+    let pvc = get_pvc(&db, "default", "long-quantity-pvc").await;
+    assert_eq!(pvc.pointer("/status/phase"), Some(&json!("Bound")));
+    assert_eq!(
+        pvc.pointer("/status/volumeName"),
+        Some(&json!("exact-long")),
+        "equivalent long and ordinary quantities must compare equal, while a smaller PV stays insufficient"
+    );
+    assert_eq!(
+        get_pv(&db, "too-small").await.pointer("/status/phase"),
+        Some(&json!("Available"))
+    );
+}
+
+#[tokio::test]
 async fn test_pvc_bind_preserves_status_conditions() {
     let db = crate::datastore::test_support::in_memory().await;
 

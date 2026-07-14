@@ -2410,7 +2410,7 @@ async fn test_service_status_subresource_preserves_fields_and_negotiates_json_pr
             Request::builder()
                 .method("GET")
                 .uri("/api/v1/namespaces/service-status-api/services/svc/status")
-                .header("accept", "application/vnd.kubernetes.protobuf")
+                .header("accept", "application/json;q=0, */*;q=1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2421,7 +2421,7 @@ async fn test_service_status_subresource_preserves_fields_and_negotiates_json_pr
     assert_eq!(
         got.pointer("/status/loadBalancer/ingress/0/ip"),
         Some(&json!("198.51.100.20")),
-        "GET /status protobuf response must carry the native Service status"
+        "GET /status must select protobuf through the wildcard when JSON is excluded"
     );
 
     let events = db

@@ -11,7 +11,7 @@ struct Suffix {
 #[derive(Clone)]
 struct QuantityRational {
     numerator: BigInt,
-    denominator: BigInt,
+    scale10: u32,
     exponent10: i32,
 }
 
@@ -249,15 +249,15 @@ fn parse_decimal_rational(raw: &str, allow_exponent: bool) -> Option<QuantityRat
     }
 
     let (number, exponent) = split_exponent(raw)?;
-    let (numerator, denominator) = parse_decimal_rational_no_exponent(number)?;
+    let (numerator, scale10) = parse_decimal_rational_no_exponent(number)?;
     Some(QuantityRational {
         numerator,
-        denominator,
+        scale10,
         exponent10: exponent,
     })
 }
 
-fn parse_decimal_rational_no_exponent(raw: &str) -> Option<(BigInt, BigInt)> {
+fn parse_decimal_rational_no_exponent(raw: &str) -> Option<(BigInt, u32)> {
     let (int_part, mut frac_part) = match raw.split_once('.') {
         Some((int_part, frac_part)) => (int_part, frac_part),
         None => (raw, ""),
@@ -279,14 +279,15 @@ fn parse_decimal_rational_no_exponent(raw: &str) -> Option<(BigInt, BigInt)> {
     } else {
         parse_decimal_digits(int_part)?
     };
-    let frac_scale = pow10_big(frac_part.len().try_into().ok()?)?;
+    let scale10 = frac_part.len().try_into().ok()?;
+    let frac_scale = pow10_big(scale10)?;
     let frac_value = if frac_part.is_empty() {
         BigInt::zero()
     } else {
         parse_decimal_digits(frac_part)?
     };
     let numerator = int_value * &frac_scale + frac_value;
-    Some((numerator, frac_scale))
+    Some((numerator, scale10))
 }
 
 fn parse_decimal_digits(raw: &str) -> Option<BigInt> {
@@ -345,18 +346,18 @@ fn apply_quantity(
     let numerator = rational.numerator
         * BigInt::from(1000_i128)
         * BigInt::from(suffix.map_or(1, |suffix| suffix.num));
-    let denominator = rational.denominator
-        * BigInt::from(final_div)
-        * BigInt::from(suffix.map_or(1, |suffix| suffix.den));
-
     // Any valid zero coefficient remains zero for every representable
     // exponent; short-circuit before allocating a huge power of ten.
     if numerator.is_zero() {
         return Some(0);
     }
 
-    let (mut numerator, mut denominator, exponent10) =
-        normalize_decimal_exponent(numerator, denominator, rational.exponent10)?;
+    let denominator_scale10 = rational
+        .scale10
+        .checked_add(decimal_power_scale(final_div)?)?
+        .checked_add(decimal_power_scale(suffix.map_or(1, |suffix| suffix.den))?)?;
+    let (mut numerator, mut denominator_scale10, exponent10) =
+        normalize_decimal_exponent(numerator, denominator_scale10, rational.exponent10)?;
     match exponent10 {
         exp if exp > 0 => {
             // The cap now applies to the *reduced* exponent. A raw exponent
@@ -373,17 +374,18 @@ fn apply_quantity(
             if magnitude > numerator_scale_digits + 4096 {
                 return Some(1);
             }
-            denominator *= pow10_big(magnitude)?;
+            denominator_scale10 = denominator_scale10.checked_add(magnitude)?;
         }
         _ => {}
     }
 
+    let denominator = pow10_big(denominator_scale10)?;
     let scaled = ceil_div_bigint(&numerator, &denominator)?;
     bounded_big_i64(&scaled)
 }
 
-/// Cancel positive powers of ten against the base-10 factors of the
-/// denominator before any overflow classification.
+/// Cancel a positive exponent against the explicit base-10 denominator scale
+/// before any overflow classification.
 ///
 /// The denominator is always a product of powers of ten (decimal scale, final
 /// scaling, and SI suffix factors), so cancelling `min(exponent, valuation)`
@@ -391,25 +393,35 @@ fn apply_quantity(
 /// before the large-positive-exponent cap: a quantity such as
 /// `0.` + 4,999 zeros + `1e5000` has a raw exponent of 5000 but a decimal
 /// denominator of `10^5000`, so the reduced exponent is zero and the value is
-/// exactly one. The cancellation uses bounded single-division steps and never
-/// allocates `10^exp` for an enormous unreduced exponent.
+/// exactly one. Tracking the scale as an integer makes cancellation constant
+/// time and avoids constructing and repeatedly dividing a huge `BigInt`.
 fn normalize_decimal_exponent(
     numerator: BigInt,
-    denominator: BigInt,
+    scale10: u32,
     exponent10: i32,
-) -> Option<(BigInt, BigInt, i32)> {
+) -> Option<(BigInt, u32, i32)> {
     if exponent10 <= 0 {
-        return Some((numerator, denominator, exponent10));
+        return Some((numerator, scale10, exponent10));
     }
-    let ten = BigInt::from(10);
-    let one = BigInt::one();
-    let mut denominator = denominator;
-    let mut exponent10 = exponent10;
-    while exponent10 > 0 && denominator > one && (&denominator % &ten) == BigInt::zero() {
-        denominator /= &ten;
-        exponent10 -= 1;
+    let positive_exponent: u32 = exponent10.try_into().ok()?;
+    let cancelled = scale10.min(positive_exponent);
+    Some((
+        numerator,
+        scale10 - cancelled,
+        exponent10.checked_sub(cancelled.try_into().ok()?)?,
+    ))
+}
+
+fn decimal_power_scale(mut value: i128) -> Option<u32> {
+    if value <= 0 {
+        return None;
     }
-    Some((numerator, denominator, exponent10))
+    let mut scale = 0u32;
+    while value > 1 && value % 10 == 0 {
+        value /= 10;
+        scale = scale.checked_add(1)?;
+    }
+    (value == 1).then_some(scale)
 }
 
 fn ceil_div_bigint(value: &BigInt, divisor: &BigInt) -> Option<BigInt> {
@@ -432,11 +444,7 @@ fn bounded_big_i64(value: &BigInt) -> Option<i64> {
 }
 
 fn pow10_big(exp: u32) -> Option<BigInt> {
-    let mut value = BigInt::one();
-    for _ in 0..exp {
-        value *= 10;
-    }
-    Some(value)
+    Some(BigInt::from(10u8).pow(exp))
 }
 
 #[cfg(test)]
@@ -635,5 +643,42 @@ mod tests {
             parse_resource_quantity("storage", &one_with_huge_exp),
             parse_resource_quantity("storage", "1")
         );
+
+        for (resource, expected) in [
+            ("cpu", 1000),
+            ("storage", 1),
+            ("memory", 1),
+            ("example.com/widgets", 1),
+        ] {
+            assert_eq!(
+                parse_resource_quantity(resource, &one_with_huge_exp),
+                Some(expected),
+                "resource scaling must remain exact for {resource}"
+            );
+        }
+
+        assert_eq!(
+            parse_resource_quantity("storage", "9223372036854775806"),
+            Some(i64::MAX - 1)
+        );
+        assert_eq!(
+            parse_resource_quantity("storage", "9223372036854775807"),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            parse_resource_quantity("storage", "9223372036854775808"),
+            Some(i64::MAX)
+        );
+        assert_eq!(parse_resource_quantity("storage", "1e3M"), None);
+        assert_eq!(parse_resource_quantity("memory", "1e3Gi"), None);
+    }
+
+    #[test]
+    fn normalize_decimal_exponent_reduces_scale_without_bigint_digit_walk() {
+        let (numerator, scale10, exponent10) =
+            normalize_decimal_exponent(BigInt::from(7), 100_000, 99_999).unwrap();
+        assert_eq!(numerator, BigInt::from(7));
+        assert_eq!(scale10, 1);
+        assert_eq!(exponent10, 0);
     }
 }
