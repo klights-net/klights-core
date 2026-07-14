@@ -259,6 +259,29 @@ fn test_parse_resource_quantity_storage_matches_kubernetes_semantics() {
 }
 
 #[test]
+fn test_parse_resource_quantity_long_exponent_normalizes_before_quota_totals() {
+    // A long-exponent quantity whose decimal scale cancels the exponent must
+    // reduce to its exact value, not i64::MAX, so resource-quota totals are not
+    // corrupted by the pre-normalization overflow cap.
+    let one_long = format!("0.{}1e5000", "0".repeat(4999));
+    let one = parse_resource_quantity("storage", &one_long);
+    assert_eq!(one, parse_resource_quantity("storage", "1"));
+    assert_eq!(one, Some(1));
+    assert_ne!(one, Some(i64::MAX));
+
+    // Equivalent long-exponent and ordinary spellings compare equal, so PVC
+    // requests and PV capacities using either form bind deterministically.
+    let ten_long = format!("0.{}1e5001", "0".repeat(4999));
+    assert_eq!(
+        parse_resource_quantity("storage", &ten_long),
+        parse_resource_quantity("storage", "10")
+    );
+
+    // A genuinely huge value still caps so quota overflow accounting is preserved.
+    assert_eq!(parse_resource_quantity("storage", "1e5000"), Some(i64::MAX));
+}
+
+#[test]
 fn test_parse_resource_quantity_storage_rejects_malformed_or_invalid_values() {
     assert_eq!(
         parse_resource_quantity("storage", "1.2345Gi"),

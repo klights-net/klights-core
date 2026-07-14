@@ -342,20 +342,28 @@ fn apply_quantity(
     suffix: Option<&Suffix>,
     final_div: i128,
 ) -> Option<i64> {
-    let mut numerator = rational.numerator
+    let numerator = rational.numerator
         * BigInt::from(1000_i128)
         * BigInt::from(suffix.map_or(1, |suffix| suffix.num));
-    let mut denominator = rational.denominator
+    let denominator = rational.denominator
         * BigInt::from(final_div)
         * BigInt::from(suffix.map_or(1, |suffix| suffix.den));
-    match rational.exponent10 {
+
+    // Any valid zero coefficient remains zero for every representable
+    // exponent; short-circuit before allocating a huge power of ten.
+    if numerator.is_zero() {
+        return Some(0);
+    }
+
+    let (mut numerator, mut denominator, exponent10) =
+        normalize_decimal_exponent(numerator, denominator, rational.exponent10)?;
+    match exponent10 {
         exp if exp > 0 => {
+            // The cap now applies to the *reduced* exponent. A raw exponent
+            // above 4096 is no longer sufficient evidence of overflow because
+            // the decimal denominator may have cancelled it.
             if exp > 4096 {
-                return if numerator.is_zero() {
-                    Some(0)
-                } else {
-                    Some(i64::MAX)
-                };
+                return Some(i64::MAX);
             }
             numerator *= pow10_big(exp.try_into().ok()?)?;
         }
@@ -363,11 +371,7 @@ fn apply_quantity(
             let magnitude = exp.checked_neg()?.try_into().ok()?;
             let numerator_scale_digits: u32 = numerator.to_str_radix(10).len().try_into().ok()?;
             if magnitude > numerator_scale_digits + 4096 {
-                return if numerator.is_zero() {
-                    Some(0)
-                } else {
-                    Some(1)
-                };
+                return Some(1);
             }
             denominator *= pow10_big(magnitude)?;
         }
@@ -376,6 +380,36 @@ fn apply_quantity(
 
     let scaled = ceil_div_bigint(&numerator, &denominator)?;
     bounded_big_i64(&scaled)
+}
+
+/// Cancel positive powers of ten against the base-10 factors of the
+/// denominator before any overflow classification.
+///
+/// The denominator is always a product of powers of ten (decimal scale, final
+/// scaling, and SI suffix factors), so cancelling `min(exponent, valuation)`
+/// factors reduces both the exponent and the denominator. This must happen
+/// before the large-positive-exponent cap: a quantity such as
+/// `0.` + 4,999 zeros + `1e5000` has a raw exponent of 5000 but a decimal
+/// denominator of `10^5000`, so the reduced exponent is zero and the value is
+/// exactly one. The cancellation uses bounded single-division steps and never
+/// allocates `10^exp` for an enormous unreduced exponent.
+fn normalize_decimal_exponent(
+    numerator: BigInt,
+    denominator: BigInt,
+    exponent10: i32,
+) -> Option<(BigInt, BigInt, i32)> {
+    if exponent10 <= 0 {
+        return Some((numerator, denominator, exponent10));
+    }
+    let ten = BigInt::from(10);
+    let one = BigInt::one();
+    let mut denominator = denominator;
+    let mut exponent10 = exponent10;
+    while exponent10 > 0 && denominator > one && (&denominator % &ten) == BigInt::zero() {
+        denominator /= &ten;
+        exponent10 -= 1;
+    }
+    Some((numerator, denominator, exponent10))
 }
 
 fn ceil_div_bigint(value: &BigInt, divisor: &BigInt) -> Option<BigInt> {
@@ -569,5 +603,37 @@ mod tests {
         assert_eq!(parse_resource_quantity("storage", "0"), Some(0));
         assert_eq!(parse_resource_quantity("cpu", "0"), Some(0));
         assert_eq!(parse_resource_quantity("memory", "0"), Some(0));
+    }
+
+    /// Positive decimal exponents must cancel against the decimal denominator
+    /// before any overflow cap is applied. A quantity like
+    /// `0.` + 4,999 zeros + `1e5000` equals exactly one, not `i64::MAX`.
+    #[test]
+    fn normalize_decimal_exponent_cancels_huge_positive_exponent() {
+        // 0.<4999 zeros>1e5000 == 1 (5000 fractional digits cancel 5000 powers)
+        let one_with_huge_exp = format!("0.{}1e5000", "0".repeat(4999));
+        assert_eq!(
+            parse_resource_quantity("storage", &one_with_huge_exp),
+            Some(1)
+        );
+        // exponent 4999 leaves one outstanding fractional digit -> sub-unit ceil
+        let sub_unit = format!("0.{}1e4999", "0".repeat(4999));
+        assert_eq!(parse_resource_quantity("storage", &sub_unit), Some(1));
+        // exponent 5001 leaves one integer digit -> 10
+        let ten = format!("0.{}1e5001", "0".repeat(4999));
+        assert_eq!(parse_resource_quantity("storage", &ten), Some(10));
+        // a coefficient whose decimal scale only partially cancels
+        let partial = format!("0.{}12e5000", "0".repeat(4998));
+        assert_eq!(parse_resource_quantity("storage", &partial), Some(12));
+        // genuine overflow that remains huge after cancellation still caps
+        assert_eq!(parse_resource_quantity("storage", "1e5000"), Some(i64::MAX));
+        // zero coefficient with huge exponents stays zero without huge allocation
+        assert_eq!(parse_resource_quantity("storage", "0e2147483647"), Some(0));
+        assert_eq!(parse_resource_quantity("storage", "0e-2147483647"), Some(0));
+        // equivalent long-exponent and ordinary spellings compare equal
+        assert_eq!(
+            parse_resource_quantity("storage", &one_with_huge_exp),
+            parse_resource_quantity("storage", "1")
+        );
     }
 }
