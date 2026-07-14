@@ -6,6 +6,103 @@ This project uses GitHub Releases as the canonical public release page. The
 release workflow extracts the matching version section from this file and
 attaches distro packages to the GitHub Release.
 
+## [0.9.13] - 2026-07-13
+
+This release hardens **protobuf API compatibility** for clients such as
+client-go, kubectl, and ArgoCD, completes **Kubernetes Quantity parsing**
+fidelity, and restores two control-plane correctness paths: pod phase
+transitions and leader-owned static volume reconciliation.
+
+### What's new
+
+- **Protobuf watch and response fidelity.** Watch events are now emitted as
+  raw length-prefixed protobuf stream events carrying the watched
+  group/version in the outer Kubernetes envelope, status responses preserve
+  their protobuf fields, and metadata timestamps keep apimachinery precision
+  across JSON and protobuf paths. This closes several client-go/protobuf watch
+  framing and status-shape gaps.
+- **Kubernetes Quantity parsing fidelity.** Quantities are parsed with bigint
+  precision, whitespace is rejected, and exponent/rational scaling is reduced
+  before multiplication, completing quantity and content-negotiation edge
+  handling for resource requests and limits.
+- **Canonical metadata creation timestamps.** Server-generated
+  `creationTimestamp` fields are stamped at `metav1.Time` second precision and
+  kept aligned across create paths and protobuf decode.
+- **Pod phase correctness restored.** A `Never` restart policy combined with a
+  nonzero exit code again transitions the pod to the `Failed` phase.
+- **Leader-owned static volume reconciliation restored.** PersistentVolume and
+  PersistentVolumeClaim reconciliation is now driven by injected leadership
+  authority instead of a hard-coded boolean, so a `Pending` PVC created before
+  its matching static PV binds once the PV appears. Followers and workers never
+  originate PV/PVC writes, and reconciliation stays event-driven with no
+  polling.
+
+### Kubernetes compatibility status
+
+- Targets Kubernetes v1.34.6 API compatibility.
+- Protobuf watch event framing, status response shape, and metadata timestamp
+  precision now match apimachinery semantics, improving client-go/protobuf and
+  ArgoCD compatibility.
+- Kubernetes `resource.Quantity` parsing now handles bigint precision,
+  whitespace rejection, and exponent/rational scaling edge cases.
+
+### Known beta limitations
+
+Carried forward from 0.9.12; no listed limitation was fully resolved in this
+release.
+
+- HPA autoscaling control loop and metrics-backed autoscaling remain
+  deferred; the metrics data source is available, but the autoscaler is not.
+- Pod subresource coverage is incomplete: `pods/attach` is still not
+  implemented, and the `pods/binding` subresource route is missing.
+- Built-in OpenAPI schemas are incomplete. CRD OpenAPI publishing exists, but
+  built-in kinds still expose stub schemas, so `kubectl explain` for built-in
+  fields is limited.
+- Scheduler behavior is not fully upstream-compatible. Known gaps include
+  pod affinity/anti-affinity, topology spread constraints, PDB-aware
+  preemption, preferred node-affinity scoring, hostPort conflict predicates,
+  and some taint handling/default-priority behavior.
+- PodSecurity admission is not implemented. Namespace labels such as
+  `pod-security.kubernetes.io/enforce`, `audit`, and `warn` are not enforced.
+- Some admission/defaulting behavior remains incomplete, including parts of
+  ResourceQuota, LimitRange, DefaultStorageClass, Service family defaulting,
+  Pod defaulting, ServiceAccount imagePullSecret propagation, and built-in
+  field-selector validation.
+- Watch and delete semantics still have known edge-case gaps, including
+  selector-less `resourceVersion=0` watch behavior, pending-delete status
+  codes, `DeleteCollection` dry-run handling, and some foreground/orphan
+  deletion details, although protobuf watch event framing was hardened in
+  this release.
+- NetworkPolicy resources are stored but not yet enforced in the datapath.
+- Aggregated API server support is passthrough-only; the kube-aggregator
+  control plane is not implemented.
+- API Priority and Fairness resources exist for CRUD/discovery, but request
+  prioritization is not enforced.
+- Structured audit logging is not yet implemented.
+- Server-Side Apply (`application/apply-patch+yaml`) is implemented for built-in
+  resources: `metadata.managedFields` is produced, cross-manager conflicts are
+  reported (HTTP 409), `force=true` transfers ownership, and dropped fields are
+  pruned. It is not yet complete: field ownership uses heuristic merge-key
+  inference rather than a schema-driven engine, CRD apply does not produce
+  `managedFields`, and protobuf responses omit `managedFields` (JSON-only).
+
+### Binary packages
+
+This release publishes:
+
+- Static binaries: `klights-linux-x86_64-static`, `klights-linux-arm64-static`
+- Ubuntu 24.04 (noble): `klights_0.9.13-1~noble_amd64.deb`, `klights_0.9.13-1~noble_arm64.deb`
+- Ubuntu 26.04 (resolute): `klights_0.9.13-1~resolute_amd64.deb`, `klights_0.9.13-1~resolute_arm64.deb`
+- RHEL 9: `klights-0.9.13-1.el9.x86_64.rpm`, `klights-0.9.13-1.el9.aarch64.rpm`
+- RHEL 10: `klights-0.9.13-1.el10.x86_64.rpm`, `klights-0.9.13-1.el10.aarch64.rpm`
+- RHEL runtime dependencies: `containerd-2.3.2-1.el9.x86_64.rpm`, `containerd-2.3.2-1.el9.aarch64.rpm`, `containerd-2.3.2-1.el10.x86_64.rpm`, `containerd-2.3.2-1.el10.aarch64.rpm`, `runc-1.5.0-1.el9.x86_64.rpm`, `runc-1.5.0-1.el9.aarch64.rpm`, `runc-1.5.0-1.el10.x86_64.rpm`, `runc-1.5.0-1.el10.aarch64.rpm`
+
+Package repositories are published from the `package-repo` branch:
+
+- APT: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt
+- RPM: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm
+- Public key: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc
+
 ## [0.9.12] - 2026-07-11
 
 This release makes the **on-demand metrics API production-ready** and
