@@ -12,6 +12,9 @@ documentation = "https://github.com/klights-net/klights-core/blob/main/README.md
 keywords = ["kubernetes", "k8s", "rust", "containerd", "control-plane"]
 categories = ["command-line-utilities", "network-programming"]
 
+[workspace]
+resolver = "3"
+
 [build-dependencies]
 vergen = { version = "8", features = ["build", "cargo", "git", "gitcl", "rustc", "si"] }
 tonic-prost-build = "0.14"
