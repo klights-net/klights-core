@@ -2173,6 +2173,7 @@ version = "0.0.0"
 name = "klights-types"
 version = "0.0.0"
 dependencies = [
+ "json-patch",
  "num-bigint",
  "num-traits",
  "serde_json",

@@ -1,16 +1,29 @@
 //! Shared domain types for klights.
 
+pub mod json_patch;
 pub mod label_selector;
+pub mod pod_status_merge;
 pub mod quantity;
+pub mod resource_semantics;
 
 use std::fmt;
 
+pub use json_patch::apply_merge_patch;
 pub use label_selector::{
     LabelRequirement, LabelSelector, LabelSelectorParseError, parse_label_selector, split_selector,
+};
+pub use pod_status_merge::{
+    PodStatusOwner, PodStatusPatch, merge_owned_and_preserved_conditions,
+    merge_pod_status_for_update,
 };
 pub use quantity::{
     format_cpu_milli, format_memory_bytes, format_resource_quantity, is_binary_quantity_resource,
     parse_cpu_milli, parse_decimal_si_quantity, parse_memory_bytes, parse_resource_quantity,
+};
+pub use resource_semantics::{
+    has_builtin_status_subresource, is_pod_delete_mark_patch, is_zero_grace_pod_delete_mark_patch,
+    mark_terminating_pod_unready_at, pod_delete_mark_patch_without_status,
+    preserve_status_subresource_on_main_update,
 };
 
 /// API resource identity used by leader queries and API mutations.
@@ -71,7 +84,13 @@ impl fmt::Display for PodIdentity {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{PodIdentity, ResourceKey};
+    use serde_json::json;
+
+    use super::{
+        PodIdentity, PodStatusOwner, ResourceKey, apply_merge_patch,
+        is_zero_grace_pod_delete_mark_patch, mark_terminating_pod_unready_at,
+        merge_pod_status_for_update,
+    };
 
     #[test]
     fn resource_key_preserves_current_identity_strings() {
@@ -137,5 +156,62 @@ mod tests {
         assert_eq!(identities.len(), 2);
         assert!(identities.contains(&first));
         assert!(identities.contains(&replacement));
+    }
+
+    #[test]
+    fn canonical_merge_patch_contract_is_infallible() {
+        let mut resource = json!({"metadata": {"labels": {"keep": "yes", "drop": "yes"}}});
+        apply_merge_patch(
+            &mut resource,
+            &json!({"metadata": {"labels": {"drop": null, "new": "yes"}}}),
+        );
+        assert_eq!(
+            resource,
+            json!({"metadata": {"labels": {"keep": "yes", "new": "yes"}}})
+        );
+    }
+
+    #[test]
+    fn canonical_pod_delete_and_readiness_contract_is_stable() {
+        let patch = json!({
+            "metadata": {
+                "deletionTimestamp": "2026-07-15T00:00:00Z",
+                "deletionGracePeriodSeconds": 0
+            },
+            "status": {"phase": "Running"}
+        });
+        assert!(is_zero_grace_pod_delete_mark_patch("v1", "Pod", &patch));
+
+        let mut pod = json!({"status": {"conditions": [], "containerStatuses": [{"ready": true}]}});
+        mark_terminating_pod_unready_at(&mut pod, "2026-07-15T00:00:00Z");
+        assert_eq!(
+            pod.pointer("/status/containerStatuses/0/ready"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            pod.pointer("/status/conditions/0/lastTransitionTime"),
+            Some(&json!("2026-07-15T00:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn canonical_pod_status_owner_preserves_scheduler_condition() {
+        let current = json!({"status": {"conditions": [
+            {"type": "Ready", "status": "True"},
+            {"type": "DisruptionTarget", "status": "True"}
+        ]}});
+        let mut incoming = json!({"conditions": [{"type": "Ready", "status": "False"}]});
+        merge_pod_status_for_update(
+            "v1",
+            "Pod",
+            &current,
+            &mut incoming,
+            PodStatusOwner::KubeletRuntime,
+        );
+        assert!(incoming["conditions"].as_array().is_some_and(|conditions| {
+            conditions.iter().any(|condition| {
+                condition.get("type").and_then(|value| value.as_str()) == Some("DisruptionTarget")
+            })
+        }));
     }
 }
