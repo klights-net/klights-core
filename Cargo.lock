@@ -2024,6 +2024,7 @@ dependencies = [
  "k8s-cri",
  "k8s-openapi",
  "k8s-pb",
+ "klights-types",
  "kube",
  "libc",
  "mnl",

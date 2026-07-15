@@ -13,6 +13,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
+#[deprecated(note = "use klights_types::ResourceKey directly; removed in Phase 3.4")]
+pub use klights_types::ResourceKey;
 
 use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource, ResourceList, WatchReplayPosition};
 use crate::kubelet::outbox::payload::OutboxOperation;
@@ -25,14 +27,6 @@ pub type ConfigMap = Resource;
 pub type Secret = Resource;
 pub type Node = Resource;
 pub type WatchStream<T> = Pin<Box<dyn Stream<Item = Result<T>> + Send>>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceKey {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub name: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRequest {

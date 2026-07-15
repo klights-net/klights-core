@@ -1559,7 +1559,7 @@ async fn delete_collection_cr_inner(
             Err(err) => return Err(err),
         };
         items.push((
-            crate::api::mutation::ResourceIdentity::new(
+            klights_types::ResourceKey::new(
                 stored_api_version,
                 info.kind.clone(),
                 ns.map(str::to_string),
@@ -2370,7 +2370,7 @@ async fn delete_cr_inner(
         .into_response());
     }
 
-    let target_identity = crate::api::mutation::ResourceIdentity::new(
+    let target_identity = klights_types::ResourceKey::new(
         stored_api_version.clone(),
         info.kind.clone(),
         ns.map(str::to_string),

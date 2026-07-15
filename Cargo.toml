@@ -50,6 +50,7 @@ repository = "https://github.com/klights-net/klights-core"
 publish = false
 
 [workspace.dependencies]
+klights-types = { path = "crates/klights-types" }
 vergen = { version = "8", features = ["build", "cargo", "git", "gitcl", "rustc", "si"] }
 tonic-prost-build = "0.14"
 tokio = { version = ">=1.51.0, <1.52.0", features = ["rt", "rt-multi-thread", "macros", "time", "signal", "sync", "net", "process", "fs", "io-util"] }
@@ -176,6 +177,7 @@ vergen = { workspace = true }
 tonic-prost-build = { workspace = true }
 
 [dependencies]
+klights-types = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 axum = { workspace = true }

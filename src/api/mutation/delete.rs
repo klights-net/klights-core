@@ -34,14 +34,11 @@ pub enum DeleteResult {
 
 #[async_trait]
 pub trait DeleteStrategy: Send + Sync {
-    async fn load(
-        &self,
-        target: &crate::api::mutation::ResourceIdentity,
-    ) -> Result<Resource, AppError>;
+    async fn load(&self, target: &klights_types::ResourceKey) -> Result<Resource, AppError>;
 
     async fn execute(
         &self,
-        target: &crate::api::mutation::ResourceIdentity,
+        target: &klights_types::ResourceKey,
         resource: Resource,
         intent: &crate::api::mutation::DeleteIntent,
     ) -> Result<DeleteResult, AppError>;
@@ -53,10 +50,7 @@ pub struct FinalizerAwareDeleteStrategy<'a> {
 
 #[async_trait]
 impl DeleteStrategy for FinalizerAwareDeleteStrategy<'_> {
-    async fn load(
-        &self,
-        target: &crate::api::mutation::ResourceIdentity,
-    ) -> Result<Resource, AppError> {
+    async fn load(&self, target: &klights_types::ResourceKey) -> Result<Resource, AppError> {
         self.db
             .get_resource(
                 &target.api_version,
@@ -70,7 +64,7 @@ impl DeleteStrategy for FinalizerAwareDeleteStrategy<'_> {
 
     async fn execute(
         &self,
-        target: &crate::api::mutation::ResourceIdentity,
+        target: &klights_types::ResourceKey,
         resource: Resource,
         intent: &crate::api::mutation::DeleteIntent,
     ) -> Result<DeleteResult, AppError> {
@@ -124,7 +118,7 @@ impl DeleteStrategy for FinalizerAwareDeleteStrategy<'_> {
 
 pub async fn delete_loaded_with_strategy<S>(
     strategy: &S,
-    target: crate::api::mutation::ResourceIdentity,
+    target: klights_types::ResourceKey,
     resource: Resource,
     intent: &crate::api::mutation::DeleteIntent,
 ) -> Result<DeleteResult, AppError>
@@ -136,7 +130,7 @@ where
 
 pub async fn delete_with_strategy<S>(
     strategy: &S,
-    target: crate::api::mutation::ResourceIdentity,
+    target: klights_types::ResourceKey,
     intent: &crate::api::mutation::DeleteIntent,
 ) -> Result<DeleteResult, AppError>
 where
@@ -148,7 +142,7 @@ where
 
 pub async fn delete_collection_items<S>(
     strategy: &S,
-    items: Vec<(crate::api::mutation::ResourceIdentity, Resource)>,
+    items: Vec<(klights_types::ResourceKey, Resource)>,
     intent: &crate::api::mutation::DeleteIntent,
 ) -> Result<Vec<DeleteResult>, AppError>
 where

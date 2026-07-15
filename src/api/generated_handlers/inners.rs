@@ -265,7 +265,7 @@ pub async fn delete_collection_listed_resource_inner(
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         db: state.db.as_ref(),
     };
-    let target_identity = crate::api::mutation::ResourceIdentity::new(
+    let target_identity = klights_types::ResourceKey::new(
         api_version,
         kind,
         namespace.map(str::to_string),
@@ -1752,12 +1752,8 @@ pub async fn delete_inner(
         return Ok((StatusCode::OK, Json(result)));
     }
 
-    let target_identity = crate::api::mutation::ResourceIdentity::new(
-        api_version,
-        kind,
-        ns.map(str::to_string),
-        name,
-    );
+    let target_identity =
+        klights_types::ResourceKey::new(api_version, kind, ns.map(str::to_string), name);
     let delete_strategy = crate::api::mutation::delete::FinalizerAwareDeleteStrategy {
         db: state.db.as_ref(),
     };
@@ -2061,7 +2057,7 @@ pub async fn delete_collection_shared_inner(
     for resource in list.items {
         let owner_uid = resource.uid.clone();
         let res_name = resource.name.clone();
-        let target_identity = crate::api::mutation::ResourceIdentity::new(
+        let target_identity = klights_types::ResourceKey::new(
             api_version,
             kind,
             namespace.map(str::to_string),

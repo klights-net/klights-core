@@ -1,23 +1,4 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResourceIdentity {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub name: String,
-}
+//! Transitional compatibility paths for the canonical resource identity value.
 
-impl ResourceIdentity {
-    pub fn new(
-        api_version: impl Into<String>,
-        kind: impl Into<String>,
-        namespace: Option<String>,
-        name: impl Into<String>,
-    ) -> Self {
-        Self {
-            api_version: api_version.into(),
-            kind: kind.into(),
-            namespace,
-            name: name.into(),
-        }
-    }
-}
+#[deprecated(note = "use klights_types::ResourceKey directly; removed in Phase 3.4")]
+pub type ResourceIdentity = klights_types::ResourceKey;
