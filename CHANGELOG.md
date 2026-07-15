@@ -6,6 +6,112 @@ This project uses GitHub Releases as the canonical public release page. The
 release workflow extracts the matching version section from this file and
 attaches distro packages to the GitHub Release.
 
+## [0.9.14] - 2026-07-14
+
+This release completes **HTTP content-negotiation (Accept) fidelity** for
+clients such as client-go, kubectl, and ArgoCD, fixes a **Kubernetes
+`resource.Quantity` overflow** misclassification affecting PVC and quota
+accounting, and resolves two **watch and Node-status stability** issues: a
+spurious 410 on absent exact-name watches and a self-triggering Node status
+write loop.
+
+### What's new
+
+- **HTTP Accept content-negotiation fidelity.** Unary Accept negotiation now
+  derives each server-supported representation's effective quality from its
+  most-specific matching range, honoring `q=0` exclusions and wildcard
+  specificity. For example, `Accept: application/json;q=0, */*;q=1` now selects
+  protobuf when supported and returns HTTP 406 Not Acceptable when it is not,
+  instead of ignoring the JSON exclusion or silently defaulting to JSON.
+  Repeated headers, wildcard exclusions, fallback selection, malformed
+  precision, and Service `/status` responses all share the same negotiation,
+  so a 406 result propagates and a protobuf encode failure never silently falls
+  back to JSON. This improves client-go / kubectl / ArgoCD content-negotiation
+  compatibility.
+- **Kubernetes `resource.Quantity` overflow fix.** Positive-exponent overflow
+  is now classified against the exponent *after* canceling decimal scale
+  against the denominator, instead of the raw decimal exponent. A valid
+  quantity such as `0.` followed by 4,999 zeros and `1e5000` (which equals
+  exactly one) is no longer misclassified as overflow (`i64::MAX`), fixing PVC
+  capacity ordering, static-volume selection, and resource-quota accounting.
+  Exponent cancellation is now constant-time via tracked decimal scales,
+  avoiding repeated BigInt division; one shared Quantity parser serves PVC/PV
+  matching and resource quota.
+- **Watch stability for exact-name watches.** Exact-name collection watches
+  stay open instead of returning a synthetic 410 when unrelated traffic
+  advances the watch before its selected object exists. Scoped bookmarks stay
+  anchored to the last delivered resource version.
+- **Node status write-loop fix.** Timestamped Node condition transitions are
+  treated as newer than legacy conditions without timestamps, and Raft status
+  mutations are suppressed when typed status merging produces no persisted
+  change — preventing self-triggering watch churn and PATCH starvation.
+
+### Kubernetes compatibility status
+
+- Targets Kubernetes v1.34.6 API compatibility.
+- Unary HTTP `Accept` content negotiation now honors `q=0` exclusions and
+  per-representation specificity, returning 406 Not Acceptable when no
+  supported representation is acceptable.
+- Kubernetes `resource.Quantity` parsing no longer misclassifies valid
+  long-exponent quantities as overflow.
+
+### Known beta limitations
+
+Carried forward from 0.9.13; no listed limitation was fully resolved in this
+release.
+
+- HPA autoscaling control loop and metrics-backed autoscaling remain
+  deferred; the metrics data source is available, but the autoscaler is not.
+- Pod subresource coverage is incomplete: `pods/attach` is still not
+  implemented, and the `pods/binding` subresource route is missing.
+- Built-in OpenAPI schemas are incomplete. CRD OpenAPI publishing exists, but
+  built-in kinds still expose stub schemas, so `kubectl explain` for built-in
+  fields is limited.
+- Scheduler behavior is not fully upstream-compatible. Known gaps include
+  pod affinity/anti-affinity, topology spread constraints, PDB-aware
+  preemption, preferred node-affinity scoring, hostPort conflict predicates,
+  and some taint handling/default-priority behavior.
+- PodSecurity admission is not implemented. Namespace labels such as
+  `pod-security.kubernetes.io/enforce`, `audit`, and `warn` are not enforced.
+- Some admission/defaulting behavior remains incomplete, including parts of
+  ResourceQuota, LimitRange, DefaultStorageClass, Service family defaulting,
+  Pod defaulting, ServiceAccount imagePullSecret propagation, and built-in
+  field-selector validation.
+- Watch and delete semantics still have known edge-case gaps, including
+  selector-less `resourceVersion=0` watch behavior, pending-delete status
+  codes, `DeleteCollection` dry-run handling, and some foreground/orphan
+  deletion details, although watch stability was further hardened in this
+  release.
+- NetworkPolicy resources are stored but not yet enforced in the datapath.
+- Aggregated API server support is passthrough-only; the kube-aggregator
+  control plane is not implemented.
+- API Priority and Fairness resources exist for CRUD/discovery, but request
+  prioritization is not enforced.
+- Structured audit logging is not yet implemented.
+- Server-Side Apply (`application/apply-patch+yaml`) is implemented for built-in
+  resources: `metadata.managedFields` is produced, cross-manager conflicts are
+  reported (HTTP 409), `force=true` transfers ownership, and dropped fields are
+  pruned. It is not yet complete: field ownership uses heuristic merge-key
+  inference rather than a schema-driven engine, CRD apply does not produce
+  `managedFields`, and protobuf responses omit `managedFields` (JSON-only).
+
+### Binary packages
+
+This release publishes:
+
+- Static binaries: `klights-linux-x86_64-static`, `klights-linux-arm64-static`
+- Ubuntu 24.04 (noble): `klights_0.9.14-1~noble_amd64.deb`, `klights_0.9.14-1~noble_arm64.deb`
+- Ubuntu 26.04 (resolute): `klights_0.9.14-1~resolute_amd64.deb`, `klights_0.9.14-1~resolute_arm64.deb`
+- RHEL 9: `klights-0.9.14-1.el9.x86_64.rpm`, `klights-0.9.14-1.el9.aarch64.rpm`
+- RHEL 10: `klights-0.9.14-1.el10.x86_64.rpm`, `klights-0.9.14-1.el10.aarch64.rpm`
+- RHEL runtime dependencies: `containerd-2.3.2-1.el9.x86_64.rpm`, `containerd-2.3.2-1.el9.aarch64.rpm`, `containerd-2.3.2-1.el10.x86_64.rpm`, `containerd-2.3.2-1.el10.aarch64.rpm`, `runc-1.5.0-1.el9.x86_64.rpm`, `runc-1.5.0-1.el9.aarch64.rpm`, `runc-1.5.0-1.el10.x86_64.rpm`, `runc-1.5.0-1.el10.aarch64.rpm`
+
+Package repositories are published from the `package-repo` branch:
+
+- APT: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/apt
+- RPM: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/rpm
+- Public key: https://raw.githubusercontent.com/klights-net/klights-core/package-repo/klights-archive-keyring.asc
+
 ## [0.9.13] - 2026-07-13
 
 This release hardens **protobuf API compatibility** for clients such as
