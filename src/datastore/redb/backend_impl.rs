@@ -297,7 +297,7 @@ impl DatastoreBackend for RedbDatastore {
         let ls_owned = ls.map(|s| s.to_string());
         let fs_owned = fs.map(|s| s.to_string());
         let parsed_label_reqs = if let Some(ref sel) = ls_owned {
-            Some(crate::label_selector::parse_label_selector(sel)?)
+            Some(klights_types::parse_label_selector(sel)?)
         } else {
             None
         };

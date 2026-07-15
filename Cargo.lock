@@ -2172,6 +2172,11 @@ version = "0.0.0"
 [[package]]
 name = "klights-types"
 version = "0.0.0"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "serde_json",
+]
 
 [[package]]
 name = "klights-watch"

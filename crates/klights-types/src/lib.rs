@@ -1,6 +1,17 @@
 //! Shared domain types for klights.
 
+pub mod label_selector;
+pub mod quantity;
+
 use std::fmt;
+
+pub use label_selector::{
+    LabelRequirement, LabelSelector, LabelSelectorParseError, parse_label_selector, split_selector,
+};
+pub use quantity::{
+    format_cpu_milli, format_memory_bytes, format_resource_quantity, is_binary_quantity_resource,
+    parse_cpu_milli, parse_decimal_si_quantity, parse_memory_bytes, parse_resource_quantity,
+};
 
 /// API resource identity used by leader queries and API mutations.
 ///

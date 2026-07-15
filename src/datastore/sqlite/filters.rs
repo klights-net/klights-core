@@ -209,7 +209,7 @@ pub(super) fn split_selector(selector: &str) -> Vec<&str> {
 }
 
 pub(super) fn parse_label_selector(selector: &str) -> Result<Vec<LabelRequirement>> {
-    crate::label_selector::parse_label_selector(selector)
+    Ok(klights_types::parse_label_selector(selector)?)
 }
 
 #[cfg(test)]

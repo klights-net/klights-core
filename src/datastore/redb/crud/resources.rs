@@ -901,7 +901,7 @@ impl RedbResourceStore {
         let has_selectors = ls_owned.is_some() || fs_owned.is_some();
 
         let parsed_label_reqs = if let Some(ref sel) = ls_owned {
-            Some(crate::label_selector::parse_label_selector(sel)?)
+            Some(klights_types::parse_label_selector(sel)?)
         } else {
             None
         };
@@ -1130,7 +1130,7 @@ impl RedbResourceStore {
     ) -> Result<ResourceList> {
         let targets = targets.to_vec();
         let label_requirements = label_selector
-            .map(crate::label_selector::parse_label_selector)
+            .map(klights_types::parse_label_selector)
             .transpose()?
             .unwrap_or_default();
 
