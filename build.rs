@@ -1,11 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use vergen::EmitBuilder;
 
 fn main() {
     println!("cargo:rerun-if-changed=proto/replication.proto");
-    println!("cargo:rerun-if-changed=.git/refs/tags");
-    println!("cargo:rerun-if-changed=.git/packed-refs");
     let descriptor_path = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
         .join("klights_replication_descriptor.bin");
     tonic_prost_build::configure()
@@ -24,18 +22,118 @@ fn main() {
 
     let commit_short = short_commit_hash();
     println!("cargo:rustc-env=KLIGHTS_GIT_COMMIT_SHORT={}", commit_short);
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
 
     // Configure vergen to emit version info at compile time
     EmitBuilder::builder()
         .all_build()
         .all_cargo()
-        .all_git()
+        .git_branch()
+        .git_commit_author_email()
+        .git_commit_author_name()
+        .git_commit_count()
+        .git_commit_date()
+        .git_commit_message()
+        .git_commit_timestamp()
+        .git_describe(false, false, None)
+        .git_sha(false)
+        .git_cmd(None)
         .all_rustc()
         .all_sysinfo()
         .emit()
         .expect("Unable to generate vergen build info");
+    emit_git_dirty();
+    emit_git_rerun_inputs();
+}
+
+fn emit_git_dirty() {
+    println!("cargo:rerun-if-env-changed=VERGEN_GIT_DIRTY");
+    let dirty = match std::env::var("VERGEN_GIT_DIRTY") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => live_git_dirty().to_string(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("VERGEN_GIT_DIRTY must be valid Unicode")
+        }
+    };
+    println!("cargo:rustc-env=VERGEN_GIT_DIRTY={}", dirty);
+}
+
+fn live_git_dirty() -> bool {
+    let manifest_dir = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"),
+    );
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .current_dir(manifest_dir)
+        .output()
+        .expect("failed to query git dirty state");
+    assert!(output.status.success(), "git status failed");
+    !output.stdout.is_empty()
+}
+
+fn emit_git_rerun_inputs() {
+    for input in ["HEAD", "index", "refs/tags", "packed-refs"] {
+        emit_existing_git_input(input);
+    }
+    if let Some(reference) = symbolic_head() {
+        emit_git_input_or_namespace(&reference, "refs/heads");
+    }
+}
+
+fn emit_existing_git_input(input: &str) {
+    let Some(path) = git_path(input) else {
+        return;
+    };
+    if path.exists() {
+        emit_rerun_path(path);
+    }
+}
+
+fn emit_git_input_or_namespace(input: &str, namespace: &str) {
+    let Some(path) = git_path(input) else {
+        return;
+    };
+    if path.exists() {
+        emit_rerun_path(path);
+    } else {
+        emit_existing_git_input(namespace);
+    }
+}
+
+fn emit_rerun_path(path: PathBuf) {
+    let path = path.canonicalize().unwrap_or(path);
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+fn git_path(path: &str) -> Option<PathBuf> {
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-path", path])
+        .current_dir(&manifest_dir)
+        .output()
+        .ok()?
+        .stdout;
+    let output = String::from_utf8(output).ok()?;
+    let path = Path::new(output.trim());
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        Some(manifest_dir.join(path))
+    }
+}
+
+fn symbolic_head() -> Option<String> {
+    let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR")?);
+    let output = Command::new("git")
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .current_dir(manifest_dir)
+        .output()
+        .ok()?
+        .stdout;
+    String::from_utf8(output)
+        .ok()
+        .map(|reference| reference.trim().to_string())
+        .filter(|reference| !reference.is_empty())
 }
 
 fn short_commit_hash() -> String {
