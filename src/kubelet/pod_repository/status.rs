@@ -509,8 +509,8 @@ impl PodStatusService {
                 // preserves by `type` every condition the kubelet runtime does not
                 // own (e.g. the scheduler's DisruptionTarget). Ownership is decided
                 // by PodStatusOwner, not by an ad hoc condition-type heuristic here.
-                crate::pod_status_merge::merge_owned_and_preserved_conditions(
-                    crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
+                klights_types::merge_owned_and_preserved_conditions(
+                    klights_types::PodStatusOwner::KubeletRuntime,
                     vec![
                         build_pod_condition(
                             &existing_conditions,

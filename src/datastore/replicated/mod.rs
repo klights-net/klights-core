@@ -274,7 +274,7 @@ where
                     .as_ref()
                     .is_none_or(|expected_uid| current.uid == *expected_uid)
             {
-                crate::resource_semantics::preserve_status_subresource_on_main_update(
+                klights_types::preserve_status_subresource_on_main_update(
                     &api_version,
                     &kind,
                     &current.data,

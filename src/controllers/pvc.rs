@@ -189,7 +189,7 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         .and_then(|s| s.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing storage request"))?;
     let requested_storage_size =
-        crate::quantity::parse_resource_quantity("storage", requested_storage)
+        klights_types::parse_resource_quantity("storage", requested_storage)
             .ok_or_else(|| anyhow::anyhow!("Invalid storage request '{requested_storage}'"))?;
 
     let access_modes = spec
@@ -257,7 +257,7 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
         else {
             continue;
         };
-        let Some(pv_capacity) = crate::quantity::parse_resource_quantity("storage", pv_capacity)
+        let Some(pv_capacity) = klights_types::parse_resource_quantity("storage", pv_capacity)
         else {
             continue;
         };

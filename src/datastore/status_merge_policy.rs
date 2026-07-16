@@ -549,21 +549,11 @@ fn preserve_live_status_conditions_by_type(live_resource: &Value, incoming_statu
 
 fn merge_pod_status(live_resource: &Value, incoming_status: &mut Value, origin: StatusApplyOrigin) {
     let owner = match origin {
-        StatusApplyOrigin::KubeletOutbox => crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
-        StatusApplyOrigin::ApiSubresource => {
-            crate::pod_status_merge::PodStatusOwner::ApiStatusSubresource
-        }
-        StatusApplyOrigin::ReplicatedApply => {
-            crate::pod_status_merge::PodStatusOwner::ReplicatedApply
-        }
+        StatusApplyOrigin::KubeletOutbox => klights_types::PodStatusOwner::KubeletRuntime,
+        StatusApplyOrigin::ApiSubresource => klights_types::PodStatusOwner::ApiStatusSubresource,
+        StatusApplyOrigin::ReplicatedApply => klights_types::PodStatusOwner::ReplicatedApply,
     };
-    crate::pod_status_merge::merge_pod_status_for_update(
-        "v1",
-        "Pod",
-        live_resource,
-        incoming_status,
-        owner,
-    );
+    klights_types::merge_pod_status_for_update("v1", "Pod", live_resource, incoming_status, owner);
 }
 
 #[cfg(test)]

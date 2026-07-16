@@ -1371,7 +1371,7 @@ impl RedbResourceStore {
             let mut current_data: Value =
                 serde_json::from_slice(&current.1).unwrap_or(Value::Null);
             let before_patch = current_data.clone();
-            crate::json_patch::apply_merge_patch(&mut current_data, &patch)?;
+            klights_types::apply_merge_patch(&mut current_data, &patch);
             helpers::validate_uid_immutable(&current_data, &before_patch)?;
             if crate::utils::resource_bodies_equal_ignoring_metadata_field(
                 &before_patch,

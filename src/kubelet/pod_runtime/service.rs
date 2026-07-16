@@ -2251,12 +2251,12 @@ impl PodRuntimeService for RealPodRuntimeService {
         // phase/container state (e.g. a CRI list racing the reconcile seeing
         // an empty sandbox after the pod already Succeeded).
         let mut status = status;
-        crate::pod_status_merge::merge_pod_status_for_update(
+        klights_types::merge_pod_status_for_update(
             "v1",
             "Pod",
             &resource.data,
             &mut status,
-            crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
+            klights_types::PodStatusOwner::KubeletRuntime,
         );
         let emit_key = key.clone();
         let emitted = self

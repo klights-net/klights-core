@@ -665,8 +665,7 @@ pub fn apply_patch(
         Some("application/merge-patch+json") | Some("application/json") | None => {
             // JSON Merge Patch (RFC 7386) - default
             let mut doc = current.clone();
-            crate::json_patch::apply_merge_patch(&mut doc, patch)
-                .map_err(|e| AppError::BadRequest(format!("Invalid JSON Merge Patch: {}", e)))?;
+            klights_types::apply_merge_patch(&mut doc, patch);
             Ok(doc)
         }
         Some("application/strategic-merge-patch+json") | Some("application/apply-patch+yaml") => {
@@ -721,7 +720,7 @@ pub const SPEC_BEARING_KINDS: &[&str] = &[
     "VolumeAttachment",
 ];
 
-pub use crate::resource_semantics::preserve_status_subresource_on_main_update;
+pub use klights_types::preserve_status_subresource_on_main_update;
 
 pub fn normalize_resource_for_storage(api_version: &str, kind: &str, body: &mut Value) {
     if api_version == "events.k8s.io/v1" && kind == "Event" {

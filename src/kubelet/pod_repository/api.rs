@@ -1708,12 +1708,12 @@ async fn write_preemption_termination(
         // authoritative for scheduler conditions while kubelet-owned lifecycle
         // conditions present in the live status are preserved, and no terminal
         // container-state rewrite is applied (that is a kubelet-only guarantee).
-        crate::pod_status_merge::merge_pod_status_for_update(
+        klights_types::merge_pod_status_for_update(
             "v1",
             "Pod",
             &data,
             &mut status,
-            crate::pod_status_merge::PodStatusOwner::Scheduler,
+            klights_types::PodStatusOwner::Scheduler,
         );
         if let Some(object) = data.as_object_mut() {
             object.insert("status".to_string(), status);

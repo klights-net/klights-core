@@ -166,10 +166,7 @@ impl Datastore {
                 if !strict_resource_version
                     && let Some(expected) = effective_preconditions.resource_version
                     && expected != current.rv
-                    && crate::resource_semantics::has_builtin_status_subresource(
-                        &key.api_version,
-                        &key.kind,
-                    )
+                    && klights_types::has_builtin_status_subresource(&key.api_version, &key.kind)
                     && let Some(base) = Self::resource_snapshot_for_key_at_rv_in_tx(
                         &tx,
                         &key.api_version,
@@ -196,28 +193,19 @@ impl Datastore {
                 })?;
 
                 let mut patched: Value = current.data.clone();
-                let zero_grace_pod_delete =
-                    crate::resource_semantics::is_zero_grace_pod_delete_mark_patch(
-                        &key.api_version,
-                        &key.kind,
-                        &patch,
-                    );
+                let zero_grace_pod_delete = klights_types::is_zero_grace_pod_delete_mark_patch(
+                    &key.api_version,
+                    &key.kind,
+                    &patch,
+                );
                 let effective_patch = if zero_grace_pod_delete {
-                    crate::resource_semantics::pod_delete_mark_patch_without_status(&patch)
+                    klights_types::pod_delete_mark_patch_without_status(&patch)
                 } else {
                     patch
                 };
                 match patch_kind {
                     PatchKind::Merge => {
-                        crate::json_patch::apply_merge_patch(&mut patched, &effective_patch)
-                            .map_err(|e| {
-                                rusqlite::Error::ToSqlConversionFailure(Box::new(
-                                    std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        e.to_string(),
-                                    ),
-                                ))
-                            })?;
+                        klights_types::apply_merge_patch(&mut patched, &effective_patch);
                     }
                 }
                 validate_metadata_uid_immutable(&patched, &current.data).map_err(|e| {
@@ -226,14 +214,15 @@ impl Datastore {
                         e.to_string(),
                     )))
                 })?;
-                crate::resource_semantics::preserve_status_subresource_on_main_update(
+                klights_types::preserve_status_subresource_on_main_update(
                     &key.api_version,
                     &key.kind,
                     &current.data,
                     &mut patched,
                 );
                 if zero_grace_pod_delete {
-                    crate::resource_semantics::mark_terminating_pod_unready(&mut patched);
+                    let transition_time = crate::utils::k8s_timestamp();
+                    klights_types::mark_terminating_pod_unready_at(&mut patched, &transition_time);
                 }
                 preserve_server_metadata_fields_from_existing(&mut patched, &current.data);
                 ensure_metadata_identity(&mut patched, key.namespace.as_deref(), &key.name);

@@ -504,26 +504,19 @@ fn apply_latest_patch_to_current_resource(
     let current: serde_json::Value =
         serde_json::from_slice(current_bytes).map_err(serde_to_sqlite_error)?;
     let mut patched = current.clone();
-    let zero_grace_pod_delete = crate::resource_semantics::is_zero_grace_pod_delete_mark_patch(
+    let zero_grace_pod_delete = klights_types::is_zero_grace_pod_delete_mark_patch(
         &patch.api_version,
         &patch.kind,
         &patch.patch,
     );
     let effective_patch = if zero_grace_pod_delete {
-        crate::resource_semantics::pod_delete_mark_patch_without_status(&patch.patch)
+        klights_types::pod_delete_mark_patch_without_status(&patch.patch)
     } else {
         patch.patch.clone()
     };
     match patch.patch_kind {
         PatchKind::Merge => {
-            crate::json_patch::apply_merge_patch(&mut patched, &effective_patch).map_err(
-                |err| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        err.to_string(),
-                    )))
-                },
-            )?;
+            klights_types::apply_merge_patch(&mut patched, &effective_patch);
         }
     }
     if zero_grace_pod_delete {
@@ -533,7 +526,7 @@ fn apply_latest_patch_to_current_resource(
             .or_else(|| deterministic_terminating_unready_timestamp(&patched, Some(&current)))
             .unwrap_or("1970-01-01T00:00:00Z")
             .to_string();
-        crate::resource_semantics::mark_terminating_pod_unready_at(&mut patched, &transition_time);
+        klights_types::mark_terminating_pod_unready_at(&mut patched, &transition_time);
     }
     crate::datastore::sqlite::resource_shape::validate_metadata_uid_immutable(&patched, &current)
         .map_err(|err| {
@@ -770,7 +763,7 @@ fn preserve_same_uid_server_metadata_from_existing(
             deterministic_terminating_unready_timestamp(&row.data, Some(&existing_data))
                 .unwrap_or("1970-01-01T00:00:00Z")
                 .to_string();
-        crate::resource_semantics::mark_terminating_pod_unready_at(&mut row.data, &transition_time);
+        klights_types::mark_terminating_pod_unready_at(&mut row.data, &transition_time);
     }
     Ok(())
 }

@@ -397,11 +397,11 @@ pub fn resource_quota_has_pod_scope_constraints(resource_quota: &serde_json::Val
 }
 
 pub fn parse_resource_quantity(resource_key: &str, quantity: &str) -> Option<i64> {
-    crate::quantity::parse_resource_quantity(resource_key, quantity)
+    klights_types::parse_resource_quantity(resource_key, quantity)
 }
 
 pub fn format_resource_quantity(resource_key: &str, value: i64) -> String {
-    crate::quantity::format_resource_quantity(resource_key, value)
+    klights_types::format_resource_quantity(resource_key, value)
 }
 
 pub fn calculate_pod_effective_resource_for_key(

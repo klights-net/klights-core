@@ -231,7 +231,7 @@ impl Datastore {
         name: &str,
         proposed: &mut Value,
     ) -> tokio_rusqlite::Result<()> {
-        if !crate::resource_semantics::has_builtin_status_subresource(api_version, kind) {
+        if !klights_types::has_builtin_status_subresource(api_version, kind) {
             return Ok(());
         }
 
@@ -250,7 +250,7 @@ impl Datastore {
         };
         let current: Value =
             serde_json::from_slice(&current_bytes).map_err(serde_to_sqlite_error)?;
-        crate::resource_semantics::preserve_status_subresource_on_main_update(
+        klights_types::preserve_status_subresource_on_main_update(
             api_version,
             kind,
             &current,
@@ -340,7 +340,7 @@ impl Datastore {
             return Ok(effective);
         };
         if !preserve_latest_status
-            || !crate::resource_semantics::has_builtin_status_subresource(api_version, kind)
+            || !klights_types::has_builtin_status_subresource(api_version, kind)
             || current.resource_version == expected_rv
             || current.resource_version < expected_rv
         {

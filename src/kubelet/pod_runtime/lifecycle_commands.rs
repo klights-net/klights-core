@@ -196,12 +196,12 @@ pub(super) async fn handle_lifecycle_command(
                         "phase": "Running",
                         "containerStatuses": container_statuses,
                     });
-                    crate::pod_status_merge::merge_pod_status_for_update(
+                    klights_types::merge_pod_status_for_update(
                         "v1",
                         "Pod",
                         &pod,
                         &mut status,
-                        crate::pod_status_merge::PodStatusOwner::KubeletRuntime,
+                        klights_types::PodStatusOwner::KubeletRuntime,
                     );
                     service.write_pod_status(&key, status).await?;
                 }

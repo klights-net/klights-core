@@ -478,10 +478,7 @@ impl Datastore {
                         .or_else(|| (expected_rv > 0).then_some(expected_rv));
                     if let Some(expected) = effective_preconditions.resource_version
                         && expected != live_rv
-                        && crate::resource_semantics::has_builtin_status_subresource(
-                            &api_version,
-                            &kind,
-                        )
+                        && klights_types::has_builtin_status_subresource(&api_version, &kind)
                         && let Some(base) = Self::resource_snapshot_for_key_at_rv_in_tx(
                             tx,
                             &api_version,
@@ -505,7 +502,7 @@ impl Datastore {
                 ensure_resource_type_meta(&mut data, &api_version, &kind);
                 ensure_metadata_identity(&mut data, namespace.as_deref(), &name);
                 ensure_pod_status_ip_arrays(&mut data, &api_version, &kind);
-                crate::resource_semantics::preserve_status_subresource_on_main_update(
+                klights_types::preserve_status_subresource_on_main_update(
                     &api_version,
                     &kind,
                     &live,
@@ -1017,10 +1014,7 @@ impl Datastore {
                 if !strict_resource_version
                     && let Some(expected) = effective_preconditions.resource_version
                     && expected != live_rv
-                    && crate::resource_semantics::has_builtin_status_subresource(
-                        &api_version,
-                        &kind,
-                    )
+                    && klights_types::has_builtin_status_subresource(&api_version, &kind)
                     && let Some(base) = Self::resource_snapshot_for_key_at_rv_in_tx(
                         tx,
                         &api_version,
@@ -1044,7 +1038,7 @@ impl Datastore {
                     &preconditions,
                 ) {
                     let terminating_pod_unready_timestamp =
-                        crate::resource_semantics::is_zero_grace_pod_delete_mark_patch(
+                        klights_types::is_zero_grace_pod_delete_mark_patch(
                             &api_version,
                             &kind,
                             &patch,
@@ -1078,7 +1072,7 @@ impl Datastore {
                 ensure_resource_type_meta(&mut live, &api_version, &kind);
                 ensure_metadata_identity(&mut live, namespace.as_deref(), &name);
                 ensure_pod_status_ip_arrays(&mut live, &api_version, &kind);
-                crate::resource_semantics::preserve_status_subresource_on_main_update(
+                klights_types::preserve_status_subresource_on_main_update(
                     &api_version,
                     &kind,
                     &live_before_patch,
@@ -2490,7 +2484,7 @@ impl Datastore {
     }
 
     fn is_pod_delete_mark_patch(api_version: &str, kind: &str, patch: &Value) -> bool {
-        crate::resource_semantics::is_pod_delete_mark_patch(api_version, kind, patch)
+        klights_types::is_pod_delete_mark_patch(api_version, kind, patch)
     }
 
     fn apply_outbox_patch(
@@ -2504,8 +2498,7 @@ impl Datastore {
         let existing = live.clone();
         match patch_kind {
             crate::datastore::types::PatchKind::Merge => {
-                crate::json_patch::apply_merge_patch(live, &patch)
-                    .map_err(Self::sqlite_conversion_error)?;
+                klights_types::apply_merge_patch(live, &patch);
             }
         }
         crate::datastore::sqlite::resource_shape::validate_metadata_uid_immutable(live, &existing)
