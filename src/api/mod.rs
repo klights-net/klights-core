@@ -229,8 +229,8 @@ use crate::api_status::{
 use crate::controllers;
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{CatchUpResource, DatastoreBackend, Resource, WatchTarget};
-use crate::label_selector::LabelSelector;
 use crate::watch::{WatchCursorError, WatchEvent};
+use klights_types::LabelSelector;
 
 // APIService proxy helpers moved to apiservice_proxy.rs
 

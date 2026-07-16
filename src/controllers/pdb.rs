@@ -47,7 +47,7 @@ pub async fn reconcile_pdb(
         // shape (matchLabels + matchExpressions) per K8s spec. A missing or
         // null selector matches every pod (caller decides via separate spec
         // validation whether the empty case is meaningful).
-        let parsed_selector = match crate::label_selector::LabelSelector::from_k8s_selector(
+        let parsed_selector = match klights_types::LabelSelector::from_k8s_selector(
             spec.get("selector").unwrap_or(&Value::Null),
         ) {
             Ok(s) => s,

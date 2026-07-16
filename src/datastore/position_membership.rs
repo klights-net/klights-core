@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{Resource, WatchReplayPosition, WatchTarget, WatchTargetScope};
-use crate::label_selector::LabelSelector;
+use klights_types::LabelSelector;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct MembershipKey {

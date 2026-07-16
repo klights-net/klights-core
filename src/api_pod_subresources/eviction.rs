@@ -128,7 +128,7 @@ fn pod_matches_pdb_selector(pod: &Value, pdb: &Value) -> bool {
     // matchExpressions semantics with the PDB status reconciler. A
     // malformed selector treats the pod as not-matched, mirroring K8s
     // "no protection on broken selector" semantics.
-    match crate::label_selector::LabelSelector::from_k8s_selector(selector) {
+    match klights_types::LabelSelector::from_k8s_selector(selector) {
         Ok(s) => s.matches_resource(pod),
         Err(_) => false,
     }

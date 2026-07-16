@@ -105,7 +105,7 @@ pub async fn job_reconcile_keys_for_pod(
     Ok(keys)
 }
 
-fn job_selector_for_pod_side_effect(job: &Value) -> Option<crate::label_selector::LabelSelector> {
+fn job_selector_for_pod_side_effect(job: &Value) -> Option<klights_types::LabelSelector> {
     let selector = if let Some(selector) = job.pointer("/spec/selector") {
         selector.clone()
     } else {
@@ -117,7 +117,7 @@ fn job_selector_for_pod_side_effect(job: &Value) -> Option<crate::label_selector
         }
         serde_json::json!({ "matchLabels": labels })
     };
-    crate::label_selector::LabelSelector::from_k8s_selector(&selector).ok()
+    klights_types::LabelSelector::from_k8s_selector(&selector).ok()
 }
 
 /// Create a JobReconcileEffect instance backed by the supplied late-bound

@@ -199,7 +199,7 @@ pub(super) struct SelectorPushdown {
     /// SQL parameter values, one Vec per clause (flattened into a single params vec at bind time).
     pub sql_params: Vec<String>,
     /// Label requirements that cannot be pushed to SQL (Inequality, NotIn multi-value).
-    pub residual_labels: Vec<crate::label_selector::LabelRequirement>,
+    pub residual_labels: Vec<klights_types::LabelRequirement>,
     /// Field conditions that cannot be pushed to SQL (not in indexed_field_paths).
     pub residual_fields: Vec<super::filters::FieldSelectorCondition>,
 }
@@ -216,14 +216,14 @@ pub(super) struct SelectorPushdown {
 /// NotIn (all fully pushed via EXISTS/NOT EXISTS).
 /// Field conditions are pushed if their path is in `indexed_field_paths`.
 pub(super) fn build_selector_pushdown(
-    label_requirements: &[crate::label_selector::LabelRequirement],
+    label_requirements: &[klights_types::LabelRequirement],
     field_conditions: &[super::filters::FieldSelectorCondition],
     api_version: &str,
     kind: &str,
     param_offset: usize,
     cluster_scoped: bool,
 ) -> SelectorPushdown {
-    use crate::label_selector::LabelRequirement;
+    use klights_types::LabelRequirement;
 
     let ns_join = if cluster_scoped {
         "rl.namespace = ''"
@@ -550,7 +550,7 @@ mod tests {
 
     // --- build_selector_pushdown unit tests ---
 
-    use crate::label_selector::LabelRequirement;
+    use klights_types::LabelRequirement;
 
     #[test]
     fn pushdown_equality_generates_exists_with_two_params() {

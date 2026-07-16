@@ -181,9 +181,7 @@ async fn selector_matching_orphan_keys_for_pod(
         let selector_matches = replica_set
             .data
             .pointer("/spec/selector")
-            .and_then(|selector| {
-                crate::label_selector::LabelSelector::from_k8s_selector(selector).ok()
-            })
+            .and_then(|selector| klights_types::LabelSelector::from_k8s_selector(selector).ok())
             .is_some_and(|selector| selector.matches_resource(pod));
         if selector_matches && seen.insert(("apps/v1", "ReplicaSet", replica_set.name.clone())) {
             keys.push(ReconcileKey::namespaced(
@@ -208,7 +206,7 @@ async fn selector_matching_orphan_keys_for_pod(
             .data
             .pointer("/spec/selector")
             .and_then(|selector| {
-                crate::label_selector::LabelSelector::from_flat_match_labels(selector).ok()
+                klights_types::LabelSelector::from_flat_match_labels(selector).ok()
             })
             .is_some_and(|selector| {
                 !selector.requirements().is_empty() && selector.matches_resource(pod)

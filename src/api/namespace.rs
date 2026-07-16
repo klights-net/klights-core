@@ -1,6 +1,6 @@
 use crate::api::*;
 use crate::datastore::ListPageRequest;
-use crate::label_selector::LabelSelector;
+use klights_types::LabelSelector;
 
 pub async fn get_namespace(
     State(state): State<Arc<AppState>>,

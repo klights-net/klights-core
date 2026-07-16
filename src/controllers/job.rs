@@ -1391,7 +1391,7 @@ fn job_pod_selector(spec: &Value, template: &Value) -> Option<Value> {
 }
 
 fn pod_matches_job_selector(pod: &Value, selector: &Value) -> bool {
-    let parsed = match crate::label_selector::LabelSelector::from_k8s_selector(selector) {
+    let parsed = match klights_types::LabelSelector::from_k8s_selector(selector) {
         Ok(parsed) => parsed,
         Err(_) => return false,
     };

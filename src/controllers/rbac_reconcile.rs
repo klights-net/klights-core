@@ -8,7 +8,7 @@ use crate::auth::default_rbac::{
     default_rbac_fixtures,
 };
 use crate::datastore::DatastoreBackend;
-use crate::label_selector::LabelSelector;
+use klights_types::LabelSelector;
 
 pub async fn reconcile_default_rbac_objects(db: &dyn DatastoreBackend) -> Result<()> {
     for fixture in default_rbac_fixtures() {

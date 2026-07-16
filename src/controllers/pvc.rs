@@ -1,6 +1,6 @@
 use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
-use crate::label_selector::LabelSelector;
 use anyhow::{Context, Result};
+use klights_types::LabelSelector;
 use serde_json::{Value, json};
 
 /// Inject resourceVersion into resource metadata

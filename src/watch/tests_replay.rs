@@ -256,8 +256,8 @@ fn test_matches_label_selector_inequality_not_equal() {
 
 #[test]
 fn test_watch_label_selector_exists_and_not_exists_match_list_semantics() {
-    let exists_selector = crate::label_selector::LabelSelector::parse("has-gpu").unwrap();
-    let not_exists_selector = crate::label_selector::LabelSelector::parse("!deprecated").unwrap();
+    let exists_selector = klights_types::LabelSelector::parse("has-gpu").unwrap();
+    let not_exists_selector = klights_types::LabelSelector::parse("!deprecated").unwrap();
 
     let events = vec![
         WatchEvent::added(serde_json::json!({

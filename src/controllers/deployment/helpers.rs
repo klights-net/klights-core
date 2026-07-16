@@ -45,7 +45,7 @@ pub(super) fn labels_match_selector(
     // A malformed selector (unknown operator, etc.) is treated as
     // match-none so a broken Deployment cannot accidentally adopt every
     // pod in the namespace.
-    match crate::label_selector::LabelSelector::from_k8s_selector(selector) {
+    match klights_types::LabelSelector::from_k8s_selector(selector) {
         Ok(s) => s.matches_labels(Some(labels)),
         Err(_) => false,
     }

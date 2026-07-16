@@ -7,9 +7,9 @@
 
 use crate::datastore::DatastoreBackend;
 use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
-use crate::label_selector::LabelSelector;
 use anyhow::{Context as _, Result};
 use futures::future::{poll_fn, select_all};
+use klights_types::LabelSelector;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::future::Future;

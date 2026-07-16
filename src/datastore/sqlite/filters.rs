@@ -1,6 +1,6 @@
 use super::*;
 
-type LabelRequirement = crate::label_selector::LabelRequirement;
+type LabelRequirement = klights_types::LabelRequirement;
 
 pub(super) fn matches_label_requirements(data: &Value, requirements: &[LabelRequirement]) -> bool {
     let labels = data
@@ -205,7 +205,7 @@ pub(super) fn matches_field_selector_conditions(
 
 #[cfg(test)]
 pub(super) fn split_selector(selector: &str) -> Vec<&str> {
-    crate::label_selector::split_selector(selector)
+    klights_types::split_selector(selector)
 }
 
 pub(super) fn parse_label_selector(selector: &str) -> Result<Vec<LabelRequirement>> {

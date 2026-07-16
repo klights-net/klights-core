@@ -72,7 +72,7 @@ impl NetworkPolicyPlan {
                 continue;
             };
 
-            let selector = crate::label_selector::LabelSelector::from_k8s_selector(
+            let selector = klights_types::LabelSelector::from_k8s_selector(
                 spec.get("podSelector").unwrap_or(&Value::Null),
             )?;
             let selected_pods: Vec<&PodInfo> = pod_infos
@@ -322,11 +322,11 @@ fn peers_for_rule(
 
         let namespace_selector = peer
             .get("namespaceSelector")
-            .map(crate::label_selector::LabelSelector::from_k8s_selector)
+            .map(klights_types::LabelSelector::from_k8s_selector)
             .transpose()?;
         let pod_selector = peer
             .get("podSelector")
-            .map(crate::label_selector::LabelSelector::from_k8s_selector)
+            .map(klights_types::LabelSelector::from_k8s_selector)
             .transpose()?;
 
         for pod in all_pods {

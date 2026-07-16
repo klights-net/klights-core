@@ -1,6 +1,6 @@
 use crate::admission::request_context::AdmissionRequestContext;
-use crate::label_selector::LabelSelector;
 use anyhow::Result;
+use klights_types::LabelSelector;
 use serde_json::Value;
 use std::sync::Arc;
 

@@ -1442,7 +1442,7 @@ async fn test_rc_does_not_adopt_pod_with_foreign_controller_owner() {
 #[test]
 fn rc_flat_selector_matches_only_labeled_pods() {
     let selector = json!({"app": "test", "tier": "fe"});
-    let parsed = crate::label_selector::LabelSelector::from_flat_match_labels(&selector)
+    let parsed = klights_types::LabelSelector::from_flat_match_labels(&selector)
         .expect("flat selector parse should succeed");
 
     let matching_pod = json!({"metadata": {"labels": {"app": "test", "tier": "fe"}}});
@@ -1473,7 +1473,7 @@ fn rc_flat_selector_matches_only_labeled_pods() {
 #[test]
 fn rc_empty_selector_matches_no_pods() {
     let selector = json!({});
-    let parsed = crate::label_selector::LabelSelector::from_flat_match_labels(&selector)
+    let parsed = klights_types::LabelSelector::from_flat_match_labels(&selector)
         .expect("empty selector should parse");
     assert!(
         parsed.requirements().is_empty(),
@@ -1492,7 +1492,7 @@ fn rc_empty_selector_matches_no_pods() {
 #[test]
 fn rc_selector_with_non_string_value_returns_error() {
     let selector = json!({"app": 123});
-    let result = crate::label_selector::LabelSelector::from_flat_match_labels(&selector);
+    let result = klights_types::LabelSelector::from_flat_match_labels(&selector);
     assert!(
         result.is_err(),
         "non-string selector value must be rejected"

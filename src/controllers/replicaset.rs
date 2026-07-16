@@ -305,7 +305,7 @@ pub async fn reconcile_replicaset(
 }
 
 fn pod_matches_selector(pod: &Value, selector: &Value) -> bool {
-    let parsed = match crate::label_selector::LabelSelector::from_k8s_selector(selector) {
+    let parsed = match klights_types::LabelSelector::from_k8s_selector(selector) {
         Ok(p) => p,
         // Malformed selector → match nothing (a Pod with no labels still
         // wouldn't match an unparseable selector).

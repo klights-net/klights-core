@@ -1,7 +1,7 @@
 use super::super::queries;
 use super::*;
 use crate::datastore::sqlite::create_pending_watch_event;
-use crate::label_selector::LabelSelector;
+use klights_types::LabelSelector;
 impl Datastore {
     pub async fn create_namespace(&self, name: &str, mut data: Value) -> Result<Resource> {
         ensure_resource_type_meta(&mut data, "v1", "Namespace");

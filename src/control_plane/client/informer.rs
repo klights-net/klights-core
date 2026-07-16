@@ -169,7 +169,7 @@ fn label_selector_matches(resource: &Resource, selector: Option<&str>) -> bool {
     let Some(selector) = selector.filter(|selector| !selector.trim().is_empty()) else {
         return true;
     };
-    crate::label_selector::LabelSelector::parse(selector)
+    klights_types::LabelSelector::parse(selector)
         .map(|parsed| parsed.matches_resource(&resource.data))
         .unwrap_or(false)
 }

@@ -182,9 +182,7 @@ fn pod_is_terminating(pod: &Value) -> bool {
 /// non-empty selector. K8s behaviour: Services without a selector (or with
 /// an empty `matchLabels: {}`) do not get controller-managed Endpoints —
 /// the user provides them manually for headless / external services.
-pub fn endpoints_selector(
-    selector: Option<&Value>,
-) -> Option<crate::label_selector::LabelSelector> {
+pub fn endpoints_selector(selector: Option<&Value>) -> Option<klights_types::LabelSelector> {
     let selector = selector?;
     let has_match_labels = selector
         .pointer("/matchLabels")
@@ -209,7 +207,7 @@ pub fn endpoints_selector(
     } else {
         selector.clone()
     };
-    crate::label_selector::LabelSelector::from_k8s_selector(&canonical).ok()
+    klights_types::LabelSelector::from_k8s_selector(&canonical).ok()
 }
 
 fn endpoints_desired_state_matches(current: &Value, desired: &Value) -> bool {
@@ -247,7 +245,7 @@ fn build_desired_endpoints(
     service_ports: Option<&Value>,
     publish_not_ready: bool,
     pods: &[Resource],
-    selector: &crate::label_selector::LabelSelector,
+    selector: &klights_types::LabelSelector,
 ) -> Value {
     let mut subset_groups: Vec<EndpointSubsetGroup> = Vec::new();
     let mut subset_group_indexes: BTreeMap<String, usize> = BTreeMap::new();
@@ -368,7 +366,7 @@ fn build_desired_endpointslices(
     namespace: &str,
     service_ports: Option<&Value>,
     pods: &[Resource],
-    selector: &crate::label_selector::LabelSelector,
+    selector: &klights_types::LabelSelector,
 ) -> Vec<(String, Value)> {
     let mut slice_groups: Vec<EndpointSliceGroup> = Vec::new();
     let mut slice_group_indexes: BTreeMap<String, usize> = BTreeMap::new();

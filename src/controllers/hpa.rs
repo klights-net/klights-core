@@ -119,7 +119,7 @@ struct ScaleTarget {
     name: String,
     namespace: String,
     uid: String,
-    selector: crate::label_selector::LabelSelector,
+    selector: klights_types::LabelSelector,
     spec_replicas: i64,
     status_replicas: i64,
     kind_tag: ScaleTargetKind,
@@ -265,14 +265,14 @@ async fn get_scale_target(
 
     let selector = match kind_tag {
         ScaleTargetKind::ReplicationController => {
-            crate::label_selector::LabelSelector::from_flat_match_labels(
+            klights_types::LabelSelector::from_flat_match_labels(
                 resource
                     .data
                     .pointer("/spec/selector")
                     .unwrap_or(&Value::Null),
             )?
         }
-        _ => crate::label_selector::LabelSelector::from_k8s_selector(
+        _ => klights_types::LabelSelector::from_k8s_selector(
             resource
                 .data
                 .pointer("/spec/selector")

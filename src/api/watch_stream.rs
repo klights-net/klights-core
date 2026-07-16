@@ -6,7 +6,6 @@ use crate::datastore::{
     DatastoreBackendWatchStore, DatastoreHandle, RawWatchReplayStore, SnapshotAtRv,
     WatchReplayAnchorStore, WatchReplayPosition, WatchTarget,
 };
-use crate::label_selector::LabelSelector;
 use crate::watch::{
     EventType, RawSignalWatchCursor, WatchContentType, WatchCursorError, WatchDeliveryScope,
     WatchEvent, WatchSignalReceiver, WatchTopic,
@@ -17,6 +16,7 @@ use axum::body::Body;
 use axum::http::HeaderMap;
 use k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent as PbWatchEvent;
 use k8s_pb::apimachinery::pkg::runtime::RawExtension;
+use klights_types::LabelSelector;
 use prost::Message;
 use serde_json::Value;
 use std::sync::Arc;
