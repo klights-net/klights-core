@@ -13,8 +13,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
-#[deprecated(note = "use klights_types::ResourceKey directly; removed in Phase 3.4")]
-pub use klights_types::ResourceKey;
+use klights_types::ResourceKey;
 
 use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource, ResourceList, WatchReplayPosition};
 use crate::kubelet::outbox::payload::OutboxOperation;
