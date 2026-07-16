@@ -1,8 +1,36 @@
 //! JSON + protobuf encode/decode for storage commands.
 //! Extracted from command.rs (refactor).
 
-use super::proto::*;
 use super::*;
+// TEMPORARY(Phase 4.2): root domain conversions remain consumer-owned.
+// REMOVE: Phase 5.1 moves this adapter with the storage command domain.
+use klights_internal_protobuf::storage::*;
+
+impl From<CommandMeta> for ProtoCommandMeta {
+    fn from(meta: CommandMeta) -> Self {
+        Self {
+            command_id: meta.command_id.0,
+            codec_version: meta.codec_version,
+            resource_version: meta.resource_version,
+            uid: meta.uid,
+            timestamp_ms: meta.timestamp_ms,
+            authoring_node: meta.authoring_node,
+        }
+    }
+}
+
+impl From<ProtoCommandMeta> for CommandMeta {
+    fn from(wire: ProtoCommandMeta) -> Self {
+        Self {
+            command_id: CommandId(wire.command_id),
+            codec_version: wire.codec_version,
+            resource_version: wire.resource_version,
+            uid: wire.uid,
+            timestamp_ms: wire.timestamp_ms,
+            authoring_node: wire.authoring_node,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 

@@ -1,5 +1,8 @@
 //! Generated internal Raft and RPC wire definitions for klights.
 
+pub mod log_apply;
+pub mod storage;
+
 tonic::include_proto!("klights.replication");
 
 /// Encoded descriptor set for the internal replication service.
@@ -199,5 +202,63 @@ mod tests {
             ReplicationEntry::decode(entry.encode_to_vec().as_slice()).unwrap(),
             entry
         );
+    }
+
+    #[test]
+    fn storage_wire_tags_remain_stable() {
+        let meta = crate::storage::ProtoCommandMeta {
+            command_id: "x".to_string(),
+            codec_version: 2,
+            resource_version: 3,
+            uid: None,
+            timestamp_ms: 4,
+            authoring_node: "n".to_string(),
+        };
+        assert_eq!(
+            meta.encode_to_vec(),
+            vec![
+                0x0a, 0x01, b'x', 0x10, 0x02, 0x18, 0x03, 0x28, 0x04, 0x32, 0x01, b'n'
+            ]
+        );
+
+        let command = crate::storage::ProtoStorageCommand {
+            command: Some(
+                crate::storage::proto_storage_command::Command::DeleteResourceWithTombstone(
+                    crate::storage::ProtoDeleteResourceWithTombstone {
+                        api_version: String::new(),
+                        kind: String::new(),
+                        namespace: None,
+                        name: String::new(),
+                        preconditions: None,
+                        grace_seconds: 0,
+                    },
+                ),
+            ),
+        };
+        assert_eq!(command.encode_to_vec(), vec![0xe2, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn log_apply_wire_tags_remain_stable() {
+        let commit = crate::log_apply::ProtoLogApplyCommit {
+            resource_version: 7,
+            mutations: Vec::new(),
+            outbox_watermark: None,
+            resource_version_assignment:
+                crate::log_apply::ProtoResourceVersionAssignment::CommittedApplyV1 as i32,
+        };
+        assert_eq!(commit.encode_to_vec(), vec![0x08, 0x07, 0x20, 0x01]);
+
+        let mutation = crate::log_apply::ProtoLogApplyMutation {
+            mutation: Some(
+                crate::log_apply::proto_log_apply_mutation::Mutation::GcWatchEvents(
+                    crate::log_apply::ProtoLogApplyWatchEventsGc {
+                        max_rows: 0,
+                        batch_cap: 0,
+                    },
+                ),
+            ),
+        };
+        assert_eq!(mutation.encode_to_vec(), vec![0xaa, 0x01, 0x00]);
     }
 }

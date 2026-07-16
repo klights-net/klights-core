@@ -531,13 +531,22 @@ pub enum CommandError {
     Internal { message: String },
 }
 
-// ---------------------------------------------------------------------------
-// Protobuf wire types (prost::Message)
-// ---------------------------------------------------------------------------
-
 pub mod codec;
-/// Protobuf wire type for `CommandMeta`.
-pub mod proto;
 
 pub use codec::*;
-pub use proto::*;
+
+/// Serde helper that serializes `serde_json::Value` as its native JSON value.
+pub mod serde_bytes_base64 {
+    pub fn serialize<S: serde::Serializer>(
+        value: &serde_json::Value,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(value, serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<serde_json::Value, D::Error> {
+        serde::Deserialize::deserialize(deserializer)
+    }
+}

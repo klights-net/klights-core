@@ -1,7 +1,4 @@
-//! Protobuf/gRPC types for storage commands.
-//! Extracted from command.rs (refactor).
-
-use super::*;
+//! Stable protobuf wire representations for replicated storage commands.
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ProtoCommandMeta {
@@ -17,32 +14,6 @@ pub struct ProtoCommandMeta {
     pub timestamp_ms: i64,
     #[prost(string, tag = "6")]
     pub authoring_node: String,
-}
-
-impl From<CommandMeta> for ProtoCommandMeta {
-    fn from(m: CommandMeta) -> Self {
-        Self {
-            command_id: m.command_id.0,
-            codec_version: m.codec_version,
-            resource_version: m.resource_version,
-            uid: m.uid,
-            timestamp_ms: m.timestamp_ms,
-            authoring_node: m.authoring_node,
-        }
-    }
-}
-
-impl From<ProtoCommandMeta> for CommandMeta {
-    fn from(p: ProtoCommandMeta) -> Self {
-        Self {
-            command_id: CommandId(p.command_id),
-            codec_version: p.codec_version,
-            resource_version: p.resource_version,
-            uid: p.uid,
-            timestamp_ms: p.timestamp_ms,
-            authoring_node: p.authoring_node,
-        }
-    }
 }
 
 /// Protobuf wire type for the `CommandError` enum.
@@ -525,27 +496,3 @@ pub enum ProtoCommandErrorCode {
 pub mod proto_command_error {
     pub use super::ProtoCommandErrorCode as ErrorCode;
 }
-
-// ---------------------------------------------------------------------------
-// serde helper: pass-through for serde_json::Value (already native JSON)
-// ---------------------------------------------------------------------------
-
-/// Serde helper that serializes `serde_json::Value` as-is.
-/// Since `Value` is natively serializable, this is identity.
-pub mod serde_bytes_base64 {
-    pub fn serialize<S: serde::Serializer>(
-        val: &serde_json::Value,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
-        serde::Serialize::serialize(val, s)
-    }
-
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        d: D,
-    ) -> Result<serde_json::Value, D::Error> {
-        serde::Deserialize::deserialize(d)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// JSON codec
