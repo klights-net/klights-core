@@ -1338,6 +1338,11 @@ impl Datastore {
                     )],
                 )
             }
+            _ => {
+                return Err(tokio_rusqlite::Error::Rusqlite(
+                    rusqlite::Error::InvalidQuery,
+                ));
+            }
         };
 
         Ok((commit, rv))

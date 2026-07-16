@@ -268,6 +268,7 @@ impl DatastoreApplier for RedbDatastore {
                 // klights_meta table. Pod cleanup intents are SQLite
                 // cluster.db state and are no-op for redb.
             }
+            _ => unreachable!("unsupported StorageCommand variant in Redb test adapter"),
         }
         Ok(())
     }

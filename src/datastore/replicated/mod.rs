@@ -574,6 +574,7 @@ where
         StorageCommand::SetKlightsMeta { key, value } => {
             backend.set_klights_meta(&key, &value).await?;
         }
+        _ => unreachable!("unsupported StorageCommand variant in legacy test adapter"),
     }
 
     let current_rv = backend.get_current_resource_version().await.unwrap_or(0);

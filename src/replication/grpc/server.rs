@@ -9,7 +9,7 @@ use tonic::{Request, Response, Status, metadata::MetadataMap};
 use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{Resource, ResourcePreconditions, WatchReplayPosition, WatchTarget};
+use crate::datastore::{ResourcePreconditions, WatchReplayPosition, WatchTarget};
 use crate::metrics::{
     NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResponse,
 };
@@ -2032,7 +2032,7 @@ fn pod_cleanup_intent_to_proto(
 }
 
 fn resource_from_event(event: &crate::watch::WatchEvent) -> crate::datastore::Resource {
-    Resource::from_watch_event_ref(event)
+    crate::datastore::Resource::from_watch_event_ref(event)
 }
 
 fn watch_event_type(event: &crate::watch::WatchEvent) -> &'static str {

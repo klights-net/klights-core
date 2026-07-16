@@ -15,6 +15,14 @@ use std::sync::Arc;
 use crate::networking::{NodeName, PodSubnet};
 use crate::watch::WatchEvent;
 
+// TEMPORARY(Phase 5.1): one compatibility facade preserves root datastore
+// source paths while adjacent cluster semantics are extracted.
+// REMOVE(Phase 5.5): import these canonical values from klights-cluster-core.
+pub use klights_cluster_core::{
+    PatchKind, Resource, ResourceBatchOperation, ResourceBatchPutMode, ResourcePatchRequest,
+    ResourcePreconditions,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PodSlotAdmissionState {
     Admitted,
@@ -66,23 +74,6 @@ pub enum PodSlotAdmissionEvent {
         pod_uid: String,
         resource_version: i64,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Resource {
-    pub id: i64,
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub name: String,
-    /// Kubernetes object UID, mirrored from `metadata.uid` and the backend UID
-    /// column. This is the identity-stable guard for delete/recreate slots.
-    pub uid: String,
-    pub resource_version: i64,
-    /// JSON body. Held as `Arc<Value>` so cloning a `Resource` is O(1) refcount
-    /// bump instead of a deep-walk of every Map/String/Vec in the tree. Mutate
-    /// via `Arc::make_mut(&mut resource.data)` for copy-on-write.
-    pub data: Arc<Value>,
 }
 
 pub const POD_CLEANUP_REASON_NODE_LOST: &str = "NodeLost";
@@ -156,80 +147,9 @@ impl WatchReplayFloor {
     }
 }
 
-impl Resource {
-    pub fn from_watch_event(event: WatchEvent) -> Self {
-        Self::from_watch_event_data(event.object)
-    }
-
-    pub fn from_watch_event_ref(event: &WatchEvent) -> Self {
-        Self::from_watch_event_data(event.object.clone())
-    }
-
-    pub fn try_from_watch_event(event: &WatchEvent) -> Result<Self> {
-        let data = event.object.clone();
-        let api_version = data
-            .get("apiVersion")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| anyhow!("watch event missing apiVersion"))?
-            .to_string();
-        let kind = data
-            .get("kind")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| anyhow!("watch event missing kind"))?
-            .to_string();
-        let name = data
-            .pointer("/metadata/name")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| anyhow!("watch event missing metadata.name"))?
-            .to_string();
-        Ok(Self {
-            id: 0,
-            api_version,
-            kind,
-            namespace: data
-                .pointer("/metadata/namespace")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
-            name,
-            uid: Self::uid_from_data(&data),
-            resource_version: crate::utils::extract_resource_version_from_object(&data),
-            data,
-        })
-    }
-
-    fn from_watch_event_data(data: Arc<Value>) -> Self {
-        Self {
-            id: 0,
-            api_version: data
-                .get("apiVersion")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            kind: data
-                .get("kind")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            namespace: data
-                .pointer("/metadata/namespace")
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
-            name: data
-                .pointer("/metadata/name")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            uid: Self::uid_from_data(&data),
-            resource_version: crate::utils::extract_resource_version_from_object(&data),
-            data,
-        }
-    }
-
-    pub fn uid_from_data(data: &Value) -> String {
-        data.pointer("/metadata/uid")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default()
-            .to_string()
+impl klights_cluster_core::ResourceEventObject for WatchEvent {
+    fn resource_object(&self) -> &Arc<Value> {
+        &self.object
     }
 }
 
@@ -337,88 +257,6 @@ impl OwnedPodNetworkAllocationRequest {
     }
 }
 
-/// Optimistic write guards for a single Kubernetes object identity.
-///
-/// `resource_version` protects against stale snapshots of the same object.
-/// `uid` protects a name slot across delete/recreate, where the name is reused
-/// but the Kubernetes object identity changed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourcePreconditions {
-    pub uid: Option<String>,
-    pub resource_version: Option<i64>,
-}
-
-impl ResourcePreconditions {
-    pub fn resource_version(resource_version: i64) -> Self {
-        Self {
-            uid: None,
-            resource_version: Some(resource_version),
-        }
-    }
-
-    pub fn uid(uid: impl Into<String>) -> Self {
-        Self {
-            uid: Some(uid.into()),
-            resource_version: None,
-        }
-    }
-
-    pub fn uid_and_resource_version(uid: impl Into<String>, resource_version: i64) -> Self {
-        Self {
-            uid: Some(uid.into()),
-            resource_version: Some(resource_version),
-        }
-    }
-
-    pub fn from_resource(resource: &Resource) -> Self {
-        Self::uid_and_resource_version(resource.uid.clone(), resource.resource_version)
-    }
-
-    pub fn from_metadata(metadata: &Value, resource_version: i64) -> Result<Self> {
-        let uid = metadata
-            .get("uid")
-            .and_then(|v| v.as_str())
-            .filter(|uid| !uid.trim().is_empty())
-            .ok_or_else(|| anyhow!("metadata.uid is required for UID-qualified write"))?;
-        Ok(Self::uid_and_resource_version(
-            uid.to_string(),
-            resource_version,
-        ))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResourceBatchPutMode {
-    Create,
-    Update,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ResourceBatchOperation {
-    Put {
-        api_version: String,
-        kind: String,
-        namespace: Option<String>,
-        name: String,
-        data: Value,
-        mode: ResourceBatchPutMode,
-        preconditions: ResourcePreconditions,
-    },
-    Delete {
-        api_version: String,
-        kind: String,
-        namespace: Option<String>,
-        name: String,
-        preconditions: ResourcePreconditions,
-    },
-}
-
-/// Patch format for resource updates that do not use optimistic concurrency checks.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum PatchKind {
-    Merge,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ResourceListQuery<'a> {
     pub label_selector: Option<&'a str>,
@@ -448,35 +286,6 @@ impl<'a> ResourceListQuery<'a> {
 
     pub fn page_request(self) -> Result<ListPageRequest> {
         ListPageRequest::try_new(self.limit, self.continue_token.map(str::to_string))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ResourcePatchRequest {
-    pub patch_kind: PatchKind,
-    pub patch: Value,
-    pub preconditions: ResourcePreconditions,
-    #[serde(default)]
-    pub strict_resource_version: bool,
-}
-
-impl ResourcePatchRequest {
-    pub fn new(patch_kind: PatchKind, patch: Value, preconditions: ResourcePreconditions) -> Self {
-        Self {
-            patch_kind,
-            patch,
-            preconditions,
-            strict_resource_version: false,
-        }
-    }
-
-    pub fn without_preconditions(patch_kind: PatchKind, patch: Value) -> Self {
-        Self::new(patch_kind, patch, ResourcePreconditions::default())
-    }
-
-    pub fn with_strict_resource_version(mut self) -> Self {
-        self.strict_resource_version = true;
-        self
     }
 }
 
@@ -687,19 +496,6 @@ mod resource_arc_tests {
     use super::*;
     use serde_json::json;
 
-    fn sample() -> Resource {
-        Resource {
-            id: 1,
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: Some("default".to_string()),
-            name: "p".to_string(),
-            uid: "uid-p".to_string(),
-            resource_version: 1,
-            data: Arc::new(json!({"spec": {"x": 1}, "status": {"y": 2}})),
-        }
-    }
-
     #[test]
     fn resource_helpers_convert_watch_event_and_added_catchup() {
         let event = WatchEvent::added(json!({
@@ -724,34 +520,6 @@ mod resource_arc_tests {
         let catchup = CatchUpResource::added(resource);
         assert_eq!(catchup.event_type.as_ref(), "ADDED");
         assert!(matches!(catchup.event_type, std::borrow::Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn cloning_resource_is_shallow_arc_bump() {
-        let r = sample();
-        assert_eq!(Arc::strong_count(&r.data), 1);
-        let r2 = r.clone();
-        assert_eq!(Arc::strong_count(&r.data), 2);
-        assert!(Arc::ptr_eq(&r.data, &r2.data));
-    }
-
-    #[test]
-    fn make_mut_forks_when_shared() {
-        let r = sample();
-        let mut r2 = r.clone();
-        assert_eq!(Arc::strong_count(&r.data), 2);
-
-        // Mutate r2; original r must be untouched.
-        Arc::make_mut(&mut r2.data)
-            .as_object_mut()
-            .unwrap()
-            .insert("forked".to_string(), json!(true));
-
-        assert_eq!(Arc::strong_count(&r.data), 1);
-        assert_eq!(Arc::strong_count(&r2.data), 1);
-        assert!(!Arc::ptr_eq(&r.data, &r2.data));
-        assert!(r.data.get("forked").is_none());
-        assert_eq!(r2.data.get("forked"), Some(&json!(true)));
     }
 }
 

@@ -51,6 +51,7 @@ publish = false
 
 [workspace.dependencies]
 klights-types = { path = "crates/klights-types" }
+klights-cluster-core = { path = "crates/klights-cluster-core" }
 klights-internal-protobuf = { path = "crates/klights-internal-protobuf" }
 vergen = { version = "8", features = ["build", "cargo", "git", "gitcl", "rustc", "si"] }
 tonic-prost-build = "0.14"
@@ -178,6 +179,7 @@ vergen = { workspace = true }
 
 [dependencies]
 klights-types = { workspace = true }
+klights-cluster-core = { workspace = true }
 klights-internal-protobuf = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

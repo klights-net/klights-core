@@ -340,6 +340,7 @@ impl DatastoreApplier for Datastore {
             StorageCommand::ApplyResourceBatch { operations } => {
                 self.apply_resource_batch(operations).await?;
             }
+            _ => unreachable!("unsupported StorageCommand variant in SQLite test adapter"),
         }
         Ok(())
     }

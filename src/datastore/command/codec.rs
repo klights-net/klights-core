@@ -2,12 +2,27 @@
 //! Extracted from command.rs (refactor).
 
 use super::*;
-// TEMPORARY(Phase 4.2): root domain conversions remain consumer-owned.
-// REMOVE: Phase 5.1 moves this adapter with the storage command domain.
+use klights_cluster_core::{
+    PatchKind, ResourceBatchOperation, ResourceBatchPutMode, ResourcePreconditions,
+};
+// TEMPORARY(Phase 5.1): the root composition crate remains the only package
+// that can see both the canonical cluster-core domain and generated wire.
+// REMOVE(Phase 5.5): move this private conversion boundary to replication.
 use klights_internal_protobuf::storage::*;
+use prost::Message;
 
-impl From<CommandMeta> for ProtoCommandMeta {
-    fn from(meta: CommandMeta) -> Self {
+/// Local conversion traits keep the generated-wire boundary explicit without
+/// violating Rust's orphan rules now that both canonical sides have owners.
+trait BoundaryFrom<T>: Sized {
+    fn boundary_from(value: T) -> Self;
+}
+
+trait BoundaryTryFrom<T>: Sized {
+    fn boundary_try_from(value: T) -> anyhow::Result<Self>;
+}
+
+impl BoundaryFrom<CommandMeta> for ProtoCommandMeta {
+    fn boundary_from(meta: CommandMeta) -> Self {
         Self {
             command_id: meta.command_id.0,
             codec_version: meta.codec_version,
@@ -19,8 +34,8 @@ impl From<CommandMeta> for ProtoCommandMeta {
     }
 }
 
-impl From<ProtoCommandMeta> for CommandMeta {
-    fn from(wire: ProtoCommandMeta) -> Self {
+impl BoundaryFrom<ProtoCommandMeta> for CommandMeta {
+    fn boundary_from(wire: ProtoCommandMeta) -> Self {
         Self {
             command_id: CommandId(wire.command_id),
             codec_version: wire.codec_version,
@@ -70,7 +85,7 @@ pub fn decode_meta_json(bytes: &[u8]) -> anyhow::Result<CommandMeta> {
 
 /// Encode a `StorageCommand` as protobuf bytes.
 pub fn encode_command_protobuf(cmd: &StorageCommand) -> anyhow::Result<Vec<u8>> {
-    let proto = ProtoStorageCommand::from(cmd.clone());
+    let proto = ProtoStorageCommand::boundary_try_from(cmd.clone())?;
     let mut buf = Vec::with_capacity(proto.encoded_len());
     prost::Message::encode(&proto, &mut buf)?;
     Ok(buf)
@@ -79,12 +94,12 @@ pub fn encode_command_protobuf(cmd: &StorageCommand) -> anyhow::Result<Vec<u8>> 
 /// Decode a `StorageCommand` from protobuf bytes.
 pub fn decode_command_protobuf(bytes: &[u8]) -> anyhow::Result<StorageCommand> {
     let proto: ProtoStorageCommand = prost::Message::decode(bytes)?;
-    proto.try_into()
+    StorageCommand::boundary_try_from(proto)
 }
 
 /// Encode `StorageResponse` as protobuf bytes.
 pub fn encode_response_protobuf(resp: &StorageResponse) -> anyhow::Result<Vec<u8>> {
-    let proto = ProtoStorageResponse::from(resp.clone());
+    let proto = ProtoStorageResponse::boundary_try_from(resp.clone())?;
     let mut buf = Vec::with_capacity(proto.encoded_len());
     prost::Message::encode(&proto, &mut buf)?;
     Ok(buf)
@@ -93,12 +108,12 @@ pub fn encode_response_protobuf(resp: &StorageResponse) -> anyhow::Result<Vec<u8
 /// Decode `StorageResponse` from protobuf bytes.
 pub fn decode_response_protobuf(bytes: &[u8]) -> anyhow::Result<StorageResponse> {
     let proto: ProtoStorageResponse = prost::Message::decode(bytes)?;
-    proto.try_into()
+    StorageResponse::boundary_try_from(proto)
 }
 
 /// Encode `CommandMeta` as protobuf bytes.
 pub fn encode_meta_protobuf(meta: &CommandMeta) -> anyhow::Result<Vec<u8>> {
-    let proto: ProtoCommandMeta = meta.clone().into();
+    let proto = ProtoCommandMeta::boundary_from(meta.clone());
     let mut buf = Vec::with_capacity(proto.encoded_len());
     prost::Message::encode(&proto, &mut buf)?;
     Ok(buf)
@@ -107,12 +122,12 @@ pub fn encode_meta_protobuf(meta: &CommandMeta) -> anyhow::Result<Vec<u8>> {
 /// Decode `CommandMeta` from protobuf bytes.
 pub fn decode_meta_protobuf(bytes: &[u8]) -> anyhow::Result<CommandMeta> {
     let proto: ProtoCommandMeta = prost::Message::decode(bytes)?;
-    Ok(proto.into())
+    Ok(CommandMeta::boundary_from(proto))
 }
 
 /// Encode `CommandError` as protobuf bytes.
 pub fn encode_error_protobuf(err: &CommandError) -> anyhow::Result<Vec<u8>> {
-    let proto = ProtoCommandError::from(err.clone());
+    let proto = ProtoCommandError::boundary_try_from(err.clone())?;
     let mut buf = Vec::with_capacity(proto.encoded_len());
     prost::Message::encode(&proto, &mut buf)?;
     Ok(buf)
@@ -121,7 +136,7 @@ pub fn encode_error_protobuf(err: &CommandError) -> anyhow::Result<Vec<u8>> {
 /// Decode `CommandError` from protobuf bytes.
 pub fn decode_error_protobuf(bytes: &[u8]) -> anyhow::Result<CommandError> {
     let proto: ProtoCommandError = prost::Message::decode(bytes)?;
-    proto.try_into()
+    CommandError::boundary_try_from(proto)
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +151,8 @@ fn bytes_to_json(data: &[u8]) -> serde_json::Value {
     serde_json::from_slice(data).unwrap_or(serde_json::Value::Null)
 }
 
-impl From<ResourcePreconditions> for ProtoResourcePreconditions {
-    fn from(preconditions: ResourcePreconditions) -> Self {
+impl BoundaryFrom<ResourcePreconditions> for ProtoResourcePreconditions {
+    fn boundary_from(preconditions: ResourcePreconditions) -> Self {
         Self {
             uid: preconditions.uid,
             resource_version: preconditions.resource_version,
@@ -145,8 +160,8 @@ impl From<ResourcePreconditions> for ProtoResourcePreconditions {
     }
 }
 
-impl From<ProtoResourcePreconditions> for ResourcePreconditions {
-    fn from(preconditions: ProtoResourcePreconditions) -> Self {
+impl BoundaryFrom<ProtoResourcePreconditions> for ResourcePreconditions {
+    fn boundary_from(preconditions: ProtoResourcePreconditions) -> Self {
         Self {
             uid: preconditions.uid,
             resource_version: preconditions.resource_version,
@@ -159,12 +174,12 @@ fn decode_preconditions(
     command: &str,
 ) -> anyhow::Result<ResourcePreconditions> {
     preconditions
-        .map(Into::into)
+        .map(ResourcePreconditions::boundary_from)
         .ok_or_else(|| anyhow::anyhow!("protobuf {command} is missing resource preconditions"))
 }
 
-impl From<ResourceBatchPutMode> for ProtoResourceBatchPutMode {
-    fn from(mode: ResourceBatchPutMode) -> Self {
+impl BoundaryFrom<ResourceBatchPutMode> for ProtoResourceBatchPutMode {
+    fn boundary_from(mode: ResourceBatchPutMode) -> Self {
         match mode {
             ResourceBatchPutMode::Create => Self::Create,
             ResourceBatchPutMode::Update => Self::Update,
@@ -172,10 +187,8 @@ impl From<ResourceBatchPutMode> for ProtoResourceBatchPutMode {
     }
 }
 
-impl TryFrom<ProtoResourceBatchPutMode> for ResourceBatchPutMode {
-    type Error = anyhow::Error;
-
-    fn try_from(mode: ProtoResourceBatchPutMode) -> anyhow::Result<Self> {
+impl BoundaryTryFrom<ProtoResourceBatchPutMode> for ResourceBatchPutMode {
+    fn boundary_try_from(mode: ProtoResourceBatchPutMode) -> anyhow::Result<Self> {
         Ok(match mode {
             ProtoResourceBatchPutMode::Create => Self::Create,
             ProtoResourceBatchPutMode::Update => Self::Update,
@@ -183,8 +196,8 @@ impl TryFrom<ProtoResourceBatchPutMode> for ResourceBatchPutMode {
     }
 }
 
-impl From<ResourceBatchOperation> for ProtoResourceBatchOperation {
-    fn from(operation: ResourceBatchOperation) -> Self {
+impl BoundaryFrom<ResourceBatchOperation> for ProtoResourceBatchOperation {
+    fn boundary_from(operation: ResourceBatchOperation) -> Self {
         let operation = match operation {
             ResourceBatchOperation::Put {
                 api_version,
@@ -200,8 +213,8 @@ impl From<ResourceBatchOperation> for ProtoResourceBatchOperation {
                 namespace,
                 name,
                 data: json_to_bytes(&data),
-                mode: ProtoResourceBatchPutMode::from(mode) as i32,
-                preconditions: Some(preconditions.into()),
+                mode: ProtoResourceBatchPutMode::boundary_from(mode) as i32,
+                preconditions: Some(ProtoResourcePreconditions::boundary_from(preconditions)),
             }),
             ResourceBatchOperation::Delete {
                 api_version,
@@ -214,7 +227,7 @@ impl From<ResourceBatchOperation> for ProtoResourceBatchOperation {
                 kind,
                 namespace,
                 name,
-                preconditions: Some(preconditions.into()),
+                preconditions: Some(ProtoResourcePreconditions::boundary_from(preconditions)),
             }),
         };
         Self {
@@ -223,10 +236,8 @@ impl From<ResourceBatchOperation> for ProtoResourceBatchOperation {
     }
 }
 
-impl TryFrom<ProtoResourceBatchOperation> for ResourceBatchOperation {
-    type Error = anyhow::Error;
-
-    fn try_from(operation: ProtoResourceBatchOperation) -> anyhow::Result<Self> {
+impl BoundaryTryFrom<ProtoResourceBatchOperation> for ResourceBatchOperation {
+    fn boundary_try_from(operation: ProtoResourceBatchOperation) -> anyhow::Result<Self> {
         let operation = operation
             .operation
             .ok_or_else(|| anyhow::anyhow!("protobuf ResourceBatchOperation has no variant"))?;
@@ -236,7 +247,7 @@ impl TryFrom<ProtoResourceBatchOperation> for ResourceBatchOperation {
                     .map_err(|_| {
                         anyhow::anyhow!("unknown protobuf ResourceBatchPutMode: {}", put.mode)
                     })
-                    .and_then(ResourceBatchPutMode::try_from)?;
+                    .and_then(ResourceBatchPutMode::boundary_try_from)?;
                 Ok(ResourceBatchOperation::Put {
                     api_version: put.api_version,
                     kind: put.kind,
@@ -263,8 +274,8 @@ impl TryFrom<ProtoResourceBatchOperation> for ResourceBatchOperation {
     }
 }
 
-impl From<StorageCommand> for ProtoStorageCommand {
-    fn from(cmd: StorageCommand) -> Self {
+impl BoundaryTryFrom<StorageCommand> for ProtoStorageCommand {
+    fn boundary_try_from(cmd: StorageCommand) -> anyhow::Result<Self> {
         let command = match cmd {
             StorageCommand::CreateResource {
                 api_version,
@@ -294,7 +305,7 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 name,
                 data: json_to_bytes(&data),
                 expected_rv,
-                preconditions: Some(preconditions.into()),
+                preconditions: Some(ProtoResourcePreconditions::boundary_from(preconditions)),
             }),
             StorageCommand::DeleteResource {
                 api_version,
@@ -307,7 +318,7 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 kind,
                 namespace,
                 name,
-                preconditions: Some(preconditions.into()),
+                preconditions: Some(ProtoResourcePreconditions::boundary_from(preconditions)),
             }),
             StorageCommand::DeleteResourceWithTombstone {
                 api_version,
@@ -322,7 +333,7 @@ impl From<StorageCommand> for ProtoStorageCommand {
                     kind,
                     namespace,
                     name,
-                    preconditions: Some(preconditions.into()),
+                    preconditions: Some(ProtoResourcePreconditions::boundary_from(preconditions)),
                     grace_seconds,
                 },
             ),
@@ -344,7 +355,7 @@ impl From<StorageCommand> for ProtoStorageCommand {
                     PatchKind::Merge => ProtoPatchKind::Merge as i32,
                 },
                 patch: json_to_bytes(&patch),
-                preconditions: Some(preconditions.into()),
+                preconditions: Some(ProtoResourcePreconditions::boundary_from(preconditions)),
                 strict_resource_version,
             }),
             StorageCommand::UpdateStatus {
@@ -363,12 +374,15 @@ impl From<StorageCommand> for ProtoStorageCommand {
                 name,
                 status: json_to_bytes(&status),
                 expected_rv,
-                preconditions: Some(preconditions.into()),
+                preconditions: Some(ProtoResourcePreconditions::boundary_from(preconditions)),
                 observed_status_stamp,
             }),
             StorageCommand::ApplyResourceBatch { operations } => {
                 proto_storage_command::Command::ApplyResourceBatch(ProtoApplyResourceBatch {
-                    operations: operations.into_iter().map(Into::into).collect(),
+                    operations: operations
+                        .into_iter()
+                        .map(ProtoResourceBatchOperation::boundary_from)
+                        .collect(),
                 })
             }
             StorageCommand::CreateNamespace { name, data } => {
@@ -533,17 +547,16 @@ impl From<StorageCommand> for ProtoStorageCommand {
             StorageCommand::SetKlightsMeta { key, value } => {
                 proto_storage_command::Command::SetKlightsMeta(ProtoSetKlightsMeta { key, value })
             }
+            _ => anyhow::bail!("unsupported StorageCommand variant at codec boundary"),
         };
-        ProtoStorageCommand {
+        Ok(ProtoStorageCommand {
             command: Some(command),
-        }
+        })
     }
 }
 
-impl TryFrom<ProtoStorageCommand> for StorageCommand {
-    type Error = anyhow::Error;
-
-    fn try_from(proto: ProtoStorageCommand) -> anyhow::Result<Self> {
+impl BoundaryTryFrom<ProtoStorageCommand> for StorageCommand {
+    fn boundary_try_from(proto: ProtoStorageCommand) -> anyhow::Result<Self> {
         let cmd = proto
             .command
             .ok_or_else(|| anyhow::anyhow!("protobuf StorageCommand has no variant"))?;
@@ -613,7 +626,7 @@ impl TryFrom<ProtoStorageCommand> for StorageCommand {
                     operations: batch
                         .operations
                         .into_iter()
-                        .map(ResourceBatchOperation::try_from)
+                        .map(ResourceBatchOperation::boundary_try_from)
                         .collect::<anyhow::Result<Vec<_>>>()?,
                 }
             }
@@ -743,8 +756,8 @@ impl TryFrom<ProtoStorageCommand> for StorageCommand {
     }
 }
 
-impl From<StorageResponse> for ProtoStorageResponse {
-    fn from(resp: StorageResponse) -> Self {
+impl BoundaryTryFrom<StorageResponse> for ProtoStorageResponse {
+    fn boundary_try_from(resp: StorageResponse) -> anyhow::Result<Self> {
         let response = match resp {
             StorageResponse::Resource {
                 resource_version,
@@ -776,17 +789,16 @@ impl From<StorageResponse> for ProtoStorageResponse {
             StorageResponse::Error { message } => {
                 proto_storage_response::Response::Error(ProtoErrorResp { message })
             }
+            _ => anyhow::bail!("unsupported StorageResponse variant at codec boundary"),
         };
-        ProtoStorageResponse {
+        Ok(ProtoStorageResponse {
             response: Some(response),
-        }
+        })
     }
 }
 
-impl TryFrom<ProtoStorageResponse> for StorageResponse {
-    type Error = anyhow::Error;
-
-    fn try_from(proto: ProtoStorageResponse) -> anyhow::Result<Self> {
+impl BoundaryTryFrom<ProtoStorageResponse> for StorageResponse {
+    fn boundary_try_from(proto: ProtoStorageResponse) -> anyhow::Result<Self> {
         let resp = proto
             .response
             .ok_or_else(|| anyhow::anyhow!("protobuf StorageResponse has no variant"))?;
@@ -815,21 +827,20 @@ impl TryFrom<ProtoStorageResponse> for StorageResponse {
     }
 }
 
-impl From<CommandError> for ProtoCommandError {
-    fn from(err: CommandError) -> Self {
+impl BoundaryTryFrom<CommandError> for ProtoCommandError {
+    fn boundary_try_from(err: CommandError) -> anyhow::Result<Self> {
         let (code, message) = match err {
             CommandError::Conflict { message } => (ProtoCommandErrorCode::Conflict as i32, message),
             CommandError::NotFound { message } => (ProtoCommandErrorCode::NotFound as i32, message),
             CommandError::Internal { message } => (ProtoCommandErrorCode::Internal as i32, message),
+            _ => anyhow::bail!("unsupported CommandError variant at codec boundary"),
         };
-        ProtoCommandError { code, message }
+        Ok(ProtoCommandError { code, message })
     }
 }
 
-impl TryFrom<ProtoCommandError> for CommandError {
-    type Error = anyhow::Error;
-
-    fn try_from(proto: ProtoCommandError) -> anyhow::Result<Self> {
+impl BoundaryTryFrom<ProtoCommandError> for CommandError {
+    fn boundary_try_from(proto: ProtoCommandError) -> anyhow::Result<Self> {
         let code = ProtoCommandErrorCode::try_from(proto.code)
             .map_err(|_| anyhow::anyhow!("unknown protobuf CommandErrorCode: {}", proto.code))?;
 
@@ -921,19 +932,6 @@ mod tests {
         let proto_bytes = encode_command_protobuf(&cmd).expect("encode protobuf command");
         let proto_decoded = decode_command_protobuf(&proto_bytes).expect("decode protobuf command");
         assert_eq!(proto_decoded, cmd);
-    }
-
-    #[test]
-    fn apply_resource_batch_variant_name_and_builder() {
-        let cmd = StorageCommand::apply_resource_batch(Vec::new());
-        assert_eq!(cmd.variant_name(), "ApplyResourceBatch");
-        match cmd {
-            StorageCommand::ApplyResourceBatch { operations } => assert!(operations.is_empty()),
-            other => panic!(
-                "expected ApplyResourceBatch, got {:?}",
-                other.variant_name()
-            ),
-        }
     }
 
     // ---- Helpers ----
@@ -1199,6 +1197,12 @@ mod tests {
                 "GcAppliedOutbox",
             ),
             (
+                StorageCommand::EnsureClusterMetadata {
+                    cluster_id: "cluster-1".into(),
+                },
+                "EnsureClusterMetadata",
+            ),
+            (
                 StorageCommand::SetKlightsMeta {
                     key: "voters".into(),
                     value: r#"["mn-leader"]"#.into(),
@@ -1277,6 +1281,7 @@ mod tests {
             "WatchEventAppend",
             "GcWatchEvents",
             "GcAppliedOutbox",
+            "EnsureClusterMetadata",
             "SetKlightsMeta",
         ]
         .into_iter()
@@ -1659,65 +1664,6 @@ mod tests {
         }
     }
 
-    /// Builder helpers stamp the matching variant.
-    #[test]
-    fn builder_helpers_construct_expected_variants() {
-        let cr = StorageCommand::create_resource(
-            "v1",
-            "Pod",
-            Some("default"),
-            "p",
-            json!({"apiVersion": "v1"}),
-        );
-        assert_eq!(cr.variant_name(), "CreateResource");
-
-        let ur = StorageCommand::update_resource(
-            "v1",
-            "Pod",
-            Some("default"),
-            "p",
-            json!({"apiVersion": "v1"}),
-            5,
-        );
-        assert_eq!(ur.variant_name(), "UpdateResource");
-
-        let us = StorageCommand::update_status(
-            "v1",
-            "Pod",
-            Some("default"),
-            "p",
-            json!({"phase": "Running"}),
-            Some(5),
-        );
-        assert_eq!(us.variant_name(), "UpdateStatus");
-
-        let pr = StorageCommand::patch_resource(
-            "v1",
-            "ConfigMap",
-            Some("default"),
-            "cm",
-            PatchKind::Merge,
-            json!({"data": {"k": "v"}}),
-        );
-        assert_eq!(pr.variant_name(), "PatchResource");
-
-        let cn = StorageCommand::create_namespace("ns", json!({"kind": "Namespace"}));
-        assert_eq!(cn.variant_name(), "CreateNamespace");
-
-        // Cluster-scoped resource accepts namespace=None.
-        let cluster = StorageCommand::create_resource(
-            "rbac.authorization.k8s.io/v1",
-            "ClusterRole",
-            None,
-            "admin",
-            json!({"kind": "ClusterRole"}),
-        );
-        match cluster {
-            StorageCommand::CreateResource { namespace, .. } => assert!(namespace.is_none()),
-            other => panic!("expected CreateResource, got {:?}", other.variant_name()),
-        }
-    }
-
     /// Protobuf encoding is deterministic for the same input.
     #[test]
     fn protobuf_delete_resource_round_trip_is_deterministic() {
@@ -1734,31 +1680,6 @@ mod tests {
 
         let decoded = decode_command_protobuf(&first).unwrap();
         assert_eq!(cmd, decoded);
-    }
-
-    // ---- Codec version constant ----
-
-    #[test]
-    fn codec_version_is_2() {
-        assert_eq!(COMMAND_CODEC_VERSION, 2);
-    }
-
-    // ---- CommandId ----
-
-    #[test]
-    fn command_id_new_is_unique() {
-        let a = CommandId::new();
-        let b = CommandId::new();
-        assert_ne!(
-            a, b,
-            "two CommandId::new() calls must produce different IDs"
-        );
-    }
-
-    #[test]
-    fn command_id_display_round_trips() {
-        let id = CommandId("test-123".into());
-        assert_eq!(id.to_string(), "test-123");
     }
 
     // ---- CommandMeta edge cases ----

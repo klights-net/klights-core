@@ -787,6 +787,10 @@ pub(crate) async fn apply_forwarded_command(
             "{} cannot be forwarded from a replica",
             command.variant_name()
         )),
+        unsupported => Err(anyhow!(
+            "{} cannot be forwarded from a replica",
+            unsupported.variant_name()
+        )),
     }
 }
 

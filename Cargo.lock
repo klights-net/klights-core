@@ -2024,6 +2024,7 @@ dependencies = [
  "k8s-cri",
  "k8s-openapi",
  "k8s-pb",
+ "klights-cluster-core",
  "klights-internal-protobuf",
  "klights-types",
  "kube",
@@ -2104,6 +2105,13 @@ version = "0.0.0"
 [[package]]
 name = "klights-cluster-core"
 version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "klights-types",
+ "serde",
+ "serde_json",
+ "uuid",
+]
 
 [[package]]
 name = "klights-cluster-datastore"
