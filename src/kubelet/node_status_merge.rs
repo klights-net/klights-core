@@ -1,5 +1,7 @@
 use crate::kubelet::node_role_labels::prune_klights_managed_node_role_labels;
 
+pub use klights_cluster_core::merge_node_status_for_update;
+
 pub fn set_node_external_ip(node: &mut serde_json::Value, external_ip: &str) -> bool {
     let external_ip = external_ip.trim();
     if external_ip.is_empty() {
@@ -99,20 +101,6 @@ pub fn merge_existing_node_mutable_fields(
     merge_node_status_conditions(desired, existing);
 }
 
-/// Merge an incoming Node `/status` update with the live Node's co-authored
-/// conditions, preserving fresher leader transitions while allowing newer
-/// worker dataplane recovery transitions to apply.
-pub fn merge_node_status_for_update(
-    incoming_status: &mut serde_json::Value,
-    existing: &serde_json::Value,
-) {
-    let mut desired = serde_json::json!({ "status": incoming_status.clone() });
-    merge_node_status_conditions(&mut desired, existing);
-    if let Some(status) = desired.get("status").cloned() {
-        *incoming_status = status;
-    }
-}
-
 pub(crate) fn preserve_existing_network_conditions(
     desired: &mut serde_json::Value,
     existing: &serde_json::Value,
@@ -145,156 +133,10 @@ pub(crate) fn preserve_existing_network_conditions(
 }
 
 fn merge_node_status_conditions(desired: &mut serde_json::Value, existing: &serde_json::Value) {
-    let Some(desired_conditions) = desired
-        .pointer_mut("/status/conditions")
-        .and_then(|value| value.as_array_mut())
-    else {
+    let Some(incoming_status) = desired.get_mut("status") else {
         return;
     };
-    let Some(existing_conditions) = existing
-        .pointer("/status/conditions")
-        .and_then(|v| v.as_array())
-    else {
-        return;
-    };
-    let desired_network_pair_should_replace =
-        network_condition_pair_should_replace(desired_conditions, existing_conditions);
-    let existing_network_pair_should_preserve =
-        network_condition_pair_should_preserve_existing(desired_conditions, existing_conditions);
-    for existing_cond in existing_conditions {
-        let Some(cond_type) = existing_cond.get("type").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        match desired_conditions
-            .iter()
-            .position(|c| c.get("type").and_then(|v| v.as_str()) == Some(cond_type))
-        {
-            None => {
-                desired_conditions.push(existing_cond.clone());
-            }
-            Some(idx) => {
-                if desired_network_pair_should_replace && is_network_condition_type(cond_type) {
-                    continue;
-                }
-                if existing_network_pair_should_preserve && is_network_condition_type(cond_type) {
-                    desired_conditions[idx] = existing_cond.clone();
-                    continue;
-                }
-                if !condition_is_strictly_newer(&desired_conditions[idx], existing_cond) {
-                    desired_conditions[idx] = existing_cond.clone();
-                }
-            }
-        }
-    }
-}
-
-fn is_network_condition_type(cond_type: &str) -> bool {
-    matches!(cond_type, "Ready" | "NetworkUnavailable")
-}
-
-fn network_condition_pair_has_newer_transition(
-    desired_conditions: &[serde_json::Value],
-    existing_conditions: &[serde_json::Value],
-) -> bool {
-    let desired_ready = condition_by_type(desired_conditions, "Ready");
-    let desired_network = condition_by_type(desired_conditions, "NetworkUnavailable");
-    let existing_ready = condition_by_type(existing_conditions, "Ready");
-    let existing_network = condition_by_type(existing_conditions, "NetworkUnavailable");
-
-    if !desired_network_pair_is_coherent(desired_ready, desired_network) {
-        return false;
-    }
-
-    let desired_ready_is_newer = desired_ready.is_some_and(|desired| {
-        existing_ready.is_some_and(|existing| condition_is_strictly_newer(desired, existing))
-    });
-    if desired_ready_is_newer {
-        return true;
-    }
-
-    network_condition_pair_is_healthy(desired_ready, desired_network)
-        && desired_network.is_some_and(|desired| {
-            existing_network.is_some_and(|existing| condition_is_strictly_newer(desired, existing))
-        })
-}
-
-fn network_condition_pair_should_replace(
-    desired_conditions: &[serde_json::Value],
-    existing_conditions: &[serde_json::Value],
-) -> bool {
-    if network_condition_pair_has_newer_transition(desired_conditions, existing_conditions) {
-        return true;
-    }
-
-    let desired_ready = condition_by_type(desired_conditions, "Ready");
-    let desired_network = condition_by_type(desired_conditions, "NetworkUnavailable");
-    let existing_ready = condition_by_type(existing_conditions, "Ready");
-    let existing_network = condition_by_type(existing_conditions, "NetworkUnavailable");
-
-    network_condition_pair_is_healthy(desired_ready, desired_network)
-        && network_condition_pair_is_unavailable(existing_ready, existing_network)
-        && network_condition_pair_timestamps_tie(
-            desired_ready,
-            desired_network,
-            existing_ready,
-            existing_network,
-        )
-}
-
-fn network_condition_pair_should_preserve_existing(
-    desired_conditions: &[serde_json::Value],
-    existing_conditions: &[serde_json::Value],
-) -> bool {
-    let desired_ready = condition_by_type(desired_conditions, "Ready");
-    let desired_network = condition_by_type(desired_conditions, "NetworkUnavailable");
-    let existing_ready = condition_by_type(existing_conditions, "Ready");
-    let existing_network = condition_by_type(existing_conditions, "NetworkUnavailable");
-
-    desired_network_pair_is_coherent(desired_ready, desired_network)
-        && desired_network_pair_is_coherent(existing_ready, existing_network)
-        && !network_condition_pair_should_replace(desired_conditions, existing_conditions)
-}
-
-fn desired_network_pair_is_coherent(
-    ready: Option<&serde_json::Value>,
-    network: Option<&serde_json::Value>,
-) -> bool {
-    matches!(
-        (condition_status(ready), condition_status(network)),
-        (Some("True"), Some("False")) | (Some("False"), Some("True"))
-    )
-}
-
-fn network_condition_pair_is_healthy(
-    ready: Option<&serde_json::Value>,
-    network: Option<&serde_json::Value>,
-) -> bool {
-    matches!(
-        (condition_status(ready), condition_status(network)),
-        (Some("True"), Some("False"))
-    )
-}
-
-fn network_condition_pair_is_unavailable(
-    ready: Option<&serde_json::Value>,
-    network: Option<&serde_json::Value>,
-) -> bool {
-    matches!(
-        (condition_status(ready), condition_status(network)),
-        (Some("False"), Some("True"))
-    )
-}
-
-fn network_condition_pair_timestamps_tie(
-    desired_ready: Option<&serde_json::Value>,
-    desired_network: Option<&serde_json::Value>,
-    existing_ready: Option<&serde_json::Value>,
-    existing_network: Option<&serde_json::Value>,
-) -> bool {
-    condition_transition_time(desired_ready).is_some()
-        && condition_transition_time(desired_ready) == condition_transition_time(existing_ready)
-        && condition_transition_time(desired_network).is_some()
-        && condition_transition_time(desired_network) == condition_transition_time(existing_network)
+    klights_cluster_core::merge_node_status_for_update(incoming_status, existing);
 }
 
 fn condition_by_type<'a>(
@@ -304,41 +146,6 @@ fn condition_by_type<'a>(
     conditions
         .iter()
         .find(|condition| condition.get("type").and_then(|value| value.as_str()) == Some(cond_type))
-}
-
-fn condition_status(condition: Option<&serde_json::Value>) -> Option<&str> {
-    condition
-        .and_then(|condition| condition.get("status"))
-        .and_then(|value| value.as_str())
-}
-
-fn condition_transition_time(condition: Option<&serde_json::Value>) -> Option<&str> {
-    condition
-        .and_then(|condition| condition.get("lastTransitionTime"))
-        .and_then(|value| value.as_str())
-}
-
-fn condition_is_strictly_newer(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    let a_time = a.get("lastTransitionTime").and_then(|v| v.as_str());
-    let b_time = b.get("lastTransitionTime").and_then(|v| v.as_str());
-    match (a_time, b_time) {
-        (Some(a_str), Some(b_str)) => match (parse_rfc3339_utc(a_str), parse_rfc3339_utc(b_str)) {
-            (Some(a_dt), Some(b_dt)) => a_dt > b_dt,
-            _ => a_str > b_str,
-        },
-        // Legacy or externally-created Node conditions may omit
-        // lastTransitionTime. A timestamped transition has positive ordering
-        // evidence and must supersede such a condition; otherwise controllers
-        // can never move the Node to a new state.
-        (Some(_), None) => true,
-        (None, Some(_) | None) => false,
-    }
-}
-
-fn parse_rfc3339_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
 }
 
 fn node_status_external_ip(node: &serde_json::Value) -> Option<&str> {
@@ -378,41 +185,5 @@ fn merge_metadata_object_field(
         for (key, value) in overlay {
             entry_obj.insert(key.clone(), value.clone());
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn timestamped_node_condition_replaces_legacy_condition_without_timestamp() {
-        let existing = serde_json::json!({
-            "status": {
-                "conditions": [{
-                    "type": "Ready",
-                    "status": "True",
-                    "reason": "E2E"
-                }]
-            }
-        });
-        let mut incoming = serde_json::json!({
-            "conditions": [{
-                "type": "Ready",
-                "status": "Unknown",
-                "reason": "NodeStatusUnknown",
-                "lastTransitionTime": "2026-07-14T11:38:22Z"
-            }]
-        });
-
-        merge_node_status_for_update(&mut incoming, &existing);
-
-        assert_eq!(
-            incoming
-                .pointer("/conditions/0/status")
-                .and_then(|v| v.as_str()),
-            Some("Unknown"),
-            "a timestamped controller transition must supersede a legacy condition with no timestamp"
-        );
     }
 }

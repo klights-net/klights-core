@@ -187,10 +187,20 @@ pub fn validate_uid_immutable(incoming: &Value, current: &Value) -> Result<()> {
     let Some(current_uid) = resource_uid(current) else {
         return Ok(());
     };
-    if incoming_uid == current_uid {
-        return Ok(());
-    }
-    Err(crate::datastore::errors::DatastoreError::conflict("metadata.uid is immutable").into())
+    klights_cluster_core::validate_apply_preconditions(
+        klights_cluster_core::ApplyPreconditionPolicy::Strict,
+        klights_cluster_core::ApplyPreconditions {
+            uid: Some(incoming_uid),
+            ..klights_cluster_core::ApplyPreconditions::default()
+        },
+        Some(klights_cluster_core::CurrentResourceState {
+            uid: Some(current_uid),
+            resource_version: 0,
+        }),
+    )
+    .map_err(|_| {
+        crate::datastore::errors::DatastoreError::conflict("metadata.uid is immutable").into()
+    })
 }
 
 /// Validate resource preconditions (UID and RV) against current state.
@@ -199,22 +209,30 @@ pub fn validate_resource_preconditions(
     current: &Value,
     current_rv: i64,
 ) -> Result<()> {
-    if let Some(expected_uid) = preconditions.uid.as_deref()
-        && resource_uid(current) != Some(expected_uid)
-    {
-        return Err(
-            crate::datastore::errors::DatastoreError::conflict("UID precondition failed").into(),
-        );
-    }
-    if let Some(expected_rv) = preconditions.resource_version
-        && current_rv != expected_rv
-    {
-        return Err(crate::datastore::errors::DatastoreError::conflict(
-            "resourceVersion precondition failed",
-        )
-        .into());
-    }
-    Ok(())
+    klights_cluster_core::validate_apply_preconditions(
+        klights_cluster_core::ApplyPreconditionPolicy::Strict,
+        klights_cluster_core::ApplyPreconditions {
+            uid: preconditions.uid.as_deref(),
+            resource_version: preconditions.resource_version,
+            ..klights_cluster_core::ApplyPreconditions::default()
+        },
+        Some(klights_cluster_core::CurrentResourceState {
+            uid: resource_uid(current),
+            resource_version: current_rv,
+        }),
+    )
+    .map_err(|violation| match violation {
+        klights_cluster_core::ApplyPreconditionViolation::Uid { .. } => {
+            crate::datastore::errors::DatastoreError::conflict("UID precondition failed").into()
+        }
+        klights_cluster_core::ApplyPreconditionViolation::ResourceVersion { .. } => {
+            crate::datastore::errors::DatastoreError::conflict(
+                "resourceVersion precondition failed",
+            )
+            .into()
+        }
+        other => crate::datastore::errors::DatastoreError::conflict(other.to_string()).into(),
+    })
 }
 
 /// Increment the global resource version counter.

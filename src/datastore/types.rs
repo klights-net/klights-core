@@ -352,81 +352,8 @@ pub enum WatchReplayRead<T = CatchUpResource> {
     Expired,
 }
 
-/// Lossless durable watch-log cursor. `event_id == 0` denotes an external
-/// Kubernetes resourceVersion boundary; once replay starts, `event_id` is the
-/// authoritative insertion/apply-order position and permits later-applied rows
-/// whose resourceVersion is lower than an already observed row.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct WatchReplayPosition {
-    pub resource_version: i64,
-    pub event_id: i64,
-    /// While non-zero, rows through this durable event ID are filtered by
-    /// `resource_version`; later rows are selected solely by event ID. This
-    /// closes a positive-RV list/watch handoff without losing a lower-RV row
-    /// applied after the signal subscription is established.
-    pub resource_version_filter_through_event_id: i64,
-}
-
-impl WatchReplayPosition {
-    pub const fn from_resource_version(resource_version: i64) -> Self {
-        Self {
-            resource_version,
-            event_id: 0,
-            resource_version_filter_through_event_id: 0,
-        }
-    }
-
-    pub const fn from_resource_version_through_event_id(
-        resource_version: i64,
-        event_id: i64,
-    ) -> Self {
-        Self {
-            resource_version,
-            event_id: 0,
-            resource_version_filter_through_event_id: event_id,
-        }
-    }
-
-    pub fn after_page<T>(
-        current: Self,
-        events: &[PositionedWatchEvent<T>],
-        high_water_event_id: i64,
-        _limit: std::num::NonZeroUsize,
-    ) -> Self {
-        if let Some(event) = events.last() {
-            // Advance only through rows actually returned.  A backend may
-            // under-fill a bounded scan while rows remain (target filtering,
-            // decode skips, or a keyset boundary); jumping to the high-water
-            // event ID on every short page would permanently skip that suffix.
-            let mut next = event.position;
-            if next.event_id < current.resource_version_filter_through_event_id {
-                next.resource_version = current.resource_version;
-                next.resource_version_filter_through_event_id =
-                    current.resource_version_filter_through_event_id;
-            }
-            return next;
-        }
-        Self {
-            resource_version: events.last().map_or(current.resource_version, |event| {
-                event.position.resource_version
-            }),
-            event_id: high_water_event_id,
-            resource_version_filter_through_event_id: if high_water_event_id
-                < current.resource_version_filter_through_event_id
-            {
-                current.resource_version_filter_through_event_id
-            } else {
-                0
-            },
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct PositionedWatchEvent<T> {
-    pub position: WatchReplayPosition,
-    pub event: T,
-}
+pub use klights_cluster_core::PositionedWatchEvent;
+pub use klights_cluster_core::WatchReplayPosition;
 
 #[derive(Clone, Debug)]
 pub struct PositionedWatchReplay<T> {

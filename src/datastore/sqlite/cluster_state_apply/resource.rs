@@ -227,24 +227,27 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         );
         let data_bytes = serde_json::to_vec(&row.data)
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
-        if existing.as_ref().is_some_and(|(rv, _uid, existing_bytes)| {
-            *rv == row.resource_version && *existing_bytes == data_bytes
-        }) {
-            sink.upsert_indexes_from_bytes(identity, &data_bytes)?;
-            return Ok(None);
-        }
+        let same_resource_version_and_body =
+            existing.as_ref().is_some_and(|(rv, _uid, existing_bytes)| {
+                *rv == row.resource_version && *existing_bytes == data_bytes
+            });
+        let event_type = match klights_cluster_core::decide_resource_put(
+            existing.is_some(),
+            same_resource_version_and_body,
+        ) {
+            klights_cluster_core::ResourceWriteDecision::NoOp => {
+                sink.upsert_indexes_from_bytes(identity, &data_bytes)?;
+                return Ok(None);
+            }
+            klights_cluster_core::ResourceWriteDecision::Write(event_type) => event_type,
+        };
         sink.upsert_resource_from_bytes(identity, &row.uid, row.resource_version, &data_bytes)?;
         sink.upsert_indexes_from_bytes(identity, &data_bytes)?;
-        let event_type = if existing.is_some() {
-            "MODIFIED"
-        } else {
-            "ADDED"
-        };
         sink.emit_watch_from_bytes(
             emit_watch_events,
             identity,
             row.resource_version,
-            event_type,
+            event_type.as_str(),
             &data_bytes,
             row.data,
         )
@@ -322,22 +325,20 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
         let Some((current_rv, current_uid, data_bytes)) = existing else {
             return Ok(None);
         };
-        if !key.uid.is_empty() && key.uid.as_str() != current_uid.as_str() {
+        let requested_uid = (!key.uid.is_empty()).then_some(key.uid.as_str());
+        let event_type = klights_cluster_core::decide_resource_delete(
+            apply_precondition_policy(resource_precondition_mode),
+            requested_uid,
+            key.precondition_resource_version,
+            Some(klights_cluster_core::CurrentResourceState {
+                uid: Some(current_uid.as_str()),
+                resource_version: current_rv,
+            }),
+        )
+        .map_err(apply_precondition_error)?;
+        let klights_cluster_core::ResourceDeleteDecision::Delete(event_type) = event_type else {
             return Ok(None);
-        }
-        if matches!(
-            resource_precondition_mode,
-            ResourcePreconditionMode::StrictCommittedApply
-        ) && let Some(expected_rv) = key.precondition_resource_version
-            && expected_rv != current_rv
-        {
-            return Err(apply_conflict_error(
-                ApplyConflictCode::ResourceVersionPrecondition,
-                format!(
-                    "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-                ),
-            ));
-        }
+        };
         sink.delete_resource_from_identity(identity)?;
         sink.delete_indexes_from_identity(identity)?;
         let data: serde_json::Value =
@@ -346,7 +347,7 @@ impl<'tx, 'conn> ClusterStateApplier<'tx, 'conn> {
             emit_watch_events,
             identity,
             resource_version,
-            "DELETED",
+            event_type.as_str(),
             &data_bytes,
             data,
         )
@@ -481,26 +482,19 @@ fn apply_latest_patch_to_current_resource(
     namespace: Option<&str>,
     resource_precondition_mode: ResourcePreconditionMode,
 ) -> tokio_rusqlite::Result<serde_json::Value> {
-    if let ResourcePreconditionMode::StrictCommittedApply = resource_precondition_mode {
-        if let Some(expected_uid) = patch.precondition_uid.as_deref()
-            && expected_uid != current_uid
-        {
-            return Err(apply_conflict_error(
-                ApplyConflictCode::UidPrecondition,
-                "UID precondition failed (409 Conflict)",
-            ));
-        }
-        if let Some(expected_rv) = patch.precondition_resource_version
-            && expected_rv != current_rv
-        {
-            return Err(apply_conflict_error(
-                ApplyConflictCode::ResourceVersionPrecondition,
-                format!(
-                    "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-                ),
-            ));
-        }
-    }
+    klights_cluster_core::validate_apply_preconditions(
+        apply_precondition_policy(resource_precondition_mode),
+        klights_cluster_core::ApplyPreconditions {
+            uid: patch.precondition_uid.as_deref(),
+            resource_version: patch.precondition_resource_version,
+            ..klights_cluster_core::ApplyPreconditions::default()
+        },
+        Some(klights_cluster_core::CurrentResourceState {
+            uid: Some(current_uid),
+            resource_version: current_rv,
+        }),
+    )
+    .map_err(apply_precondition_error)?;
     let current: serde_json::Value =
         serde_json::from_slice(current_bytes).map_err(serde_to_sqlite_error)?;
     let mut patched = current.clone();
@@ -812,40 +806,11 @@ fn validate_put_resource_apply_preconditions(
     row: &LogApplyResourceRow,
     existing: Option<&ExistingResourceRow>,
 ) -> tokio_rusqlite::Result<()> {
-    if row.require_absent && existing.is_some() {
-        return Err(apply_conflict_error(
-            ApplyConflictCode::AlreadyExists,
-            "Resource already exists (409 Conflict)",
-        ));
-    }
-    if row.require_existing && existing.is_none() {
-        return Err(apply_conflict_error(
-            ApplyConflictCode::NotFound,
-            "Resource not found (404 Not Found)",
-        ));
-    }
-    let Some((current_rv, current_uid, _)) = existing else {
-        return Ok(());
-    };
-    if let Some(expected_uid) = row.precondition_uid.as_deref()
-        && expected_uid != current_uid
-    {
-        return Err(apply_conflict_error(
-            ApplyConflictCode::UidPrecondition,
-            "UID precondition failed (409 Conflict)",
-        ));
-    }
-    if let Some(expected_rv) = row.precondition_resource_version
-        && expected_rv != *current_rv
-    {
-        return Err(apply_conflict_error(
-            ApplyConflictCode::ResourceVersionPrecondition,
-            format!(
-                "resourceVersion precondition failed: expected {expected_rv} got {current_rv} (409 Conflict)"
-            ),
-        ));
-    }
-    Ok(())
+    validate_put_resource_preconditions(
+        klights_cluster_core::ApplyPreconditionPolicy::Strict,
+        row,
+        existing,
+    )
 }
 
 /// `LegacyFollowerReplay` PUT validation: enforce only structural conditions
@@ -855,17 +820,72 @@ fn validate_put_resource_presence_preconditions(
     row: &LogApplyResourceRow,
     existing: Option<&ExistingResourceRow>,
 ) -> tokio_rusqlite::Result<()> {
-    if row.require_absent && existing.is_some() {
-        return Err(apply_conflict_error(
+    validate_put_resource_preconditions(
+        klights_cluster_core::ApplyPreconditionPolicy::PresenceOnly,
+        row,
+        existing,
+    )
+}
+
+fn validate_put_resource_preconditions(
+    policy: klights_cluster_core::ApplyPreconditionPolicy,
+    row: &LogApplyResourceRow,
+    existing: Option<&ExistingResourceRow>,
+) -> tokio_rusqlite::Result<()> {
+    klights_cluster_core::validate_apply_preconditions(
+        policy,
+        klights_cluster_core::ApplyPreconditions {
+            require_absent: row.require_absent,
+            require_existing: row.require_existing,
+            uid: row.precondition_uid.as_deref(),
+            resource_version: row.precondition_resource_version,
+        },
+        existing.map(
+            |(resource_version, uid, _)| klights_cluster_core::CurrentResourceState {
+                uid: Some(uid.as_str()),
+                resource_version: *resource_version,
+            },
+        ),
+    )
+    .map_err(apply_precondition_error)
+}
+
+const fn apply_precondition_policy(
+    mode: ResourcePreconditionMode,
+) -> klights_cluster_core::ApplyPreconditionPolicy {
+    match mode {
+        ResourcePreconditionMode::StrictCommittedApply => {
+            klights_cluster_core::ApplyPreconditionPolicy::Strict
+        }
+        ResourcePreconditionMode::LegacyFollowerReplay => {
+            klights_cluster_core::ApplyPreconditionPolicy::PresenceOnly
+        }
+    }
+}
+
+fn apply_precondition_error(
+    violation: klights_cluster_core::ApplyPreconditionViolation,
+) -> tokio_rusqlite::Error {
+    match violation {
+        klights_cluster_core::ApplyPreconditionViolation::AlreadyExists => apply_conflict_error(
             ApplyConflictCode::AlreadyExists,
             "Resource already exists (409 Conflict)",
-        ));
-    }
-    if row.require_existing && existing.is_none() {
-        return Err(apply_conflict_error(
+        ),
+        klights_cluster_core::ApplyPreconditionViolation::NotFound => apply_conflict_error(
             ApplyConflictCode::NotFound,
             "Resource not found (404 Not Found)",
-        ));
+        ),
+        klights_cluster_core::ApplyPreconditionViolation::Uid { .. } => apply_conflict_error(
+            ApplyConflictCode::UidPrecondition,
+            "UID precondition failed (409 Conflict)",
+        ),
+        klights_cluster_core::ApplyPreconditionViolation::ResourceVersion { expected, actual } => {
+            apply_conflict_error(
+                ApplyConflictCode::ResourceVersionPrecondition,
+                format!(
+                    "resourceVersion precondition failed: expected {expected} got {actual} (409 Conflict)"
+                ),
+            )
+        }
     }
-    Ok(())
 }

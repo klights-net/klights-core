@@ -423,7 +423,9 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             |row| row.get::<_, Option<i64>>(0),
         )?;
 
-        if last_applied_stamp.is_some_and(|last| incoming_stamp <= last) {
+        if klights_cluster_core::decide_status_stamp(last_applied_stamp, Some(incoming_stamp))
+            == klights_cluster_core::StatusStampDecision::RecordLedgerOnly
+        {
             let (applied_rv, pending, _applied_mutation) = apply_commit_in_tx_with_watch_events(
                 tx,
                 {

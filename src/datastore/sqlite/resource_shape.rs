@@ -164,10 +164,20 @@ pub(super) fn validate_metadata_uid_immutable(incoming: &Value, existing: &Value
     let Some(existing_uid) = metadata_uid(existing) else {
         return Ok(());
     };
-    if incoming_uid == existing_uid {
-        return Ok(());
-    }
-    Err(crate::datastore::errors::DatastoreError::conflict("metadata.uid is immutable").into())
+    klights_cluster_core::validate_apply_preconditions(
+        klights_cluster_core::ApplyPreconditionPolicy::Strict,
+        klights_cluster_core::ApplyPreconditions {
+            uid: Some(incoming_uid),
+            ..klights_cluster_core::ApplyPreconditions::default()
+        },
+        Some(klights_cluster_core::CurrentResourceState {
+            uid: Some(existing_uid),
+            resource_version: 0,
+        }),
+    )
+    .map_err(|_| {
+        crate::datastore::errors::DatastoreError::conflict("metadata.uid is immutable").into()
+    })
 }
 
 pub(super) fn validate_resource_preconditions(
@@ -175,23 +185,33 @@ pub(super) fn validate_resource_preconditions(
     current_uid: Option<&str>,
     current_rv: i64,
 ) -> Result<()> {
-    if let Some(expected_uid) = preconditions.uid.as_deref()
-        && current_uid != Some(expected_uid)
-    {
-        return Err(crate::datastore::errors::DatastoreError::conflict(format!(
-            "UID precondition failed: expected {expected_uid}"
-        ))
-        .into());
-    }
-    if let Some(expected_rv) = preconditions.resource_version
-        && current_rv != expected_rv
-    {
-        return Err(crate::datastore::errors::DatastoreError::conflict(format!(
-            "resourceVersion precondition failed: expected {expected_rv} got {current_rv}"
-        ))
-        .into());
-    }
-    Ok(())
+    klights_cluster_core::validate_apply_preconditions(
+        klights_cluster_core::ApplyPreconditionPolicy::Strict,
+        klights_cluster_core::ApplyPreconditions {
+            uid: preconditions.uid.as_deref(),
+            resource_version: preconditions.resource_version,
+            ..klights_cluster_core::ApplyPreconditions::default()
+        },
+        Some(klights_cluster_core::CurrentResourceState {
+            uid: current_uid,
+            resource_version: current_rv,
+        }),
+    )
+    .map_err(|violation| match violation {
+        klights_cluster_core::ApplyPreconditionViolation::Uid { expected, .. } => {
+            crate::datastore::errors::DatastoreError::conflict(format!(
+                "UID precondition failed: expected {expected}"
+            ))
+            .into()
+        }
+        klights_cluster_core::ApplyPreconditionViolation::ResourceVersion { expected, actual } => {
+            crate::datastore::errors::DatastoreError::conflict(format!(
+                "resourceVersion precondition failed: expected {expected} got {actual}"
+            ))
+            .into()
+        }
+        other => crate::datastore::errors::DatastoreError::conflict(other.to_string()).into(),
+    })
 }
 
 pub(super) fn warn_uid_precondition_mismatch(
@@ -256,38 +276,7 @@ pub(super) fn preserve_server_metadata_fields_from_existing(data: &mut Value, ex
     }
 }
 
-pub(super) fn resource_client_owned_state_equal(left: &Value, right: &Value) -> bool {
-    let mut left = left.clone();
-    let mut right = right.clone();
-    strip_status_and_server_metadata(&mut left);
-    strip_status_and_server_metadata(&mut right);
-    left == right
-}
-
-fn strip_status_and_server_metadata(value: &mut Value) {
-    let Some(obj) = value.as_object_mut() else {
-        return;
-    };
-    obj.remove("status");
-
-    let Some(metadata) = obj
-        .get_mut("metadata")
-        .and_then(|value| value.as_object_mut())
-    else {
-        return;
-    };
-    for key in [
-        "resourceVersion",
-        "uid",
-        "creationTimestamp",
-        "generation",
-        "deletionTimestamp",
-        "deletionGracePeriodSeconds",
-        "managedFields",
-    ] {
-        metadata.remove(key);
-    }
-}
+pub(super) use klights_cluster_core::resource_client_owned_state_equal;
 
 pub(super) fn ensure_pod_status_ip_arrays(data: &mut Value, api_version: &str, kind: &str) {
     if api_version != "v1" || kind != "Pod" {

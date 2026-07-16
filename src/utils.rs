@@ -17,63 +17,7 @@ pub fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> 
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Structural equality for two top-level K8s resource bodies that
-/// ignores a single field inside the top-level `metadata` object
-/// (typically `resourceVersion`). Walks both trees once without
-/// allocating, so callers can detect no-op patches without the deep
-/// `Value::clone()` + strip-rv-from-clone pattern.
-pub fn resource_bodies_equal_ignoring_metadata_field(
-    a: &serde_json::Value,
-    b: &serde_json::Value,
-    metadata_field: &str,
-) -> bool {
-    use serde_json::Value;
-    let (Value::Object(ao), Value::Object(bo)) = (a, b) else {
-        return a == b;
-    };
-    if ao.len() != bo.len() {
-        return false;
-    }
-    for (key, av) in ao {
-        let bv = match bo.get(key) {
-            Some(v) => v,
-            None => return false,
-        };
-        if key == "metadata" {
-            if !objects_equal_ignoring_key(av, bv, metadata_field) {
-                return false;
-            }
-        } else if av != bv {
-            return false;
-        }
-    }
-    true
-}
-
-/// Compare two `Object` Values for equality, skipping one named key on
-/// both sides. Falls back to `==` if either side isn't an object so the
-/// outer helper handles unusual shapes safely.
-fn objects_equal_ignoring_key(a: &serde_json::Value, b: &serde_json::Value, key: &str) -> bool {
-    use serde_json::Value;
-    let (Value::Object(ao), Value::Object(bo)) = (a, b) else {
-        return a == b;
-    };
-    let a_count = ao.iter().filter(|(k, _)| *k != key).count();
-    let b_count = bo.iter().filter(|(k, _)| *k != key).count();
-    if a_count != b_count {
-        return false;
-    }
-    for (k, av) in ao {
-        if k == key {
-            continue;
-        }
-        match bo.get(k) {
-            Some(bv) if av == bv => {}
-            _ => return false,
-        }
-    }
-    true
-}
+pub use klights_cluster_core::resource_bodies_equal_ignoring_metadata_field;
 
 #[cfg(test)]
 mod resource_bodies_equal_tests {

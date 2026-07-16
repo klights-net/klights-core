@@ -591,7 +591,11 @@ impl Datastore {
                             rusqlite::params![subject_key],
                             |row| row.get::<_, Option<i64>>(0),
                         )?;
-                        if last_applied_stamp.is_some_and(|last| incoming_stamp <= last) {
+                        if klights_cluster_core::decide_status_stamp(
+                            last_applied_stamp,
+                            Some(incoming_stamp),
+                        ) == klights_cluster_core::StatusStampDecision::RecordLedgerOnly
+                        {
                             // Stale snapshot: produce a commit with no resource
                             // mutation so the live status is preserved and no
                             // watch event is emitted. The outer apply still
