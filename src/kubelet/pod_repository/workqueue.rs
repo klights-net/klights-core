@@ -11,9 +11,9 @@ use tokio::sync::Notify;
 use crate::datastore::{DatastoreHandle, PodWorkqueueEntry, PodWorkqueueKind};
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
-use crate::pod_identity::PodIdentity;
 use crate::side_effects::SideEffectMetrics;
 use crate::task_supervisor::{TaskCategory, TaskSupervisor};
+use klights_types::PodIdentity;
 
 use super::delete_coordinator::{PodDeleteCoordinator, PodDeleteRetryDecision};
 use super::store::PodStore;
@@ -1577,7 +1577,7 @@ mod tests {
 
         db.pod_workqueue_enqueue(
             crate::datastore::PodWorkqueueKind::Pod,
-            &crate::pod_identity::PodIdentity::new("default", "remote-pod", "uid-old"),
+            &klights_types::PodIdentity::new("default", "remote-pod", "uid-old"),
             json!({"target_node": "node-b"}),
             0,
             0,
@@ -1638,7 +1638,7 @@ mod tests {
 
         db.pod_workqueue_enqueue(
             crate::datastore::PodWorkqueueKind::Pod,
-            &crate::pod_identity::PodIdentity::new("default", "worker-pod", "uid-old"),
+            &klights_types::PodIdentity::new("default", "worker-pod", "uid-old"),
             json!({"target_node": "node-b"}),
             0,
             0,
@@ -1833,7 +1833,7 @@ mod tests {
         // Enqueue as if namespace termination did it.
         db.pod_workqueue_enqueue(
             crate::datastore::PodWorkqueueKind::Pod,
-            &crate::pod_identity::PodIdentity::new("terminating-ns", "finalizer-pod", "uid-f"),
+            &klights_types::PodIdentity::new("terminating-ns", "finalizer-pod", "uid-f"),
             json!({"target_node": "node-b"}),
             0,
             0,

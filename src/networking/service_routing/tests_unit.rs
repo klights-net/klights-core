@@ -794,7 +794,7 @@ fn inventory_resource(
 impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClient {
     async fn get_resource(
         &self,
-        _key: crate::control_plane::client::ResourceKey,
+        _key: klights_types::ResourceKey,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
         self.cached_get_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -938,7 +938,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
 
     async fn get_resource_fresh(
         &self,
-        key: crate::control_plane::client::ResourceKey,
+        key: klights_types::ResourceKey,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
         self.fresh_get_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

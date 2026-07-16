@@ -1,5 +1,5 @@
 use super::*;
-use crate::pod_identity::PodIdentity;
+use klights_types::PodIdentity;
 use serde_json::json;
 
 fn now_ms() -> i64 {

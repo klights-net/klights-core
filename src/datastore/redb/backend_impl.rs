@@ -367,7 +367,7 @@ impl DatastoreBackend for RedbDatastore {
     async fn pod_workqueue_enqueue(
         &self,
         kind: PodWorkqueueKind,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         payload: Value,
         ac: i64,
         md: i64,
@@ -735,7 +735,7 @@ impl DatastoreBackend for RedbDatastore {
     async fn ipam_allocate_and_record_pod_network(
         &self,
         sid: &str,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         sb: u32,
         ss: u32,
         vh: &str,
@@ -1509,7 +1509,7 @@ impl crate::datastore::NetworkMetadataStore for RedbDatastore {
     async fn ipam_allocate_and_record_pod_network(
         &self,
         sandbox_id: &str,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         subnet_base_int: u32,
         subnet_size: u32,
         veth_host: &str,
@@ -1620,7 +1620,7 @@ impl crate::datastore::PodWorkqueueStore for RedbDatastore {
     async fn pod_workqueue_enqueue(
         &self,
         kind: PodWorkqueueKind,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         payload: Value,
         attempt_count: i64,
         min_delay_ms: i64,

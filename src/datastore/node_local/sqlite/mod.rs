@@ -1599,7 +1599,7 @@ impl SqliteNodeLocalDb {
     pub async fn enqueue_workqueue(
         &self,
         kind: PodWorkqueueKind,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         payload: Value,
         attempt_count: i64,
         min_delay_ms: i64,

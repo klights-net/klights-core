@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::api::{AppError, DeleteOptions};
-use crate::control_plane::client::{LeaderApiClient, ListRequest, ResourceKey};
+use crate::control_plane::client::{LeaderApiClient, ListRequest};
 use crate::controllers::gc::GcPodDeleteSink;
 use crate::datastore::{DatastoreHandle, Resource, ResourceList};
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
@@ -30,6 +30,7 @@ use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
 use crate::task_supervisor::TaskSupervisor;
 #[cfg(test)]
 use crate::watch::WatchEvent;
+use klights_types::ResourceKey;
 
 pub mod api;
 pub mod background;

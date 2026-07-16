@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::control_plane::client::{LeaderApiClient, ListRequest, ResourceKey, WatchRequest};
+use crate::control_plane::client::{LeaderApiClient, ListRequest, WatchRequest};
 #[cfg(test)]
 use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::node_local::NodeLocalHandle;
@@ -25,6 +25,7 @@ use crate::datastore::{
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::watch::{EventType, WatchBus, WatchEvent, WatchSignal, WatchTopic};
+use klights_types::ResourceKey;
 
 const WORKER_WATCH_EVENT_HISTORY_CAPACITY: usize = 32_768;
 
@@ -1240,7 +1241,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
     async fn pod_workqueue_enqueue(
         &self,
         kind: PodWorkqueueKind,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         payload: Value,
         attempt_count: i64,
         min_delay_ms: i64,
@@ -1269,7 +1270,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
         min_delay_ms: i64,
         error: &str,
     ) -> Result<()> {
-        let pod = crate::pod_identity::PodIdentity::new(&row.namespace, &row.name, &row.uid);
+        let pod = klights_types::PodIdentity::new(&row.namespace, &row.name, &row.uid);
         self.node_local
             .enqueue_workqueue(
                 row.kind,
@@ -1792,7 +1793,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
     async fn ipam_allocate_and_record_pod_network(
         &self,
         sandbox_id: &str,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         subnet_base_int: u32,
         subnet_size: u32,
         veth_host: &str,
@@ -2134,7 +2135,7 @@ impl crate::datastore::PodWorkqueueStore for WorkerStoreAdapter {
     async fn pod_workqueue_enqueue(
         &self,
         kind: PodWorkqueueKind,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         payload: Value,
         attempt_count: i64,
         min_delay_ms: i64,
@@ -2163,7 +2164,7 @@ impl crate::datastore::PodWorkqueueStore for WorkerStoreAdapter {
         min_delay_ms: i64,
         error: &str,
     ) -> Result<()> {
-        let pod = crate::pod_identity::PodIdentity::new(&row.namespace, &row.name, &row.uid);
+        let pod = klights_types::PodIdentity::new(&row.namespace, &row.name, &row.uid);
         self.node_local
             .enqueue_workqueue(
                 row.kind,
@@ -2378,7 +2379,7 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
     async fn ipam_allocate_and_record_pod_network(
         &self,
         sandbox_id: &str,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         subnet_base_int: u32,
         subnet_size: u32,
         veth_host: &str,
@@ -4744,7 +4745,7 @@ mod tests {
             "worker-a".to_string(),
         );
 
-        let pod = crate::pod_identity::PodIdentity::new("default", "stuck", "uid-stuck");
+        let pod = klights_types::PodIdentity::new("default", "stuck", "uid-stuck");
         adapter
             .pod_workqueue_enqueue(
                 PodWorkqueueKind::Pod,

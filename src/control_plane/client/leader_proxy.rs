@@ -36,13 +36,14 @@ use tokio::sync::watch;
 
 use crate::control_plane::client::{
     CacheScope, ConfigMap, LeaderApiClient, ListRequest, ListResponse, Node, Pod,
-    ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest, ResourceEvent, ResourceKey,
-    Secret, WatchRequest, WatchStream,
+    ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest, ResourceEvent, Secret,
+    WatchRequest, WatchStream,
 };
 use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource};
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
 use crate::networking::wireguard::DataplanePeerMetadata;
+use klights_types::ResourceKey;
 
 /// Leader-aware `LeaderApiClient` that dispatches each call to a local
 /// `LocalApiClient` (reads, plus writes when self is the elected

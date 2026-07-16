@@ -9,8 +9,8 @@ use tokio::sync::watch;
 
 use crate::control_plane::client::{
     CacheScope, ConfigMap, LeaderApiClient, ListRequest, ListResponse, Node, Pod,
-    ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest, ResourceEvent, ResourceKey,
-    Secret, WatchRequest, WatchStream,
+    ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest, ResourceEvent, Secret,
+    WatchRequest, WatchStream,
 };
 use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::replicated::WriteRejection;
@@ -22,6 +22,7 @@ use crate::datastore::{
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{OutboxApplyClient, OutboxApplyError, OutboxApplyResult};
 use crate::networking::wireguard::DataplanePeerMetadata;
+use klights_types::ResourceKey;
 
 /// T6 step 1: builds a `watch::Receiver<bool>` that is permanently true.
 ///
@@ -674,12 +675,13 @@ mod inner_gate_tests {
 
     use super::*;
     use crate::control_plane::client::LeaderApiClient;
-    use crate::control_plane::client::{ListRequest, ResourceKey};
+    use crate::control_plane::client::ListRequest;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::command::StorageCommand;
     use crate::datastore::{ReplicatedCreateOptions, ResourceListQuery};
     use crate::kubelet::outbox::OutboxApplyError;
     use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+    use klights_types::ResourceKey;
 
     fn pod_status_payload() -> bytes::Bytes {
         let command = StorageCommand::UpdateStatus {

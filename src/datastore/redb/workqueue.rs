@@ -10,7 +10,7 @@ use crate::datastore::redb::accessor::RedbAccessor;
 use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
 use crate::datastore::types::*;
-use crate::pod_identity::PodIdentity;
+use klights_types::PodIdentity;
 
 pub struct RedbWorkqueueStore {
     accessor: Arc<RedbAccessor>,

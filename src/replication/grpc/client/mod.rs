@@ -24,7 +24,7 @@ use tower::Service;
 
 use crate::control_plane::client::{
     ListRequest, ListResponse, ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest,
-    ResourceEvent, ResourceKey, WatchRequest, WatchStream,
+    ResourceEvent, WatchRequest, WatchStream,
 };
 use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource};
 use crate::kubelet::outbox::payload::OutboxOperation;
@@ -38,6 +38,7 @@ use crate::replication::grpc::{
     JOIN_TOKEN_METADATA_KEY, entry_from_proto, generated, log_apply_commit_from_proto,
     watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
+use klights_types::ResourceKey;
 /// Response from SignControlplaneCsr RPC.
 pub struct SignControlplaneCsrResponse {
     pub signed_server_cert: String,

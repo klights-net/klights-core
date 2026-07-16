@@ -3,8 +3,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::control_plane::client::{LeaderApiClient, ResourceKey};
+use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::Resource;
+use klights_types::ResourceKey;
 
 pub use crate::control_plane::client::{
     ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest,
@@ -162,13 +163,14 @@ mod tests {
     use serde_json::json;
 
     use crate::control_plane::client::{
-        CacheScope, LeaderApiClient, ListRequest, ListResponse, Node, Pod, ResourceEvent,
-        ResourceKey, Secret, WatchRequest, WatchStream,
+        CacheScope, LeaderApiClient, ListRequest, ListResponse, Node, Pod, ResourceEvent, Secret,
+        WatchRequest, WatchStream,
     };
     use crate::datastore::{NodeSubnet, Resource, ResourceList};
     use crate::kubelet::outbox::payload::OutboxOperation;
     use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
     use crate::networking::wireguard::DataplanePeerMetadata;
+    use klights_types::ResourceKey;
 
     use super::{LocalCacheVolumeSourceReader, VolumeSourceReader};
 

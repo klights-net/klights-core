@@ -44,7 +44,7 @@ pub trait CniStore: Send + Sync {
     async fn reserve_ip_and_insert_network(
         &self,
         sandbox_id: &str,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         subnet_base_int: u32,
         subnet_size: u32,
         veth_host: &str,
@@ -70,7 +70,7 @@ impl CniStore for dyn DatastoreBackend {
     async fn reserve_ip_and_insert_network(
         &self,
         sandbox_id: &str,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         subnet_base_int: u32,
         subnet_size: u32,
         veth_host: &str,
@@ -117,7 +117,7 @@ impl CniStore for dyn NodeLocalBackend {
     async fn reserve_ip_and_insert_network(
         &self,
         sandbox_id: &str,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         subnet_base_int: u32,
         subnet_size: u32,
         veth_host: &str,
@@ -205,7 +205,7 @@ pub struct CniAddArgs<'a, S: CniStore + ?Sized + 'a> {
     pub store: &'a S,
     pub handle: &'a rtnetlink::Handle,
     pub sandbox_id: &'a str,
-    pub pod: crate::pod_identity::PodIdentity,
+    pub pod: klights_types::PodIdentity,
     pub bridge_name: &'a BridgeName,
     pub bridge_idx: u32,
     pub netns_setns_path: &'a str,
@@ -583,7 +583,7 @@ async fn publish_pod_network_assignment(
 async fn allocate_ip_with_reclaim<S: CniStore + ?Sized>(
     store: &S,
     sandbox_id: &str,
-    pod: &crate::pod_identity::PodIdentity,
+    pod: &klights_types::PodIdentity,
     subnet_base: u32,
     subnet_size: u32,
     veth_host: &str,

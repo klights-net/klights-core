@@ -1538,9 +1538,8 @@ mod cases {
         // tonic future. With every server path wedged far longer than the
         // per-call deadline, each unary RPC must still return within a
         // wall-clock bound — i.e. it routes through `unary_call`'s deadline.
-        use crate::control_plane::client::{
-            ListRequest, ProjectedServiceAccountTokenRequest, ResourceKey,
-        };
+        use crate::control_plane::client::{ListRequest, ProjectedServiceAccountTokenRequest};
+        use klights_types::ResourceKey;
         let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await

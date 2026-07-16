@@ -587,7 +587,7 @@ impl NetworkPlane {
             store: self.node_local.as_ref(),
             handle: &self.rt,
             sandbox_id: &request.sandbox_id,
-            pod: crate::pod_identity::PodIdentity::new(
+            pod: klights_types::PodIdentity::new(
                 &request.namespace,
                 &request.pod_name,
                 &request.pod_uid,

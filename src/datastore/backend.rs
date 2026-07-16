@@ -568,7 +568,7 @@ pub trait DatastoreBackend: Send + Sync {
     async fn pod_workqueue_enqueue(
         &self,
         kind: PodWorkqueueKind,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         payload: Value,
         attempt_count: i64,
         min_delay_ms: i64,
@@ -1031,7 +1031,7 @@ pub trait DatastoreBackend: Send + Sync {
     async fn ipam_allocate_and_record_pod_network(
         &self,
         sandbox_id: &str,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         subnet_base_int: u32,
         subnet_size: u32,
         veth_host: &str,
@@ -1641,7 +1641,7 @@ pub trait NetworkMetadataStore: Send + Sync {
     async fn ipam_allocate_and_record_pod_network(
         &self,
         sandbox_id: &str,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         subnet_base_int: u32,
         subnet_size: u32,
         veth_host: &str,
@@ -1686,7 +1686,7 @@ pub trait PodWorkqueueStore: Send + Sync {
     async fn pod_workqueue_enqueue(
         &self,
         kind: PodWorkqueueKind,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         payload: Value,
         attempt_count: i64,
         min_delay_ms: i64,
@@ -2202,7 +2202,7 @@ impl NetworkMetadataStore for DatastoreBackendPodRuntimeStore {
     async fn ipam_allocate_and_record_pod_network(
         &self,
         sandbox_id: &str,
-        pod: &crate::pod_identity::PodIdentity,
+        pod: &klights_types::PodIdentity,
         subnet_base_int: u32,
         subnet_size: u32,
         veth_host: &str,

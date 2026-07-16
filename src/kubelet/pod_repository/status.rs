@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::control_plane::client::{LeaderApiClient, ResourceKey};
+use crate::control_plane::client::LeaderApiClient;
 use crate::controllers::workqueue::ReconcileKey;
 use crate::datastore::Resource;
 use crate::kubelet::outbox::payload::OutboxOperation;
@@ -20,6 +20,7 @@ use crate::kubelet::pod_status_logic::{
     compute_initialized_condition, get_condition_last_transition_time,
 };
 use crate::side_effects::ControllerDispatcherSlot;
+use klights_types::ResourceKey;
 
 use super::state_only_writer::StateOnlyWriter;
 use super::store::PodStore;

@@ -210,7 +210,7 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
 
         let live = if let Some(cluster_api) = &self.cluster_api {
             cluster_api
-                .get_resource_fresh(crate::control_plane::client::ResourceKey {
+                .get_resource_fresh(klights_types::ResourceKey {
                     api_version: "v1".to_string(),
                     kind: "Pod".to_string(),
                     namespace: Some(ns.to_string()),

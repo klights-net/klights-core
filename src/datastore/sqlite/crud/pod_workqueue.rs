@@ -1,6 +1,6 @@
 use super::super::queries;
 use super::*;
-use crate::pod_identity::PodIdentity;
+use klights_types::PodIdentity;
 use rusqlite::OptionalExtension;
 
 fn now_ms() -> i64 {

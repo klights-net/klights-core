@@ -7,7 +7,7 @@ use crate::datastore::{
     PodEndpointEvent, PodEndpointRow, PodNetworkAllocationRequest, PodNetworkEndpoint,
     PodSlotAdmissionEvent, PodWorkqueueEntry, PodWorkqueueKind,
 };
-use crate::pod_identity::PodIdentity;
+use klights_types::PodIdentity;
 
 use super::{
     DeadLetterRow, OutboxInsert, OutboxRow, OutboxStats, PodRuntimeRow, PodStatusCheckpoint,

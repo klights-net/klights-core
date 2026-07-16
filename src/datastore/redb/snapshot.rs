@@ -334,7 +334,7 @@ mod tests {
     use super::*;
     use crate::datastore::backend::DatastoreBackend;
     use crate::datastore::redb::RedbDatastore;
-    use crate::pod_identity::PodIdentity;
+    use klights_types::PodIdentity;
     use serde_json::json;
 
     async fn fresh_redb() -> RedbDatastore {

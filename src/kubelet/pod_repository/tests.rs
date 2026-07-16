@@ -12,14 +12,15 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::control_plane::client::{
-    CacheScope, LeaderApiClient, ListRequest, ListResponse, ResourceEvent, ResourceKey,
-    WatchRequest, WatchStream,
+    CacheScope, LeaderApiClient, ListRequest, ListResponse, ResourceEvent, WatchRequest,
+    WatchStream,
 };
+use klights_types::ResourceKey;
 
 use super::state_only_writer::StateOnlyWriter;
 use super::store::{PodStore, UnscheduledPodDeleteOutcome};
 use super::{PodReader, PodRepository, PodRepositoryBuildConfig};
-use crate::pod_identity::PodIdentity;
+use klights_types::PodIdentity;
 
 fn fixture_supervisor() -> Arc<crate::task_supervisor::TaskSupervisor> {
     Arc::new(crate::task_supervisor::TaskSupervisor::new(

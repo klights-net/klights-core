@@ -43,7 +43,7 @@ impl EnvSourceReader for LeaderApiEnvSourceReader {
         // spuriously fail the container with a not-found; the fresh read confirms
         // against the leader. Mirrors the volume-source reader. See B4.
         self.cluster_api
-            .get_resource_fresh(crate::control_plane::client::ResourceKey {
+            .get_resource_fresh(klights_types::ResourceKey {
                 api_version: "v1".to_string(),
                 kind: "Secret".to_string(),
                 namespace: Some(namespace.to_string()),
@@ -61,7 +61,7 @@ impl EnvSourceReader for LeaderApiEnvSourceReader {
         // be in a primed-but-lagging worker cache, and a cached miss would
         // spuriously fail the container.
         self.cluster_api
-            .get_resource_fresh(crate::control_plane::client::ResourceKey {
+            .get_resource_fresh(klights_types::ResourceKey {
                 api_version: "v1".to_string(),
                 kind: "ConfigMap".to_string(),
                 namespace: Some(namespace.to_string()),
@@ -937,13 +937,14 @@ mod tests {
 
         use crate::control_plane::client::{
             CacheScope, ConfigMap, LeaderApiClient, ListRequest, ListResponse, Node, Pod,
-            ResourceEvent, ResourceKey, Secret, WatchRequest, WatchStream,
+            ResourceEvent, Secret, WatchRequest, WatchStream,
         };
         use crate::datastore::{NodeSubnet, Resource};
         use crate::kubelet::outbox::payload::OutboxOperation;
         use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
         use crate::kubelet::pod_env::{EnvSourceReader, LeaderApiEnvSourceReader};
         use crate::networking::wireguard::DataplanePeerMetadata;
+        use klights_types::ResourceKey;
 
         struct FreshOnlyLeaderApiClient {
             resource: Resource,

@@ -10,8 +10,8 @@ use tokio_util::sync::CancellationToken;
 use crate::control_plane::client::informer::{InformerCache, scope_for_request};
 use crate::control_plane::client::{
     CacheScope, ConfigMap, LeaderApiClient, ListRequest, ListResponse, Node, Pod,
-    ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest, ResourceEvent, ResourceKey,
-    Secret, WatchRequest, WatchStream,
+    ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest, ResourceEvent, Secret,
+    WatchRequest, WatchStream,
 };
 use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource, ResourceList};
 use crate::kubelet::outbox::payload::OutboxOperation;
@@ -19,6 +19,7 @@ use crate::kubelet::outbox::{OutboxApplyClient, OutboxApplyError, OutboxApplyRes
 use crate::networking::wireguard::DataplanePeerMetadata;
 use crate::replication::grpc::client::ReplicationGrpcClient;
 use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
+use klights_types::ResourceKey;
 
 /// bug-grpc: a worker watch stream that delivers neither an event nor a
 /// heartbeat BOOKMARK within this window is treated as wedged and dropped, so
@@ -709,9 +710,7 @@ mod tests {
     use serde_json::json;
 
     use crate::control_plane::client::remote::RemoteApiClient;
-    use crate::control_plane::client::{
-        CacheScope, LeaderApiClient, ListRequest, ResourceKey, WatchRequest,
-    };
+    use crate::control_plane::client::{CacheScope, LeaderApiClient, ListRequest, WatchRequest};
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend::DatastoreHandle;
     use crate::datastore::command::StorageCommand;
@@ -724,6 +723,7 @@ mod tests {
     use crate::replication::protocol::JoinRole;
     use crate::replication::service::ReplicationService;
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_types::ResourceKey;
 
     fn dataplane() -> JoinDataplaneMetadata {
         JoinDataplaneMetadata {

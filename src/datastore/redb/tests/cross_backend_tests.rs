@@ -10,7 +10,7 @@ use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::redb::RedbDatastore;
 use crate::datastore::sqlite::Datastore as SqliteDs;
 use crate::datastore::types::*;
-use crate::pod_identity::PodIdentity;
+use klights_types::PodIdentity;
 
 async fn sqlite_db() -> SqliteDs {
     SqliteDs::new_in_memory().await.unwrap()
@@ -1876,7 +1876,7 @@ parametrize_backends!(node_dataplane_metadata_round_trip, |db| {
 #[tokio::test]
 async fn redb_workqueue() {
     let db = redb_db().await;
-    let pod = crate::pod_identity::PodIdentity::new("default", "mypod", "uid1");
+    let pod = klights_types::PodIdentity::new("default", "mypod", "uid1");
     db.pod_workqueue_enqueue(
         PodWorkqueueKind::Pod,
         &pod,
@@ -1905,7 +1905,7 @@ async fn redb_workqueue() {
         .as_millis() as i64;
     let e = db.pod_workqueue_claim_due(future).await.unwrap().unwrap();
     db.pod_workqueue_complete(e.id).await.unwrap();
-    let ns_pod = crate::pod_identity::PodIdentity::new("", "myns", "uid2");
+    let ns_pod = klights_types::PodIdentity::new("", "myns", "uid2");
     db.pod_workqueue_enqueue(PodWorkqueueKind::Namespace, &ns_pod, json!({}), 0, 0, None)
         .await
         .unwrap();

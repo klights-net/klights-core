@@ -1138,8 +1138,8 @@ async fn ensure_sysctl_value(path: &str, expected: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::control_plane::client::{
-        CacheScope, LeaderApiClient, ListRequest, ListResponse, ResourceEvent, ResourceKey,
-        WatchRequest, WatchStream,
+        CacheScope, LeaderApiClient, ListRequest, ListResponse, ResourceEvent, WatchRequest,
+        WatchStream,
     };
     use crate::datastore::{NodeSubnet, Resource};
     use crate::kubelet::outbox::payload::OutboxOperation;
@@ -1148,6 +1148,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use bytes::Bytes;
+    use klights_types::ResourceKey;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},

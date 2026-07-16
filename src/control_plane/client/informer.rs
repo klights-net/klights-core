@@ -4,9 +4,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::{Notify, RwLock};
 
-use crate::control_plane::client::{CacheScope, ListRequest, ResourceEvent, ResourceKey};
+use crate::control_plane::client::{CacheScope, ListRequest, ResourceEvent};
 use crate::datastore::{Resource, ResourceList};
 use crate::watch::EventType;
+use klights_types::ResourceKey;
 
 #[derive(Clone)]
 pub(super) struct InformerCache {
