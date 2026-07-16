@@ -9,7 +9,8 @@
 //! `bootstrap.kubernetes.io/token` Secrets in `kube-system`.
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+
+pub use klights_cluster_core::ClusterMetadata;
 
 /// Metadata keys stored in `_klights_meta`.
 pub const KEY_CLUSTER_ID: &str = "cluster_id";
@@ -17,14 +18,6 @@ pub const KEY_LEADER_EPOCH: &str = "leader_epoch";
 pub const KEY_RAFT_VOTERS: &str = "voters";
 pub const KEY_RAFT_TERM: &str = "term";
 pub const KEY_RAFT_LEADER_HINT: &str = "leader_hint";
-
-/// Cluster metadata read from the datastore.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterMetadata {
-    pub cluster_id: String,
-    pub leader_epoch: i64,
-    pub current_rv: i64,
-}
 
 /// Generate a new random cluster ID (UUID v4).
 #[cfg(test)]

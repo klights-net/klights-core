@@ -1093,7 +1093,7 @@ impl RaftNodeJoinHandler {
                 None
             }
         };
-        let membership = merge_controlplane_join_membership_metadata(
+        let membership = klights_cluster_core::merge_controlplane_join_membership_metadata(
             membership,
             latest.as_ref(),
             admitted_node_name,
@@ -1108,28 +1108,6 @@ impl RaftNodeJoinHandler {
                 )
             })
     }
-}
-
-fn merge_controlplane_join_membership_metadata(
-    mut membership: crate::control_plane::client::membership::ClusterMembership,
-    latest: Option<&crate::control_plane::client::membership::ClusterMembership>,
-    admitted_node_name: &str,
-    as_learner: bool,
-    leader_hint: &str,
-) -> crate::control_plane::client::membership::ClusterMembership {
-    if let Some(latest) = latest
-        && latest.cluster_id == membership.cluster_id
-    {
-        membership.voters.extend(latest.voters.iter().cloned());
-        membership.term = membership.term.max(latest.term);
-    }
-    if !as_learner {
-        membership.voters.push(admitted_node_name.to_string());
-    }
-    membership.voters.sort();
-    membership.voters.dedup();
-    membership.leader_hint = Some(leader_hint.to_string());
-    membership
 }
 
 fn validate_committed_apply_v1_join_feature(
@@ -1533,43 +1511,6 @@ mod tests {
             derive_operation_label(&command),
             crate::kubelet::outbox::payload::OutboxOperation::NodeStatus,
             "direct API Node updates must not use the kubelet NodeStatus outbox operation"
-        );
-    }
-
-    #[test]
-    fn join_membership_metadata_merge_preserves_concurrent_voters() {
-        let stale = crate::control_plane::client::membership::ClusterMembership {
-            cluster_id: "cluster-a".to_string(),
-            voters: vec![
-                "mn-controlplane1".to_string(),
-                "mn-controlplane2".to_string(),
-            ],
-            term: 0,
-            leader_hint: Some("mn-controlplane1".to_string()),
-        };
-        let latest = crate::control_plane::client::membership::ClusterMembership {
-            cluster_id: "cluster-a".to_string(),
-            voters: vec![
-                "mn-controlplane1".to_string(),
-                "mn-controlplane2".to_string(),
-                "mn-controlplane3".to_string(),
-            ],
-            term: 0,
-            leader_hint: Some("mn-controlplane1".to_string()),
-        };
-
-        let merged = merge_controlplane_join_membership_metadata(
-            stale,
-            Some(&latest),
-            "mn-controlplane2",
-            false,
-            "mn-controlplane1",
-        );
-
-        assert_eq!(
-            merged.voters,
-            vec!["mn-controlplane1", "mn-controlplane2", "mn-controlplane3"],
-            "a late duplicate JoinAsControlplane retry must not shrink voters metadata"
         );
     }
 

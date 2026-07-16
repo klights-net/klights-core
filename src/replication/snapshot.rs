@@ -19,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+
+pub use klights_cluster_core::{MetadataComparison, compare_metadata, needs_confirmation};
 
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::types::{NodeSubnet, PodCleanupIntent, Resource};
@@ -58,113 +59,6 @@ pub(crate) fn install_snapshot_watch_page_pause() -> SnapshotWatchPagePause {
     pause
 }
 
-/// Result of comparing local replica metadata against leader metadata.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MetadataComparison {
-    /// Local data is behind or at the leader — safe to reseed.
-    Behind {
-        local_cluster_id: String,
-        local_leader_epoch: i64,
-        local_last_rv: i64,
-        leader_cluster_id: String,
-        leader_leader_epoch: i64,
-        leader_current_rv: i64,
-    },
-    /// Local data is ahead of the leader — warn before wipe.
-    Ahead {
-        local_cluster_id: String,
-        local_last_rv: i64,
-        leader_current_rv: i64,
-    },
-    /// Cluster ID or leader epoch differs — warn before wipe.
-    Mismatch {
-        local_cluster_id: Option<String>,
-        local_leader_epoch: Option<i64>,
-        leader_cluster_id: String,
-        leader_leader_epoch: i64,
-        reason: String,
-    },
-    /// No local data exists — safe to reseed without warning.
-    NoLocalData,
-}
-
-/// Compare local replica metadata against leader metadata.
-pub fn compare_metadata(
-    local_cluster_id: Option<String>,
-    local_leader_epoch: Option<i64>,
-    local_last_rv: Option<i64>,
-    leader_cluster_id: &str,
-    leader_leader_epoch: i64,
-    leader_current_rv: i64,
-) -> MetadataComparison {
-    // No local data — safe to reseed
-    let local_cid = match local_cluster_id {
-        Some(cid) => cid,
-        None => return MetadataComparison::NoLocalData,
-    };
-
-    let local_epoch = match local_leader_epoch {
-        Some(e) => e,
-        None => {
-            return MetadataComparison::Mismatch {
-                local_cluster_id: Some(local_cid),
-                local_leader_epoch: None,
-                leader_cluster_id: leader_cluster_id.to_string(),
-                leader_leader_epoch,
-                reason: "local leader_epoch missing".into(),
-            };
-        }
-    };
-
-    let local_rv = local_last_rv.unwrap_or(0);
-
-    // Check cluster_id match
-    if local_cid != leader_cluster_id {
-        return MetadataComparison::Mismatch {
-            local_cluster_id: Some(local_cid.clone()),
-            local_leader_epoch: Some(local_epoch),
-            leader_cluster_id: leader_cluster_id.to_string(),
-            leader_leader_epoch,
-            reason: format!(
-                "cluster_id mismatch: local={} leader={}",
-                local_cid, leader_cluster_id
-            ),
-        };
-    }
-
-    // Check leader_epoch match
-    if local_epoch != leader_leader_epoch {
-        return MetadataComparison::Mismatch {
-            local_cluster_id: Some(local_cid.clone()),
-            local_leader_epoch: Some(local_epoch),
-            leader_cluster_id: leader_cluster_id.to_string(),
-            leader_leader_epoch,
-            reason: format!(
-                "leader_epoch mismatch: local={} leader={}",
-                local_epoch, leader_leader_epoch
-            ),
-        };
-    }
-
-    // Check RV relationship
-    if local_rv > leader_current_rv {
-        return MetadataComparison::Ahead {
-            local_cluster_id: local_cid,
-            local_last_rv: local_rv,
-            leader_current_rv,
-        };
-    }
-
-    MetadataComparison::Behind {
-        local_cluster_id: local_cid,
-        local_leader_epoch: local_epoch,
-        local_last_rv: local_rv,
-        leader_cluster_id: leader_cluster_id.to_string(),
-        leader_leader_epoch,
-        leader_current_rv,
-    }
-}
-
 /// Read local replica metadata from the datastore.
 pub async fn read_local_metadata(
     db: &dyn DatastoreBackend,
@@ -181,14 +75,6 @@ pub async fn read_local_metadata(
     let current_rv = db.get_current_resource_version().await.ok();
 
     Ok((cluster_id, leader_epoch, current_rv))
-}
-
-/// Whether a metadata comparison requires operator confirmation before wipe.
-pub fn needs_confirmation(comparison: &MetadataComparison) -> bool {
-    matches!(
-        comparison,
-        MetadataComparison::Ahead { .. } | MetadataComparison::Mismatch { .. }
-    )
 }
 
 /// Leader-side: generate an authoritative snapshot of all cluster-replicated data.
@@ -683,131 +569,6 @@ fn cluster_pod_cleanup_mutation_from_intent(intent: PodCleanupIntent) -> Cluster
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- Metadata comparison tests ----
-
-    #[test]
-    fn no_local_data_is_safe() {
-        let result = compare_metadata(None, None, None, "cluster-1", 0, 100);
-        assert_eq!(result, MetadataComparison::NoLocalData);
-        assert!(!needs_confirmation(&result));
-    }
-
-    #[test]
-    fn behind_leader_is_safe() {
-        let result = compare_metadata(
-            Some("cluster-1".into()),
-            Some(0),
-            Some(50),
-            "cluster-1",
-            0,
-            100,
-        );
-        match &result {
-            MetadataComparison::Behind {
-                local_last_rv,
-                leader_current_rv,
-                ..
-            } => {
-                assert_eq!(*local_last_rv, 50);
-                assert_eq!(*leader_current_rv, 100);
-            }
-            other => panic!("expected Behind, got {:?}", other),
-        }
-        assert!(!needs_confirmation(&result));
-    }
-
-    #[test]
-    fn at_leader_rv_is_safe() {
-        let result = compare_metadata(
-            Some("cluster-1".into()),
-            Some(0),
-            Some(100),
-            "cluster-1",
-            0,
-            100,
-        );
-        assert!(matches!(result, MetadataComparison::Behind { .. }));
-        assert!(!needs_confirmation(&result));
-    }
-
-    #[test]
-    fn ahead_of_leader_needs_confirmation() {
-        let result = compare_metadata(
-            Some("cluster-1".into()),
-            Some(0),
-            Some(150),
-            "cluster-1",
-            0,
-            100,
-        );
-        assert!(matches!(result, MetadataComparison::Ahead { .. }));
-        assert!(needs_confirmation(&result));
-    }
-
-    #[test]
-    fn cluster_id_mismatch_needs_confirmation() {
-        let result = compare_metadata(
-            Some("cluster-old".into()),
-            Some(0),
-            Some(50),
-            "cluster-new",
-            0,
-            100,
-        );
-        match &result {
-            MetadataComparison::Mismatch { reason, .. } => {
-                assert!(reason.contains("cluster_id mismatch"));
-            }
-            other => panic!("expected Mismatch, got {:?}", other),
-        }
-        assert!(needs_confirmation(&result));
-    }
-
-    #[test]
-    fn leader_epoch_mismatch_needs_confirmation() {
-        let result = compare_metadata(
-            Some("cluster-1".into()),
-            Some(5),
-            Some(50),
-            "cluster-1",
-            0,
-            100,
-        );
-        match &result {
-            MetadataComparison::Mismatch { reason, .. } => {
-                assert!(reason.contains("leader_epoch mismatch"));
-            }
-            other => panic!("expected Mismatch, got {:?}", other),
-        }
-        assert!(needs_confirmation(&result));
-    }
-
-    #[test]
-    fn missing_leader_epoch_needs_confirmation() {
-        let result = compare_metadata(
-            Some("cluster-1".into()),
-            None,
-            Some(50),
-            "cluster-1",
-            0,
-            100,
-        );
-        match &result {
-            MetadataComparison::Mismatch { reason, .. } => {
-                assert!(reason.contains("leader_epoch missing"));
-            }
-            other => panic!("expected Mismatch, got {:?}", other),
-        }
-        assert!(needs_confirmation(&result));
-    }
-
-    #[test]
-    fn missing_local_rv_treated_as_zero() {
-        let result = compare_metadata(Some("cluster-1".into()), Some(0), None, "cluster-1", 0, 100);
-        // local_rv defaults to 0, which is behind 100
-        assert!(matches!(result, MetadataComparison::Behind { .. }));
-    }
 
     // ---- Snapshot generation tests ----
 

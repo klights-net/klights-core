@@ -2,6 +2,8 @@
 
 pub mod apply;
 pub mod command;
+pub mod membership;
+pub mod recovery;
 pub mod replay;
 pub mod resource;
 pub mod stale_resource;
@@ -17,6 +19,11 @@ pub use apply::{
 pub use command::{
     COMMAND_CODEC_VERSION, CommandError, CommandId, CommandMeta, StorageCommand, StorageResponse,
 };
+pub use membership::{
+    ClusterMembership, NodeId, RaftShape, merge_controlplane_join_membership_metadata,
+    raft_node_id_for_node_name,
+};
+pub use recovery::{ClusterMetadata, MetadataComparison, compare_metadata, needs_confirmation};
 pub use replay::{PositionedWatchEvent, WatchReplayPosition};
 pub use resource::{
     PatchKind, Resource, ResourceBatchOperation, ResourceBatchPutMode, ResourceEventObject,

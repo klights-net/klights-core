@@ -29,16 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::datastore::Resource;
 
-pub type NodeId = u64;
-
-pub fn raft_node_id_for_node_name(node_name: &str) -> NodeId {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in node_name.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    if hash == 0 { 1 } else { hash }
-}
+pub use klights_cluster_core::{NodeId, RaftShape, raft_node_id_for_node_name};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageCommandPayload(pub Vec<u8>);
@@ -63,28 +54,6 @@ pub struct StorageCommandResult {
     pub applied_rv: Option<i64>,
     pub error_message: Option<String>,
     pub applied_mutation: Option<AppliedMutation>,
-}
-
-/// P3-11d: snapshot of cluster shape used by the shape-driven role-label
-/// task. Computed live from `Raft::metrics()` so the K8s role label
-/// migrates as voters join, leave, or the leader changes — without any
-/// runtime CLI mode switch on this node.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RaftShape {
-    /// Number of voters in the current Raft membership. `0` while a
-    /// joining controlplane waits for its `add_voter` to commit.
-    pub voter_count: u32,
-    /// Whether this node is the currently-elected Raft leader.
-    pub is_leader: bool,
-    /// T1.7: whether this node participates in the current raft
-    /// membership as a **learner** rather than a voter. Learners
-    /// receive `AppendEntries` and apply through the same state-machine
-    /// code as voters but do not count toward quorum and do not vote.
-    /// Computed from `metrics.membership_config.nodes()` minus
-    /// `voter_ids()`. The shape-driven role-label task emits the
-    /// `node-role.kubernetes.io/replica` label when `is_learner=true`
-    /// for control-plane learner nodes.
-    pub is_learner: bool,
 }
 
 declare_raft_types!(
@@ -129,20 +98,6 @@ mod tests {
         let voters: std::collections::BTreeSet<NodeId> = nodes.keys().copied().collect();
         let m: Membership<NodeId, BasicNode> = Membership::new(vec![voters], nodes);
         assert_eq!(m.voter_ids().count(), 3);
-    }
-
-    #[test]
-    fn raft_node_id_for_node_name_is_deterministic_and_non_zero() {
-        assert_eq!(
-            raft_node_id_for_node_name("mn-controlplane1"),
-            raft_node_id_for_node_name("mn-controlplane1")
-        );
-        assert_ne!(
-            raft_node_id_for_node_name("mn-controlplane1"),
-            raft_node_id_for_node_name("mn-controlplane2")
-        );
-        assert_ne!(raft_node_id_for_node_name("mn-controlplane1"), 0);
-        assert_ne!(raft_node_id_for_node_name(""), 0);
     }
 
     #[test]
