@@ -393,7 +393,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
     if commit.resource_version_assignment == ResourceVersionAssignment::CommittedApplyV1
         && matches!(
             outbox_watermark_decision_in_tx(tx, commit.outbox_watermark.as_ref())?,
-            OutboxWatermarkDecision::Duplicate
+            klights_cluster_core::OutboxWatermarkDecision::Duplicate
         )
     {
         return Ok(RaftLogApplyOutcome {
@@ -415,7 +415,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
 
     if commit.resource_version_assignment == ResourceVersionAssignment::CommittedApplyV1
         && let Some((subject_key, incoming_stamp)) =
-            stamped_pod_status_subject_and_stamp_from_commit(&commit)
+            klights_cluster_core::stamped_pod_status_subject_and_stamp(&commit)
     {
         let last_applied_stamp: Option<i64> = tx.query_row(
             queries::APPLIED_OUTBOX_MAX_STATUS_STAMP_FOR_SUBJECT,
@@ -429,7 +429,8 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             let (applied_rv, pending, _applied_mutation) = apply_commit_in_tx_with_watch_events(
                 tx,
                 {
-                    let mut outbox_commit = commit_with_outbox_rows_only(commit);
+                    let mut outbox_commit =
+                        klights_cluster_core::commit_with_outbox_rows_only(commit);
                     outbox_commit.resource_version = Datastore::current_resource_version_in_tx(tx)?;
                     outbox_commit
                 },
@@ -601,16 +602,16 @@ fn apply_commit_in_tx_with_watch_events(
         return Ok((applied_rv, Vec::new(), None));
     }
     match outbox_watermark_decision_in_tx(tx, watermark.as_ref())? {
-        OutboxWatermarkDecision::Duplicate => {
+        klights_cluster_core::OutboxWatermarkDecision::Duplicate => {
             advance_metadata_rv_to_at_least_tx(tx, commit.resource_version)?;
             return Ok((applied_rv, Vec::new(), None));
         }
-        OutboxWatermarkDecision::Gap { last_seq, next_seq } => {
+        klights_cluster_core::OutboxWatermarkDecision::Gap { last_seq, next_seq } => {
             return Err(other_error(format!(
                 "outbox stream gap for seq {next_seq}: last committed seq is {last_seq}"
             )));
         }
-        OutboxWatermarkDecision::Apply => {}
+        klights_cluster_core::OutboxWatermarkDecision::Apply => {}
     }
     let mutation_count = commit.mutations.len();
     let applied_mutation = applied_mutation_from_stamped_commit(&commit)?;
@@ -679,23 +680,16 @@ fn applied_mutation_from_stamped_commit(
     ))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboxWatermarkDecision {
-    Apply,
-    Duplicate,
-    Gap { last_seq: i64, next_seq: i64 },
-}
-
 fn outbox_watermark_decision_in_tx(
     tx: &rusqlite::Transaction<'_>,
     watermark: Option<&OutboxStreamWatermark>,
-) -> tokio_rusqlite::Result<OutboxWatermarkDecision> {
+) -> tokio_rusqlite::Result<klights_cluster_core::OutboxWatermarkDecision> {
     let Some(watermark) = watermark else {
-        return Ok(OutboxWatermarkDecision::Apply);
+        return klights_cluster_core::decide_outbox_watermark(None, None)
+            .map_err(|err| other_error(err.to_string()));
     };
-    if watermark.stream_seq <= 0 {
-        return Err(other_error("outbox stream seq must be positive"));
-    }
+    klights_cluster_core::decide_outbox_watermark(None, Some(watermark))
+        .map_err(|err| other_error(err.to_string()))?;
     let last_seq: Option<i64> = tx
         .query_row(
             "SELECT last_seq FROM outbox_stream_watermarks WHERE client_id = ?1 AND stream_id = ?2",
@@ -703,23 +697,8 @@ fn outbox_watermark_decision_in_tx(
             |row| row.get(0),
         )
         .optional()?;
-    match last_seq {
-        Some(last_seq) if watermark.stream_seq <= last_seq => {
-            Ok(OutboxWatermarkDecision::Duplicate)
-        }
-        Some(last_seq) if watermark.stream_seq != last_seq.saturating_add(1) => {
-            Ok(OutboxWatermarkDecision::Gap {
-                last_seq,
-                next_seq: watermark.stream_seq,
-            })
-        }
-        Some(_) => Ok(OutboxWatermarkDecision::Apply),
-        None if watermark.stream_seq == 1 => Ok(OutboxWatermarkDecision::Apply),
-        None => Ok(OutboxWatermarkDecision::Gap {
-            last_seq: 0,
-            next_seq: watermark.stream_seq,
-        }),
-    }
+    klights_cluster_core::decide_outbox_watermark(last_seq, Some(watermark))
+        .map_err(|err| other_error(err.to_string()))
 }
 
 fn upsert_outbox_watermark_in_tx(
@@ -850,51 +829,6 @@ fn stamp_provisional_resource_version_in_tx(
         }
     }
     Ok(commit)
-}
-
-fn stamped_pod_status_subject_and_stamp_from_commit(
-    commit: &LogApplyCommit,
-) -> Option<(String, i64)> {
-    commit.mutations.iter().find_map(|mutation| match mutation {
-        LogApplyMutation::PutAppliedOutbox(row)
-            if row.status_stamp.is_some_and(|stamp| stamp > 0)
-                && is_stamped_pod_status_outbox_operation(&row.operation)
-                && !row.subject_key.is_empty() =>
-        {
-            Some((
-                row.subject_key.clone(),
-                row.status_stamp.expect("status_stamp was validated"),
-            ))
-        }
-        _ => None,
-    })
-}
-
-fn is_stamped_pod_status_outbox_operation(operation: &str) -> bool {
-    matches!(
-        operation,
-        "PodStatus"
-            | "RuntimeReconcile"
-            | "ProbeReadiness"
-            | "DeadlineExceeded"
-            | "ContainerStatusSnapshot"
-            | "EphemeralContainerStatuses"
-    )
-}
-
-fn commit_with_outbox_rows_only(commit: LogApplyCommit) -> LogApplyCommit {
-    let mutations = commit
-        .mutations
-        .into_iter()
-        .filter_map(|mutation| match mutation {
-            LogApplyMutation::PutAppliedOutbox(_) => Some(mutation),
-            _ => None,
-        })
-        .collect();
-    LogApplyCommit {
-        mutations,
-        ..commit
-    }
 }
 
 fn applied_outbox_record_in_tx(

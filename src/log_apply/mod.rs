@@ -5,480 +5,114 @@
 //! orchestration contains no SQLite or gRPC assumptions.
 
 use anyhow::Result;
-// TEMPORARY(Phase 4.2): root domain conversions remain consumer-owned.
-// REMOVE: Phase 5.3 moves this adapter with the log-apply domain.
+// Generated-wire and concrete persistence/network conversions remain owned by
+// this root boundary adapter; the logical commit domain is canonical in
+// klights-cluster-core.
 use klights_internal_protobuf::log_apply::*;
 use prost::Message;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::datastore::types::{
-    AppliedOutboxRecord, NodeSubnet, PatchKind, PodCleanupIntent, Resource,
-};
+use crate::datastore::types::{AppliedOutboxRecord, NodeSubnet, PatchKind, PodCleanupIntent};
 use crate::networking::wireguard::DataplanePeerMetadata;
 pub mod mutation;
-pub use mutation::*;
+
+trait WireFrom<T>: Sized {
+    fn wire_from(value: T) -> Self;
+}
+
+trait IntoWire<T>: Sized {
+    fn into_wire(self) -> T;
+}
+
+impl<T, U> IntoWire<U> for T
+where
+    U: WireFrom<T>,
+{
+    fn into_wire(self) -> U {
+        U::wire_from(self)
+    }
+}
+
+trait TryWireFrom<T>: Sized {
+    type Error;
+
+    fn try_wire_from(value: T) -> std::result::Result<Self, Self::Error>;
+}
+
+trait TryIntoWire<T>: Sized {
+    type Error;
+
+    fn try_into_wire(self) -> std::result::Result<T, Self::Error>;
+}
+
+impl<T, U> TryIntoWire<U> for T
+where
+    U: TryWireFrom<T>,
+{
+    type Error = U::Error;
+
+    fn try_into_wire(self) -> std::result::Result<U, Self::Error> {
+        U::try_wire_from(self)
+    }
+}
 
 // T3: `KEY_LAST_APPLIED_INDEX`, `KEY_LAST_APPLIED_RV` removed —
 // the `log_apply_entries` table and its checkpoint are gone.
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LogApplyCommit {
-    pub resource_version: i64,
-    /// Missing fields from pre-envelope JSON/protobuf payloads decode to the
-    /// legacy leader-assigned behavior.
-    #[serde(default)]
-    pub resource_version_assignment: ResourceVersionAssignment,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outbox_watermark: Option<OutboxStreamWatermark>,
-    pub mutations: Vec<LogApplyMutation>,
-}
+pub use klights_cluster_core::{
+    ClusterMetaMutation, ClusterMutation, LogApplyAppliedOutboxRow, LogApplyCommit,
+    LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation,
+    LogApplyNodeSubnetRow, LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow,
+    LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow, LogApplyWatchEventRow,
+    NamespaceMutation, NetworkMutation, OutboxLedgerMutation, OutboxStreamWatermark,
+    PodCleanupMutation, ResourceMutation, ResourceVersionAssignment, VersionedClusterMutation,
+    WatchHistoryMutation,
+};
 
-/// Wire-stable source of a replicated commit's public resourceVersion.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ResourceVersionAssignment {
-    #[default]
-    LegacyLeaderAssigned,
-    CommittedApplyV1,
-}
-
-impl ResourceVersionAssignment {
-    pub const fn as_metadata_value(self) -> &'static str {
-        match self {
-            Self::LegacyLeaderAssigned => "legacy_leader_assigned",
-            Self::CommittedApplyV1 => "committed_apply_v1",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutboxStreamWatermark {
-    pub client_id: String,
-    pub stream_id: i64,
-    pub stream_seq: i64,
-}
-
-impl LogApplyCommit {
-    pub fn new(resource_version: i64, mutations: Vec<LogApplyMutation>) -> Self {
+impl From<&NodeSubnet> for LogApplyNodeSubnetRow {
+    fn from(row: &NodeSubnet) -> Self {
         Self {
-            resource_version,
-            resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
-            outbox_watermark: None,
-            mutations,
+            node_name: row.node_name.as_str().to_string(),
+            subnet: row.subnet.to_string(),
+            subnet_base_int: row.subnet_base_int,
+            gateway_ip: row.gateway_ip.to_string(),
+            node_ip: row.node_ip.to_string(),
+            mode: match row.mode {
+                crate::controllers::annotations::NodePeerMode::Root => "root".to_string(),
+                crate::controllers::annotations::NodePeerMode::Rootless => "rootless".to_string(),
+            },
+            hostport_range: row.hostport_range.as_ref().map(ToString::to_string),
         }
     }
+}
 
-    pub fn from_cluster_mutations(resource_version: i64, mutations: Vec<ClusterMutation>) -> Self {
+impl From<&DataplanePeerMetadata> for LogApplyNodeDataplaneRow {
+    fn from(row: &DataplanePeerMetadata) -> Self {
         Self {
-            resource_version,
-            resource_version_assignment: ResourceVersionAssignment::LegacyLeaderAssigned,
-            outbox_watermark: None,
-            mutations: mutations
-                .into_iter()
-                .map(ClusterMutation::into_log_apply_mutation)
-                .collect(),
+            node_name: row.node_name.clone(),
+            mode: row.mode.as_str().to_string(),
+            encryption: row.encryption.as_str().to_string(),
+            public_key: row.public_key.as_ref().map(ToString::to_string),
+            endpoint: row.endpoint.to_string(),
+            port: row.port,
         }
     }
-
-    pub fn put_resource(resource: &Resource) -> Self {
-        Self::new(
-            resource.resource_version,
-            vec![LogApplyMutation::PutResource(LogApplyResourceRow {
-                api_version: resource.api_version.clone(),
-                kind: resource.kind.clone(),
-                namespace: resource.namespace.clone(),
-                name: resource.name.clone(),
-                uid: resource.uid.clone(),
-                resource_version: resource.resource_version,
-                data: (*resource.data).clone(),
-                require_absent: false,
-                require_existing: false,
-                precondition_uid: None,
-                precondition_resource_version: None,
-                status_only: false,
-            })],
-        )
-    }
-
-    pub fn delete_resource(
-        resource_version: i64,
-        api_version: impl Into<String>,
-        kind: impl Into<String>,
-        namespace: Option<String>,
-        name: impl Into<String>,
-        uid: impl Into<String>,
-    ) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::DeleteResource(LogApplyResourceKey {
-                api_version: api_version.into(),
-                kind: kind.into(),
-                namespace,
-                name: name.into(),
-                uid: uid.into(),
-                precondition_resource_version: None,
-            })],
-        )
-    }
-
-    pub fn put_namespace(resource: &Resource) -> Self {
-        Self::new(
-            resource.resource_version,
-            vec![LogApplyMutation::PutNamespace(LogApplyNamespaceRow {
-                name: resource.name.clone(),
-                uid: resource.uid.clone(),
-                resource_version: resource.resource_version,
-                data: (*resource.data).clone(),
-            })],
-        )
-    }
-
-    pub fn delete_namespace(resource_version: i64, name: impl Into<String>) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::DeleteNamespace { name: name.into() }],
-        )
-    }
-
-    pub fn delete_namespace_contents(resource_version: i64, name: impl Into<String>) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::DeleteNamespaceContents { name: name.into() }],
-        )
-    }
-
-    pub fn put_node_subnet(resource_version: i64, row: &NodeSubnet) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::PutNodeSubnet(LogApplyNodeSubnetRow {
-                node_name: row.node_name.as_str().to_string(),
-                subnet: row.subnet.to_string(),
-                subnet_base_int: row.subnet_base_int,
-                gateway_ip: row.gateway_ip.to_string(),
-                node_ip: row.node_ip.to_string(),
-                mode: match row.mode {
-                    crate::controllers::annotations::NodePeerMode::Root => "root".to_string(),
-                    crate::controllers::annotations::NodePeerMode::Rootless => {
-                        "rootless".to_string()
-                    }
-                },
-                hostport_range: row.hostport_range.as_ref().map(|range| range.to_string()),
-            })],
-        )
-    }
-
-    pub fn delete_node_subnet(resource_version: i64, node_name: impl Into<String>) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::DeleteNodeSubnet {
-                node_name: node_name.into(),
-            }],
-        )
-    }
-
-    pub fn put_node_dataplane(resource_version: i64, row: &DataplanePeerMetadata) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::PutNodeDataplane(
-                LogApplyNodeDataplaneRow {
-                    node_name: row.node_name.clone(),
-                    mode: row.mode.as_str().to_string(),
-                    encryption: row.encryption.as_str().to_string(),
-                    public_key: row.public_key.as_ref().map(|key| key.to_string()),
-                    endpoint: row.endpoint.to_string(),
-                    port: row.port,
-                },
-            )],
-        )
-    }
-
-    pub fn delete_node_dataplane(resource_version: i64, node_name: impl Into<String>) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::DeleteNodeDataplane {
-                node_name: node_name.into(),
-            }],
-        )
-    }
-
-    pub fn advance_resource_version(resource_version: i64) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::AdvanceResourceVersion { resource_version }],
-        )
-    }
-
-    pub fn put_applied_outbox(resource_version: i64, record: AppliedOutboxRecord) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::PutAppliedOutbox(record.into())],
-        )
-    }
-
-    pub fn put_watch_event(row: LogApplyWatchEventRow) -> Self {
-        Self::new(
-            row.resource_version,
-            vec![LogApplyMutation::PutWatchEvent(row)],
-        )
-    }
-
-    pub fn gc_applied_outbox(
-        resource_version: i64,
-        cutoff_ms: i64,
-        operations: Vec<String>,
-    ) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::GcAppliedOutbox {
-                cutoff_ms,
-                operations,
-            }],
-        )
-    }
-
-    pub fn put_pod_cleanup_intent(resource_version: i64, row: PodCleanupIntent) -> Self {
-        Self::new(
-            resource_version,
-            vec![LogApplyMutation::PutPodCleanupIntent(row.into())],
-        )
-    }
-
-    /// Validate a live replicated commit before state-machine apply.
-    pub fn validate_live_resource_version_assignment(&self) -> Result<()> {
-        match self.resource_version_assignment {
-            ResourceVersionAssignment::LegacyLeaderAssigned if self.resource_version > 0 => Ok(()),
-            ResourceVersionAssignment::LegacyLeaderAssigned => {
-                anyhow::bail!("legacy leader-assigned live commit requires resourceVersion > 0")
-            }
-            ResourceVersionAssignment::CommittedApplyV1 if self.resource_version == 0 => Ok(()),
-            ResourceVersionAssignment::CommittedApplyV1 => {
-                anyhow::bail!("committed-apply-v1 live commit requires resourceVersion == 0")
-            }
-        }
-    }
-
-    /// Exact snapshot replay preserves historical RVs and never restamps them.
-    pub fn validate_snapshot_restore_resource_version_assignment(&self) -> Result<()> {
-        if self.resource_version_assignment != ResourceVersionAssignment::LegacyLeaderAssigned {
-            anyhow::bail!(
-                "snapshot restore requires legacy leader-assigned resourceVersion envelope"
-            );
-        }
-        Ok(())
-    }
-
-    /// Convert a proposal-time command materialization into a V1 template.
-    /// Preconditions are deliberately retained; every output RV is assigned
-    /// once by the committed SQLite Raft apply transaction.
-    pub fn into_committed_apply_v1_template(mut self) -> Self {
-        self.resource_version_assignment = ResourceVersionAssignment::CommittedApplyV1;
-        self.resource_version = 0;
-        for mutation in &mut self.mutations {
-            match mutation {
-                LogApplyMutation::PutResource(row) => row.resource_version = 0,
-                LogApplyMutation::PatchResourceLatest(row) => row.resource_version = 0,
-                LogApplyMutation::PutNamespace(row) => row.resource_version = 0,
-                LogApplyMutation::PutWatchEvent(row) => row.resource_version = 0,
-                LogApplyMutation::PutPodCleanupIntent(row) => row.resource_version = 0,
-                LogApplyMutation::PutAppliedOutbox(row) => row.applied_rv = None,
-                LogApplyMutation::AdvanceResourceVersion { resource_version } => {
-                    *resource_version = 0
-                }
-                _ => {}
-            }
-        }
-        self
-    }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum LogApplyMutation {
-    PutResource(LogApplyResourceRow),
-    PatchResourceLatest(LogApplyResourcePatch),
-    DeleteResource(LogApplyResourceKey),
-    PutNamespace(LogApplyNamespaceRow),
-    DeleteNamespace {
-        name: String,
-    },
-    DeleteNamespaceContents {
-        name: String,
-    },
-    PutNodeSubnet(LogApplyNodeSubnetRow),
-    AllocateNodeSubnet(LogApplyNodeSubnetAllocation),
-    DeleteNodeSubnet {
-        node_name: String,
-    },
-    PutNodeDataplane(LogApplyNodeDataplaneRow),
-    DeleteNodeDataplane {
-        node_name: String,
-    },
-    PutAppliedOutbox(LogApplyAppliedOutboxRow),
-    DeleteAppliedOutbox {
-        idempotency_key: String,
-    },
-    GcAppliedOutbox {
-        cutoff_ms: i64,
-        operations: Vec<String>,
-    },
-    GcWatchEvents {
-        max_rows: i64,
-        batch_cap: i64,
-    },
-    PutWatchEvent(LogApplyWatchEventRow),
-    AdvanceResourceVersion {
-        resource_version: i64,
-    },
-    PutKlightsMeta {
-        key: String,
-        value: String,
-    },
-    PutPodCleanupIntent(LogApplyPodCleanupIntentRow),
-    DeletePodCleanupIntent(LogApplyPodCleanupIntentKey),
-    DeletePodCleanupIntentsForNode {
-        node_name: String,
-    },
+pub fn put_node_subnet(resource_version: i64, row: &NodeSubnet) -> LogApplyCommit {
+    LogApplyCommit::put_node_subnet_row(resource_version, row.into())
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LogApplyResourceRow {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub name: String,
-    pub uid: String,
-    pub resource_version: i64,
-    pub data: serde_json::Value,
-    #[serde(default)]
-    pub require_absent: bool,
-    #[serde(default)]
-    pub require_existing: bool,
-    #[serde(default)]
-    pub precondition_uid: Option<String>,
-    #[serde(default)]
-    pub precondition_resource_version: Option<i64>,
-    #[serde(default)]
-    pub status_only: bool,
+pub fn put_node_dataplane(resource_version: i64, row: &DataplanePeerMetadata) -> LogApplyCommit {
+    LogApplyCommit::put_node_dataplane_row(resource_version, row.into())
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LogApplyResourcePatch {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub name: String,
-    pub resource_version: i64,
-    pub patch_kind: PatchKind,
-    pub patch: serde_json::Value,
-    #[serde(default)]
-    pub require_existing: bool,
-    #[serde(default)]
-    pub precondition_uid: Option<String>,
-    #[serde(default)]
-    pub precondition_resource_version: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminating_pod_unready_timestamp: Option<String>,
+pub fn put_applied_outbox(resource_version: i64, record: AppliedOutboxRecord) -> LogApplyCommit {
+    LogApplyCommit::put_applied_outbox_row(resource_version, record.into())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogApplyResourceKey {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub name: String,
-    /// UID captured by the leader at delete-time inside the same outbox
-    /// transaction. When non-empty, `apply_commit_in_tx` enforces
-    /// `WHERE api_version/kind/namespace/name/uid = ?` so a stale delete
-    /// for an older UID is a no-op against a same-name replacement.
-    /// Empty UID is permitted only by snapshot/backfill paths that
-    /// reconstruct deletes from watch history without UID context.
-    #[serde(default)]
-    pub uid: String,
-    #[serde(default)]
-    pub precondition_resource_version: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogApplyNodeSubnetAllocation {
-    pub node_name: String,
-    pub cluster_cidr: String,
-    pub node_ip: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LogApplyNamespaceRow {
-    pub name: String,
-    pub uid: String,
-    pub resource_version: i64,
-    pub data: serde_json::Value,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogApplyNodeSubnetRow {
-    pub node_name: String,
-    pub subnet: String,
-    pub subnet_base_int: u32,
-    pub gateway_ip: String,
-    pub node_ip: String,
-    pub mode: String,
-    pub hostport_range: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogApplyNodeDataplaneRow {
-    pub node_name: String,
-    pub mode: String,
-    pub encryption: String,
-    pub public_key: Option<String>,
-    pub endpoint: String,
-    pub port: Option<u16>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogApplyAppliedOutboxRow {
-    pub idempotency_key: String,
-    pub subject_key: String,
-    pub operation: String,
-    pub first_seen_ms: i64,
-    pub applied_rv: Option<i64>,
-    pub result_proto: Vec<u8>,
-    /// Worker-observed monotonic stamp of the Pod status snapshot this ledger
-    /// row recorded (`None` for non-status operations). Replicated so any raft
-    /// member that becomes leader can keep gating stale status snapshots.
-    #[serde(default)]
-    pub status_stamp: Option<i64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LogApplyWatchEventRow {
-    #[serde(default)]
-    pub event_id: Option<i64>,
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub name: String,
-    pub resource_version: i64,
-    pub event_type: String,
-    pub data: serde_json::Value,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LogApplyPodCleanupIntentRow {
-    pub node_name: String,
-    pub namespace: String,
-    pub pod_name: String,
-    pub pod_uid: String,
-    pub reason: String,
-    pub resource_version: i64,
-    pub created_at_ms: i64,
-    pub pod_data: serde_json::Value,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LogApplyPodCleanupIntentKey {
-    pub node_name: String,
-    pub namespace: String,
-    pub pod_name: String,
-    pub pod_uid: String,
-    pub reason: String,
+pub fn put_pod_cleanup_intent(resource_version: i64, row: PodCleanupIntent) -> LogApplyCommit {
+    LogApplyCommit::put_pod_cleanup_intent_row(resource_version, row.into())
 }
 
 impl From<PodCleanupIntent> for LogApplyPodCleanupIntentRow {
@@ -559,7 +193,7 @@ pub fn decode_commit_json(bytes: &[u8]) -> Result<LogApplyCommit> {
     let mutations = versioned
         .mutations
         .into_iter()
-        .map(LogApplyMutation::try_from)
+        .map(|mutation| LogApplyMutation::try_from(mutation).map_err(anyhow::Error::from))
         .collect::<Result<Vec<_>>>()?;
     let mut commit = LogApplyCommit::new(versioned.resource_version, mutations);
     commit.resource_version_assignment = versioned.resource_version_assignment;
@@ -585,14 +219,14 @@ struct VersionedLogApplyCommit {
 }
 
 pub fn encode_commit_protobuf(commit: &LogApplyCommit) -> Result<Vec<u8>> {
-    let proto = ProtoLogApplyCommit::from(commit.clone());
+    let proto = ProtoLogApplyCommit::wire_from(commit.clone());
     Ok(proto.encode_to_vec())
 }
 
 pub fn decode_commit_protobuf(bytes: &[u8]) -> Result<LogApplyCommit> {
     let start = std::time::Instant::now();
     let proto = ProtoLogApplyCommit::decode(bytes)?;
-    let commit: LogApplyCommit = proto.try_into()?;
+    let commit: LogApplyCommit = proto.try_into_wire()?;
     crate::datastore::diagnostics::log_slow_log_apply_decode(
         "protobuf",
         start.elapsed(),
@@ -603,8 +237,8 @@ pub fn decode_commit_protobuf(bytes: &[u8]) -> Result<LogApplyCommit> {
     Ok(commit)
 }
 
-impl From<OutboxStreamWatermark> for ProtoOutboxStreamWatermark {
-    fn from(watermark: OutboxStreamWatermark) -> Self {
+impl WireFrom<OutboxStreamWatermark> for ProtoOutboxStreamWatermark {
+    fn wire_from(watermark: OutboxStreamWatermark) -> Self {
         Self {
             client_id: watermark.client_id,
             stream_id: watermark.stream_id,
@@ -613,8 +247,8 @@ impl From<OutboxStreamWatermark> for ProtoOutboxStreamWatermark {
     }
 }
 
-impl From<ProtoOutboxStreamWatermark> for OutboxStreamWatermark {
-    fn from(watermark: ProtoOutboxStreamWatermark) -> Self {
+impl WireFrom<ProtoOutboxStreamWatermark> for OutboxStreamWatermark {
+    fn wire_from(watermark: ProtoOutboxStreamWatermark) -> Self {
         Self {
             client_id: watermark.client_id,
             stream_id: watermark.stream_id,
@@ -623,12 +257,16 @@ impl From<ProtoOutboxStreamWatermark> for OutboxStreamWatermark {
     }
 }
 
-impl From<LogApplyCommit> for ProtoLogApplyCommit {
-    fn from(commit: LogApplyCommit) -> Self {
+impl WireFrom<LogApplyCommit> for ProtoLogApplyCommit {
+    fn wire_from(commit: LogApplyCommit) -> Self {
         Self {
             resource_version: commit.resource_version,
-            mutations: commit.mutations.into_iter().map(Into::into).collect(),
-            outbox_watermark: commit.outbox_watermark.map(Into::into),
+            mutations: commit
+                .mutations
+                .into_iter()
+                .map(IntoWire::into_wire)
+                .collect(),
+            outbox_watermark: commit.outbox_watermark.map(IntoWire::into_wire),
             resource_version_assignment: match commit.resource_version_assignment {
                 ResourceVersionAssignment::LegacyLeaderAssigned => {
                     ProtoResourceVersionAssignment::LegacyLeaderAssigned as i32
@@ -641,10 +279,10 @@ impl From<LogApplyCommit> for ProtoLogApplyCommit {
     }
 }
 
-impl TryFrom<ProtoLogApplyCommit> for LogApplyCommit {
+impl TryWireFrom<ProtoLogApplyCommit> for LogApplyCommit {
     type Error = anyhow::Error;
 
-    fn try_from(proto: ProtoLogApplyCommit) -> Result<Self> {
+    fn try_wire_from(proto: ProtoLogApplyCommit) -> Result<Self> {
         let resource_version_assignment =
             ProtoResourceVersionAssignment::try_from(proto.resource_version_assignment)
                 .map_err(|value| anyhow::anyhow!("unknown resourceVersion assignment: {value}"))?;
@@ -658,31 +296,31 @@ impl TryFrom<ProtoLogApplyCommit> for LogApplyCommit {
                     ResourceVersionAssignment::CommittedApplyV1
                 }
             },
-            outbox_watermark: proto.outbox_watermark.map(Into::into),
+            outbox_watermark: proto.outbox_watermark.map(IntoWire::into_wire),
             mutations: proto
                 .mutations
                 .into_iter()
-                .map(LogApplyMutation::try_from)
+                .map(LogApplyMutation::try_wire_from)
                 .collect::<Result<Vec<_>>>()?,
         })
     }
 }
 
-impl From<LogApplyMutation> for ProtoLogApplyMutation {
-    fn from(mutation: LogApplyMutation) -> Self {
+impl WireFrom<LogApplyMutation> for ProtoLogApplyMutation {
+    fn wire_from(mutation: LogApplyMutation) -> Self {
         use proto_log_apply_mutation::Mutation;
         let mutation = match mutation {
-            LogApplyMutation::PutResource(row) => Mutation::PutResource(row.into()),
+            LogApplyMutation::PutResource(row) => Mutation::PutResource(row.into_wire()),
             LogApplyMutation::PatchResourceLatest(patch) => {
-                Mutation::PatchResourceLatest(patch.into())
+                Mutation::PatchResourceLatest(patch.into_wire())
             }
-            LogApplyMutation::DeleteResource(key) => Mutation::DeleteResource(key.into()),
-            LogApplyMutation::PutNamespace(row) => Mutation::PutNamespace(row.into()),
+            LogApplyMutation::DeleteResource(key) => Mutation::DeleteResource(key.into_wire()),
+            LogApplyMutation::PutNamespace(row) => Mutation::PutNamespace(row.into_wire()),
             LogApplyMutation::DeleteNamespace { name } => Mutation::DeleteNamespace(name),
             LogApplyMutation::DeleteNamespaceContents { name } => {
                 Mutation::DeleteNamespaceContents(name)
             }
-            LogApplyMutation::PutNodeSubnet(row) => Mutation::PutNodeSubnet(row.into()),
+            LogApplyMutation::PutNodeSubnet(row) => Mutation::PutNodeSubnet(row.into_wire()),
             LogApplyMutation::AllocateNodeSubnet(allocation) => {
                 Mutation::AllocateNodeSubnet(ProtoLogApplyNodeSubnetAllocation {
                     node_name: allocation.node_name,
@@ -693,11 +331,11 @@ impl From<LogApplyMutation> for ProtoLogApplyMutation {
             LogApplyMutation::DeleteNodeSubnet { node_name } => {
                 Mutation::DeleteNodeSubnet(node_name)
             }
-            LogApplyMutation::PutNodeDataplane(row) => Mutation::PutNodeDataplane(row.into()),
+            LogApplyMutation::PutNodeDataplane(row) => Mutation::PutNodeDataplane(row.into_wire()),
             LogApplyMutation::DeleteNodeDataplane { node_name } => {
                 Mutation::DeleteNodeDataplane(node_name)
             }
-            LogApplyMutation::PutAppliedOutbox(row) => Mutation::PutAppliedOutbox(row.into()),
+            LogApplyMutation::PutAppliedOutbox(row) => Mutation::PutAppliedOutbox(row.into_wire()),
             LogApplyMutation::DeleteAppliedOutbox { idempotency_key } => {
                 Mutation::DeleteAppliedOutbox(idempotency_key)
             }
@@ -718,13 +356,15 @@ impl From<LogApplyMutation> for ProtoLogApplyMutation {
                 max_rows,
                 batch_cap,
             }),
-            LogApplyMutation::PutWatchEvent(row) => Mutation::PutWatchEvent(row.into()),
+            LogApplyMutation::PutWatchEvent(row) => Mutation::PutWatchEvent(row.into_wire()),
             LogApplyMutation::PutKlightsMeta { key, value } => {
                 Mutation::PutKlightsMeta(ProtoLogApplyKlightsMeta { key, value })
             }
-            LogApplyMutation::PutPodCleanupIntent(row) => Mutation::PutPodCleanupIntent(row.into()),
+            LogApplyMutation::PutPodCleanupIntent(row) => {
+                Mutation::PutPodCleanupIntent(row.into_wire())
+            }
             LogApplyMutation::DeletePodCleanupIntent(key) => {
-                Mutation::DeletePodCleanupIntent(key.into())
+                Mutation::DeletePodCleanupIntent(key.into_wire())
             }
             LogApplyMutation::DeletePodCleanupIntentsForNode { node_name } => {
                 Mutation::DeletePodCleanupIntentsForNode(node_name)
@@ -736,27 +376,27 @@ impl From<LogApplyMutation> for ProtoLogApplyMutation {
     }
 }
 
-impl TryFrom<ProtoLogApplyMutation> for LogApplyMutation {
+impl TryWireFrom<ProtoLogApplyMutation> for LogApplyMutation {
     type Error = anyhow::Error;
 
-    fn try_from(proto: ProtoLogApplyMutation) -> Result<Self> {
+    fn try_wire_from(proto: ProtoLogApplyMutation) -> Result<Self> {
         use proto_log_apply_mutation::Mutation;
         Ok(
             match proto
                 .mutation
                 .ok_or_else(|| anyhow::anyhow!("log_apply mutation is missing variant"))?
             {
-                Mutation::PutResource(row) => LogApplyMutation::PutResource(row.try_into()?),
+                Mutation::PutResource(row) => LogApplyMutation::PutResource(row.try_into_wire()?),
                 Mutation::PatchResourceLatest(patch) => {
-                    LogApplyMutation::PatchResourceLatest(patch.try_into()?)
+                    LogApplyMutation::PatchResourceLatest(patch.try_into_wire()?)
                 }
-                Mutation::DeleteResource(key) => LogApplyMutation::DeleteResource(key.into()),
-                Mutation::PutNamespace(row) => LogApplyMutation::PutNamespace(row.try_into()?),
+                Mutation::DeleteResource(key) => LogApplyMutation::DeleteResource(key.into_wire()),
+                Mutation::PutNamespace(row) => LogApplyMutation::PutNamespace(row.try_into_wire()?),
                 Mutation::DeleteNamespace(name) => LogApplyMutation::DeleteNamespace { name },
                 Mutation::DeleteNamespaceContents(name) => {
                     LogApplyMutation::DeleteNamespaceContents { name }
                 }
-                Mutation::PutNodeSubnet(row) => LogApplyMutation::PutNodeSubnet(row.into()),
+                Mutation::PutNodeSubnet(row) => LogApplyMutation::PutNodeSubnet(row.into_wire()),
                 Mutation::AllocateNodeSubnet(allocation) => {
                     LogApplyMutation::AllocateNodeSubnet(LogApplyNodeSubnetAllocation {
                         node_name: allocation.node_name,
@@ -768,12 +408,14 @@ impl TryFrom<ProtoLogApplyMutation> for LogApplyMutation {
                     LogApplyMutation::DeleteNodeSubnet { node_name }
                 }
                 Mutation::PutNodeDataplane(row) => {
-                    LogApplyMutation::PutNodeDataplane(row.try_into()?)
+                    LogApplyMutation::PutNodeDataplane(row.try_into_wire()?)
                 }
                 Mutation::DeleteNodeDataplane(node_name) => {
                     LogApplyMutation::DeleteNodeDataplane { node_name }
                 }
-                Mutation::PutAppliedOutbox(row) => LogApplyMutation::PutAppliedOutbox(row.into()),
+                Mutation::PutAppliedOutbox(row) => {
+                    LogApplyMutation::PutAppliedOutbox(row.into_wire())
+                }
                 Mutation::DeleteAppliedOutbox(idempotency_key) => {
                     LogApplyMutation::DeleteAppliedOutbox { idempotency_key }
                 }
@@ -788,16 +430,18 @@ impl TryFrom<ProtoLogApplyMutation> for LogApplyMutation {
                     max_rows: gc.max_rows,
                     batch_cap: gc.batch_cap,
                 },
-                Mutation::PutWatchEvent(row) => LogApplyMutation::PutWatchEvent(row.try_into()?),
+                Mutation::PutWatchEvent(row) => {
+                    LogApplyMutation::PutWatchEvent(row.try_into_wire()?)
+                }
                 Mutation::PutKlightsMeta(meta) => LogApplyMutation::PutKlightsMeta {
                     key: meta.key,
                     value: meta.value,
                 },
                 Mutation::PutPodCleanupIntent(row) => {
-                    LogApplyMutation::PutPodCleanupIntent(row.try_into()?)
+                    LogApplyMutation::PutPodCleanupIntent(row.try_into_wire()?)
                 }
                 Mutation::DeletePodCleanupIntent(key) => {
-                    LogApplyMutation::DeletePodCleanupIntent(key.into())
+                    LogApplyMutation::DeletePodCleanupIntent(key.into_wire())
                 }
                 Mutation::DeletePodCleanupIntentsForNode(node_name) => {
                     LogApplyMutation::DeletePodCleanupIntentsForNode { node_name }
@@ -807,8 +451,8 @@ impl TryFrom<ProtoLogApplyMutation> for LogApplyMutation {
     }
 }
 
-impl From<LogApplyResourcePatch> for ProtoLogApplyResourcePatch {
-    fn from(patch: LogApplyResourcePatch) -> Self {
+impl WireFrom<LogApplyResourcePatch> for ProtoLogApplyResourcePatch {
+    fn wire_from(patch: LogApplyResourcePatch) -> Self {
         Self {
             api_version: patch.api_version,
             kind: patch.kind,
@@ -828,10 +472,10 @@ impl From<LogApplyResourcePatch> for ProtoLogApplyResourcePatch {
     }
 }
 
-impl TryFrom<ProtoLogApplyResourcePatch> for LogApplyResourcePatch {
+impl TryWireFrom<ProtoLogApplyResourcePatch> for LogApplyResourcePatch {
     type Error = anyhow::Error;
 
-    fn try_from(patch: ProtoLogApplyResourcePatch) -> Result<Self> {
+    fn try_wire_from(patch: ProtoLogApplyResourcePatch) -> Result<Self> {
         Ok(Self {
             api_version: patch.api_version,
             kind: patch.kind,
@@ -853,8 +497,8 @@ impl TryFrom<ProtoLogApplyResourcePatch> for LogApplyResourcePatch {
     }
 }
 
-impl From<LogApplyResourceRow> for ProtoLogApplyResourceRow {
-    fn from(row: LogApplyResourceRow) -> Self {
+impl WireFrom<LogApplyResourceRow> for ProtoLogApplyResourceRow {
+    fn wire_from(row: LogApplyResourceRow) -> Self {
         Self {
             api_version: row.api_version,
             kind: row.kind,
@@ -873,10 +517,10 @@ impl From<LogApplyResourceRow> for ProtoLogApplyResourceRow {
     }
 }
 
-impl TryFrom<ProtoLogApplyResourceRow> for LogApplyResourceRow {
+impl TryWireFrom<ProtoLogApplyResourceRow> for LogApplyResourceRow {
     type Error = anyhow::Error;
 
-    fn try_from(row: ProtoLogApplyResourceRow) -> Result<Self> {
+    fn try_wire_from(row: ProtoLogApplyResourceRow) -> Result<Self> {
         Ok(Self {
             api_version: row.api_version,
             kind: row.kind,
@@ -894,8 +538,8 @@ impl TryFrom<ProtoLogApplyResourceRow> for LogApplyResourceRow {
     }
 }
 
-impl From<LogApplyResourceKey> for ProtoLogApplyResourceKey {
-    fn from(key: LogApplyResourceKey) -> Self {
+impl WireFrom<LogApplyResourceKey> for ProtoLogApplyResourceKey {
+    fn wire_from(key: LogApplyResourceKey) -> Self {
         Self {
             api_version: key.api_version,
             kind: key.kind,
@@ -907,8 +551,8 @@ impl From<LogApplyResourceKey> for ProtoLogApplyResourceKey {
     }
 }
 
-impl From<ProtoLogApplyResourceKey> for LogApplyResourceKey {
-    fn from(key: ProtoLogApplyResourceKey) -> Self {
+impl WireFrom<ProtoLogApplyResourceKey> for LogApplyResourceKey {
+    fn wire_from(key: ProtoLogApplyResourceKey) -> Self {
         Self {
             api_version: key.api_version,
             kind: key.kind,
@@ -920,8 +564,8 @@ impl From<ProtoLogApplyResourceKey> for LogApplyResourceKey {
     }
 }
 
-impl From<LogApplyNamespaceRow> for ProtoLogApplyNamespaceRow {
-    fn from(row: LogApplyNamespaceRow) -> Self {
+impl WireFrom<LogApplyNamespaceRow> for ProtoLogApplyNamespaceRow {
+    fn wire_from(row: LogApplyNamespaceRow) -> Self {
         Self {
             name: row.name,
             uid: row.uid,
@@ -932,10 +576,10 @@ impl From<LogApplyNamespaceRow> for ProtoLogApplyNamespaceRow {
     }
 }
 
-impl TryFrom<ProtoLogApplyNamespaceRow> for LogApplyNamespaceRow {
+impl TryWireFrom<ProtoLogApplyNamespaceRow> for LogApplyNamespaceRow {
     type Error = anyhow::Error;
 
-    fn try_from(row: ProtoLogApplyNamespaceRow) -> Result<Self> {
+    fn try_wire_from(row: ProtoLogApplyNamespaceRow) -> Result<Self> {
         Ok(Self {
             name: row.name,
             uid: row.uid,
@@ -945,8 +589,8 @@ impl TryFrom<ProtoLogApplyNamespaceRow> for LogApplyNamespaceRow {
     }
 }
 
-impl From<LogApplyNodeSubnetRow> for ProtoLogApplyNodeSubnetRow {
-    fn from(row: LogApplyNodeSubnetRow) -> Self {
+impl WireFrom<LogApplyNodeSubnetRow> for ProtoLogApplyNodeSubnetRow {
+    fn wire_from(row: LogApplyNodeSubnetRow) -> Self {
         Self {
             node_name: row.node_name,
             subnet: row.subnet,
@@ -959,8 +603,8 @@ impl From<LogApplyNodeSubnetRow> for ProtoLogApplyNodeSubnetRow {
     }
 }
 
-impl From<ProtoLogApplyNodeSubnetRow> for LogApplyNodeSubnetRow {
-    fn from(row: ProtoLogApplyNodeSubnetRow) -> Self {
+impl WireFrom<ProtoLogApplyNodeSubnetRow> for LogApplyNodeSubnetRow {
+    fn wire_from(row: ProtoLogApplyNodeSubnetRow) -> Self {
         Self {
             node_name: row.node_name,
             subnet: row.subnet,
@@ -973,8 +617,8 @@ impl From<ProtoLogApplyNodeSubnetRow> for LogApplyNodeSubnetRow {
     }
 }
 
-impl From<LogApplyNodeDataplaneRow> for ProtoLogApplyNodeDataplaneRow {
-    fn from(row: LogApplyNodeDataplaneRow) -> Self {
+impl WireFrom<LogApplyNodeDataplaneRow> for ProtoLogApplyNodeDataplaneRow {
+    fn wire_from(row: LogApplyNodeDataplaneRow) -> Self {
         Self {
             node_name: row.node_name,
             mode: row.mode,
@@ -986,10 +630,10 @@ impl From<LogApplyNodeDataplaneRow> for ProtoLogApplyNodeDataplaneRow {
     }
 }
 
-impl TryFrom<ProtoLogApplyNodeDataplaneRow> for LogApplyNodeDataplaneRow {
+impl TryWireFrom<ProtoLogApplyNodeDataplaneRow> for LogApplyNodeDataplaneRow {
     type Error = anyhow::Error;
 
-    fn try_from(row: ProtoLogApplyNodeDataplaneRow) -> Result<Self> {
+    fn try_wire_from(row: ProtoLogApplyNodeDataplaneRow) -> Result<Self> {
         Ok(Self {
             node_name: row.node_name,
             mode: row.mode,
@@ -1001,8 +645,8 @@ impl TryFrom<ProtoLogApplyNodeDataplaneRow> for LogApplyNodeDataplaneRow {
     }
 }
 
-impl From<LogApplyAppliedOutboxRow> for ProtoLogApplyAppliedOutboxRow {
-    fn from(row: LogApplyAppliedOutboxRow) -> Self {
+impl WireFrom<LogApplyAppliedOutboxRow> for ProtoLogApplyAppliedOutboxRow {
+    fn wire_from(row: LogApplyAppliedOutboxRow) -> Self {
         Self {
             idempotency_key: row.idempotency_key,
             subject_key: row.subject_key,
@@ -1015,8 +659,8 @@ impl From<LogApplyAppliedOutboxRow> for ProtoLogApplyAppliedOutboxRow {
     }
 }
 
-impl From<ProtoLogApplyAppliedOutboxRow> for LogApplyAppliedOutboxRow {
-    fn from(row: ProtoLogApplyAppliedOutboxRow) -> Self {
+impl WireFrom<ProtoLogApplyAppliedOutboxRow> for LogApplyAppliedOutboxRow {
+    fn wire_from(row: ProtoLogApplyAppliedOutboxRow) -> Self {
         Self {
             idempotency_key: row.idempotency_key,
             subject_key: row.subject_key,
@@ -1029,8 +673,8 @@ impl From<ProtoLogApplyAppliedOutboxRow> for LogApplyAppliedOutboxRow {
     }
 }
 
-impl From<LogApplyWatchEventRow> for ProtoLogApplyWatchEventRow {
-    fn from(row: LogApplyWatchEventRow) -> Self {
+impl WireFrom<LogApplyWatchEventRow> for ProtoLogApplyWatchEventRow {
+    fn wire_from(row: LogApplyWatchEventRow) -> Self {
         Self {
             api_version: row.api_version,
             kind: row.kind,
@@ -1045,10 +689,10 @@ impl From<LogApplyWatchEventRow> for ProtoLogApplyWatchEventRow {
     }
 }
 
-impl TryFrom<ProtoLogApplyWatchEventRow> for LogApplyWatchEventRow {
+impl TryWireFrom<ProtoLogApplyWatchEventRow> for LogApplyWatchEventRow {
     type Error = anyhow::Error;
 
-    fn try_from(row: ProtoLogApplyWatchEventRow) -> Result<Self> {
+    fn try_wire_from(row: ProtoLogApplyWatchEventRow) -> Result<Self> {
         Ok(Self {
             event_id: row.event_id,
             api_version: row.api_version,
@@ -1062,8 +706,8 @@ impl TryFrom<ProtoLogApplyWatchEventRow> for LogApplyWatchEventRow {
     }
 }
 
-impl From<LogApplyPodCleanupIntentRow> for ProtoLogApplyPodCleanupIntentRow {
-    fn from(row: LogApplyPodCleanupIntentRow) -> Self {
+impl WireFrom<LogApplyPodCleanupIntentRow> for ProtoLogApplyPodCleanupIntentRow {
+    fn wire_from(row: LogApplyPodCleanupIntentRow) -> Self {
         Self {
             node_name: row.node_name,
             namespace: row.namespace,
@@ -1078,10 +722,10 @@ impl From<LogApplyPodCleanupIntentRow> for ProtoLogApplyPodCleanupIntentRow {
     }
 }
 
-impl TryFrom<ProtoLogApplyPodCleanupIntentRow> for LogApplyPodCleanupIntentRow {
+impl TryWireFrom<ProtoLogApplyPodCleanupIntentRow> for LogApplyPodCleanupIntentRow {
     type Error = anyhow::Error;
 
-    fn try_from(row: ProtoLogApplyPodCleanupIntentRow) -> Result<Self> {
+    fn try_wire_from(row: ProtoLogApplyPodCleanupIntentRow) -> Result<Self> {
         Ok(Self {
             node_name: row.node_name,
             namespace: row.namespace,
@@ -1095,8 +739,8 @@ impl TryFrom<ProtoLogApplyPodCleanupIntentRow> for LogApplyPodCleanupIntentRow {
     }
 }
 
-impl From<LogApplyPodCleanupIntentKey> for ProtoLogApplyPodCleanupIntentKey {
-    fn from(key: LogApplyPodCleanupIntentKey) -> Self {
+impl WireFrom<LogApplyPodCleanupIntentKey> for ProtoLogApplyPodCleanupIntentKey {
+    fn wire_from(key: LogApplyPodCleanupIntentKey) -> Self {
         Self {
             node_name: key.node_name,
             namespace: key.namespace,
@@ -1107,8 +751,8 @@ impl From<LogApplyPodCleanupIntentKey> for ProtoLogApplyPodCleanupIntentKey {
     }
 }
 
-impl From<ProtoLogApplyPodCleanupIntentKey> for LogApplyPodCleanupIntentKey {
-    fn from(key: ProtoLogApplyPodCleanupIntentKey) -> Self {
+impl WireFrom<ProtoLogApplyPodCleanupIntentKey> for LogApplyPodCleanupIntentKey {
+    fn wire_from(key: ProtoLogApplyPodCleanupIntentKey) -> Self {
         Self {
             node_name: key.node_name,
             namespace: key.namespace,
@@ -1468,42 +1112,6 @@ mod parity_tests {
     }
 
     #[test]
-    fn resource_version_assignment_rejects_invalid_live_and_snapshot_combinations() {
-        let legacy_zero = LogApplyCommit::new(0, Vec::new());
-        assert!(
-            legacy_zero
-                .validate_live_resource_version_assignment()
-                .is_err()
-        );
-
-        let mut v1_positive = LogApplyCommit::new(1, Vec::new());
-        v1_positive.resource_version_assignment = ResourceVersionAssignment::CommittedApplyV1;
-        assert!(
-            v1_positive
-                .validate_live_resource_version_assignment()
-                .is_err()
-        );
-        assert!(
-            v1_positive
-                .validate_snapshot_restore_resource_version_assignment()
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn legacy_snapshot_replay_preserves_assigned_resource_version() {
-        let commit = LogApplyCommit::new(73, Vec::new());
-        commit
-            .validate_snapshot_restore_resource_version_assignment()
-            .expect("legacy snapshot commit is preserved");
-        assert_eq!(commit.resource_version, 73);
-        assert_eq!(
-            commit.resource_version_assignment,
-            ResourceVersionAssignment::LegacyLeaderAssigned
-        );
-    }
-
-    #[test]
     fn outbox_stream_watermark_round_trips_json_and_protobuf() {
         let mut commit = LogApplyCommit::new(
             77,
@@ -1583,35 +1191,6 @@ mod parity_tests {
 
         let restored: AppliedOutboxRecord = row.into();
         assert_eq!(restored.status_stamp, Some(99));
-    }
-
-    #[test]
-    fn every_mutation_variant_round_trips_through_cluster_mutation() {
-        for name in all_variant_names() {
-            let (label, mutation) = sample(name);
-            let original = mutation.clone();
-            let cm: ClusterMutation = original.clone().into();
-            let round_tripped: LogApplyMutation = cm.into();
-            assert_eq!(
-                round_tripped, original,
-                "{label}: ClusterMutation round-trip changed the value"
-            );
-        }
-    }
-
-    #[test]
-    fn from_cluster_mutations_matches_log_apply_commit_new_for_samples() {
-        for name in all_variant_names() {
-            let (label, mutation) = sample(name);
-            let rv = commit_for(mutation.clone()).resource_version;
-            let cm: ClusterMutation = mutation.clone().into();
-            let from_cluster = LogApplyCommit::from_cluster_mutations(rv, vec![cm]);
-            let direct = LogApplyCommit::new(rv, vec![mutation]);
-            assert_eq!(
-                from_cluster, direct,
-                "{label}: from_cluster_mutations must match LogApplyCommit::new on the same sample"
-            );
-        }
     }
 
     #[test]

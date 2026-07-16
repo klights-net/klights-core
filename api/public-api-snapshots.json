@@ -2,11 +2,11 @@
   "format": "rustdoc-json-public-paths-v1",
   "packages": {
     "klights": {
-      "count": 3108,
-      "sha256": "470e4ccea9ea0d0ad2946b48caf74d0bba3d29f5aa4f01c14bc778d7e67bf14d",
+      "count": 3037,
+      "sha256": "62a6f955c6f67e380c3ff8356ddefd738799a6290f6274e478eb6c4b8a7a9592",
       "source": {
-        "count": 490045,
-        "sha256": "36ecfbb7b9fec62aea7e986e970baa2030fd4d674053753ae66dff2b69fe0dcb"
+        "count": 489310,
+        "sha256": "800b932e892294d4f08ffd0c4d64d31395ed3046863f9aa08f68e85684304900"
       }
     },
     "klights-apiserver": {
@@ -26,11 +26,11 @@
       }
     },
     "klights-cluster-core": {
-      "count": 140,
-      "sha256": "fc2b50eecc646bccdb2d39856fc10a18fb96925054010cd4be663bf259e8483a",
+      "count": 230,
+      "sha256": "88c0c47b0220a68876d8cd92f1966bbd724f763a7d156fa122b250acd8d47422",
       "source": {
-        "count": 3829,
-        "sha256": "0fced501dfc25e11f20f6899f727931e19739dc89dc0fd9c8065f2e18d70b7b1"
+        "count": 5055,
+        "sha256": "2e6f518d02ba083c547fdca406b4e5251c671e156bb9cdcc44244e3af17ce885"
       }
     },
     "klights-cluster-datastore": {
