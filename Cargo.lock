@@ -2024,6 +2024,7 @@ dependencies = [
  "k8s-cri",
  "k8s-openapi",
  "k8s-pb",
+ "klights-internal-protobuf",
  "klights-types",
  "kube",
  "libc",
@@ -2078,7 +2079,6 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-prost",
- "tonic-prost-build",
  "tonic-reflection",
  "tower",
  "tower-http",
@@ -2120,6 +2120,12 @@ version = "0.0.0"
 [[package]]
 name = "klights-internal-protobuf"
 version = "0.0.0"
+dependencies = [
+ "prost",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
 
 [[package]]
 name = "klights-kube-protobuf"

@@ -2,7 +2,7 @@
 //!
 //! Request/response types for the leader <-> replica replication protocol.
 //! All types are serde-serializable for the JSON codec and have protobuf
-//! equivalents in `proto/replication.proto`.
+//! equivalents in the `klights-internal-protobuf` replication schema.
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};

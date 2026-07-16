@@ -10,3 +10,11 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+prost = { workspace = true }
+tonic = { workspace = true, features = ["codegen"] }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
