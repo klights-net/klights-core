@@ -8,7 +8,7 @@
 //! Keep this module as pure apply logic: zero `await`, zero
 //! `DatastoreBackend` references, and no runtime side effects.
 use crate::datastore::command::{
-    COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand, StorageResponse,
+    COMMAND_CODEC_VERSION, CommandMeta, StorageCommand, StorageResponse, new_command_id,
 };
 use crate::datastore::types::{Resource, ResourceBatchOperation};
 use crate::replication::protocol::{
@@ -256,7 +256,7 @@ pub(super) fn meta_for_rv(
     authoring_node: String,
 ) -> CommandMeta {
     CommandMeta {
-        command_id: CommandId::new(),
+        command_id: new_command_id(),
         codec_version: COMMAND_CODEC_VERSION,
         resource_version,
         uid,

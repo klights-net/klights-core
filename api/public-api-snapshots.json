@@ -1,12 +1,13 @@
 {
-  "format": "rustdoc-json-public-paths-v1",
+  "format": "rustdoc-json-reachable-api-v2",
+  "schema": 2,
   "packages": {
     "klights": {
-      "count": 3037,
-      "sha256": "62a6f955c6f67e380c3ff8356ddefd738799a6290f6274e478eb6c4b8a7a9592",
+      "count": 46140,
+      "sha256": "aabc7b2435e9534b76ff8edf02df16e52ea0686906d5cf643b4504c1dde5b58b",
       "source": {
-        "count": 489310,
-        "sha256": "800b932e892294d4f08ffd0c4d64d31395ed3046863f9aa08f68e85684304900"
+        "count": 489340,
+        "sha256": "4b1acf9f2156bb7eb6ddbcf37667327b4ea7be558b2329f508c12e87675fe306"
       }
     },
     "klights-apiserver": {
@@ -26,11 +27,11 @@
       }
     },
     "klights-cluster-core": {
-      "count": 230,
-      "sha256": "88c0c47b0220a68876d8cd92f1966bbd724f763a7d156fa122b250acd8d47422",
+      "count": 2898,
+      "sha256": "343744aa50c73a809c176b1d63e4f1ffd1d7714f1a2eb9e0002042b0de967bd8",
       "source": {
-        "count": 5055,
-        "sha256": "2e6f518d02ba083c547fdca406b4e5251c671e156bb9cdcc44244e3af17ce885"
+        "count": 5267,
+        "sha256": "ce1f4cfa4f23e481605f34b27ffc3770cd65b4677c9d1287b435b6519c5cbf81"
       }
     },
     "klights-cluster-datastore": {
@@ -58,8 +59,8 @@
       }
     },
     "klights-internal-protobuf": {
-      "count": 262,
-      "sha256": "33a7f8419d2592ee1e2244a489e7109d3762cb33e6b99a7ed790c83def6acb59",
+      "count": 7652,
+      "sha256": "6252d2a04f6c758f0e1b0888c2fc1059e2b0d2f715c8be9a0de4afdeb49e9baf",
       "source": {
         "count": 1711,
         "sha256": "6cf0ad083dbe4ed37d5284fbf993d0a514d82b1dc16fd8bc494ab671eda40a5f"
@@ -162,8 +163,8 @@
       }
     },
     "klights-types": {
-      "count": 41,
-      "sha256": "93f3d8c88370a4472f1113c14361504f9febbb300785be6fb783a6ab33c38775",
+      "count": 317,
+      "sha256": "d7f39dea24de6cddbcb6ec65aae15c097aa69385705d9ed04473f58d14e17e20",
       "source": {
         "count": 2376,
         "sha256": "7ee8eb72f16c54bbc039ab315c987255bf4f6d52f20edd52459fccf44b273dfb"
@@ -177,6 +178,5 @@
         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       }
     }
-  },
-  "schema": 1
+  }
 }

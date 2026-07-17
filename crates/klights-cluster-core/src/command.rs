@@ -41,24 +41,11 @@ pub const COMMAND_CODEC_VERSION: u32 = 2;
 
 /// Unique identifier for a storage command.
 ///
-/// Typically a UUID v4, but the codec does not enforce a format — any
-/// unique string works.  Used for idempotency deduplication in the
-/// replicated apply layer.
+/// The value-only domain does not generate identifiers. The root command
+/// adapter supplies UUID-v4 strings at command-authoring boundaries, while
+/// codecs intentionally accept any string for backward compatibility.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CommandId(pub String);
-
-impl CommandId {
-    /// Generate a new random command ID (UUID v4).
-    pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4().to_string())
-    }
-}
-
-impl Default for CommandId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl std::fmt::Display for CommandId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -673,9 +660,7 @@ mod tests {
     #[test]
     fn command_identity_and_codec_version_contract_is_owned_here() {
         assert_eq!(COMMAND_CODEC_VERSION, 2);
-        let first = CommandId::new();
-        let second = CommandId::new();
-        assert_ne!(first, second);
-        assert_eq!(CommandId("test-123".to_string()).to_string(), "test-123");
+        let command_id = CommandId("test-123".to_string());
+        assert_eq!(command_id.to_string(), "test-123");
     }
 }

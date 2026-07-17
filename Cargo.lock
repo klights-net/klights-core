@@ -2106,12 +2106,10 @@ version = "0.0.0"
 name = "klights-cluster-core"
 version = "0.0.0"
 dependencies = [
- "anyhow",
  "chrono",
  "klights-types",
  "serde",
  "serde_json",
- "uuid",
 ]
 
 [[package]]

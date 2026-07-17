@@ -356,7 +356,8 @@ fn merge_conditions_by_newest_transition_time(live_resource: &Value, incoming_st
         return;
     };
 
-    let mut seen_types = std::collections::HashSet::new();
+    let live_by_type = first_live_conditions_by_type(live_conditions);
+    let mut seen_types = std::collections::BTreeSet::new();
     for incoming in incoming_conditions.iter_mut() {
         let Some(condition_type) = incoming
             .get("type")
@@ -366,11 +367,10 @@ fn merge_conditions_by_newest_transition_time(live_resource: &Value, incoming_st
         else {
             continue;
         };
-        if let Some(live_condition) = live_conditions.iter().find(|condition| {
-            condition.get("type").and_then(Value::as_str) == Some(condition_type.as_str())
-        }) && live_condition_is_newer(live_condition, incoming)
+        if let Some(live_condition) = live_by_type.get(condition_type.as_str())
+            && live_condition_is_newer(live_condition, incoming)
         {
-            *incoming = live_condition.clone();
+            *incoming = (*live_condition).clone();
         }
         seen_types.insert(condition_type);
     }
@@ -387,6 +387,22 @@ fn merge_conditions_by_newest_transition_time(live_resource: &Value, incoming_st
             incoming_conditions.push(live_condition.clone());
         }
     }
+}
+
+fn first_live_conditions_by_type(
+    live_conditions: &[Value],
+) -> std::collections::BTreeMap<&str, &Value> {
+    let mut live_by_type = std::collections::BTreeMap::new();
+    for condition in live_conditions {
+        if let Some(condition_type) = condition
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            live_by_type.entry(condition_type).or_insert(condition);
+        }
+    }
+    live_by_type
 }
 
 fn live_condition_is_newer(live_condition: &Value, incoming_condition: &Value) -> bool {
@@ -468,7 +484,7 @@ fn preserve_unmentioned_live_status_conditions_by_type(
         return;
     };
 
-    let mut seen_types = std::collections::HashSet::new();
+    let mut seen_types = std::collections::BTreeSet::new();
     for incoming in incoming_conditions.iter() {
         let Some(condition_type) = incoming
             .get("type")
@@ -515,7 +531,8 @@ fn preserve_live_status_conditions_by_type(live_resource: &Value, incoming_statu
         return;
     };
 
-    let mut seen_types = std::collections::HashSet::new();
+    let live_by_type = first_live_conditions_by_type(live_conditions);
+    let mut seen_types = std::collections::BTreeSet::new();
     for incoming in incoming_conditions.iter_mut() {
         let Some(condition_type) = incoming
             .get("type")
@@ -525,10 +542,8 @@ fn preserve_live_status_conditions_by_type(live_resource: &Value, incoming_statu
         else {
             continue;
         };
-        if let Some(live_condition) = live_conditions.iter().find(|condition| {
-            condition.get("type").and_then(Value::as_str) == Some(condition_type.as_str())
-        }) {
-            *incoming = live_condition.clone();
+        if let Some(live_condition) = live_by_type.get(condition_type.as_str()) {
+            *incoming = (*live_condition).clone();
         }
         seen_types.insert(condition_type);
     }
@@ -931,6 +946,97 @@ mod tests {
     }
 
     #[test]
+    fn ordered_condition_identity_set_scales_and_preserves_input_order() {
+        const COUNT: usize = 8_192;
+        let live_conditions = (COUNT / 4..COUNT)
+            .map(|index| json!({"type": format!("Condition-{index:05}"), "status": "True"}))
+            .collect::<Vec<_>>();
+        let incoming_conditions = (0..COUNT / 2)
+            .map(|index| json!({"type": format!("Condition-{index:05}"), "status": "False"}))
+            .collect::<Vec<_>>();
+        let live = json!({"status": {"conditions": live_conditions}});
+        let mut incoming = json!({"conditions": incoming_conditions});
+
+        preserve_unmentioned_live_status_conditions_by_type(&live, &mut incoming);
+
+        let merged = incoming
+            .get("conditions")
+            .and_then(Value::as_array)
+            .expect("conditions remain an array");
+        assert_eq!(merged.len(), COUNT);
+        for (index, condition) in merged.iter().enumerate() {
+            assert_eq!(
+                condition.get("type").and_then(Value::as_str),
+                Some(format!("Condition-{index:05}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_newest_condition_merge_scales_and_preserves_exact_order() {
+        const COUNT: usize = 8_192;
+        let live_conditions = (COUNT / 4..COUNT)
+            .map(|index| {
+                json!({
+                    "type": format!("Condition-{index:05}"),
+                    "status": "True",
+                    "lastTransitionTime": "2025-01-01T00:00:00Z"
+                })
+            })
+            .collect::<Vec<_>>();
+        let incoming_conditions = (0..COUNT / 2)
+            .map(|index| {
+                json!({
+                    "type": format!("Condition-{index:05}"),
+                    "status": "False",
+                    "lastTransitionTime": "2024-01-01T00:00:00Z"
+                })
+            })
+            .collect::<Vec<_>>();
+        let live = json!({"status": {"conditions": live_conditions}});
+        let mut incoming = json!({"conditions": incoming_conditions});
+
+        merge_conditions_by_newest_transition_time(&live, &mut incoming);
+
+        assert_indexed_condition_order(&incoming, COUNT);
+    }
+
+    #[test]
+    fn indexed_live_condition_merge_scales_and_preserves_exact_order() {
+        const COUNT: usize = 8_192;
+        let live_conditions = (COUNT / 4..COUNT)
+            .map(|index| json!({"type": format!("Condition-{index:05}"), "status": "True"}))
+            .collect::<Vec<_>>();
+        let incoming_conditions = (0..COUNT / 2)
+            .map(|index| json!({"type": format!("Condition-{index:05}"), "status": "False"}))
+            .collect::<Vec<_>>();
+        let live = json!({"status": {"conditions": live_conditions}});
+        let mut incoming = json!({"conditions": incoming_conditions});
+
+        preserve_live_status_conditions_by_type(&live, &mut incoming);
+
+        assert_indexed_condition_order(&incoming, COUNT);
+    }
+
+    fn assert_indexed_condition_order(incoming: &Value, count: usize) {
+        let merged = incoming
+            .get("conditions")
+            .and_then(Value::as_array)
+            .expect("conditions remain an array");
+        assert_eq!(merged.len(), count);
+        for (index, condition) in merged.iter().enumerate() {
+            assert_eq!(
+                condition.get("type").and_then(Value::as_str),
+                Some(format!("Condition-{index:05}").as_str())
+            );
+            assert_eq!(
+                condition.get("status").and_then(Value::as_str),
+                Some(if index < count / 4 { "False" } else { "True" })
+            );
+        }
+    }
+
+    #[test]
     fn stale_unknown_status_preserves_live_status_authoritatively() {
         let live = json!({"status": {"observedGeneration": 9}});
         let mut incoming = json!({"observedGeneration": 1});
@@ -1194,7 +1300,7 @@ mod tests {
                     StatusApplyFreshness::Stale,
                     StatusApplyOrigin::ReplicatedApply,
                 );
-                let condition_types: std::collections::HashSet<_> = incoming
+                let condition_types: std::collections::BTreeSet<_> = incoming
                     .get("conditions")
                     .and_then(serde_json::Value::as_array)
                     .into_iter()

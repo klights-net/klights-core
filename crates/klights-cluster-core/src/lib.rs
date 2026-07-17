@@ -40,7 +40,7 @@ pub use recovery::{ClusterMetadata, MetadataComparison, compare_metadata, needs_
 pub use replay::{PositionedWatchEvent, WatchReplayPosition};
 pub use resource::{
     PatchKind, Resource, ResourceBatchOperation, ResourceBatchPutMode, ResourceEventObject,
-    ResourcePatchRequest, ResourcePreconditions,
+    ResourceIdentityError, ResourcePatchRequest, ResourcePreconditions,
 };
 pub use stale_resource::apply_same_uid_stale_full_resource_policy;
 pub use status::{

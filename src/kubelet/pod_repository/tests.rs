@@ -362,7 +362,10 @@ impl crate::kubelet::outbox::OutboxApplyClient for TestOutboxApplyClient {
             .await
             .map_err(|err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()))?;
         let meta = crate::datastore::command::CommandMeta {
-            command_id: crate::datastore::command::CommandId::new(),
+            command_id: crate::datastore::command::CommandId(format!(
+                "pod-repository-command-{}",
+                current_rv.saturating_add(1)
+            )),
             codec_version: crate::datastore::command::COMMAND_CODEC_VERSION,
             resource_version: current_rv.saturating_add(1),
             uid: match &command {
@@ -12314,7 +12317,10 @@ impl DeleteCasRacingRaftProposer {
     ) -> anyhow::Result<()> {
         let current_rv = self.inner.get_current_resource_version().await.unwrap_or(0);
         let meta = crate::datastore::command::CommandMeta {
-            command_id: crate::datastore::command::CommandId::new(),
+            command_id: crate::datastore::command::CommandId(format!(
+                "failing-pod-repository-command-{}",
+                current_rv.saturating_add(1)
+            )),
             codec_version: crate::datastore::command::COMMAND_CODEC_VERSION,
             resource_version: current_rv.saturating_add(1),
             uid: match &command {

@@ -1,11 +1,40 @@
 //! Backend- and transport-neutral Kubernetes resource values.
 
+use std::fmt;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use klights_types::ResourceKey;
+
+/// Missing identity fields rejected at resource normalization boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceIdentityError {
+    ResourceMissingApiVersion,
+    ResourceMissingKind,
+    ResourceMissingMetadataName,
+    WatchEventMissingApiVersion,
+    WatchEventMissingKind,
+    WatchEventMissingMetadataName,
+    MetadataUidRequired,
+}
+
+impl fmt::Display for ResourceIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ResourceMissingApiVersion => "resource missing apiVersion",
+            Self::ResourceMissingKind => "resource missing kind",
+            Self::ResourceMissingMetadataName => "resource missing metadata.name",
+            Self::WatchEventMissingApiVersion => "watch event missing apiVersion",
+            Self::WatchEventMissingKind => "watch event missing kind",
+            Self::WatchEventMissingMetadataName => "watch event missing metadata.name",
+            Self::MetadataUidRequired => "metadata.uid is required for UID-qualified write",
+        })
+    }
+}
+
+impl std::error::Error for ResourceIdentityError {}
 
 /// Canonical stored Kubernetes resource.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,21 +58,21 @@ pub trait ResourceEventObject {
 
 impl Resource {
     /// Normalize a complete Kubernetes JSON object, rejecting missing identity.
-    pub fn try_from_data(data: Arc<Value>) -> anyhow::Result<Self> {
+    pub fn try_from_data(data: Arc<Value>) -> Result<Self, ResourceIdentityError> {
         let api_version = data
             .get("apiVersion")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("resource missing apiVersion"))?
+            .ok_or(ResourceIdentityError::ResourceMissingApiVersion)?
             .to_string();
         let kind = data
             .get("kind")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("resource missing kind"))?
+            .ok_or(ResourceIdentityError::ResourceMissingKind)?
             .to_string();
         let name = data
             .pointer("/metadata/name")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("resource missing metadata.name"))?
+            .ok_or(ResourceIdentityError::ResourceMissingMetadataName)?
             .to_string();
         Ok(Self::from_normalized_parts(data, api_version, kind, name))
     }
@@ -58,17 +87,17 @@ impl Resource {
 
     pub fn try_from_watch_event(
         event: &(impl ResourceEventObject + ?Sized),
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, ResourceIdentityError> {
         let data = event.resource_object();
         data.get("apiVersion")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("watch event missing apiVersion"))?;
+            .ok_or(ResourceIdentityError::WatchEventMissingApiVersion)?;
         data.get("kind")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("watch event missing kind"))?;
+            .ok_or(ResourceIdentityError::WatchEventMissingKind)?;
         data.pointer("/metadata/name")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("watch event missing metadata.name"))?;
+            .ok_or(ResourceIdentityError::WatchEventMissingMetadataName)?;
         Self::try_from_data(data.clone())
     }
 
@@ -171,12 +200,15 @@ impl ResourcePreconditions {
         Self::uid_and_resource_version(resource.uid.clone(), resource.resource_version)
     }
 
-    pub fn from_metadata(metadata: &Value, resource_version: i64) -> anyhow::Result<Self> {
+    pub fn from_metadata(
+        metadata: &Value,
+        resource_version: i64,
+    ) -> Result<Self, ResourceIdentityError> {
         let uid = metadata
             .get("uid")
             .and_then(Value::as_str)
             .filter(|uid| !uid.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("metadata.uid is required for UID-qualified write"))?;
+            .ok_or(ResourceIdentityError::MetadataUidRequired)?;
         Ok(Self::uid_and_resource_version(uid, resource_version))
     }
 }
@@ -288,6 +320,68 @@ mod tests {
             .unwrap_err()
             .to_string(),
             "resource missing apiVersion"
+        );
+    }
+
+    #[test]
+    fn resource_identity_errors_are_typed_and_preserve_display_contracts() {
+        let cases = [
+            (
+                json!({"kind": "Pod", "metadata": {"name": "web"}}),
+                ResourceIdentityError::ResourceMissingApiVersion,
+                "resource missing apiVersion",
+            ),
+            (
+                json!({"apiVersion": "v1", "metadata": {"name": "web"}}),
+                ResourceIdentityError::ResourceMissingKind,
+                "resource missing kind",
+            ),
+            (
+                json!({"apiVersion": "v1", "kind": "Pod", "metadata": {}}),
+                ResourceIdentityError::ResourceMissingMetadataName,
+                "resource missing metadata.name",
+            ),
+        ];
+        for (data, expected, display) in cases {
+            let error = Resource::try_from_data(Arc::new(data)).unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(error.to_string(), display);
+        }
+
+        struct Event(Arc<Value>);
+        impl ResourceEventObject for Event {
+            fn resource_object(&self) -> &Arc<Value> {
+                &self.0
+            }
+        }
+        let watch_cases = [
+            (
+                json!({"kind": "Pod", "metadata": {"name": "web"}}),
+                ResourceIdentityError::WatchEventMissingApiVersion,
+                "watch event missing apiVersion",
+            ),
+            (
+                json!({"apiVersion": "v1", "metadata": {"name": "web"}}),
+                ResourceIdentityError::WatchEventMissingKind,
+                "watch event missing kind",
+            ),
+            (
+                json!({"apiVersion": "v1", "kind": "Pod", "metadata": {}}),
+                ResourceIdentityError::WatchEventMissingMetadataName,
+                "watch event missing metadata.name",
+            ),
+        ];
+        for (data, expected, display) in watch_cases {
+            let error = Resource::try_from_watch_event(&Event(Arc::new(data))).unwrap_err();
+            assert_eq!(error, expected);
+            assert_eq!(error.to_string(), display);
+        }
+
+        let error = ResourcePreconditions::from_metadata(&json!({"uid": "  "}), 9).unwrap_err();
+        assert_eq!(error, ResourceIdentityError::MetadataUidRequired);
+        assert_eq!(
+            error.to_string(),
+            "metadata.uid is required for UID-qualified write"
         );
     }
 

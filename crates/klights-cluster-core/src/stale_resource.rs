@@ -6,7 +6,7 @@
 //! that preservation policy for full-resource applies so the SQLite apply code
 //! stays free of scattered stale-PUT helpers.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
 use serde_json::Value;
 
@@ -257,7 +257,7 @@ fn preserve_pod_owner_refs_for_stale_put(
         Some(incoming_owner_refs) => incoming_owner_refs,
     };
 
-    let mut incoming_identities = HashSet::with_capacity(incoming_owner_refs.len());
+    let mut incoming_identities = BTreeSet::new();
     for owner_ref in incoming_owner_refs.iter() {
         if let Some(identity) = owner_reference_identity(owner_ref) {
             incoming_identities.insert(identity);
@@ -280,7 +280,7 @@ fn preserve_pod_owner_refs_for_stale_put(
     );
 }
 
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
 enum OwnerReferenceIdentity {
     Uid(String),
     ApiKindName(String, String, String),
@@ -463,6 +463,33 @@ mod tests {
                 case.expected,
                 "{}",
                 case.name
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_owner_reference_identity_set_scales_and_preserves_input_order() {
+        const COUNT: usize = 8_192;
+        let incoming_refs = (0..COUNT / 2)
+            .map(|index| json!({"uid": format!("uid-{index:05}")}))
+            .collect::<Vec<_>>();
+        let existing_refs = (COUNT / 4..COUNT)
+            .map(|index| json!({"uid": format!("uid-{index:05}")}))
+            .collect::<Vec<_>>();
+        let mut incoming = json!({"metadata": {"ownerReferences": incoming_refs}});
+        let existing = json!({"metadata": {"ownerReferences": existing_refs}});
+
+        preserve_pod_owner_refs_for_stale_put("v1", "Pod", &mut incoming, &existing);
+
+        let merged = incoming
+            .pointer("/metadata/ownerReferences")
+            .and_then(Value::as_array)
+            .expect("owner references remain an array");
+        assert_eq!(merged.len(), COUNT);
+        for (index, owner) in merged.iter().enumerate() {
+            assert_eq!(
+                owner.get("uid").and_then(Value::as_str),
+                Some(format!("uid-{index:05}").as_str())
             );
         }
     }

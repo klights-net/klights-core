@@ -1007,7 +1007,7 @@ mod cases {
                 data: serde_json::json!({"metadata": {"name": format!("client-stream-{rv}")}}),
             },
             meta: CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId(format!("grpc-client-stream-{rv}")),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: rv,
                 uid: None,

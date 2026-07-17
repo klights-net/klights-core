@@ -8,13 +8,14 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[package.metadata.klights]
+isolation = "value-only"
+
 [dependencies]
-anyhow = { workspace = true }
 chrono = { workspace = true }
 klights-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-uuid = { workspace = true }
 
 [lints]
 workspace = true

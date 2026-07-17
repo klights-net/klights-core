@@ -878,7 +878,7 @@ mod cases {
             &db,
             decoded,
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("protobuf-codec-apply".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 2,
                 uid: Some("uid-codec".into()),
@@ -932,7 +932,7 @@ mod cases {
                 }),
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("create-existing-resource".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 2,
                 uid: None,
@@ -1036,7 +1036,7 @@ mod cases {
                 }),
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("update-resource-uid-mismatch".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 5,
                 uid: Some("uid-new".into()),
@@ -1139,7 +1139,7 @@ mod cases {
                 },
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("delete-resource-rv-mismatch".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 2,
                 uid: None,
@@ -1220,7 +1220,7 @@ mod cases {
                 preconditions: ResourcePreconditions::from_resource(&created),
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("update-resource-success".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 3,
                 uid: Some(created.uid.clone()),
@@ -1304,7 +1304,7 @@ mod cases {
                 preconditions: ResourcePreconditions::from_resource(&created),
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("delete-resource-success".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 3,
                 uid: Some(created.uid.clone()),
@@ -1412,7 +1412,7 @@ mod cases {
                 preconditions: ResourcePreconditions::resource_version(created.resource_version),
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("status-update-success".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 5,
                 uid: Some(created.uid.clone()),
@@ -1495,7 +1495,7 @@ mod cases {
                 observed_status_stamp: None,
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("lenient-patch-rv-mismatch".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 3,
                 uid: Some(created.uid.clone()),
@@ -1553,7 +1553,7 @@ mod cases {
                 strict_resource_version: false,
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("lenient-patch-success".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 2,
                 uid: None,
@@ -1635,7 +1635,7 @@ mod cases {
                 strict_resource_version: false,
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("lenient-patch-uid-mismatch".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 3,
                 uid: Some(created.uid.clone()),
@@ -1716,7 +1716,7 @@ mod cases {
                 strict_resource_version: false,
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("strict-patch-rv-mismatch".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 3,
                 uid: Some(created.uid.clone()),
@@ -1823,7 +1823,7 @@ mod cases {
                 strict_resource_version: false,
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("status-rv-mismatch".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 5,
                 uid: Some(created.uid.clone()),
@@ -1888,7 +1888,7 @@ mod cases {
                 observed_status_stamp: None,
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("stale-replicated-status".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 2,
                 uid: None,
@@ -2659,12 +2659,16 @@ mod cases {
                 &self,
                 command: StorageCommand,
             ) -> anyhow::Result<crate::datastore::raft::types::StorageCommandResult> {
-                self.calls.lock().unwrap().push(command.variant_name());
+                let sequence = {
+                    let mut calls = self.calls.lock().unwrap();
+                    calls.push(command.variant_name());
+                    calls.len()
+                };
                 apply_command_to_backend(
                     self.inner.as_ref(),
                     command,
                     CommandMeta {
-                        command_id: CommandId::new(),
+                        command_id: CommandId(format!("raft-inline-{sequence}")),
                         codec_version: COMMAND_CODEC_VERSION,
                         resource_version: 0,
                         uid: None,
@@ -2968,7 +2972,7 @@ mod cases {
 
         let db = crate::datastore::test_support::in_memory().await;
         let meta = CommandMeta {
-            command_id: CommandId::new(),
+            command_id: CommandId("ensure-cluster-metadata".to_string()),
             codec_version: COMMAND_CODEC_VERSION,
             resource_version: 1,
             uid: None,
@@ -3437,7 +3441,7 @@ mod cases {
                 },
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("preserve-live-status".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 // Deliberately older than the live RV after the kubelet status
                 // write so the apply path takes the preserve-live-status branch.
@@ -3552,7 +3556,7 @@ mod cases {
                 },
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("bind-pod-status".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 1,
                 uid: Some("bind-me-uid".into()),
@@ -3679,7 +3683,7 @@ mod cases {
                 observed_status_stamp: None,
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("delete-victim-status".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: 1,
                 uid: Some("victim-uid".into()),
@@ -3777,7 +3781,7 @@ mod cases {
                 observed_status_stamp: None,
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("replicated-job-stale-status".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: created.resource_version,
                 uid: Some("replicated-job-uid".into()),
@@ -3867,7 +3871,7 @@ mod cases {
                 observed_status_stamp: None,
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId(format!("stale-status-{}-{}", case.kind, case.name)),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: created.resource_version,
                 uid: Some(case.uid.into()),
@@ -4237,7 +4241,7 @@ mod cases {
                 observed_status_stamp: None,
             },
             CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId("replicated-fresh-service-status".to_string()),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: created.resource_version,
                 uid: Some("replicated-fresh-service-uid".into()),

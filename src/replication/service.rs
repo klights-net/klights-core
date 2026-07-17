@@ -555,7 +555,7 @@ impl ReplicationService {
         mut request: NodeExecSyncRequest,
     ) -> Result<NodeExecSyncResponse> {
         if request.request_id.trim().is_empty() {
-            request.request_id = crate::datastore::command::CommandId::new().to_string();
+            request.request_id = crate::datastore::command::new_command_id().to_string();
         }
         let request_id = request.request_id.clone();
         let node_name = request.node_name.clone();
@@ -629,7 +629,7 @@ impl ReplicationService {
         mut request: NodeMetricsRequest,
     ) -> Result<NodeMetricsResponse> {
         if request.request_id.trim().is_empty() {
-            request.request_id = crate::datastore::command::CommandId::new().to_string();
+            request.request_id = crate::datastore::command::new_command_id().to_string();
         }
         let request_id = request.request_id.clone();
         let node_name = request.node_name.clone();
@@ -707,7 +707,7 @@ impl ReplicationService {
         mut request: NodeExecRequest,
     ) -> Result<NodeExecStreamSession> {
         if request.request_id.trim().is_empty() {
-            request.request_id = crate::datastore::command::CommandId::new().to_string();
+            request.request_id = crate::datastore::command::new_command_id().to_string();
         }
         let request_id = request.request_id.clone();
         let node_name = request.node_name.clone();
@@ -782,7 +782,7 @@ impl ReplicationService {
 
     pub async fn request_pod_log(&self, mut request: PodLogRequest) -> Result<PodLogResponse> {
         if request.request_id.trim().is_empty() {
-            request.request_id = crate::datastore::command::CommandId::new().to_string();
+            request.request_id = crate::datastore::command::new_command_id().to_string();
         }
         request.follow = None;
         let request_id = request.request_id.clone();
@@ -845,7 +845,7 @@ impl ReplicationService {
         mut request: PodLogRequest,
     ) -> Result<PodLogStreamSession> {
         if request.request_id.trim().is_empty() {
-            request.request_id = crate::datastore::command::CommandId::new().to_string();
+            request.request_id = crate::datastore::command::new_command_id().to_string();
         }
         request.follow = Some("true".to_string());
         let request_id = request.request_id.clone();
@@ -994,7 +994,7 @@ mod tests {
                 data: json!({"metadata": {"name": "test"}}),
             },
             meta: CommandMeta {
-                command_id: CommandId::new(),
+                command_id: CommandId(format!("replication-service-sample-{rv}")),
                 codec_version: COMMAND_CODEC_VERSION,
                 resource_version: rv,
                 uid: None,

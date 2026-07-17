@@ -413,7 +413,7 @@ mod tests {
 
     fn sample_meta() -> CommandMeta {
         CommandMeta {
-            command_id: CommandId::new(),
+            command_id: CommandId("protocol-sample-command".to_string()),
             codec_version: COMMAND_CODEC_VERSION,
             resource_version: 1,
             uid: None,
