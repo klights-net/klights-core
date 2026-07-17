@@ -28,6 +28,7 @@ use crate::datastore::DatastoreBackend;
 use crate::datastore::node_local::SqliteNodeLocalDb;
 use crate::datastore::raft::snapshot::{RaftSnapshotData, SqliteRaftSnapshotBuilder};
 use crate::datastore::raft::types::{NodeId, StorageCommandResult, TypeConfig};
+use klights_cluster_store::PrivilegedCommittedRaftApply;
 
 const META_KEY_LAST_APPLIED: &str = "last_applied";
 const META_KEY_LAST_MEMBERSHIP: &str = "last_membership";
@@ -200,11 +201,45 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                     // byte-identical across the cluster.
                     let commit = crate::log_apply::decode_commit_protobuf(payload.as_slice())
                         .map_err(|e| apply_err(log_id, e))?;
-                    let result = self
-                        .backend
-                        .apply_raft_log_apply_commit(commit)
+                    let port =
+                        crate::datastore::cluster_store_adapter::DatastoreCommittedRaftApply::new(
+                            self.backend.clone(),
+                            super::authority::committed_apply(),
+                        );
+                    let outcome = port
+                        .apply_committed_raft(
+                            klights_cluster_store::CommittedRaftApplyRequest::new(commit),
+                        )
                         .await
-                        .map_err(|e| apply_err(log_id, e))?;
+                        .map_err(|e| apply_err(log_id, e))?
+                        .into_outcome();
+                    let result = match outcome {
+                        klights_cluster_core::CommittedApplyOutcome::Visible {
+                            resource_version,
+                            resource,
+                        } => StorageCommandResult {
+                            applied_rv: Some(resource_version),
+                            error_message: None,
+                            applied_mutation: resource
+                                .map(crate::datastore::raft::types::AppliedMutation::Resource),
+                        },
+                        klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+                            resource_version,
+                            ..
+                        } => StorageCommandResult {
+                            applied_rv: Some(resource_version),
+                            error_message: None,
+                            applied_mutation: None,
+                        },
+                        klights_cluster_core::CommittedApplyOutcome::Rejected(rejection) => {
+                            StorageCommandResult {
+                                applied_rv: None,
+                                error_message: Some(rejection.message().to_string()),
+                                applied_mutation: None,
+                            }
+                        }
+                        _ => return Err(apply_err(log_id, "unsupported committed apply outcome")),
+                    };
                     out.push(result);
                 }
             }
@@ -248,24 +283,15 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
         // authoritative replace primitive, which deletes all replicated
         // tables first, then replays the snapshot commits and restores the
         // leader RV. (finding.md H1 / P0 cluster.db divergence.)
-        self.backend
-            .replace_replicated_resource_state(
-                data.commits,
-                data.current_rv,
-                data.watch_event_high_water,
-                data.watch_replay_floors,
-                Some(crate::datastore::ReplicatedSnapshotMetadata {
-                    cluster_id: String::new(),
-                    leader_epoch: 0,
-                    membership: None,
-                    resource_version_assignment_mode: None,
-                    snapshot_assignment_mode: Some(data.resource_version_assignment_mode),
-                }),
-            )
-            .await
-            .map_err(|e| StorageError::IO {
-                source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
-            })?;
+        crate::datastore::cluster_store_adapter::DatastoreAuthoritativeSnapshotPersistence::new(
+            self.backend.clone(),
+            super::authority::snapshot_install(),
+        )
+        .restore_legacy_raft_snapshot(data)
+        .await
+        .map_err(|e| StorageError::IO {
+            source: StorageIOError::write_state_machine(AnyError::error(e.to_string())),
+        })?;
         if let Some(id) = meta.last_log_id {
             self.write_last_applied(id).await?;
         }

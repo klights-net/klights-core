@@ -99,7 +99,7 @@ pub struct PodCleanupIntent {
 pub struct ReplicatedSnapshotMetadata {
     pub cluster_id: String,
     pub leader_epoch: i64,
-    pub membership: Option<crate::control_plane::client::membership::ClusterMembership>,
+    pub membership: ReplicatedMembershipState,
     /// Snapshot-only mode metadata. `None` preserves callers that restore
     /// cluster identity without carrying the RV-assignment envelope.
     pub resource_version_assignment_mode: Option<crate::log_apply::ResourceVersionAssignment>,
@@ -107,6 +107,25 @@ pub struct ReplicatedSnapshotMetadata {
     /// Older non-Raft callers may continue to use the explicit legacy field.
     pub snapshot_assignment_mode:
         Option<crate::datastore::resource_version_assignment::SnapshotAssignmentMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicatedMembershipState {
+    LegacyOmitted,
+    AuthoritativeAbsent,
+    Present(klights_cluster_core::ClusterMembership),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableAllocatorObservation {
+    pub resource_version_assignment: klights_cluster_core::ResourceVersionAssignment,
+    pub position: klights_cluster_core::WatchReplayPosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterMetadataObservation {
+    pub metadata: klights_cluster_core::ClusterMetadata,
+    pub membership: ReplicatedMembershipState,
 }
 
 /// Per-resource-scope compaction boundary for durable watch replay.
@@ -566,13 +585,14 @@ impl ListPageRequest {
 
         list.continue_token = None;
         list.remaining_item_count = None;
-        if let Some(limit) = self.limit {
-            let limit = limit as usize;
-            if list.items.len() > limit {
-                list.remaining_item_count = Some((list.items.len() - limit) as i64);
-                list.items.truncate(limit);
-                list.continue_token = list.items.last().map(|item| item.name.clone());
-            }
+        if let Some(limit) = self.limit
+            && i64::try_from(list.items.len()).unwrap_or(i64::MAX) > limit
+            && let Ok(limit) = usize::try_from(limit)
+        {
+            list.remaining_item_count =
+                Some(i64::try_from(list.items.len() - limit).unwrap_or(i64::MAX));
+            list.items.truncate(limit);
+            list.continue_token = list.items.last().map(|item| item.name.clone());
         }
         list
     }

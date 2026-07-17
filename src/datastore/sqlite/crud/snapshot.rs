@@ -437,7 +437,10 @@ fn paginate_snapshot(
     let total = filtered.len() as i64;
     let (page, continue_token, remaining_item_count) = match query.limit.filter(|l| *l > 0) {
         Some(limit) if total > limit => {
-            let page: Vec<Resource> = filtered.into_iter().take(limit as usize).collect();
+            let page: Vec<Resource> = filtered
+                .into_iter()
+                .take(usize::try_from(limit).unwrap_or(usize::MAX))
+                .collect();
             let last = page.last().map(|r| r.name.clone());
             (page, last, Some(total - limit))
         }

@@ -1005,6 +1005,13 @@ impl DatastoreBackend for WorkerStoreAdapter {
         self.unsupported("apply_raft_log_apply_commit")
     }
 
+    async fn apply_raft_log_apply_commit_outcome(
+        &self,
+        _commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+        self.unsupported("apply_raft_log_apply_commit_outcome")
+    }
+
     async fn create_resource(
         &self,
         _api_version: &str,
@@ -2110,6 +2117,13 @@ impl crate::datastore::ReplicationStore for WorkerStoreAdapter {
         _commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         self.unsupported("apply_raft_log_apply_commit")
+    }
+
+    async fn apply_raft_log_apply_commit_outcome(
+        &self,
+        _commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+        self.unsupported("apply_raft_log_apply_commit_outcome")
     }
 
     async fn current_log_apply_index(&self) -> Result<i64> {

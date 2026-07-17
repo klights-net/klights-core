@@ -6,6 +6,7 @@ use crate::bootstrap::cluster_meta::{
 use crate::datastore::sqlite::cluster_state_apply::ResourcePreconditionMode;
 use crate::datastore::types::{
     AppliedOutboxRecord, PendingWatchEvent, ReplicatedSnapshotMetadata, Resource,
+    WatchReplayPosition,
 };
 use crate::log_apply::{
     ClusterMutation, LogApplyCommit, LogApplyMutation, OutboxStreamWatermark,
@@ -21,6 +22,53 @@ use crate::log_apply::{LogApplyResourceKey, LogApplyResourcePatch, LogApplyResou
 use anyhow::{Result, anyhow};
 use rusqlite::OptionalExtension;
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct PostCommitPublishPause {
+    pub(crate) reached: std::sync::Arc<tokio::sync::Notify>,
+    pub(crate) published: std::sync::Arc<tokio::sync::Notify>,
+    gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+impl PostCommitPublishPause {
+    pub(crate) fn resume(&self) {
+        let (lock, condition) = &*self.gate;
+        *lock.lock().unwrap() = true;
+        condition.notify_one();
+    }
+}
+
+#[cfg(test)]
+static POST_COMMIT_PUBLISH_PAUSE: std::sync::Mutex<Option<PostCommitPublishPause>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static POST_COMMIT_PUBLISH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) fn install_post_commit_publish_pause() -> PostCommitPublishPause {
+    let pause = PostCommitPublishPause {
+        reached: std::sync::Arc::new(tokio::sync::Notify::new()),
+        published: std::sync::Arc::new(tokio::sync::Notify::new()),
+        gate: std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+    };
+    *POST_COMMIT_PUBLISH_PAUSE.lock().unwrap() = Some(pause.clone());
+    pause
+}
+
+#[cfg(test)]
+fn pause_after_commit_before_publish() -> Option<std::sync::Arc<tokio::sync::Notify>> {
+    let pause = POST_COMMIT_PUBLISH_PAUSE.lock().unwrap().take()?;
+    pause.reached.notify_one();
+    let (lock, condition) = &*pause.gate;
+    let mut resumed = lock.lock().unwrap();
+    while !*resumed {
+        resumed = condition.wait(resumed).unwrap();
+    }
+    Some(pause.published)
+}
+
 impl Datastore {
     /// Replace cluster-replicated Kubernetes resources from a full leader snapshot.
     ///
@@ -35,21 +83,27 @@ impl Datastore {
         watch_replay_floors: Option<Vec<crate::datastore::WatchReplayFloor>>,
         metadata: Option<ReplicatedSnapshotMetadata>,
     ) -> Result<()> {
-        let pending = self
-            .db_call("replace_replicated_resource_state", move |conn| {
-                replace_resource_state_in_conn(
-                    conn,
-                    entries,
-                    current_rv,
-                    watch_event_high_water,
-                    watch_replay_floors,
-                    metadata,
-                )
-            })
-            .await
-            .map_err(|err| anyhow!("failed to replace replicated resource state: {err}"))?;
-
-        self.publish_watch_events(pending);
+        let watch_bus = self.watch_bus.clone();
+        self.db_call("replace_replicated_resource_state", move |conn| {
+            let pending = replace_resource_state_in_conn(
+                conn,
+                entries,
+                current_rv,
+                watch_event_high_water,
+                watch_replay_floors,
+                metadata,
+            )?;
+            #[cfg(test)]
+            let published = pause_after_commit_before_publish();
+            super::watch::publish_pending_batch(pending, &watch_bus);
+            #[cfg(test)]
+            if let Some(published) = published {
+                published.notify_one();
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|err| anyhow!("failed to replace replicated resource state: {err}"))?;
         Ok(())
     }
 }
@@ -171,7 +225,7 @@ fn replace_resource_state_in_conn(
     }
     if let Some(floors) = watch_replay_floors {
         for floor in floors {
-            let position_is_exact = floor.position_is_exact || floor.floor_event_id > 0;
+            let position_is_exact = floor.position_is_exact;
             if floor.floor_resource_version < 0 || (position_is_exact && floor.floor_event_id < 0) {
                 return Err(other_error(
                     "snapshot watch replay floor must be non-negative",
@@ -249,24 +303,33 @@ fn replace_resource_state_in_conn(
                 rusqlite::params![KEY_LEADER_EPOCH, metadata.leader_epoch.to_string()],
             )?;
         }
-        if let Some(membership) = metadata.membership {
-            let voters = serde_json::to_string(&membership.voters)
-                .map_err(|err| other_error(format!("failed to serialize voters: {err}")))?;
-            tx.execute(
-                queries::UPSERT_KLIGHTS_META,
-                rusqlite::params![KEY_RAFT_VOTERS, voters],
-            )?;
-            tx.execute(
-                queries::UPSERT_KLIGHTS_META,
-                rusqlite::params![KEY_RAFT_TERM, membership.term.to_string()],
-            )?;
-            tx.execute(
-                queries::UPSERT_KLIGHTS_META,
-                rusqlite::params![
-                    KEY_RAFT_LEADER_HINT,
-                    membership.leader_hint.unwrap_or_default()
-                ],
-            )?;
+        match metadata.membership {
+            crate::datastore::ReplicatedMembershipState::LegacyOmitted => {}
+            crate::datastore::ReplicatedMembershipState::AuthoritativeAbsent => {
+                tx.execute(
+                    "DELETE FROM _klights_meta WHERE key IN (?1, ?2, ?3)",
+                    rusqlite::params![KEY_RAFT_VOTERS, KEY_RAFT_TERM, KEY_RAFT_LEADER_HINT],
+                )?;
+            }
+            crate::datastore::ReplicatedMembershipState::Present(membership) => {
+                let voters = serde_json::to_string(&membership.voters)
+                    .map_err(|err| other_error(format!("failed to serialize voters: {err}")))?;
+                tx.execute(
+                    queries::UPSERT_KLIGHTS_META,
+                    rusqlite::params![KEY_RAFT_VOTERS, voters],
+                )?;
+                tx.execute(
+                    queries::UPSERT_KLIGHTS_META,
+                    rusqlite::params![KEY_RAFT_TERM, membership.term.to_string()],
+                )?;
+                tx.execute(
+                    queries::UPSERT_KLIGHTS_META,
+                    rusqlite::params![
+                        KEY_RAFT_LEADER_HINT,
+                        membership.leader_hint.unwrap_or_default()
+                    ],
+                )?;
+            }
         }
     }
     tx.commit()?;
@@ -348,24 +411,105 @@ impl Datastore {
         &self,
         commit: LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
-        let outcome = self
+        Ok(self
+            .apply_raft_log_apply_commit_atomically(commit)
+            .await?
+            .result)
+    }
+
+    pub async fn apply_raft_log_apply_commit_outcome(
+        &self,
+        commit: LogApplyCommit,
+    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+        Ok(self
+            .apply_raft_log_apply_commit_atomically(commit)
+            .await?
+            .committed_outcome)
+    }
+
+    async fn apply_raft_log_apply_commit_atomically(
+        &self,
+        commit: LogApplyCommit,
+    ) -> Result<RaftLogApplyCommitted> {
+        let watch_bus = self.watch_bus.clone();
+        let result = self
             .db_call("apply_raft_log_apply_commit", move |conn| {
                 let tx = conn.transaction()?;
                 let outcome = apply_commit_in_tx_for_raft(&tx, commit)?;
                 tx.commit()?;
-                Ok(outcome)
+                #[cfg(test)]
+                let published = pause_after_commit_before_publish();
+                super::watch::publish_pending_batch(outcome.pending, &watch_bus);
+                #[cfg(test)]
+                if let Some(published) = published {
+                    published.notify_one();
+                }
+                Ok(RaftLogApplyCommitted {
+                    result: outcome.result,
+                    committed_outcome: outcome.committed_outcome,
+                })
             })
             .await
             .map_err(|err| anyhow!("failed to apply raft log_apply commit: {err}"))?;
 
-        self.publish_watch_events(outcome.pending);
-        Ok(outcome.result)
+        Ok(result)
     }
 }
 
 pub(crate) struct RaftLogApplyOutcome {
     pub result: crate::datastore::raft::types::StorageCommandResult,
+    pub committed_outcome: klights_cluster_core::CommittedApplyOutcome,
     pub pending: Vec<PendingWatchEvent>,
+}
+
+struct RaftLogApplyCommitted {
+    result: crate::datastore::raft::types::StorageCommandResult,
+    committed_outcome: klights_cluster_core::CommittedApplyOutcome,
+}
+
+impl RaftLogApplyOutcome {
+    fn try_new(
+        committed_outcome: klights_cluster_core::CommittedApplyOutcome,
+        pending: Vec<PendingWatchEvent>,
+    ) -> tokio_rusqlite::Result<Self> {
+        let result = match &committed_outcome {
+            klights_cluster_core::CommittedApplyOutcome::Visible {
+                resource_version,
+                resource,
+            } => crate::datastore::raft::types::StorageCommandResult {
+                applied_rv: Some(*resource_version),
+                error_message: None,
+                applied_mutation: resource
+                    .clone()
+                    .map(crate::datastore::raft::types::AppliedMutation::Resource),
+            },
+            klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+                resource_version,
+                ..
+            } => crate::datastore::raft::types::StorageCommandResult {
+                applied_rv: Some(*resource_version),
+                error_message: None,
+                applied_mutation: None,
+            },
+            klights_cluster_core::CommittedApplyOutcome::Rejected(rejection) => {
+                crate::datastore::raft::types::StorageCommandResult {
+                    applied_rv: None,
+                    error_message: Some(rejection.message().to_string()),
+                    applied_mutation: None,
+                }
+            }
+            _ => {
+                return Err(other_error(
+                    "unsupported canonical committed-apply outcome variant",
+                ));
+            }
+        };
+        Ok(Self {
+            result,
+            committed_outcome,
+            pending,
+        })
+    }
 }
 
 pub(crate) fn apply_commit_in_tx_for_raft(
@@ -374,6 +518,11 @@ pub(crate) fn apply_commit_in_tx_for_raft(
 ) -> tokio_rusqlite::Result<RaftLogApplyOutcome> {
     let reserved_rv = commit.resource_version;
     validate_live_raft_resource_version_assignment(tx, &commit)?;
+    let before_position = WatchReplayPosition {
+        resource_version: Datastore::current_resource_version_in_tx(tx)?,
+        event_id: Datastore::watch_event_allocator_high_water_in_conn(tx)?,
+        resource_version_filter_through_event_id: 0,
+    };
     let outbox_template = commit.mutations.iter().find_map(|mutation| match mutation {
         LogApplyMutation::PutAppliedOutbox(row) => Some(row.clone()),
         _ => None,
@@ -382,10 +531,13 @@ pub(crate) fn apply_commit_in_tx_for_raft(
         && let Some(existing) = applied_outbox_record_in_tx(tx, &template.idempotency_key)?
         && !is_uncommitted_outbox_placeholder(&existing)
     {
-        return Ok(RaftLogApplyOutcome {
-            result: storage_result_from_applied_outbox(&existing)?,
-            pending: Vec::new(),
-        });
+        let result = storage_result_from_applied_outbox(&existing)?;
+        let outcome = committed_outcome_from_storage_result(
+            result,
+            false,
+            klights_cluster_core::NoPublicChangeReason::DuplicateIdempotencyKey,
+        )?;
+        return RaftLogApplyOutcome::try_new(outcome, Vec::new());
     }
 
     // A duplicate watermark has already been applied. Do not allocate a V1
@@ -396,14 +548,13 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             klights_cluster_core::OutboxWatermarkDecision::Duplicate
         )
     {
-        return Ok(RaftLogApplyOutcome {
-            result: crate::datastore::raft::types::StorageCommandResult {
-                applied_rv: Some(Datastore::current_resource_version_in_tx(tx)?),
-                error_message: None,
-                applied_mutation: None,
+        return RaftLogApplyOutcome::try_new(
+            klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+                resource_version: Datastore::current_resource_version_in_tx(tx)?,
+                reason: klights_cluster_core::NoPublicChangeReason::DuplicateWatermark,
             },
-            pending: Vec::new(),
-        });
+            Vec::new(),
+        );
     }
 
     let resource_precondition_mode = match commit.resource_version_assignment {
@@ -437,14 +588,26 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                 true,
                 resource_precondition_mode,
             )?;
-            return Ok(RaftLogApplyOutcome {
-                result: crate::datastore::raft::types::StorageCommandResult {
-                    applied_rv: Some(applied_rv),
-                    error_message: None,
-                    applied_mutation: None,
+            let reason = match last_applied_stamp.cmp(&Some(incoming_stamp)) {
+                std::cmp::Ordering::Greater => {
+                    klights_cluster_core::NoPublicChangeReason::StaleStatusStamp
+                }
+                std::cmp::Ordering::Equal => {
+                    klights_cluster_core::NoPublicChangeReason::EqualStatusStamp
+                }
+                std::cmp::Ordering::Less => {
+                    return Err(other_error(
+                        "status-stamp decision recorded ledger-only for a newer stamp",
+                    ));
+                }
+            };
+            return RaftLogApplyOutcome::try_new(
+                klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+                    resource_version: applied_rv,
+                    reason,
                 },
                 pending,
-            });
+            );
         }
     }
 
@@ -452,19 +615,34 @@ pub(crate) fn apply_commit_in_tx_for_raft(
     match apply_commit_in_tx_returning_rv_and_mutation(tx, commit, resource_precondition_mode) {
         Ok((rv, pending, applied_mutation)) => {
             tx.execute("RELEASE raft_apply_attempt", [])?;
-            Ok(RaftLogApplyOutcome {
-                result: crate::datastore::raft::types::StorageCommandResult {
-                    applied_rv: Some(rv),
-                    error_message: None,
-                    applied_mutation,
-                },
-                pending,
-            })
+            let after_position = WatchReplayPosition {
+                resource_version: Datastore::current_resource_version_in_tx(tx)?,
+                event_id: Datastore::watch_event_allocator_high_water_in_conn(tx)?,
+                resource_version_filter_through_event_id: 0,
+            };
+            let visible_change = after_position.resource_version > before_position.resource_version
+                || after_position.event_id > before_position.event_id;
+            let resource = applied_mutation.map(|mutation| match mutation {
+                crate::datastore::raft::types::AppliedMutation::Resource(resource) => resource,
+            });
+            let outcome = if visible_change || resource.is_some() {
+                klights_cluster_core::CommittedApplyOutcome::Visible {
+                    resource_version: rv,
+                    resource,
+                }
+            } else {
+                klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+                    resource_version: rv,
+                    reason: klights_cluster_core::NoPublicChangeReason::LedgerOnly,
+                }
+            };
+            RaftLogApplyOutcome::try_new(outcome, pending)
         }
         Err(err) if is_terminal_apply_conflict(&err) => {
             tx.execute("ROLLBACK TO raft_apply_attempt", [])?;
             tx.execute("RELEASE raft_apply_attempt", [])?;
             let message = err.to_string();
+            let rejection = committed_rejection_from_conflict(&err, message.clone())?;
             rollback_uncommitted_metadata_rv_if_current_tx(tx, reserved_rv)?;
             if let Some(mut row) = outbox_template {
                 row.applied_rv = None;
@@ -478,20 +656,91 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                     .outbox_mut()
                     .put_applied_outbox(row)?;
             }
-            Ok(RaftLogApplyOutcome {
-                result: crate::datastore::raft::types::StorageCommandResult {
-                    applied_rv: None,
-                    error_message: Some(message),
-                    applied_mutation: None,
-                },
-                pending: Vec::new(),
-            })
+            RaftLogApplyOutcome::try_new(
+                klights_cluster_core::CommittedApplyOutcome::Rejected(rejection),
+                Vec::new(),
+            )
         }
         Err(err) => {
             tx.execute("ROLLBACK TO raft_apply_attempt", [])?;
             tx.execute("RELEASE raft_apply_attempt", [])?;
             Err(err)
         }
+    }
+}
+
+fn committed_outcome_from_storage_result(
+    result: crate::datastore::raft::types::StorageCommandResult,
+    visible_change: bool,
+    no_change_reason: klights_cluster_core::NoPublicChangeReason,
+) -> tokio_rusqlite::Result<klights_cluster_core::CommittedApplyOutcome> {
+    if let Some(message) = result.error_message {
+        return Ok(klights_cluster_core::CommittedApplyOutcome::Rejected(
+            committed_rejection_from_message(message),
+        ));
+    }
+    let resource = result.applied_mutation.map(|mutation| match mutation {
+        crate::datastore::raft::types::AppliedMutation::Resource(resource) => resource,
+    });
+    let resource_version = result.applied_rv.ok_or_else(|| {
+        other_error("committed apply returned neither a public resourceVersion nor a rejection")
+    })?;
+    if visible_change || resource.is_some() {
+        Ok(klights_cluster_core::CommittedApplyOutcome::Visible {
+            resource_version,
+            resource,
+        })
+    } else {
+        Ok(
+            klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+                resource_version,
+                reason: no_change_reason,
+            },
+        )
+    }
+}
+
+fn committed_rejection_from_conflict(
+    error: &tokio_rusqlite::Error,
+    message: String,
+) -> tokio_rusqlite::Result<klights_cluster_core::CommittedApplyRejection> {
+    let tokio_rusqlite::Error::Other(inner) = error else {
+        return Err(other_error(
+            "terminal committed-apply rejection had no typed conflict",
+        ));
+    };
+    let conflict = inner
+        .downcast_ref::<ApplyConflictError>()
+        .ok_or_else(|| other_error("terminal committed-apply rejection had no typed conflict"))?;
+    Ok(match conflict.code {
+        ApplyConflictCode::NotFound => {
+            klights_cluster_core::CommittedApplyRejection::NotFound { message }
+        }
+        ApplyConflictCode::AlreadyExists => {
+            klights_cluster_core::CommittedApplyRejection::AlreadyExists { message }
+        }
+        ApplyConflictCode::UidPrecondition => {
+            klights_cluster_core::CommittedApplyRejection::UidConflict { message }
+        }
+        ApplyConflictCode::ResourceVersionPrecondition => {
+            klights_cluster_core::CommittedApplyRejection::ResourceVersionConflict { message }
+        }
+    })
+}
+
+fn committed_rejection_from_message(
+    message: String,
+) -> klights_cluster_core::CommittedApplyRejection {
+    if message.contains("resourceVersion") {
+        klights_cluster_core::CommittedApplyRejection::ResourceVersionConflict { message }
+    } else if message.contains("UID") || message.contains("uid") {
+        klights_cluster_core::CommittedApplyRejection::UidConflict { message }
+    } else if message.contains("already exists") {
+        klights_cluster_core::CommittedApplyRejection::AlreadyExists { message }
+    } else if message.contains("not found") {
+        klights_cluster_core::CommittedApplyRejection::NotFound { message }
+    } else {
+        klights_cluster_core::CommittedApplyRejection::InvalidCommit { message }
     }
 }
 
@@ -1184,7 +1433,7 @@ mod tests {
             Some(ReplicatedSnapshotMetadata {
                 cluster_id: String::new(),
                 leader_epoch: 0,
-                membership: None,
+                membership: crate::datastore::ReplicatedMembershipState::LegacyOmitted,
                 resource_version_assignment_mode: Some(ResourceVersionAssignment::CommittedApplyV1),
                 snapshot_assignment_mode: None,
             }),
@@ -1254,7 +1503,7 @@ mod tests {
                 Some(ReplicatedSnapshotMetadata {
                     cluster_id: String::new(),
                     leader_epoch: 0,
-                    membership: None,
+                    membership: crate::datastore::ReplicatedMembershipState::LegacyOmitted,
                     resource_version_assignment_mode: None,
                     snapshot_assignment_mode: Some(
                         crate::datastore::resource_version_assignment::SnapshotAssignmentMode::AbsentLegacySnapshot,
@@ -1338,7 +1587,7 @@ mod tests {
                 Some(ReplicatedSnapshotMetadata {
                     cluster_id: String::new(),
                     leader_epoch: 0,
-                    membership: None,
+                    membership: crate::datastore::ReplicatedMembershipState::LegacyOmitted,
                     resource_version_assignment_mode: Some(
                         ResourceVersionAssignment::LegacyLeaderAssigned,
                     ),
@@ -4510,5 +4759,144 @@ mod tests {
             row_json.data, row_proto.data,
             "JSON and protobuf paths must produce identical data"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_after_commit_still_publishes_and_retry_recovers_receipt() {
+        let _serial = POST_COMMIT_PUBLISH_TEST_LOCK.lock().await;
+        let db = crate::datastore::test_support::in_memory().await;
+        enable_committed_apply_v1(&db).await;
+        let mut watch =
+            db.subscribe_watch_signals(crate::watch::WatchTopic::new("v1", "ConfigMap"));
+        let key = "cancel-after-commit";
+        let commit = committed_apply_v1(LogApplyCommit::new(
+            0,
+            vec![
+                v1_resource("cancelled-apply", "cancelled-uid"),
+                LogApplyMutation::PutAppliedOutbox(LogApplyAppliedOutboxRow {
+                    idempotency_key: key.to_string(),
+                    subject_key: "v1/ConfigMap/default/cancelled-apply/cancelled-uid".to_string(),
+                    operation: "Create".to_string(),
+                    first_seen_ms: 1,
+                    applied_rv: None,
+                    result_proto: crate::datastore::command::encode_response_protobuf(
+                        &crate::datastore::command::StorageResponse::Ack {
+                            resource_version: 0,
+                        },
+                    )
+                    .unwrap(),
+                    status_stamp: None,
+                }),
+            ],
+        ));
+        let pause = install_post_commit_publish_pause();
+        let task_db = db.clone();
+        let task_commit = commit.clone();
+        let task =
+            tokio::spawn(async move { task_db.apply_raft_log_apply_commit(task_commit).await });
+        pause.reached.notified().await;
+        task.abort();
+        pause.resume();
+        pause.published.notified().await;
+
+        let stored = db
+            .get_resource("v1", "ConfigMap", Some("default"), "cancelled-apply")
+            .await
+            .unwrap()
+            .expect("commit survived caller cancellation");
+        let committed_position = db.current_watch_replay_position().await.unwrap();
+        assert!(
+            watch
+                .recv()
+                .await
+                .unwrap()
+                .advances
+                .iter()
+                .any(|advance| advance.high_rv == stored.resource_version)
+        );
+
+        let receipt = db.apply_raft_log_apply_commit(commit).await.unwrap();
+        assert_eq!(receipt.applied_rv, Some(stored.resource_version));
+        assert!(receipt.error_message.is_none());
+        assert_eq!(
+            db.current_watch_replay_position().await.unwrap(),
+            committed_position
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_snapshot_restore_after_commit_still_publishes_and_is_retryable() {
+        let _serial = POST_COMMIT_PUBLISH_TEST_LOCK.lock().await;
+        let db = crate::datastore::test_support::in_memory().await;
+        let mut watch =
+            db.subscribe_watch_signals(crate::watch::WatchTopic::new("v1", "ConfigMap"));
+        let restored = serde_json::json!({
+            "metadata": {
+                "name": "restored-after-cancel",
+                "namespace": "default",
+                "uid": "restore-uid",
+                "resourceVersion": "5"
+            }
+        });
+        let commit = LogApplyCommit::new(
+            5,
+            vec![
+                LogApplyMutation::PutResource(LogApplyResourceRow {
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "restored-after-cancel".into(),
+                    uid: "restore-uid".into(),
+                    resource_version: 5,
+                    data: restored.clone(),
+                    require_absent: true,
+                    require_existing: false,
+                    precondition_uid: None,
+                    precondition_resource_version: None,
+                    status_only: false,
+                }),
+                LogApplyMutation::PutWatchEvent(LogApplyWatchEventRow {
+                    event_id: Some(1),
+                    api_version: "v1".into(),
+                    kind: "ConfigMap".into(),
+                    namespace: Some("default".into()),
+                    name: "restored-after-cancel".into(),
+                    resource_version: 5,
+                    event_type: "ADDED".into(),
+                    data: restored,
+                }),
+            ],
+        );
+        let pause = install_post_commit_publish_pause();
+        let task_db = db.clone();
+        let task_commit = commit.clone();
+        let task = tokio::spawn(async move {
+            task_db
+                .replace_replicated_resource_state(vec![task_commit], 5, None, None, None)
+                .await
+        });
+        pause.reached.notified().await;
+        task.abort();
+        pause.resume();
+        pause.published.notified().await;
+        assert!(
+            watch
+                .recv()
+                .await
+                .unwrap()
+                .advances
+                .iter()
+                .any(|advance| advance.high_rv == 5)
+        );
+        assert!(
+            db.get_resource("v1", "ConfigMap", Some("default"), "restored-after-cancel")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        db.replace_replicated_resource_state(vec![commit], 5, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(db.get_current_resource_version().await.unwrap(), 5);
     }
 }

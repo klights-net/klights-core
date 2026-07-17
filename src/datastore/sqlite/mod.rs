@@ -58,14 +58,14 @@ pub use super::backend::{
     DatastoreBackend, DatastoreHandle, NamespaceStore, NetworkStore, ResourceStore, WatchStore,
 };
 pub use super::types::{
-    AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PatchKind,
-    PendingWatchEvent, PodCleanupIntent, PodEndpointEvent, PodEndpointMode, PodEndpointRow,
-    PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodSlotAdmissionState,
-    PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplay, PositionedWatchReplayRead,
-    RawWatchEvent, ReplicatedCreateOptions, ReplicatedSnapshotMetadata, Resource,
-    ResourceBatchOperation, ResourceList, ResourceListQuery, ResourcePatchRequest,
-    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayPosition, WatchTarget,
-    WatchTargetScope,
+    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
+    ListPageRequest, NodeSubnet, PatchKind, PendingWatchEvent, PodCleanupIntent, PodEndpointEvent,
+    PodEndpointMode, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
+    PodSlotAdmissionResult, PodSlotAdmissionState, PodWorkqueueEntry, PodWorkqueueKind,
+    PositionedWatchReplay, PositionedWatchReplayRead, RawWatchEvent, ReplicatedCreateOptions,
+    ReplicatedMembershipState, ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation,
+    ResourceList, ResourceListQuery, ResourcePatchRequest, ResourcePreconditions, SandboxRef,
+    SnapshotAtRv, WatchReplayPosition, WatchTarget, WatchTargetScope,
 };
 
 pub use executor::DbExecutor;
@@ -110,6 +110,8 @@ pub struct Datastore {
     pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
     pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
     snapshot_fence: std::sync::Arc<tokio::sync::RwLock<()>>,
+    #[cfg(test)]
+    fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct AtomicOutboxMutation {
@@ -2964,6 +2966,10 @@ impl Datastore {
             pod_endpoint_tx,
             pod_slot_admission_tx,
             snapshot_fence: std::sync::Arc::new(tokio::sync::RwLock::new(())),
+            #[cfg(test)]
+            fail_next_watch_position_observation: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
         };
         ds.gc_stale_applied_outbox_placeholders(
             std::time::SystemTime::now()
@@ -3120,6 +3126,124 @@ impl Datastore {
 
 #[async_trait]
 impl DatastoreBackend for Datastore {
+    async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
+        self.read_db_call("read_durable_allocator_observation", |conn| {
+            let raw_rv: String = conn.query_row("SELECT value FROM metadata WHERE key = 'resource_version'", [], |row| row.get(0))?;
+            let resource_version = raw_rv.parse::<i64>().map_err(|_| crate::datastore::sqlite::cluster_replace::other_error(format!("invalid resource_version metadata {raw_rv:?}")))?;
+            let event_id = Datastore::watch_event_allocator_high_water_in_conn(conn)?;
+            if resource_version < 0 || event_id < 0 {
+                return Err(crate::datastore::sqlite::cluster_replace::other_error("allocator values must be non-negative"));
+            }
+            let raw_mode = conn.query_row(
+                queries::META_SELECT,
+                [crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE],
+                |row| row.get::<_, String>(0),
+            ).optional()?;
+            let resource_version_assignment = raw_mode
+                .map(|raw| crate::datastore::resource_version_assignment::parse_resource_version_assignment_mode(&raw)
+                    .map_err(|error| crate::datastore::sqlite::cluster_replace::other_error(error.to_string())))
+                .transpose()?
+                .unwrap_or(crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned);
+            Ok(DurableAllocatorObservation {
+                resource_version_assignment,
+                position: WatchReplayPosition { resource_version, event_id, resource_version_filter_through_event_id: 0 },
+            })
+        }).await.map_err(|error| anyhow!("atomic allocator observation failed: {error}"))
+    }
+
+    async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
+        self.read_db_call("read_cluster_metadata_observation", |conn| {
+            let get = |key: &str| -> rusqlite::Result<Option<String>> {
+                conn.query_row(queries::META_SELECT, [key], |row| row.get(0))
+                    .optional()
+            };
+            let cluster_id = get(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)?
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    crate::datastore::sqlite::cluster_replace::other_error(
+                        "cluster_id is missing or empty",
+                    )
+                })?;
+            let raw_epoch =
+                get(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH)?.ok_or_else(|| {
+                    crate::datastore::sqlite::cluster_replace::other_error(
+                        "leader_epoch is missing",
+                    )
+                })?;
+            let leader_epoch = raw_epoch.parse::<i64>().map_err(|_| {
+                crate::datastore::sqlite::cluster_replace::other_error(format!(
+                    "invalid leader_epoch {raw_epoch:?}"
+                ))
+            })?;
+            let raw_rv: String = conn.query_row(
+                "SELECT value FROM metadata WHERE key = 'resource_version'",
+                [],
+                |row| row.get(0),
+            )?;
+            let current_rv = raw_rv.parse::<i64>().map_err(|_| {
+                crate::datastore::sqlite::cluster_replace::other_error(format!(
+                    "invalid resource_version metadata {raw_rv:?}"
+                ))
+            })?;
+            if leader_epoch < 0 || current_rv < 0 {
+                return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                    "cluster metadata numeric values must be non-negative",
+                ));
+            }
+            let raw_voters = get(crate::bootstrap::cluster_meta::KEY_RAFT_VOTERS)?;
+            let raw_term = get(crate::bootstrap::cluster_meta::KEY_RAFT_TERM)?;
+            let raw_hint = get(crate::bootstrap::cluster_meta::KEY_RAFT_LEADER_HINT)?;
+            let membership = match (raw_voters, raw_term, raw_hint) {
+                (None, None, None) => ReplicatedMembershipState::AuthoritativeAbsent,
+                (Some(raw_voters), Some(raw_term), Some(raw_hint)) => {
+                    let voters: Vec<String> =
+                        serde_json::from_str(&raw_voters).map_err(|error| {
+                            crate::datastore::sqlite::cluster_replace::other_error(format!(
+                                "invalid voters metadata: {error}"
+                            ))
+                        })?;
+                    let term = raw_term.parse::<i64>().map_err(|_| {
+                        crate::datastore::sqlite::cluster_replace::other_error(format!(
+                            "invalid raft term {raw_term:?}"
+                        ))
+                    })?;
+                    let mut unique = std::collections::HashSet::with_capacity(voters.len());
+                    if term < 0
+                        || voters.is_empty()
+                        || voters
+                            .iter()
+                            .any(|voter| voter.is_empty() || !unique.insert(voter.as_str()))
+                    {
+                        return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                            "membership contains an invalid term or voter set",
+                        ));
+                    }
+                    ReplicatedMembershipState::Present(klights_cluster_core::ClusterMembership {
+                        cluster_id: cluster_id.clone(),
+                        voters,
+                        term,
+                        leader_hint: (!raw_hint.is_empty()).then_some(raw_hint),
+                    })
+                }
+                _ => {
+                    return Err(crate::datastore::sqlite::cluster_replace::other_error(
+                        "membership metadata is incomplete",
+                    ));
+                }
+            };
+            Ok(ClusterMetadataObservation {
+                metadata: klights_cluster_core::ClusterMetadata {
+                    cluster_id,
+                    leader_epoch,
+                    current_rv,
+                },
+                membership,
+            })
+        })
+        .await
+        .map_err(|error| anyhow!("atomic cluster metadata observation failed: {error}"))
+    }
+
     async fn acquire_snapshot_exclusive_fence(
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
@@ -3192,6 +3316,13 @@ impl DatastoreBackend for Datastore {
         commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         Datastore::apply_raft_log_apply_commit(self, commit).await
+    }
+
+    async fn apply_raft_log_apply_commit_outcome(
+        &self,
+        commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+        Datastore::apply_raft_log_apply_commit_outcome(self, commit).await
     }
 
     async fn create_resource(

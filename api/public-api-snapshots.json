@@ -3,11 +3,11 @@
   "schema": 2,
   "packages": {
     "klights": {
-      "count": 46140,
-      "sha256": "aabc7b2435e9534b76ff8edf02df16e52ea0686906d5cf643b4504c1dde5b58b",
+      "count": 46372,
+      "sha256": "32e788cb76baa2883f2a8c155a15639e8cdee0853af5a782bc938d634aa9dedf",
       "source": {
-        "count": 489340,
-        "sha256": "4b1acf9f2156bb7eb6ddbcf37667327b4ea7be558b2329f508c12e87675fe306"
+        "count": 493179,
+        "sha256": "4dcbbae928ea70a3350d4b601ced4464896ee1a2f1471511b58c452c441b70fa"
       }
     },
     "klights-apiserver": {
@@ -27,11 +27,11 @@
       }
     },
     "klights-cluster-core": {
-      "count": 2898,
-      "sha256": "343744aa50c73a809c176b1d63e4f1ffd1d7714f1a2eb9e0002042b0de967bd8",
+      "count": 3024,
+      "sha256": "1f1e7ea91c41b928589f7e0d93641659884ac4fa3a331cd68b301641de857a9b",
       "source": {
-        "count": 5267,
-        "sha256": "ce1f4cfa4f23e481605f34b27ffc3770cd65b4677c9d1287b435b6519c5cbf81"
+        "count": 5314,
+        "sha256": "23f8e0f9d8d29eaa2ccd28dbe926b4f095172d506eca7f766fe336f3783fe1cc"
       }
     },
     "klights-cluster-datastore": {
@@ -43,11 +43,11 @@
       }
     },
     "klights-cluster-store": {
-      "count": 0,
-      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "count": 1675,
+      "sha256": "a1d5131e45314e6d899a56a8918cdb831a01b89d9552b7b444167a74edcde395",
       "source": {
-        "count": 0,
-        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        "count": 2851,
+        "sha256": "ca8abf6a64038ee1d1f57529cd442ae87a6d6aa7a3b7563d31bf7b9b921cfe39"
       }
     },
     "klights-controllers": {

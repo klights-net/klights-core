@@ -2025,6 +2025,7 @@ dependencies = [
  "k8s-openapi",
  "k8s-pb",
  "klights-cluster-core",
+ "klights-cluster-store",
  "klights-internal-protobuf",
  "klights-types",
  "kube",
@@ -2119,6 +2120,10 @@ version = "0.0.0"
 [[package]]
 name = "klights-cluster-store"
 version = "0.0.0"
+dependencies = [
+ "klights-cluster-core",
+ "klights-types",
+]
 
 [[package]]
 name = "klights-controllers"

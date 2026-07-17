@@ -21,11 +21,12 @@ pub use command::{
     COMMAND_CODEC_VERSION, CommandError, CommandId, CommandMeta, StorageCommand, StorageResponse,
 };
 pub use log_apply::{
-    ClusterMetaMutation, ClusterMutation, InvalidOutboxStreamSequence, LogApplyAppliedOutboxRow,
-    LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
-    LogApplyNodeSubnetAllocation, LogApplyNodeSubnetRow, LogApplyPodCleanupIntentKey,
-    LogApplyPodCleanupIntentRow, LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow,
-    LogApplyWatchEventRow, NamespaceMutation, NetworkMutation, OutboxLedgerMutation,
+    ClusterMetaMutation, ClusterMutation, CommittedApplyOutcome, CommittedApplyRejection,
+    InvalidOutboxStreamSequence, LogApplyAppliedOutboxRow, LogApplyCommit, LogApplyMutation,
+    LogApplyNamespaceRow, LogApplyNodeDataplaneRow, LogApplyNodeSubnetAllocation,
+    LogApplyNodeSubnetRow, LogApplyPodCleanupIntentKey, LogApplyPodCleanupIntentRow,
+    LogApplyResourceKey, LogApplyResourcePatch, LogApplyResourceRow, LogApplyWatchEventRow,
+    NamespaceMutation, NetworkMutation, NoPublicChangeReason, OutboxLedgerMutation,
     OutboxStreamWatermark, OutboxWatermarkDecision, PodCleanupMutation, ResourceMutation,
     ResourceVersionAssignment, ResourceVersionAssignmentError, UnsupportedClusterMutationVersion,
     VersionedClusterMutation, WatchHistoryMutation, commit_with_outbox_rows_only,

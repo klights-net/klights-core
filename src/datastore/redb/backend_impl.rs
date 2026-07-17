@@ -25,6 +25,110 @@ use super::RedbDatastore;
 
 #[async_trait]
 impl DatastoreBackend for RedbDatastore {
+    async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
+        self.accessor.call("redb_atomic_allocator_observation", |db| {
+            let read = db.begin_read()?;
+            let meta = read.open_table(tables::META)?;
+            let parse_meta = |key: &str| -> Result<i64> {
+                match meta.get(key)? {
+                    None => Ok(0),
+                    Some(value) => {
+                        let raw = std::str::from_utf8(value.value()).map_err(|error| anyhow!("invalid UTF-8 {key} metadata: {error}"))?;
+                        raw.parse::<i64>().map_err(|_| anyhow!("invalid numeric {key} metadata {raw:?}"))
+                    }
+                }
+            };
+            let resource_version = parse_meta("rv")?;
+            let event_id = parse_meta("watch_event_id")?;
+            if resource_version < 0 || event_id < 0 { return Err(anyhow!("allocator values must be non-negative")); }
+            let klights = read.open_table(tables::KLIGHTS_META)?;
+            let assignment = match klights.get(crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE)? {
+                None => crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+                Some(value) => crate::datastore::resource_version_assignment::parse_resource_version_assignment_mode(value.value())?,
+            };
+            Ok(DurableAllocatorObservation {
+                resource_version_assignment: assignment,
+                position: WatchReplayPosition { resource_version, event_id, resource_version_filter_through_event_id: 0 },
+            })
+        }).await
+    }
+
+    async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
+        self.accessor
+            .call("redb_atomic_cluster_metadata_observation", |db| {
+                let read = db.begin_read()?;
+                let klights = read.open_table(tables::KLIGHTS_META)?;
+                let get = |key: &str| -> Result<Option<String>> {
+                    Ok(klights.get(key)?.map(|value| value.value().to_string()))
+                };
+                let cluster_id = get(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)?
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow!("cluster_id is missing or empty"))?;
+                let raw_epoch = get(crate::bootstrap::cluster_meta::KEY_LEADER_EPOCH)?
+                    .ok_or_else(|| anyhow!("leader_epoch is missing"))?;
+                let leader_epoch = raw_epoch
+                    .parse::<i64>()
+                    .map_err(|_| anyhow!("invalid leader_epoch {raw_epoch:?}"))?;
+                let meta = read.open_table(tables::META)?;
+                let current_rv = match meta.get("rv")? {
+                    None => 0,
+                    Some(value) => {
+                        let raw = std::str::from_utf8(value.value())
+                            .map_err(|error| anyhow!("invalid resource_version UTF-8: {error}"))?;
+                        raw.parse::<i64>()
+                            .map_err(|_| anyhow!("invalid resource_version {raw:?}"))?
+                    }
+                };
+                if leader_epoch < 0 || current_rv < 0 {
+                    return Err(anyhow!(
+                        "cluster metadata numeric values must be non-negative"
+                    ));
+                }
+                let membership = match (
+                    get(crate::bootstrap::cluster_meta::KEY_RAFT_VOTERS)?,
+                    get(crate::bootstrap::cluster_meta::KEY_RAFT_TERM)?,
+                    get(crate::bootstrap::cluster_meta::KEY_RAFT_LEADER_HINT)?,
+                ) {
+                    (None, None, None) => ReplicatedMembershipState::AuthoritativeAbsent,
+                    (Some(raw_voters), Some(raw_term), Some(raw_hint)) => {
+                        let voters: Vec<String> = serde_json::from_str(&raw_voters)?;
+                        let term = raw_term
+                            .parse::<i64>()
+                            .map_err(|_| anyhow!("invalid raft term {raw_term:?}"))?;
+                        let mut unique = std::collections::HashSet::with_capacity(voters.len());
+                        if term < 0
+                            || voters.is_empty()
+                            || voters
+                                .iter()
+                                .any(|voter| voter.is_empty() || !unique.insert(voter.as_str()))
+                        {
+                            return Err(anyhow!(
+                                "membership contains an invalid term or voter set"
+                            ));
+                        }
+                        ReplicatedMembershipState::Present(
+                            klights_cluster_core::ClusterMembership {
+                                cluster_id: cluster_id.clone(),
+                                voters,
+                                term,
+                                leader_hint: (!raw_hint.is_empty()).then_some(raw_hint),
+                            },
+                        )
+                    }
+                    _ => return Err(anyhow!("membership metadata is incomplete")),
+                };
+                Ok(ClusterMetadataObservation {
+                    metadata: klights_cluster_core::ClusterMetadata {
+                        cluster_id,
+                        leader_epoch,
+                        current_rv,
+                    },
+                    membership,
+                })
+            })
+            .await
+    }
+
     fn close(&self) {
         self.accessor.close();
     }
@@ -1711,6 +1815,13 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
     }
 
+    async fn apply_raft_log_apply_commit_outcome(
+        &self,
+        commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+        crate::datastore::DatastoreBackend::apply_raft_log_apply_commit_outcome(self, commit).await
+    }
+
     async fn current_log_apply_index(&self) -> Result<i64> {
         crate::datastore::DatastoreBackend::current_log_apply_index(self).await
     }
@@ -1735,6 +1846,21 @@ impl crate::datastore::ReplicationStore for RedbDatastore {
             options,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl crate::datastore::DurableRecoveryStore for RedbDatastore {
+    async fn read_durable_allocator_observation(
+        &self,
+    ) -> Result<crate::datastore::DurableAllocatorObservation> {
+        crate::datastore::DatastoreBackend::read_durable_allocator_observation(self).await
+    }
+
+    async fn read_cluster_metadata_observation(
+        &self,
+    ) -> Result<crate::datastore::ClusterMetadataObservation> {
+        crate::datastore::DatastoreBackend::read_cluster_metadata_observation(self).await
     }
 }
 

@@ -336,6 +336,15 @@ impl Datastore {
     }
 
     pub async fn current_watch_replay_position(&self) -> Result<WatchReplayPosition> {
+        #[cfg(test)]
+        if self
+            .fail_next_watch_position_observation
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow::anyhow!(
+                "injected watch-position observation failure"
+            ));
+        }
         self.read_db_call("current_watch_replay_position", |conn| {
             let resource_version = Self::current_resource_version_in_conn(conn)?;
             let event_id = Self::watch_event_allocator_high_water_in_conn(conn)?;
@@ -347,6 +356,12 @@ impl Datastore {
         })
         .await
         .map_err(|err| anyhow::anyhow!("Failed to read watch replay position: {err}"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_watch_position_observation(&self) {
+        self.fail_next_watch_position_observation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub async fn list_raw_watch_events_since_checked_bounded(

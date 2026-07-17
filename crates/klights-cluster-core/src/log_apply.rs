@@ -11,6 +11,55 @@ use serde::{Deserialize, Serialize};
 
 use crate::{PatchKind, Resource};
 
+/// Canonical state-machine result for a committed logical delta. The enum
+/// prevents a terminal rejection from simultaneously claiming a visible
+/// mutation or a no-op from manufacturing a new public resourceVersion.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub enum CommittedApplyOutcome {
+    Visible {
+        resource_version: i64,
+        resource: Option<Resource>,
+    },
+    NoPublicChange {
+        resource_version: i64,
+        reason: NoPublicChangeReason,
+    },
+    Rejected(CommittedApplyRejection),
+}
+
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoPublicChangeReason {
+    DuplicateIdempotencyKey,
+    DuplicateWatermark,
+    StaleStatusStamp,
+    EqualStatusStamp,
+    LedgerOnly,
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommittedApplyRejection {
+    NotFound { message: String },
+    AlreadyExists { message: String },
+    UidConflict { message: String },
+    ResourceVersionConflict { message: String },
+    InvalidCommit { message: String },
+}
+
+impl CommittedApplyRejection {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::NotFound { message }
+            | Self::AlreadyExists { message }
+            | Self::UidConflict { message }
+            | Self::ResourceVersionConflict { message }
+            | Self::InvalidCommit { message } => message,
+        }
+    }
+}
+
 /// One logical cluster-state commit in legacy or committed-apply form.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogApplyCommit {

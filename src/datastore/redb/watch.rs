@@ -192,7 +192,7 @@ impl RedbWatchStore {
             } else {
                 position.event_id.saturating_add(1).max(0) as u64
             };
-            let mut events = Vec::with_capacity(limit.get());
+            let mut events = Vec::with_capacity(limit.get().min(4096));
             for entry in table.range(start_id..=high_water_event_id.max(0) as u64)? {
                 let (id, value) = entry?;
                 let event_id = id.value() as i64;
@@ -306,7 +306,7 @@ impl RedbWatchStore {
             } else {
                 position.event_id.saturating_add(1).max(0) as u64
             };
-            let mut events = Vec::with_capacity(limit.get());
+            let mut events = Vec::with_capacity(limit.get().min(4096));
             for entry in table.range(start_id..=high_water_event_id.max(0) as u64)? {
                 let (id, value) = entry?;
                 let event_id = id.value() as i64;
@@ -577,7 +577,7 @@ impl RedbWatchStore {
             let r = db.begin_read()?;
             let tbl = r.open_table(tables::WATCH_EVENTS)?;
             let limit = limit.get();
-            let mut result = Vec::with_capacity(limit);
+            let mut result = Vec::with_capacity(limit.min(4096));
             let start = after_id.saturating_add(1).max(0) as u64;
             for e in tbl.range(start..)? {
                 let (id_guard, event_ref) = e?;
@@ -637,7 +637,7 @@ impl RedbWatchStore {
         self.db_call("watch_list_all_after_id_bounded", move |db| {
             let r = db.begin_read()?;
             let tbl = r.open_table(tables::WATCH_EVENTS)?;
-            let mut result = Vec::with_capacity(limit.get());
+            let mut result = Vec::with_capacity(limit.get().min(4096));
             let start = after_id.saturating_add(1).max(0) as u64;
             let end = through_id.max(0) as u64;
             for entry in tbl.range(start..=end)? {

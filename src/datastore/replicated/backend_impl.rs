@@ -39,6 +39,17 @@ fn ensure_mark_delete_timestamps(data: &mut Value, grace_seconds: i64) {
 
 #[async_trait]
 impl DatastoreBackend for ReplicatedDatastore {
+    async fn read_durable_allocator_observation(
+        &self,
+    ) -> Result<crate::datastore::DurableAllocatorObservation> {
+        self.inner.read_durable_allocator_observation().await
+    }
+
+    async fn read_cluster_metadata_observation(
+        &self,
+    ) -> Result<crate::datastore::ClusterMetadataObservation> {
+        self.inner.read_cluster_metadata_observation().await
+    }
     async fn acquire_snapshot_exclusive_fence(
         &self,
     ) -> Result<Option<crate::datastore::backend::SnapshotExclusiveFence>> {
@@ -106,6 +117,13 @@ impl DatastoreBackend for ReplicatedDatastore {
         commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult> {
         self.inner.apply_raft_log_apply_commit(commit).await
+    }
+
+    async fn apply_raft_log_apply_commit_outcome(
+        &self,
+        commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+        self.inner.apply_raft_log_apply_commit_outcome(commit).await
     }
 
     async fn create_resource(
@@ -2119,6 +2137,13 @@ impl crate::datastore::ReplicationStore for ReplicatedDatastore {
         crate::datastore::DatastoreBackend::apply_raft_log_apply_commit(self, commit).await
     }
 
+    async fn apply_raft_log_apply_commit_outcome(
+        &self,
+        commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+        crate::datastore::DatastoreBackend::apply_raft_log_apply_commit_outcome(self, commit).await
+    }
+
     async fn current_log_apply_index(&self) -> Result<i64> {
         crate::datastore::DatastoreBackend::current_log_apply_index(self).await
     }
@@ -2143,6 +2168,21 @@ impl crate::datastore::ReplicationStore for ReplicatedDatastore {
             options,
         )
         .await
+    }
+}
+
+#[async_trait]
+impl crate::datastore::DurableRecoveryStore for ReplicatedDatastore {
+    async fn read_durable_allocator_observation(
+        &self,
+    ) -> Result<crate::datastore::DurableAllocatorObservation> {
+        crate::datastore::DatastoreBackend::read_durable_allocator_observation(self).await
+    }
+
+    async fn read_cluster_metadata_observation(
+        &self,
+    ) -> Result<crate::datastore::ClusterMetadataObservation> {
+        crate::datastore::DatastoreBackend::read_cluster_metadata_observation(self).await
     }
 }
 

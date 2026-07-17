@@ -20,12 +20,13 @@ use super::types::PendingWatchEvent;
 #[cfg(test)]
 use super::types::ReplicatedCreateOptions;
 use super::types::{
-    AppliedOutboxRecord, CatchUpResource, ListPageRequest, NodeSubnet, PatchKind, PodCleanupIntent,
-    PodEndpointEvent, PodEndpointRow, PodNetworkEndpoint, PodSlotAdmissionEvent,
-    PodSlotAdmissionResult, PodWorkqueueEntry, PodWorkqueueKind, PositionedWatchReplayRead,
-    RawWatchEvent, ReplicatedSnapshotMetadata, Resource, ResourceBatchOperation, ResourceList,
-    ResourceListQuery, ResourcePatchRequest, ResourcePreconditions, SandboxRef, SnapshotAtRv,
-    WatchReplayFloor, WatchReplayPosition, WatchReplayRead, WatchTarget,
+    AppliedOutboxRecord, CatchUpResource, ClusterMetadataObservation, DurableAllocatorObservation,
+    ListPageRequest, NodeSubnet, PatchKind, PodCleanupIntent, PodEndpointEvent, PodEndpointRow,
+    PodNetworkEndpoint, PodSlotAdmissionEvent, PodSlotAdmissionResult, PodWorkqueueEntry,
+    PodWorkqueueKind, PositionedWatchReplayRead, RawWatchEvent, ReplicatedSnapshotMetadata,
+    Resource, ResourceBatchOperation, ResourceList, ResourceListQuery, ResourcePatchRequest,
+    ResourcePreconditions, SandboxRef, SnapshotAtRv, WatchReplayFloor, WatchReplayPosition,
+    WatchReplayRead, WatchTarget,
 };
 
 /// Exclusive guard held while a logical snapshot walks multiple bounded read
@@ -61,6 +62,20 @@ impl SnapshotMutationFence {
 /// exists.
 #[async_trait]
 pub trait DatastoreBackend: Send + Sync {
+    /// Atomically observe both durable allocators and their persisted mode.
+    async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
+        Err(anyhow::anyhow!(
+            "datastore backend does not implement atomic allocator observation"
+        ))
+    }
+
+    /// Atomically and strictly parse cluster identity plus membership.
+    async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
+        Err(anyhow::anyhow!(
+            "datastore backend does not implement atomic cluster metadata observation"
+        ))
+    }
+
     async fn acquire_snapshot_exclusive_fence(&self) -> Result<Option<SnapshotExclusiveFence>> {
         Ok(None)
     }
@@ -160,6 +175,18 @@ pub trait DatastoreBackend: Send + Sync {
         &self,
         commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult>;
+
+    /// Apply one committed Raft entry and return the canonical outcome derived
+    /// inside the same datastore transaction. Backends must fail before
+    /// mutation when they cannot provide this atomic classification.
+    async fn apply_raft_log_apply_commit_outcome(
+        &self,
+        _commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+        Err(anyhow::anyhow!(
+            "datastore backend does not support atomic committed-apply outcomes"
+        ))
+    }
 
     /// Append one committed log-apply entry to the backend-local durable log.
     /// T3: `append_log_apply_entry`, `list_log_apply_entries_after`,
@@ -1769,6 +1796,10 @@ pub trait ReplicationStore: Send + Sync {
         &self,
         commit: crate::log_apply::LogApplyCommit,
     ) -> Result<crate::datastore::raft::types::StorageCommandResult>;
+    async fn apply_raft_log_apply_commit_outcome(
+        &self,
+        commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<klights_cluster_core::CommittedApplyOutcome>;
     async fn current_log_apply_index(&self) -> Result<i64>;
     #[cfg(test)]
     async fn apply_replicated_create_resource(
@@ -1823,6 +1854,15 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
         self.as_ref().apply_raft_log_apply_commit(commit).await
     }
 
+    async fn apply_raft_log_apply_commit_outcome(
+        &self,
+        commit: crate::log_apply::LogApplyCommit,
+    ) -> Result<klights_cluster_core::CommittedApplyOutcome> {
+        self.as_ref()
+            .apply_raft_log_apply_commit_outcome(commit)
+            .await
+    }
+
     async fn current_log_apply_index(&self) -> Result<i64> {
         self.as_ref().current_log_apply_index().await
     }
@@ -1840,6 +1880,24 @@ impl<T: ReplicationStore + ?Sized> ReplicationStore for std::sync::Arc<T> {
         self.as_ref()
             .apply_replicated_create_resource(api_version, kind, namespace, name, data, options)
             .await
+    }
+}
+
+/// Atomic cluster-state observations used by authoritative recovery capture.
+#[async_trait]
+pub trait DurableRecoveryStore: Send + Sync {
+    async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation>;
+    async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation>;
+}
+
+#[async_trait]
+impl<T: DurableRecoveryStore + ?Sized> DurableRecoveryStore for std::sync::Arc<T> {
+    async fn read_durable_allocator_observation(&self) -> Result<DurableAllocatorObservation> {
+        self.as_ref().read_durable_allocator_observation().await
+    }
+
+    async fn read_cluster_metadata_observation(&self) -> Result<ClusterMetadataObservation> {
+        self.as_ref().read_cluster_metadata_observation().await
     }
 }
 

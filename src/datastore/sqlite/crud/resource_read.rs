@@ -6,6 +6,8 @@ use super::super::selector_index;
 use super::helpers::*;
 use super::*;
 
+const MAX_INTERNAL_LIST_PREALLOCATION: usize = 4096;
+
 #[cfg(test)]
 pub(crate) struct ListResourcesSnapshotPause {
     target: ListResourcesSnapshotPauseTarget,
@@ -466,7 +468,11 @@ impl Datastore {
                         let rows = stmt.query_map(&param_refs[..], row_to_namespaced_resource)?;
                         // Bounded by `fetch_limit` (LIMIT clause); pre-size to avoid
                         // realloc churn on the common large-page list path.
-                        let mut items = Vec::with_capacity(fetch_limit as usize);
+                        let mut items = Vec::with_capacity(
+                            usize::try_from(fetch_limit)
+                                .unwrap_or(usize::MAX)
+                                .min(MAX_INTERNAL_LIST_PREALLOCATION),
+                        );
                         for row in rows {
                             items.push(row?);
                         }
@@ -518,7 +524,11 @@ impl Datastore {
                         let rows = stmt.query_map(&param_refs[..], row_to_cluster_resource)?;
                         // Bounded by `fetch_limit` (LIMIT clause); pre-size to avoid
                         // realloc churn on the common large-page list path.
-                        let mut items = Vec::with_capacity(fetch_limit as usize);
+                        let mut items = Vec::with_capacity(
+                            usize::try_from(fetch_limit)
+                                .unwrap_or(usize::MAX)
+                                .min(MAX_INTERNAL_LIST_PREALLOCATION),
+                        );
                         for row in rows {
                             items.push(row?);
                         }
@@ -570,7 +580,8 @@ impl Datastore {
         let selector_limited =
             limit.is_some() && (label_selector.is_some() || field_selector.is_some());
         if selector_limited {
-            let lim = limit.expect("selector_limited implies Some(limit)") as usize;
+            let lim = usize::try_from(limit.expect("selector_limited implies Some(limit)"))
+                .unwrap_or(usize::MAX);
             let label_requirements = if let Some(selector) = label_selector {
                 Some(parse_label_selector(selector)?)
             } else {
@@ -685,7 +696,7 @@ impl Datastore {
 
                         let residual_labels = &index_pushdown.residual_labels;
                         let residual_fields = &index_pushdown.residual_fields;
-                        let mut page_items = Vec::with_capacity(lim + 1);
+                        let mut page_items = Vec::with_capacity(lim.saturating_add(1).min(MAX_INTERNAL_LIST_PREALLOCATION));
                         let mut cursor_name = token_owned.clone();
 
                         loop {
@@ -844,7 +855,7 @@ impl Datastore {
                         }
                         query.push_str(" ORDER BY r.name");
                         query.push_str(&format!(" LIMIT ?{}", params.len() + 1));
-                        params.push(Box::new((lim + 1) as i64));
+                        params.push(Box::new(i64::try_from(lim.saturating_add(1)).unwrap_or(i64::MAX)));
 
                         let param_refs: Vec<&dyn rusqlite::ToSql> =
                             params.iter().map(|p| p.as_ref()).collect();
@@ -864,7 +875,7 @@ impl Datastore {
                                 data: std::sync::Arc::new(data),
                             })
                         })?;
-                        let mut page_items = Vec::with_capacity(lim);
+                        let mut page_items = Vec::with_capacity(lim.min(MAX_INTERNAL_LIST_PREALLOCATION));
                         for row in rows {
                             let item = row?;
                             if page_items.len() <= lim {
@@ -939,7 +950,7 @@ impl Datastore {
 
                         let residual_labels = &index_pushdown.residual_labels;
                         let residual_fields = &index_pushdown.residual_fields;
-                        let mut page_items = Vec::with_capacity(lim + 1);
+                        let mut page_items = Vec::with_capacity(lim.saturating_add(1).min(MAX_INTERNAL_LIST_PREALLOCATION));
                         let mut cursor_name = token_owned.clone();
 
                         loop {
@@ -1062,7 +1073,7 @@ impl Datastore {
                         }
                         query.push_str(" ORDER BY r.name");
                         query.push_str(&format!(" LIMIT ?{}", params.len() + 1));
-                        params.push(Box::new((lim + 1) as i64));
+                        params.push(Box::new(i64::try_from(lim.saturating_add(1)).unwrap_or(i64::MAX)));
 
                         let param_refs: Vec<&dyn rusqlite::ToSql> =
                             params.iter().map(|p| p.as_ref()).collect();
@@ -1084,7 +1095,7 @@ impl Datastore {
                                 data: std::sync::Arc::new(data),
                             })
                         })?;
-                        let mut page_items = Vec::with_capacity(lim);
+                        let mut page_items = Vec::with_capacity(lim.min(MAX_INTERNAL_LIST_PREALLOCATION));
                         for row in rows {
                             let item = row?;
                             if page_items.len() <= lim {
@@ -1349,13 +1360,14 @@ impl Datastore {
         let mut next_token: Option<String> = None;
         let mut remaining_item_count: Option<i64> = None;
         if let Some(lim) = limit
-            && items.len() > lim as usize
+            && i64::try_from(items.len()).unwrap_or(i64::MAX) > lim
+            && let Ok(lim) = usize::try_from(lim)
         {
             // Accurate remaining_item_count: we fetched all items after the continue token,
             // so remaining = total_after_token - page_size.
             // K8s conformance requires remainingItemCount + len(items) == total.
-            remaining_item_count = Some((items.len() - lim as usize) as i64);
-            items.truncate(lim as usize);
+            remaining_item_count = Some(i64::try_from(items.len() - lim).unwrap_or(i64::MAX));
+            items.truncate(lim);
             next_token = Some(items.last().unwrap().name.clone());
         }
         let response_rv = list_response_resource_version(

@@ -25,9 +25,10 @@ pub use klights_cluster_core::{MetadataComparison, compare_metadata, needs_confi
 use crate::datastore::backend::DatastoreBackend;
 use crate::datastore::types::{NodeSubnet, PodCleanupIntent, Resource};
 use crate::log_apply::{
-    ClusterMutation, LogApplyCommit, LogApplyNamespaceRow, LogApplyNodeDataplaneRow,
-    LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourceRow, LogApplyWatchEventRow,
-    NamespaceMutation, NetworkMutation, PodCleanupMutation, ResourceMutation, WatchHistoryMutation,
+    ClusterMutation, LogApplyCommit, LogApplyMutation, LogApplyNamespaceRow,
+    LogApplyNodeDataplaneRow, LogApplyNodeSubnetRow, LogApplyResourceKey, LogApplyResourceRow,
+    LogApplyWatchEventRow, NamespaceMutation, NetworkMutation, PodCleanupMutation,
+    ResourceMutation, WatchHistoryMutation,
 };
 
 const SNAPSHOT_JSON_COMMIT_BATCH_SIZE: usize = 128;
@@ -290,6 +291,26 @@ async fn emit_snapshot_commits<S: SnapshotCommitSink + Unpin>(
                 outbox_watermark: Some(watermark),
             })
             .await?;
+        }
+
+        let page_limit = std::num::NonZeroUsize::new(SNAPSHOT_EMIT_PAGE_SIZE)
+            .expect("SNAPSHOT_EMIT_PAGE_SIZE is nonzero");
+        let mut after_key: Option<String> = None;
+        loop {
+            let rows = db
+                .list_applied_outbox_paged(after_key.as_deref(), page_limit)
+                .await?;
+            if rows.is_empty() {
+                break;
+            }
+            after_key = rows.last().map(|row| row.idempotency_key.clone());
+            for row in rows {
+                sink.push(LogApplyCommit::new(
+                    current_rv,
+                    vec![LogApplyMutation::PutAppliedOutbox(row.into())],
+                ))
+                .await?;
+            }
         }
     }
 
@@ -962,7 +983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_generation_does_not_export_legacy_applied_outbox_rows() {
+    async fn snapshot_generation_preserves_applied_outbox_dedup_rows() {
         let leader = crate::datastore::test_support::in_memory().await;
         leader
             .create_resource(
@@ -1004,10 +1025,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            follower.list_applied_outbox().await.unwrap().is_empty(),
-            "snapshots must not replicate legacy applied_outbox rows"
-        );
+        let rows = follower.list_applied_outbox().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].idempotency_key, "legacy-snapshot-key");
     }
 
     #[tokio::test]

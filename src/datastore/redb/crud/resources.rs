@@ -915,7 +915,11 @@ impl RedbResourceStore {
                 // once we have limit+1 matches. No remainingItemCount.
                 if has_selectors {
                     let target = limit
-                        .map(|lim| lim.max(1) as usize + 1)
+                        .map(|lim| {
+                            usize::try_from(lim.max(1))
+                                .unwrap_or(usize::MAX)
+                                .saturating_add(1)
+                        })
                         .unwrap_or(usize::MAX);
 
                     let mut matches: Vec<Resource> = Vec::new();
@@ -994,9 +998,13 @@ impl RedbResourceStore {
                         scan(tables::RES_CLUSTER, None)?;
                     }
 
-                    let has_more = limit.is_some() && matches.len() > limit.unwrap() as usize;
-                    if has_more {
-                        matches.truncate(limit.unwrap() as usize);
+                    let has_more = limit.is_some_and(|limit| {
+                        i64::try_from(matches.len()).unwrap_or(i64::MAX) > limit
+                    });
+                    if has_more
+                        && let Some(limit) = limit.and_then(|value| usize::try_from(value).ok())
+                    {
+                        matches.truncate(limit);
                     }
                     let continue_token = if has_more {
                         matches.last().map(|r| r.name.clone())
@@ -1015,7 +1023,8 @@ impl RedbResourceStore {
                 }
 
                 // Non-selector path: original behavior with exact counts.
-                let non_selector_limit = limit.map(|lim| lim as usize);
+                let non_selector_limit =
+                    limit.map(|lim| usize::try_from(lim).unwrap_or(usize::MAX));
                 let mut items: Vec<Resource> = Vec::new();
                 let mut has_more = false;
                 let mut remaining_after_page = 0_i64;
