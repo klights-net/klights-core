@@ -2170,6 +2170,9 @@ version = "0.0.0"
 [[package]]
 name = "klights-node-store"
 version = "0.0.0"
+dependencies = [
+ "klights-types",
+]
 
 [[package]]
 name = "klights-pod-api"

@@ -158,8 +158,8 @@ pub(super) fn outbox_claim_next_due() -> &'static str {
 pub(super) fn outbox_claim_due_batch() -> &'static str {
     OUTBOX_CLAIM_DUE_BATCH_SQL.as_str()
 }
-pub(super) const OUTBOX_SET_LEASE: &str =
-    "UPDATE outbox SET leased_until_ms = ?2, lease_token = ?3 WHERE id = ?1";
+pub(super) const OUTBOX_SET_LEASE: &str = "UPDATE outbox SET leased_until_ms = ?2, lease_token = ?3 \
+     WHERE id = ?1 AND next_due_ms <= ?4 AND leased_until_ms <= ?4";
 pub(super) const OUTBOX_RENEW_LEASE: &str = "UPDATE outbox \
      SET leased_until_ms = ?3 WHERE id = ?1 AND lease_token = ?2";
 pub(super) const OUTBOX_MARK_FAILED: &str = "UPDATE outbox \

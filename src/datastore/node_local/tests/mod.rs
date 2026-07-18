@@ -175,6 +175,42 @@ async fn node_local_outbox_claim_skips_same_subject_rows_with_stream_in_flight()
 }
 
 #[tokio::test]
+async fn node_local_outbox_batch_claim_is_atomic_across_independent_claimers() {
+    let db = open_node_local_in_memory().await;
+    db.enqueue_outbox(test_outbox_insert(
+        "atomic-claim-a",
+        "v1/Pod/default/a/uid-a",
+        1,
+    ))
+    .await
+    .unwrap();
+    db.enqueue_outbox(test_outbox_insert(
+        "atomic-claim-b",
+        "v1/Pod/default/b/uid-b",
+        1,
+    ))
+    .await
+    .unwrap();
+
+    let (left, right) = tokio::join!(
+        db.claim_due_outbox_batch(10, 2, 1_000, "claim-left"),
+        db.claim_due_outbox_batch(10, 2, 1_000, "claim-right"),
+    );
+    let left = left.unwrap();
+    let right = right.unwrap();
+    let left_ids = left
+        .iter()
+        .map(|row| row.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let right_ids = right
+        .iter()
+        .map(|row| row.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(left_ids.is_disjoint(&right_ids));
+    assert_eq!(left.len() + right.len(), 2);
+}
+
+#[tokio::test]
 async fn node_local_outbox_prioritizes_status_before_older_events() {
     let db = open_node_local_in_memory().await;
     db.enqueue_outbox(test_outbox_insert_with_operation(

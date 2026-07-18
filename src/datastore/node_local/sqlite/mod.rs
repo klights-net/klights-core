@@ -537,7 +537,7 @@ impl SqliteNodeLocalDb {
             assign_outbox_stream_seq_if_needed(&tx, id)?;
             tx.execute(
                 queries::OUTBOX_SET_LEASE,
-                rusqlite::params![id, leased_until_ms, lease_token],
+                rusqlite::params![id, leased_until_ms, lease_token, now_ms],
             )?;
             let row = tx.query_row(queries::OUTBOX_ROW_SELECT, [id], row_to_outbox)?;
             tx.commit()?;
@@ -610,34 +610,28 @@ impl SqliteNodeLocalDb {
     ) -> Result<Vec<OutboxRow>> {
         let lease_token = lease_token.to_string();
         let limit_i64 = limit.min(256) as i64;
-        // Find due row IDs (outside transaction — safe since there is only
-        // one dispatcher; any concurrent insert will be caught in the next batch).
-        let ids: Vec<i64> = self
-            .db_call("node_local:outbox_claim_batch_find", move |conn| {
-                let mut stmt = conn.prepare(queries::outbox_claim_due_batch())?;
-                let rows =
-                    stmt.query_map(rusqlite::params![now_ms, limit_i64], |row| row.get(0))?;
-                let result = rows.collect::<rusqlite::Result<Vec<i64>>>()?;
-                Ok(result)
-            })
-            .await
-            .map_err(|e| anyhow!("outbox batch claim find failed: {e}"))?;
-
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Set leases and fetch full rows in a single transaction.
+        // Select, conditionally lease, and fetch in one transaction so
+        // independent dispatchers cannot claim the same row.
         let rows = self
-            .db_call("node_local:outbox_claim_batch_set", move |conn| {
+            .db_call("node_local:outbox_claim_batch", move |conn| {
                 let tx = conn.transaction()?;
+                let ids = {
+                    let mut stmt = tx.prepare(queries::outbox_claim_due_batch())?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![now_ms, limit_i64], |row| row.get(0))?;
+                    rows.collect::<rusqlite::Result<Vec<i64>>>()?
+                };
+                if ids.is_empty() {
+                    tx.commit()?;
+                    return Ok(Vec::new());
+                }
                 let leased_until_ms = now_ms.saturating_add(lease_ms.max(1));
                 let mut leased_ids = Vec::new();
                 for &id in &ids {
                     assign_outbox_stream_seq_if_needed(&tx, id)?;
                     let changed = tx.execute(
                         queries::OUTBOX_SET_LEASE,
-                        rusqlite::params![id, leased_until_ms, lease_token],
+                        rusqlite::params![id, leased_until_ms, lease_token, now_ms],
                     )?;
                     if changed > 0 {
                         leased_ids.push(id);
@@ -660,7 +654,7 @@ impl SqliteNodeLocalDb {
                 Ok(rows)
             })
             .await
-            .map_err(|e| anyhow!("outbox batch claim set failed: {e}"))?;
+            .map_err(|e| anyhow!("outbox batch claim failed: {e}"))?;
 
         Ok(rows)
     }

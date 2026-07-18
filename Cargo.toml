@@ -53,6 +53,7 @@ publish = false
 klights-types = { path = "crates/klights-types" }
 klights-cluster-core = { path = "crates/klights-cluster-core" }
 klights-cluster-store = { path = "crates/klights-cluster-store" }
+klights-node-store = { path = "crates/klights-node-store" }
 klights-internal-protobuf = { path = "crates/klights-internal-protobuf" }
 vergen = { version = "8", features = ["build", "cargo", "git", "gitcl", "rustc", "si"] }
 tonic-prost-build = "0.14"
