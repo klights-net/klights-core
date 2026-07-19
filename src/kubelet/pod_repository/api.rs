@@ -193,7 +193,6 @@ pub struct PodApiService {
     delete_coordinator: Arc<PodDeleteCoordinator>,
     side_effects: Arc<SideEffectRegistry>,
     metrics: Arc<SideEffectMetrics>,
-    outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     #[cfg(test)]
     scheduler_bind_gate: std::sync::Mutex<Option<Arc<SchedulerBindGateForTest>>>,
 }
@@ -219,7 +218,7 @@ impl PodApiService {
             delete_coordinator,
             side_effects,
             metrics,
-            outbox,
+            outbox: _,
         } = dependencies;
         Self {
             store,
@@ -229,7 +228,6 @@ impl PodApiService {
             delete_coordinator,
             side_effects,
             metrics,
-            outbox,
             #[cfg(test)]
             scheduler_bind_gate: std::sync::Mutex::new(None),
         }
@@ -748,9 +746,8 @@ impl PodApiService {
         .await?;
         if status_changed
             && let Some(message) = decision.unschedulable_message.as_deref()
-            && let Err(e) = crate::kubelet::events::emit_pod_event_with_outbox(
+            && let Err(e) = crate::kubelet::events::emit_control_plane_pod_event(
                 self.db.as_ref(),
-                self.outbox.as_deref(),
                 crate::kubelet::events::PodEventRecord {
                     pod: &final_resource.data,
                     reason: "FailedScheduling",

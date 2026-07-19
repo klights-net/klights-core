@@ -7424,6 +7424,29 @@ async fn leader_scheduler_marks_unschedulable_pod_and_emits_failed_scheduling_ev
     .unwrap();
 
     repo.schedule_all_unbound_pods().await.unwrap();
+
+    let events_before_outbox_dispatch = db
+        .list_resources(
+            "v1",
+            "Event",
+            Some("default"),
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        events_before_outbox_dispatch.items.iter().any(|event| {
+            event.data.get("reason").and_then(|v| v.as_str()) == Some("FailedScheduling")
+                && event
+                    .data
+                    .pointer("/involvedObject/name")
+                    .and_then(|v| v.as_str())
+                    == Some("additional-pod")
+        }),
+        "leader scheduler must commit FailedScheduling directly instead of routing a scheduler-authored Event through the node outbox: {:?}",
+        events_before_outbox_dispatch.items
+    );
+
     drain_repo_outbox(db.clone(), &node_db).await.unwrap();
     let pod = repo
         .get_pod("default", "additional-pod")
@@ -8094,6 +8117,35 @@ async fn scheduler_marks_pod_unschedulable_when_node_selector_does_not_match() {
             .and_then(|v| v.as_str())
             .is_some_and(|message| message.contains("node affinity/selector")),
         "expected node selector failure message, got {scheduled:?}"
+    );
+
+    let events = repo
+        .store
+        .db()
+        .list_resources(
+            "v1",
+            "Event",
+            Some("default"),
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        events.items.iter().any(|event| {
+            event.data.get("reason").and_then(|v| v.as_str()) == Some("FailedScheduling")
+                && event
+                    .data
+                    .pointer("/involvedObject/name")
+                    .and_then(|v| v.as_str())
+                    == Some("restricted-pod")
+                && event
+                    .data
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|message| message.contains("node affinity/selector"))
+        }),
+        "nodeSelector rejection must publish a FailedScheduling event directly from the leader: {:?}",
+        events.items
     );
 }
 

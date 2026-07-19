@@ -49,7 +49,7 @@ pub async fn emit_pod_event(
     let outbox = Outbox::new(node_db.clone());
     let event = emit_pod_event_impl(
         ds,
-        Some(&outbox),
+        PodEventPersistence::NodeOutbox(Some(&outbox)),
         PodEventRecord {
             pod,
             reason,
@@ -121,7 +121,25 @@ pub async fn emit_pod_event_with_outbox(
     outbox: Option<&Outbox>,
     record: PodEventRecord<'_>,
 ) -> Result<Value> {
-    emit_pod_event_impl(ds, outbox, record).await
+    emit_pod_event_impl(ds, PodEventPersistence::NodeOutbox(outbox), record).await
+}
+
+/// Persist an Event authored by a leader-owned control-plane component.
+///
+/// Control-plane Events must not be sent through the node-authenticated outbox:
+/// their reporting instance is the controller rather than a kubelet node, so
+/// worker Event authorization correctly rejects them. The supplied datastore is
+/// the leader-owned cluster port and preserves Raft proposal/apply semantics.
+pub(crate) async fn emit_control_plane_pod_event(
+    ds: &dyn DatastoreBackend,
+    record: PodEventRecord<'_>,
+) -> Result<Value> {
+    emit_pod_event_impl(ds, PodEventPersistence::LeaderStore, record).await
+}
+
+enum PodEventPersistence<'a> {
+    NodeOutbox(Option<&'a Outbox>),
+    LeaderStore,
 }
 
 /// Outcome of the namespace preflight before emitting a pod event.
@@ -151,7 +169,7 @@ fn classify_namespace_preflight(result: Result<(), crate::api::AppError>) -> Nam
 
 async fn emit_pod_event_impl(
     ds: &dyn DatastoreBackend,
-    outbox: Option<&Outbox>,
+    persistence: PodEventPersistence<'_>,
     record: PodEventRecord<'_>,
 ) -> Result<Value> {
     let PodEventRecord {
@@ -278,27 +296,35 @@ async fn emit_pod_event_impl(
     });
 
     let subject_key = format!("v1/Event/{namespace}/{event_name}");
-    OutboxSendPlanner::new(outbox)
-        .route(OutboxCommand {
-            idempotency_key: format!("EventCreate:{subject_key}:{}", uuid::Uuid::new_v4()),
-            operation: OutboxOperation::EventCreate,
-            subject: OutboxSubject {
-                key: subject_key,
-                namespace: Some(namespace.to_string()),
-                name: event_name.clone(),
-                uid: None,
-            },
-            pod_uid: pod_uid.to_string(),
-            command: StorageCommand::CreateResource {
-                api_version: "v1".to_string(),
-                kind: "Event".to_string(),
-                namespace: Some(namespace.to_string()),
-                name: event_name.clone(),
-                data: event.clone(),
-            },
-            now_ms: epoch_ms(),
-        })
-        .await?;
+    match persistence {
+        PodEventPersistence::NodeOutbox(outbox) => {
+            OutboxSendPlanner::new(outbox)
+                .route(OutboxCommand {
+                    idempotency_key: format!("EventCreate:{subject_key}:{}", uuid::Uuid::new_v4()),
+                    operation: OutboxOperation::EventCreate,
+                    subject: OutboxSubject {
+                        key: subject_key,
+                        namespace: Some(namespace.to_string()),
+                        name: event_name.clone(),
+                        uid: None,
+                    },
+                    pod_uid: pod_uid.to_string(),
+                    command: StorageCommand::CreateResource {
+                        api_version: "v1".to_string(),
+                        kind: "Event".to_string(),
+                        namespace: Some(namespace.to_string()),
+                        name: event_name.clone(),
+                        data: event.clone(),
+                    },
+                    now_ms: epoch_ms(),
+                })
+                .await?;
+        }
+        PodEventPersistence::LeaderStore => {
+            ds.create_resource("v1", "Event", Some(namespace), &event_name, event.clone())
+                .await?;
+        }
+    }
     Ok(event)
 }
 
