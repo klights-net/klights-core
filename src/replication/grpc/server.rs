@@ -496,14 +496,12 @@ impl GrpcReplicationServer {
     async fn require_steady_state_auth<T>(
         &self,
         request: &Request<T>,
-    ) -> std::result::Result<(), Status> {
-        if node_client_identity(request)?.is_some() {
-            Ok(())
-        } else {
-            Err(Status::unauthenticated(
+    ) -> std::result::Result<crate::auth::AuthenticatedIdentity, Status> {
+        node_client_identity(request)?.ok_or_else(|| {
+            Status::unauthenticated(
                 "steady-state replication RPC requires a node client certificate",
-            ))
-        }
+            )
+        })
     }
 }
 
@@ -580,6 +578,10 @@ fn caller_node_authority<T>(request: &Request<T>) -> CallerAuthority {
         return CallerAuthority::Unrestricted;
     };
     let identity = crate::auth::AuthenticatedIdentity::client_cert(user.username, user.groups);
+    node_authority_from_identity(&identity)
+}
+
+fn node_authority_from_identity(identity: &crate::auth::AuthenticatedIdentity) -> CallerAuthority {
     let is_controlplane = identity
         .groups
         .iter()
@@ -1531,18 +1533,18 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         &self,
         request: Request<generated::ApplyOutboxRequest>,
     ) -> std::result::Result<Response<generated::ApplyOutboxResponse>, Status> {
-        self.require_steady_state_auth(&request).await?;
+        let authenticated_identity = self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
-        let caller = caller_node_authority(&request);
-        let req = request.into_inner();
-        let authenticated_node = match &caller {
-            CallerAuthority::Node(node_name) => node_name.as_str(),
-            CallerAuthority::Unrestricted => {
-                return Err(Status::permission_denied(
+        let caller = node_authority_from_identity(&authenticated_identity);
+        let authenticated_node = authenticated_identity
+            .username
+            .strip_prefix("system:node:")
+            .ok_or_else(|| {
+                Status::unauthenticated(
                     "durable outbox delivery requires an authenticated node client certificate",
-                ));
-            }
-        };
+                )
+            })?;
+        let req = request.into_inner();
         // NodeRestriction: the legacy wire author must equal the certificate-bound author.
         enforce_node_authority(&caller, &req.authoring_node)?;
         let delivery_operation =
@@ -4982,6 +4984,108 @@ mod tests {
             .expect("read Node")
             .expect("Node exists");
         assert_eq!(stored.resource_version, created.resource_version);
+    }
+
+    #[tokio::test]
+    async fn grpc_apply_outbox_accepts_joining_controlplane_node_status() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let created = db
+            .create_resource(
+                "v1",
+                "Node",
+                None,
+                "mn-controlplane2",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {
+                        "name": "mn-controlplane2",
+                        "uid": "controlplane2-uid"
+                    },
+                    "status": {
+                        "conditions": [{
+                            "type": "Ready",
+                            "status": "False",
+                            "reason": "NetworkUnavailable",
+                            "lastTransitionTime": "2026-07-19T02:12:10Z"
+                        }, {
+                            "type": "NetworkUnavailable",
+                            "status": "True",
+                            "reason": "DataplaneNotReady",
+                            "lastTransitionTime": "2026-07-19T02:12:10Z"
+                        }]
+                    }
+                }),
+            )
+            .await
+            .expect("create joining controlplane Node");
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let grpc = super::GrpcReplicationServer::new(service, db.clone());
+        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(
+            StorageCommand::UpdateStatus {
+                api_version: "v1".to_string(),
+                kind: "Node".to_string(),
+                namespace: None,
+                name: "mn-controlplane2".to_string(),
+                status: serde_json::json!({
+                    "conditions": [{
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "Ready",
+                        "lastTransitionTime": "2026-07-19T02:12:14Z"
+                    }, {
+                        "type": "NetworkUnavailable",
+                        "status": "False",
+                        "reason": "Ready",
+                        "lastTransitionTime": "2026-07-19T02:12:14Z"
+                    }]
+                }),
+                expected_rv: None,
+                preconditions: ResourcePreconditions::uid(created.uid.clone()),
+                observed_status_stamp: None,
+            },
+        )
+        .encode_protobuf()
+        .expect("encode controlplane Node status payload");
+
+        let response = grpc
+            .apply_outbox(request_with_controlplane_client_cert(
+                generated::ApplyOutboxRequest {
+                    idempotency_key: "controlplane2-node-ready".to_string(),
+                    operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                        .as_str()
+                        .to_string(),
+                    payload_proto: payload,
+                    authoring_node: "mn-controlplane2".to_string(),
+                    client_id: "mn-controlplane2".to_string(),
+                    stream_id: 1,
+                    stream_seq: 1,
+                },
+                "mn-controlplane2",
+            ))
+            .await
+            .expect("joining controlplane node cert must authorize durable NodeStatus delivery")
+            .into_inner();
+
+        assert!(
+            response.error.is_none(),
+            "unexpected apply error: {response:?}"
+        );
+        assert!(response.applied_rv > created.resource_version);
+        let stored = db
+            .get_resource("v1", "Node", None, "mn-controlplane2")
+            .await
+            .expect("read joining controlplane Node")
+            .expect("joining controlplane Node exists");
+        assert_eq!(
+            stored.data.pointer("/status/conditions/0/status"),
+            Some(&serde_json::json!("True"))
+        );
+        assert_eq!(
+            stored.data.pointer("/status/conditions/1/status"),
+            Some(&serde_json::json!("False"))
+        );
     }
 
     #[tokio::test]

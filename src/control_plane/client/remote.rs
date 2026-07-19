@@ -682,7 +682,7 @@ impl LeaderOutboxDelivery for RemoteApiClient {
                 OutboxDeliveryError::unavailable("RemoteApiClient missing gRPC transport")
             })?;
             if grpc.node_name() != self.node_name {
-                return Err(OutboxDeliveryError::unavailable(format!(
+                return Err(OutboxDeliveryError::conflict(format!(
                     "RemoteApiClient node identity {} does not match gRPC identity {}",
                     self.node_name,
                     grpc.node_name(),
@@ -762,6 +762,18 @@ mod tests {
         DatastoreHandle,
         tokio::task::JoinHandle<()>,
     ) {
+        remote_client_and_leader_db_with_node_names("worker-1".to_string(), "worker-1".to_string())
+            .await
+    }
+
+    async fn remote_client_and_leader_db_with_node_names(
+        remote_node_name: String,
+        grpc_node_name: String,
+    ) -> (
+        RemoteApiClient,
+        DatastoreHandle,
+        tokio::task::JoinHandle<()>,
+    ) {
         let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
             .await
@@ -779,16 +791,18 @@ mod tests {
         );
         // Simulate the mTLS edge: in production the TLS layer injects the
         // caller's client certificate; over the in-process plaintext channel we
-        // inject worker-1's node cert so node-scoped RPCs (NodeRestriction) see
-        // an authenticated node identity.
+        // inject the gRPC transport's node cert so node-scoped RPCs
+        // (NodeRestriction) see the same authenticated identity.
+        let grpc_node_cert = test_node_cert_der(&grpc_node_name);
         let app = app.layer(axum::middleware::from_fn(
-            |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
-                request
-                    .extensions_mut()
-                    .insert(crate::auth::TlsClientCertificate(test_node_cert_der(
-                        "worker-1",
-                    )));
-                next.run(request).await
+            move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+                let grpc_node_cert = grpc_node_cert.clone();
+                async move {
+                    request
+                        .extensions_mut()
+                        .insert(crate::auth::TlsClientCertificate(grpc_node_cert));
+                    next.run(request).await
+                }
             },
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -801,7 +815,7 @@ mod tests {
                 GrpcClientConfig {
                     leader_endpoint: endpoint,
                     token,
-                    node_name: "worker-1".to_string(),
+                    node_name: grpc_node_name,
                     role: JoinRole::Worker,
                     dataplane: dataplane(),
                     ca_cert_path: None,
@@ -816,7 +830,7 @@ mod tests {
             .unwrap(),
         );
         (
-            RemoteApiClient::from_grpc(grpc, supervisor, "worker-1".to_string()),
+            RemoteApiClient::from_grpc(grpc, supervisor, remote_node_name),
             db,
             handle,
         )
@@ -975,6 +989,36 @@ mod tests {
             matches!(&err, OutboxApplyError::Retryable(message) if message.contains("missing gRPC transport")),
             "missing gRPC should be a retryable dispatcher error, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_apply_outbox_node_identity_mismatch_is_terminal() {
+        let (client, _db, handle) = remote_client_and_leader_db_with_node_names(
+            "worker-1".to_string(),
+            "worker-2".to_string(),
+        )
+        .await;
+
+        let err = client
+            .deliver_outbox(
+                OutboxDeliveryRequest::try_new(
+                    "identity-mismatch",
+                    klights_leader_api::OutboxDeliveryOperation::PodStatus,
+                    Arc::<[u8]>::from(pod_status_payload("uid-1").to_vec()),
+                    "worker-client",
+                    7,
+                    1,
+                )
+                .expect("valid delivery request"),
+            )
+            .await
+            .expect_err("identity mismatch must not remain in durable retry");
+
+        assert!(
+            matches!(&err, OutboxApplyError::ConflictTerminal(message) if message.contains("RemoteApiClient node identity")),
+            "identity mismatch must be terminal, got {err:?}"
+        );
+        handle.abort();
     }
 
     #[tokio::test]
