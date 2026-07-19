@@ -1,5 +1,10 @@
 use anyhow::{Context, Result, anyhow};
 use futures::stream::BoxStream;
+use klights_node_api::{
+    ExecStreamChannel, ExecTerminalError, NodeExecFrame, NodeExecSyncResult, NodeLogEvent,
+    NodeLogTerminalError, NodeMetricsContainerSample, NodeMetricsError, NodeMetricsNodeSample,
+    NodeMetricsPodSample, NodeMetricsResult,
+};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,19 +16,19 @@ use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{ResourcePreconditions, WatchReplayPosition, WatchTarget};
 use crate::kubelet::pod_repository::store::PodStore;
-use crate::metrics::{
-    NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResponse,
-};
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use crate::replication::grpc::{
     JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, resource_command_request_from_proto,
     watch_replay_expired_status, watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
 use crate::replication::protocol::{
-    ExecStreamChannel, FollowerControlMessage, JoinResponse, JoinRole, NodeExecRequest,
-    NodeExecStreamFrame, NodeExecSyncRequest, NodeExecSyncResponse, PodLogRequest, PodLogResponse,
+    FollowerControlMessage, JoinResponse, JoinRole, RoutedNodeExecFrame, RoutedNodeExecRequest,
+    RoutedNodeExecSyncRequest, RoutedNodeExecSyncResponse, RoutedNodeLogEvent,
+    RoutedNodeLogRequest, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse,
 };
-use crate::replication::service::ReplicationService;
+use crate::replication::service::{
+    FollowerCompletionContext, NodeOperationKind, ReplicationService,
+};
 use crate::replication::snapshot::SnapshotCommitSink;
 use crate::watch::WatchEventSelection;
 
@@ -998,24 +1003,52 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                                     service.update_follower_ack(&joined_node_name, ack.applied_rv).await;
                                 }
                                 Some(generated::follower_message::Payload::NodeExecSyncResponse(response)) => {
-                                    if let Err(err) = service.complete_node_exec_sync(node_exec_sync_response_from_proto(response)).await {
+                                    if let Err(err) = service.complete_node_exec_sync(
+                                        FollowerCompletionContext::new(
+                                            &joined_node_name,
+                                            follower_session.expect("accepted stream has a follower session"),
+                                            NodeOperationKind::ExecSync,
+                                        ),
+                                        node_exec_sync_response_from_proto(response),
+                                    ).await {
                                         tracing::warn!(node = %joined_node_name, error = %err, "dropped unmatched node exec response");
                                     }
                                 }
                                 Some(generated::follower_message::Payload::PodLogResponse(response)) => {
-                                    if let Err(err) = service.complete_pod_log(pod_log_response_from_proto(response)).await {
+                                    if let Err(err) = service.complete_node_log_event(
+                                        FollowerCompletionContext::new(
+                                            &joined_node_name,
+                                            follower_session.expect("accepted stream has a follower session"),
+                                            NodeOperationKind::Log,
+                                        ),
+                                        pod_log_response_from_proto(response),
+                                    ).await {
                                         tracing::warn!(node = %joined_node_name, error = %err, "dropped unmatched pod log response");
                                     }
                                 }
                                 Some(generated::follower_message::Payload::NodeMetricsResponse(response)) => {
-                                    if let Err(err) = service.complete_node_metrics(node_metrics_response_from_proto(response)).await {
+                                    if let Err(err) = service.complete_node_metrics(
+                                        FollowerCompletionContext::new(
+                                            &joined_node_name,
+                                            follower_session.expect("accepted stream has a follower session"),
+                                            NodeOperationKind::Metrics,
+                                        ),
+                                        node_metrics_response_from_proto(response),
+                                    ).await {
                                         tracing::warn!(node = %joined_node_name, error = %err, "dropped unmatched node metrics response");
                                     }
                                 }
                                 Some(generated::follower_message::Payload::NodeExecStreamFrame(frame)) => {
                                     match node_exec_stream_frame_from_proto(frame) {
                                         Ok(frame) => {
-                                            if let Err(err) = service.complete_node_exec_stream_frame(frame).await {
+                                            if let Err(err) = service.complete_node_exec_stream_frame(
+                                                FollowerCompletionContext::new(
+                                                    &joined_node_name,
+                                                    follower_session.expect("accepted stream has a follower session"),
+                                                    NodeOperationKind::ExecStream,
+                                                ),
+                                                frame,
+                                            ).await {
                                                 tracing::warn!(node = %joined_node_name, error = %err, "dropped unmatched node exec stream frame");
                                             }
                                         }
@@ -2895,134 +2928,175 @@ async fn dataplane_peers_from_db(
 // `forwarded_*_to_proto` helpers removed in T6 along with the legacy
 // ForwardCommand wire path.
 
-fn node_exec_sync_request_to_proto(request: NodeExecSyncRequest) -> generated::NodeExecSyncRequest {
+fn node_exec_sync_request_to_proto(
+    request: RoutedNodeExecSyncRequest,
+) -> generated::NodeExecSyncRequest {
+    let request_id = request.request_id;
+    let (target, command, timeout_seconds) = request.request.into_parts();
+    let (node_name, namespace, pod_name, container_id) = target.into_parts();
     generated::NodeExecSyncRequest {
-        request_id: request.request_id,
-        node_name: request.node_name,
-        namespace: request.namespace,
-        pod_name: request.pod_name,
-        container_id: request.container_id,
-        command: request.command,
-        timeout_seconds: request.timeout_seconds,
+        request_id,
+        node_name,
+        namespace,
+        pod_name,
+        container_id,
+        command,
+        timeout_seconds,
     }
 }
 
 fn node_exec_sync_response_from_proto(
     response: generated::NodeExecSyncResponse,
-) -> NodeExecSyncResponse {
-    NodeExecSyncResponse {
+) -> RoutedNodeExecSyncResponse {
+    let result = match response.error {
+        Some(error) => NodeExecSyncResult::failed(
+            response.stdout,
+            response.stderr,
+            response.exit_code,
+            ExecTerminalError::new(error),
+        ),
+        None => NodeExecSyncResult::success(response.stdout, response.stderr, response.exit_code),
+    };
+    RoutedNodeExecSyncResponse {
         request_id: response.request_id,
-        stdout: response.stdout,
-        stderr: response.stderr,
-        exit_code: response.exit_code,
-        error: response.error,
+        result,
     }
 }
 
-fn node_exec_request_to_proto(request: NodeExecRequest) -> generated::NodeExecRequest {
+fn node_exec_request_to_proto(request: RoutedNodeExecRequest) -> generated::NodeExecRequest {
+    let request_id = request.request_id;
+    let (target, command, options, attach) = request.request.into_parts();
+    let (node_name, namespace, pod_name, container_id) = target.into_parts();
     generated::NodeExecRequest {
-        request_id: request.request_id,
-        node_name: request.node_name,
-        namespace: request.namespace,
-        pod_name: request.pod_name,
-        container_id: request.container_id,
-        command: request.command,
-        tty: request.tty,
-        stdin: request.stdin,
-        stdout: request.stdout,
-        stderr: request.stderr,
-        attach: request.attach,
+        request_id,
+        node_name,
+        namespace,
+        pod_name,
+        container_id,
+        command,
+        tty: options.tty(),
+        stdin: options.stdin(),
+        stdout: options.stdout(),
+        stderr: options.stderr(),
+        attach,
     }
 }
 
-fn node_exec_stream_frame_to_proto(frame: NodeExecStreamFrame) -> generated::NodeExecStreamFrame {
+fn node_exec_stream_frame_to_proto(frame: RoutedNodeExecFrame) -> generated::NodeExecStreamFrame {
+    let (channel, data, fin) = frame.frame.into_parts();
     generated::NodeExecStreamFrame {
         request_id: frame.request_id,
-        channel: frame.channel.as_str().to_string(),
-        data: frame.data,
-        fin: frame.fin,
+        channel: channel.as_wire_name().to_string(),
+        data,
+        fin,
     }
 }
 
 fn node_exec_stream_frame_from_proto(
     frame: generated::NodeExecStreamFrame,
-) -> Result<NodeExecStreamFrame> {
-    let channel = ExecStreamChannel::parse(&frame.channel)
+) -> Result<RoutedNodeExecFrame> {
+    let channel = ExecStreamChannel::try_from_wire_name(&frame.channel)
         .ok_or_else(|| anyhow!("unknown node exec stream channel '{}'", frame.channel))?;
-    Ok(NodeExecStreamFrame {
+    Ok(RoutedNodeExecFrame {
         request_id: frame.request_id,
-        channel,
-        data: frame.data,
-        fin: frame.fin,
+        frame: NodeExecFrame::new(channel, frame.data, frame.fin),
     })
 }
 
-fn pod_log_request_to_proto(request: PodLogRequest) -> generated::PodLogRequest {
+fn pod_log_request_to_proto(routed: RoutedNodeLogRequest) -> generated::PodLogRequest {
+    let (target, options) = routed.request.into_parts();
+    let (node_name, namespace, pod_name, pod_uid, container_name) = target.into_parts();
+    let (_, tail_lines, timestamps, since_time, since_seconds, limit_bytes, previous) =
+        options.into_parts();
     generated::PodLogRequest {
-        request_id: request.request_id,
-        node_name: request.node_name,
-        namespace: request.namespace,
-        pod_name: request.pod_name,
-        pod_uid: request.pod_uid,
-        container_name: request.container_name,
-        follow: request.follow,
-        tail_lines: request.tail_lines,
-        timestamps: request.timestamps,
-        since_time: request.since_time,
-        since_seconds: request.since_seconds,
-        limit_bytes: request.limit_bytes,
-        previous: request.previous,
+        request_id: routed.request_id,
+        node_name,
+        namespace,
+        pod_name,
+        pod_uid,
+        container_name,
+        follow: routed.follow.then(|| "true".to_string()),
+        tail_lines: tail_lines.map(|value| value.to_string()),
+        timestamps,
+        since_time,
+        since_seconds,
+        limit_bytes: limit_bytes.and_then(|value| i64::try_from(value).ok()),
+        previous,
     }
 }
 
-fn pod_log_response_from_proto(response: generated::PodLogResponse) -> PodLogResponse {
-    PodLogResponse {
+fn pod_log_response_from_proto(response: generated::PodLogResponse) -> RoutedNodeLogEvent {
+    let event = match response.error {
+        Some(error) => NodeLogEvent::failed(response.log_content, NodeLogTerminalError::new(error)),
+        None if response.fin => NodeLogEvent::complete(response.log_content),
+        None => NodeLogEvent::data(response.log_content),
+    };
+    RoutedNodeLogEvent {
         request_id: response.request_id,
-        log_content: response.log_content,
-        error: response.error,
-        fin: response.fin,
+        event,
     }
 }
 
-fn node_metrics_request_to_proto(request: NodeMetricsRequest) -> generated::NodeMetricsRequest {
+fn node_metrics_request_to_proto(
+    request: RoutedNodeMetricsRequest,
+) -> generated::NodeMetricsRequest {
+    let (target, pod_uids) = request.request.into_parts();
     generated::NodeMetricsRequest {
         request_id: request.request_id,
-        node_name: request.node_name,
-        pod_uids: request.pod_uids,
+        node_name: target.into_node_name(),
+        pod_uids,
     }
 }
 
 fn node_metrics_response_from_proto(
     response: generated::NodeMetricsResponse,
-) -> NodeMetricsResponse {
-    NodeMetricsResponse {
-        request_id: response.request_id,
-        node_name: response.node_name,
-        node: response
-            .node
-            .map(|node| crate::metrics::NodeMetricsNodeSample {
-                cpu_nanos: node.cpu_nanos,
-                memory_bytes: node.memory_bytes,
-            }),
-        pods: response
-            .pods
-            .into_iter()
-            .map(|pod| NodeMetricsPodSample {
-                namespace: pod.namespace,
-                name: pod.name,
-                uid: pod.uid,
-                containers: pod
-                    .containers
-                    .into_iter()
-                    .map(|container| NodeMetricsContainerSample {
-                        name: container.name,
-                        cpu_nanos: container.cpu_nanos,
-                        memory_bytes: container.memory_bytes,
-                    })
-                    .collect(),
-            })
-            .collect(),
-        error: response.error,
+) -> RoutedNodeMetricsResponse {
+    let request_id = response.request_id;
+    let node_name = response.node_name;
+    let result = match response.error {
+        Some(error) => Err(NodeMetricsError::unavailable(error)),
+        None => {
+            let target = match klights_node_api::NodeMetricsTarget::try_new(node_name.clone()) {
+                Ok(target) => target,
+                Err(error) => {
+                    return RoutedNodeMetricsResponse {
+                        request_id,
+                        node_name,
+                        result: Err(error),
+                    };
+                }
+            };
+            let node = response
+                .node
+                .map(|node| NodeMetricsNodeSample::new(node.cpu_nanos, node.memory_bytes));
+            let pods = response
+                .pods
+                .into_iter()
+                .map(|pod| {
+                    NodeMetricsPodSample::new(
+                        pod.namespace,
+                        pod.name,
+                        pod.uid,
+                        pod.containers
+                            .into_iter()
+                            .map(|container| {
+                                NodeMetricsContainerSample::new(
+                                    container.name,
+                                    container.cpu_nanos,
+                                    container.memory_bytes,
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            Ok(NodeMetricsResult::new(target, node, pods))
+        }
+    };
+    RoutedNodeMetricsResponse {
+        request_id,
+        node_name,
+        result,
     }
 }
 
@@ -3052,6 +3126,84 @@ mod tests {
         ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
         server_reflection_request, server_reflection_response,
     };
+
+    #[test]
+    fn node_metrics_wire_conversions_preserve_correlation_and_sample_fields() {
+        let request = crate::replication::protocol::RoutedNodeMetricsRequest {
+            request_id: "metrics-request-7".to_string(),
+            request: klights_node_api::NodeMetricsRequest::new(
+                klights_node_api::NodeMetricsTarget::try_new("worker-7").unwrap(),
+                vec!["pod-a".to_string(), "pod-b".to_string()],
+            ),
+        };
+        let request = super::node_metrics_request_to_proto(request);
+        assert_eq!(request.request_id, "metrics-request-7");
+        assert_eq!(request.node_name, "worker-7");
+        assert_eq!(request.pod_uids, ["pod-a", "pod-b"]);
+
+        let response = super::node_metrics_response_from_proto(generated::NodeMetricsResponse {
+            request_id: "metrics-request-7".to_string(),
+            node_name: "worker-7".to_string(),
+            node: Some(generated::NodeMetricsNodeSample {
+                cpu_nanos: 17,
+                memory_bytes: 23,
+            }),
+            pods: vec![generated::NodeMetricsPodSample {
+                namespace: "default".to_string(),
+                name: "pod-a".to_string(),
+                uid: "pod-a-uid".to_string(),
+                containers: vec![generated::NodeMetricsContainerSample {
+                    name: "main".to_string(),
+                    cpu_nanos: 29,
+                    memory_bytes: 31,
+                }],
+            }],
+            error: None,
+        });
+        assert_eq!(response.request_id, "metrics-request-7");
+        assert_eq!(response.node_name, "worker-7");
+        let result = response.result.unwrap();
+        assert_eq!(result.target().node_name(), "worker-7");
+        assert_eq!(result.node().unwrap().cpu_nanos(), 17);
+        assert_eq!(result.node().unwrap().memory_bytes(), 23);
+        assert_eq!(result.pods()[0].namespace(), "default");
+        assert_eq!(result.pods()[0].name(), "pod-a");
+        assert_eq!(result.pods()[0].uid(), "pod-a-uid");
+        assert_eq!(result.pods()[0].containers()[0].name(), "main");
+        assert_eq!(result.pods()[0].containers()[0].cpu_nanos(), 29);
+        assert_eq!(result.pods()[0].containers()[0].memory_bytes(), 31);
+
+        let error = super::node_metrics_response_from_proto(generated::NodeMetricsResponse {
+            request_id: "metrics-request-8".to_string(),
+            node_name: "worker-8".to_string(),
+            node: None,
+            pods: Vec::new(),
+            error: Some("runtime stats unavailable".to_string()),
+        });
+        assert_eq!(error.request_id, "metrics-request-8");
+        assert_eq!(error.node_name, "worker-8");
+        assert!(matches!(
+            error.result,
+            Err(klights_node_api::NodeMetricsError::Unavailable { ref message })
+                if message == "runtime stats unavailable"
+        ));
+
+        let mixed = super::node_metrics_response_from_proto(generated::NodeMetricsResponse {
+            request_id: "metrics-request-9".to_string(),
+            node_name: "worker-9".to_string(),
+            node: Some(generated::NodeMetricsNodeSample {
+                cpu_nanos: 99,
+                memory_bytes: 101,
+            }),
+            pods: Vec::new(),
+            error: Some("runtime failed".to_string()),
+        });
+        assert!(matches!(
+            mixed.result,
+            Err(klights_node_api::NodeMetricsError::Unavailable { ref message })
+                if message == "runtime failed"
+        ));
+    }
 
     #[test]
     fn resource_proto_body_uses_authoritative_identity_and_resource_version() {

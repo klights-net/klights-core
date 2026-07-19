@@ -1,5 +1,8 @@
 use super::*;
 use crate::api::AdmissionContextRequest;
+use klights_node_api::{
+    ExecStreamOptions as NodeExecStreamOptions, NodeExec, NodeExecRequest, NodeExecTarget,
+};
 
 /// Build a K8s metav1.Status JSON for exec exit code (v4/v5 compatible).
 /// v5 requires `metadata` and `details` fields; v4 tolerates them.
@@ -391,6 +394,27 @@ async fn pod_exec_remote_websocket_stream(
             if attach { "attach" } else { "exec" }
         ))
     })?;
+    let node_exec: Arc<dyn NodeExec> = replication;
+    let handler_target = target.clone();
+    let ExecTarget {
+        namespace,
+        pod_name,
+        container_id,
+        command,
+    } = target;
+    let node_target = NodeExecTarget::try_new(node_name, namespace, pod_name, container_id)
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let options = NodeExecStreamOptions::new(
+        stream_options.stdin,
+        stream_options.stdout,
+        stream_options.stderr,
+        stream_options.tty,
+    );
+    let node_request = if attach {
+        NodeExecRequest::attach(node_target, options)
+    } else {
+        NodeExecRequest::exec(node_target, command, options)
+    };
 
     let ws_key = req
         .headers()
@@ -405,7 +429,6 @@ async fn pod_exec_remote_websocket_stream(
     let task_supervisor = state.task_supervisor.clone();
 
     let on_upgrade = hyper::upgrade::on(req);
-    let handler_target = target.clone();
     if let Err(err) = state
         .task_supervisor
         .spawn_async(
@@ -428,22 +451,7 @@ async fn pod_exec_remote_websocket_stream(
                         )
                         .await;
 
-                        match replication
-                            .open_node_exec_stream(crate::replication::protocol::NodeExecRequest {
-                                request_id: String::new(),
-                                node_name,
-                                namespace: target.namespace,
-                                pod_name: target.pod_name,
-                                container_id: target.container_id,
-                                command: target.command,
-                                tty: stream_options.tty,
-                                stdin: stream_options.stdin,
-                                stdout: stream_options.stdout,
-                                stderr: stream_options.stderr,
-                                attach,
-                            })
-                            .await
-                        {
+                        match node_exec.open_exec(node_request).await {
                             Ok(session) => {
                                 handle_remote_exec_websocket_tungstenite(
                                     ws_stream,
@@ -516,6 +524,7 @@ async fn pod_exec_remote_spdy_stream(
             if attach { "attach" } else { "exec" }
         ))
     })?;
+    let node_exec: Arc<dyn NodeExec> = replication;
     let selected_subprotocol =
         crate::api_pod_subresources::exec_spdy::negotiate_spdy_subprotocol(req.headers());
     let task_supervisor = state.task_supervisor.clone();
@@ -540,7 +549,7 @@ async fn pod_exec_remote_spdy_stream(
                         crate::api_pod_subresources::exec_spdy::handle_remote_exec_spdy(
                             io,
                             crate::api_pod_subresources::exec_spdy::RemoteExecSpdyRequest {
-                                replication,
+                                node_exec,
                                 task_supervisor: task_supervisor_for_handler,
                                 node_name,
                                 target,
@@ -575,6 +584,7 @@ async fn pod_exec_remote_websocket_sync(
     let replication = state.replication.as_ref().cloned().ok_or_else(|| {
         AppError::Internal("replication service not available for remote pod exec".to_string())
     })?;
+    let node_exec: Arc<dyn NodeExec> = replication;
 
     let ws_key = req
         .headers()
@@ -611,7 +621,7 @@ async fn pod_exec_remote_websocket_sync(
                         handle_remote_exec_websocket_sync(
                             ws_stream,
                             RemoteExecWebSocketSyncRequest {
-                                replication,
+                                node_exec,
                                 target,
                                 subprotocol: selected_subprotocol,
                                 node_name,

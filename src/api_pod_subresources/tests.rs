@@ -567,7 +567,7 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
         None,
     )
     .unwrap();
-    let (mut follower_rx, _follower_session) = replication.register_follower(metadata).await;
+    let (mut follower_rx, follower_session) = replication.register_follower(metadata).await;
     state.replication = Some(replication.clone());
     state
         .db
@@ -612,26 +612,36 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
     else {
         panic!("expected remote pod log follow request");
     };
-    assert_eq!(request.follow.as_deref(), Some("true"));
-    assert_eq!(request.tail_lines.as_deref(), Some("200"));
+    assert!(request.follow);
+    assert_eq!(request.request.options().tail_lines(), Some(200));
 
     let mut body_task = tokio::spawn(async move { to_bytes(resp.into_body(), usize::MAX).await });
     replication
-        .complete_pod_log(crate::replication::protocol::PodLogResponse {
-            request_id: request.request_id.clone(),
-            log_content: b"tail ".to_vec(),
-            error: None,
-            fin: false,
-        })
+        .complete_node_log_event(
+            crate::replication::service::FollowerCompletionContext::new(
+                &remote_node,
+                follower_session,
+                crate::replication::service::NodeOperationKind::Log,
+            ),
+            crate::replication::protocol::RoutedNodeLogEvent {
+                request_id: request.request_id.clone(),
+                event: klights_node_api::NodeLogEvent::data(b"tail ".to_vec()),
+            },
+        )
         .await
         .unwrap();
     replication
-        .complete_pod_log(crate::replication::protocol::PodLogResponse {
-            request_id: request.request_id.clone(),
-            log_content: b"\xf6\n".to_vec(),
-            error: None,
-            fin: false,
-        })
+        .complete_node_log_event(
+            crate::replication::service::FollowerCompletionContext::new(
+                &remote_node,
+                follower_session,
+                crate::replication::service::NodeOperationKind::Log,
+            ),
+            crate::replication::protocol::RoutedNodeLogEvent {
+                request_id: request.request_id.clone(),
+                event: klights_node_api::NodeLogEvent::data(b"\xf6\n".to_vec()),
+            },
+        )
         .await
         .unwrap();
     assert!(
@@ -642,12 +652,17 @@ async fn test_remote_pod_log_follow_keeps_http_body_open_until_terminal_frame() 
     );
 
     replication
-        .complete_pod_log(crate::replication::protocol::PodLogResponse {
-            request_id: request.request_id,
-            log_content: Vec::new(),
-            error: None,
-            fin: true,
-        })
+        .complete_node_log_event(
+            crate::replication::service::FollowerCompletionContext::new(
+                &remote_node,
+                follower_session,
+                crate::replication::service::NodeOperationKind::Log,
+            ),
+            crate::replication::protocol::RoutedNodeLogEvent {
+                request_id: request.request_id,
+                event: klights_node_api::NodeLogEvent::terminal(),
+            },
+        )
         .await
         .unwrap();
     let body = tokio::time::timeout(std::time::Duration::from_secs(2), &mut body_task)
@@ -1612,30 +1627,24 @@ fn test_websocket_uses_structured_status_channel_only_for_v4_and_v5() {
 
 #[test]
 fn test_remote_exec_error_status_payload_is_terminal_without_fin() {
-    use crate::replication::protocol::{ExecStreamChannel, NodeExecStreamFrame};
+    use klights_node_api::{ExecStreamChannel, NodeExecFrame};
 
-    let frame = NodeExecStreamFrame {
-        request_id: "exec-1".to_string(),
-        channel: ExecStreamChannel::Error,
-        data: serde_json::json!({"metadata": {}, "status": "Success"})
+    let frame = NodeExecFrame::new(
+        ExecStreamChannel::Error,
+        serde_json::json!({"metadata": {}, "status": "Success"})
             .to_string()
             .into_bytes(),
-        fin: false,
-    };
+        false,
+    );
 
     assert!(remote_exec_error_frame_is_terminal(&frame));
 }
 
 #[test]
 fn test_remote_exec_non_error_frame_is_not_terminal_without_fin() {
-    use crate::replication::protocol::{ExecStreamChannel, NodeExecStreamFrame};
+    use klights_node_api::{ExecStreamChannel, NodeExecFrame};
 
-    let frame = NodeExecStreamFrame {
-        request_id: "exec-1".to_string(),
-        channel: ExecStreamChannel::Stdout,
-        data: b"done\n".to_vec(),
-        fin: false,
-    };
+    let frame = NodeExecFrame::new(ExecStreamChannel::Stdout, b"done\n".to_vec(), false);
 
     assert!(!remote_exec_error_frame_is_terminal(&frame));
 }
@@ -1872,8 +1881,9 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
     use std::net::{IpAddr, Ipv4Addr};
 
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
-    use crate::replication::protocol::{FollowerControlMessage, NodeExecSyncResponse};
+    use crate::replication::protocol::{FollowerControlMessage, RoutedNodeExecSyncResponse};
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_node_api::{NodeExec, NodeExecSyncResult};
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
@@ -1884,7 +1894,7 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
         db,
         supervisor.clone(),
     ));
-    let (mut follower_rx, _follower_session) = replication
+    let (mut follower_rx, follower_session) = replication
         .register_follower(DataplanePeerMetadata {
             node_name: "worker-1".to_string(),
             mode: DataplaneMode::Root,
@@ -1901,13 +1911,17 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
             return;
         };
         replication_for_follower
-            .complete_node_exec_sync(NodeExecSyncResponse {
-                request_id: request.request_id,
-                stdout: b"worker-stdout\n".to_vec(),
-                stderr: Vec::new(),
-                exit_code: 0,
-                error: None,
-            })
+            .complete_node_exec_sync(
+                crate::replication::service::FollowerCompletionContext::new(
+                    "worker-1",
+                    follower_session,
+                    crate::replication::service::NodeOperationKind::ExecSync,
+                ),
+                RoutedNodeExecSyncResponse {
+                    request_id: request.request_id,
+                    result: NodeExecSyncResult::success(b"worker-stdout\n".to_vec(), Vec::new(), 0),
+                },
+            )
             .await
             .unwrap();
     });
@@ -1921,7 +1935,7 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
     let server = tokio::spawn(handle_remote_exec_websocket_sync(
         server_ws,
         RemoteExecWebSocketSyncRequest {
-            replication,
+            node_exec: replication as Arc<dyn NodeExec>,
             target: ExecTarget {
                 namespace: "default".to_string(),
                 pod_name: "worker-pod".to_string(),
@@ -1978,9 +1992,10 @@ async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
     use std::net::{IpAddr, Ipv4Addr};
 
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
-    use crate::replication::protocol::{FollowerControlMessage, NodeExecSyncResponse};
+    use crate::replication::protocol::{FollowerControlMessage, RoutedNodeExecSyncResponse};
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use futures::{SinkExt as _, StreamExt as _};
+    use klights_node_api::{NodeExec, NodeExecSyncResult};
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
@@ -1991,7 +2006,7 @@ async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
         db,
         supervisor.clone(),
     ));
-    let (mut follower_rx, _follower_session) = replication
+    let (mut follower_rx, follower_session) = replication
         .register_follower(DataplanePeerMetadata {
             node_name: "worker-1".to_string(),
             mode: DataplaneMode::Root,
@@ -2008,13 +2023,17 @@ async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
             return;
         };
         replication_for_follower
-            .complete_node_exec_sync(NodeExecSyncResponse {
-                request_id: request.request_id,
-                stdout: b"worker-stdout\n".to_vec(),
-                stderr: Vec::new(),
-                exit_code: 0,
-                error: None,
-            })
+            .complete_node_exec_sync(
+                crate::replication::service::FollowerCompletionContext::new(
+                    "worker-1",
+                    follower_session,
+                    crate::replication::service::NodeOperationKind::ExecSync,
+                ),
+                RoutedNodeExecSyncResponse {
+                    request_id: request.request_id,
+                    result: NodeExecSyncResult::success(b"worker-stdout\n".to_vec(), Vec::new(), 0),
+                },
+            )
             .await
             .unwrap();
     });
@@ -2028,7 +2047,7 @@ async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
     let mut server = tokio::spawn(handle_remote_exec_websocket_sync(
         server_ws,
         RemoteExecWebSocketSyncRequest {
-            replication,
+            node_exec: replication as Arc<dyn NodeExec>,
             target: ExecTarget {
                 namespace: "default".to_string(),
                 pod_name: "worker-pod".to_string(),

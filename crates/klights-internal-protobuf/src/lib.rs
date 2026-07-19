@@ -23,6 +23,149 @@ mod tests {
     const COMMITTED_APPLY_RV_V1: u64 = 1 << 0;
 
     #[test]
+    fn private_stream_envelope_tags_preserve_every_preexisting_payload() {
+        let follower_cases = [
+            (
+                "join",
+                FollowerMessage {
+                    payload: Some(follower_message::Payload::Join(Default::default())),
+                },
+                0x0a,
+            ),
+            (
+                "ack",
+                FollowerMessage {
+                    payload: Some(follower_message::Payload::Ack(Default::default())),
+                },
+                0x1a,
+            ),
+            (
+                "exec_sync",
+                FollowerMessage {
+                    payload: Some(follower_message::Payload::NodeExecSyncResponse(
+                        Default::default(),
+                    )),
+                },
+                0x22,
+            ),
+            (
+                "logs",
+                FollowerMessage {
+                    payload: Some(follower_message::Payload::PodLogResponse(Default::default())),
+                },
+                0x2a,
+            ),
+            (
+                "exec_stream",
+                FollowerMessage {
+                    payload: Some(follower_message::Payload::NodeExecStreamFrame(
+                        Default::default(),
+                    )),
+                },
+                0x32,
+            ),
+            (
+                "observed_endpoint",
+                FollowerMessage {
+                    payload: Some(follower_message::Payload::ObservedLeaderEndpoint(
+                        Default::default(),
+                    )),
+                },
+                0x3a,
+            ),
+            (
+                "metrics",
+                FollowerMessage {
+                    payload: Some(follower_message::Payload::NodeMetricsResponse(
+                        Default::default(),
+                    )),
+                },
+                0x42,
+            ),
+        ];
+        for (name, message, expected_key) in follower_cases {
+            let encoded = message.encode_to_vec();
+            assert_eq!(encoded, [expected_key, 0], "follower {name}");
+            assert_eq!(
+                FollowerMessage::decode(encoded.as_slice()).unwrap(),
+                message
+            );
+        }
+
+        let leader_cases = [
+            (
+                "join",
+                LeaderMessage {
+                    payload: Some(leader_message::Payload::JoinResponse(Default::default())),
+                },
+                0x0a,
+            ),
+            (
+                "stream_item",
+                LeaderMessage {
+                    payload: Some(leader_message::Payload::StreamItem(Default::default())),
+                },
+                0x1a,
+            ),
+            (
+                "exec_sync",
+                LeaderMessage {
+                    payload: Some(leader_message::Payload::NodeExecSyncRequest(
+                        Default::default(),
+                    )),
+                },
+                0x22,
+            ),
+            (
+                "logs",
+                LeaderMessage {
+                    payload: Some(leader_message::Payload::PodLogRequest(Default::default())),
+                },
+                0x2a,
+            ),
+            (
+                "exec_stream_request",
+                LeaderMessage {
+                    payload: Some(leader_message::Payload::NodeExecRequest(Default::default())),
+                },
+                0x32,
+            ),
+            (
+                "exec_stream_frame",
+                LeaderMessage {
+                    payload: Some(leader_message::Payload::NodeExecStreamFrame(
+                        Default::default(),
+                    )),
+                },
+                0x3a,
+            ),
+            (
+                "observe_endpoint",
+                LeaderMessage {
+                    payload: Some(leader_message::Payload::ObserveLeaderEndpointRequest(
+                        Default::default(),
+                    )),
+                },
+                0x42,
+            ),
+            (
+                "metrics",
+                LeaderMessage {
+                    payload: Some(leader_message::Payload::NodeMetricsRequest(
+                        Default::default(),
+                    )),
+                },
+                0x4a,
+            ),
+        ];
+        for (name, message, expected_key) in leader_cases {
+            let encoded = message.encode_to_vec();
+            assert_eq!(encoded, [expected_key, 0], "leader {name}");
+            assert_eq!(LeaderMessage::decode(encoded.as_slice()).unwrap(), message);
+        }
+    }
+
+    #[test]
     fn metadata_supported_features_defaults_to_zero_and_round_trips_v1() {
         let legacy = MetadataResponse {
             cluster_id: "legacy".to_string(),

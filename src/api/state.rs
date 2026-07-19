@@ -46,6 +46,8 @@ pub struct AppState {
     pub nodeport_alloc: std::sync::Arc<crate::controllers::service::NodePortAllocator>,
     pub cri: Option<std::sync::Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
     pub metrics_provider: std::sync::Arc<dyn crate::metrics::MetricsProvider>,
+    /// Root-composed control-plane capability for Pod port-forward sessions.
+    pub node_port_forward: std::sync::Arc<dyn klights_node_api::NodePortForward>,
     pub controller_dispatcher: std::sync::Arc<crate::controller_dispatcher::ControllerDispatcher>,
     /// Centralized post-mutation side-effect dispatch (P3d-1). HTTP mutation
     /// handlers call [`SideEffectRegistry::run_hooks`] after their datastore

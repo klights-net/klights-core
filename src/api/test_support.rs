@@ -71,6 +71,7 @@ pub async fn build_test_app_state() -> crate::api::AppState {
         nodeport_alloc,
         cri: None,
         metrics_provider: Arc::new(crate::metrics::FallbackOnlyMetricsProvider),
+        node_port_forward: crate::portforward::local_node_port_forward(task_supervisor.clone()),
         controller_dispatcher,
         side_effects,
         metrics,

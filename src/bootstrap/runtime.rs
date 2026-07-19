@@ -95,19 +95,15 @@ async fn start_controlplane_leader_control_stream_if_needed(
     let client = client.expect("checked above");
 
     if let Some(cri) = cri_for_api {
-        let exec_handler = std::sync::Arc::new(
-            crate::replication::grpc::client::CriNodeExecSyncHandler::new(
+        let exec_handler =
+            std::sync::Arc::new(crate::replication::grpc::client::CriNodeExecRuntime::new(
                 cri.clone(),
                 task_supervisor.clone(),
-            ),
-        );
+            ));
+        client.set_node_exec_runtime(exec_handler).await;
         client
-            .set_node_exec_sync_handler(exec_handler.clone())
-            .await;
-        client.set_node_exec_stream_handler(exec_handler).await;
-        client
-            .set_node_metrics_handler(std::sync::Arc::new(
-                crate::replication::grpc::client::CriNodeMetricsHandler::new(
+            .set_node_metrics_runtime(std::sync::Arc::new(
+                crate::replication::grpc::client::CriNodeMetricsRuntime::new(
                     cri.clone(),
                     task_supervisor.clone(),
                 ),
@@ -115,8 +111,8 @@ async fn start_controlplane_leader_control_stream_if_needed(
             .await;
     }
     client
-        .set_pod_log_handler(std::sync::Arc::new(
-            crate::replication::grpc::client::LocalPodLogHandler::new_with_pod_event_store(
+        .set_node_log_runtime(std::sync::Arc::new(
+            crate::replication::grpc::client::LocalNodeLogRuntime::new_with_pod_event_store(
                 config.containerd_namespace.clone(),
                 task_supervisor.clone(),
                 crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(

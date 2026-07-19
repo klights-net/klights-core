@@ -5,6 +5,10 @@
 //! equivalents in the `klights-internal-protobuf` replication schema.
 
 use anyhow::{Context, Result, anyhow};
+use klights_node_api::{
+    NodeExecFrame, NodeExecRequest, NodeExecSyncRequest, NodeExecSyncResult, NodeMetricsError,
+    NodeMetricsRequest, NodeMetricsResult,
+};
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
 
@@ -13,7 +17,6 @@ use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::types::{
     NodeSubnet, PodSlotAdmissionResult, PodSlotAdmissionState, Resource,
 };
-use crate::metrics::NodeMetricsRequest;
 use crate::networking::{NodeName, PodSubnet};
 
 /// A replication envelope wrapping a command with its metadata.
@@ -119,138 +122,71 @@ pub enum StreamItem {
     Heartbeat { current_rv: i64 },
 }
 
-/// Leader-to-follower node API request for non-interactive CRI ExecSync.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeExecSyncRequest {
-    pub request_id: String,
-    pub node_name: String,
-    pub namespace: String,
-    pub pod_name: String,
-    pub container_id: String,
-    pub command: Vec<String>,
-    pub timeout_seconds: i64,
+/// Replication-private correlation envelope. The request itself is owned by
+/// `klights-node-api`; only transport routing identity lives here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutedNodeExecSyncRequest {
+    pub(crate) request_id: String,
+    pub(crate) request: NodeExecSyncRequest,
 }
 
-/// Follower-to-leader response for a node-local ExecSync request.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeExecSyncResponse {
-    pub request_id: String,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub exit_code: i32,
-    pub error: Option<String>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutedNodeExecSyncResponse {
+    pub(crate) request_id: String,
+    pub(crate) result: NodeExecSyncResult,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ExecStreamChannel {
-    Stdin,
-    Stdout,
-    Stderr,
-    Error,
-    Resize,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutedNodeExecRequest {
+    pub(crate) request_id: String,
+    pub(crate) request: NodeExecRequest,
 }
 
-impl ExecStreamChannel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ExecStreamChannel::Stdin => "stdin",
-            ExecStreamChannel::Stdout => "stdout",
-            ExecStreamChannel::Stderr => "stderr",
-            ExecStreamChannel::Error => "error",
-            ExecStreamChannel::Resize => "resize",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "stdin" => Some(ExecStreamChannel::Stdin),
-            "stdout" => Some(ExecStreamChannel::Stdout),
-            "stderr" => Some(ExecStreamChannel::Stderr),
-            "error" => Some(ExecStreamChannel::Error),
-            "resize" => Some(ExecStreamChannel::Resize),
-            _ => None,
-        }
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutedNodeExecFrame {
+    pub(crate) request_id: String,
+    pub(crate) frame: NodeExecFrame,
 }
 
-/// Leader-to-follower node API request for streaming CRI Exec.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeExecRequest {
-    pub request_id: String,
-    pub node_name: String,
-    pub namespace: String,
-    pub pod_name: String,
-    pub container_id: String,
-    pub command: Vec<String>,
-    pub tty: bool,
-    pub stdin: bool,
-    pub stdout: bool,
-    pub stderr: bool,
-    pub attach: bool,
+/// Replication-private correlation envelope for a node log request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutedNodeLogRequest {
+    pub(crate) request_id: String,
+    pub(crate) follow: bool,
+    pub(crate) request: klights_node_api::NodeLogRequest,
 }
 
-/// One data/control frame for a node-local streaming Exec session.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeExecStreamFrame {
-    pub request_id: String,
-    pub channel: ExecStreamChannel,
-    pub data: Vec<u8>,
-    pub fin: bool,
+/// Replication-private correlation envelope for a node log event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutedNodeLogEvent {
+    pub(crate) request_id: String,
+    pub(crate) event: klights_node_api::NodeLogEvent,
 }
 
-pub fn exec_error_status_payload_is_terminal(data: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(data)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("status")
-                .and_then(|status| status.as_str())
-                .map(|status| status == "Success" || status == "Failure")
-        })
-        .unwrap_or(false)
+/// Replication-private correlation envelope for one node metrics request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutedNodeMetricsRequest {
+    pub(crate) request_id: String,
+    pub(crate) request: NodeMetricsRequest,
 }
 
-pub fn node_exec_error_frame_is_terminal(frame: &NodeExecStreamFrame) -> bool {
-    frame.channel == ExecStreamChannel::Error
-        && (frame.fin || exec_error_status_payload_is_terminal(&frame.data))
-}
-
-/// Request from the leader to a follower node to read pod container logs.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodLogRequest {
-    pub request_id: String,
-    pub node_name: String,
-    pub namespace: String,
-    pub pod_name: String,
-    pub pod_uid: String,
-    pub container_name: String,
-    pub follow: Option<String>,
-    pub tail_lines: Option<String>,
-    pub timestamps: Option<String>,
-    pub since_time: Option<String>,
-    pub since_seconds: Option<i64>,
-    pub limit_bytes: Option<i64>,
-    pub previous: Option<String>,
-}
-
-/// Response from a follower node with pod container log content.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PodLogResponse {
-    pub request_id: String,
-    pub log_content: Vec<u8>,
-    pub error: Option<String>,
-    pub fin: bool,
+/// Replication-private correlation envelope for one node metrics result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RoutedNodeMetricsResponse {
+    pub(crate) request_id: String,
+    pub(crate) node_name: String,
+    pub(crate) result: Result<NodeMetricsResult, NodeMetricsError>,
 }
 
 /// Per-follower control messages emitted by the leader onto the existing
 /// follower-initiated stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FollowerControlMessage {
-    NodeExecSync(NodeExecSyncRequest),
-    NodeExec(NodeExecRequest),
-    NodeExecFrame(NodeExecStreamFrame),
-    PodLog(PodLogRequest),
-    NodeMetrics(NodeMetricsRequest),
+pub(crate) enum FollowerControlMessage {
+    NodeExecSync(RoutedNodeExecSyncRequest),
+    NodeExec(RoutedNodeExecRequest),
+    NodeExecFrame(RoutedNodeExecFrame),
+    PodLog(RoutedNodeLogRequest),
+    NodeMetrics(RoutedNodeMetricsRequest),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

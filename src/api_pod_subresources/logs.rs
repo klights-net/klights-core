@@ -1,10 +1,10 @@
 use super::*;
 use crate::datastore::{CurrentResourceVersionStore, WatchStore};
-use crate::replication::protocol::PodLogRequest;
 use crate::watch::{
     EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
     WindowPolicy,
 };
+use klights_node_api::{NodeLog, NodeLogOptions, NodeLogRequest, NodeLogTarget};
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -36,7 +36,7 @@ pub struct LogQuery {
 }
 
 struct RemotePodLogRequest<'a> {
-    state: Arc<AppState>,
+    node_log: Arc<dyn NodeLog>,
     namespace: &'a str,
     name: &'a str,
     pod_uid: &'a str,
@@ -46,7 +46,8 @@ struct RemotePodLogRequest<'a> {
 }
 
 struct RemotePodLogWebSocketRequest {
-    state: Arc<AppState>,
+    node_log: Arc<dyn NodeLog>,
+    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     namespace: String,
     name: String,
     pod_uid: String,
@@ -161,9 +162,13 @@ pub async fn get_pod_log(
             .and_then(|m| m.get("uid"))
             .and_then(|u| u.as_str())
             .ok_or_else(|| AppError::Internal("Pod has no UID".to_string()))?;
+        let node_log: Arc<dyn NodeLog> = state.replication.as_ref().cloned().ok_or_else(|| {
+            AppError::Internal("replication service not available for remote pod log".to_string())
+        })?;
         if is_pod_log_websocket_upgrade(req.headers()) {
             return get_remote_pod_log_websocket(RemotePodLogWebSocketRequest {
-                state,
+                node_log,
+                task_supervisor: state.task_supervisor.clone(),
                 namespace,
                 name,
                 pod_uid: pod_uid.to_string(),
@@ -175,7 +180,7 @@ pub async fn get_pod_log(
             .await;
         }
         return get_remote_pod_log(RemotePodLogRequest {
-            state,
+            node_log,
             namespace: &namespace,
             name: &name,
             pod_uid,
@@ -1732,7 +1737,7 @@ fn anyhow_to_io_error(error: anyhow::Error) -> io::Error {
 
 async fn get_remote_pod_log(request: RemotePodLogRequest<'_>) -> Result<Response, AppError> {
     let RemotePodLogRequest {
-        state,
+        node_log,
         namespace,
         name,
         pod_uid,
@@ -1740,29 +1745,13 @@ async fn get_remote_pod_log(request: RemotePodLogRequest<'_>) -> Result<Response
         params,
         node_name,
     } = request;
-    let replication = state.replication.as_ref().cloned().ok_or_else(|| {
-        AppError::Internal("replication service not available for remote pod log".to_string())
-    })?;
+    let follow = params.follow.as_deref() == Some("true");
+    let request =
+        pod_log_request_from_parts(node_name, namespace, name, pod_uid, container_name, params)?;
 
-    let request = PodLogRequest {
-        request_id: String::new(),
-        node_name: node_name.to_string(),
-        namespace: namespace.to_string(),
-        pod_name: name.to_string(),
-        pod_uid: pod_uid.to_string(),
-        container_name: container_name.to_string(),
-        follow: params.follow.clone(),
-        tail_lines: params.tail_lines.map(|t| t.to_string()),
-        timestamps: params.timestamps.clone(),
-        since_time: params.since_time.clone(),
-        since_seconds: params.since_seconds,
-        limit_bytes: params.limit_bytes.map(|l| l as i64),
-        previous: params.previous.clone(),
-    };
-
-    if params.follow.as_deref() == Some("true") {
-        let mut session = replication
-            .request_pod_log_stream(request)
+    if follow {
+        let mut session = node_log
+            .open_logs(request)
             .await
             .map_err(|e| AppError::BadGateway(format!("remote pod log request failed: {e}")))?;
         let trace_namespace = namespace.to_string();
@@ -1775,9 +1764,11 @@ async fn get_remote_pod_log(request: RemotePodLogRequest<'_>) -> Result<Response
                 format!("{trace_namespace}/{trace_name}:{trace_container}@{trace_node}"),
             );
             loop {
-                match session.recv_response().await {
+                match session.recv_frame().await {
                     Ok(Some(response)) => {
-                        if let Some(error) = response.error {
+                        let terminal = response.is_terminal();
+                        let (content, terminal_error, _) = response.into_parts();
+                        if let Some(error) = terminal_error {
                             tracing::warn!(
                                 target: "klights::pod_logs",
                                 namespace = %trace_namespace,
@@ -1787,14 +1778,14 @@ async fn get_remote_pod_log(request: RemotePodLogRequest<'_>) -> Result<Response
                                 error = %error,
                                 "remote pod log follow returned error"
                             );
-                            session.close().await;
+                            let _ = session.cancel().await;
                             yield Err(std::io::Error::other(format!("remote pod log error: {error}")));
                             break;
                         }
-                        if !response.log_content.is_empty() {
-                            yield Ok(response.log_content);
+                        if !content.is_empty() {
+                            yield Ok(content);
                         }
-                        if response.fin {
+                        if terminal {
                             tracing::info!(
                                 target: "klights::pod_logs",
                                 namespace = %trace_namespace,
@@ -1803,7 +1794,7 @@ async fn get_remote_pod_log(request: RemotePodLogRequest<'_>) -> Result<Response
                                 node = %trace_node,
                                 "remote pod log follow received terminal frame"
                             );
-                            session.close().await;
+                            let _ = session.cancel().await;
                             break;
                         }
                     }
@@ -1816,6 +1807,7 @@ async fn get_remote_pod_log(request: RemotePodLogRequest<'_>) -> Result<Response
                             node = %trace_node,
                             "remote pod log follow session closed without terminal frame"
                         );
+                        let _ = session.cancel().await;
                         break;
                     }
                     Err(err) => {
@@ -1828,7 +1820,7 @@ async fn get_remote_pod_log(request: RemotePodLogRequest<'_>) -> Result<Response
                             error = %err,
                             "remote pod log follow session receive failed"
                         );
-                        session.close().await;
+                        let _ = session.cancel().await;
                         yield Err(std::io::Error::other(format!("remote pod log stream failed: {err}")));
                         break;
                     }
@@ -1839,22 +1831,48 @@ async fn get_remote_pod_log(request: RemotePodLogRequest<'_>) -> Result<Response
         return build_text_log_response(axum::body::Body::from_stream(stream));
     }
 
-    let response = replication
-        .request_pod_log(request)
+    let response = node_log
+        .read_logs(request)
         .await
         .map_err(|e| AppError::BadGateway(format!("remote pod log request failed: {e}")))?;
 
-    if let Some(error) = response.error {
+    let (content, terminal_error) = response.into_parts();
+    if let Some(error) = terminal_error {
         return Err(AppError::Internal(format!("remote pod log error: {error}")));
     }
 
-    build_text_log_response(axum::body::Body::from(response.log_content))
+    build_text_log_response(axum::body::Body::from(content))
 }
 
 struct PodLogFollowTrace {
     mode: &'static str,
     target: String,
     started: std::time::Instant,
+}
+
+fn pod_log_request_from_parts(
+    node_name: &str,
+    namespace: &str,
+    pod_name: &str,
+    pod_uid: &str,
+    container_name: &str,
+    params: LogQuery,
+) -> Result<NodeLogRequest, AppError> {
+    let target = NodeLogTarget::try_new(node_name, namespace, pod_name, pod_uid, container_name)
+        .map_err(|err| AppError::BadRequest(format!("invalid pod log target: {err}")))?;
+
+    Ok(NodeLogRequest::new(
+        target,
+        NodeLogOptions::new(
+            params.follow,
+            params.tail_lines,
+            params.timestamps,
+            params.since_time,
+            params.since_seconds,
+            params.limit_bytes,
+            params.previous,
+        ),
+    ))
 }
 
 impl PodLogFollowTrace {
@@ -1889,7 +1907,8 @@ async fn get_remote_pod_log_websocket(
     request: RemotePodLogWebSocketRequest,
 ) -> Result<Response, AppError> {
     let RemotePodLogWebSocketRequest {
-        state,
+        node_log,
+        task_supervisor,
         namespace,
         name,
         pod_uid,
@@ -1905,25 +1924,16 @@ async fn get_remote_pod_log_websocket(
         .clone();
     let subprotocol = negotiate_pod_log_websocket_subprotocol(req.headers());
     let on_upgrade = hyper::upgrade::on(req);
-    let replication = state.replication.as_ref().cloned();
-    let request = PodLogRequest {
-        request_id: String::new(),
-        node_name,
-        namespace,
-        pod_name: name,
-        pod_uid,
-        container_name,
-        follow: params.follow.clone(),
-        tail_lines: params.tail_lines.map(|t| t.to_string()),
-        timestamps: params.timestamps.clone(),
-        since_time: params.since_time.clone(),
-        since_seconds: params.since_seconds,
-        limit_bytes: params.limit_bytes.map(|l| l as i64),
-        previous: params.previous.clone(),
-    };
+    let request = pod_log_request_from_parts(
+        &node_name,
+        &namespace,
+        &name,
+        &pod_uid,
+        &container_name,
+        params,
+    )?;
 
-    if let Err(err) = state
-        .task_supervisor
+    if let Err(err) = task_supervisor
         .spawn_async(
             crate::task_supervisor::TaskCategory::Others,
             "pod_log_remote_ws_upgrade",
@@ -1942,7 +1952,7 @@ async fn get_remote_pod_log_websocket(
                         .await;
                         handle_remote_pod_log_websocket_tungstenite(
                             ws_stream,
-                            replication,
+                            Some(node_log),
                             request,
                         )
                         .await;
@@ -1963,8 +1973,8 @@ async fn get_remote_pod_log_websocket(
 
 pub async fn handle_remote_pod_log_websocket_tungstenite<S>(
     mut socket: tokio_tungstenite::WebSocketStream<S>,
-    replication: Option<Arc<crate::replication::ReplicationService>>,
-    request: PodLogRequest,
+    node_log: Option<Arc<dyn NodeLog>>,
+    request: NodeLogRequest,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -1972,13 +1982,14 @@ pub async fn handle_remote_pod_log_websocket_tungstenite<S>(
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-    let output = match replication {
-        Some(replication) => match replication.request_pod_log(request).await {
+    let output = match node_log {
+        Some(node_log) => match node_log.read_logs(request).await {
             Ok(response) => {
-                if let Some(error) = response.error {
+                let (content, terminal_error) = response.into_parts();
+                if let Some(error) = terminal_error {
                     Err(format!("remote pod log error: {error}"))
                 } else {
-                    Ok(response.log_content)
+                    Ok(content)
                 }
             }
             Err(err) => Err(format!("remote pod log request failed: {err}")),

@@ -2,7 +2,6 @@ use crate::datastore::Resource;
 use crate::kubelet::pod_resources::{parse_cpu_resource, parse_memory_resource};
 use anyhow::{Context as _, anyhow};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
@@ -10,124 +9,38 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 
+use klights_node_api::NodeMetrics;
+use klights_node_api::{
+    NodeMetricsContainerSample, NodeMetricsError, NodeMetricsNodeSample, NodeMetricsPodSample,
+    NodeMetricsRequest, NodeMetricsResult, NodeMetricsTarget,
+};
+
 pub const METRICS_API_VERSION: &str = "metrics.k8s.io/v1beta1";
 pub const METRICS_WINDOW: &str = "30s";
 
 const NODE_CPU_SAMPLE_DELAY: Duration = Duration::from_millis(100);
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NodeMetricsRequest {
-    pub request_id: String,
-    pub node_name: String,
-    pub pod_uids: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NodeMetricsResponse {
-    pub request_id: String,
-    pub node_name: String,
-    pub node: Option<NodeMetricsNodeSample>,
-    pub pods: Vec<NodeMetricsPodSample>,
-    pub error: Option<String>,
-}
-
-impl NodeMetricsResponse {
-    pub fn error(request_id: String, node_name: String, error: impl Into<String>) -> Self {
-        Self {
-            request_id,
-            node_name,
-            node: None,
-            pods: Vec::new(),
-            error: Some(error.into()),
-        }
-    }
-
-    pub fn from_node_sample(
-        request_id: String,
-        node_name: String,
-        node: NodeMetricsNodeSample,
-    ) -> Self {
-        Self {
-            request_id,
-            node_name,
-            node: Some(node),
-            pods: Vec::new(),
-            error: None,
-        }
-    }
-
-    pub fn from_pod_sandbox_stats(
-        request: &NodeMetricsRequest,
-        node: Option<NodeMetricsNodeSample>,
-        stats: Vec<k8s_cri::v1::PodSandboxStats>,
-    ) -> Self {
-        let wanted_uids: BTreeSet<&str> = request
-            .pod_uids
-            .iter()
-            .map(String::as_str)
-            .filter(|uid| !uid.is_empty())
-            .collect();
-        let pods = stats
-            .into_iter()
-            .filter_map(RuntimePodSample::from_cri)
-            .filter(|sample| wanted_uids.is_empty() || wanted_uids.contains(sample.uid.as_str()))
-            .map(NodeMetricsPodSample::from)
-            .collect();
-
-        Self {
-            request_id: request.request_id.clone(),
-            node_name: request.node_name.clone(),
-            node,
-            pods,
-            error: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NodeMetricsNodeSample {
-    pub cpu_nanos: u64,
-    pub memory_bytes: u64,
-}
-
 impl From<NodeMetricsNodeSample> for ResourceUsage {
     fn from(sample: NodeMetricsNodeSample) -> Self {
-        Self::new(sample.cpu_nanos, sample.memory_bytes)
+        Self::new(sample.cpu_nanos(), sample.memory_bytes())
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NodeMetricsPodSample {
-    pub namespace: String,
-    pub name: String,
-    pub uid: String,
-    pub containers: Vec<NodeMetricsContainerSample>,
 }
 
 impl From<RuntimePodSample> for NodeMetricsPodSample {
     fn from(sample: RuntimePodSample) -> Self {
-        Self {
-            namespace: sample.namespace,
-            name: sample.name,
-            uid: sample.uid,
-            containers: sample
+        Self::new(
+            sample.namespace,
+            sample.name,
+            sample.uid,
+            sample
                 .containers
                 .into_iter()
-                .map(|(name, usage)| NodeMetricsContainerSample {
-                    name,
-                    cpu_nanos: usage.cpu_nanos,
-                    memory_bytes: usage.memory_bytes,
+                .map(|(name, usage)| {
+                    NodeMetricsContainerSample::new(name, usage.cpu_nanos, usage.memory_bytes)
                 })
                 .collect(),
-        }
+        )
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct NodeMetricsContainerSample {
-    pub name: String,
-    pub cpu_nanos: u64,
-    pub memory_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -318,25 +231,25 @@ impl RuntimeMetricsSnapshot {
         snapshot
     }
 
-    pub fn from_node_metrics_responses(
-        responses: impl IntoIterator<Item = NodeMetricsResponse>,
+    pub fn from_node_metrics_results(
+        results: impl IntoIterator<Item = Result<NodeMetricsResult, NodeMetricsError>>,
     ) -> Self {
         let mut snapshot = Self::default();
-        for response in responses {
-            if let Some(error) = response.error {
-                tracing::debug!(
-                    node = %response.node_name,
-                    %error,
-                    "node runtime metrics unavailable"
-                );
-                continue;
-            }
-            if let Some(node) = response.node {
+        for result in results {
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::debug!(%error, "node runtime metrics unavailable");
+                    continue;
+                }
+            };
+            let (target, node, pods) = result.into_parts();
+            if let Some(node) = node {
                 snapshot
                     .node_usage
-                    .insert(response.node_name.clone(), ResourceUsage::from(node));
+                    .insert(target.into_node_name(), ResourceUsage::from(node));
             }
-            for sample in response.pods {
+            for sample in pods {
                 snapshot.insert_sample(RuntimePodSample::from(sample));
             }
         }
@@ -403,18 +316,16 @@ impl RuntimePodSample {
 
 impl From<NodeMetricsPodSample> for RuntimePodSample {
     fn from(sample: NodeMetricsPodSample) -> Self {
+        let (namespace, name, uid, containers) = sample.into_parts();
         Self {
-            uid: sample.uid,
-            namespace: sample.namespace,
-            name: sample.name,
-            containers: sample
-                .containers
+            uid,
+            namespace,
+            name,
+            containers: containers
                 .into_iter()
                 .map(|container| {
-                    (
-                        container.name,
-                        ResourceUsage::new(container.cpu_nanos, container.memory_bytes),
-                    )
+                    let (name, cpu_nanos, memory_bytes) = container.into_parts();
+                    (name, ResourceUsage::new(cpu_nanos, memory_bytes))
                 })
                 .collect(),
         }
@@ -438,8 +349,11 @@ impl MetricsProvider for FallbackOnlyMetricsProvider {
 
 #[derive(Default)]
 struct NodeMetricsRequestCoalescer {
-    in_flight: Mutex<HashMap<String, watch::Receiver<Option<NodeMetricsResponse>>>>,
+    in_flight: Mutex<HashMap<String, NodeMetricsResponseWatch>>,
 }
+
+type NodeMetricsResponseWatch =
+    watch::Receiver<Option<Result<NodeMetricsResult, NodeMetricsError>>>;
 
 impl NodeMetricsRequestCoalescer {
     async fn get_or_spawn<F>(
@@ -447,9 +361,9 @@ impl NodeMetricsRequestCoalescer {
         node_name: String,
         supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
         fetch: F,
-    ) -> NodeMetricsResponse
+    ) -> Result<NodeMetricsResult, NodeMetricsError>
     where
-        F: Future<Output = NodeMetricsResponse> + Send + 'static,
+        F: Future<Output = Result<NodeMetricsResult, NodeMetricsError>> + Send + 'static,
     {
         let (receiver, should_spawn, sender) = {
             let mut in_flight = self.in_flight.lock().await;
@@ -479,11 +393,9 @@ impl NodeMetricsRequestCoalescer {
                 .await;
             if let Err(error) = spawn_result {
                 self.in_flight.lock().await.remove(&node_name);
-                return NodeMetricsResponse::error(
-                    String::new(),
-                    node_name,
-                    format!("failed to spawn node metrics request: {error:#}"),
-                );
+                return Err(NodeMetricsError::unavailable(format!(
+                    "failed to spawn node metrics request for '{node_name}': {error:#}"
+                )));
             }
         }
 
@@ -492,19 +404,17 @@ impl NodeMetricsRequestCoalescer {
 }
 
 async fn await_node_metrics_response(
-    mut receiver: watch::Receiver<Option<NodeMetricsResponse>>,
+    mut receiver: watch::Receiver<Option<Result<NodeMetricsResult, NodeMetricsError>>>,
     node_name: String,
-) -> NodeMetricsResponse {
+) -> Result<NodeMetricsResult, NodeMetricsError> {
     loop {
         if let Some(response) = receiver.borrow().clone() {
             return response;
         }
         if receiver.changed().await.is_err() {
-            return NodeMetricsResponse::error(
-                String::new(),
-                node_name,
-                "node metrics request closed before response",
-            );
+            return Err(NodeMetricsError::closed(format!(
+                "node '{node_name}' metrics request closed before response"
+            )));
         }
     }
 }
@@ -512,7 +422,7 @@ async fn await_node_metrics_response(
 pub struct OnDemandMetricsProvider {
     local_node_name: String,
     cri: Option<Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
-    replication: Option<Arc<crate::replication::ReplicationService>>,
+    node_metrics: Option<Arc<dyn NodeMetrics>>,
     supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     coalescer: Arc<NodeMetricsRequestCoalescer>,
 }
@@ -521,22 +431,25 @@ impl OnDemandMetricsProvider {
     pub fn new(
         local_node_name: String,
         cri: Option<Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
-        replication: Option<Arc<crate::replication::ReplicationService>>,
+        node_metrics: Option<Arc<dyn NodeMetrics>>,
         supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     ) -> Self {
         Self {
             local_node_name,
             cri,
-            replication,
+            node_metrics,
             supervisor,
             coalescer: Arc::new(NodeMetricsRequestCoalescer::default()),
         }
     }
 
-    async fn collect_node_metrics(&self, node_name: String) -> NodeMetricsResponse {
+    async fn collect_node_metrics(
+        &self,
+        node_name: String,
+    ) -> Result<NodeMetricsResult, NodeMetricsError> {
         let local_node_name = self.local_node_name.clone();
         let cri = self.cri.clone();
-        let replication = self.replication.clone();
+        let node_metrics = self.node_metrics.clone();
         let request_node_name = node_name.clone();
         let supervisor = self.supervisor.clone();
         let fetch_supervisor = supervisor.clone();
@@ -544,26 +457,15 @@ impl OnDemandMetricsProvider {
             .get_or_spawn(node_name.clone(), supervisor, async move {
                 if request_node_name == local_node_name {
                     collect_local_cri_node_metrics(cri, request_node_name, fetch_supervisor).await
-                } else if let Some(replication) = replication {
-                    let request = NodeMetricsRequest {
-                        request_id: String::new(),
-                        node_name: request_node_name.clone(),
-                        pod_uids: Vec::new(),
-                    };
-                    match replication.request_node_metrics(request).await {
-                        Ok(response) => response,
-                        Err(error) => NodeMetricsResponse::error(
-                            String::new(),
-                            request_node_name,
-                            format!("{error:#}"),
-                        ),
-                    }
+                } else if let Some(node_metrics) = node_metrics {
+                    let target = NodeMetricsTarget::try_new(request_node_name)?;
+                    node_metrics
+                        .collect_metrics(NodeMetricsRequest::new(target, Vec::new()))
+                        .await
                 } else {
-                    NodeMetricsResponse::error(
-                        String::new(),
-                        request_node_name,
+                    Err(NodeMetricsError::unavailable(
                         "replication service is not available for remote node metrics",
-                    )
+                    ))
                 }
             })
             .await
@@ -584,7 +486,7 @@ impl MetricsProvider for OnDemandMetricsProvider {
                 .map(|node| self.collect_node_metrics(node)),
         )
         .await;
-        RuntimeMetricsSnapshot::from_node_metrics_responses(responses)
+        RuntimeMetricsSnapshot::from_node_metrics_results(responses)
     }
 }
 
@@ -592,12 +494,9 @@ async fn collect_local_cri_node_metrics(
     cri: Option<Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
     node_name: String,
     supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
-) -> NodeMetricsResponse {
-    let request = NodeMetricsRequest {
-        request_id: String::new(),
-        node_name: node_name.clone(),
-        pod_uids: Vec::new(),
-    };
+) -> Result<NodeMetricsResult, NodeMetricsError> {
+    let target = NodeMetricsTarget::try_new(node_name)?;
+    let request = NodeMetricsRequest::new(target.clone(), Vec::new());
     let node = match LinuxProcNodeMetricsSampler::new(supervisor)
         .sample_node()
         .await
@@ -610,29 +509,50 @@ async fn collect_local_cri_node_metrics(
     };
     let Some(cri) = cri else {
         if let Some(node) = node {
-            return NodeMetricsResponse::from_node_sample(String::new(), node_name, node);
+            return Ok(NodeMetricsResult::new(target, Some(node), Vec::new()));
         }
-        return NodeMetricsResponse::error(
-            String::new(),
-            node_name,
+        return Err(NodeMetricsError::unavailable(
             "CRI client is not available for local node metrics",
-        );
+        ));
     };
     let mut client = {
         let guard = cri.lock().await;
         guard.clone()
     };
     match client.list_pod_sandbox_stats(None).await {
-        Ok(stats) => NodeMetricsResponse::from_pod_sandbox_stats(&request, node, stats),
+        Ok(stats) => Ok(node_metrics_result_from_pod_sandbox_stats(
+            &request, node, stats,
+        )),
         Err(error) => {
             tracing::debug!(%error, "CRI pod sandbox metrics unavailable");
             if let Some(node) = node {
-                NodeMetricsResponse::from_node_sample(String::new(), node_name, node)
+                Ok(NodeMetricsResult::new(target, Some(node), Vec::new()))
             } else {
-                NodeMetricsResponse::error(String::new(), node_name, format!("{error:#}"))
+                Err(NodeMetricsError::unavailable(format!("{error:#}")))
             }
         }
     }
+}
+
+pub(crate) fn node_metrics_result_from_pod_sandbox_stats(
+    request: &NodeMetricsRequest,
+    node: Option<NodeMetricsNodeSample>,
+    stats: Vec<k8s_cri::v1::PodSandboxStats>,
+) -> NodeMetricsResult {
+    let wanted_uids: BTreeSet<&str> = request
+        .pod_uids()
+        .iter()
+        .map(String::as_str)
+        .filter(|uid| !uid.is_empty())
+        .collect();
+    let pods = stats
+        .into_iter()
+        .filter_map(RuntimePodSample::from_cri)
+        .filter(|sample| wanted_uids.is_empty() || wanted_uids.contains(sample.uid.as_str()))
+        .map(NodeMetricsPodSample::from)
+        .collect();
+
+    NodeMetricsResult::new(request.target().clone(), node, pods)
 }
 
 #[async_trait]
@@ -675,10 +595,10 @@ impl NodeMetricsSampler for LinuxProcNodeMetricsSampler {
                 .div_ceil(elapsed_jiffies)
         };
 
-        Ok(NodeMetricsNodeSample {
+        Ok(NodeMetricsNodeSample::new(
             cpu_nanos,
-            memory_bytes: second.memory_used_bytes,
-        })
+            second.memory_used_bytes,
+        ))
     }
 }
 
@@ -1015,25 +935,21 @@ mod tests {
 
     #[test]
     fn node_metrics_response_merges_into_runtime_snapshot() {
-        let runtime = RuntimeMetricsSnapshot::from_node_metrics_responses([NodeMetricsResponse {
-            request_id: "metrics-1".to_string(),
-            node_name: "node-b".to_string(),
-            node: Some(NodeMetricsNodeSample {
-                cpu_nanos: 222_000_000,
-                memory_bytes: 99 * 1024 * 1024,
-            }),
-            pods: vec![NodeMetricsPodSample {
-                namespace: "default".to_string(),
-                name: "pod-a".to_string(),
-                uid: "uid-a".to_string(),
-                containers: vec![NodeMetricsContainerSample {
-                    name: "app".to_string(),
-                    cpu_nanos: 88_000_000,
-                    memory_bytes: 7 * 1024 * 1024,
-                }],
-            }],
-            error: None,
-        }]);
+        let runtime =
+            RuntimeMetricsSnapshot::from_node_metrics_results([Ok(NodeMetricsResult::new(
+                NodeMetricsTarget::try_new("node-b").unwrap(),
+                Some(NodeMetricsNodeSample::new(222_000_000, 99 * 1024 * 1024)),
+                vec![NodeMetricsPodSample::new(
+                    "default",
+                    "pod-a",
+                    "uid-a",
+                    vec![NodeMetricsContainerSample::new(
+                        "app",
+                        88_000_000,
+                        7 * 1024 * 1024,
+                    )],
+                )],
+            ))]);
         let snapshot = MetricsSnapshot::from_runtime_nodes(&runtime);
         assert_eq!(
             snapshot.available_node_usage("node-b"),
@@ -1055,6 +971,24 @@ mod tests {
 
         assert_eq!(object["containers"][0]["usage"]["cpu"], "88m");
         assert_eq!(object["containers"][0]["usage"]["memory"], "7168Ki");
+    }
+
+    #[test]
+    fn node_only_metrics_result_remains_a_partial_success() {
+        let runtime =
+            RuntimeMetricsSnapshot::from_node_metrics_results([Ok(NodeMetricsResult::new(
+                NodeMetricsTarget::try_new("node-without-cri-stats").unwrap(),
+                Some(NodeMetricsNodeSample::new(333_000_000, 128 * 1024 * 1024)),
+                Vec::new(),
+            ))]);
+
+        assert_eq!(
+            MetricsSnapshot::from_runtime_nodes(&runtime)
+                .available_node_usage("node-without-cri-stats"),
+            Some(ResourceUsage::new(333_000_000, 128 * 1024 * 1024))
+        );
+        assert!(runtime.by_uid.is_empty());
+        assert!(runtime.by_namespace_name.is_empty());
     }
 
     #[test]
@@ -1092,13 +1026,11 @@ mod tests {
                         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         started.wait().await;
                         release.notified().await;
-                        NodeMetricsResponse {
-                            request_id: "first".to_string(),
-                            node_name: "node-a".to_string(),
-                            node: None,
-                            pods: Vec::new(),
-                            error: None,
-                        }
+                        Ok(NodeMetricsResult::new(
+                            NodeMetricsTarget::try_new("node-a").unwrap(),
+                            None,
+                            Vec::new(),
+                        ))
                     })
                     .await
             })
@@ -1113,11 +1045,7 @@ mod tests {
                 coalescer
                     .get_or_spawn("node-a".to_string(), supervisor, async move {
                         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        NodeMetricsResponse::error(
-                            "second".to_string(),
-                            "node-a".to_string(),
-                            "must not run",
-                        )
+                        Err(NodeMetricsError::unavailable("must not run"))
                     })
                     .await
             })
@@ -1129,8 +1057,8 @@ mod tests {
         let second = second.unwrap();
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(first.request_id, "first");
-        assert_eq!(second.request_id, "first");
+        assert_eq!(first.unwrap().target().node_name(), "node-a");
+        assert_eq!(second.unwrap().target().node_name(), "node-a");
 
         let _ = supervisor.shutdown(std::time::Duration::from_secs(1)).await;
     }

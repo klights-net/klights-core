@@ -16,17 +16,24 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
+use klights_node_api::{
+    BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, ExecSetupError,
+    NodeExec, NodeExecFrame, NodeExecFuture, NodeExecRequest, NodeExecSession, NodeExecSyncRequest,
+    NodeExecSyncResult, NodeLog, NodeLogEvent, NodeLogFuture, NodeLogRequest, NodeLogResult,
+    NodeLogSetupError, NodeMetrics, NodeMetricsError, NodeMetricsFuture, NodeMetricsRequest,
+    NodeMetricsResult,
+};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, oneshot, watch};
 
 use super::protocol::{
-    FollowerControlMessage, JoinRequest, JoinResponse, MetadataResponse, NodeExecRequest,
-    NodeExecStreamFrame, NodeExecSyncRequest, NodeExecSyncResponse, PodLogRequest, PodLogResponse,
-    ReplicationEntry,
+    FollowerControlMessage, JoinRequest, JoinResponse, MetadataResponse, ReplicationEntry,
+    RoutedNodeExecFrame, RoutedNodeExecRequest, RoutedNodeExecSyncRequest,
+    RoutedNodeExecSyncResponse, RoutedNodeLogEvent, RoutedNodeLogRequest, RoutedNodeMetricsRequest,
+    RoutedNodeMetricsResponse,
 };
 
 use crate::datastore::backend::DatastoreBackend;
-use crate::metrics::{NodeMetricsRequest, NodeMetricsResponse};
 use crate::networking::wireguard::DataplanePeerMetadata;
 use crate::replication::grpc::fanout::FanoutPool;
 use crate::task_supervisor::{TaskCategory, TaskSupervisor};
@@ -39,14 +46,65 @@ const NODE_METRICS_TIMEOUT: Duration = Duration::from_secs(15);
 const NODE_EXEC_STREAM_FRAME_QUEUE_CAPACITY: usize = 128;
 const POD_LOG_STREAM_FRAME_QUEUE_CAPACITY: usize = 128;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodeOperationKind {
+    ExecSync,
+    ExecStream,
+    Log,
+    Metrics,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FollowerCompletionContext<'a> {
+    node_name: &'a str,
+    follower_session: u64,
+    kind: NodeOperationKind,
+}
+
+impl<'a> FollowerCompletionContext<'a> {
+    pub(crate) const fn new(
+        node_name: &'a str,
+        follower_session: u64,
+        kind: NodeOperationKind,
+    ) -> Self {
+        Self {
+            node_name,
+            follower_session,
+            kind,
+        }
+    }
+}
+
+struct PendingNodeOperation<T> {
+    node_name: String,
+    follower_session: u64,
+    kind: NodeOperationKind,
+    generation: u64,
+    sink: T,
+}
+
 type PendingNodeExecStreams =
-    Arc<Mutex<HashMap<String, (String, mpsc::Sender<NodeExecStreamFrame>)>>>;
-type PendingPodLogStreams = Arc<Mutex<HashMap<String, (String, mpsc::Sender<PodLogResponse>)>>>;
-type PendingNodeExecSync =
-    Mutex<HashMap<String, (String, oneshot::Sender<Result<NodeExecSyncResponse>>)>>;
-type PendingPodLogSync = Mutex<HashMap<String, (String, oneshot::Sender<Result<PodLogResponse>>)>>;
-type PendingNodeMetrics =
-    Mutex<HashMap<String, (String, oneshot::Sender<Result<NodeMetricsResponse>>)>>;
+    Arc<Mutex<HashMap<String, PendingNodeOperation<mpsc::Sender<RoutedNodeExecFrame>>>>>;
+type PendingNodeLogStreams =
+    Arc<Mutex<HashMap<String, PendingNodeOperation<mpsc::Sender<RoutedNodeLogEvent>>>>>;
+type PendingNodeExecSync = Mutex<
+    HashMap<
+        String,
+        PendingNodeOperation<oneshot::Sender<Result<NodeExecSyncResult, ExecSetupError>>>,
+    >,
+>;
+type PendingNodeLogSync = Mutex<
+    HashMap<
+        String,
+        PendingNodeOperation<oneshot::Sender<Result<NodeLogResult, NodeLogSetupError>>>,
+    >,
+>;
+type PendingNodeMetrics = Mutex<
+    HashMap<
+        String,
+        PendingNodeOperation<oneshot::Sender<Result<NodeMetricsResult, NodeMetricsError>>>,
+    >,
+>;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FollowerMetrics {
@@ -90,11 +148,12 @@ pub struct ReplicationService {
     /// Task supervisor for all spawned tasks.
     supervisor: Arc<TaskSupervisor>,
     next_follower_session: AtomicU64,
+    next_pending_generation: AtomicU64,
     followers: RwLock<HashMap<String, FollowerState>>,
     pending_node_exec: PendingNodeExecSync,
     pending_node_exec_streams: PendingNodeExecStreams,
-    pending_pod_log: PendingPodLogSync,
-    pending_pod_log_streams: PendingPodLogStreams,
+    pending_pod_log: PendingNodeLogSync,
+    pending_pod_log_streams: PendingNodeLogStreams,
     pending_node_metrics: PendingNodeMetrics,
     pod_log_timeout: Duration,
     fanout_pool: Mutex<FanoutPool<ReplicationEntry>>,
@@ -102,70 +161,176 @@ pub struct ReplicationService {
     observed_peer_endpoints: RwLock<HashMap<String, String>>,
 }
 
-pub struct NodeExecStreamSession {
+struct ReplicationNodeExecSession {
     request_id: String,
+    generation: u64,
     control_tx: mpsc::Sender<FollowerControlMessage>,
-    inbound_rx: mpsc::Receiver<NodeExecStreamFrame>,
+    inbound_rx: Mutex<mpsc::Receiver<RoutedNodeExecFrame>>,
     pending: PendingNodeExecStreams,
+    cancelled: AtomicBool,
 }
 
-impl NodeExecStreamSession {
-    pub fn request_id(&self) -> &str {
-        &self.request_id
+impl BoundedByteStream for ReplicationNodeExecSession {
+    type Frame = NodeExecFrame;
+
+    fn bounds(&self) -> ByteStreamBounds {
+        ByteStreamBounds::try_new(
+            NODE_EXEC_STREAM_FRAME_QUEUE_CAPACITY,
+            NODE_EXEC_STREAM_FRAME_QUEUE_CAPACITY,
+        )
+        .expect("exec stream capacities are non-zero constants")
     }
 
-    pub async fn send_frame(&self, mut frame: NodeExecStreamFrame) -> Result<()> {
-        if frame.request_id.trim().is_empty() {
-            frame.request_id = self.request_id.clone();
-        }
-        self.control_tx
-            .send(FollowerControlMessage::NodeExecFrame(frame))
-            .await
-            .map_err(|err| anyhow!("node exec stream control channel closed: {err}"))
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 
-    pub async fn recv_frame(&mut self) -> Result<Option<NodeExecStreamFrame>> {
-        Ok(self.inbound_rx.recv().await)
+    fn send_frame(&self, frame: NodeExecFrame) -> ByteStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if self.is_cancelled() {
+                return Err(ByteStreamError::cancelled());
+            }
+            self.control_tx
+                .send(FollowerControlMessage::NodeExecFrame(RoutedNodeExecFrame {
+                    request_id: self.request_id.clone(),
+                    frame,
+                }))
+                .await
+                .map_err(|err| {
+                    ByteStreamError::closed(format!(
+                        "node exec stream control channel closed: {err}"
+                    ))
+                })
+        })
     }
 
-    pub async fn close(&self) {
-        self.pending.lock().await.remove(&self.request_id);
+    fn recv_frame(&self) -> ByteStreamFuture<'_, Option<NodeExecFrame>> {
+        Box::pin(async move {
+            if self.is_cancelled() {
+                return Err(ByteStreamError::cancelled());
+            }
+            match self.inbound_rx.lock().await.recv().await {
+                Some(routed) => {
+                    if routed.frame.is_terminal() {
+                        self.cancelled.store(true, Ordering::Release);
+                    }
+                    Ok(Some(routed.frame))
+                }
+                None => {
+                    self.cancelled.store(true, Ordering::Release);
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    fn cancel(&mut self) -> ByteStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if !self.cancelled.swap(true, Ordering::AcqRel) {
+                self.inbound_rx.get_mut().close();
+                let mut pending = self.pending.lock().await;
+                if pending
+                    .get(&self.request_id)
+                    .is_some_and(|entry| entry.generation == self.generation)
+                {
+                    pending.remove(&self.request_id);
+                }
+            }
+            Ok(())
+        })
     }
 }
 
-impl Drop for NodeExecStreamSession {
+impl Drop for ReplicationNodeExecSession {
     fn drop(&mut self) {
         // Best-effort cleanup: the session might be dropped in a sync context
         // (e.g. during stack unwind). Use try_lock to avoid blocking.
-        if let Ok(mut pending) = self.pending.try_lock() {
+        if let Ok(mut pending) = self.pending.try_lock()
+            && pending
+                .get(&self.request_id)
+                .is_some_and(|entry| entry.generation == self.generation)
+        {
             pending.remove(&self.request_id);
         }
     }
 }
 
-pub struct PodLogStreamSession {
+struct ReplicationNodeLogStream {
     request_id: String,
-    inbound_rx: mpsc::Receiver<PodLogResponse>,
-    pending: PendingPodLogStreams,
+    generation: u64,
+    inbound_rx: Mutex<mpsc::Receiver<RoutedNodeLogEvent>>,
+    pending: PendingNodeLogStreams,
+    cancelled: AtomicBool,
 }
 
-impl PodLogStreamSession {
-    pub fn request_id(&self) -> &str {
-        &self.request_id
+impl BoundedByteStream for ReplicationNodeLogStream {
+    type Frame = NodeLogEvent;
+
+    fn bounds(&self) -> ByteStreamBounds {
+        ByteStreamBounds::try_new(
+            POD_LOG_STREAM_FRAME_QUEUE_CAPACITY,
+            POD_LOG_STREAM_FRAME_QUEUE_CAPACITY,
+        )
+        .expect("log stream capacities are non-zero constants")
     }
 
-    pub async fn recv_response(&mut self) -> Result<Option<PodLogResponse>> {
-        Ok(self.inbound_rx.recv().await)
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 
-    pub async fn close(&self) {
-        self.pending.lock().await.remove(&self.request_id);
+    fn send_frame(&self, _frame: NodeLogEvent) -> ByteStreamFuture<'_, ()> {
+        Box::pin(async move {
+            Err(ByteStreamError::closed(
+                "replication node log stream is receive-only",
+            ))
+        })
+    }
+
+    fn recv_frame(&self) -> ByteStreamFuture<'_, Option<NodeLogEvent>> {
+        Box::pin(async move {
+            if self.is_cancelled() {
+                return Err(ByteStreamError::cancelled());
+            }
+            match self.inbound_rx.lock().await.recv().await {
+                Some(routed) => {
+                    let terminal = routed.event.is_terminal();
+                    if terminal {
+                        self.cancelled.store(true, Ordering::Release);
+                    }
+                    Ok(Some(routed.event))
+                }
+                None => {
+                    self.cancelled.store(true, Ordering::Release);
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    fn cancel(&mut self) -> ByteStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if !self.cancelled.swap(true, Ordering::AcqRel) {
+                self.inbound_rx.get_mut().close();
+                let mut pending = self.pending.lock().await;
+                if pending
+                    .get(&self.request_id)
+                    .is_some_and(|entry| entry.generation == self.generation)
+                {
+                    pending.remove(&self.request_id);
+                }
+            }
+            Ok(())
+        })
     }
 }
 
-impl Drop for PodLogStreamSession {
+impl Drop for ReplicationNodeLogStream {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.pending.try_lock() {
+        if let Ok(mut pending) = self.pending.try_lock()
+            && pending
+                .get(&self.request_id)
+                .is_some_and(|entry| entry.generation == self.generation)
+        {
             pending.remove(&self.request_id);
         }
     }
@@ -194,6 +359,7 @@ impl ReplicationService {
             db,
             supervisor,
             next_follower_session: AtomicU64::new(1),
+            next_pending_generation: AtomicU64::new(1),
             followers: RwLock::new(HashMap::new()),
             pending_node_exec: Mutex::new(HashMap::new()),
             pending_node_exec_streams: Arc::new(Mutex::new(HashMap::new())),
@@ -209,6 +375,44 @@ impl ReplicationService {
 
     pub(crate) fn task_supervisor(&self) -> Arc<TaskSupervisor> {
         self.supervisor.clone()
+    }
+
+    fn next_operation_generation(&self) -> u64 {
+        self.next_pending_generation.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn follower_route(
+        &self,
+        node_name: &str,
+    ) -> Option<(mpsc::Sender<FollowerControlMessage>, u64)> {
+        self.followers
+            .read()
+            .await
+            .get(node_name)
+            .map(|state| (state.control_tx.clone(), state.session_id))
+    }
+
+    fn validate_completion<T>(
+        request_id: &str,
+        pending: &PendingNodeOperation<T>,
+        context: FollowerCompletionContext<'_>,
+        expected_kind: NodeOperationKind,
+    ) -> Result<()> {
+        if context.kind != expected_kind {
+            return Err(anyhow!(
+                "node completion kind mismatch for '{request_id}': expected {expected_kind:?}, got {:?}",
+                context.kind
+            ));
+        }
+        if pending.kind != expected_kind
+            || pending.node_name != context.node_name
+            || pending.follower_session != context.follower_session
+        {
+            return Err(anyhow!(
+                "unauthenticated node completion correlation for '{request_id}'"
+            ));
+        }
+        Ok(())
     }
 
     pub async fn record_observed_peer_endpoint(&self, node_name: &str, endpoint: String) {
@@ -408,7 +612,7 @@ impl ReplicationService {
         self.current_rv.load(Ordering::Acquire)
     }
 
-    pub async fn register_follower(
+    pub(crate) async fn register_follower(
         &self,
         metadata: DataplanePeerMetadata,
     ) -> (mpsc::Receiver<FollowerControlMessage>, u64) {
@@ -465,12 +669,16 @@ impl ReplicationService {
             let mut pending = self.pending_node_exec.lock().await;
             let stale: Vec<String> = pending
                 .iter()
-                .filter(|(_, (n, _))| n.as_str() == node_name)
+                .filter(|(_, entry)| {
+                    entry.node_name == node_name && entry.follower_session == session_id
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &stale {
-                if let Some((_, tx)) = pending.remove(id) {
-                    let _ = tx.send(Err(anyhow::anyhow!("{disconnected_err}")));
+                if let Some(entry) = pending.remove(id) {
+                    let _ = entry
+                        .sink
+                        .send(Err(ExecSetupError::unavailable(disconnected_err.clone())));
                 }
             }
         }
@@ -480,12 +688,16 @@ impl ReplicationService {
             let mut pending = self.pending_pod_log.lock().await;
             let stale: Vec<String> = pending
                 .iter()
-                .filter(|(_, (n, _))| n.as_str() == node_name)
+                .filter(|(_, entry)| {
+                    entry.node_name == node_name && entry.follower_session == session_id
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &stale {
-                if let Some((_, tx)) = pending.remove(id) {
-                    let _ = tx.send(Err(anyhow::anyhow!("{disconnected_err}")));
+                if let Some(entry) = pending.remove(id) {
+                    let _ = entry.sink.send(Err(NodeLogSetupError::unavailable(
+                        disconnected_err.clone(),
+                    )));
                 }
             }
         }
@@ -495,12 +707,16 @@ impl ReplicationService {
             let mut pending = self.pending_node_metrics.lock().await;
             let stale: Vec<String> = pending
                 .iter()
-                .filter(|(_, (n, _))| n.as_str() == node_name)
+                .filter(|(_, entry)| {
+                    entry.node_name == node_name && entry.follower_session == session_id
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &stale {
-                if let Some((_, tx)) = pending.remove(id) {
-                    let _ = tx.send(Err(anyhow::anyhow!("{disconnected_err}")));
+                if let Some(entry) = pending.remove(id) {
+                    let _ = entry
+                        .sink
+                        .send(Err(NodeMetricsError::unavailable(disconnected_err.clone())));
                 }
             }
         }
@@ -511,7 +727,9 @@ impl ReplicationService {
             let mut pending = self.pending_node_exec_streams.lock().await;
             let stale: Vec<String> = pending
                 .iter()
-                .filter(|(_, (n, _))| n.as_str() == node_name)
+                .filter(|(_, entry)| {
+                    entry.node_name == node_name && entry.follower_session == session_id
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &stale {
@@ -524,7 +742,9 @@ impl ReplicationService {
             let mut pending = self.pending_pod_log_streams.lock().await;
             let stale: Vec<String> = pending
                 .iter()
-                .filter(|(_, (n, _))| n.as_str() == node_name)
+                .filter(|(_, entry)| {
+                    entry.node_name == node_name && entry.follower_session == session_id
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &stale {
@@ -533,40 +753,58 @@ impl ReplicationService {
         }
     }
 
-    pub async fn request_node_exec_sync(
+    async fn request_node_exec_sync(
         &self,
-        mut request: NodeExecSyncRequest,
-    ) -> Result<NodeExecSyncResponse> {
-        if request.request_id.trim().is_empty() {
-            request.request_id = crate::datastore::command::new_command_id().to_string();
-        }
-        let request_id = request.request_id.clone();
-        let node_name = request.node_name.clone();
-        let control_tx = {
-            let followers = self.followers.read().await;
-            followers
-                .get(&node_name)
-                .map(|state| state.control_tx.clone())
-                .ok_or_else(|| anyhow!("node '{node_name}' is not connected for exec"))?
-        };
+        request_id: String,
+        request: NodeExecSyncRequest,
+    ) -> Result<NodeExecSyncResult, ExecSetupError> {
+        let node_name = request.target().node_name().to_string();
+        let (control_tx, follower_session) =
+            self.follower_route(&node_name).await.ok_or_else(|| {
+                ExecSetupError::unavailable(format!("node '{node_name}' is not connected for exec"))
+            })?;
+        let generation = self.next_operation_generation();
 
         let (response_tx, response_rx) = oneshot::channel();
         {
             let mut pending = self.pending_node_exec.lock().await;
-            if pending
-                .insert(request_id.clone(), (node_name.clone(), response_tx))
-                .is_some()
-            {
-                return Err(anyhow!("duplicate node exec request id '{request_id}'"));
+            match pending.entry(request_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PendingNodeOperation {
+                        node_name: node_name.clone(),
+                        follower_session,
+                        kind: NodeOperationKind::ExecSync,
+                        generation,
+                        sink: response_tx,
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err(ExecSetupError::duplicate_session(format!(
+                        "duplicate node exec request id '{request_id}'"
+                    )));
+                }
             }
         }
 
         if let Err(err) = control_tx
-            .send(FollowerControlMessage::NodeExecSync(request))
+            .send(FollowerControlMessage::NodeExecSync(
+                RoutedNodeExecSyncRequest {
+                    request_id: request_id.clone(),
+                    request,
+                },
+            ))
             .await
         {
-            self.pending_node_exec.lock().await.remove(&request_id);
-            return Err(anyhow!("node '{node_name}' exec stream is closed: {err}"));
+            let mut pending = self.pending_node_exec.lock().await;
+            if pending
+                .get(&request_id)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                pending.remove(&request_id);
+            }
+            return Err(ExecSetupError::unavailable(format!(
+                "node '{node_name}' exec stream is closed: {err}"
+            )));
         }
 
         match self
@@ -577,72 +815,107 @@ impl ReplicationService {
                 response_rx,
             )
             .await
-            .context("wait for node exec response")?
-        {
+            .map_err(|err| {
+                ExecSetupError::unavailable(format!("wait for node exec response: {err}"))
+            })? {
             Ok(Ok(response)) => response,
-            Ok(Err(_closed)) => Err(anyhow!("node '{node_name}' exec response channel closed")),
+            Ok(Err(_closed)) => Err(ExecSetupError::unavailable(format!(
+                "node '{node_name}' exec response channel closed"
+            ))),
             Err(_elapsed) => {
-                self.pending_node_exec.lock().await.remove(&request_id);
-                Err(anyhow!(
+                let mut pending = self.pending_node_exec.lock().await;
+                if pending
+                    .get(&request_id)
+                    .is_some_and(|entry| entry.generation == generation)
+                {
+                    pending.remove(&request_id);
+                }
+                Err(ExecSetupError::timeout(format!(
                     "node '{node_name}' exec response timed out after {:?}",
                     NODE_EXEC_SYNC_TIMEOUT
-                ))
+                )))
             }
         }
     }
 
-    pub async fn complete_node_exec_sync(&self, response: NodeExecSyncResponse) -> Result<()> {
-        let Some((_node_name, waiter)) = self
-            .pending_node_exec
-            .lock()
-            .await
-            .remove(&response.request_id)
-        else {
+    pub(crate) async fn complete_node_exec_sync(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        response: RoutedNodeExecSyncResponse,
+    ) -> Result<()> {
+        let mut pending = self.pending_node_exec.lock().await;
+        let Some(entry) = pending.get(&response.request_id) else {
             return Err(anyhow!(
                 "unknown node exec response id '{}'",
                 response.request_id
             ));
         };
-        let _ = waiter.send(Ok(response));
+        Self::validate_completion(
+            &response.request_id,
+            entry,
+            context,
+            NodeOperationKind::ExecSync,
+        )?;
+        let entry = pending
+            .remove(&response.request_id)
+            .expect("validated pending exec response remains present");
+        let _ = entry.sink.send(Ok(response.result));
         Ok(())
     }
 
-    pub async fn request_node_metrics(
+    async fn request_node_metrics(
         &self,
-        mut request: NodeMetricsRequest,
-    ) -> Result<NodeMetricsResponse> {
-        if request.request_id.trim().is_empty() {
-            request.request_id = crate::datastore::command::new_command_id().to_string();
-        }
-        let request_id = request.request_id.clone();
-        let node_name = request.node_name.clone();
-        let control_tx = {
-            let followers = self.followers.read().await;
-            followers
-                .get(&node_name)
-                .map(|state| state.control_tx.clone())
-                .ok_or_else(|| anyhow!("node '{node_name}' is not connected for metrics"))?
-        };
+        request_id: String,
+        request: NodeMetricsRequest,
+    ) -> Result<NodeMetricsResult, NodeMetricsError> {
+        let node_name = request.target().node_name().to_string();
+        let (control_tx, follower_session) =
+            self.follower_route(&node_name).await.ok_or_else(|| {
+                NodeMetricsError::unavailable(format!(
+                    "node '{node_name}' is not connected for metrics"
+                ))
+            })?;
+        let generation = self.next_operation_generation();
 
         let (response_tx, response_rx) = oneshot::channel();
         {
             let mut pending = self.pending_node_metrics.lock().await;
-            if pending
-                .insert(request_id.clone(), (node_name.clone(), response_tx))
-                .is_some()
-            {
-                return Err(anyhow!("duplicate node metrics request id '{request_id}'"));
+            if pending.contains_key(&request_id) {
+                return Err(NodeMetricsError::duplicate_request(format!(
+                    "duplicate node metrics request id '{request_id}'"
+                )));
             }
+            pending.insert(
+                request_id.clone(),
+                PendingNodeOperation {
+                    node_name: node_name.clone(),
+                    follower_session,
+                    kind: NodeOperationKind::Metrics,
+                    generation,
+                    sink: response_tx,
+                },
+            );
         }
 
         if let Err(err) = control_tx
-            .send(FollowerControlMessage::NodeMetrics(request))
+            .send(FollowerControlMessage::NodeMetrics(
+                RoutedNodeMetricsRequest {
+                    request_id: request_id.clone(),
+                    request,
+                },
+            ))
             .await
         {
-            self.pending_node_metrics.lock().await.remove(&request_id);
-            return Err(anyhow!(
+            let mut pending = self.pending_node_metrics.lock().await;
+            if pending
+                .get(&request_id)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                pending.remove(&request_id);
+            }
+            return Err(NodeMetricsError::unavailable(format!(
                 "node '{node_name}' metrics stream is closed: {err}"
-            ));
+            )));
         }
 
         match self
@@ -653,150 +926,225 @@ impl ReplicationService {
                 response_rx,
             )
             .await
-            .context("wait for node metrics response")?
-        {
+            .map_err(|error| {
+                NodeMetricsError::unavailable(format!("wait for node metrics response: {error}"))
+            })? {
             Ok(Ok(response)) => response,
-            Ok(Err(_closed)) => Err(anyhow!(
+            Ok(Err(_closed)) => Err(NodeMetricsError::closed(format!(
                 "node '{node_name}' metrics response channel closed"
-            )),
+            ))),
             Err(_elapsed) => {
-                self.pending_node_metrics.lock().await.remove(&request_id);
-                Err(anyhow!(
+                let mut pending = self.pending_node_metrics.lock().await;
+                if pending
+                    .get(&request_id)
+                    .is_some_and(|entry| entry.generation == generation)
+                {
+                    pending.remove(&request_id);
+                }
+                Err(NodeMetricsError::timeout(format!(
                     "node '{node_name}' metrics response timed out after {:?}",
                     NODE_METRICS_TIMEOUT
-                ))
+                )))
             }
         }
     }
 
-    pub async fn complete_node_metrics(&self, response: NodeMetricsResponse) -> Result<()> {
-        let Some((_node_name, waiter)) = self
-            .pending_node_metrics
-            .lock()
-            .await
-            .remove(&response.request_id)
-        else {
+    pub(crate) async fn complete_node_metrics(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        response: RoutedNodeMetricsResponse,
+    ) -> Result<()> {
+        let mut pending = self.pending_node_metrics.lock().await;
+        let Some(entry) = pending.get(&response.request_id) else {
             return Err(anyhow!(
                 "unknown node metrics response id '{}'",
                 response.request_id
             ));
         };
-        let _ = waiter.send(Ok(response));
+        Self::validate_completion(
+            &response.request_id,
+            entry,
+            context,
+            NodeOperationKind::Metrics,
+        )?;
+        if response.node_name != context.node_name {
+            return Err(anyhow!(
+                "node metrics payload source mismatch for '{}': authenticated '{}', payload '{}'",
+                response.request_id,
+                context.node_name,
+                response.node_name
+            ));
+        }
+        if let Ok(result) = &response.result
+            && result.target().node_name() != context.node_name
+        {
+            return Err(anyhow!(
+                "node metrics result target mismatch for '{}'",
+                response.request_id
+            ));
+        }
+        let entry = pending
+            .remove(&response.request_id)
+            .expect("validated pending metrics response remains present");
+        let _ = entry.sink.send(response.result);
         Ok(())
     }
 
-    pub async fn open_node_exec_stream(
+    async fn open_node_exec_stream(
         &self,
-        mut request: NodeExecRequest,
-    ) -> Result<NodeExecStreamSession> {
-        if request.request_id.trim().is_empty() {
-            request.request_id = crate::datastore::command::new_command_id().to_string();
-        }
-        let request_id = request.request_id.clone();
-        let node_name = request.node_name.clone();
-        let control_tx = {
-            let followers = self.followers.read().await;
-            followers
-                .get(&node_name)
-                .map(|state| state.control_tx.clone())
-                .ok_or_else(|| anyhow!("node '{node_name}' is not connected for exec"))?
-        };
+        request_id: String,
+        request: NodeExecRequest,
+    ) -> Result<ReplicationNodeExecSession, ExecSetupError> {
+        let node_name = request.target().node_name().to_string();
+        let (control_tx, follower_session) =
+            self.follower_route(&node_name).await.ok_or_else(|| {
+                ExecSetupError::unavailable(format!("node '{node_name}' is not connected for exec"))
+            })?;
+        let generation = self.next_operation_generation();
 
         let (frame_tx, frame_rx) = mpsc::channel(NODE_EXEC_STREAM_FRAME_QUEUE_CAPACITY);
         {
             let mut pending = self.pending_node_exec_streams.lock().await;
-            if pending
-                .insert(request_id.clone(), (node_name.clone(), frame_tx))
-                .is_some()
-            {
-                return Err(anyhow!("duplicate node exec stream id '{request_id}'"));
+            match pending.entry(request_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PendingNodeOperation {
+                        node_name: node_name.clone(),
+                        follower_session,
+                        kind: NodeOperationKind::ExecStream,
+                        generation,
+                        sink: frame_tx,
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err(ExecSetupError::duplicate_session(format!(
+                        "duplicate node exec stream id '{request_id}'"
+                    )));
+                }
             }
         }
 
         if let Err(err) = control_tx
-            .send(FollowerControlMessage::NodeExec(request))
+            .send(FollowerControlMessage::NodeExec(RoutedNodeExecRequest {
+                request_id: request_id.clone(),
+                request,
+            }))
             .await
         {
-            self.pending_node_exec_streams
-                .lock()
-                .await
-                .remove(&request_id);
-            return Err(anyhow!(
+            let mut pending = self.pending_node_exec_streams.lock().await;
+            if pending
+                .get(&request_id)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                pending.remove(&request_id);
+            }
+            return Err(ExecSetupError::unavailable(format!(
                 "node '{node_name}' exec stream is closed before stream start: {err}"
-            ));
+            )));
         }
 
-        Ok(NodeExecStreamSession {
+        Ok(ReplicationNodeExecSession {
             request_id,
+            generation,
             control_tx,
-            inbound_rx: frame_rx,
+            inbound_rx: Mutex::new(frame_rx),
             pending: self.pending_node_exec_streams.clone(),
+            cancelled: AtomicBool::new(false),
         })
     }
 
-    pub async fn complete_node_exec_stream_frame(&self, frame: NodeExecStreamFrame) -> Result<()> {
+    pub(crate) async fn complete_node_exec_stream_frame(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        frame: RoutedNodeExecFrame,
+    ) -> Result<()> {
         let request_id = frame.request_id.clone();
-        let sender = {
+        let (sender, generation) = {
             let pending = self.pending_node_exec_streams.lock().await;
-            pending.get(&request_id).map(|(_, s)| s.clone())
-        };
-        let Some(sender) = sender else {
-            return Err(anyhow!("unknown node exec stream id '{request_id}'"));
+            let Some(entry) = pending.get(&request_id) else {
+                return Err(anyhow!("unknown node exec stream id '{request_id}'"));
+            };
+            Self::validate_completion(&request_id, entry, context, NodeOperationKind::ExecStream)?;
+            (entry.sink.clone(), entry.generation)
         };
 
-        let should_close = super::protocol::node_exec_error_frame_is_terminal(&frame);
+        let should_close = frame.frame.is_terminal();
         if sender.send(frame).await.is_err() {
-            self.pending_node_exec_streams
-                .lock()
-                .await
-                .remove(&request_id);
+            let mut pending = self.pending_node_exec_streams.lock().await;
+            if pending
+                .get(&request_id)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                pending.remove(&request_id);
+            }
             return Err(anyhow!(
                 "node exec stream receiver closed for '{request_id}'"
             ));
         }
         if should_close {
-            self.pending_node_exec_streams
-                .lock()
-                .await
-                .remove(&request_id);
+            let mut pending = self.pending_node_exec_streams.lock().await;
+            if pending
+                .get(&request_id)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                pending.remove(&request_id);
+            }
         }
         Ok(())
     }
 
-    pub async fn request_pod_log(&self, mut request: PodLogRequest) -> Result<PodLogResponse> {
-        if request.request_id.trim().is_empty() {
-            request.request_id = crate::datastore::command::new_command_id().to_string();
-        }
-        request.follow = None;
-        let request_id = request.request_id.clone();
-        let node_name = request.node_name.clone();
-        let control_tx = {
-            let followers = self.followers.read().await;
-            followers
-                .get(&node_name)
-                .map(|state| state.control_tx.clone())
-                .ok_or_else(|| anyhow!("node '{node_name}' is not connected for pod log"))?
-        };
+    async fn request_node_log(
+        &self,
+        request_id: String,
+        request: NodeLogRequest,
+    ) -> Result<NodeLogResult, NodeLogSetupError> {
+        let node_name = request.target().node_name().to_string();
+        let (control_tx, follower_session) =
+            self.follower_route(&node_name).await.ok_or_else(|| {
+                NodeLogSetupError::unavailable(format!(
+                    "node '{node_name}' is not connected for pod log"
+                ))
+            })?;
+        let generation = self.next_operation_generation();
 
         let (response_tx, response_rx) = oneshot::channel();
         {
             let mut pending = self.pending_pod_log.lock().await;
-            if pending
-                .insert(request_id.clone(), (node_name.clone(), response_tx))
-                .is_some()
-            {
-                return Err(anyhow!("duplicate pod log request id '{request_id}'"));
+            match pending.entry(request_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PendingNodeOperation {
+                        node_name: node_name.clone(),
+                        follower_session,
+                        kind: NodeOperationKind::Log,
+                        generation,
+                        sink: response_tx,
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err(NodeLogSetupError::duplicate_stream(format!(
+                        "duplicate pod log request id '{request_id}'"
+                    )));
+                }
             }
         }
 
         if let Err(err) = control_tx
-            .send(FollowerControlMessage::PodLog(request))
+            .send(FollowerControlMessage::PodLog(RoutedNodeLogRequest {
+                request_id: request_id.clone(),
+                follow: false,
+                request,
+            }))
             .await
         {
-            self.pending_pod_log.lock().await.remove(&request_id);
-            return Err(anyhow!(
+            let mut pending = self.pending_pod_log.lock().await;
+            if pending
+                .get(&request_id)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                pending.remove(&request_id);
+            }
+            return Err(NodeLogSetupError::unavailable(format!(
                 "node '{node_name}' pod log stream is closed: {err}"
-            ));
+            )));
         }
 
         match self
@@ -807,103 +1155,148 @@ impl ReplicationService {
                 response_rx,
             )
             .await
-            .context("wait for node pod log response")?
-        {
+            .map_err(|err| {
+                NodeLogSetupError::unavailable(format!("wait for node pod log response: {err}"))
+            })? {
             Ok(Ok(response)) => response,
-            Ok(Err(_closed)) => Err(anyhow!(
+            Ok(Err(_closed)) => Err(NodeLogSetupError::unavailable(format!(
                 "node '{node_name}' pod log response channel closed"
-            )),
+            ))),
             Err(_elapsed) => {
-                self.pending_pod_log.lock().await.remove(&request_id);
-                Err(anyhow!(
+                let mut pending = self.pending_pod_log.lock().await;
+                if pending
+                    .get(&request_id)
+                    .is_some_and(|entry| entry.generation == generation)
+                {
+                    pending.remove(&request_id);
+                }
+                Err(NodeLogSetupError::timeout(format!(
                     "node '{node_name}' pod log response timed out after {:?}",
                     self.pod_log_timeout
-                ))
+                )))
             }
         }
     }
 
-    pub async fn request_pod_log_stream(
+    async fn open_node_log_stream(
         &self,
-        mut request: PodLogRequest,
-    ) -> Result<PodLogStreamSession> {
-        if request.request_id.trim().is_empty() {
-            request.request_id = crate::datastore::command::new_command_id().to_string();
-        }
-        request.follow = Some("true".to_string());
-        let request_id = request.request_id.clone();
-        let node_name = request.node_name.clone();
-        let control_tx = {
-            let followers = self.followers.read().await;
-            followers
-                .get(&node_name)
-                .map(|state| state.control_tx.clone())
-                .ok_or_else(|| anyhow!("node '{node_name}' is not connected for pod log"))?
-        };
+        request_id: String,
+        request: NodeLogRequest,
+    ) -> Result<ReplicationNodeLogStream, NodeLogSetupError> {
+        let node_name = request.target().node_name().to_string();
+        let (control_tx, follower_session) =
+            self.follower_route(&node_name).await.ok_or_else(|| {
+                NodeLogSetupError::unavailable(format!(
+                    "node '{node_name}' is not connected for pod log"
+                ))
+            })?;
+        let generation = self.next_operation_generation();
 
         let (frame_tx, frame_rx) = mpsc::channel(POD_LOG_STREAM_FRAME_QUEUE_CAPACITY);
         {
             let mut pending = self.pending_pod_log_streams.lock().await;
-            if pending
-                .insert(request_id.clone(), (node_name.clone(), frame_tx))
-                .is_some()
-            {
-                return Err(anyhow!("duplicate pod log stream id '{request_id}'"));
+            match pending.entry(request_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PendingNodeOperation {
+                        node_name: node_name.clone(),
+                        follower_session,
+                        kind: NodeOperationKind::Log,
+                        generation,
+                        sink: frame_tx,
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err(NodeLogSetupError::duplicate_stream(format!(
+                        "duplicate pod log stream id '{request_id}'"
+                    )));
+                }
             }
         }
 
         if let Err(err) = control_tx
-            .send(FollowerControlMessage::PodLog(request))
+            .send(FollowerControlMessage::PodLog(RoutedNodeLogRequest {
+                request_id: request_id.clone(),
+                follow: true,
+                request,
+            }))
             .await
         {
-            self.pending_pod_log_streams
-                .lock()
-                .await
-                .remove(&request_id);
-            return Err(anyhow!(
+            let mut pending = self.pending_pod_log_streams.lock().await;
+            if pending
+                .get(&request_id)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                pending.remove(&request_id);
+            }
+            return Err(NodeLogSetupError::unavailable(format!(
                 "node '{node_name}' pod log stream is closed before stream start: {err}"
-            ));
+            )));
         }
 
-        Ok(PodLogStreamSession {
+        Ok(ReplicationNodeLogStream {
             request_id,
-            inbound_rx: frame_rx,
+            generation,
+            inbound_rx: Mutex::new(frame_rx),
             pending: self.pending_pod_log_streams.clone(),
+            cancelled: AtomicBool::new(false),
         })
     }
 
-    pub async fn complete_pod_log(&self, response: PodLogResponse) -> Result<()> {
-        if let Some((_node_name, waiter)) = self
-            .pending_pod_log
-            .lock()
-            .await
-            .remove(&response.request_id)
+    pub(crate) async fn complete_node_log_event(
+        &self,
+        context: FollowerCompletionContext<'_>,
+        routed: RoutedNodeLogEvent,
+    ) -> Result<()> {
         {
-            let _ = waiter.send(Ok(response));
-            return Ok(());
+            let mut pending = self.pending_pod_log.lock().await;
+            if let Some(entry) = pending.get(&routed.request_id) {
+                Self::validate_completion(
+                    &routed.request_id,
+                    entry,
+                    context,
+                    NodeOperationKind::Log,
+                )?;
+                let entry = pending
+                    .remove(&routed.request_id)
+                    .expect("validated pending log response remains present");
+                let (content, terminal_error, _) = routed.event.into_parts();
+                let result = match terminal_error {
+                    Some(error) => NodeLogResult::failed(content, error),
+                    None => NodeLogResult::success(content),
+                };
+                let _ = entry.sink.send(Ok(result));
+                return Ok(());
+            }
         }
 
-        let request_id = response.request_id.clone();
-        let sender = {
+        let request_id = routed.request_id.clone();
+        let should_close = routed.event.is_terminal();
+        let (sender, generation) = {
             let pending = self.pending_pod_log_streams.lock().await;
-            pending.get(&request_id).map(|(_, s)| s.clone())
+            let Some(entry) = pending.get(&request_id) else {
+                return Err(anyhow!("unknown pod log response id '{request_id}'"));
+            };
+            Self::validate_completion(&request_id, entry, context, NodeOperationKind::Log)?;
+            (entry.sink.clone(), entry.generation)
         };
-        let Some(sender) = sender else {
-            return Err(anyhow!("unknown pod log response id '{request_id}'"));
-        };
-        let should_close = response.fin || response.error.is_some();
-        if sender.send(response).await.is_err() {
-            self.pending_pod_log_streams
-                .lock()
-                .await
-                .remove(&request_id);
+        if sender.send(routed).await.is_err() {
+            let mut pending = self.pending_pod_log_streams.lock().await;
+            if pending
+                .get(&request_id)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                pending.remove(&request_id);
+            }
             return Err(anyhow!("pod log stream receiver closed for '{request_id}'"));
         }
         if should_close {
-            self.pending_pod_log_streams
-                .lock()
-                .await
-                .remove(&request_id);
+            let mut pending = self.pending_pod_log_streams.lock().await;
+            if pending
+                .get(&request_id)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                pending.remove(&request_id);
+            }
         }
         Ok(())
     }
@@ -934,6 +1327,55 @@ impl ReplicationService {
     }
 }
 
+impl NodeExec for ReplicationService {
+    fn exec_sync(&self, request: NodeExecSyncRequest) -> NodeExecFuture<'_, NodeExecSyncResult> {
+        Box::pin(async move {
+            let request_id = crate::datastore::command::new_command_id().to_string();
+            self.request_node_exec_sync(request_id, request).await
+        })
+    }
+
+    fn open_exec(&self, request: NodeExecRequest) -> NodeExecFuture<'_, Box<dyn NodeExecSession>> {
+        Box::pin(async move {
+            let request_id = crate::datastore::command::new_command_id().to_string();
+            let session = self.open_node_exec_stream(request_id, request).await?;
+            Ok(Box::new(session) as Box<dyn NodeExecSession>)
+        })
+    }
+}
+
+impl NodeLog for ReplicationService {
+    fn read_logs(&self, request: NodeLogRequest) -> NodeLogFuture<'_, NodeLogResult> {
+        Box::pin(async move {
+            let request_id = crate::datastore::command::new_command_id().to_string();
+            self.request_node_log(request_id, request).await
+        })
+    }
+
+    fn open_logs(
+        &self,
+        request: NodeLogRequest,
+    ) -> NodeLogFuture<'_, Box<dyn BoundedByteStream<Frame = NodeLogEvent>>> {
+        Box::pin(async move {
+            let request_id = crate::datastore::command::new_command_id().to_string();
+            let stream = self.open_node_log_stream(request_id, request).await?;
+            Ok(Box::new(stream) as Box<dyn BoundedByteStream<Frame = NodeLogEvent>>)
+        })
+    }
+}
+
+impl NodeMetrics for ReplicationService {
+    fn collect_metrics(
+        &self,
+        request: NodeMetricsRequest,
+    ) -> NodeMetricsFuture<'_, NodeMetricsResult> {
+        Box::pin(async move {
+            let request_id = crate::datastore::command::new_command_id().to_string();
+            self.request_node_metrics(request_id, request).await
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,6 +1383,7 @@ mod tests {
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
     use crate::task_supervisor::TaskCategoryConfig;
+    use klights_node_api::ExecStreamChannel;
     use serde_json::json;
 
     async fn test_service() -> ReplicationService {
@@ -965,6 +1408,47 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    fn sample_node_log_request(
+        node_name: &str,
+        follow: bool,
+        tail_lines: Option<usize>,
+    ) -> NodeLogRequest {
+        NodeLogRequest::new(
+            klights_node_api::NodeLogTarget::try_new(
+                node_name,
+                "sonobuoy",
+                "sonobuoy-e2e-job",
+                "pod-uid",
+                "e2e",
+            )
+            .unwrap(),
+            klights_node_api::NodeLogOptions::new(
+                follow.then(|| "true".to_string()),
+                tail_lines,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+    }
+
+    fn sample_node_exec_request(node_name: &str) -> NodeExecRequest {
+        let target = klights_node_api::NodeExecTarget::try_new(
+            node_name,
+            "default",
+            "test-pod",
+            "containerd://abc",
+        )
+        .unwrap();
+        NodeExecRequest::exec(
+            target,
+            vec!["sh".to_string()],
+            klights_node_api::ExecStreamOptions::new(false, true, false, false),
+        )
     }
 
     fn sample_entry(rv: i64) -> ReplicationEntry {
@@ -1145,24 +1629,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let (mut follower_rx, _follower_session) = service.register_follower(metadata).await;
+        let (mut follower_rx, follower_session) = service.register_follower(metadata).await;
 
-        let mut session = service
-            .request_pod_log_stream(PodLogRequest {
-                request_id: "log-stream-1".to_string(),
-                node_name: "worker-1".to_string(),
-                namespace: "sonobuoy".to_string(),
-                pod_name: "sonobuoy-e2e-job".to_string(),
-                pod_uid: "pod-uid".to_string(),
-                container_name: "e2e".to_string(),
-                follow: Some("true".to_string()),
-                tail_lines: Some("200".to_string()),
-                timestamps: None,
-                since_time: None,
-                since_seconds: None,
-                limit_bytes: None,
-                previous: None,
-            })
+        let session = service
+            .open_node_log_stream(
+                "log-stream-1".to_string(),
+                sample_node_log_request("worker-1", true, Some(200)),
+            )
             .await
             .unwrap();
 
@@ -1170,48 +1643,62 @@ mod tests {
             panic!("expected pod log follow request");
         };
         assert_eq!(request.request_id, "log-stream-1");
-        assert_eq!(request.follow.as_deref(), Some("true"));
-        assert_eq!(request.tail_lines.as_deref(), Some("200"));
+        assert!(request.follow);
+        assert_eq!(request.request.options().tail_lines(), Some(200));
 
         service
-            .complete_pod_log(PodLogResponse {
-                request_id: "log-stream-1".to_string(),
-                log_content: b"first\n".to_vec(),
-                error: None,
-                fin: false,
-            })
+            .complete_node_log_event(
+                FollowerCompletionContext::new(
+                    "worker-1",
+                    follower_session,
+                    NodeOperationKind::Log,
+                ),
+                RoutedNodeLogEvent {
+                    request_id: "log-stream-1".to_string(),
+                    event: NodeLogEvent::data(b"first\n".to_vec()),
+                },
+            )
             .await
             .unwrap();
         service
-            .complete_pod_log(PodLogResponse {
-                request_id: "log-stream-1".to_string(),
-                log_content: b"second\n".to_vec(),
-                error: None,
-                fin: false,
-            })
+            .complete_node_log_event(
+                FollowerCompletionContext::new(
+                    "worker-1",
+                    follower_session,
+                    NodeOperationKind::Log,
+                ),
+                RoutedNodeLogEvent {
+                    request_id: "log-stream-1".to_string(),
+                    event: NodeLogEvent::data(b"second\n".to_vec()),
+                },
+            )
             .await
             .unwrap();
         service
-            .complete_pod_log(PodLogResponse {
-                request_id: "log-stream-1".to_string(),
-                log_content: Vec::new(),
-                error: None,
-                fin: true,
-            })
+            .complete_node_log_event(
+                FollowerCompletionContext::new(
+                    "worker-1",
+                    follower_session,
+                    NodeOperationKind::Log,
+                ),
+                RoutedNodeLogEvent {
+                    request_id: "log-stream-1".to_string(),
+                    event: NodeLogEvent::terminal(),
+                },
+            )
             .await
             .unwrap();
 
         assert_eq!(
-            session.recv_response().await.unwrap().unwrap().log_content,
+            session.recv_frame().await.unwrap().unwrap().content(),
             b"first\n"
         );
         assert_eq!(
-            session.recv_response().await.unwrap().unwrap().log_content,
+            session.recv_frame().await.unwrap().unwrap().content(),
             b"second\n"
         );
-        let terminal = session.recv_response().await.unwrap().unwrap();
-        assert!(terminal.fin);
-        assert!(session.recv_response().await.unwrap().is_none());
+        let terminal = session.recv_frame().await.unwrap().unwrap();
+        assert!(terminal.is_terminal());
     }
 
     #[tokio::test]
@@ -1447,7 +1934,7 @@ mod tests {
         assert_eq!(service.follower_metrics().await.follower_count, 0);
     }
 
-    /// When a NodeExecStreamSession is dropped without calling close(), the
+    /// When the replication node-exec session is dropped without cancellation, the
     /// pending entry must be removed by the Drop impl.
     #[tokio::test]
     async fn node_exec_stream_session_drop_clears_pending_entry() {
@@ -1464,19 +1951,10 @@ mod tests {
         let (_control_rx, _session_id) = service.register_follower(metadata).await;
 
         let session = service
-            .open_node_exec_stream(NodeExecRequest {
-                request_id: "drop-test-1".to_string(),
-                node_name: "worker-1".to_string(),
-                namespace: "default".to_string(),
-                pod_name: "test-pod".to_string(),
-                container_id: "containerd://abc".to_string(),
-                command: vec!["sh".to_string()],
-                tty: false,
-                stdin: false,
-                stdout: true,
-                stderr: false,
-                attach: false,
-            })
+            .open_node_exec_stream(
+                "drop-test-1".to_string(),
+                sample_node_exec_request("worker-1"),
+            )
             .await
             .unwrap();
 
@@ -1500,7 +1978,7 @@ mod tests {
         );
     }
 
-    /// Same drop-safety for PodLogStreamSession.
+    /// Same drop-safety for the replication node-log stream.
     #[tokio::test]
     async fn pod_log_stream_session_drop_clears_pending_entry() {
         let service = Arc::new(test_service().await);
@@ -1516,21 +1994,10 @@ mod tests {
         let (_control_rx, _session_id) = service.register_follower(metadata).await;
 
         let session = service
-            .request_pod_log_stream(PodLogRequest {
-                request_id: "log-drop-1".to_string(),
-                node_name: "worker-1".to_string(),
-                namespace: "default".to_string(),
-                pod_name: "test-pod".to_string(),
-                pod_uid: "uid-1".to_string(),
-                container_name: "app".to_string(),
-                follow: None,
-                tail_lines: None,
-                timestamps: None,
-                since_time: None,
-                since_seconds: None,
-                limit_bytes: None,
-                previous: None,
-            })
+            .open_node_log_stream(
+                "log-drop-1".to_string(),
+                sample_node_log_request("worker-1", true, None),
+            )
             .await
             .unwrap();
 
@@ -1572,32 +2039,54 @@ mod tests {
 
         // Manually insert a pending node-exec sync request for this node.
         let (exec_tx, mut exec_rx) = tokio::sync::oneshot::channel();
-        service
-            .pending_node_exec
-            .lock()
-            .await
-            .insert("exec-req-1".to_string(), ("test-node".to_string(), exec_tx));
+        service.pending_node_exec.lock().await.insert(
+            "exec-req-1".to_string(),
+            PendingNodeOperation {
+                node_name: "test-node".to_string(),
+                follower_session: session_id,
+                kind: NodeOperationKind::ExecSync,
+                generation: 1,
+                sink: exec_tx,
+            },
+        );
 
         // Manually insert a pending pod-log request for this node.
         let (log_tx, mut log_rx) = tokio::sync::oneshot::channel();
-        service
-            .pending_pod_log
-            .lock()
-            .await
-            .insert("log-req-1".to_string(), ("test-node".to_string(), log_tx));
+        service.pending_pod_log.lock().await.insert(
+            "log-req-1".to_string(),
+            PendingNodeOperation {
+                node_name: "test-node".to_string(),
+                follower_session: session_id,
+                kind: NodeOperationKind::Log,
+                generation: 2,
+                sink: log_tx,
+            },
+        );
 
         // Manually insert a pending node metrics request for this node.
         let (metrics_tx, mut metrics_rx) = tokio::sync::oneshot::channel();
         service.pending_node_metrics.lock().await.insert(
             "metrics-req-1".to_string(),
-            ("test-node".to_string(), metrics_tx),
+            PendingNodeOperation {
+                node_name: "test-node".to_string(),
+                follower_session: session_id,
+                kind: NodeOperationKind::Metrics,
+                generation: 3,
+                sink: metrics_tx,
+            },
         );
 
         // Also register a request for a DIFFERENT node — it must survive.
         let (other_tx, mut other_rx) = tokio::sync::oneshot::channel();
         service.pending_node_exec.lock().await.insert(
             "exec-req-2".to_string(),
-            ("other-node".to_string(), other_tx),
+            PendingNodeOperation {
+                node_name: "other-node".to_string(),
+                follower_session: 999,
+                kind: NodeOperationKind::ExecSync,
+                generation: 4,
+                sink: other_tx,
+            },
         );
 
         // Unregister the follower for test-node.
@@ -1692,16 +2181,18 @@ mod tests {
             None,
         )
         .unwrap();
-        let (mut control_rx, _session_id) = service.register_follower(metadata).await;
+        let (mut control_rx, session_id) = service.register_follower(metadata).await;
 
         let service_for_request = service.clone();
         let request_task = tokio::spawn(async move {
             service_for_request
-                .request_node_metrics(NodeMetricsRequest {
-                    request_id: "metrics-1".to_string(),
-                    node_name: "worker-1".to_string(),
-                    pod_uids: Vec::new(),
-                })
+                .request_node_metrics(
+                    "metrics-1".to_string(),
+                    NodeMetricsRequest::new(
+                        klights_node_api::NodeMetricsTarget::try_new("worker-1").unwrap(),
+                        Vec::new(),
+                    ),
+                )
                 .await
                 .unwrap()
         });
@@ -1710,22 +2201,280 @@ mod tests {
             panic!("expected node metrics request");
         };
         assert_eq!(request.request_id, "metrics-1");
-        assert_eq!(request.node_name, "worker-1");
+        assert_eq!(request.request.target().node_name(), "worker-1");
 
         service
-            .complete_node_metrics(NodeMetricsResponse {
-                request_id: request.request_id,
-                node_name: "worker-1".to_string(),
-                node: None,
-                pods: Vec::new(),
-                error: None,
-            })
+            .complete_node_metrics(
+                FollowerCompletionContext::new("worker-1", session_id, NodeOperationKind::Metrics),
+                RoutedNodeMetricsResponse {
+                    request_id: request.request_id,
+                    node_name: "worker-1".to_string(),
+                    result: Ok(NodeMetricsResult::new(
+                        request.request.target().clone(),
+                        None,
+                        Vec::new(),
+                    )),
+                },
+            )
             .await
             .unwrap();
 
         let response = request_task.await.unwrap();
-        assert_eq!(response.node_name, "worker-1");
-        assert!(response.error.is_none());
+        assert_eq!(response.target().node_name(), "worker-1");
+        assert!(response.node().is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_node_metrics_correlation_does_not_replace_original_waiter() {
+        let service = Arc::new(test_service().await);
+        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            "worker-1".to_string(),
+            crate::networking::wireguard::DataplaneMode::Root,
+            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            None,
+            Some("127.0.0.1".to_string()),
+            None,
+        )
+        .unwrap();
+        let (_control_rx, session_id) = service.register_follower(metadata).await;
+        let (original_tx, original_rx) = tokio::sync::oneshot::channel();
+        service.pending_node_metrics.lock().await.insert(
+            "metrics-duplicate".to_string(),
+            PendingNodeOperation {
+                node_name: "worker-1".to_string(),
+                follower_session: session_id,
+                kind: NodeOperationKind::Metrics,
+                generation: service.next_operation_generation(),
+                sink: original_tx,
+            },
+        );
+
+        let error = service
+            .request_node_metrics(
+                "metrics-duplicate".to_string(),
+                NodeMetricsRequest::new(
+                    klights_node_api::NodeMetricsTarget::try_new("worker-1").unwrap(),
+                    Vec::new(),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NodeMetricsError::DuplicateRequest { .. }));
+
+        let expected = NodeMetricsResult::new(
+            klights_node_api::NodeMetricsTarget::try_new("worker-1").unwrap(),
+            None,
+            Vec::new(),
+        );
+        service
+            .complete_node_metrics(
+                FollowerCompletionContext::new("worker-1", session_id, NodeOperationKind::Metrics),
+                RoutedNodeMetricsResponse {
+                    request_id: "metrics-duplicate".to_string(),
+                    node_name: "worker-1".to_string(),
+                    result: Ok(expected.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(original_rx.await.unwrap().unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn authenticated_completion_mismatch_never_consumes_metrics_waiter() {
+        let service = Arc::new(test_service().await);
+        let worker = |name: &str| {
+            crate::networking::wireguard::DataplanePeerMetadata::try_new(
+                name.to_string(),
+                crate::networking::wireguard::DataplaneMode::Root,
+                crate::networking::wireguard::DataplaneEncryption::Disabled,
+                None,
+                Some("127.0.0.1".to_string()),
+                None,
+            )
+            .unwrap()
+        };
+        let (mut worker_one_rx, worker_one_session) =
+            service.register_follower(worker("worker-1")).await;
+        let (_worker_two_rx, worker_two_session) =
+            service.register_follower(worker("worker-2")).await;
+
+        let request_service = service.clone();
+        let request = tokio::spawn(async move {
+            request_service
+                .request_node_metrics(
+                    "shared-metrics-id".to_string(),
+                    NodeMetricsRequest::new(
+                        klights_node_api::NodeMetricsTarget::try_new("worker-1").unwrap(),
+                        Vec::new(),
+                    ),
+                )
+                .await
+        });
+        let Some(FollowerControlMessage::NodeMetrics(routed)) = worker_one_rx.recv().await else {
+            panic!("expected metrics request");
+        };
+        let response = || RoutedNodeMetricsResponse {
+            request_id: routed.request_id.clone(),
+            node_name: "worker-1".to_string(),
+            result: Ok(NodeMetricsResult::new(
+                klights_node_api::NodeMetricsTarget::try_new("worker-1").unwrap(),
+                None,
+                Vec::new(),
+            )),
+        };
+
+        for context in [
+            FollowerCompletionContext::new(
+                "worker-2",
+                worker_two_session,
+                NodeOperationKind::Metrics,
+            ),
+            FollowerCompletionContext::new(
+                "worker-1",
+                worker_one_session,
+                NodeOperationKind::ExecSync,
+            ),
+        ] {
+            assert!(
+                service
+                    .complete_node_metrics(context, response())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                service
+                    .pending_node_metrics
+                    .lock()
+                    .await
+                    .contains_key("shared-metrics-id")
+            );
+        }
+
+        let mismatched_payload = RoutedNodeMetricsResponse {
+            node_name: "worker-2".to_string(),
+            ..response()
+        };
+        assert!(
+            service
+                .complete_node_metrics(
+                    FollowerCompletionContext::new(
+                        "worker-1",
+                        worker_one_session,
+                        NodeOperationKind::Metrics,
+                    ),
+                    mismatched_payload,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .pending_node_metrics
+                .lock()
+                .await
+                .contains_key("shared-metrics-id")
+        );
+
+        service
+            .complete_node_metrics(
+                FollowerCompletionContext::new(
+                    "worker-1",
+                    worker_one_session,
+                    NodeOperationKind::Metrics,
+                ),
+                response(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            request.await.unwrap().unwrap().target().node_name(),
+            "worker-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_exec_stream_completion_cannot_remove_reused_request_id() {
+        let service = Arc::new(test_service().await);
+        let metadata = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            "worker-1".to_string(),
+            crate::networking::wireguard::DataplaneMode::Root,
+            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            None,
+            Some("127.0.0.1".to_string()),
+            None,
+        )
+        .unwrap();
+        let (mut control_rx, follower_session) = service.register_follower(metadata).await;
+        let old_session = service
+            .open_node_exec_stream(
+                "reused-exec-id".to_string(),
+                sample_node_exec_request("worker-1"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(FollowerControlMessage::NodeExec(_))
+        ));
+        let context = FollowerCompletionContext::new(
+            "worker-1",
+            follower_session,
+            NodeOperationKind::ExecStream,
+        );
+        for _ in 0..NODE_EXEC_STREAM_FRAME_QUEUE_CAPACITY {
+            service
+                .complete_node_exec_stream_frame(
+                    context,
+                    RoutedNodeExecFrame {
+                        request_id: "reused-exec-id".to_string(),
+                        frame: NodeExecFrame::new(ExecStreamChannel::Stdout, vec![1], false),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let blocked_service = service.clone();
+        let blocked = tokio::spawn(async move {
+            blocked_service
+                .complete_node_exec_stream_frame(
+                    context,
+                    RoutedNodeExecFrame {
+                        request_id: "reused-exec-id".to_string(),
+                        frame: NodeExecFrame::new(ExecStreamChannel::Error, Vec::new(), true),
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        drop(old_session);
+        let replacement = service
+            .open_node_exec_stream(
+                "reused-exec-id".to_string(),
+                sample_node_exec_request("worker-1"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            control_rx.recv().await,
+            Some(FollowerControlMessage::NodeExec(_))
+        ));
+        assert!(blocked.await.unwrap().is_err());
+
+        service
+            .complete_node_exec_stream_frame(
+                context,
+                RoutedNodeExecFrame {
+                    request_id: "reused-exec-id".to_string(),
+                    frame: NodeExecFrame::new(ExecStreamChannel::Stdout, b"new".to_vec(), false),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replacement.recv_frame().await.unwrap().unwrap().data(),
+            b"new"
+        );
     }
 
     #[tokio::test]
@@ -1742,20 +2491,11 @@ mod tests {
         .unwrap();
         let (mut control_rx, session_id) = service.register_follower(metadata).await;
 
-        let mut session = service
-            .open_node_exec_stream(NodeExecRequest {
-                request_id: "exec-stream-disconnect-1".to_string(),
-                node_name: "worker-1".to_string(),
-                namespace: "default".to_string(),
-                pod_name: "test-pod".to_string(),
-                container_id: "containerd://abc".to_string(),
-                command: vec!["sh".to_string()],
-                tty: false,
-                stdin: false,
-                stdout: true,
-                stderr: false,
-                attach: false,
-            })
+        let session = service
+            .open_node_exec_stream(
+                "exec-stream-disconnect-1".to_string(),
+                sample_node_exec_request("worker-1"),
+            )
             .await
             .unwrap();
 
@@ -1805,22 +2545,11 @@ mod tests {
         .unwrap();
         let (mut control_rx, session_id) = service.register_follower(metadata).await;
 
-        let mut session = service
-            .request_pod_log_stream(PodLogRequest {
-                request_id: "pod-log-stream-disconnect-1".to_string(),
-                node_name: "worker-1".to_string(),
-                namespace: "default".to_string(),
-                pod_name: "test-pod".to_string(),
-                pod_uid: "uid-1".to_string(),
-                container_name: "app".to_string(),
-                follow: None,
-                tail_lines: None,
-                timestamps: None,
-                since_time: None,
-                since_seconds: None,
-                limit_bytes: None,
-                previous: None,
-            })
+        let session = service
+            .open_node_log_stream(
+                "pod-log-stream-disconnect-1".to_string(),
+                sample_node_log_request("worker-1", true, None),
+            )
             .await
             .unwrap();
 
@@ -1836,13 +2565,11 @@ mod tests {
 
         service.unregister_follower("worker-1", session_id).await;
 
-        let closed = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            session.recv_response(),
-        )
-        .await
-        .expect("stream recv must resolve immediately after follower disconnect")
-        .unwrap();
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_millis(100), session.recv_frame())
+                .await
+                .expect("stream recv must resolve immediately after follower disconnect")
+                .unwrap();
         assert!(
             closed.is_none(),
             "disconnect must close the pod log stream receiver"

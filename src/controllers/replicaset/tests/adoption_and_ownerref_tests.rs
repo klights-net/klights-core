@@ -127,6 +127,7 @@ async fn test_replicaset_scale_subresource() {
         nodeport_alloc: std::sync::Arc::new(crate::controllers::service::NodePortAllocator::new()),
         cri: None,
         metrics_provider: std::sync::Arc::new(crate::metrics::FallbackOnlyMetricsProvider),
+        node_port_forward: crate::portforward::local_node_port_forward(task_supervisor.clone()),
         controller_dispatcher,
         side_effects,
         metrics,

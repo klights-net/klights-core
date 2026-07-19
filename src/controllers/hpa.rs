@@ -744,7 +744,9 @@ fn existing_transition_time(
 mod tests {
     use super::*;
     use crate::datastore::DatastoreBackend;
-    use crate::metrics::{NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsResponse};
+    use klights_node_api::{
+        NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsResult, NodeMetricsTarget,
+    };
     use serde_json::json;
 
     async fn create_ready_pod(
@@ -802,25 +804,25 @@ mod tests {
         cpu_nanos: u64,
         memory_bytes: u64,
     ) -> RuntimeMetricsSnapshot {
-        RuntimeMetricsSnapshot::from_node_metrics_responses([NodeMetricsResponse {
-            request_id: "test-runtime-metrics".to_string(),
-            node_name: "node-a".to_string(),
-            node: None,
-            pods: pod_names
+        RuntimeMetricsSnapshot::from_node_metrics_results([Ok(NodeMetricsResult::new(
+            NodeMetricsTarget::try_new("node-a").unwrap(),
+            None,
+            pod_names
                 .into_iter()
-                .map(|name| NodeMetricsPodSample {
-                    namespace: namespace.to_string(),
-                    name: name.to_string(),
-                    uid: String::new(),
-                    containers: vec![NodeMetricsContainerSample {
-                        name: "app".to_string(),
-                        cpu_nanos,
-                        memory_bytes,
-                    }],
+                .map(|name| {
+                    NodeMetricsPodSample::new(
+                        namespace,
+                        name,
+                        "",
+                        vec![NodeMetricsContainerSample::new(
+                            "app",
+                            cpu_nanos,
+                            memory_bytes,
+                        )],
+                    )
                 })
                 .collect(),
-            error: None,
-        }])
+        ))])
     }
 
     #[tokio::test]

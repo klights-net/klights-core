@@ -10,25 +10,26 @@ mod cases {
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
-    use crate::metrics::{
-        NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResponse,
-    };
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
     use crate::replication::grpc::client::{
-        ChannelLane, GrpcClientConfig, JoinDataplaneMetadata, LocalPodLogHandler,
-        NodeExecStreamHandler, NodeExecSyncHandler, NodeMetricsHandler, PodLogHandler,
+        ChannelLane, GrpcClientConfig, JoinDataplaneMetadata, LocalNodeLogRuntime,
         ReplicationGrpcClient,
     };
     use crate::replication::grpc::client::{ConnectDispatchContext, dispatch_leader_message};
     use crate::replication::grpc::generated::{self, follower_message, leader_message};
-    use crate::replication::protocol::{
-        ExecStreamChannel, JoinRole, NodeExecRequest, NodeExecStreamFrame, NodeExecSyncRequest,
-        NodeExecSyncResponse, PodLogRequest, ReplicationEntry, StreamItem,
-    };
+    use crate::replication::protocol::{JoinRole, ReplicationEntry, StreamItem};
     use crate::replication::service::ReplicationService;
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use futures::StreamExt as _;
     use klights_leader_api::{OutboxDeliveryOperation, OutboxDeliveryRequest};
+    use klights_node_api::{
+        BoundedByteStream, ExecStreamChannel, ExecStreamOptions, NodeExec, NodeExecFrame,
+        NodeExecRequest, NodeExecRuntime, NodeExecRuntimeFuture, NodeExecSession,
+        NodeExecSyncRequest, NodeExecSyncResult, NodeExecTarget, NodeLogOptions, NodeLogRequest,
+        NodeLogRuntime, NodeLogTarget, NodeMetrics, NodeMetricsContainerSample, NodeMetricsFuture,
+        NodeMetricsNodeSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResult,
+        NodeMetricsRuntime, NodeMetricsTarget,
+    };
     use tokio_util::sync::CancellationToken;
 
     use crate::leader_tls_policy::LeaderTlsVerification;
@@ -43,6 +44,135 @@ mod cases {
             mode: DataplaneMode::Root,
             encryption: DataplaneEncryption::Disabled,
         }
+    }
+
+    #[tokio::test]
+    async fn local_log_session_cancel_and_drop_stop_the_owned_producer() {
+        for explicit_cancel in [false, true] {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let producer_cancel = tokio_util::sync::CancellationToken::new();
+            let mut session = super::super::LocalPodLogStreamSession {
+                inbound_rx: tokio::sync::Mutex::new(rx),
+                producer_cancel: producer_cancel.clone(),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+            };
+
+            if explicit_cancel {
+                session.cancel().await.unwrap();
+                session.cancel().await.unwrap();
+                assert!(session.is_cancelled());
+            } else {
+                drop(session);
+            }
+            assert!(producer_cancel.is_cancelled());
+        }
+    }
+
+    fn cancellation_test_context(
+        supervisor: Arc<TaskSupervisor>,
+        exec: Option<Arc<dyn NodeExecRuntime>>,
+        logs: Option<Arc<dyn NodeLogRuntime>>,
+    ) -> ConnectDispatchContext {
+        ConnectDispatchContext {
+            supervisor,
+            node_exec_runtime: Arc::new(tokio::sync::Mutex::new(exec)),
+            node_exec_inputs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            node_stream_cancellations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            node_log_runtime: Arc::new(tokio::sync::Mutex::new(logs)),
+            node_metrics_runtime: Arc::new(tokio::sync::Mutex::new(None)),
+            observed_leader_endpoint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_disconnect_cancels_and_clears_all_private_stream_routes() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let context = cancellation_test_context(supervisor.clone(), None, None);
+        let exec_cancel = Arc::new(CancellationToken::new());
+        let log_cancel = Arc::new(CancellationToken::new());
+        context.node_stream_cancellations.lock().await.extend([
+            (
+                (super::super::ActiveRuntimeKind::Exec, "exec-1".to_string()),
+                exec_cancel.clone(),
+            ),
+            (
+                (super::super::ActiveRuntimeKind::Log, "log-1".to_string()),
+                log_cancel.clone(),
+            ),
+        ]);
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel(1);
+        context.node_exec_inputs.lock().await.insert(
+            "exec-1".to_string(),
+            super::super::NodeExecInputRoute {
+                sender: input_tx,
+                cancellation: exec_cancel.clone(),
+            },
+        );
+
+        super::super::cancel_all_node_streams(&context).await;
+
+        assert!(exec_cancel.is_cancelled());
+        assert!(log_cancel.is_cancelled());
+        assert!(context.node_stream_cancellations.lock().await.is_empty());
+        assert!(context.node_exec_inputs.lock().await.is_empty());
+        let _ = supervisor.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[test]
+    fn node_metrics_worker_wire_conversions_preserve_fields_and_errors() {
+        let routed = super::super::node_metrics_request_from_proto(generated::NodeMetricsRequest {
+            request_id: "metrics-worker-3".to_string(),
+            node_name: "worker-3".to_string(),
+            pod_uids: vec!["uid-a".to_string(), "uid-b".to_string()],
+        })
+        .unwrap();
+        assert_eq!(routed.request_id, "metrics-worker-3");
+        assert_eq!(routed.request.target().node_name(), "worker-3");
+        assert_eq!(routed.request.pod_uids(), ["uid-a", "uid-b"]);
+
+        let response = super::super::node_metrics_response_to_proto(
+            crate::replication::protocol::RoutedNodeMetricsResponse {
+                request_id: routed.request_id,
+                node_name: "worker-3".to_string(),
+                result: Ok(NodeMetricsResult::new(
+                    routed.request.target().clone(),
+                    Some(NodeMetricsNodeSample::new(37, 41)),
+                    vec![NodeMetricsPodSample::new(
+                        "kube-system",
+                        "pod-a",
+                        "uid-a",
+                        vec![NodeMetricsContainerSample::new("main", 43, 47)],
+                    )],
+                )),
+            },
+        );
+        assert_eq!(response.request_id, "metrics-worker-3");
+        assert_eq!(response.node_name, "worker-3");
+        assert_eq!(response.node.unwrap().cpu_nanos, 37);
+        assert_eq!(response.pods[0].namespace, "kube-system");
+        assert_eq!(response.pods[0].name, "pod-a");
+        assert_eq!(response.pods[0].uid, "uid-a");
+        assert_eq!(response.pods[0].containers[0].name, "main");
+        assert_eq!(response.pods[0].containers[0].cpu_nanos, 43);
+        assert_eq!(response.pods[0].containers[0].memory_bytes, 47);
+        assert!(response.error.is_none());
+
+        let error = super::super::node_metrics_response_to_proto(
+            crate::replication::protocol::RoutedNodeMetricsResponse {
+                request_id: "metrics-worker-4".to_string(),
+                node_name: "worker-4".to_string(),
+                result: Err(klights_node_api::NodeMetricsError::unavailable(
+                    "CRI unavailable",
+                )),
+            },
+        );
+        assert_eq!(error.request_id, "metrics-worker-4");
+        assert_eq!(error.node_name, "worker-4");
+        assert!(error.node.is_none());
+        assert!(error.pods.is_empty());
+        assert_eq!(error.error.as_deref(), Some("CRI unavailable"));
     }
 
     #[test]
@@ -474,11 +604,13 @@ mod cases {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let context = ConnectDispatchContext {
             supervisor,
-            node_exec_sync_handler: Arc::new(tokio::sync::Mutex::new(None)),
-            node_exec_stream_handler: Arc::new(tokio::sync::Mutex::new(None)),
+            node_exec_runtime: Arc::new(tokio::sync::Mutex::new(None)),
             node_exec_inputs: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            pod_log_handler: Arc::new(tokio::sync::Mutex::new(None)),
-            node_metrics_handler: Arc::new(tokio::sync::Mutex::new(None)),
+            node_stream_cancellations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            node_log_runtime: Arc::new(tokio::sync::Mutex::new(None)),
+            node_metrics_runtime: Arc::new(tokio::sync::Mutex::new(None)),
             observed_leader_endpoint: Some("10.99.0.10".to_string()),
         };
         let (outbound, mut outbound_rx) = tokio::sync::mpsc::channel(1);
@@ -2292,6 +2424,38 @@ mod cases {
     }
 
     #[tokio::test]
+    async fn local_node_log_runtime_previous_is_empty_for_finite_and_follow() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let runtime = LocalNodeLogRuntime::new("previous-log-test".to_string(), supervisor.clone());
+        let target =
+            NodeLogTarget::try_new("worker-1", "default", "logger", "pod-uid", "main").unwrap();
+        let request = NodeLogRequest::new(
+            target,
+            NodeLogOptions::new(
+                Some("true".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("true".to_string()),
+            ),
+        );
+
+        let finite = runtime.read_logs(request.clone()).await.unwrap();
+        assert!(finite.content().is_empty());
+        assert!(finite.terminal_error().is_none());
+
+        let follow = runtime.open_logs(request).await.unwrap();
+        let terminal = follow.recv_frame().await.unwrap().unwrap();
+        assert!(terminal.content().is_empty());
+        assert!(terminal.is_terminal());
+        assert!(terminal.terminal_error().is_none());
+
+        let _ = supervisor.shutdown(Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
     async fn local_pod_log_follow_closes_on_matching_pod_deleted_event() {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2328,35 +2492,30 @@ mod cases {
             )
             .await
             .unwrap();
-        let handler = LocalPodLogHandler::new_with_pod_event_store(
+        let handler = LocalNodeLogRuntime::new_with_pod_event_store(
             runtime_ns.clone(),
             supervisor.clone(),
             crate::api_pod_subresources::logs::PodLogFollowWatchSource::new(Arc::new(
                 crate::datastore::DatastoreBackendWatchStore::new(pod_event_db.clone()),
             )),
         );
-        let mut stream = handler.follow_logs(PodLogRequest {
-            request_id: "log-follow-delete".to_string(),
-            node_name: "worker-1".to_string(),
-            namespace: "sonobuoy".to_string(),
-            pod_name: "sonobuoy-e2e-job".to_string(),
-            pod_uid: "pod-uid".to_string(),
-            container_name: "e2e".to_string(),
-            follow: Some("true".to_string()),
-            tail_lines: None,
-            timestamps: None,
-            since_time: None,
-            since_seconds: None,
-            limit_bytes: None,
-            previous: None,
-        });
+        let target =
+            NodeLogTarget::try_new("worker-1", "sonobuoy", "sonobuoy-e2e-job", "pod-uid", "e2e")
+                .unwrap();
+        let stream = handler
+            .open_logs(NodeLogRequest::new(
+                target,
+                NodeLogOptions::new(Some("true".to_string()), None, None, None, None, None, None),
+            ))
+            .await
+            .unwrap();
 
         assert!(
             supervisor
                 .timeout(
                     "test_pod_log_follow_waits",
                     Duration::from_millis(100),
-                    stream.next(),
+                    stream.recv_frame(),
                 )
                 .await
                 .unwrap()
@@ -2373,14 +2532,15 @@ mod cases {
             .timeout(
                 "test_pod_log_follow_deleted",
                 Duration::from_secs(2),
-                stream.next(),
+                stream.recv_frame(),
             )
             .await
             .unwrap()
+            .unwrap()
             .unwrap();
         assert!(
-            done.is_none(),
-            "pod log follow must close after the matching pod delete event"
+            done.is_some_and(|event| event.is_terminal()),
+            "pod log follow must emit a terminal event after the matching pod delete event"
         );
 
         let _ = supervisor.shutdown(Duration::from_secs(1)).await;
@@ -2389,43 +2549,51 @@ mod cases {
 
     struct StaticExecHandler;
 
-    #[async_trait::async_trait]
-    impl NodeExecSyncHandler for StaticExecHandler {
-        async fn exec_sync(&self, request: NodeExecSyncRequest) -> NodeExecSyncResponse {
-            NodeExecSyncResponse {
-                request_id: request.request_id,
-                stdout: b"worker-stdout\n".to_vec(),
-                stderr: Vec::new(),
-                exit_code: 0,
-                error: None,
-            }
+    impl NodeExecRuntime for StaticExecHandler {
+        fn exec_sync(
+            &self,
+            request: NodeExecSyncRequest,
+        ) -> NodeExecRuntimeFuture<'_, NodeExecSyncResult> {
+            Box::pin(async move {
+                let _ = request;
+                NodeExecSyncResult::success(b"worker-stdout\n".to_vec(), Vec::new(), 0)
+            })
+        }
+
+        fn exec_stream(
+            &self,
+            request: NodeExecRequest,
+            session: Box<dyn NodeExecSession>,
+        ) -> NodeExecRuntimeFuture<'_, ()> {
+            Box::pin(async move {
+                let _ = (request, session);
+            })
         }
     }
 
     struct StaticMetricsHandler;
 
-    #[async_trait::async_trait]
-    impl NodeMetricsHandler for StaticMetricsHandler {
-        async fn collect_metrics(&self, request: NodeMetricsRequest) -> NodeMetricsResponse {
-            NodeMetricsResponse {
-                request_id: request.request_id,
-                node_name: request.node_name,
-                node: Some(crate::metrics::NodeMetricsNodeSample {
-                    cpu_nanos: 7_000_000,
-                    memory_bytes: 11 * 1024 * 1024,
-                }),
-                pods: vec![NodeMetricsPodSample {
-                    namespace: "default".to_string(),
-                    name: "remote-pod".to_string(),
-                    uid: "remote-uid".to_string(),
-                    containers: vec![NodeMetricsContainerSample {
-                        name: "app".to_string(),
-                        cpu_nanos: 42_000_000,
-                        memory_bytes: 6 * 1024 * 1024,
-                    }],
-                }],
-                error: None,
-            }
+    impl NodeMetricsRuntime for StaticMetricsHandler {
+        fn collect_metrics(
+            &self,
+            request: NodeMetricsRequest,
+        ) -> NodeMetricsFuture<'_, NodeMetricsResult> {
+            Box::pin(async move {
+                Ok(NodeMetricsResult::new(
+                    request.target().clone(),
+                    Some(NodeMetricsNodeSample::new(7_000_000, 11 * 1024 * 1024)),
+                    vec![NodeMetricsPodSample::new(
+                        "default",
+                        "remote-pod",
+                        "remote-uid",
+                        vec![NodeMetricsContainerSample::new(
+                            "app",
+                            42_000_000,
+                            6 * 1024 * 1024,
+                        )],
+                    )],
+                ))
+            })
         }
     }
 
@@ -2469,29 +2637,30 @@ mod cases {
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         client
-            .set_node_exec_sync_handler(Arc::new(StaticExecHandler))
+            .set_node_exec_runtime(Arc::new(StaticExecHandler))
             .await;
         client.ensure_joined().await.unwrap();
 
-        let response = service
-            .request_node_exec_sync(NodeExecSyncRequest {
-                request_id: String::new(),
-                node_name: "worker-1".to_string(),
-                namespace: "hostport-2155".to_string(),
-                pod_name: "e2e-host-exec".to_string(),
-                container_id: "worker-container".to_string(),
-                command: vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "echo ok".to_string(),
-                ],
-                timeout_seconds: 300,
-            })
-            .await
-            .unwrap();
+        let request = NodeExecSyncRequest::try_new(
+            NodeExecTarget::try_new(
+                "worker-1",
+                "hostport-2155",
+                "e2e-host-exec",
+                "worker-container",
+            )
+            .unwrap(),
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo ok".to_string(),
+            ],
+            300,
+        )
+        .unwrap();
+        let response = service.exec_sync(request).await.unwrap();
 
-        assert_eq!(response.stdout, b"worker-stdout\n");
-        assert_eq!(response.exit_code, 0);
+        assert_eq!(response.stdout(), b"worker-stdout\n");
+        assert_eq!(response.exit_code(), 0);
         handle.abort();
     }
 
@@ -2535,62 +2704,70 @@ mod cases {
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         client
-            .set_node_metrics_handler(Arc::new(StaticMetricsHandler))
+            .set_node_metrics_runtime(Arc::new(StaticMetricsHandler))
             .await;
         client.ensure_joined().await.unwrap();
 
         let response = service
-            .request_node_metrics(NodeMetricsRequest {
-                request_id: String::new(),
-                node_name: "worker-1".to_string(),
-                pod_uids: Vec::new(),
-            })
+            .collect_metrics(NodeMetricsRequest::new(
+                NodeMetricsTarget::try_new("worker-1").unwrap(),
+                Vec::new(),
+            ))
             .await
             .unwrap();
 
-        assert_eq!(response.node_name, "worker-1");
-        assert_eq!(response.pods[0].uid, "remote-uid");
-        assert_eq!(response.pods[0].containers[0].cpu_nanos, 42_000_000);
+        assert_eq!(response.target().node_name(), "worker-1");
+        assert_eq!(response.pods()[0].uid(), "remote-uid");
+        assert_eq!(response.pods()[0].containers()[0].cpu_nanos(), 42_000_000);
         handle.abort();
     }
 
     struct EchoExecStreamHandler;
 
-    #[async_trait::async_trait]
-    impl NodeExecStreamHandler for EchoExecStreamHandler {
-        async fn exec_stream(
+    impl NodeExecRuntime for EchoExecStreamHandler {
+        fn exec_sync(
+            &self,
+            request: NodeExecSyncRequest,
+        ) -> NodeExecRuntimeFuture<'_, NodeExecSyncResult> {
+            Box::pin(async move {
+                let _ = request;
+                NodeExecSyncResult::success(Vec::new(), Vec::new(), 0)
+            })
+        }
+
+        fn exec_stream(
             &self,
             request: NodeExecRequest,
-            mut input: tokio::sync::mpsc::Receiver<NodeExecStreamFrame>,
-            output: tokio::sync::mpsc::Sender<NodeExecStreamFrame>,
-        ) {
-            while let Some(frame) = input.recv().await {
-                if frame.channel == ExecStreamChannel::Stdin && !frame.data.is_empty() {
-                    output
-                        .send(NodeExecStreamFrame {
-                            request_id: request.request_id.clone(),
-                            channel: ExecStreamChannel::Stdout,
-                            data: frame.data,
-                            fin: false,
-                        })
-                        .await
-                        .unwrap();
+            session: Box<dyn NodeExecSession>,
+        ) -> NodeExecRuntimeFuture<'_, ()> {
+            Box::pin(async move {
+                let _ = request;
+                while let Some(frame) = session.recv_frame().await.unwrap() {
+                    if frame.channel() == ExecStreamChannel::Stdin && !frame.data().is_empty() {
+                        session
+                            .send_frame(NodeExecFrame::new(
+                                ExecStreamChannel::Stdout,
+                                frame.data().to_vec(),
+                                false,
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    if frame.fin() {
+                        break;
+                    }
                 }
-                if frame.fin {
-                    break;
-                }
-            }
-            output
-                .send(NodeExecStreamFrame {
-                    request_id: request.request_id,
-                    channel: ExecStreamChannel::Error,
-                    data: serde_json::json!({"metadata": {}, "status": "Success"})
-                        .to_string()
-                        .into_bytes(),
-                    fin: true,
-                })
-                .await
-                .unwrap();
+                session
+                    .send_frame(NodeExecFrame::new(
+                        ExecStreamChannel::Error,
+                        serde_json::json!({"metadata": {}, "status": "Success"})
+                            .to_string()
+                            .into_bytes(),
+                        true,
+                    ))
+                    .await
+                    .unwrap();
+            })
         }
     }
 
@@ -2634,33 +2811,23 @@ mod cases {
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         client
-            .set_node_exec_stream_handler(Arc::new(EchoExecStreamHandler))
+            .set_node_exec_runtime(Arc::new(EchoExecStreamHandler))
             .await;
         client.ensure_joined().await.unwrap();
 
-        let mut session = service
-            .open_node_exec_stream(NodeExecRequest {
-                request_id: String::new(),
-                node_name: "worker-1".to_string(),
-                namespace: "default".to_string(),
-                pod_name: "remote-exec".to_string(),
-                container_id: "remote-container".to_string(),
-                command: vec!["/bin/sh".to_string()],
-                tty: true,
-                stdin: true,
-                stdout: true,
-                stderr: true,
-                attach: false,
-            })
-            .await
-            .unwrap();
+        let request = NodeExecRequest::exec(
+            NodeExecTarget::try_new("worker-1", "default", "remote-exec", "remote-container")
+                .unwrap(),
+            vec!["/bin/sh".to_string()],
+            ExecStreamOptions::new(true, true, true, true),
+        );
+        let session = service.open_exec(request).await.unwrap();
         session
-            .send_frame(NodeExecStreamFrame {
-                request_id: String::new(),
-                channel: ExecStreamChannel::Stdin,
-                data: b"echo hello\n".to_vec(),
-                fin: false,
-            })
+            .send_frame(NodeExecFrame::new(
+                ExecStreamChannel::Stdin,
+                b"echo hello\n".to_vec(),
+                false,
+            ))
             .await
             .unwrap();
 
@@ -2675,16 +2842,15 @@ mod cases {
             .unwrap()
             .unwrap()
             .expect("echo frame should arrive");
-        assert_eq!(echoed.channel, ExecStreamChannel::Stdout);
-        assert_eq!(echoed.data, b"echo hello\n");
+        assert_eq!(echoed.channel(), ExecStreamChannel::Stdout);
+        assert_eq!(echoed.data(), b"echo hello\n");
 
         session
-            .send_frame(NodeExecStreamFrame {
-                request_id: String::new(),
-                channel: ExecStreamChannel::Stdin,
-                data: Vec::new(),
-                fin: true,
-            })
+            .send_frame(NodeExecFrame::new(
+                ExecStreamChannel::Stdin,
+                Vec::new(),
+                true,
+            ))
             .await
             .unwrap();
         let status = supervisor
@@ -2698,8 +2864,8 @@ mod cases {
             .unwrap()
             .unwrap()
             .expect("status frame should arrive");
-        assert_eq!(status.channel, ExecStreamChannel::Error);
-        assert!(status.fin);
+        assert_eq!(status.channel(), ExecStreamChannel::Error);
+        assert!(status.fin());
         handle.abort();
     }
 

@@ -3,18 +3,26 @@ use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context as TaskContext, Poll};
 #[cfg(test)]
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 use hyper_util::rt::TokioIo;
 use klights_leader_api::{
     LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest,
     OutboxDeliveryResult,
+};
+use klights_node_api::{
+    BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, ExecStreamChannel,
+    ExecStreamOptions, ExecTerminalError, NodeExecFrame, NodeExecRequest, NodeExecRuntime,
+    NodeExecRuntimeFuture, NodeExecSession, NodeExecSyncRequest, NodeExecSyncResult,
+    NodeExecTarget, NodeLogEvent, NodeLogFuture, NodeLogRequest, NodeLogResult, NodeLogRuntime,
+    NodeLogSetupError, NodeLogTarget, NodeLogTerminalError, NodeMetricsError, NodeMetricsRequest,
+    NodeMetricsResult, NodeMetricsRuntime, NodeMetricsTarget,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::rustls::{
@@ -23,6 +31,7 @@ use tokio_rustls::rustls::{
     crypto::{self, CryptoProvider},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
+use tokio_util::sync::CancellationToken;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::Service;
 
@@ -37,7 +46,7 @@ use crate::control_plane::client::{
 };
 use crate::datastore::Resource;
 use crate::leader_tls_policy::{LeaderTlsVerification, LeaderTlsVerificationPolicy};
-use crate::metrics::{NodeMetricsRequest, NodeMetricsResponse, NodeMetricsSampler};
+use crate::metrics::NodeMetricsSampler;
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
 use crate::replication::grpc::generated::replication_client::ReplicationClient as TonicClient;
 use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
@@ -59,25 +68,35 @@ pub struct SignControlplaneCsrResponse {
 }
 
 use crate::replication::protocol::{
-    ExecStreamChannel, JoinResponse, JoinRole, NodeExecRequest, NodeExecStreamFrame,
-    NodeExecSyncRequest, NodeExecSyncResponse, PodLogRequest, PodLogResponse, StreamItem,
+    JoinResponse, JoinRole, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse, StreamItem,
 };
 use crate::task_supervisor::{TaskCategory, TaskSupervisor};
 
 const CONNECT_CHANNEL_CAPACITY: usize = 64;
 const STREAM_ITEM_CHANNEL_CAPACITY: usize = 1024;
 const NODE_EXEC_STREAM_FRAME_CHANNEL_CAPACITY: usize = 128;
+const NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY: usize = 128;
 // bug-grpc A1: message-size limits now live on `GrpcTransportPolicy`
 // (`max_message_bytes`); the former `MAX_GRPC_MESSAGE_BYTES` constant is
 // gone so client, CRI, and server cannot drift.
 // `DEFAULT_FORWARD_RESPONSE_TIMEOUT` and `PendingForward` removed in T6.
 type StreamItemQueue = Arc<Mutex<mpsc::Receiver<Result<StreamItem>>>>;
-type NodeExecSyncHandlerSlot = Arc<Mutex<Option<Arc<dyn NodeExecSyncHandler>>>>;
-type NodeExecStreamHandlerSlot = Arc<Mutex<Option<Arc<dyn NodeExecStreamHandler>>>>;
-type NodeExecInputRoutes =
-    Arc<Mutex<std::collections::HashMap<String, mpsc::Sender<NodeExecStreamFrame>>>>;
-type PodLogHandlerSlot = Arc<Mutex<Option<Arc<dyn PodLogHandler>>>>;
-type NodeMetricsHandlerSlot = Arc<Mutex<Option<Arc<dyn NodeMetricsHandler>>>>;
+type NodeExecRuntimeSlot = Arc<Mutex<Option<Arc<dyn NodeExecRuntime>>>>;
+#[derive(Clone)]
+struct NodeExecInputRoute {
+    sender: mpsc::Sender<NodeExecFrame>,
+    cancellation: Arc<CancellationToken>,
+}
+type NodeExecInputRoutes = Arc<Mutex<std::collections::HashMap<String, NodeExecInputRoute>>>;
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum ActiveRuntimeKind {
+    Exec,
+    Log,
+}
+type RuntimeCancellationRoutes =
+    Arc<Mutex<std::collections::HashMap<(ActiveRuntimeKind, String), Arc<CancellationToken>>>>;
+type NodeLogRuntimeSlot = Arc<Mutex<Option<Arc<dyn NodeLogRuntime>>>>;
+type NodeMetricsRuntimeSlot = Arc<Mutex<Option<Arc<dyn NodeMetricsRuntime>>>>;
 
 #[derive(Debug)]
 struct SkipCaServerCertVerifier {
@@ -142,50 +161,21 @@ impl ServerCertVerifier for SkipCaServerCertVerifier {
 #[derive(Clone)]
 struct ConnectDispatchContext {
     supervisor: Arc<TaskSupervisor>,
-    node_exec_sync_handler: NodeExecSyncHandlerSlot,
-    node_exec_stream_handler: NodeExecStreamHandlerSlot,
+    node_exec_runtime: NodeExecRuntimeSlot,
     node_exec_inputs: NodeExecInputRoutes,
-    pod_log_handler: PodLogHandlerSlot,
-    node_metrics_handler: NodeMetricsHandlerSlot,
+    node_stream_cancellations: RuntimeCancellationRoutes,
+    node_log_runtime: NodeLogRuntimeSlot,
+    node_metrics_runtime: NodeMetricsRuntimeSlot,
     observed_leader_endpoint: Option<String>,
 }
 
-#[async_trait]
-pub trait NodeExecSyncHandler: Send + Sync {
-    async fn exec_sync(&self, request: NodeExecSyncRequest) -> NodeExecSyncResponse;
-}
-
-#[async_trait]
-pub trait NodeExecStreamHandler: Send + Sync {
-    async fn exec_stream(
-        &self,
-        request: NodeExecRequest,
-        input: mpsc::Receiver<NodeExecStreamFrame>,
-        output: mpsc::Sender<NodeExecStreamFrame>,
-    );
-}
-
-#[async_trait]
-pub trait PodLogHandler: Send + Sync {
-    async fn get_logs(&self, request: PodLogRequest) -> PodLogResponse;
-    fn follow_logs(
-        &self,
-        request: PodLogRequest,
-    ) -> Pin<Box<dyn Stream<Item = PodLogResponse> + Send>>;
-}
-
-#[async_trait]
-pub trait NodeMetricsHandler: Send + Sync {
-    async fn collect_metrics(&self, request: NodeMetricsRequest) -> NodeMetricsResponse;
-}
-
-pub struct CriNodeExecSyncHandler {
+pub(crate) struct CriNodeExecRuntime {
     cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
     task_supervisor: Arc<TaskSupervisor>,
 }
 
-impl CriNodeExecSyncHandler {
-    pub fn new(
+impl CriNodeExecRuntime {
+    pub(crate) fn new(
         cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
         task_supervisor: Arc<TaskSupervisor>,
     ) -> Self {
@@ -196,13 +186,13 @@ impl CriNodeExecSyncHandler {
     }
 }
 
-pub struct CriNodeMetricsHandler {
+pub(crate) struct CriNodeMetricsRuntime {
     cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
     task_supervisor: Arc<TaskSupervisor>,
 }
 
-impl CriNodeMetricsHandler {
-    pub fn new(
+impl CriNodeMetricsRuntime {
+    pub(crate) fn new(
         cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
         task_supervisor: Arc<TaskSupervisor>,
     ) -> Self {
@@ -213,14 +203,15 @@ impl CriNodeMetricsHandler {
     }
 }
 
-pub struct LocalPodLogHandler {
+pub(crate) struct LocalNodeLogRuntime {
     containerd_namespace: String,
     task_supervisor: Arc<TaskSupervisor>,
     pod_log_follow_watch: Option<crate::api_pod_subresources::logs::PodLogFollowWatchSource>,
 }
 
-impl LocalPodLogHandler {
-    pub fn new(containerd_namespace: String, task_supervisor: Arc<TaskSupervisor>) -> Self {
+impl LocalNodeLogRuntime {
+    #[cfg(test)]
+    pub(crate) fn new(containerd_namespace: String, task_supervisor: Arc<TaskSupervisor>) -> Self {
         Self {
             containerd_namespace,
             task_supervisor,
@@ -240,219 +231,340 @@ impl LocalPodLogHandler {
         }
     }
 
-    fn log_path(&self, request: &PodLogRequest) -> String {
+    fn log_path(&self, target: &NodeLogTarget) -> String {
         crate::paths::pod_log_dir_path(
             &self.containerd_namespace,
-            &request.namespace,
-            &request.pod_name,
-            &request.pod_uid,
+            target.namespace(),
+            target.pod_name(),
+            target.pod_uid(),
         )
-        .join(&request.container_name)
+        .join(target.container_name())
         .join("0.log")
         .to_string_lossy()
         .into_owned()
     }
 }
 
-#[async_trait]
-impl PodLogHandler for LocalPodLogHandler {
-    async fn get_logs(&self, request: PodLogRequest) -> PodLogResponse {
-        let log_path = self.log_path(&request);
-
+impl NodeLogRuntime for LocalNodeLogRuntime {
+    fn read_logs(&self, request: NodeLogRequest) -> NodeLogFuture<'_, NodeLogResult> {
+        let (target, options) = request.into_parts();
+        let log_path = self.log_path(&target);
+        let (follow, tail_lines, timestamps, since_time, since_seconds, limit_bytes, previous) =
+            options.into_parts();
+        let is_previous = previous.as_deref() == Some("true");
         let params = crate::api_pod_subresources::logs::LogQuery {
-            container: Some(request.container_name.clone()),
-            follow: None,
-            tail_lines: request.tail_lines.as_deref().and_then(|t| t.parse().ok()),
-            timestamps: request.timestamps.clone(),
-            since_seconds: request.since_seconds,
-            since_time: request.since_time.clone(),
-            limit_bytes: request.limit_bytes.map(|l| l as usize),
-            previous: request.previous.clone(),
+            container: Some(target.container_name().to_string()),
+            follow,
+            tail_lines,
+            timestamps,
+            since_seconds,
+            since_time,
+            limit_bytes,
+            previous,
             insecure_skip_tls_verify_backend: false,
         };
 
-        match crate::api_pod_subresources::logs::build_log_output_bytes(
-            &log_path,
-            &params,
-            self.task_supervisor.as_ref(),
-        )
-        .await
-        {
-            Ok(content) => PodLogResponse {
-                request_id: request.request_id,
-                log_content: content.to_vec(),
-                error: None,
-                fin: true,
-            },
-            Err(e) => PodLogResponse {
-                request_id: request.request_id,
-                log_content: Vec::new(),
-                error: Some(format!("{e:?}")),
-                fin: true,
-            },
-        }
+        Box::pin(async move {
+            if is_previous {
+                return Ok(NodeLogResult::success(Vec::new()));
+            }
+            match crate::api_pod_subresources::logs::build_log_output_bytes(
+                &log_path,
+                &params,
+                self.task_supervisor.as_ref(),
+            )
+            .await
+            {
+                Ok(content) => Ok(NodeLogResult::success(content.to_vec())),
+                Err(e) => Ok(NodeLogResult::failed(
+                    Vec::new(),
+                    NodeLogTerminalError::new(format!("{e:?}")),
+                )),
+            }
+        })
     }
 
-    fn follow_logs(
+    fn open_logs(
         &self,
-        request: PodLogRequest,
-    ) -> Pin<Box<dyn Stream<Item = PodLogResponse> + Send>> {
-        let request_id = request.request_id.clone();
-        if request.previous.as_deref() == Some("true") {
-            return Box::pin(futures::stream::once(async move {
-                PodLogResponse {
-                    request_id,
-                    log_content: Vec::new(),
-                    error: None,
-                    fin: true,
-                }
-            }));
-        }
-
-        let namespace = request.namespace.clone();
-        let pod_name = request.pod_name.clone();
-        let pod_uid = request.pod_uid.clone();
-        let container_name = request.container_name.clone();
-        let log_path = self.log_path(&request);
+        request: NodeLogRequest,
+    ) -> NodeLogFuture<'_, Box<dyn BoundedByteStream<Frame = NodeLogEvent>>> {
+        let (target, options) = request.into_parts();
+        let log_path = self.log_path(&target);
+        let (follow, tail_lines, timestamps, since_time, since_seconds, limit_bytes, previous) =
+            options.into_parts();
         let params = crate::api_pod_subresources::logs::LogQuery {
-            container: Some(request.container_name.clone()),
-            follow: request.follow.clone(),
-            tail_lines: request
-                .tail_lines
-                .as_deref()
-                .and_then(|s| s.parse::<usize>().ok()),
-            timestamps: request.timestamps.clone(),
-            since_time: request.since_time.clone(),
-            since_seconds: request.since_seconds,
-            limit_bytes: request
-                .limit_bytes
-                .and_then(|limit| usize::try_from(limit).ok()),
-            previous: request.previous.clone(),
+            container: Some(target.container_name().to_string()),
+            follow: Some(follow.unwrap_or_else(|| "true".to_string())),
+            tail_lines,
+            timestamps,
+            since_seconds,
+            since_time,
+            limit_bytes,
+            previous,
             insecure_skip_tls_verify_backend: false,
         };
-        let byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
-            if let Some(pod_log_follow_watch) = self.pod_log_follow_watch.clone() {
-                let task_supervisor = self.task_supervisor.clone();
-                let stream = async_stream::stream! {
-                    let pod_events = crate::api_pod_subresources::logs::build_pod_log_follow_event_cursor(
+        let namespace = target.namespace().to_string();
+        let pod_name = target.pod_name().to_string();
+        let pod_uid = target.pod_uid().to_string();
+        let container_name = target.container_name().to_string();
+
+        if params.previous.as_deref() == Some("true") {
+            return Box::pin(async move {
+                let (tx, rx) = mpsc::channel(NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY);
+                let _ = tx.send(NodeLogEvent::terminal()).await;
+                Ok(Box::new(LocalPodLogStreamSession {
+                    inbound_rx: Mutex::new(rx),
+                    producer_cancel: CancellationToken::new(),
+                    cancelled: AtomicBool::new(false),
+                })
+                    as Box<dyn BoundedByteStream<Frame = NodeLogEvent>>)
+            });
+        }
+
+        let pod_log_follow_watch = self.pod_log_follow_watch.clone();
+        let task_supervisor = self.task_supervisor.clone();
+        let producer_supervisor = task_supervisor.clone();
+        let (tx, rx) = mpsc::channel(NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY);
+        let log_tx = tx.clone();
+        let producer_cancel = CancellationToken::new();
+        let task_cancel = producer_cancel.clone();
+        let log_task = async move {
+            let mut inbound = if let Some(pod_log_follow_watch) = pod_log_follow_watch {
+                let pod_events =
+                    crate::api_pod_subresources::logs::build_pod_log_follow_event_cursor(
                         &pod_log_follow_watch,
-                    ).await;
-                    let termination = crate::api_pod_subresources::logs::PodLogFollowTermination::new(
-                        pod_events,
-                        namespace,
-                        pod_name,
-                        pod_uid,
-                        container_name,
-                        false,
-                    );
-                    let mut logs = Box::pin(
-                        crate::api_pod_subresources::logs::follow_log_file_with_termination_watch(
-                            log_path,
-                            params,
-                            task_supervisor,
+                    )
+                    .await;
+                let termination = crate::api_pod_subresources::logs::PodLogFollowTermination::new(
+                    pod_events,
+                    namespace,
+                    pod_name,
+                    pod_uid,
+                    container_name,
+                    false,
+                );
+                Box::pin(
+                    crate::api_pod_subresources::logs::follow_log_file_with_termination_watch(
+                        log_path,
+                        params,
+                        producer_supervisor.clone(),
                         termination,
-                        ),
-                    );
-                    while let Some(item) = logs.next().await {
-                        yield item;
-                    }
-                };
-                Box::pin(stream)
+                    ),
+                )
+                    as Pin<
+                        Box<dyn Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>,
+                    >
             } else {
                 Box::pin(
                     crate::api_pod_subresources::logs::follow_log_file_with_initial_query(
                         log_path,
                         params,
-                        self.task_supervisor.clone(),
+                        producer_supervisor.clone(),
                     ),
                 )
             };
-
-        let stream = byte_stream.map(move |item| match item {
-            Ok(log_content) => PodLogResponse {
-                request_id: request_id.clone(),
-                log_content: log_content.to_vec(),
-                error: None,
-                fin: false,
-            },
-            Err(err) => PodLogResponse {
-                request_id: request_id.clone(),
-                log_content: Vec::new(),
-                error: Some(err.to_string()),
-                fin: true,
-            },
-        });
-        Box::pin(stream)
-    }
-}
-
-#[async_trait]
-impl NodeExecSyncHandler for CriNodeExecSyncHandler {
-    async fn exec_sync(&self, request: NodeExecSyncRequest) -> NodeExecSyncResponse {
-        let result = {
-            let mut cri = self.cri.lock().await;
-            crate::api_pod_subresources::exec_sync_with_created_state_retry(
-                &mut cri,
-                self.task_supervisor.as_ref(),
-                &request.container_id,
-                &request.command,
-                request.timeout_seconds,
-            )
-            .await
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    _ = task_cancel.cancelled() => return,
+                    item = inbound.next() => item,
+                };
+                let Some(item) = item else {
+                    break;
+                };
+                match item {
+                    Ok(log_content) => {
+                        let send = log_tx.send(NodeLogEvent::data(log_content.to_vec()));
+                        if tokio::select! {
+                            biased;
+                            _ = task_cancel.cancelled() => true,
+                            result = send => result.is_err(),
+                        } {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        let send = log_tx.send(NodeLogEvent::failed(
+                            Vec::new(),
+                            NodeLogTerminalError::new(err.to_string()),
+                        ));
+                        tokio::select! {
+                            biased;
+                            _ = task_cancel.cancelled() => {},
+                            _ = send => {},
+                        }
+                        return;
+                    }
+                }
+            }
+            let send = log_tx.send(NodeLogEvent::terminal());
+            tokio::select! {
+                biased;
+                _ = task_cancel.cancelled() => {},
+                _ = send => {},
+            }
         };
-        match result {
-            Ok(response) => NodeExecSyncResponse {
-                request_id: request.request_id,
-                stdout: response.stdout,
-                stderr: response.stderr,
-                exit_code: response.exit_code,
-                error: None,
-            },
-            Err(err) => NodeExecSyncResponse {
-                request_id: request.request_id,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                exit_code: 126,
-                error: Some(err.to_string()),
-            },
-        }
+
+        Box::pin(async move {
+            if let Err(err) = task_supervisor
+                .spawn_async(
+                    TaskCategory::Network,
+                    "grpc_client_local_pod_log_follow",
+                    log_task,
+                )
+                .await
+            {
+                let _ = tx
+                    .send(NodeLogEvent::failed(
+                        Vec::new(),
+                        NodeLogTerminalError::new(err.to_string()),
+                    ))
+                    .await;
+            }
+            Ok(Box::new(LocalPodLogStreamSession {
+                inbound_rx: Mutex::new(rx),
+                producer_cancel,
+                cancelled: AtomicBool::new(false),
+            })
+                as Box<dyn BoundedByteStream<Frame = NodeLogEvent>>)
+        })
     }
 }
 
-#[async_trait]
-impl NodeExecStreamHandler for CriNodeExecSyncHandler {
-    async fn exec_stream(
+struct LocalPodLogStreamSession {
+    inbound_rx: Mutex<mpsc::Receiver<NodeLogEvent>>,
+    producer_cancel: CancellationToken,
+    cancelled: AtomicBool,
+}
+
+impl BoundedByteStream for LocalPodLogStreamSession {
+    type Frame = NodeLogEvent;
+
+    fn bounds(&self) -> ByteStreamBounds {
+        ByteStreamBounds::try_new(
+            NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY,
+            NODE_LOG_STREAM_FRAME_CHANNEL_CAPACITY,
+        )
+        .expect("log stream capacities are non-zero constants")
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn send_frame(&self, _frame: NodeLogEvent) -> ByteStreamFuture<'_, ()> {
+        Box::pin(async move { Err(ByteStreamError::closed("pod log stream is receive-only")) })
+    }
+
+    fn recv_frame(&self) -> ByteStreamFuture<'_, Option<NodeLogEvent>> {
+        Box::pin(async move {
+            if self.is_cancelled() {
+                return Err(ByteStreamError::cancelled());
+            }
+            let frame = self.inbound_rx.lock().await.recv().await;
+            match frame {
+                Some(frame) => {
+                    if frame.is_terminal() {
+                        self.cancelled.store(true, Ordering::Release);
+                        self.producer_cancel.cancel();
+                    }
+                    Ok(Some(frame))
+                }
+                None => {
+                    self.cancelled.store(true, Ordering::Release);
+                    self.producer_cancel.cancel();
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    fn cancel(&mut self) -> ByteStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if !self.cancelled.swap(true, Ordering::AcqRel) {
+                self.producer_cancel.cancel();
+                self.inbound_rx.get_mut().close();
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Drop for LocalPodLogStreamSession {
+    fn drop(&mut self) {
+        self.producer_cancel.cancel();
+    }
+}
+
+impl NodeExecRuntime for CriNodeExecRuntime {
+    fn exec_sync(
+        &self,
+        request: NodeExecSyncRequest,
+    ) -> NodeExecRuntimeFuture<'_, NodeExecSyncResult> {
+        Box::pin(async move {
+            let (target, command, timeout_seconds) = request.into_parts();
+            let result = {
+                let mut cri = self.cri.lock().await;
+                crate::api_pod_subresources::exec_sync_with_created_state_retry(
+                    &mut cri,
+                    self.task_supervisor.as_ref(),
+                    target.container_id(),
+                    &command,
+                    timeout_seconds,
+                )
+                .await
+            };
+            match result {
+                Ok(response) => NodeExecSyncResult::success(
+                    response.stdout,
+                    response.stderr,
+                    response.exit_code,
+                ),
+                Err(err) => NodeExecSyncResult::failed(
+                    Vec::new(),
+                    Vec::new(),
+                    126,
+                    ExecTerminalError::new(err.to_string()),
+                ),
+            }
+        })
+    }
+
+    fn exec_stream(
         &self,
         request: NodeExecRequest,
-        input: mpsc::Receiver<NodeExecStreamFrame>,
-        output: mpsc::Sender<NodeExecStreamFrame>,
-    ) {
-        if let Err(err) = run_cri_node_exec_stream(
-            self.cri.clone(),
-            self.task_supervisor.clone(),
-            request.clone(),
-            input,
-            output.clone(),
-        )
-        .await
-        {
-            let _ = output
-                .send(node_exec_error_frame(
-                    request.request_id,
-                    format!("remote node exec failed: {err:#}"),
-                ))
-                .await;
-        }
+        mut session: Box<dyn NodeExecSession>,
+    ) -> NodeExecRuntimeFuture<'_, ()> {
+        Box::pin(async move {
+            if let Err(err) = run_cri_node_exec_stream(
+                self.cri.clone(),
+                self.task_supervisor.clone(),
+                request,
+                session.as_mut(),
+            )
+            .await
+            {
+                let _ = session
+                    .send_frame(node_exec_error_frame(format!(
+                        "remote node exec failed: {err:#}"
+                    )))
+                    .await;
+            }
+        })
     }
 }
 
-#[async_trait]
-impl NodeMetricsHandler for CriNodeMetricsHandler {
-    async fn collect_metrics(&self, request: NodeMetricsRequest) -> NodeMetricsResponse {
-        let node =
-            match crate::metrics::LinuxProcNodeMetricsSampler::new(self.task_supervisor.clone())
-                .sample_node()
-                .await
+impl NodeMetricsRuntime for CriNodeMetricsRuntime {
+    fn collect_metrics(
+        &self,
+        request: NodeMetricsRequest,
+    ) -> klights_node_api::NodeMetricsFuture<'_, NodeMetricsResult> {
+        Box::pin(async move {
+            let node = match crate::metrics::LinuxProcNodeMetricsSampler::new(
+                self.task_supervisor.clone(),
+            )
+            .sample_node()
+            .await
             {
                 Ok(sample) => Some(sample),
                 Err(error) => {
@@ -460,91 +572,79 @@ impl NodeMetricsHandler for CriNodeMetricsHandler {
                     None
                 }
             };
-        let mut client = {
-            let guard = self.cri.lock().await;
-            guard.clone()
-        };
-        match client.list_pod_sandbox_stats(None).await {
-            Ok(stats) => NodeMetricsResponse::from_pod_sandbox_stats(&request, node, stats),
-            Err(err) => {
-                tracing::debug!(error = %err, "CRI pod sandbox metrics unavailable");
-                if let Some(node) = node {
-                    NodeMetricsResponse::from_node_sample(
-                        request.request_id,
-                        request.node_name,
-                        node,
-                    )
-                } else {
-                    NodeMetricsResponse::error(
-                        request.request_id,
-                        request.node_name,
-                        format!("{err:#}"),
-                    )
+            let mut client = {
+                let guard = self.cri.lock().await;
+                guard.clone()
+            };
+            match client.list_pod_sandbox_stats(None).await {
+                Ok(stats) => Ok(crate::metrics::node_metrics_result_from_pod_sandbox_stats(
+                    &request, node, stats,
+                )),
+                Err(err) => {
+                    tracing::debug!(error = %err, "CRI pod sandbox metrics unavailable");
+                    if let Some(node) = node {
+                        Ok(NodeMetricsResult::new(
+                            request.target().clone(),
+                            Some(node),
+                            Vec::new(),
+                        ))
+                    } else {
+                        Err(NodeMetricsError::unavailable(format!("{err:#}")))
+                    }
                 }
             }
-        }
+        })
     }
 }
 
-fn node_exec_error_frame(request_id: String, message: String) -> NodeExecStreamFrame {
-    NodeExecStreamFrame {
-        request_id,
-        channel: ExecStreamChannel::Error,
-        data: serde_json::json!({
+fn node_exec_error_frame(message: String) -> NodeExecFrame {
+    NodeExecFrame::new(
+        ExecStreamChannel::Error,
+        serde_json::json!({
             "metadata": {},
             "status": "Failure",
             "message": message,
         })
         .to_string()
         .into_bytes(),
-        fin: true,
-    }
-}
-
-async fn send_exec_frame(
-    output: &mpsc::Sender<NodeExecStreamFrame>,
-    frame: NodeExecStreamFrame,
-) -> Result<()> {
-    output
-        .send(frame)
-        .await
-        .map_err(|_| anyhow!("node exec stream output receiver closed"))
+        true,
+    )
 }
 
 async fn run_cri_node_exec_stream(
     cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
     task_supervisor: Arc<TaskSupervisor>,
     request: NodeExecRequest,
-    mut input: mpsc::Receiver<NodeExecStreamFrame>,
-    output: mpsc::Sender<NodeExecStreamFrame>,
+    session: &mut dyn NodeExecSession,
 ) -> Result<()> {
     use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
     use tokio::io::AsyncWriteExt;
 
+    let (target, command, options, attach) = request.into_parts();
+
     tracing::debug!(
-        request_id = %request.request_id,
-        container = %request.container_id,
-        command = ?request.command,
-        stdin = request.stdin,
-        stdout = request.stdout,
-        stderr = request.stderr,
-        tty = request.tty,
+        container = %target.container_id(),
+        command = ?command,
+        stdin = options.stdin(),
+        stdout = options.stdout(),
+        stderr = options.stderr(),
+        tty = options.tty(),
         "starting CRI node exec stream"
     );
 
     let streaming_url = {
         let mut cri_client = cri.lock().await;
-        if request.attach {
+        if attach {
             crate::api_pod_subresources::attach_with_created_state_retry(
                 &mut cri_client,
                 task_supervisor.as_ref(),
                 crate::api_pod_subresources::AttachRequest {
-                    container_id: &request.container_id,
+                    container_id: target.container_id(),
                     stream_options: crate::api_pod_subresources::ExecStreamOptions {
-                        tty: request.tty,
-                        stdin: request.stdin,
-                        stdout: request.stdout,
-                        stderr: request.stderr && !request.tty,
+                        tty: options.tty(),
+                        stdin: options.stdin(),
+                        stdout: options.stdout(),
+                        stderr: options.stderr() && !options.tty(),
                     },
                 },
             )
@@ -555,13 +655,13 @@ async fn run_cri_node_exec_stream(
                 &mut cri_client,
                 task_supervisor.as_ref(),
                 crate::api_pod_subresources::ExecRequest {
-                    container_id: &request.container_id,
-                    command: &request.command,
+                    container_id: target.container_id(),
+                    command: &command,
                     stream_options: crate::api_pod_subresources::ExecStreamOptions {
-                        tty: request.tty,
-                        stdin: request.stdin,
-                        stdout: request.stdout,
-                        stderr: request.stderr && !request.tty,
+                        tty: options.tty(),
+                        stdin: options.stdin(),
+                        stdout: options.stdout(),
+                        stderr: options.stderr() && !options.tty(),
                     },
                 },
             )
@@ -573,17 +673,17 @@ async fn run_cri_node_exec_stream(
     let mut containerd_stream = SpdyExec::connect_to_streaming_url(&streaming_url).await?;
     let mut containerd_spdy = SpdyExec::new();
 
-    if request.stdin {
+    if options.stdin() {
         containerd_spdy
             .write_syn_stream(&mut containerd_stream, 1, StreamType::Stdin)
             .await?;
     }
-    if request.stdout {
+    if options.stdout() {
         containerd_spdy
             .write_syn_stream(&mut containerd_stream, 3, StreamType::Stdout)
             .await?;
     }
-    if request.stderr && !request.tty {
+    if options.stderr() && !options.tty() {
         containerd_spdy
             .write_syn_stream(&mut containerd_stream, 5, StreamType::Stderr)
             .await?;
@@ -591,7 +691,7 @@ async fn run_cri_node_exec_stream(
     containerd_spdy
         .write_syn_stream(&mut containerd_stream, 7, StreamType::Error)
         .await?;
-    if request.tty {
+    if options.tty() {
         containerd_spdy
             .write_syn_stream(&mut containerd_stream, 9, StreamType::Resize)
             .await?;
@@ -606,49 +706,47 @@ async fn run_cri_node_exec_stream(
             .await?;
     }
 
-    let mut stdin_closed = !request.stdin;
+    let mut stdin_closed = !options.stdin();
     let mut input_closed = false;
     loop {
         tokio::select! {
-            frame = input.recv(), if !input_closed && (!stdin_closed || request.tty) => {
+            frame = session.recv_frame(), if !input_closed && (!stdin_closed || options.tty()) => {
                 match frame {
-                    Some(frame) => match frame.channel {
-                        ExecStreamChannel::Stdin if request.stdin => {
+                    Ok(Some(frame)) => match frame.channel() {
+                        ExecStreamChannel::Stdin if options.stdin() => {
                             tracing::debug!(
-                                request_id = %request.request_id,
-                                len = frame.data.len(),
-                                fin = frame.fin,
+                                len = frame.data().len(),
+                                fin = frame.fin(),
                                 "forwarding node exec stdin to containerd"
                             );
-                            if !frame.data.is_empty() {
+                            if !frame.data().is_empty() {
                                 containerd_spdy
-                                    .write_data_frame(&mut containerd_stream, 1, &frame.data, false)
+                                    .write_data_frame(&mut containerd_stream, 1, frame.data(), false)
                                     .await?;
                             }
-                            if frame.fin {
+                            if frame.fin() {
                                 containerd_spdy
                                     .write_data_frame(&mut containerd_stream, 1, &[], true)
                                     .await?;
                                 stdin_closed = true;
                             }
                         }
-                        ExecStreamChannel::Resize if request.tty => {
+                        ExecStreamChannel::Resize if options.tty() => {
                             tracing::debug!(
-                                request_id = %request.request_id,
-                                len = frame.data.len(),
-                                fin = frame.fin,
+                                len = frame.data().len(),
+                                fin = frame.fin(),
                                 "forwarding node exec resize to containerd"
                             );
-                            if !frame.data.is_empty() {
+                            if !frame.data().is_empty() {
                                 containerd_spdy
-                                    .write_data_frame(&mut containerd_stream, 9, &frame.data, false)
+                                    .write_data_frame(&mut containerd_stream, 9, frame.data(), false)
                                     .await?;
                             }
                         }
                         _ => {}
                     },
-                    None => {
-                        if request.stdin && !stdin_closed {
+                    Ok(None) => {
+                        if options.stdin() && !stdin_closed {
                             let _ = containerd_spdy
                                 .write_data_frame(&mut containerd_stream, 1, &[], true)
                                 .await;
@@ -656,6 +754,7 @@ async fn run_cri_node_exec_stream(
                         stdin_closed = true;
                         input_closed = true;
                     }
+                    Err(error) => return Err(anyhow!(error)),
                 }
             }
             frame = containerd_spdy.read_frame(&mut containerd_stream) => {
@@ -668,24 +767,15 @@ async fn run_cri_node_exec_stream(
                             _ => None,
                         };
                         if let Some(channel) = channel {
-                            let node_frame = NodeExecStreamFrame {
-                                request_id: request.request_id.clone(),
-                                channel,
-                                data,
-                                fin,
-                            };
-                            let is_terminal_error_frame =
-                                crate::replication::protocol::node_exec_error_frame_is_terminal(
-                                    &node_frame,
-                                );
+                            let node_frame = NodeExecFrame::new(channel, data, fin);
+                            let is_terminal_error_frame = node_frame.is_terminal();
                             tracing::debug!(
-                                request_id = %request.request_id,
-                                channel = node_frame.channel.as_str(),
-                                len = node_frame.data.len(),
+                                channel = node_frame.channel().as_wire_name(),
+                                len = node_frame.data().len(),
                                 fin,
                                 "forwarding containerd exec frame to leader"
                             );
-                            send_exec_frame(&output, node_frame).await?;
+                            session.send_frame(node_frame).await.map_err(|error| anyhow!(error))?;
                             if is_terminal_error_frame {
                                 return Ok(());
                             }
@@ -774,10 +864,9 @@ pub struct ReplicationGrpcClient {
     supervisor: Arc<TaskSupervisor>,
     stream: Arc<Mutex<Option<OpenConnectStream>>>,
     join_response: Arc<Mutex<Option<JoinResponse>>>,
-    node_exec_sync_handler: NodeExecSyncHandlerSlot,
-    node_exec_stream_handler: NodeExecStreamHandlerSlot,
-    pod_log_handler: PodLogHandlerSlot,
-    node_metrics_handler: NodeMetricsHandlerSlot,
+    node_exec_runtime: NodeExecRuntimeSlot,
+    node_log_runtime: NodeLogRuntimeSlot,
+    node_metrics_runtime: NodeMetricsRuntimeSlot,
     /// T2 step 5: list of all known leader endpoints (from --leader).
     /// When the stream fails, the reconnect loop cycles through these
     /// to find a reachable leader instead of retrying the same fixed
@@ -984,10 +1073,9 @@ impl ReplicationGrpcClient {
             supervisor,
             stream: Arc::new(Mutex::new(None)),
             join_response: Arc::new(Mutex::new(None)),
-            node_exec_sync_handler: Arc::new(Mutex::new(None)),
-            node_exec_stream_handler: Arc::new(Mutex::new(None)),
-            pod_log_handler: Arc::new(Mutex::new(None)),
-            node_metrics_handler: Arc::new(Mutex::new(None)),
+            node_exec_runtime: Arc::new(Mutex::new(None)),
+            node_log_runtime: Arc::new(Mutex::new(None)),
+            node_metrics_runtime: Arc::new(Mutex::new(None)),
             all_leader_endpoints: Arc::new(std::sync::Mutex::new(Vec::new())),
             endpoint_index: Arc::new(std::sync::Mutex::new(0)),
             current_endpoint_override: Arc::new(std::sync::Mutex::new(None)),
@@ -1167,20 +1255,16 @@ impl ReplicationGrpcClient {
         candidates
     }
 
-    pub async fn set_node_exec_sync_handler(&self, handler: Arc<dyn NodeExecSyncHandler>) {
-        *self.node_exec_sync_handler.lock().await = Some(handler);
+    pub async fn set_node_exec_runtime(&self, runtime: Arc<dyn NodeExecRuntime>) {
+        *self.node_exec_runtime.lock().await = Some(runtime);
     }
 
-    pub async fn set_node_exec_stream_handler(&self, handler: Arc<dyn NodeExecStreamHandler>) {
-        *self.node_exec_stream_handler.lock().await = Some(handler);
+    pub async fn set_node_log_runtime(&self, handler: Arc<dyn NodeLogRuntime>) {
+        *self.node_log_runtime.lock().await = Some(handler);
     }
 
-    pub async fn set_pod_log_handler(&self, handler: Arc<dyn PodLogHandler>) {
-        *self.pod_log_handler.lock().await = Some(handler);
-    }
-
-    pub async fn set_node_metrics_handler(&self, handler: Arc<dyn NodeMetricsHandler>) {
-        *self.node_metrics_handler.lock().await = Some(handler);
+    pub async fn set_node_metrics_runtime(&self, runtime: Arc<dyn NodeMetricsRuntime>) {
+        *self.node_metrics_runtime.lock().await = Some(runtime);
     }
 
     #[cfg(test)]
@@ -2290,11 +2374,11 @@ impl ReplicationGrpcClient {
         let (stream_tx, stream_rx) = mpsc::channel(STREAM_ITEM_CHANNEL_CAPACITY);
         let dispatch_context = ConnectDispatchContext {
             supervisor: self.supervisor.clone(),
-            node_exec_sync_handler: self.node_exec_sync_handler.clone(),
-            node_exec_stream_handler: self.node_exec_stream_handler.clone(),
+            node_exec_runtime: self.node_exec_runtime.clone(),
             node_exec_inputs: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            pod_log_handler: self.pod_log_handler.clone(),
-            node_metrics_handler: self.node_metrics_handler.clone(),
+            node_stream_cancellations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            node_log_runtime: self.node_log_runtime.clone(),
+            node_metrics_runtime: self.node_metrics_runtime.clone(),
             observed_leader_endpoint: self.observed_leader_endpoint_for_report(),
         };
         self.supervisor
@@ -2645,7 +2729,59 @@ async fn run_connect_reader(
         }
     };
 
+    cancel_all_node_streams(&context).await;
     let _ = stream_tx.send(Err(terminal_error)).await;
+}
+
+async fn cancel_all_node_streams(context: &ConnectDispatchContext) {
+    let cancellations = {
+        let mut routes = context.node_stream_cancellations.lock().await;
+        routes.drain().map(|(_, cancel)| cancel).collect::<Vec<_>>()
+    };
+    for cancel in cancellations {
+        cancel.cancel();
+    }
+    context.node_exec_inputs.lock().await.clear();
+}
+
+async fn remove_node_stream_cancellation_if_current(
+    routes: &RuntimeCancellationRoutes,
+    kind: ActiveRuntimeKind,
+    request_id: &str,
+    expected: &Arc<CancellationToken>,
+) {
+    let mut routes = routes.lock().await;
+    let key = (kind, request_id.to_string());
+    if routes
+        .get(&key)
+        .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        routes.remove(&key);
+    }
+}
+
+async fn remove_node_exec_routes_if_current(
+    inputs: &NodeExecInputRoutes,
+    cancellations: &RuntimeCancellationRoutes,
+    request_id: &str,
+    expected: &Arc<CancellationToken>,
+) {
+    {
+        let mut inputs = inputs.lock().await;
+        if inputs
+            .get(request_id)
+            .is_some_and(|route| Arc::ptr_eq(&route.cancellation, expected))
+        {
+            inputs.remove(request_id);
+        }
+    }
+    remove_node_stream_cancellation_if_current(
+        cancellations,
+        ActiveRuntimeKind::Exec,
+        request_id,
+        expected,
+    )
+    .await;
 }
 
 async fn dispatch_leader_message(
@@ -2664,8 +2800,7 @@ async fn dispatch_leader_message(
         }
         // T6: legacy ForwardResponse payload removed.
         Some(generated::leader_message::Payload::NodeExecSyncRequest(request)) => {
-            let response =
-                handle_node_exec_sync_request(request, &context.node_exec_sync_handler).await;
+            let response = handle_node_exec_sync_request(request, &context.node_exec_runtime).await;
             outbound
                 .send(generated::FollowerMessage {
                     payload: Some(generated::follower_message::Payload::NodeExecSyncResponse(
@@ -2680,32 +2815,34 @@ async fn dispatch_leader_message(
                 request,
                 outbound,
                 context.supervisor.clone(),
-                &context.node_exec_stream_handler,
+                &context.node_exec_runtime,
                 &context.node_exec_inputs,
+                &context.node_stream_cancellations,
             )
             .await?;
         }
         Some(generated::leader_message::Payload::NodeExecStreamFrame(frame)) => {
-            let frame = node_exec_stream_frame_from_proto(frame)?;
+            let (request_id, frame) = node_exec_stream_frame_from_proto(frame)?;
             tracing::debug!(
-                request_id = %frame.request_id,
-                channel = frame.channel.as_str(),
-                len = frame.data.len(),
-                fin = frame.fin,
+                request_id = %request_id,
+                channel = frame.channel().as_wire_name(),
+                len = frame.data().len(),
+                fin = frame.fin(),
                 "received node exec stream input frame from leader"
             );
             let route = {
                 let routes = context.node_exec_inputs.lock().await;
-                routes.get(&frame.request_id).cloned()
+                routes.get(&request_id).cloned()
             };
             let Some(route) = route else {
                 tracing::warn!(
-                    request_id = %frame.request_id,
+                    request_id = %request_id,
                     "dropped node exec stream input frame for inactive stream"
                 );
                 return Ok(());
             };
             route
+                .sender
                 .send(frame)
                 .await
                 .map_err(|_| anyhow!("node exec stream input receiver closed"))?;
@@ -2714,13 +2851,14 @@ async fn dispatch_leader_message(
             if request.follow.as_deref() == Some("true") {
                 handle_pod_log_follow_request(
                     request,
-                    &context.pod_log_handler,
+                    &context.node_log_runtime,
                     outbound.clone(),
                     context.supervisor.clone(),
+                    context.node_stream_cancellations.clone(),
                 )
                 .await?;
             } else {
-                let response = handle_pod_log_request(request, &context.pod_log_handler).await;
+                let response = handle_pod_log_request(request, &context.node_log_runtime).await;
                 outbound
                     .send(generated::FollowerMessage {
                         payload: Some(generated::follower_message::Payload::PodLogResponse(
@@ -2735,7 +2873,7 @@ async fn dispatch_leader_message(
         }
         Some(generated::leader_message::Payload::NodeMetricsRequest(request)) => {
             let response =
-                handle_node_metrics_request(request, &context.node_metrics_handler).await;
+                handle_node_metrics_request(request, &context.node_metrics_runtime).await;
             outbound
                 .send(generated::FollowerMessage {
                     payload: Some(generated::follower_message::Payload::NodeMetricsResponse(
@@ -2779,73 +2917,183 @@ async fn dispatch_leader_message(
 
 async fn handle_node_exec_sync_request(
     request: generated::NodeExecSyncRequest,
-    handler: &NodeExecSyncHandlerSlot,
+    handler: &NodeExecRuntimeSlot,
 ) -> generated::NodeExecSyncResponse {
-    let request = node_exec_sync_request_from_proto(request);
+    let request_id = request.request_id.clone();
+    let request = match node_exec_sync_request_from_proto(request) {
+        Ok(request) => request,
+        Err(error) => {
+            return generated::NodeExecSyncResponse {
+                request_id,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: 126,
+                error: Some(error.to_string()),
+            };
+        }
+    };
     let Some(handler) = handler.lock().await.clone() else {
         return generated::NodeExecSyncResponse {
-            request_id: request.request_id,
+            request_id,
             stdout: Vec::new(),
             stderr: Vec::new(),
             exit_code: 126,
             error: Some("node exec handler is not available".to_string()),
         };
     };
-    node_exec_sync_response_to_proto(handler.exec_sync(request).await)
+    node_exec_sync_response_to_proto(request_id, handler.exec_sync(request).await)
+}
+
+struct GrpcNodeExecSession {
+    input: Mutex<mpsc::Receiver<NodeExecFrame>>,
+    output: mpsc::Sender<NodeExecFrame>,
+    cancelled: AtomicBool,
+}
+
+impl BoundedByteStream for GrpcNodeExecSession {
+    type Frame = NodeExecFrame;
+
+    fn bounds(&self) -> ByteStreamBounds {
+        ByteStreamBounds::try_new(
+            NODE_EXEC_STREAM_FRAME_CHANNEL_CAPACITY,
+            NODE_EXEC_STREAM_FRAME_CHANNEL_CAPACITY,
+        )
+        .expect("exec stream capacity is a non-zero constant")
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn send_frame(&self, frame: NodeExecFrame) -> ByteStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if self.is_cancelled() {
+                return Err(ByteStreamError::cancelled());
+            }
+            self.output
+                .send(frame)
+                .await
+                .map_err(|_| ByteStreamError::closed("node exec stream output receiver closed"))
+        })
+    }
+
+    fn recv_frame(&self) -> ByteStreamFuture<'_, Option<NodeExecFrame>> {
+        Box::pin(async move {
+            if self.is_cancelled() {
+                return Err(ByteStreamError::cancelled());
+            }
+            Ok(self.input.lock().await.recv().await)
+        })
+    }
+
+    fn cancel(&mut self) -> ByteStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if !self.cancelled.swap(true, Ordering::AcqRel) {
+                self.input.get_mut().close();
+            }
+            Ok(())
+        })
+    }
 }
 
 async fn handle_node_exec_stream_request(
     request: generated::NodeExecRequest,
     outbound: &mpsc::Sender<generated::FollowerMessage>,
     supervisor: Arc<TaskSupervisor>,
-    handler: &NodeExecStreamHandlerSlot,
+    handler: &NodeExecRuntimeSlot,
     node_exec_inputs: &NodeExecInputRoutes,
+    node_stream_cancellations: &RuntimeCancellationRoutes,
 ) -> Result<()> {
-    let request = node_exec_request_from_proto(request);
+    let request_id = request.request_id.clone();
+    let request = node_exec_request_from_proto(request)?;
     let Some(handler) = handler.lock().await.clone() else {
         send_node_exec_frame_to_leader(
             outbound,
-            node_exec_error_frame(
-                request.request_id,
-                "node exec stream handler is not available".to_string(),
-            ),
+            &request_id,
+            node_exec_error_frame("node exec stream handler is not available".to_string()),
         )
         .await?;
         return Ok(());
     };
 
     let (input_tx, input_rx) = mpsc::channel(NODE_EXEC_STREAM_FRAME_CHANNEL_CAPACITY);
+    let runtime_cancel = Arc::new(CancellationToken::new());
+    {
+        let mut cancellations = node_stream_cancellations.lock().await;
+        let key = (ActiveRuntimeKind::Exec, request_id.clone());
+        if cancellations.contains_key(&key) {
+            return Err(anyhow!(
+                "duplicate private node exec stream request id '{request_id}'"
+            ));
+        }
+        cancellations.insert(key, runtime_cancel.clone());
+    }
     {
         let mut routes = node_exec_inputs.lock().await;
-        routes.insert(request.request_id.clone(), input_tx);
+        if routes.contains_key(&request_id) {
+            drop(routes);
+            remove_node_stream_cancellation_if_current(
+                node_stream_cancellations,
+                ActiveRuntimeKind::Exec,
+                &request_id,
+                &runtime_cancel,
+            )
+            .await;
+            return Err(anyhow!(
+                "duplicate private node exec input route id '{request_id}'"
+            ));
+        }
+        routes.insert(
+            request_id.clone(),
+            NodeExecInputRoute {
+                sender: input_tx,
+                cancellation: runtime_cancel.clone(),
+            },
+        );
     }
 
-    let request_id = request.request_id.clone();
     let task_request_id = request_id.clone();
+    let task_cancel = runtime_cancel.clone();
     let output = outbound.clone();
     let routes = node_exec_inputs.clone();
+    let cancellations = node_stream_cancellations.clone();
     tracing::debug!(
         request_id = %request_id,
-        stdin = request.stdin,
-        stdout = request.stdout,
-        stderr = request.stderr,
-        tty = request.tty,
+        stdin = request.options().stdin(),
+        stdout = request.options().stdout(),
+        stderr = request.options().stderr(),
+        tty = request.options().tty(),
         "registered node exec stream input route"
     );
     if let Err(err) = supervisor
         .spawn_async(
             TaskCategory::Network,
-            "grpc_node_exec_stream_handler",
+            "grpc_node_exec_runtime",
             async move {
                 let (output_tx, mut output_rx) =
                     mpsc::channel(NODE_EXEC_STREAM_FRAME_CHANNEL_CAPACITY);
-                let handler_task = handler.exec_stream(request, input_rx, output_tx);
+                let session = GrpcNodeExecSession {
+                    input: Mutex::new(input_rx),
+                    output: output_tx,
+                    cancelled: AtomicBool::new(false),
+                };
+                let handler_task = handler.exec_stream(request, Box::new(session));
                 tokio::pin!(handler_task);
                 loop {
                     tokio::select! {
+                        biased;
+                        _ = task_cancel.cancelled() => {
+                            break;
+                        }
                         _ = &mut handler_task => {
                             while let Some(frame) = output_rx.recv().await {
-                                if send_node_exec_frame_to_leader(&output, frame).await.is_err() {
+                                let terminal = frame.is_terminal();
+                                if send_node_exec_frame_to_leader_with_cancel(
+                                    &output,
+                                    &task_request_id,
+                                    frame,
+                                    &task_cancel,
+                                ).await.is_err() || terminal {
                                     break;
                                 }
                             }
@@ -2855,31 +3103,63 @@ async fn handle_node_exec_stream_request(
                             let Some(frame) = frame else {
                                 break;
                             };
-                            if send_node_exec_frame_to_leader(&output, frame).await.is_err() {
+                            let terminal = frame.is_terminal();
+                            if send_node_exec_frame_to_leader_with_cancel(
+                                &output,
+                                &task_request_id,
+                                frame,
+                                &task_cancel,
+                            ).await.is_err() || terminal {
                                 break;
                             }
                         }
                     }
                 }
-                routes.lock().await.remove(&task_request_id);
+                remove_node_exec_routes_if_current(
+                    &routes,
+                    &cancellations,
+                    &task_request_id,
+                    &task_cancel,
+                )
+                .await;
             },
         )
         .await
     {
-        node_exec_inputs.lock().await.remove(&request_id);
+        remove_node_exec_routes_if_current(
+            node_exec_inputs,
+            node_stream_cancellations,
+            &request_id,
+            &runtime_cancel,
+        )
+        .await;
         return Err(err);
     }
     Ok(())
 }
 
+async fn send_node_exec_frame_to_leader_with_cancel(
+    outbound: &mpsc::Sender<generated::FollowerMessage>,
+    request_id: &str,
+    frame: NodeExecFrame,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow!("node exec stream cancelled")),
+        result = send_node_exec_frame_to_leader(outbound, request_id, frame) => result,
+    }
+}
+
 async fn send_node_exec_frame_to_leader(
     outbound: &mpsc::Sender<generated::FollowerMessage>,
-    frame: NodeExecStreamFrame,
+    request_id: &str,
+    frame: NodeExecFrame,
 ) -> Result<()> {
     outbound
         .send(generated::FollowerMessage {
             payload: Some(generated::follower_message::Payload::NodeExecStreamFrame(
-                node_exec_stream_frame_to_proto(frame),
+                node_exec_stream_frame_to_proto(request_id, frame),
             )),
         })
         .await
@@ -2888,43 +3168,69 @@ async fn send_node_exec_frame_to_leader(
 
 async fn handle_pod_log_request(
     request: generated::PodLogRequest,
-    handler: &PodLogHandlerSlot,
+    handler: &NodeLogRuntimeSlot,
 ) -> generated::PodLogResponse {
-    let request = pod_log_request_from_proto(request);
-    let Some(handler) = handler.lock().await.clone() else {
-        return generated::PodLogResponse {
-            request_id: request.request_id,
-            log_content: Vec::new(),
-            error: Some("pod log handler is not available".to_string()),
-            fin: true,
-        };
+    let request_id = request.request_id.clone();
+    let request = match node_log_request_from_proto(request) {
+        Ok(request) => request,
+        Err(error) => {
+            return node_log_error_to_proto(request_id, error.to_string());
+        }
     };
-    pod_log_response_to_proto(handler.get_logs(request).await)
+    let Some(handler) = handler.lock().await.clone() else {
+        return node_log_error_to_proto(request_id, "pod log handler is not available".to_string());
+    };
+    match handler.read_logs(request).await {
+        Ok(result) => node_log_result_to_proto(request_id, result),
+        Err(error) => node_log_error_to_proto(request_id, error.to_string()),
+    }
 }
 
 async fn handle_node_metrics_request(
     request: generated::NodeMetricsRequest,
-    handler: &NodeMetricsHandlerSlot,
+    runtime: &NodeMetricsRuntimeSlot,
 ) -> generated::NodeMetricsResponse {
-    let request = node_metrics_request_from_proto(request);
-    let Some(handler) = handler.lock().await.clone() else {
-        return node_metrics_response_to_proto(NodeMetricsResponse::error(
-            request.request_id,
-            request.node_name,
-            "node metrics handler is not available",
-        ));
+    let request = match node_metrics_request_from_proto(request) {
+        Ok(request) => request,
+        Err(response) => return node_metrics_response_to_proto(response),
     };
-    node_metrics_response_to_proto(handler.collect_metrics(request).await)
+    let request_id = request.request_id;
+    let node_name = request.request.target().node_name().to_string();
+    let result = match runtime.lock().await.clone() {
+        Some(runtime) => runtime.collect_metrics(request.request).await,
+        None => Err(NodeMetricsError::unavailable(
+            "node metrics handler is not available",
+        )),
+    };
+    node_metrics_response_to_proto(RoutedNodeMetricsResponse {
+        request_id,
+        node_name,
+        result,
+    })
 }
 
 async fn handle_pod_log_follow_request(
     request: generated::PodLogRequest,
-    handler: &PodLogHandlerSlot,
+    handler: &NodeLogRuntimeSlot,
     outbound: mpsc::Sender<generated::FollowerMessage>,
     supervisor: Arc<TaskSupervisor>,
+    node_stream_cancellations: RuntimeCancellationRoutes,
 ) -> Result<()> {
-    let request = pod_log_request_from_proto(request);
     let request_id = request.request_id.clone();
+    let request = match node_log_request_from_proto(request) {
+        Ok(request) => request,
+        Err(error) => {
+            outbound
+                .send(generated::FollowerMessage {
+                    payload: Some(generated::follower_message::Payload::PodLogResponse(
+                        node_log_error_to_proto(request_id, error.to_string()),
+                    )),
+                })
+                .await
+                .map_err(|_| anyhow!("replication stream closed before pod log response send"))?;
+            return Ok(());
+        }
+    };
     let Some(handler) = handler.lock().await.clone() else {
         outbound
             .send(generated::FollowerMessage {
@@ -2942,46 +3248,134 @@ async fn handle_pod_log_follow_request(
         return Ok(());
     };
 
-    supervisor
+    let runtime_cancel = Arc::new(CancellationToken::new());
+    {
+        let mut cancellations = node_stream_cancellations.lock().await;
+        let key = (ActiveRuntimeKind::Log, request_id.clone());
+        if cancellations.contains_key(&key) {
+            return Err(anyhow!(
+                "duplicate private pod log stream request id '{request_id}'"
+            ));
+        }
+        cancellations.insert(key, runtime_cancel.clone());
+    }
+    let task_request_id = request_id.clone();
+    let task_cancel = runtime_cancel.clone();
+    let cancellations = node_stream_cancellations.clone();
+
+    if let Err(error) = supervisor
         .spawn_async(
             TaskCategory::Network,
             "grpc_pod_log_follow_stream",
             async move {
-                let mut stream = handler.follow_logs(request);
-                while let Some(response) = stream.next().await {
-                    let terminal = response.fin || response.error.is_some();
-                    if outbound
-                        .send(generated::FollowerMessage {
-                            payload: Some(generated::follower_message::Payload::PodLogResponse(
-                                pod_log_response_to_proto(response),
-                            )),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    if terminal {
-                        return;
-                    }
-                }
-
-                let _ = outbound
-                    .send(generated::FollowerMessage {
-                        payload: Some(generated::follower_message::Payload::PodLogResponse(
-                            generated::PodLogResponse {
-                                request_id,
-                                log_content: Vec::new(),
-                                error: None,
-                                fin: true,
-                            },
-                        )),
-                    })
-                    .await;
+                run_pod_log_follow_task(
+                    handler,
+                    request,
+                    task_request_id.clone(),
+                    outbound,
+                    task_cancel.clone(),
+                )
+                .await;
+                remove_node_stream_cancellation_if_current(
+                    &cancellations,
+                    ActiveRuntimeKind::Log,
+                    &task_request_id,
+                    &task_cancel,
+                )
+                .await;
             },
         )
-        .await?;
+        .await
+    {
+        remove_node_stream_cancellation_if_current(
+            &node_stream_cancellations,
+            ActiveRuntimeKind::Log,
+            &request_id,
+            &runtime_cancel,
+        )
+        .await;
+        return Err(error);
+    }
     Ok(())
+}
+
+async fn run_pod_log_follow_task(
+    handler: Arc<dyn NodeLogRuntime>,
+    request: NodeLogRequest,
+    request_id: String,
+    outbound: mpsc::Sender<generated::FollowerMessage>,
+    cancel: Arc<CancellationToken>,
+) {
+    let open = handler.open_logs(request);
+    let mut stream = match tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return,
+        result = open => result,
+    } {
+        Ok(stream) => stream,
+        Err(error) => {
+            let response = generated::PodLogResponse {
+                request_id,
+                log_content: Vec::new(),
+                error: Some(error.to_string()),
+                fin: true,
+            };
+            let _ = send_pod_log_response_with_cancel(&outbound, response, &cancel).await;
+            return;
+        }
+    };
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            event = stream.recv_frame() => event,
+        };
+        match event {
+            Ok(Some(event)) => {
+                let terminal = event.is_terminal();
+                let response = node_log_event_to_proto(request_id.clone(), event);
+                if send_pod_log_response_with_cancel(&outbound, response, &cancel)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if terminal {
+                    break;
+                }
+            }
+            Ok(None) => {
+                let response = generated::PodLogResponse {
+                    request_id: request_id.clone(),
+                    log_content: Vec::new(),
+                    error: None,
+                    fin: true,
+                };
+                let _ = send_pod_log_response_with_cancel(&outbound, response, &cancel).await;
+                break;
+            }
+            Err(error) => {
+                let response = node_log_error_to_proto(request_id.clone(), error.to_string());
+                let _ = send_pod_log_response_with_cancel(&outbound, response, &cancel).await;
+                break;
+            }
+        }
+    }
+    let _ = stream.cancel().await;
+}
+
+async fn send_pod_log_response_with_cancel(
+    outbound: &mpsc::Sender<generated::FollowerMessage>,
+    response: generated::PodLogResponse,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow!("node log stream cancelled")),
+        result = outbound.send(generated::FollowerMessage {
+            payload: Some(generated::follower_message::Payload::PodLogResponse(response)),
+        }) => result.map_err(|_| anyhow!("replication stream closed before pod log response send")),
+    }
 }
 
 // `impl CommandForwarder for ReplicationGrpcClient` removed in T6 along
@@ -3720,130 +4114,191 @@ fn stream_item_from_proto(item: generated::StreamItem) -> Result<StreamItem> {
 
 fn node_exec_sync_request_from_proto(
     request: generated::NodeExecSyncRequest,
-) -> NodeExecSyncRequest {
-    NodeExecSyncRequest {
-        request_id: request.request_id,
-        node_name: request.node_name,
-        namespace: request.namespace,
-        pod_name: request.pod_name,
-        container_id: request.container_id,
-        command: request.command,
-        timeout_seconds: request.timeout_seconds,
-    }
+) -> Result<NodeExecSyncRequest> {
+    let target = NodeExecTarget::try_new(
+        request.node_name,
+        request.namespace,
+        request.pod_name,
+        request.container_id,
+    )?;
+    Ok(NodeExecSyncRequest::try_new(
+        target,
+        request.command,
+        request.timeout_seconds,
+    )?)
 }
 
 fn node_exec_sync_response_to_proto(
-    response: NodeExecSyncResponse,
+    request_id: String,
+    response: NodeExecSyncResult,
 ) -> generated::NodeExecSyncResponse {
+    let (stdout, stderr, exit_code, terminal_error) = response.into_parts();
     generated::NodeExecSyncResponse {
-        request_id: response.request_id,
-        stdout: response.stdout,
-        stderr: response.stderr,
-        exit_code: response.exit_code,
-        error: response.error,
+        request_id,
+        stdout,
+        stderr,
+        exit_code,
+        error: terminal_error.map(ExecTerminalError::into_message),
     }
 }
 
-fn node_exec_request_from_proto(request: generated::NodeExecRequest) -> NodeExecRequest {
-    NodeExecRequest {
-        request_id: request.request_id,
-        node_name: request.node_name,
-        namespace: request.namespace,
-        pod_name: request.pod_name,
-        container_id: request.container_id,
-        command: request.command,
-        tty: request.tty,
-        stdin: request.stdin,
-        stdout: request.stdout,
-        stderr: request.stderr,
-        attach: request.attach,
-    }
+fn node_exec_request_from_proto(request: generated::NodeExecRequest) -> Result<NodeExecRequest> {
+    let target = NodeExecTarget::try_new(
+        request.node_name,
+        request.namespace,
+        request.pod_name,
+        request.container_id,
+    )?;
+    let options =
+        ExecStreamOptions::new(request.stdin, request.stdout, request.stderr, request.tty);
+    Ok(if request.attach {
+        NodeExecRequest::attach(target, options)
+    } else {
+        NodeExecRequest::exec(target, request.command, options)
+    })
 }
 
-fn node_exec_stream_frame_to_proto(frame: NodeExecStreamFrame) -> generated::NodeExecStreamFrame {
+fn node_exec_stream_frame_to_proto(
+    request_id: &str,
+    frame: NodeExecFrame,
+) -> generated::NodeExecStreamFrame {
+    let (channel, data, fin) = frame.into_parts();
     generated::NodeExecStreamFrame {
-        request_id: frame.request_id,
-        channel: frame.channel.as_str().to_string(),
-        data: frame.data,
-        fin: frame.fin,
+        request_id: request_id.to_string(),
+        channel: channel.as_wire_name().to_string(),
+        data,
+        fin,
     }
 }
 
 fn node_exec_stream_frame_from_proto(
     frame: generated::NodeExecStreamFrame,
-) -> Result<NodeExecStreamFrame> {
-    let channel = ExecStreamChannel::parse(&frame.channel)
+) -> Result<(String, NodeExecFrame)> {
+    let channel = ExecStreamChannel::try_from_wire_name(&frame.channel)
         .ok_or_else(|| anyhow!("unknown node exec stream channel '{}'", frame.channel))?;
-    Ok(NodeExecStreamFrame {
-        request_id: frame.request_id,
-        channel,
-        data: frame.data,
-        fin: frame.fin,
+    Ok((
+        frame.request_id,
+        NodeExecFrame::new(channel, frame.data, frame.fin),
+    ))
+}
+
+fn node_log_request_from_proto(
+    request: generated::PodLogRequest,
+) -> std::result::Result<NodeLogRequest, NodeLogSetupError> {
+    let target = NodeLogTarget::try_new(
+        request.node_name,
+        request.namespace,
+        request.pod_name,
+        request.pod_uid,
+        request.container_name,
+    )?;
+    let options = klights_node_api::NodeLogOptions::new(
+        request.follow,
+        request.tail_lines.and_then(|value| value.parse().ok()),
+        request.timestamps,
+        request.since_time,
+        request.since_seconds,
+        request
+            .limit_bytes
+            .and_then(|value| usize::try_from(value).ok()),
+        request.previous,
+    );
+    Ok(NodeLogRequest::new(target, options))
+}
+
+fn node_log_result_to_proto(
+    request_id: String,
+    response: NodeLogResult,
+) -> generated::PodLogResponse {
+    let (log_content, terminal_error) = response.into_parts();
+    generated::PodLogResponse {
+        request_id,
+        log_content,
+        error: terminal_error.map(NodeLogTerminalError::into_message),
+        fin: true,
+    }
+}
+
+fn node_log_event_to_proto(request_id: String, event: NodeLogEvent) -> generated::PodLogResponse {
+    let (log_content, terminal_error, terminal) = event.into_parts();
+    generated::PodLogResponse {
+        request_id,
+        log_content,
+        error: terminal_error.map(NodeLogTerminalError::into_message),
+        fin: terminal,
+    }
+}
+
+fn node_log_error_to_proto(request_id: String, error: String) -> generated::PodLogResponse {
+    generated::PodLogResponse {
+        request_id,
+        log_content: Vec::new(),
+        error: Some(error),
+        fin: true,
+    }
+}
+
+fn node_metrics_request_from_proto(
+    request: generated::NodeMetricsRequest,
+) -> std::result::Result<RoutedNodeMetricsRequest, RoutedNodeMetricsResponse> {
+    let request_id = request.request_id;
+    let node_name = request.node_name;
+    let target = match NodeMetricsTarget::try_new(node_name.clone()) {
+        Ok(target) => target,
+        Err(error) => {
+            return Err(RoutedNodeMetricsResponse {
+                request_id,
+                node_name,
+                result: Err(error),
+            });
+        }
+    };
+    Ok(RoutedNodeMetricsRequest {
+        request_id,
+        request: NodeMetricsRequest::new(target, request.pod_uids),
     })
 }
 
-fn pod_log_request_from_proto(request: generated::PodLogRequest) -> PodLogRequest {
-    PodLogRequest {
-        request_id: request.request_id,
-        node_name: request.node_name,
-        namespace: request.namespace,
-        pod_name: request.pod_name,
-        pod_uid: request.pod_uid,
-        container_name: request.container_name,
-        follow: request.follow,
-        tail_lines: request.tail_lines,
-        timestamps: request.timestamps,
-        since_time: request.since_time,
-        since_seconds: request.since_seconds,
-        limit_bytes: request.limit_bytes,
-        previous: request.previous,
-    }
-}
-
-fn pod_log_response_to_proto(response: PodLogResponse) -> generated::PodLogResponse {
-    generated::PodLogResponse {
-        request_id: response.request_id,
-        log_content: response.log_content,
-        error: response.error,
-        fin: response.fin,
-    }
-}
-
-fn node_metrics_request_from_proto(request: generated::NodeMetricsRequest) -> NodeMetricsRequest {
-    NodeMetricsRequest {
-        request_id: request.request_id,
-        node_name: request.node_name,
-        pod_uids: request.pod_uids,
-    }
-}
-
-fn node_metrics_response_to_proto(response: NodeMetricsResponse) -> generated::NodeMetricsResponse {
+fn node_metrics_response_to_proto(
+    response: RoutedNodeMetricsResponse,
+) -> generated::NodeMetricsResponse {
+    let (node, pods, error) = match response.result {
+        Ok(result) => {
+            let (_target, node, pods) = result.into_parts();
+            (node, pods, None)
+        }
+        Err(error) => (None, Vec::new(), Some(error.to_string())),
+    };
     generated::NodeMetricsResponse {
         request_id: response.request_id,
         node_name: response.node_name,
-        node: response.node.map(|node| generated::NodeMetricsNodeSample {
-            cpu_nanos: node.cpu_nanos,
-            memory_bytes: node.memory_bytes,
+        node: node.map(|node| generated::NodeMetricsNodeSample {
+            cpu_nanos: node.cpu_nanos(),
+            memory_bytes: node.memory_bytes(),
         }),
-        pods: response
-            .pods
+        pods: pods
             .into_iter()
-            .map(|pod| generated::NodeMetricsPodSample {
-                namespace: pod.namespace,
-                name: pod.name,
-                uid: pod.uid,
-                containers: pod
-                    .containers
-                    .into_iter()
-                    .map(|container| generated::NodeMetricsContainerSample {
-                        name: container.name,
-                        cpu_nanos: container.cpu_nanos,
-                        memory_bytes: container.memory_bytes,
-                    })
-                    .collect(),
+            .map(|pod| {
+                let (namespace, name, uid, containers) = pod.into_parts();
+                generated::NodeMetricsPodSample {
+                    namespace,
+                    name,
+                    uid,
+                    containers: containers
+                        .into_iter()
+                        .map(|container| {
+                            let (name, cpu_nanos, memory_bytes) = container.into_parts();
+                            generated::NodeMetricsContainerSample {
+                                name,
+                                cpu_nanos,
+                                memory_bytes,
+                            }
+                        })
+                        .collect(),
+                }
             })
             .collect(),
-        error: response.error,
+        error,
     }
 }
 

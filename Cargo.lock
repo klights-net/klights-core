@@ -2028,6 +2028,7 @@ dependencies = [
  "klights-cluster-store",
  "klights-internal-protobuf",
  "klights-leader-api",
+ "klights-node-api",
  "klights-types",
  "kube",
  "libc",
@@ -2169,6 +2170,10 @@ version = "0.0.0"
 [[package]]
 name = "klights-node-api"
 version = "0.0.0"
+dependencies = [
+ "bytes",
+ "serde_json",
+]
 
 [[package]]
 name = "klights-node-datastore"

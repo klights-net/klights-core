@@ -1,14 +1,16 @@
 use super::*;
 
-pub fn remote_exec_error_frame_is_terminal(
-    frame: &crate::replication::protocol::NodeExecStreamFrame,
-) -> bool {
-    crate::replication::protocol::node_exec_error_frame_is_terminal(frame)
+use klights_node_api::{
+    ExecStreamChannel, NodeExec, NodeExecFrame, NodeExecSession, NodeExecSyncRequest,
+    NodeExecTarget, exec_error_status_payload_is_terminal,
+};
+
+pub fn remote_exec_error_frame_is_terminal(frame: &NodeExecFrame) -> bool {
+    frame.is_terminal()
 }
 
 fn spdy_error_stream_frame_is_terminal(stream_id: u32, data: &[u8], fin: bool) -> bool {
-    stream_id == 7
-        && (fin || crate::replication::protocol::exec_error_status_payload_is_terminal(data))
+    stream_id == 7 && (fin || exec_error_status_payload_is_terminal(data))
 }
 
 async fn close_websocket_gracefully<S>(
@@ -69,7 +71,7 @@ pub struct ExecWebSocketRequest {
 }
 
 pub struct RemoteExecWebSocketRequest {
-    pub session: crate::replication::service::NodeExecStreamSession,
+    pub session: Box<dyn NodeExecSession>,
     pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     pub target: ExecTarget,
     pub subprotocol: String,
@@ -78,7 +80,7 @@ pub struct RemoteExecWebSocketRequest {
 }
 
 pub struct RemoteExecWebSocketSyncRequest {
-    pub replication: Arc<crate::replication::ReplicationService>,
+    pub node_exec: Arc<dyn NodeExec>,
     pub target: ExecTarget,
     pub subprotocol: String,
     pub node_name: String,
@@ -633,7 +635,6 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    use crate::replication::protocol::{ExecStreamChannel, NodeExecStreamFrame};
     use futures::sink::SinkExt as _;
     use futures::stream::StreamExt as _;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
@@ -683,12 +684,11 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
                     stdin_idle_timeout.as_secs()
                 );
                 let _ = session
-                    .send_frame(NodeExecStreamFrame {
-                        request_id: String::new(),
-                        channel: ExecStreamChannel::Stdin,
-                        data: Vec::new(),
-                        fin: true,
-                    })
+                    .send_frame(NodeExecFrame::new(
+                        ExecStreamChannel::Stdin,
+                        Vec::new(),
+                        true,
+                    ))
                     .await;
                 stdin_closed = true;
             }
@@ -703,21 +703,19 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
                             0 if stdin && !stdin_closed => {
                                 if data.len() == 1 {
                                     let _ = session
-                                        .send_frame(NodeExecStreamFrame {
-                                            request_id: String::new(),
-                                            channel: ExecStreamChannel::Stdin,
-                                            data: Vec::new(),
-                                            fin: true,
-                                        })
+                                        .send_frame(NodeExecFrame::new(
+                                            ExecStreamChannel::Stdin,
+                                            Vec::new(),
+                                            true,
+                                        ))
                                         .await;
                                     stdin_closed = true;
                                 } else { match session
-                                    .send_frame(NodeExecStreamFrame {
-                                        request_id: String::new(),
-                                        channel: ExecStreamChannel::Stdin,
-                                        data: data[1..].to_vec(),
-                                        fin: false,
-                                    })
+                                    .send_frame(NodeExecFrame::new(
+                                        ExecStreamChannel::Stdin,
+                                        data[1..].to_vec(),
+                                        false,
+                                    ))
                                     .await
                                 { Err(e) => {
                                     tracing::error!("Remote exec WebSocket stdin forward failed: {}", e);
@@ -728,12 +726,11 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
                             }
                             4 if tty => {
                                 if let Err(e) = session
-                                    .send_frame(NodeExecStreamFrame {
-                                        request_id: String::new(),
-                                        channel: ExecStreamChannel::Resize,
-                                        data: data[1..].to_vec(),
-                                        fin: false,
-                                    })
+                                    .send_frame(NodeExecFrame::new(
+                                        ExecStreamChannel::Resize,
+                                        data[1..].to_vec(),
+                                        false,
+                                    ))
                                     .await
                                 {
                                     tracing::error!("Remote exec WebSocket resize forward failed: {}", e);
@@ -746,31 +743,15 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
                     Some(Ok(TungsteniteMessage::Close(_))) | None => {
                         tracing::info!("Remote exec WebSocket closed by client");
                         peer_closed = true;
-                        if stdin && !stdin_closed {
-                            let _ = session
-                                .send_frame(NodeExecStreamFrame {
-                                    request_id: String::new(),
-                                    channel: ExecStreamChannel::Stdin,
-                                    data: Vec::new(),
-                                    fin: true,
-                                })
-                                .await;
-                        }
+                        // A close must not queue behind a backpressured stdin
+                        // FIN. Cancel the local session boundary immediately.
+                        let _ = session.cancel().await;
                         break;
                     }
                     Some(Err(e)) => {
                         tracing::error!("Remote exec WebSocket receive error: {}", e);
                         peer_closed = true;
-                        if stdin && !stdin_closed {
-                            let _ = session
-                                .send_frame(NodeExecStreamFrame {
-                                    request_id: String::new(),
-                                    channel: ExecStreamChannel::Stdin,
-                                    data: Vec::new(),
-                                    fin: true,
-                                })
-                                .await;
-                        }
+                        let _ = session.cancel().await;
                         break;
                     }
                     _ => {}
@@ -788,18 +769,18 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
                 };
 
                 let terminal_error_frame = remote_exec_error_frame_is_terminal(&frame);
-                let channel = match frame.channel {
+                let channel = match frame.channel() {
                     ExecStreamChannel::Stdout => 1,
                     ExecStreamChannel::Stderr => 2,
                     ExecStreamChannel::Error => 3,
                     ExecStreamChannel::Stdin | ExecStreamChannel::Resize => continue,
                 };
 
-                if !frame.data.is_empty() {
-                    if frame.channel == ExecStreamChannel::Error
+                if !frame.data().is_empty() {
+                    if frame.channel() == ExecStreamChannel::Error
                         && !websocket_uses_structured_status_channel(&subprotocol)
                     {
-                        let is_success = serde_json::from_slice::<serde_json::Value>(&frame.data)
+                        let is_success = serde_json::from_slice::<serde_json::Value>(frame.data())
                             .ok()
                             .and_then(|v| {
                                 v.get("status")
@@ -816,7 +797,7 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
                     }
 
                     let mut ws_frame = vec![channel];
-                    ws_frame.extend_from_slice(&frame.data);
+                    ws_frame.extend_from_slice(frame.data());
                     if let Err(e) = ws_sender.send(TungsteniteMessage::Binary(ws_frame.into())).await {
                         tracing::error!("Remote exec WebSocket send failed: {}", e);
                         break;
@@ -830,7 +811,7 @@ pub async fn handle_remote_exec_websocket_tungstenite<S>(
         }
     }
 
-    session.close().await;
+    let _ = session.cancel().await;
     close_websocket_gracefully(
         &mut ws_sender,
         &mut ws_receiver,
@@ -857,7 +838,7 @@ pub async fn handle_remote_exec_websocket_sync<S>(
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
     let RemoteExecWebSocketSyncRequest {
-        replication,
+        node_exec,
         target,
         subprotocol,
         node_name,
@@ -880,23 +861,24 @@ pub async fn handle_remote_exec_websocket_sync<S>(
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
-    let result = replication
-        .request_node_exec_sync(crate::replication::protocol::NodeExecSyncRequest {
-            request_id: String::new(),
-            node_name,
-            namespace: namespace.clone(),
-            pod_name: pod_name.clone(),
-            container_id: container_id.clone(),
-            command: command.clone(),
-            timeout_seconds: 300,
-        })
-        .await;
+    let result = NodeExecTarget::try_new(
+        node_name,
+        namespace.clone(),
+        pod_name.clone(),
+        container_id.clone(),
+    )
+    .and_then(|target| NodeExecSyncRequest::try_new(target, command.clone(), 300))
+    .map(|request| node_exec.exec_sync(request));
+    let result = match result {
+        Ok(result) => result.await,
+        Err(error) => Err(error),
+    };
 
     match result {
         Ok(response) => {
-            if !response.stdout.is_empty() {
+            if !response.stdout().is_empty() {
                 let mut frame = vec![1u8];
-                frame.extend_from_slice(&response.stdout);
+                frame.extend_from_slice(response.stdout());
                 if let Err(e) = ws_sender
                     .send(TungsteniteMessage::Binary(frame.into()))
                     .await
@@ -905,9 +887,9 @@ pub async fn handle_remote_exec_websocket_sync<S>(
                 }
             }
 
-            if !response.stderr.is_empty() {
+            if !response.stderr().is_empty() {
                 let mut frame = vec![2u8];
-                frame.extend_from_slice(&response.stderr);
+                frame.extend_from_slice(response.stderr());
                 if let Err(e) = ws_sender
                     .send(TungsteniteMessage::Binary(frame.into()))
                     .await
@@ -916,18 +898,18 @@ pub async fn handle_remote_exec_websocket_sync<S>(
                 }
             }
 
-            if let Some(error) = &response.error {
+            if let Some(error) = response.terminal_error() {
                 tracing::error!("Remote exec-sync error: {}", error);
                 let mut frame = vec![3u8];
                 frame.extend_from_slice(&format_websocket_error_payload(
                     &subprotocol,
-                    error.clone(),
+                    error.message().to_string(),
                 ));
                 let _ = ws_sender
                     .send(TungsteniteMessage::Binary(frame.into()))
                     .await;
             } else if websocket_uses_structured_status_channel(&subprotocol) {
-                let exit_msg = exec_exit_status(response.exit_code);
+                let exit_msg = exec_exit_status(response.exit_code());
                 let mut frame = vec![3u8];
                 frame.extend_from_slice(exit_msg.to_string().as_bytes());
                 let _ = ws_sender

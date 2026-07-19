@@ -285,7 +285,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         Arc::new(crate::metrics::OnDemandMetricsProvider::new(
             config.node_name.clone(),
             cri_for_api.clone(),
-            replication_service_for_router.clone(),
+            replication_service_for_router
+                .clone()
+                .map(|service| service as Arc<dyn klights_node_api::NodeMetrics>),
             supervisor.clone(),
         ));
     controller_dispatcher
@@ -486,6 +488,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         None
     };
 
+    let node_port_forward = crate::portforward::local_node_port_forward(supervisor.clone());
     let watcher_state = Arc::new(api::AppState {
         db: db_handle.clone(),
         cluster_api: cluster_api.clone(),
@@ -499,6 +502,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         nodeport_alloc,
         cri: None,
         metrics_provider: metrics_provider.clone(),
+        node_port_forward,
         controller_dispatcher,
         side_effects,
         metrics,

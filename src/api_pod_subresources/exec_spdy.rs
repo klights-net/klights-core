@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::*;
-use crate::replication::protocol::{
-    ExecStreamChannel, NodeExecRequest, exec_error_status_payload_is_terminal,
-    node_exec_error_frame_is_terminal,
-};
 use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
+use klights_node_api::{
+    ExecStreamChannel, ExecStreamOptions as NodeExecStreamOptions, NodeExec, NodeExecRequest,
+    NodeExecSession, NodeExecTarget, exec_error_status_payload_is_terminal,
+};
 
 const SPDY_UPGRADE_VALUE: &str = "SPDY/3.1";
 const SPDY_PROTOCOL_HEADER: &str = "X-Stream-Protocol-Version";
@@ -31,7 +31,7 @@ pub struct LocalExecSpdyRequest {
 }
 
 pub struct RemoteExecSpdyRequest {
-    pub replication: Arc<crate::replication::ReplicationService>,
+    pub node_exec: Arc<dyn NodeExec>,
     pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
     pub node_name: String,
     pub target: ExecTarget,
@@ -423,41 +423,124 @@ where
     }
 }
 
-async fn bridge_remote_exec_stream_to_client<S>(
-    client_spdy: &SpdyExec,
-    client_stream: &mut S,
-    streams: &SpdyClientStreams,
-    mut session: crate::replication::service::NodeExecStreamSession,
+async fn bridge_remote_exec_full_duplex<S>(
+    mut client_spdy: SpdyExec,
+    client_stream: S,
+    streams: SpdyClientStreams,
+    mut session: Box<dyn NodeExecSession>,
 ) -> anyhow::Result<()>
 where
-    S: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    while let Some(frame) = session.recv_frame().await? {
-        let channel = match frame.channel {
-            ExecStreamChannel::Stdout => Some(StreamType::Stdout),
-            ExecStreamChannel::Stderr => Some(StreamType::Stderr),
-            ExecStreamChannel::Error => Some(StreamType::Error),
-            ExecStreamChannel::Stdin | ExecStreamChannel::Resize => None,
-        };
-        if let Some(channel) = channel {
-            let terminal = node_exec_error_frame_is_terminal(&frame);
-            write_spdy_exec_channel_frame(
-                client_spdy,
-                client_stream,
-                streams,
-                channel,
-                &frame.data,
-                frame.fin,
-            )
-            .await?;
-            if terminal {
-                session.close().await;
-                return Ok(());
+    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
+    let client_writer = SpdyExec::new();
+    let mut pending_input: Option<klights_node_api::NodeExecFrame> = None;
+    let mut pending_output: Option<klights_node_api::NodeExecFrame> = None;
+
+    loop {
+        tokio::select! {
+            result = async {
+                let frame = pending_input.as_ref().expect("guarded pending input");
+                session.send_frame(frame.clone()).await
+            }, if pending_input.is_some() => {
+                if let Err(error) = result {
+                    let _ = session.cancel().await;
+                    return Err(error.into());
+                }
+                pending_input = None;
+            }
+            result = async {
+                let frame: &klights_node_api::NodeExecFrame =
+                    pending_output.as_ref().expect("guarded pending output");
+                let channel = match frame.channel() {
+                    ExecStreamChannel::Stdout => Some(StreamType::Stdout),
+                    ExecStreamChannel::Stderr => Some(StreamType::Stderr),
+                    ExecStreamChannel::Error => Some(StreamType::Error),
+                    ExecStreamChannel::Stdin | ExecStreamChannel::Resize => None,
+                };
+                if let Some(channel) = channel {
+                    write_spdy_exec_channel_frame(
+                        &client_writer,
+                        &mut client_write,
+                        &streams,
+                        channel,
+                        frame.data(),
+                        frame.fin(),
+                    ).await?;
+                }
+                Ok::<bool, anyhow::Error>(frame.is_terminal())
+            }, if pending_output.is_some() => {
+                let terminal = match result {
+                    Ok(terminal) => terminal,
+                    Err(error) => {
+                        let _ = session.cancel().await;
+                        return Err(error);
+                    }
+                };
+                pending_output = None;
+                if terminal {
+                    let _ = session.cancel().await;
+                    return Ok(());
+                }
+            }
+            inbound = client_spdy.read_frame(&mut client_read), if pending_input.is_none() => {
+                let inbound = match inbound {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let _ = session.cancel().await;
+                        return Err(error);
+                    }
+                };
+                match inbound {
+                    SpdyFrame::Data { stream_id, data, fin } => {
+                        let channel = if Some(stream_id) == streams.stdin {
+                            Some(ExecStreamChannel::Stdin)
+                        } else if Some(stream_id) == streams.resize {
+                            Some(ExecStreamChannel::Resize)
+                        } else {
+                            None
+                        };
+                        if let Some(channel) = channel {
+                            pending_input = Some(klights_node_api::NodeExecFrame::new(
+                                channel, data, fin,
+                            ));
+                        }
+                    }
+                    SpdyFrame::Ping { id } => {
+                        if let Err(error) = client_writer.write_ping(&mut client_write, id).await {
+                            let _ = session.cancel().await;
+                            return Err(error);
+                        }
+                    }
+                    SpdyFrame::RstStream { .. } | SpdyFrame::GoAway => {
+                        let _ = session.cancel().await;
+                        return Ok(());
+                    }
+                    SpdyFrame::SynReply { .. }
+                    | SpdyFrame::Settings
+                    | SpdyFrame::WindowUpdate { .. }
+                    | SpdyFrame::Unknown
+                    | SpdyFrame::SynStream { .. } => {}
+                }
+            }
+            outbound = session.recv_frame(), if pending_output.is_none() => {
+                let outbound = match outbound {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let _ = session.cancel().await;
+                        return Err(error.into());
+                    }
+                };
+                match outbound {
+                    Some(frame) => pending_output = Some(frame),
+                    None => {
+                        let _ = session.cancel().await;
+                        return Ok(());
+                    }
+                }
             }
         }
     }
-    session.close().await;
-    Ok(())
 }
 
 pub async fn handle_local_exec_spdy<S>(mut client_stream: S, request: LocalExecSpdyRequest)
@@ -527,7 +610,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let RemoteExecSpdyRequest {
-        replication,
+        node_exec,
         task_supervisor,
         node_name,
         target,
@@ -556,31 +639,32 @@ where
         }
     };
 
-    let session = replication
-        .open_node_exec_stream(NodeExecRequest {
-            request_id: String::new(),
-            node_name,
-            namespace: namespace.clone(),
-            pod_name: pod_name.clone(),
-            container_id: container_id.clone(),
-            command: command.clone(),
-            tty: request.tty,
-            stdin: request.stdin,
-            stdout: request.stdout,
-            stderr: request.stderr,
-            attach: request.attach,
-        })
-        .await;
+    let target = match NodeExecTarget::try_new(
+        node_name,
+        namespace.clone(),
+        pod_name.clone(),
+        container_id.clone(),
+    ) {
+        Ok(target) => target,
+        Err(error) => {
+            tracing::error!(%error, "Remote SPDY exec target validation failed");
+            let _ = client_stream.shutdown().await;
+            return;
+        }
+    };
+    let options =
+        NodeExecStreamOptions::new(request.stdin, request.stdout, request.stderr, request.tty);
+    let node_request = if request.attach {
+        NodeExecRequest::attach(target, options)
+    } else {
+        NodeExecRequest::exec(target, command.clone(), options)
+    };
+    let session = node_exec.open_exec(node_request).await;
 
     match session {
         Ok(session) => {
-            if let Err(err) = bridge_remote_exec_stream_to_client(
-                &client_spdy,
-                &mut client_stream,
-                &streams,
-                session,
-            )
-            .await
+            if let Err(err) =
+                bridge_remote_exec_full_duplex(client_spdy, client_stream, streams, session).await
             {
                 tracing::error!(
                     "Remote SPDY exec failed: pod={}/{}, container={}, error={}",
@@ -589,14 +673,9 @@ where
                     container_id,
                     err
                 );
-                let _ = write_spdy_exec_error(
-                    &client_spdy,
-                    &mut client_stream,
-                    &streams,
-                    err.to_string(),
-                )
-                .await;
             }
+            tracing::info!("Remote SPDY exec completed: pod={}/{}", namespace, pod_name);
+            return;
         }
         Err(err) => {
             tracing::error!("Remote SPDY exec stream open failed: {}", err);
@@ -618,4 +697,117 @@ pub fn spdy_switching_protocols_response(subprotocol: String) -> Result<Response
         .header(SPDY_PROTOCOL_HEADER, subprotocol)
         .body(axum::body::Body::empty())
         .map_err(|err| AppError::Internal(format!("Failed to build SPDY response: {err}")))
+}
+
+#[cfg(test)]
+mod remote_full_duplex_tests {
+    use super::*;
+    use klights_node_api::{
+        BoundedByteStream, ByteStreamBounds, ByteStreamError, ByteStreamFuture, NodeExecFrame,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::mpsc;
+
+    struct FakeSession {
+        input_tx: mpsc::Sender<NodeExecFrame>,
+        output_rx: tokio::sync::Mutex<mpsc::Receiver<NodeExecFrame>>,
+        cancelled: std::sync::Arc<AtomicBool>,
+    }
+
+    impl BoundedByteStream for FakeSession {
+        type Frame = NodeExecFrame;
+
+        fn bounds(&self) -> ByteStreamBounds {
+            ByteStreamBounds::try_new(1, 1).unwrap()
+        }
+
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+
+        fn send_frame(&self, frame: NodeExecFrame) -> ByteStreamFuture<'_, ()> {
+            Box::pin(async move {
+                self.input_tx
+                    .send(frame)
+                    .await
+                    .map_err(|_| ByteStreamError::closed("input closed"))
+            })
+        }
+
+        fn recv_frame(&self) -> ByteStreamFuture<'_, Option<NodeExecFrame>> {
+            Box::pin(async move { Ok(self.output_rx.lock().await.recv().await) })
+        }
+
+        fn cancel(&mut self) -> ByteStreamFuture<'_, ()> {
+            Box::pin(async move {
+                self.cancelled.store(true, Ordering::Release);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_spdy_relays_input_and_output_while_input_is_backpressured() {
+        let (server_io, mut client_io) = tokio::io::duplex(4096);
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        input_tx
+            .send(NodeExecFrame::new(
+                ExecStreamChannel::Stdin,
+                b"occupied".to_vec(),
+                false,
+            ))
+            .await
+            .unwrap();
+        let (output_tx, output_rx) = mpsc::channel(1);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let session = Box::new(FakeSession {
+            input_tx,
+            output_rx: tokio::sync::Mutex::new(output_rx),
+            cancelled: cancelled.clone(),
+        });
+        let streams = SpdyClientStreams {
+            stdin: Some(1),
+            stdout: Some(3),
+            stderr: None,
+            error: Some(5),
+            resize: None,
+        };
+        let relay = tokio::spawn(bridge_remote_exec_full_duplex(
+            SpdyExec::new(),
+            server_io,
+            streams,
+            session,
+        ));
+        let client_spdy = SpdyExec::new();
+        client_spdy
+            .write_data_frame(&mut client_io, 1, b"blocked-input", false)
+            .await
+            .unwrap();
+        output_tx
+            .send(NodeExecFrame::new(
+                ExecStreamChannel::Stdout,
+                b"output-progress".to_vec(),
+                false,
+            ))
+            .await
+            .unwrap();
+
+        let mut decoder = SpdyExec::new();
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            decoder.read_frame(&mut client_io),
+        )
+        .await
+        .expect("output must progress while input delivery is backpressured")
+        .unwrap();
+        assert!(
+            matches!(frame, SpdyFrame::Data { stream_id: 3, ref data, fin: false } if data == b"output-progress")
+        );
+
+        assert_eq!(input_rx.recv().await.unwrap().data(), b"occupied");
+        assert_eq!(input_rx.recv().await.unwrap().data(), b"blocked-input");
+        drop(client_io);
+        assert!(relay.await.unwrap().is_err());
+        assert!(cancelled.load(Ordering::Acquire));
+    }
 }

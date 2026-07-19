@@ -299,39 +299,37 @@ async fn test_metrics_k8s_io_lists_and_gets_metrics_for_existing_nodes_and_pods(
         }
     }
 
-    let runtime = crate::metrics::RuntimeMetricsSnapshot::from_node_metrics_responses([
-        crate::metrics::NodeMetricsResponse {
-            request_id: "metrics-test".to_string(),
-            node_name: "node-a".to_string(),
-            node: Some(crate::metrics::NodeMetricsNodeSample {
-                cpu_nanos: 777_000_000,
-                memory_bytes: 256 * 1024 * 1024,
-            }),
-            pods: vec![crate::metrics::NodeMetricsPodSample {
-                namespace: "metrics-ns".to_string(),
-                name: "pod-a".to_string(),
-                uid: String::new(),
-                containers: vec![
-                    crate::metrics::NodeMetricsContainerSample {
-                        name: "app".to_string(),
-                        cpu_nanos: 123_000_000,
-                        memory_bytes: 9 * 1024 * 1024,
-                    },
-                    crate::metrics::NodeMetricsContainerSample {
-                        name: "sidecar".to_string(),
-                        cpu_nanos: 45_000_000,
-                        memory_bytes: 5 * 1024 * 1024,
-                    },
-                    crate::metrics::NodeMetricsContainerSample {
-                        name: "besteffort".to_string(),
-                        cpu_nanos: 1_000_000,
-                        memory_bytes: 1024 * 1024,
-                    },
+    let runtime = crate::metrics::RuntimeMetricsSnapshot::from_node_metrics_results([Ok(
+        klights_node_api::NodeMetricsResult::new(
+            klights_node_api::NodeMetricsTarget::try_new("node-a").unwrap(),
+            Some(klights_node_api::NodeMetricsNodeSample::new(
+                777_000_000,
+                256 * 1024 * 1024,
+            )),
+            vec![klights_node_api::NodeMetricsPodSample::new(
+                "metrics-ns",
+                "pod-a",
+                "",
+                vec![
+                    klights_node_api::NodeMetricsContainerSample::new(
+                        "app",
+                        123_000_000,
+                        9 * 1024 * 1024,
+                    ),
+                    klights_node_api::NodeMetricsContainerSample::new(
+                        "sidecar",
+                        45_000_000,
+                        5 * 1024 * 1024,
+                    ),
+                    klights_node_api::NodeMetricsContainerSample::new(
+                        "besteffort",
+                        1_000_000,
+                        1024 * 1024,
+                    ),
                 ],
-            }],
-            error: None,
-        },
-    ]);
+            )],
+        ),
+    )]);
     let mut state = build_test_app_state().await;
     state.metrics_provider = std::sync::Arc::new(StaticMetricsProvider { runtime });
     let db = state.db.clone();
