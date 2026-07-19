@@ -480,6 +480,7 @@ impl RaftLogApplyOutcome {
             } => crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: Some(*resource_version),
                 error_message: None,
+                public_resource_changed: true,
                 applied_mutation: resource
                     .clone()
                     .map(crate::datastore::raft::types::AppliedMutation::Resource),
@@ -490,12 +491,14 @@ impl RaftLogApplyOutcome {
             } => crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: Some(*resource_version),
                 error_message: None,
+                public_resource_changed: false,
                 applied_mutation: None,
             },
             klights_cluster_core::CommittedApplyOutcome::Rejected(rejection) => {
                 crate::datastore::raft::types::StorageCommandResult {
                     applied_rv: None,
                     error_message: Some(rejection.message().to_string()),
+                    public_resource_changed: false,
                     applied_mutation: None,
                 }
             }
@@ -1121,12 +1124,14 @@ fn storage_result_from_applied_outbox(
             Ok(crate::datastore::raft::types::StorageCommandResult {
                 applied_rv: row.applied_rv,
                 error_message: Some(message),
+                public_resource_changed: false,
                 applied_mutation: None,
             })
         }
         Ok(_) => Ok(crate::datastore::raft::types::StorageCommandResult {
             applied_rv: row.applied_rv,
             error_message: None,
+            public_resource_changed: false,
             applied_mutation: None,
         }),
         Err(err) => Err(other_error(format!(
@@ -2142,6 +2147,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fresh.error_message, None);
+        assert!(fresh.public_resource_changed);
         let fresh_rv = fresh.applied_rv.expect("fresh status allocates an RV");
         assert!(
             fresh_rv > before.current_rv,
@@ -2179,6 +2185,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stale.error_message, None);
+        assert!(
+            !stale.public_resource_changed,
+            "stale status ledger-only commits must not request downstream effects"
+        );
         assert_eq!(
             stale.applied_rv,
             Some(fresh_rv),
@@ -2220,6 +2230,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(same_stamp.error_message, None);
+        assert!(
+            !same_stamp.public_resource_changed,
+            "equal status ledger-only commits must not request downstream effects"
+        );
         assert_eq!(
             same_stamp.applied_rv,
             Some(fresh_rv),
@@ -2261,6 +2275,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(newer.error_message, None);
+        assert!(newer.public_resource_changed);
         let newer_rv = newer.applied_rv.expect("newer status allocates an RV");
         assert!(
             newer_rv > fresh_rv,
@@ -2337,6 +2352,7 @@ mod tests {
             .await
             .unwrap();
         assert!(conflict.error_message.is_some());
+        assert!(!conflict.public_resource_changed);
         assert_eq!(
             db.get_current_resource_version().await.unwrap(),
             before_conflict
@@ -2366,6 +2382,10 @@ mod tests {
         let before_duplicate = db.get_current_resource_version().await.unwrap();
         let duplicate = db.apply_raft_log_apply_commit(commit).await.unwrap();
         assert_eq!(duplicate.applied_rv, Some(0));
+        assert!(
+            !duplicate.public_resource_changed,
+            "duplicate committed ledger entries must not request downstream effects"
+        );
         assert_eq!(
             db.get_current_resource_version().await.unwrap(),
             before_duplicate

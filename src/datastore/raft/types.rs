@@ -53,7 +53,17 @@ pub enum AppliedMutation {
 pub struct StorageCommandResult {
     pub applied_rv: Option<i64>,
     pub error_message: Option<String>,
+    /// True only when this state-machine invocation newly committed a
+    /// Kubernetes-visible resource change. This is deliberately independent
+    /// of `applied_mutation`, which carries delete tombstones rather than a
+    /// general-purpose change signal.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub public_resource_changed: bool,
     pub applied_mutation: Option<AppliedMutation>,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 declare_raft_types!(
@@ -107,5 +117,24 @@ mod tests {
         let decoded: StorageCommandPayload = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(payload, decoded);
         assert_eq!(decoded.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn storage_command_result_decodes_legacy_payload_without_change_signal() {
+        let decoded: StorageCommandResult = serde_json::from_value(serde_json::json!({
+            "applied_rv": 7,
+            "error_message": null,
+            "applied_mutation": null
+        }))
+        .unwrap();
+
+        assert!(!decoded.public_resource_changed);
+        assert!(
+            serde_json::to_value(StorageCommandResult::default())
+                .unwrap()
+                .get("public_resource_changed")
+                .is_none(),
+            "false change signals must keep the legacy serialized shape"
+        );
     }
 }

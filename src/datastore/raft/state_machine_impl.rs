@@ -220,6 +220,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                         } => StorageCommandResult {
                             applied_rv: Some(resource_version),
                             error_message: None,
+                            public_resource_changed: true,
                             applied_mutation: resource
                                 .map(crate::datastore::raft::types::AppliedMutation::Resource),
                         },
@@ -229,12 +230,14 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                         } => StorageCommandResult {
                             applied_rv: Some(resource_version),
                             error_message: None,
+                            public_resource_changed: false,
                             applied_mutation: None,
                         },
                         klights_cluster_core::CommittedApplyOutcome::Rejected(rejection) => {
                             StorageCommandResult {
                                 applied_rv: None,
                                 error_message: Some(rejection.message().to_string()),
+                                public_resource_changed: false,
                                 applied_mutation: None,
                             }
                         }
@@ -356,6 +359,7 @@ mod tests {
         };
         let out = sm.apply(vec![entry]).await.unwrap();
         assert_eq!(out.len(), 1);
+        assert!(!out[0].public_resource_changed);
         let (last, _) = sm.applied_state().await.unwrap();
         assert_eq!(last.unwrap().index, 1);
     }
@@ -1512,6 +1516,14 @@ mod tests {
             }])
             .await
             .unwrap();
+        assert!(
+            result[0].public_resource_changed,
+            "a newly visible committed Pod status update must request downstream effects"
+        );
+        assert!(
+            result[0].applied_mutation.is_none(),
+            "visible status updates must not manufacture delete-tombstone mutation payloads"
+        );
         let ready_rv = result[0].applied_rv.unwrap();
         assert!(ready_rv > list.resource_version);
         let events = backend
@@ -1538,7 +1550,8 @@ mod tests {
             log_id: LogId::new(LeaderId::new(2, 10), 7),
             payload: EntryPayload::Membership(m),
         };
-        sm.apply(vec![entry]).await.unwrap();
+        let out = sm.apply(vec![entry]).await.unwrap();
+        assert!(!out[0].public_resource_changed);
         let (last, stored_m) = sm.applied_state().await.unwrap();
         assert_eq!(last.unwrap().index, 7);
         assert_eq!(stored_m.membership().voter_ids().count(), 3);

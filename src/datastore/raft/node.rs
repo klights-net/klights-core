@@ -850,7 +850,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
                 ));
             }
         };
-        let resource_changed = apply_result.applied_mutation.is_some();
+        let resource_changed = apply_result.public_resource_changed;
         if let Some(message) = apply_result.error_message {
             return Err(crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(
                 message,

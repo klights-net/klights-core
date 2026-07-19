@@ -616,6 +616,31 @@ mod tests {
         watch.try_recv().expect("fresh status emits a watch event");
         let fresh_rv = db.get_current_resource_version().await.unwrap();
 
+        let duplicate = deliver("fresh-status", 1, 10, "Running")
+            .await
+            .expect("same idempotency key replays its durable result");
+        assert!(
+            matches!(duplicate.result, OutboxApplyResult::AlreadyApplied { .. }),
+            "same idempotency key must be reported as AlreadyApplied"
+        );
+        assert!(
+            duplicate.command.is_none(),
+            "AlreadyApplied replay must not re-fire controller or Service effects"
+        );
+        assert!(
+            duplicate.resource.is_none(),
+            "AlreadyApplied replay must not claim a new resource effect"
+        );
+        assert_eq!(
+            db.get_current_resource_version().await.unwrap(),
+            fresh_rv,
+            "AlreadyApplied replay must remain resourceVersion-neutral"
+        );
+        assert!(matches!(
+            watch.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
         for (key, stream_seq, stamp) in [("stale-status", 2, 9), ("equal-status", 3, 10)] {
             let reads_before = db.resource_get_call_count_for_test();
             let no_change = deliver(key, stream_seq, stamp, "Pending")
