@@ -129,7 +129,7 @@ impl PodObjectService {
             .await?
             .ok_or_else(|| anyhow!("Pod not found"))?;
         let cas_rv = current.resource_version;
-        self.update_pod_owner_references_inner(ns, name, None, owner_refs, cas_rv, &current)
+        self.update_pod_owner_references_inner(ns, name, owner_refs, cas_rv, &current, false)
             .await
     }
 
@@ -143,25 +143,18 @@ impl PodObjectService {
     ) -> Result<Resource> {
         let current = self.read_current_pod(ns, name, Some(expected_uid)).await?;
         let cas_rv = current.resource_version;
-        self.update_pod_owner_references_inner(
-            ns,
-            name,
-            Some(expected_uid),
-            owner_refs,
-            cas_rv,
-            &current,
-        )
-        .await
+        self.update_pod_owner_references_inner(ns, name, owner_refs, cas_rv, &current, true)
+            .await
     }
 
     async fn update_pod_owner_references_inner(
         &self,
         ns: &str,
         name: &str,
-        _expected_uid: Option<&str>,
         owner_refs: Vec<Value>,
         cas_rv: i64,
         current: &Resource,
+        route_via_worker_outbox: bool,
     ) -> Result<Resource> {
         let owner_references = Value::Array(owner_refs);
         let snapshot = std::sync::Arc::unwrap_or_clone(current.data.clone());
@@ -176,37 +169,39 @@ impl PodObjectService {
             .ok_or_else(|| anyhow!("Pod metadata is not a JSON object"))?;
         metadata_obj.insert("ownerReferences".to_string(), owner_references.clone());
 
-        let pod_uid = current.uid.as_str();
-        let subject_key = format!("v1/Pod/{ns}/{name}/{}", current.uid);
-        let enqueued = self
-            .send_pod_metadata_outbox_command(OutboxCommand {
-                idempotency_key: format!("{}:{}", subject_key, uuid::Uuid::new_v4()),
-                operation: OutboxOperation::PodMetadata,
-                subject: OutboxSubject {
-                    key: subject_key,
-                    namespace: Some(ns.to_string()),
-                    name: name.to_string(),
-                    uid: Some(pod_uid.to_string()),
-                },
-                pod_uid: pod_uid.to_string(),
-                command: StorageCommand::PatchResource {
-                    api_version: "v1".to_string(),
-                    kind: "Pod".to_string(),
-                    namespace: Some(ns.to_string()),
-                    name: name.to_string(),
-                    patch_kind: crate::datastore::PatchKind::Merge,
-                    patch: json!({"metadata": {"ownerReferences": owner_references}}),
-                    preconditions: ResourcePreconditions {
-                        uid: Some(current.uid.clone()),
-                        resource_version: Some(cas_rv),
+        if route_via_worker_outbox {
+            let pod_uid = current.uid.as_str();
+            let subject_key = format!("v1/Pod/{ns}/{name}/{}", current.uid);
+            let enqueued = self
+                .send_pod_metadata_outbox_command(OutboxCommand {
+                    idempotency_key: format!("{}:{}", subject_key, uuid::Uuid::new_v4()),
+                    operation: OutboxOperation::PodMetadata,
+                    subject: OutboxSubject {
+                        key: subject_key,
+                        namespace: Some(ns.to_string()),
+                        name: name.to_string(),
+                        uid: Some(pod_uid.to_string()),
                     },
-                    strict_resource_version: true,
-                },
-                now_ms: now_ms(),
-            })
-            .await?;
-        if enqueued {
-            return Ok(synthetic_resource(current.clone(), body));
+                    pod_uid: pod_uid.to_string(),
+                    command: StorageCommand::PatchResource {
+                        api_version: "v1".to_string(),
+                        kind: "Pod".to_string(),
+                        namespace: Some(ns.to_string()),
+                        name: name.to_string(),
+                        patch_kind: crate::datastore::PatchKind::Merge,
+                        patch: json!({"metadata": {"ownerReferences": owner_references}}),
+                        preconditions: ResourcePreconditions {
+                            uid: Some(current.uid.clone()),
+                            resource_version: Some(cas_rv),
+                        },
+                        strict_resource_version: true,
+                    },
+                    now_ms: now_ms(),
+                })
+                .await?;
+            if enqueued {
+                return Ok(synthetic_resource(current.clone(), body));
+            }
         }
 
         self.store.update(ns, name, body, cas_rv).await

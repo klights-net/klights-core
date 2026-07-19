@@ -1349,6 +1349,130 @@ async fn test_rc_releases_pod_when_selector_changes() {
 }
 
 #[tokio::test]
+async fn test_rc_adopts_and_releases_through_leader_repository_with_worker_outbox() {
+    let db = crate::datastore::test_support::in_memory().await;
+    db.create_resource(
+        "v1",
+        "Namespace",
+        None,
+        "default",
+        json!({"metadata": {"name": "default"}}),
+    )
+    .await
+    .unwrap();
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "orphan",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "orphan",
+                "namespace": "default",
+                "uid": "orphan-uid",
+                "labels": {"app": "rc"}
+            },
+            "spec": {
+                "nodeName": "worker-b",
+                "containers": [{"name": "app", "image": "nginx"}]
+            },
+            "status": {"phase": "Running"}
+        }),
+    )
+    .await
+    .unwrap();
+    let rc = json!({
+        "apiVersion": "v1",
+        "kind": "ReplicationController",
+        "metadata": {"name": "rc", "namespace": "default", "uid": "rc-uid"},
+        "spec": {
+            "replicas": 1,
+            "selector": {"app": "rc"},
+            "template": {
+                "metadata": {"labels": {"app": "rc"}},
+                "spec": {"containers": [{"name": "app", "image": "nginx"}]}
+            }
+        }
+    });
+    db.create_resource(
+        "v1",
+        "ReplicationController",
+        Some("default"),
+        "rc",
+        rc.clone(),
+    )
+    .await
+    .unwrap();
+    let repository =
+        crate::controllers::test_utils::deferred_outbox_pod_repository_for_test(&db).await;
+    let delete_sink = crate::controllers::gc::NoOpGcPodDeleteSink;
+
+    super::reconcile_replicationcontroller(
+        &db,
+        repository.as_ref(),
+        repository.as_ref(),
+        &delete_sink,
+        &rc,
+        "leader",
+    )
+    .await
+    .expect("adopt orphan Pod");
+
+    let adopted = db
+        .get_resource("v1", "Pod", Some("default"), "orphan")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        adopted
+            .data
+            .pointer("/metadata/ownerReferences/0/uid")
+            .and_then(serde_json::Value::as_str),
+        Some("rc-uid"),
+        "RC adoption must be visible in leader storage"
+    );
+
+    let mut relabeled = (*adopted.data).clone();
+    relabeled["metadata"]["labels"]["app"] = json!("other");
+    db.update_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "orphan",
+        relabeled,
+        adopted.resource_version,
+    )
+    .await
+    .unwrap();
+    super::reconcile_replicationcontroller(
+        &db,
+        repository.as_ref(),
+        repository.as_ref(),
+        &delete_sink,
+        &rc,
+        "leader",
+    )
+    .await
+    .expect("release non-matching Pod");
+
+    let released = db
+        .get_resource("v1", "Pod", Some("default"), "orphan")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        released
+            .data
+            .pointer("/metadata/ownerReferences")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "RC release must be visible in leader storage"
+    );
+}
+
+#[tokio::test]
 async fn test_rc_does_not_adopt_pod_with_foreign_controller_owner() {
     let db = crate::datastore::test_support::in_memory().await;
 

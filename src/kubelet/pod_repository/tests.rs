@@ -1520,6 +1520,78 @@ async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
 }
 
 #[tokio::test]
+async fn controller_owner_reference_update_commits_to_leader_store_not_node_outbox() {
+    use super::PodObjectWriter;
+
+    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let created = db
+        .create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "controller-owned",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "controller-owned",
+                    "uid": "uid-controller-owned",
+                    "labels": {"app": "rc"}
+                },
+                "spec": {
+                    "nodeName": "worker-b",
+                    "containers": [{"name": "app", "image": "nginx"}]
+                }
+            }),
+        )
+        .await
+        .expect("create controller-owned Pod");
+    let node_db = fixture_node_local().await;
+    let outbox = Arc::new(crate::kubelet::outbox::Outbox::new(node_db.clone()));
+    let repo = PodRepository::new_with_scheduling_mode_outbox_and_cluster_api(
+        db.clone(),
+        fixture_supervisor(),
+        fixture_side_effects(),
+        crate::side_effects::SideEffectMetrics::new(),
+        super::api::PodSchedulingMode::DeferredMultiNodeLeader,
+        Some(outbox),
+        Arc::new(FakeLeaderApiClient::new(created)),
+    );
+    let owner = json!({
+        "apiVersion": "v1",
+        "kind": "ReplicationController",
+        "name": "rc",
+        "uid": "uid-rc",
+        "controller": true,
+        "blockOwnerDeletion": true
+    });
+
+    repo.update_pod_owner_references("default", "controller-owned", vec![owner.clone()])
+        .await
+        .expect("leader controller owner-reference update");
+
+    let live = db
+        .get_resource("v1", "Pod", Some("default"), "controller-owned")
+        .await
+        .expect("read Pod")
+        .expect("Pod remains");
+    assert_eq!(
+        live.data.pointer("/metadata/ownerReferences/0"),
+        Some(&owner),
+        "controller metadata must be committed through the leader store"
+    );
+    assert!(
+        node_db
+            .claim_next_due_outbox(i64::MAX / 4, 1_000, "assert")
+            .await
+            .expect("inspect node outbox")
+            .is_none(),
+        "leader controller writes must not enter the node-authenticated worker outbox"
+    );
+}
+
+#[tokio::test]
 async fn non_leader_pod_object_writer_without_outbox_retries_later() {
     use super::PodMetadataWriter;
     use super::PodObjectWriter;
