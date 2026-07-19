@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use crate::control_plane::client::{CacheScope, LeaderApiClient};
+use crate::control_plane::client::{
+    CacheReadinessRequest, LeaderApiClient, LeaderCacheReadiness, PodCleanupIntent,
+    PodCleanupIntentListRequest,
+};
 use crate::datastore::POD_CLEANUP_REASON_NODE_LOST;
 use crate::datastore::node_local::NodeLocalHandle;
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
@@ -18,6 +21,7 @@ pub struct StartupReconciler {
     node_name: String,
     containerd_ns: String,
     cluster_api: Arc<dyn LeaderApiClient>,
+    cache_readiness: Arc<dyn LeaderCacheReadiness>,
     node_local: NodeLocalHandle,
     cri: Arc<dyn CriRuntime>,
     router: Arc<PodLifecycleRouter>,
@@ -32,10 +36,12 @@ impl StartupReconciler {
         cri: Arc<dyn CriRuntime>,
         router: Arc<PodLifecycleRouter>,
     ) -> Self {
+        let cache_readiness: Arc<dyn LeaderCacheReadiness> = cluster_api.clone();
         Self {
             node_name,
             containerd_ns,
             cluster_api,
+            cache_readiness,
             node_local,
             cri,
             router,
@@ -43,12 +49,14 @@ impl StartupReconciler {
     }
 
     pub async fn run_once(&self) -> Result<Vec<StartupAction>> {
-        self.cluster_api
-            .wait_cache_ready(CacheScope::Resource {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: None,
-            })
+        self.cache_readiness
+            .wait_cache_ready(CacheReadinessRequest::try_new(
+                "v1",
+                "Pod",
+                None,
+                None,
+                Some(format!("spec.nodeName={}", self.node_name)),
+            )?)
             .await
             .context("wait for pod cache before startup reconcile")?;
 
@@ -59,9 +67,13 @@ impl StartupReconciler {
             .context("list node-local pod_runtime rows")?;
         let leader_pods = self
             .cluster_api
-            .list_pods_on_node(&self.node_name)
+            .list_resources(crate::control_plane::client::pods_on_node_list_request(
+                &self.node_name,
+                crate::control_plane::client::ResourceQueryConsistency::Cached,
+            )?)
             .await
             .context("list leader pods on node")?
+            .into_items()
             .into_iter()
             .map(|pod| (*pod.data).clone())
             .collect::<Vec<_>>();
@@ -111,26 +123,28 @@ impl StartupReconciler {
         let mut actions = plan_startup_actions(true, &runtime_rows, &leader_pods, &sandboxes, &[]);
         let cleanup_intents = self
             .cluster_api
-            .list_pod_cleanup_intents_for_node(&self.node_name)
+            .list_pod_cleanup_intents(
+                PodCleanupIntentListRequest::try_new(self.node_name.clone())
+                    .map_err(anyhow::Error::new)?,
+            )
             .await
             .context("list pod cleanup intents for node")?;
         append_cleanup_intent_actions(&mut actions, &cleanup_intents);
         self.apply_actions(&actions).await?;
         for intent in cleanup_intents {
-            if intent.reason == POD_CLEANUP_REASON_NODE_LOST {
+            if intent.reason() == POD_CLEANUP_REASON_NODE_LOST {
+                let namespace = intent.namespace().to_string();
+                let pod_name = intent.pod_name().to_string();
+                let pod_uid = intent.pod_uid().to_string();
                 self.cluster_api
-                    .delete_pod_cleanup_intent(
-                        &intent.node_name,
-                        &intent.namespace,
-                        &intent.pod_name,
-                        &intent.pod_uid,
-                        &intent.reason,
+                    .acknowledge_pod_cleanup_intent(
+                        intent.ack_request().map_err(anyhow::Error::new)?,
                     )
                     .await
                     .with_context(|| {
                         format!(
                             "delete pod cleanup intent for {}/{} uid={}",
-                            intent.namespace, intent.pod_name, intent.pod_uid
+                            namespace, pod_name, pod_uid
                         )
                     })?;
             }
@@ -196,14 +210,14 @@ impl StartupReconciler {
 
 fn append_cleanup_intent_actions(
     actions: &mut Vec<StartupAction>,
-    cleanup_intents: &[crate::datastore::PodCleanupIntent],
+    cleanup_intents: &[PodCleanupIntent],
 ) {
     actions.extend(
         cleanup_intents
             .iter()
-            .filter(|intent| intent.reason == POD_CLEANUP_REASON_NODE_LOST)
+            .filter(|intent| intent.reason() == POD_CLEANUP_REASON_NODE_LOST)
             .map(|intent| StartupAction::FinalizeOrphan {
-                key: PodLifecycleKey::new(&intent.namespace, &intent.pod_name, &intent.pod_uid),
+                key: PodLifecycleKey::new(intent.namespace(), intent.pod_name(), intent.pod_uid()),
                 reason: OrphanReason::NodeLost,
             }),
     );
@@ -215,6 +229,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn cleanup_intent(name: &str, uid: &str, reason: &str, rv: i64) -> PodCleanupIntent {
+        PodCleanupIntent::try_new(
+            "worker-a",
+            "default",
+            name,
+            uid,
+            reason,
+            rv,
+            1_700_000_000_000,
+            crate::datastore::Resource::try_from_data(Arc::new(json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": name,
+                    "uid": uid,
+                    "resourceVersion": (rv - 1).to_string()
+                },
+                "spec": {"nodeName": "worker-a"}
+            })))
+            .unwrap(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn stale_uid_orphan_finalized() {
@@ -256,26 +295,8 @@ mod tests {
         append_cleanup_intent_actions(
             &mut actions,
             &[
-                crate::datastore::PodCleanupIntent {
-                    node_name: "worker-a".to_string(),
-                    namespace: "default".to_string(),
-                    pod_name: "lost-pod".to_string(),
-                    pod_uid: "uid-lost".to_string(),
-                    reason: POD_CLEANUP_REASON_NODE_LOST.to_string(),
-                    resource_version: 10,
-                    created_at_ms: 1_700_000_000_000,
-                    pod_data: json!({}),
-                },
-                crate::datastore::PodCleanupIntent {
-                    node_name: "worker-a".to_string(),
-                    namespace: "default".to_string(),
-                    pod_name: "future-pod".to_string(),
-                    pod_uid: "uid-future".to_string(),
-                    reason: "FutureReason".to_string(),
-                    resource_version: 11,
-                    created_at_ms: 1_700_000_000_001,
-                    pod_data: json!({}),
-                },
+                cleanup_intent("lost-pod", "uid-lost", POD_CLEANUP_REASON_NODE_LOST, 10),
+                cleanup_intent("future-pod", "uid-future", "FutureReason", 11),
             ],
         );
 

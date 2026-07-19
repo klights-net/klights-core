@@ -729,6 +729,28 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
         crate::kubelet::outbox::OutboxApplyResult,
         crate::kubelet::outbox::OutboxApplyError,
     > {
+        self.propose_outbox_command_effect(
+            idempotency_key,
+            operation,
+            command,
+            authoring_node,
+            watermark,
+        )
+        .await
+        .map(|(result, _resource_changed)| result)
+    }
+
+    async fn propose_outbox_command_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        command: crate::datastore::command::StorageCommand,
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
         use crate::datastore::sqlite::BuildOutboxOutcome;
         if let Err(err) = self.ensure_local_leader_for_commit_materialization() {
             return Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
@@ -788,19 +810,28 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
                         "build log_apply commit for raft outbox propose: {message}"
                     ))
                 }
+                other => other,
             })?;
-        let commit = match outcome {
-            BuildOutboxOutcome::NeedsPropose { commit, .. } => commit,
+        let (commit, terminal_error) = match outcome {
+            BuildOutboxOutcome::NeedsPropose {
+                commit,
+                terminal_error,
+                ..
+            } => (commit, terminal_error),
             BuildOutboxOutcome::LeaseRenewShortcircuit => {
                 // Lease renews don't go through raft.
-                return Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 });
+                return Ok((
+                    crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 },
+                    false,
+                ));
             }
             BuildOutboxOutcome::AlreadyApplied { applied_rv } => {
                 // The idempotency key already applied, avoid duplicate
                 // proposal and keep the existing RV.
-                return Ok(crate::kubelet::outbox::OutboxApplyResult::AlreadyApplied {
-                    applied_rv,
-                });
+                return Ok((
+                    crate::kubelet::outbox::OutboxApplyResult::AlreadyApplied { applied_rv },
+                    false,
+                ));
             }
         };
         let entry_bytes = crate::log_apply::encode_commit_protobuf(&commit).map_err(|err| {
@@ -819,13 +850,20 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
                 ));
             }
         };
+        let resource_changed = apply_result.applied_mutation.is_some();
         if let Some(message) = apply_result.error_message {
             return Err(crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(
                 message,
             ));
         }
+        if let Some(error) = terminal_error {
+            return Err(error);
+        }
         let applied_rv = apply_result.applied_rv.unwrap_or(0);
-        Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv })
+        Ok((
+            crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv },
+            resource_changed,
+        ))
     }
 }
 

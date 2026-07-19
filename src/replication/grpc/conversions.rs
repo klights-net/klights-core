@@ -13,6 +13,29 @@ use crate::datastore::command::{
 };
 use crate::log_apply::{decode_commit_protobuf, encode_commit_protobuf};
 
+pub(crate) fn resource_command_request_to_proto(
+    request: &klights_leader_api::ResourceCommandRequest,
+) -> Result<generated::SubmitResourceCommandRequest> {
+    Ok(generated::SubmitResourceCommandRequest {
+        command_protobuf: encode_command_protobuf(request.command())?,
+    })
+}
+
+pub(crate) fn resource_command_request_from_proto(
+    request: generated::SubmitResourceCommandRequest,
+) -> std::result::Result<
+    klights_leader_api::ResourceCommandRequest,
+    klights_leader_api::ResourceCommandError,
+> {
+    let command = decode_command_protobuf(&request.command_protobuf).map_err(|error| {
+        klights_leader_api::ResourceCommandError::invalid_request(
+            "command.protobuf",
+            error.to_string(),
+        )
+    })?;
+    klights_leader_api::ResourceCommandRequest::try_new(command)
+}
+
 pub(crate) fn watch_replay_position_to_proto(
     position: crate::datastore::WatchReplayPosition,
 ) -> generated::WatchReplayPosition {
@@ -27,11 +50,9 @@ pub(crate) fn watch_replay_position_from_proto(
     position: &generated::WatchReplayPosition,
 ) -> crate::datastore::WatchReplayPosition {
     crate::datastore::WatchReplayPosition {
-        resource_version: position.resource_version.max(0),
-        event_id: position.event_id.max(0),
-        resource_version_filter_through_event_id: position
-            .resource_version_filter_through_event_id
-            .max(0),
+        resource_version: position.resource_version,
+        event_id: position.event_id,
+        resource_version_filter_through_event_id: position.resource_version_filter_through_event_id,
     }
 }
 
@@ -81,6 +102,7 @@ mod tests {
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
+    use klights_leader_api::ResourceCommandRequest;
 
     #[test]
     fn watch_replay_position_proto_round_trip_preserves_composite_cursor() {
@@ -99,8 +121,12 @@ mod tests {
         };
         assert_eq!(
             super::watch_replay_position_from_proto(&invalid),
-            crate::datastore::WatchReplayPosition::default(),
-            "untrusted wire cursors must be normalized to non-negative values"
+            crate::datastore::WatchReplayPosition {
+                resource_version: -1,
+                event_id: -2,
+                resource_version_filter_through_event_id: -3,
+            },
+            "untrusted wire cursors must remain invalid until typed validation rejects them"
         );
     }
 
@@ -128,6 +154,29 @@ mod tests {
         assert!(!proto.command_protobuf.is_empty());
         assert!(!proto.meta_protobuf.is_empty());
         assert_eq!(super::entry_from_proto(proto).unwrap(), entry);
+    }
+
+    #[test]
+    fn resource_command_proto_round_trip_preserves_canonical_command() {
+        let command = StorageCommand::PatchResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            patch_kind: crate::datastore::PatchKind::Merge,
+            patch: json!({"data": {"mode": "strict"}}),
+            preconditions: crate::datastore::ResourcePreconditions::uid_and_resource_version(
+                "uid-a", 41,
+            ),
+            strict_resource_version: true,
+        };
+        let request = ResourceCommandRequest::try_new(command.clone()).expect("valid command");
+        let proto = super::resource_command_request_to_proto(&request).expect("encode request");
+        assert_eq!(
+            super::resource_command_request_from_proto(proto).expect("decode request"),
+            request
+        );
+        assert_eq!(request.into_command(), command);
     }
 
     #[test]

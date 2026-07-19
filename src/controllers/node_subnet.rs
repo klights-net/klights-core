@@ -17,6 +17,7 @@ use crate::controllers::annotations::{
 };
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{DatastoreBackend, DatastoreHandle, NodeSubnet, WatchTarget};
+#[cfg(test)]
 use crate::kubelet::outbox::Outbox;
 use crate::networking::NodeEndpoint;
 use crate::networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
@@ -135,6 +136,14 @@ pub async fn run_peer_watch(
     dataplane_health: DataplaneHealth,
     cancel: CancellationToken,
 ) {
+    let query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
+        state.cluster_api.clone();
+    let node_status: std::sync::Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
+        std::sync::Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+            state.config.node_name.clone(),
+            query.clone(),
+            state.outbox.clone(),
+        ));
     run_peer_watch_with_components_inner(
         state.db.clone(),
         state.config.node_name.clone(),
@@ -143,7 +152,8 @@ pub async fn run_peer_watch(
         state.task_supervisor.clone(),
         state.is_raft_leader_rx.clone(),
         Some(dataplane_health),
-        Some(state.outbox.clone()),
+        query,
+        node_status,
         cancel,
     )
     .await;
@@ -157,7 +167,8 @@ pub async fn run_peer_watch_with_components(
     peering: std::sync::Arc<dyn crate::networking::PeerRouter>,
     task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
     dataplane_health: Option<DataplaneHealth>,
-    outbox: Option<std::sync::Arc<Outbox>>,
+    query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    node_status: std::sync::Arc<dyn klights_leader_api::LeaderNodeSelfStatus>,
     cancel: CancellationToken,
 ) {
     run_peer_watch_with_components_inner(
@@ -168,7 +179,8 @@ pub async fn run_peer_watch_with_components(
         task_supervisor,
         None,
         dataplane_health,
-        outbox,
+        query,
+        node_status,
         cancel,
     )
     .await;
@@ -183,7 +195,8 @@ async fn run_peer_watch_with_components_inner(
     _task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
     raft_leader_proxy: Option<std::sync::Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
     dataplane_health: Option<DataplaneHealth>,
-    outbox: Option<std::sync::Arc<Outbox>>,
+    query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    node_status: std::sync::Arc<dyn klights_leader_api::LeaderNodeSelfStatus>,
     cancel: CancellationToken,
 ) {
     let topic = WatchTopic::new("v1", "Node");
@@ -218,9 +231,9 @@ async fn run_peer_watch_with_components_inner(
     // from truth-in-store, not from bootstrap's local success/failure state.
     match sync_peer_routes(db.as_ref(), &my_node_name, peering.as_ref(), &mut applied).await {
         Ok(outcome) => {
-            reconcile_local_readiness(
-                db.as_ref(),
-                outbox.as_deref(),
+            reconcile_local_readiness_with_publisher(
+                query.as_ref(),
+                node_status.as_ref(),
                 &my_node_name,
                 dataplane_health.as_ref(),
                 &outcome,
@@ -275,9 +288,9 @@ async fn run_peer_watch_with_components_inner(
                     .await
                     {
                         Ok(outcome) => {
-                            reconcile_local_readiness(
-                                db.as_ref(),
-                                outbox.as_deref(),
+                            reconcile_local_readiness_with_publisher(
+                                query.as_ref(),
+                                node_status.as_ref(),
                                 &my_node_name,
                                 dataplane_health.as_ref(),
                                 &outcome,
@@ -498,6 +511,59 @@ pub async fn sync_peer_routes(
 /// Update local dataplane health from a peer-sync outcome and, if the combined
 /// readiness changed, re-publish the node's `Ready`/`NetworkUnavailable`
 /// conditions. No-op when health tracking is disabled (single-node test paths).
+async fn reconcile_local_readiness_with_publisher(
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    node_status: &dyn klights_leader_api::LeaderNodeSelfStatus,
+    my_node_name: &str,
+    dataplane_health: Option<&DataplaneHealth>,
+    outcome: &PeerSyncOutcome,
+    last_readiness: &mut Option<DataplaneHealthStatus>,
+) {
+    let Some(health) = dataplane_health else {
+        return;
+    };
+    apply_peer_sync_outcome(health, outcome);
+    let new_status = health.status();
+    if last_readiness.as_ref() == Some(&new_status) {
+        return;
+    }
+    match crate::kubelet::node::publish_node_network_conditions(
+        query,
+        node_status,
+        my_node_name,
+        health,
+    )
+    .await
+    {
+        Ok(crate::kubelet::node::NodeNetworkRefreshResult::Updated) => {
+            tracing::info!(
+                node = %my_node_name,
+                ready = new_status.is_healthy(),
+                reason = new_status.reason().unwrap_or("Ready"),
+                "node_subnet: dataplane readiness updated"
+            );
+            *last_readiness = Some(new_status);
+        }
+        Ok(crate::kubelet::node::NodeNetworkRefreshResult::Unchanged) => {
+            *last_readiness = Some(new_status);
+            tracing::debug!(
+                node = %my_node_name,
+                "node_subnet: readiness refresh skipped (conditions unchanged)"
+            );
+        }
+        Ok(crate::kubelet::node::NodeNetworkRefreshResult::Missing) => {
+            tracing::debug!(
+                node = %my_node_name,
+                "node_subnet: readiness refresh skipped (node not found)"
+            );
+        }
+        Err(error) => {
+            tracing::warn!("node_subnet: failed to publish node network conditions: {error:#}");
+        }
+    }
+}
+
+#[cfg(test)]
 async fn reconcile_local_readiness(
     db: &dyn DatastoreBackend,
     outbox: Option<&Outbox>,

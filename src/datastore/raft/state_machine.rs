@@ -111,9 +111,9 @@ pub async fn propose_outbox_on_backend_with_watermark(
 
     let watermark_present = watermark.is_some();
     let uid_bound_pod_target = is_uid_bound_pod_command(&decoded.command);
-    let deleted_resource = resource_before_delete(db, &decoded.command).await?;
-    let result = match db
-        .apply_outbox_transactionally_with_watermark(
+    let mut resource_before = resource_before_apply(db, &decoded.command).await?;
+    let (result, resource_changed) = match db
+        .apply_outbox_transactionally_with_watermark_effect(
             idempotency_key,
             operation.as_str(),
             payload.as_ref(),
@@ -147,12 +147,40 @@ pub async fn propose_outbox_on_backend_with_watermark(
     // AlreadyApplied returns the stored resource). The log_apply
     // follower ensures proper state ordering so these no longer
     // need to be silently swallowed.
-    let resource = resource_after_apply(db, &decoded.command, deleted_resource).await?;
-    let command = if watermark_present && uid_bound_pod_target && resource.is_none() {
+    let resource_before_present = resource_before.is_some();
+    let pod_patch_is_explicitly_irrelevant = matches!(
+        &decoded.command,
+        StorageCommand::PatchResource {
+            api_version,
+            kind,
+            patch,
+            ..
+        } if api_version == "v1"
+            && kind == "Pod"
+            && !pod_patch_touches_endpoint_metadata(patch)
+    );
+    let resource = if resource_changed && !pod_patch_is_explicitly_irrelevant {
+        resource_after_apply(db, &decoded.command, &mut resource_before).await?
+    } else {
+        None
+    };
+    let pod_resource_effect = pod_side_effect_resource_changed(
+        &decoded.command,
+        resource_before.as_ref(),
+        resource.as_ref(),
+        resource_before_present,
+        resource_changed,
+    );
+    let newly_applied = matches!(result, OutboxApplyResult::Applied { .. });
+    let suppress_side_effect = !newly_applied
+        || (watermark_present && uid_bound_pod_target && resource.is_none())
+        || pod_resource_effect == Some(false);
+    let resource = if pod_resource_effect == Some(false) {
         None
     } else {
-        Some(decoded.command)
+        resource
     };
+    let command = (!suppress_side_effect).then_some(decoded.command);
     Ok(RaftOutboxApply {
         result,
         resource,
@@ -217,44 +245,50 @@ impl RaftOutboxApply {
     }
 }
 
-async fn resource_before_delete(
+async fn resource_before_apply(
     db: &dyn DatastoreBackend,
     command: &StorageCommand,
 ) -> std::result::Result<Option<ForwardedResource>, OutboxApplyError> {
-    let StorageCommand::DeleteResource {
-        api_version,
-        kind,
-        namespace,
-        name,
-        ..
-    } = command
-    else {
-        if let StorageCommand::DeleteResourceWithTombstone {
+    match command {
+        StorageCommand::DeleteResource {
             api_version,
             kind,
             namespace,
             name,
             ..
-        } = command
-        {
-            return db
-                .get_resource(api_version, kind, namespace.as_deref(), name)
+        }
+        | StorageCommand::DeleteResourceWithTombstone {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
+        } => db
+            .get_resource(api_version, kind, namespace.as_deref(), name)
+            .await
+            .map(|resource| resource.map(ForwardedResource::from))
+            .map_err(|err| OutboxApplyError::Retryable(err.to_string())),
+        StorageCommand::PatchResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            patch,
+            ..
+        } if api_version == "v1" && kind == "Pod" && pod_patch_touches_endpoint_metadata(patch) => {
+            db.get_resource(api_version, kind, namespace.as_deref(), name)
                 .await
                 .map(|resource| resource.map(ForwardedResource::from))
-                .map_err(|err| OutboxApplyError::Retryable(err.to_string()));
+                .map_err(|err| OutboxApplyError::Retryable(err.to_string()))
         }
-        return Ok(None);
-    };
-    db.get_resource(api_version, kind, namespace.as_deref(), name)
-        .await
-        .map(|resource| resource.map(ForwardedResource::from))
-        .map_err(|err| OutboxApplyError::Retryable(err.to_string()))
+        _ => Ok(None),
+    }
 }
 
 async fn resource_after_apply(
     db: &dyn DatastoreBackend,
     command: &StorageCommand,
-    deleted_resource: Option<ForwardedResource>,
+    resource_before: &mut Option<ForwardedResource>,
 ) -> std::result::Result<Option<ForwardedResource>, OutboxApplyError> {
     match command {
         StorageCommand::CreateResource {
@@ -277,15 +311,71 @@ async fn resource_after_apply(
             namespace,
             name,
             ..
+        }
+        | StorageCommand::PatchResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            ..
         } => db
             .get_resource(api_version, kind, namespace.as_deref(), name)
             .await
             .map(|resource| resource.map(ForwardedResource::from))
             .map_err(|err| OutboxApplyError::Retryable(err.to_string())),
         StorageCommand::DeleteResource { .. }
-        | StorageCommand::DeleteResourceWithTombstone { .. } => Ok(deleted_resource),
+        | StorageCommand::DeleteResourceWithTombstone { .. } => Ok(resource_before.take()),
         _ => Ok(None),
     }
+}
+
+fn pod_side_effect_resource_changed(
+    command: &StorageCommand,
+    resource_before: Option<&ForwardedResource>,
+    resource_after: Option<&ForwardedResource>,
+    before_present: bool,
+    resource_changed: bool,
+) -> Option<bool> {
+    match command {
+        StorageCommand::UpdateStatus {
+            api_version, kind, ..
+        } if api_version == "v1" && kind == "Pod" => Some(resource_changed),
+        StorageCommand::DeleteResource {
+            api_version, kind, ..
+        } if api_version == "v1" && kind == "Pod" => Some(before_present),
+        StorageCommand::PatchResource {
+            api_version,
+            kind,
+            patch,
+            ..
+        } if api_version == "v1" && kind == "Pod" => Some(
+            pod_patch_touches_endpoint_metadata(patch)
+                && resource_changed
+                && pod_endpoint_metadata_changed(resource_before, resource_after),
+        ),
+        _ => None,
+    }
+}
+
+fn pod_patch_touches_endpoint_metadata(patch: &serde_json::Value) -> bool {
+    patch
+        .pointer("/metadata")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|metadata| {
+            metadata.contains_key("labels") || metadata.contains_key("deletionTimestamp")
+        })
+}
+
+fn pod_endpoint_metadata_changed(
+    before: Option<&ForwardedResource>,
+    after: Option<&ForwardedResource>,
+) -> bool {
+    ["/metadata/labels", "/metadata/deletionTimestamp"]
+        .into_iter()
+        .any(|pointer| {
+            before.and_then(|resource| resource.data.pointer(pointer))
+                != after.and_then(|resource| resource.data.pointer(pointer))
+        })
 }
 
 #[cfg(test)]
@@ -302,6 +392,88 @@ mod tests {
                 .encode_protobuf()
                 .expect("encode outbox payload"),
         )
+    }
+
+    #[tokio::test]
+    async fn pod_patch_effects_expose_only_endpoint_relevant_changed_resources() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let pod = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "patched",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "patched",
+                        "uid": "patched-uid",
+                        "labels": {"app": "old"}
+                    },
+                    "spec": {"nodeName": "worker-a"}
+                }),
+            )
+            .await
+            .unwrap();
+        let patch = |id: &'static str, patch: serde_json::Value| {
+            propose_outbox_on_backend(
+                &db,
+                id,
+                OutboxOperation::PodMetadata,
+                outbox_payload(StorageCommand::PatchResource {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "patched".to_string(),
+                    patch_kind: crate::datastore::PatchKind::Merge,
+                    patch,
+                    preconditions: ResourcePreconditions {
+                        uid: Some(pod.uid.clone()),
+                        resource_version: None,
+                    },
+                    strict_resource_version: false,
+                }),
+                "worker-a",
+            )
+        };
+
+        let labels = patch(
+            "patch-labels",
+            json!({"metadata": {"labels": {"app": "new"}}}),
+        )
+        .await
+        .unwrap();
+        assert!(labels.resource.is_some());
+        assert!(labels.command.is_some());
+
+        let deleting = patch(
+            "patch-deletion-timestamp",
+            json!({"metadata": {"deletionTimestamp": "2026-07-18T00:00:00Z"}}),
+        )
+        .await
+        .unwrap();
+        assert!(deleting.resource.is_some());
+        assert!(deleting.command.is_some());
+
+        let annotation = patch(
+            "patch-annotation",
+            json!({"metadata": {"annotations": {"example.test/value": "x"}}}),
+        )
+        .await
+        .unwrap();
+        assert!(annotation.resource.is_none());
+        assert!(annotation.command.is_none());
+
+        let no_op = patch(
+            "patch-labels-noop",
+            json!({"metadata": {"labels": {"app": "new"}}}),
+        )
+        .await
+        .unwrap();
+        assert!(no_op.resource.is_none());
+        assert!(no_op.command.is_none());
     }
 
     #[tokio::test]
@@ -333,15 +505,12 @@ mod tests {
             "worker-a",
             Some(watermark.clone()),
         )
-        .await
-        .expect("stale UID-bound Pod status must consume its outbox stream watermark");
+        .await;
+        let Err(error) = result else {
+            panic!("stale UID-bound Pod status must return its durable typed terminal decision")
+        };
 
-        assert!(matches!(result.result, OutboxApplyResult::Applied { .. }));
-        assert!(result.resource.is_none());
-        assert!(
-            result.command.is_none(),
-            "watermark-only stale Pod consumption must not fire resource side effects"
-        );
+        assert!(matches!(error, OutboxApplyError::NotFound(_)));
         assert_eq!(
             db.list_outbox_stream_watermarks().await.unwrap(),
             vec![watermark]
@@ -370,6 +539,144 @@ mod tests {
         .expect("next stream entry must not wedge behind a stale Pod row gap");
 
         assert!(db.get_namespace("after-stale-gap").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn stamped_stale_equal_pod_status_ledger_only_has_no_side_effect() {
+        let db = crate::datastore::test_support::in_memory().await;
+        crate::datastore::DatastoreBackend::set_klights_meta(
+            &db,
+            crate::datastore::resource_version_assignment::KEY_RESOURCE_VERSION_ASSIGNMENT_MODE,
+            crate::log_apply::ResourceVersionAssignment::CommittedApplyV1.as_metadata_value(),
+        )
+        .await
+        .unwrap();
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "stamped-side-effect",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "stamped-side-effect",
+                    "uid": "stamped-side-effect-uid"
+                },
+                "spec": {"nodeName": "worker-a"},
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .expect("seed Pod");
+        let mut watch = db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Pod"));
+
+        let deliver = |key: &'static str, stream_seq: i64, stamp: i64, phase: &'static str| {
+            propose_outbox_on_backend_with_watermark(
+                &db,
+                key,
+                OutboxOperation::PodStatus,
+                outbox_payload(StorageCommand::UpdateStatus {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "stamped-side-effect".to_string(),
+                    status: json!({"phase": phase}),
+                    expected_rv: None,
+                    preconditions: ResourcePreconditions {
+                        uid: Some("stamped-side-effect-uid".to_string()),
+                        resource_version: None,
+                    },
+                    observed_status_stamp: Some(stamp),
+                }),
+                "worker-a",
+                Some(crate::log_apply::OutboxStreamWatermark {
+                    client_id: "worker-client".to_string(),
+                    stream_id: 119,
+                    stream_seq,
+                }),
+            )
+        };
+
+        let reads_before_fresh = db.resource_get_call_count_for_test();
+        let fresh = deliver("fresh-status", 1, 10, "Running")
+            .await
+            .expect("fresh status applies");
+        assert_eq!(
+            db.resource_get_call_count_for_test() - reads_before_fresh,
+            1,
+            "fresh status needs only its returned-resource read"
+        );
+        assert!(fresh.command.is_some(), "fresh status must emit effects");
+        assert!(
+            fresh.resource.is_some(),
+            "fresh status must return its resource effect"
+        );
+        watch.try_recv().expect("fresh status emits a watch event");
+        let fresh_rv = db.get_current_resource_version().await.unwrap();
+
+        for (key, stream_seq, stamp) in [("stale-status", 2, 9), ("equal-status", 3, 10)] {
+            let reads_before = db.resource_get_call_count_for_test();
+            let no_change = deliver(key, stream_seq, stamp, "Pending")
+                .await
+                .expect("stale/equal status consumes its ledger position");
+            assert_eq!(
+                db.resource_get_call_count_for_test() - reads_before,
+                0,
+                "{key} needs no inference or returned-resource read"
+            );
+            assert!(
+                no_change.command.is_none(),
+                "{key} must not return a command that can fire controller/Service effects"
+            );
+            assert!(
+                no_change.resource.is_none(),
+                "{key} must not claim the still-live Pod as a resource effect"
+            );
+            assert_eq!(
+                db.get_current_resource_version().await.unwrap(),
+                fresh_rv,
+                "{key} must stay resourceVersion-neutral"
+            );
+            assert!(
+                matches!(
+                    watch.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ),
+                "{key} must stay watch-neutral"
+            );
+            assert!(
+                db.get_applied_outbox(key).await.unwrap().is_some(),
+                "{key} must retain its durable idempotency ledger"
+            );
+        }
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![crate::log_apply::OutboxStreamWatermark {
+                client_id: "worker-client".to_string(),
+                stream_id: 119,
+                stream_seq: 3,
+            }],
+            "stale/equal decisions must durably advance the exact stream"
+        );
+
+        let reads_before_newer = db.resource_get_call_count_for_test();
+        let newer = deliver("newer-status", 4, 11, "Succeeded")
+            .await
+            .expect("newer status applies after ledger-only decisions");
+        assert_eq!(
+            db.resource_get_call_count_for_test() - reads_before_newer,
+            1,
+            "newer status needs only its returned-resource read"
+        );
+        assert!(newer.command.is_some(), "newer status must emit effects");
+        assert!(
+            newer.resource.is_some(),
+            "newer status must return its resource effect"
+        );
+        watch.try_recv().expect("newer status emits a watch event");
+        assert!(db.get_current_resource_version().await.unwrap() > fresh_rv);
     }
 
     #[tokio::test]

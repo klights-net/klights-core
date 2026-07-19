@@ -20,7 +20,6 @@ use crate::kubelet::pod_status_logic::{
     compute_initialized_condition, get_condition_last_transition_time,
 };
 use crate::side_effects::ControllerDispatcherSlot;
-use klights_types::ResourceKey;
 
 use super::state_only_writer::StateOnlyWriter;
 use super::store::PodStore;
@@ -233,12 +232,11 @@ impl PodStatusService {
     ) -> Result<Resource> {
         let mut pod_resource = if let Some(cluster_api) = &self.cluster_api {
             cluster_api
-                .get_resource_fresh(ResourceKey {
-                    api_version: "v1".to_string(),
-                    kind: "Pod".to_string(),
-                    namespace: Some(ns.to_string()),
-                    name: name.to_string(),
-                })
+                .get_resource(crate::control_plane::client::pod_get_request(
+                    ns,
+                    name,
+                    crate::control_plane::client::ResourceQueryConsistency::LeaderFresh,
+                )?)
                 .await?
         } else {
             self.store.get(ns, name).await?

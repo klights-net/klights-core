@@ -11,8 +11,8 @@ pub use sqlite::SqliteNodeLocalDb;
 #[cfg(test)]
 pub use types::DeadLetterTestInsert;
 pub use types::{
-    DeadLetterRow, OutboxInsert, OutboxRow, OutboxStats, PodRuntimeRow, PodStatusCheckpoint,
-    ProbeStateRow, ReplicationCheckpoint,
+    DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats, PodRuntimeRow,
+    PodStatusCheckpoint, ProbeStateRow, ReplicationCheckpoint,
 };
 
 #[cfg(test)]

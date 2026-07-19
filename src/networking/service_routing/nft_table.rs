@@ -7,6 +7,7 @@ use super::prelude::*;
 use super::service_rules::select_authoritative_service_spec;
 use super::*;
 use crate::utils::lock_recover;
+use klights_leader_api::{ResourceListRequest, ResourceQueryConsistency, ResourceQueryError};
 use nftnl::expr::Expression;
 use nftnl::nftnl_sys as sys;
 use std::ptr;
@@ -20,6 +21,22 @@ const HOST_FORWARD_COMPAT_FAMILY: &str = "ip";
 const HOST_FORWARD_COMPAT_TABLE: &str = "filter";
 const HOST_FORWARD_COMPAT_CHAIN: &str = "FORWARD";
 const HOST_FORWARD_COMPAT_COMMENT: &str = "klights-forward-compat";
+
+fn fresh_list_request(
+    api_version: &str,
+    kind: &str,
+) -> std::result::Result<ResourceListRequest, ResourceQueryError> {
+    ResourceListRequest::try_new(
+        api_version,
+        kind,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ResourceQueryConsistency::LeaderFresh,
+    )
+}
 
 #[derive(Clone, Copy)]
 enum CtOriginalKey {
@@ -231,48 +248,22 @@ fn rule_has_comment(rule: &serde_json::Value, comment: &str) -> bool {
 pub async fn bootstrap_inventory_from_api(
     api: &dyn LeaderApiClient,
 ) -> Result<super::inventory::ServiceRouteInventory> {
-    use crate::control_plane::client::ListRequest;
-
     let services_list = api
-        .list_resources_fresh(ListRequest {
-            api_version: "v1".to_string(),
-            kind: "Service".to_string(),
-            namespace: None,
-            label_selector: None,
-            field_selector: None,
-            limit: None,
-            continue_token: None,
-        })
+        .list_resources(fresh_list_request("v1", "Service")?)
         .await
         .context("list Services through LeaderApiClient")?;
 
     let endpoints_list = api
-        .list_resources_fresh(ListRequest {
-            api_version: "v1".to_string(),
-            kind: "Endpoints".to_string(),
-            namespace: None,
-            label_selector: None,
-            field_selector: None,
-            limit: None,
-            continue_token: None,
-        })
+        .list_resources(fresh_list_request("v1", "Endpoints")?)
         .await
         .context("list Endpoints through LeaderApiClient")?;
 
     let endpoint_slices_list = api
-        .list_resources_fresh(ListRequest {
-            api_version: "discovery.k8s.io/v1".to_string(),
-            kind: "EndpointSlice".to_string(),
-            namespace: None,
-            label_selector: None,
-            field_selector: None,
-            limit: None,
-            continue_token: None,
-        })
+        .list_resources(fresh_list_request("discovery.k8s.io/v1", "EndpointSlice")?)
         .await
         .context("list EndpointSlices through LeaderApiClient")?;
 
-    let services = services_list.items.iter().filter_map(|r| {
+    let services = services_list.items().iter().filter_map(|r| {
         let ns = r.namespace.clone()?;
         Some((
             ns,
@@ -281,7 +272,7 @@ pub async fn bootstrap_inventory_from_api(
             r.data.as_ref().clone(),
         ))
     });
-    let endpoints = endpoints_list.items.iter().filter_map(|r| {
+    let endpoints = endpoints_list.items().iter().filter_map(|r| {
         let ns = r.namespace.clone()?;
         Some((
             ns,
@@ -290,7 +281,7 @@ pub async fn bootstrap_inventory_from_api(
             r.data.as_ref().clone(),
         ))
     });
-    let endpoint_slices = endpoint_slices_list.items.iter().filter_map(|r| {
+    let endpoint_slices = endpoint_slices_list.items().iter().filter_map(|r| {
         let ns = r.namespace.clone()?;
         let (_, service_name) = endpoint_slice_service_key(r)?;
         Some((
@@ -309,49 +300,25 @@ pub async fn bootstrap_inventory_from_api(
 
 pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<ServiceSpec>> {
     let services_list = api
-        .list_resources_fresh(ListRequest {
-            api_version: "v1".to_string(),
-            kind: "Service".to_string(),
-            namespace: None,
-            label_selector: None,
-            field_selector: None,
-            limit: None,
-            continue_token: None,
-        })
+        .list_resources(fresh_list_request("v1", "Service")?)
         .await
         .context("list Services through LeaderApiClient")?;
 
     let endpoints_list = api
-        .list_resources_fresh(ListRequest {
-            api_version: "v1".to_string(),
-            kind: "Endpoints".to_string(),
-            namespace: None,
-            label_selector: None,
-            field_selector: None,
-            limit: None,
-            continue_token: None,
-        })
+        .list_resources(fresh_list_request("v1", "Endpoints")?)
         .await
         .context("list Endpoints through LeaderApiClient")?;
 
     let endpoint_slices_list = api
-        .list_resources_fresh(ListRequest {
-            api_version: "discovery.k8s.io/v1".to_string(),
-            kind: "EndpointSlice".to_string(),
-            namespace: None,
-            label_selector: None,
-            field_selector: None,
-            limit: None,
-            continue_token: None,
-        })
+        .list_resources(fresh_list_request("discovery.k8s.io/v1", "EndpointSlice")?)
         .await
         .context("list EndpointSlices through LeaderApiClient")?;
 
     let mut endpoints_by_service: std::collections::HashMap<
         (String, String),
         &crate::datastore::Resource,
-    > = std::collections::HashMap::with_capacity(endpoints_list.items.len());
-    for endpoints in &endpoints_list.items {
+    > = std::collections::HashMap::with_capacity(endpoints_list.items().len());
+    for endpoints in endpoints_list.items() {
         if let Some((namespace, name)) = resource_namespace_name(endpoints) {
             endpoints_by_service.insert((namespace.to_string(), name.to_string()), endpoints);
         }
@@ -361,7 +328,7 @@ pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<Ser
         (String, String),
         Vec<&crate::datastore::Resource>,
     > = std::collections::HashMap::new();
-    for slice in &endpoint_slices_list.items {
+    for slice in endpoint_slices_list.items() {
         if let Some((namespace, service_name)) = endpoint_slice_service_key(slice) {
             endpoint_slices_by_service
                 .entry((namespace.to_string(), service_name.to_string()))
@@ -370,8 +337,8 @@ pub async fn service_specs_from_api(api: &dyn LeaderApiClient) -> Result<Vec<Ser
         }
     }
 
-    let mut specs: Vec<ServiceSpec> = Vec::with_capacity(services_list.items.len());
-    for svc_resource in &services_list.items {
+    let mut specs: Vec<ServiceSpec> = Vec::with_capacity(services_list.items().len());
+    for svc_resource in services_list.items() {
         let svc = &svc_resource.data;
         let metadata = match svc.get("metadata") {
             Some(m) => m,
@@ -829,54 +796,30 @@ impl KlightsTable {
 
     pub async fn sync_network_policies_from_api(&self, api: &dyn LeaderApiClient) -> Result<usize> {
         let policies = api
-            .list_resources_fresh(ListRequest {
-                api_version: "networking.k8s.io/v1".to_string(),
-                kind: "NetworkPolicy".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-            })
+            .list_resources(fresh_list_request("networking.k8s.io/v1", "NetworkPolicy")?)
             .await
             .context("list NetworkPolicies through LeaderApiClient")?;
         let pods = api
-            .list_resources_fresh(ListRequest {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-            })
+            .list_resources(fresh_list_request("v1", "Pod")?)
             .await
             .context("list Pods through LeaderApiClient for NetworkPolicy")?;
         let namespaces = api
-            .list_resources_fresh(ListRequest {
-                api_version: "v1".to_string(),
-                kind: "Namespace".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-            })
+            .list_resources(fresh_list_request("v1", "Namespace")?)
             .await
             .context("list Namespaces through LeaderApiClient for NetworkPolicy")?;
 
         let policy_values: Vec<serde_json::Value> = policies
-            .items
+            .items()
             .iter()
             .map(|resource| resource.data.as_ref().clone())
             .collect();
         let pod_values: Vec<serde_json::Value> = pods
-            .items
+            .items()
             .iter()
             .map(|resource| resource.data.as_ref().clone())
             .collect();
         let namespace_values: Vec<serde_json::Value> = namespaces
-            .items
+            .items()
             .iter()
             .map(|resource| resource.data.as_ref().clone())
             .collect();

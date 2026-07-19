@@ -418,7 +418,9 @@ impl NftServiceRouter {
         let remote_local_node = local_node_name.to_string();
         let service_watch_notify = notify.clone();
         let service_watch_cancel = cancel.clone();
-        let service_watch_cluster_api = cluster_api.clone();
+        let service_watch_cluster_api: std::sync::Arc<
+            dyn crate::control_plane::client::LeaderWatch,
+        > = cluster_api.clone();
         let service_watch_task_supervisor = task_supervisor.clone();
         let service_watch_table = table.clone();
         let service_watch_force_full_sync = force_full_sync.clone();
@@ -581,15 +583,16 @@ struct ServiceRoutingWatchTarget {
 
 impl ServiceRoutingWatchTarget {
     fn request(self) -> crate::control_plane::client::WatchRequest {
-        crate::control_plane::client::WatchRequest {
-            api_version: self.api_version.to_string(),
-            kind: self.kind.to_string(),
-            namespace: None,
-            label_selector: None,
-            field_selector: None,
-            start_resource_version: None,
-            start_watch_replay_position: None,
-        }
+        crate::control_plane::client::WatchRequest::try_new(
+            self.api_version,
+            self.kind,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("static service-routing watch target is valid")
     }
 }
 
@@ -630,7 +633,10 @@ fn service_inventory_watch_target_requires_full_sync(target: ServiceRoutingWatch
 enum ServiceRoutingWatchItem {
     Event {
         target: ServiceRoutingWatchTarget,
-        event: anyhow::Result<crate::control_plane::client::ResourceEvent>,
+        event: std::result::Result<
+            crate::control_plane::client::ResourceEvent,
+            crate::control_plane::client::LeaderWatchError,
+        >,
     },
     Closed {
         target: ServiceRoutingWatchTarget,
@@ -642,9 +648,7 @@ type ServiceRoutingWatchStream =
 
 fn wrap_service_routing_watch_stream(
     target: ServiceRoutingWatchTarget,
-    mut stream: crate::control_plane::client::WatchStream<
-        crate::control_plane::client::ResourceEvent,
-    >,
+    mut stream: crate::control_plane::client::WatchStream,
 ) -> ServiceRoutingWatchStream {
     use futures::StreamExt;
 
@@ -673,11 +677,11 @@ fn wrap_service_routing_watch_stream(
 }
 
 async fn open_service_routing_watch_set(
-    cluster_api: &std::sync::Arc<dyn LeaderApiClient>,
+    leader_watch: &std::sync::Arc<dyn crate::control_plane::client::LeaderWatch>,
 ) -> Result<futures::stream::SelectAll<ServiceRoutingWatchStream>> {
     let mut streams = futures::stream::SelectAll::new();
     for target in SERVICE_ROUTING_WATCH_TARGETS {
-        let stream = cluster_api
+        let stream = leader_watch
             .watch_resources(target.request())
             .await
             .with_context(|| {
@@ -735,22 +739,22 @@ fn apply_service_routing_watch_event_to_inventory(
     target: ServiceRoutingWatchTarget,
     event: crate::control_plane::client::ResourceEvent,
 ) -> Result<Option<super::inventory::InventoryApply>> {
-    use crate::watch::EventType;
+    use crate::control_plane::client::WatchEventType;
 
-    match event.event.event_type {
-        EventType::Bookmark => return Ok(Some(super::inventory::InventoryApply::NoChange)),
-        EventType::Error => anyhow::bail!("service routing watch delivered ERROR event"),
-        EventType::Added | EventType::Modified | EventType::Deleted => {}
+    match event.event_type() {
+        WatchEventType::Bookmark => return Ok(Some(super::inventory::InventoryApply::NoChange)),
+        WatchEventType::Error => anyhow::bail!("service routing watch delivered ERROR event"),
+        WatchEventType::Added | WatchEventType::Modified | WatchEventType::Deleted => {}
     }
 
-    let object = event.event.object.as_ref();
+    let object = event.resource().data.as_ref();
 
     match (target.api_version, target.kind) {
         ("networking.k8s.io/v1", "NetworkPolicy") | ("v1", "Pod") | ("v1", "Namespace") => {
             Ok(Some(super::inventory::InventoryApply::Applied))
         }
         ("v1", "Service") => {
-            let deleted = event.event.event_type == EventType::Deleted;
+            let deleted = event.event_type() == WatchEventType::Deleted;
             let (namespace, name, resource_version) = watch_event_object_identity(object)?;
             let data = (!deleted).then(|| (*object).clone());
             Ok(table.apply_service_event_to_inventory(
@@ -762,7 +766,7 @@ fn apply_service_routing_watch_event_to_inventory(
             ))
         }
         ("v1", "Endpoints") => {
-            let deleted = event.event.event_type == EventType::Deleted;
+            let deleted = event.event_type() == WatchEventType::Deleted;
             let (namespace, name, resource_version) = watch_event_object_identity(object)?;
             let data = (!deleted).then(|| (*object).clone());
             Ok(table.apply_endpoints_event_to_inventory(
@@ -774,7 +778,7 @@ fn apply_service_routing_watch_event_to_inventory(
             ))
         }
         ("discovery.k8s.io/v1", "EndpointSlice") => {
-            let deleted = event.event.event_type == EventType::Deleted;
+            let deleted = event.event_type() == WatchEventType::Deleted;
             let (namespace, name, resource_version) = watch_event_object_identity(object)?;
             let data = (!deleted).then(|| (*object).clone());
             let Some(service_name) = object
@@ -797,7 +801,7 @@ fn apply_service_routing_watch_event_to_inventory(
 }
 
 async fn run_service_routing_watch_worker(
-    cluster_api: std::sync::Arc<dyn LeaderApiClient>,
+    leader_watch: std::sync::Arc<dyn crate::control_plane::client::LeaderWatch>,
     table: std::sync::Arc<KlightsTable>,
     notify: std::sync::Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
@@ -812,7 +816,7 @@ async fn run_service_routing_watch_worker(
     // Drives the shared exponential reconnect backoff (500ms→60s).
     let mut reconnect_attempt: u32 = 0;
     loop {
-        let mut streams = match open_service_routing_watch_set(&cluster_api).await {
+        let mut streams = match open_service_routing_watch_set(&leader_watch).await {
             Ok(streams) => streams,
             Err(err) => {
                 tracing::warn!(
@@ -929,7 +933,7 @@ async fn run_service_routing_watch_worker(
                                 // outer loop which also exits on cancel.
                                 reopen_watch_set = true;
                             } else {
-                                let reopened = match cluster_api
+                                let reopened = match leader_watch
                                     .watch_resources(target.request())
                                     .await
                                 {
@@ -1138,22 +1142,38 @@ async fn ensure_sysctl_value(path: &str, expected: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::control_plane::client::{
-        CacheScope, LeaderApiClient, ListRequest, ListResponse, ResourceEvent, WatchRequest,
-        WatchStream,
+        CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient,
+        LeaderCacheReadiness, LeaderWatch, LeaderWatchError, LeaderWatchFuture, ResourceEvent,
+        WatchEventType, WatchRequest, WatchStream,
     };
-    use crate::datastore::{NodeSubnet, Resource};
-    use crate::kubelet::outbox::payload::OutboxOperation;
-    use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
-    use crate::networking::wireguard::DataplanePeerMetadata;
-    use anyhow::{Result, anyhow};
+    use crate::datastore::Resource;
     use async_trait::async_trait;
-    use bytes::Bytes;
-    use klights_types::ResourceKey;
+    use klights_leader_api::{
+        LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
+        ResourceQueryError, ResourceQueryFuture,
+    };
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::sync::Notify;
+
+    macro_rules! impl_unavailable_cache_readiness {
+        ($client:ty) => {
+            impl LeaderCacheReadiness for $client {
+                fn wait_cache_ready(
+                    &self,
+                    scope: CacheReadinessRequest,
+                ) -> CacheReadinessFuture<'_> {
+                    Box::pin(async move {
+                        Err(CacheReadinessError::unavailable(format!(
+                            "unexpected wait_cache_ready for {scope:?}"
+                        )))
+                    })
+                }
+            }
+        };
+    }
     use tokio_util::sync::CancellationToken;
 
     fn test_service_table(
@@ -1185,6 +1205,38 @@ mod tests {
         opened_notify: Notify,
         closed_endpoints_once: std::sync::atomic::AtomicBool,
     }
+
+    macro_rules! impl_unexpected_resource_query {
+        ($client:ty) => {
+            impl LeaderResourceQuery for $client {
+                fn get_resource(
+                    &self,
+                    request: ResourceGetRequest,
+                ) -> ResourceQueryFuture<'_, Option<Resource>> {
+                    Box::pin(async move {
+                        Err(ResourceQueryError::query_failed(format!(
+                            "unexpected get_resource for {:?}",
+                            request.key()
+                        )))
+                    })
+                }
+
+                fn list_resources(
+                    &self,
+                    request: ResourceListRequest,
+                ) -> ResourceQueryFuture<'_, ResourceListResult> {
+                    Box::pin(async move {
+                        Err(ResourceQueryError::query_failed(format!(
+                            "unexpected list_resources for {request:?}"
+                        )))
+                    })
+                }
+            }
+        };
+    }
+
+    impl_unexpected_resource_query!(WatchOnlyLeaderApiClient);
+    impl_unexpected_resource_query!(ReopeningLeaderApiClient);
 
     impl ReopeningLeaderApiClient {
         async fn wait_for_opened(&self, expected: usize) {
@@ -1261,10 +1313,12 @@ mod tests {
             let result = apply_service_routing_watch_event_to_inventory(
                 table.as_ref(),
                 target,
-                ResourceEvent {
-                    event: crate::watch::WatchEvent::modified(object),
-                    resume_position: None,
-                },
+                ResourceEvent::try_new(
+                    WatchEventType::Modified,
+                    Resource::try_from_data(Arc::new(object)).expect("valid watch object"),
+                    None,
+                )
+                .expect("valid focused watch event"),
             )
             .expect("policy-only watch target must not poison service inventory sync");
             assert_eq!(
@@ -1277,207 +1331,46 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl LeaderApiClient for WatchOnlyLeaderApiClient {
-        async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_resource for {key:?}"))
-        }
-
-        async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
-            Err(anyhow!("unexpected list_resources for {req:?}"))
-        }
-
-        async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
+    impl LeaderWatch for WatchOnlyLeaderApiClient {
+        fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
             self.watches_opened.fetch_add(1, Ordering::SeqCst);
             self.watched_targets
                 .lock()
                 .expect("watch target record lock not poisoned")
-                .push((req.api_version, req.kind));
-            Ok(Box::pin(futures::stream::pending()))
-        }
-
-        async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()> {
-            Err(anyhow!("unexpected wait_cache_ready for {scope:?}"))
-        }
-
-        async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_pod for {ns}/{name}"))
-        }
-
-        async fn get_pod_for_uid(
-            &self,
-            ns: &str,
-            name: &str,
-            uid: &str,
-        ) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_pod_for_uid for {ns}/{name}/{uid}"))
-        }
-
-        async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Resource>> {
-            Err(anyhow!("unexpected watch_pods_on_node for {node_name}"))
-        }
-
-        async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Resource>> {
-            Err(anyhow!("unexpected list_pods_on_node for {node_name}"))
-        }
-
-        async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_configmap for {ns}/{name}"))
-        }
-
-        async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_secret for {ns}/{name}"))
-        }
-
-        async fn get_node(&self, name: &str) -> Result<Resource> {
-            Err(anyhow!("unexpected get_node for {name}"))
-        }
-
-        async fn watch_node(&self, name: &str) -> Result<WatchStream<Resource>> {
-            Err(anyhow!("unexpected watch_node for {name}"))
-        }
-
-        async fn allocate_node_subnet(
-            &self,
-            node_name: &str,
-            _cluster_cidr: &str,
-            _node_ip: &str,
-        ) -> Result<NodeSubnet> {
-            Err(anyhow!("unexpected allocate_node_subnet for {node_name}"))
-        }
-
-        async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-            Err(anyhow!("unexpected get_node_subnet for {node_name}"))
-        }
-
-        async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-            Err(anyhow!("unexpected list_peer_subnets for {my_node_name}"))
-        }
-
-        async fn get_node_dataplane(
-            &self,
-            node_name: &str,
-        ) -> Result<Option<DataplanePeerMetadata>> {
-            Err(anyhow!("unexpected get_node_dataplane for {node_name}"))
-        }
-
-        async fn apply_outbox(
-            &self,
-            idempotency_key: &str,
-            _operation: OutboxOperation,
-            _payload: Bytes,
-            _client_id: &str,
-            _stream_id: i64,
-            _stream_seq: i64,
-        ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-            Err(OutboxApplyError::Retryable(format!(
-                "unexpected apply_outbox for {idempotency_key}"
-            )))
+                .push((req.api_version().to_string(), req.kind().to_string()));
+            Box::pin(async { Ok(Box::pin(futures::stream::pending()) as WatchStream) })
         }
     }
+
+    impl_unavailable_cache_readiness!(WatchOnlyLeaderApiClient);
+    crate::control_plane::client::impl_unavailable_leader_pod_effects!(WatchOnlyLeaderApiClient);
 
     #[async_trait]
-    impl LeaderApiClient for ReopeningLeaderApiClient {
-        async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_resource for {key:?}"))
-        }
+    impl LeaderApiClient for WatchOnlyLeaderApiClient {}
 
-        async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
-            Err(anyhow!("unexpected list_resources for {req:?}"))
-        }
-
-        async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
+    impl LeaderWatch for ReopeningLeaderApiClient {
+        fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
             self.watches_opened.fetch_add(1, Ordering::SeqCst);
             self.opened_notify.notify_waiters();
-            if req.kind == "Endpoints"
+            let close = req.kind() == "Endpoints"
                 && !self
                     .closed_endpoints_once
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Ok(Box::pin(futures::stream::empty()));
-            }
-            Ok(Box::pin(futures::stream::pending()))
-        }
-
-        async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()> {
-            Err(anyhow!("unexpected wait_cache_ready for {scope:?}"))
-        }
-
-        async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_pod for {ns}/{name}"))
-        }
-
-        async fn get_pod_for_uid(
-            &self,
-            ns: &str,
-            name: &str,
-            uid: &str,
-        ) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_pod_for_uid for {ns}/{name}/{uid}"))
-        }
-
-        async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Resource>> {
-            Err(anyhow!("unexpected watch_pods_on_node for {node_name}"))
-        }
-
-        async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Resource>> {
-            Err(anyhow!("unexpected list_pods_on_node for {node_name}"))
-        }
-
-        async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_configmap for {ns}/{name}"))
-        }
-
-        async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_secret for {ns}/{name}"))
-        }
-
-        async fn get_node(&self, name: &str) -> Result<Resource> {
-            Err(anyhow!("unexpected get_node for {name}"))
-        }
-
-        async fn watch_node(&self, name: &str) -> Result<WatchStream<Resource>> {
-            Err(anyhow!("unexpected watch_node for {name}"))
-        }
-
-        async fn allocate_node_subnet(
-            &self,
-            node_name: &str,
-            _cluster_cidr: &str,
-            _node_ip: &str,
-        ) -> Result<NodeSubnet> {
-            Err(anyhow!("unexpected allocate_node_subnet for {node_name}"))
-        }
-
-        async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-            Err(anyhow!("unexpected get_node_subnet for {node_name}"))
-        }
-
-        async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-            Err(anyhow!("unexpected list_peer_subnets for {my_node_name}"))
-        }
-
-        async fn get_node_dataplane(
-            &self,
-            node_name: &str,
-        ) -> Result<Option<DataplanePeerMetadata>> {
-            Err(anyhow!("unexpected get_node_dataplane for {node_name}"))
-        }
-
-        async fn apply_outbox(
-            &self,
-            idempotency_key: &str,
-            _operation: OutboxOperation,
-            _payload: Bytes,
-            _client_id: &str,
-            _stream_id: i64,
-            _stream_seq: i64,
-        ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-            Err(OutboxApplyError::Retryable(format!(
-                "unexpected apply_outbox for {idempotency_key}"
-            )))
+                    .swap(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if close {
+                    Ok(Box::pin(futures::stream::empty()) as WatchStream)
+                } else {
+                    Ok(Box::pin(futures::stream::pending()) as WatchStream)
+                }
+            })
         }
     }
+
+    impl_unavailable_cache_readiness!(ReopeningLeaderApiClient);
+    crate::control_plane::client::impl_unavailable_leader_pod_effects!(ReopeningLeaderApiClient);
+
+    #[async_trait]
+    impl LeaderApiClient for ReopeningLeaderApiClient {}
 
     #[tokio::test]
     async fn service_routing_watch_worker_requests_full_sync_after_watches_open() {
@@ -1673,6 +1566,8 @@ mod tests {
         opened_notify: Notify,
     }
 
+    impl_unexpected_resource_query!(ErroringLeaderApiClient);
+
     impl ErroringLeaderApiClient {
         async fn wait_for_opened(&self, expected: usize) {
             loop {
@@ -1684,111 +1579,32 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl LeaderApiClient for ErroringLeaderApiClient {
-        async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_resource for {key:?}"))
-        }
-
-        async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
-            Err(anyhow!("unexpected list_resources for {req:?}"))
-        }
-
-        async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
+    impl LeaderWatch for ErroringLeaderApiClient {
+        fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
             self.watches_opened.fetch_add(1, Ordering::SeqCst);
             self.opened_notify.notify_waiters();
-            if req.kind == "Pod" {
-                // Each open of the Pod watch immediately delivers a burst of
-                // errors, then ends. A leaky reconnect (one new open per error,
-                // keeping the old stream alive) would fan out into hundreds of
-                // duplicate opens; a backoff-less reconnect would tight-loop.
-                let burst: Vec<Result<ResourceEvent>> = (0..20)
-                    .map(|_| Err(anyhow!("simulated watch error")))
-                    .collect();
-                return Ok(Box::pin(futures::stream::iter(burst)));
-            }
-            Ok(Box::pin(futures::stream::pending()))
-        }
-
-        async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()> {
-            Err(anyhow!("unexpected wait_cache_ready for {scope:?}"))
-        }
-
-        async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_pod for {ns}/{name}"))
-        }
-
-        async fn get_pod_for_uid(
-            &self,
-            ns: &str,
-            name: &str,
-            uid: &str,
-        ) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_pod_for_uid for {ns}/{name}/{uid}"))
-        }
-
-        async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Resource>> {
-            Err(anyhow!("unexpected watch_pods_on_node for {node_name}"))
-        }
-
-        async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Resource>> {
-            Err(anyhow!("unexpected list_pods_on_node for {node_name}"))
-        }
-
-        async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_configmap for {ns}/{name}"))
-        }
-
-        async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_secret for {ns}/{name}"))
-        }
-
-        async fn get_node(&self, name: &str) -> Result<Resource> {
-            Err(anyhow!("unexpected get_node for {name}"))
-        }
-
-        async fn watch_node(&self, name: &str) -> Result<WatchStream<Resource>> {
-            Err(anyhow!("unexpected watch_node for {name}"))
-        }
-
-        async fn allocate_node_subnet(
-            &self,
-            node_name: &str,
-            _cluster_cidr: &str,
-            _node_ip: &str,
-        ) -> Result<NodeSubnet> {
-            Err(anyhow!("unexpected allocate_node_subnet for {node_name}"))
-        }
-
-        async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-            Err(anyhow!("unexpected get_node_subnet for {node_name}"))
-        }
-
-        async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-            Err(anyhow!("unexpected list_peer_subnets for {my_node_name}"))
-        }
-
-        async fn get_node_dataplane(
-            &self,
-            node_name: &str,
-        ) -> Result<Option<DataplanePeerMetadata>> {
-            Err(anyhow!("unexpected get_node_dataplane for {node_name}"))
-        }
-
-        async fn apply_outbox(
-            &self,
-            idempotency_key: &str,
-            _operation: OutboxOperation,
-            _payload: Bytes,
-            _client_id: &str,
-            _stream_id: i64,
-            _stream_seq: i64,
-        ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-            Err(OutboxApplyError::Retryable(format!(
-                "unexpected apply_outbox for {idempotency_key}"
-            )))
+            let is_pod = req.kind() == "Pod";
+            Box::pin(async move {
+                if is_pod {
+                    // Each open of the Pod watch immediately delivers a burst of
+                    // errors, then ends. A leaky reconnect (one new open per error,
+                    // keeping the old stream alive) would fan out into hundreds of
+                    // duplicate opens; a backoff-less reconnect would tight-loop.
+                    let burst: Vec<std::result::Result<ResourceEvent, LeaderWatchError>> = (0..20)
+                        .map(|_| Err(LeaderWatchError::transport("simulated watch error")))
+                        .collect();
+                    return Ok(Box::pin(futures::stream::iter(burst)) as WatchStream);
+                }
+                Ok(Box::pin(futures::stream::pending()) as WatchStream)
+            })
         }
     }
+
+    impl_unavailable_cache_readiness!(ErroringLeaderApiClient);
+    crate::control_plane::client::impl_unavailable_leader_pod_effects!(ErroringLeaderApiClient);
+
+    #[async_trait]
+    impl LeaderApiClient for ErroringLeaderApiClient {}
 
     /// Regression test for the per-watch reconnect introduced in f46660f: an
     /// erroring watch stream must NOT leak duplicate watches (one new open per

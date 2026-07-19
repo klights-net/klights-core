@@ -112,6 +112,8 @@ pub struct Datastore {
     snapshot_fence: std::sync::Arc<tokio::sync::RwLock<()>>,
     #[cfg(test)]
     fail_next_watch_position_observation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    resource_get_call_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct AtomicOutboxMutation {
@@ -138,6 +140,10 @@ pub enum BuildOutboxOutcome {
     NeedsPropose {
         commit: crate::log_apply::LogApplyCommit,
         applied_rv: i64,
+        /// Fresh terminal decision already materialized into `commit`. The
+        /// caller returns it only after raft has durably applied the ledger
+        /// and exact stream watermark carried by that commit.
+        terminal_error: Option<crate::kubelet::outbox::OutboxApplyError>,
     },
     /// Lease-renew is a no-op shortcut that never goes through raft; the
     /// leader returns success immediately without proposing.
@@ -151,6 +157,7 @@ enum BuildOutboxTxnOutcome {
     Built {
         commit: crate::log_apply::LogApplyCommit,
         rv: i64,
+        terminal_error: Option<crate::kubelet::outbox::OutboxApplyError>,
     },
     AlreadyApplied(Option<AppliedOutboxRecord>),
 }
@@ -257,7 +264,7 @@ impl Datastore {
         subject_key: &str,
         operation: &str,
         first_seen_ms: i64,
-        reserved_rv: i64,
+        reserved_rv: Option<i64>,
     ) -> tokio_rusqlite::Result<()> {
         tx.execute(
             queries::APPLIED_OUTBOX_INSERT_PLACEHOLDER_WITH_RESERVED_RV,
@@ -299,9 +306,19 @@ impl Datastore {
         operation: String,
         first_seen_ms: i64,
         status_stamp: Option<i64>,
+        terminal_error: Option<&crate::kubelet::outbox::OutboxApplyError>,
     ) {
         use crate::datastore::command::{StorageResponse, encode_response_protobuf};
         use crate::log_apply::{ClusterMutation, LogApplyAppliedOutboxRow, OutboxLedgerMutation};
+
+        let response = terminal_error.map_or_else(
+            || StorageResponse::Ack {
+                resource_version: 0,
+            },
+            |error| StorageResponse::Error {
+                message: error.to_string(),
+            },
+        );
 
         commit.mutations.push(
             ClusterMutation::OutboxLedger(OutboxLedgerMutation::PutAppliedOutbox(
@@ -311,10 +328,7 @@ impl Datastore {
                     operation,
                     first_seen_ms,
                     applied_rv: None,
-                    result_proto: encode_response_protobuf(&StorageResponse::Ack {
-                        resource_version: 0,
-                    })
-                    .unwrap_or_default(),
+                    result_proto: encode_response_protobuf(&response).unwrap_or_default(),
                     status_stamp: status_stamp.filter(|stamp| *stamp > 0),
                 },
             ))
@@ -1837,6 +1851,7 @@ impl Datastore {
                     claim_operation.clone(),
                     now,
                     status_stamp,
+                    None,
                 );
                 if assignment_mode
                     == crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
@@ -1847,7 +1862,7 @@ impl Datastore {
                         &subject_key,
                         &claim_operation,
                         now,
-                        rv,
+                        Some(rv),
                     )?;
                 }
 
@@ -1860,15 +1875,24 @@ impl Datastore {
                 };
 
                 tx.commit()?;
-                Ok(BuildOutboxTxnOutcome::Built { commit, rv })
+                Ok(BuildOutboxTxnOutcome::Built {
+                    commit,
+                    rv,
+                    terminal_error: None,
+                })
             })
             .await
             .map_err(Self::outbox_apply_error_from_db_error)?;
 
         match outcome {
-            BuildOutboxTxnOutcome::Built { commit, rv } => Ok(BuildOutboxOutcome::NeedsPropose {
+            BuildOutboxTxnOutcome::Built {
+                commit,
+                rv,
+                terminal_error,
+            } => Ok(BuildOutboxOutcome::NeedsPropose {
                 commit,
                 applied_rv: rv,
+                terminal_error,
             }),
             BuildOutboxTxnOutcome::AlreadyApplied(record) => {
                 if let Some(message) = Self::cached_outbox_terminal_error(record.as_ref())? {
@@ -1987,14 +2011,17 @@ impl Datastore {
                     tx.commit()?;
                     return Ok(BuildOutboxTxnOutcome::AlreadyApplied(Some(existing)));
                 }
-                if Self::should_consume_watermark_for_stale_uid_bound_pod_in_tx(
-                    &tx,
-                    &decoded.command,
-                )? {
-                    let rv = match resource_version_hint {
-                        Some(rv) => rv,
-                        None => Self::next_resource_version_in_tx(&tx)?,
-                    };
+                if let Some(terminal_error) =
+                    Self::terminal_error_for_stale_uid_bound_pod_in_tx(
+                        &tx,
+                        &decoded.command,
+                    )?
+                {
+                    // A stale UID-bound Pod delivery consumes only its durable
+                    // outbox ledger position. It has no public resource or
+                    // watch effect, so neither assignment mode may reserve a
+                    // public resourceVersion while materializing the commit.
+                    let rv = Self::current_resource_version_in_tx(&tx)?;
                     let mut commit = crate::log_apply::LogApplyCommit::new(rv, Vec::new());
                     commit.outbox_watermark = watermark_for_tx;
                     Self::append_applied_outbox_ledger_mutation(
@@ -2004,6 +2031,7 @@ impl Datastore {
                         claim_operation.clone(),
                         now,
                         status_stamp,
+                        Some(&terminal_error),
                     );
                     if assignment_mode
                         == crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
@@ -2014,7 +2042,7 @@ impl Datastore {
                             &subject_key,
                             &claim_operation,
                             now,
-                            rv,
+                            None,
                         )?;
                     }
                     let commit = if assignment_mode
@@ -2025,7 +2053,11 @@ impl Datastore {
                         commit
                     };
                     tx.commit()?;
-                    return Ok(BuildOutboxTxnOutcome::Built { commit, rv });
+                    return Ok(BuildOutboxTxnOutcome::Built {
+                        commit,
+                        rv,
+                        terminal_error: Some(terminal_error),
+                    });
                 }
                 if Self::should_consume_watermark_for_idempotent_existing_create_in_tx(
                     &tx,
@@ -2045,6 +2077,7 @@ impl Datastore {
                         claim_operation.clone(),
                         now,
                         status_stamp,
+                        None,
                     );
                     if assignment_mode
                         == crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
@@ -2055,7 +2088,7 @@ impl Datastore {
                             &subject_key,
                             &claim_operation,
                             now,
-                            rv,
+                            Some(rv),
                         )?;
                     }
                     let commit = if assignment_mode
@@ -2066,15 +2099,62 @@ impl Datastore {
                         commit
                     };
                     tx.commit()?;
-                    return Ok(BuildOutboxTxnOutcome::Built { commit, rv });
+                    return Ok(BuildOutboxTxnOutcome::Built {
+                        commit,
+                        rv,
+                        terminal_error: None,
+                    });
                 }
-                let (mut commit, rv) = Self::build_log_apply_commit_in_tx_from_command(
+                let (mut commit, rv) = match Self::build_log_apply_commit_in_tx_from_command(
                     &tx,
                     decoded.command,
                     &claim_operation,
                     &authoring_node_owned,
                     resource_version_hint,
-                )?;
+                ) {
+                    Ok(built) => built,
+                    Err(error) if error.to_string().contains("409 Conflict") => {
+                        let terminal_error = OutboxApplyError::ConflictTerminal(error.to_string());
+                        let rv = Self::current_resource_version_in_tx(&tx)?;
+                        let mut commit = crate::log_apply::LogApplyCommit::new(rv, Vec::new());
+                        commit.outbox_watermark = watermark_for_tx;
+                        Self::append_applied_outbox_ledger_mutation(
+                            &mut commit,
+                            claim_key.clone(),
+                            subject_key.clone(),
+                            claim_operation.clone(),
+                            now,
+                            status_stamp,
+                            Some(&terminal_error),
+                        );
+                        if assignment_mode
+                            == crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
+                        {
+                            Self::insert_legacy_outbox_placeholder_in_tx(
+                                &tx,
+                                &claim_key,
+                                &subject_key,
+                                &claim_operation,
+                                now,
+                                None,
+                            )?;
+                        }
+                        let commit = if assignment_mode
+                            == crate::log_apply::ResourceVersionAssignment::CommittedApplyV1
+                        {
+                            commit.into_committed_apply_v1_template()
+                        } else {
+                            commit
+                        };
+                        tx.commit()?;
+                        return Ok(BuildOutboxTxnOutcome::Built {
+                            commit,
+                            rv,
+                            terminal_error: Some(terminal_error),
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
                 commit.outbox_watermark = watermark_for_tx;
                 Self::append_applied_outbox_ledger_mutation(
                     &mut commit,
@@ -2083,6 +2163,7 @@ impl Datastore {
                     claim_operation.clone(),
                     now,
                     status_stamp,
+                    None,
                 );
                 if assignment_mode
                     == crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
@@ -2093,7 +2174,7 @@ impl Datastore {
                         &subject_key,
                         &claim_operation,
                         now,
-                        rv,
+                        Some(rv),
                     )?;
                 }
                 let commit = if assignment_mode
@@ -2104,15 +2185,24 @@ impl Datastore {
                     commit
                 };
                 tx.commit()?;
-                Ok(BuildOutboxTxnOutcome::Built { commit, rv })
+                Ok(BuildOutboxTxnOutcome::Built {
+                    commit,
+                    rv,
+                    terminal_error: None,
+                })
             })
             .await
             .map_err(Self::outbox_apply_error_from_db_error)?;
 
         match outcome {
-            BuildOutboxTxnOutcome::Built { commit, rv } => Ok(BuildOutboxOutcome::NeedsPropose {
+            BuildOutboxTxnOutcome::Built {
+                commit,
+                rv,
+                terminal_error,
+            } => Ok(BuildOutboxOutcome::NeedsPropose {
                 commit,
                 applied_rv: rv,
+                terminal_error,
             }),
             BuildOutboxTxnOutcome::AlreadyApplied(record) => {
                 Ok(BuildOutboxOutcome::AlreadyApplied {
@@ -2589,13 +2679,37 @@ impl Datastore {
         crate::kubelet::outbox::OutboxApplyResult,
         crate::kubelet::outbox::OutboxApplyError,
     > {
+        self.apply_outbox_transactionally_with_watermark_effect(
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+            watermark,
+        )
+        .await
+        .map(|(result, _resource_changed)| result)
+    }
+
+    pub async fn apply_outbox_transactionally_with_watermark_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
         use crate::datastore::sqlite::BuildOutboxOutcome;
         use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
 
         if watermark.is_none() {
-            return self
+            let result = self
                 .apply_outbox_transactionally(idempotency_key, operation, payload, authoring_node)
-                .await;
+                .await?;
+            let resource_changed = matches!(result, OutboxApplyResult::Applied { .. });
+            return Ok((result, resource_changed));
         }
 
         match self
@@ -2608,17 +2722,61 @@ impl Datastore {
             )
             .await?
         {
-            BuildOutboxOutcome::NeedsPropose { commit, applied_rv } => {
-                self.apply_log_apply_commit(commit)
+            BuildOutboxOutcome::NeedsPropose {
+                commit,
+                applied_rv,
+                terminal_error,
+            } => {
+                if commit.resource_version_assignment
+                    == crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
+                {
+                    self.apply_log_apply_commit(commit)
+                        .await
+                        .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
+                    if let Some(error) = terminal_error {
+                        return Err(error);
+                    }
+                    return Ok((OutboxApplyResult::Applied { applied_rv }, applied_rv > 0));
+                }
+                let outcome = self
+                    .apply_raft_log_apply_commit_outcome(commit)
                     .await
                     .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
-                Ok(OutboxApplyResult::Applied { applied_rv })
+                if let Some(error) = terminal_error {
+                    return Err(error);
+                }
+                match outcome {
+                    klights_cluster_core::CommittedApplyOutcome::Visible {
+                        resource_version,
+                        ..
+                    } => Ok((
+                        OutboxApplyResult::Applied {
+                            applied_rv: resource_version,
+                        },
+                        true,
+                    )),
+                    klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
+                        resource_version,
+                        ..
+                    } => Ok((
+                        OutboxApplyResult::Applied {
+                            applied_rv: resource_version,
+                        },
+                        false,
+                    )),
+                    klights_cluster_core::CommittedApplyOutcome::Rejected(rejection) => Err(
+                        OutboxApplyError::ConflictTerminal(rejection.message().to_string()),
+                    ),
+                    _ => Err(OutboxApplyError::Retryable(
+                        "unsupported committed outbox apply outcome".to_string(),
+                    )),
+                }
             }
             BuildOutboxOutcome::AlreadyApplied { applied_rv } => {
-                Ok(OutboxApplyResult::AlreadyApplied { applied_rv })
+                Ok((OutboxApplyResult::AlreadyApplied { applied_rv }, false))
             }
             BuildOutboxOutcome::LeaseRenewShortcircuit => {
-                Ok(OutboxApplyResult::Applied { applied_rv: 0 })
+                Ok((OutboxApplyResult::Applied { applied_rv: 0 }, false))
             }
         }
     }
@@ -2655,17 +2813,25 @@ impl Datastore {
         .map(|existing| existing.is_some())
     }
 
-    fn should_consume_watermark_for_stale_uid_bound_pod_in_tx(
+    fn terminal_error_for_stale_uid_bound_pod_in_tx(
         tx: &rusqlite::Transaction<'_>,
         command: &crate::datastore::command::StorageCommand,
-    ) -> tokio_rusqlite::Result<bool> {
+    ) -> tokio_rusqlite::Result<Option<crate::kubelet::outbox::OutboxApplyError>> {
         let Some((namespace, name, expected_uid)) = Self::uid_bound_pod_target(command) else {
-            return Ok(false);
+            return Ok(None);
         };
         match Self::resource_row_optional_for_update_in_tx(tx, "v1", "Pod", Some(namespace), name)?
         {
-            Some((_rv, live_uid, _data)) => Ok(live_uid != expected_uid),
-            None => Ok(true),
+            Some((_rv, live_uid, _data)) if live_uid != expected_uid => Ok(Some(
+                crate::kubelet::outbox::OutboxApplyError::UidMismatch {
+                    expected: expected_uid.to_string(),
+                    actual: live_uid,
+                },
+            )),
+            Some(_) => Ok(None),
+            None => Ok(Some(crate::kubelet::outbox::OutboxApplyError::NotFound(
+                format!("Pod {namespace}/{name} not found"),
+            ))),
         }
     }
 
@@ -2970,6 +3136,8 @@ impl Datastore {
             fail_next_watch_position_observation: std::sync::Arc::new(
                 std::sync::atomic::AtomicBool::new(false),
             ),
+            #[cfg(test)]
+            resource_get_call_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         ds.gc_stale_applied_outbox_placeholders(
             std::time::SystemTime::now()
@@ -4265,6 +4433,28 @@ impl DatastoreBackend for Datastore {
         crate::kubelet::outbox::OutboxApplyError,
     > {
         Datastore::apply_outbox_transactionally_with_watermark(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+            watermark,
+        )
+        .await
+    }
+
+    async fn apply_outbox_transactionally_with_watermark_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        Datastore::apply_outbox_transactionally_with_watermark_effect(
             self,
             idempotency_key,
             operation,

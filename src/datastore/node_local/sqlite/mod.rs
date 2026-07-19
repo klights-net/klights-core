@@ -125,6 +125,7 @@ pub struct ReplicationCheckpoint {
 pub struct DeadLetterRow {
     pub id: i64,
     pub original_id: i64,
+    pub client_id: String,
     pub idempotency_key: String,
     pub enqueued_ms: i64,
     pub subject_key: String,
@@ -135,6 +136,8 @@ pub struct DeadLetterRow {
     pub subject_uid: Option<String>,
     pub pod_uid: String,
     pub operation: String,
+    pub stream_id: i64,
+    pub stream_seq: i64,
     pub payload_proto: Vec<u8>,
     pub attempts: i64,
     pub last_error: String,
@@ -486,7 +489,11 @@ impl SqliteNodeLocalDb {
             } else {
                 0
             };
-            let stream_seq = 0_i64;
+            let stream_seq = if sequenced {
+                allocate_next_outbox_stream_seq(&tx, stream_id)?
+            } else {
+                0
+            };
             tx.execute(
                 queries::OUTBOX_INSERT,
                 rusqlite::params![
@@ -515,6 +522,142 @@ impl SqliteNodeLocalDb {
         })
         .await
         .map_err(|e| anyhow!("outbox enqueue failed: {e}"))
+    }
+
+    #[cfg(test)]
+    pub async fn outbox_stream_position_for_test(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<(i64, i64)>> {
+        let idempotency_key = idempotency_key.to_string();
+        self.db_call("node_local:outbox_stream_position_test", move |conn| {
+            conn.query_row(
+                "SELECT stream_id, stream_seq FROM outbox WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .map_err(|error| anyhow!("outbox stream-position test read failed: {error}"))
+    }
+
+    #[cfg(test)]
+    pub async fn clear_outbox_stream_identity_for_test(&self, idempotency_key: &str) -> Result<()> {
+        let idempotency_key = idempotency_key.to_string();
+        self.db_call("node_local:outbox_legacy_stream_test", move |conn| {
+            let tx = conn.transaction()?;
+            let changed = tx.execute(
+                "UPDATE outbox SET client_id = '', stream_id = 0, stream_seq = 0 \
+                 WHERE idempotency_key = ?1",
+                [&idempotency_key],
+            )?;
+            if changed != 1 {
+                return Err(tokio_rusqlite::Error::Other(Box::new(
+                    std::io::Error::other(format!(
+                        "test legacy identity mutation changed {changed} rows instead of exactly one"
+                    )),
+                )));
+            }
+            tx.execute("DELETE FROM outbox_stream_sequences", [])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("outbox legacy stream test mutation failed: {error}"))
+    }
+
+    #[cfg(test)]
+    pub async fn clear_all_outbox_stream_identity_for_test(&self) -> Result<()> {
+        self.db_call("node_local:outbox_legacy_stream_all_test", move |conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE outbox SET client_id = '', stream_id = 0, stream_seq = 0 \
+                 WHERE operation != 'LeaseRenew'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE outbox_dead_letter SET client_id = '', stream_id = 0, stream_seq = 0 \
+                 WHERE operation != 'LeaseRenew'",
+                [],
+            )?;
+            tx.execute("DELETE FROM outbox_stream_sequences", [])?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("outbox legacy stream test mutation failed: {error}"))
+    }
+
+    #[cfg(test)]
+    pub async fn set_outbox_operation_for_test(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+    ) -> Result<()> {
+        let idempotency_key = idempotency_key.to_string();
+        let operation = operation.to_string();
+        self.db_call("node_local:outbox_operation_test_update", move |conn| {
+            conn.execute_batch("PRAGMA ignore_check_constraints = ON")?;
+            let update = conn.execute(
+                "UPDATE outbox SET operation = ?2 WHERE idempotency_key = ?1",
+                rusqlite::params![idempotency_key, operation],
+            );
+            conn.execute_batch("PRAGMA ignore_check_constraints = OFF")?;
+            let changed = update?;
+            if changed != 1 {
+                return Err(tokio_rusqlite::Error::Other(Box::new(
+                    std::io::Error::other(format!(
+                        "test operation-only mutation changed {changed} rows instead of exactly one"
+                    )),
+                )));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("outbox operation test update failed: {error}"))
+    }
+
+    #[cfg(test)]
+    pub async fn outbox_operation_for_test(&self, idempotency_key: &str) -> Result<Option<String>> {
+        let idempotency_key = idempotency_key.to_string();
+        self.db_call("node_local:outbox_operation_test_read", move |conn| {
+            conn.query_row(
+                "SELECT operation FROM outbox WHERE idempotency_key = ?1",
+                [idempotency_key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(tokio_rusqlite::Error::from)
+        })
+        .await
+        .map_err(|error| anyhow!("outbox operation test read failed: {error}"))
+    }
+
+    #[cfg(test)]
+    pub async fn set_outbox_attempt_for_test(
+        &self,
+        idempotency_key: &str,
+        attempt: i64,
+    ) -> Result<()> {
+        let idempotency_key = idempotency_key.to_string();
+        self.db_call("node_local:outbox_attempt_test_update", move |conn| {
+            let changed = conn.execute(
+                "UPDATE outbox SET attempt = ?2 WHERE idempotency_key = ?1",
+                rusqlite::params![idempotency_key, attempt],
+            )?;
+            if changed != 1 {
+                return Err(tokio_rusqlite::Error::Other(Box::new(
+                    std::io::Error::other(format!(
+                        "test attempt mutation changed {changed} rows instead of exactly one"
+                    )),
+                )));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("outbox attempt test update failed: {error}"))
     }
 
     pub async fn claim_next_due_outbox(
@@ -583,6 +726,82 @@ impl SqliteNodeLocalDb {
         })
         .await
         .map_err(|e| anyhow!("outbox mark failed failed: {e}"))
+    }
+
+    pub async fn record_outbox_failure(
+        &self,
+        id: i64,
+        lease_token: &str,
+        backoff_until_ms: i64,
+        error: &str,
+        max_attempts: i64,
+    ) -> Result<super::OutboxFailureDisposition> {
+        let lease_token = lease_token.to_string();
+        let error = error.to_string();
+        let now = now_ms();
+        self.db_call("node_local:outbox_record_failure", move |conn| {
+            let tx = conn.transaction()?;
+            let row = tx
+                .query_row(queries::OUTBOX_ROW_SELECT, [id], row_to_outbox)
+                .optional()?;
+            let Some(mut row) =
+                row.filter(|row| row.lease_token.as_deref() == Some(lease_token.as_str()))
+            else {
+                tx.commit()?;
+                return Ok(super::OutboxFailureDisposition::LeaseLost);
+            };
+            row.attempt = row.attempt.saturating_add(1);
+            row.last_error = Some(error.clone());
+            if row.attempt >= max_attempts.max(1) {
+                tx.execute(
+                    queries::DEAD_LETTER_INSERT,
+                    rusqlite::params![
+                        row.id,
+                        row.client_id,
+                        row.idempotency_key,
+                        row.enqueued_ms,
+                        row.subject_key,
+                        row.subject_api_version,
+                        row.subject_kind,
+                        row.subject_namespace,
+                        row.subject_name,
+                        row.subject_uid,
+                        row.pod_uid,
+                        row.operation,
+                        row.stream_id,
+                        row.stream_seq,
+                        row.payload_proto,
+                        row.attempt,
+                        error,
+                        now,
+                    ],
+                )?;
+                let changed = tx.execute(
+                    "DELETE FROM outbox WHERE id = ?1 AND lease_token = ?2",
+                    rusqlite::params![id, lease_token],
+                )?;
+                if changed != 1 {
+                    return Err(tokio_rusqlite::Error::Other(Box::new(
+                        std::io::Error::other("outbox lease changed during dead-letter move"),
+                    )));
+                }
+                tx.commit()?;
+                Ok(super::OutboxFailureDisposition::DeadLettered)
+            } else {
+                let changed = tx.execute(
+                    queries::OUTBOX_MARK_FAILED,
+                    rusqlite::params![id, lease_token, backoff_until_ms, error],
+                )?;
+                if changed != 1 {
+                    tx.commit()?;
+                    return Ok(super::OutboxFailureDisposition::LeaseLost);
+                }
+                tx.commit()?;
+                Ok(super::OutboxFailureDisposition::RetryScheduled)
+            }
+        })
+        .await
+        .map_err(|e| anyhow!("outbox record failure failed: {e}"))
     }
 
     pub async fn complete_outbox(&self, id: i64, lease_token: &str) -> Result<bool> {
@@ -734,6 +953,7 @@ impl SqliteNodeLocalDb {
                 queries::DEAD_LETTER_INSERT,
                 rusqlite::params![
                     dead_row.id,
+                    dead_row.client_id,
                     dead_row.idempotency_key,
                     dead_row.enqueued_ms,
                     dead_row.subject_key,
@@ -744,6 +964,8 @@ impl SqliteNodeLocalDb {
                     dead_row.subject_uid,
                     dead_row.pod_uid,
                     dead_row.operation,
+                    dead_row.stream_id,
+                    dead_row.stream_seq,
                     dead_row.payload_proto,
                     dead_row.attempt,
                     dead_row.last_error.unwrap_or_default(),
@@ -809,15 +1031,21 @@ impl SqliteNodeLocalDb {
 
         self.db_call("node_local:outbox_dead_letter_replay", move |conn| {
             let tx = conn.transaction()?;
-            let client_id = ensure_outbox_client_id_in_tx(&tx)?;
+            let client_id = if row.client_id.is_empty() {
+                ensure_outbox_client_id_in_tx(&tx)?
+            } else {
+                row.client_id
+            };
             let sequenced =
                 operation != crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew;
-            let stream_id = if sequenced {
+            let stream_id = if row.stream_id > 0 {
+                row.stream_id
+            } else if sequenced {
                 outbox_stream_id(&row.subject_key)
             } else {
                 0
             };
-            let stream_seq = 0_i64;
+            let stream_seq = row.stream_seq;
             tx.execute(
                 queries::OUTBOX_INSERT,
                 rusqlite::params![
@@ -841,7 +1069,7 @@ impl SqliteNodeLocalDb {
                     now,
                 ],
             )?;
-            tx.execute(queries::DEAD_LETTER_DELETE, [id])?;
+            tx.execute(queries::DEAD_LETTER_DELETE_AFTER_REPLAY, [id])?;
             tx.commit()?;
             Ok(true)
         })
@@ -908,6 +1136,7 @@ impl SqliteNodeLocalDb {
                 queries::DEAD_LETTER_INSERT,
                 rusqlite::params![
                     0_i64,
+                    "",
                     idempotency_key,
                     0_i64,
                     subject_key,
@@ -918,6 +1147,8 @@ impl SqliteNodeLocalDb {
                     subject_uid,
                     pod_uid,
                     operation,
+                    0_i64,
+                    0_i64,
                     payload_proto,
                     attempts,
                     last_error,
@@ -1265,14 +1496,58 @@ fn assign_outbox_stream_seq_if_needed(
     tx: &rusqlite::Transaction<'_>,
     outbox_id: i64,
 ) -> rusqlite::Result<()> {
-    let (stream_id, stream_seq): (i64, i64) = tx.query_row(
-        "SELECT stream_id, stream_seq FROM outbox WHERE id = ?1",
+    let (client_id, subject_key, operation, stream_id, stream_seq): (
+        String,
+        String,
+        String,
+        i64,
+        i64,
+    ) = tx.query_row(
+        "SELECT client_id, subject_key, operation, stream_id, stream_seq \
+         FROM outbox WHERE id = ?1",
         [outbox_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
     )?;
-    if stream_id == 0 || stream_seq > 0 {
+    if operation == crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str() {
         return Ok(());
     }
+    if !client_id.is_empty() && stream_id > 0 && stream_seq > 0 {
+        return Ok(());
+    }
+    let client_id = if client_id.is_empty() {
+        ensure_outbox_client_id_in_tx(tx)?
+    } else {
+        client_id
+    };
+    let stream_id = if stream_id > 0 {
+        stream_id
+    } else {
+        outbox_stream_id(&subject_key)
+    };
+    let stream_seq = if stream_seq > 0 {
+        stream_seq
+    } else {
+        allocate_next_outbox_stream_seq(tx, stream_id)?
+    };
+    tx.execute(
+        "UPDATE outbox SET client_id = ?2, stream_id = ?3, stream_seq = ?4 WHERE id = ?1",
+        rusqlite::params![outbox_id, client_id, stream_id, stream_seq],
+    )?;
+    Ok(())
+}
+
+fn allocate_next_outbox_stream_seq(
+    tx: &rusqlite::Transaction<'_>,
+    stream_id: i64,
+) -> rusqlite::Result<i64> {
     let prior_seq: Option<i64> = tx
         .query_row(
             "SELECT last_seq FROM outbox_stream_sequences WHERE stream_id = ?1",
@@ -1286,11 +1561,7 @@ fn assign_outbox_stream_seq_if_needed(
          ON CONFLICT(stream_id) DO UPDATE SET last_seq = excluded.last_seq",
         rusqlite::params![stream_id, next_seq],
     )?;
-    tx.execute(
-        "UPDATE outbox SET stream_seq = ?2 WHERE id = ?1",
-        rusqlite::params![outbox_id, next_seq],
-    )?;
-    Ok(())
+    Ok(next_seq)
 }
 
 fn row_to_pod_runtime(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodRuntimeRow> {
@@ -1360,20 +1631,23 @@ fn row_to_dead_letter(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeadLetterRow
     Ok(DeadLetterRow {
         id: row.get(0)?,
         original_id: row.get(1)?,
-        idempotency_key: row.get(2)?,
-        enqueued_ms: row.get(3)?,
-        subject_key: row.get(4)?,
-        subject_api_version: row.get(5)?,
-        subject_kind: row.get(6)?,
-        subject_namespace: row.get(7)?,
-        subject_name: row.get(8)?,
-        subject_uid: row.get(9)?,
-        pod_uid: row.get(10)?,
-        operation: row.get(11)?,
-        payload_proto: row.get(12)?,
-        attempts: row.get(13)?,
-        last_error: row.get(14)?,
-        moved_at_ms: row.get(15)?,
+        client_id: row.get(2)?,
+        idempotency_key: row.get(3)?,
+        enqueued_ms: row.get(4)?,
+        subject_key: row.get(5)?,
+        subject_api_version: row.get(6)?,
+        subject_kind: row.get(7)?,
+        subject_namespace: row.get(8)?,
+        subject_name: row.get(9)?,
+        subject_uid: row.get(10)?,
+        pod_uid: row.get(11)?,
+        operation: row.get(12)?,
+        stream_id: row.get(13)?,
+        stream_seq: row.get(14)?,
+        payload_proto: row.get(15)?,
+        attempts: row.get(16)?,
+        last_error: row.get(17)?,
+        moved_at_ms: row.get(18)?,
     })
 }
 

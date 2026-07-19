@@ -196,6 +196,11 @@ impl PodSubsystem {
         let cluster_api = cluster_api.ok_or_else(|| {
             anyhow::anyhow!("missing PodRuntimeService dependencies: cluster_api")
         })?;
+        let volume_resource_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
+            cluster_api.clone();
+        let volume_projected_tokens: Arc<
+            dyn klights_leader_api::LeaderProjectedServiceAccountToken,
+        > = cluster_api.clone();
         let cri_runtime = Arc::new(crate::kubelet::pod_runtime::cri::SharedCriRuntime::new(
             cri.clone(),
         ));
@@ -248,7 +253,8 @@ impl PodSubsystem {
                     crate::kubelet::pod_runtime::volumes::RealPodVolumeRuntime::new(
                         Arc::new(
                             crate::kubelet::volume_sources::LocalCacheVolumeSourceReader::new(
-                                cluster_api.clone(),
+                                volume_resource_query,
+                                volume_projected_tokens,
                             ),
                         ),
                         containerd_ns.clone(),

@@ -3,6 +3,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
+use crate::control_plane::client::{
+    ResourceListRequest, ResourceQueryConsistency, config_map_get_request, secret_get_request,
+};
+
 #[async_trait]
 pub trait EnvSourceReader: Send + Sync {
     async fn secret(
@@ -43,13 +47,13 @@ impl EnvSourceReader for LeaderApiEnvSourceReader {
         // spuriously fail the container with a not-found; the fresh read confirms
         // against the leader. Mirrors the volume-source reader. See B4.
         self.cluster_api
-            .get_resource_fresh(klights_types::ResourceKey {
-                api_version: "v1".to_string(),
-                kind: "Secret".to_string(),
-                namespace: Some(namespace.to_string()),
-                name: name.to_string(),
-            })
+            .get_resource(secret_get_request(
+                namespace,
+                name,
+                ResourceQueryConsistency::LeaderFresh,
+            )?)
             .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn config_map(
@@ -61,29 +65,30 @@ impl EnvSourceReader for LeaderApiEnvSourceReader {
         // be in a primed-but-lagging worker cache, and a cached miss would
         // spuriously fail the container.
         self.cluster_api
-            .get_resource_fresh(klights_types::ResourceKey {
-                api_version: "v1".to_string(),
-                kind: "ConfigMap".to_string(),
-                namespace: Some(namespace.to_string()),
-                name: name.to_string(),
-            })
+            .get_resource(config_map_get_request(
+                namespace,
+                name,
+                ResourceQueryConsistency::LeaderFresh,
+            )?)
             .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn services(&self, namespace: &str) -> anyhow::Result<Vec<crate::datastore::Resource>> {
         Ok(self
             .cluster_api
-            .list_resources(crate::control_plane::client::ListRequest {
-                api_version: "v1".to_string(),
-                kind: "Service".to_string(),
-                namespace: Some(namespace.to_string()),
-                label_selector: None,
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-            })
+            .list_resources(ResourceListRequest::try_new(
+                "v1",
+                "Service",
+                Some(namespace.to_string()),
+                None,
+                None,
+                None,
+                None,
+                ResourceQueryConsistency::Cached,
+            )?)
             .await?
-            .items)
+            .into_items())
     }
 }
 
@@ -931,20 +936,18 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use anyhow::{Result, anyhow};
         use async_trait::async_trait;
-        use bytes::Bytes;
 
         use crate::control_plane::client::{
-            CacheScope, ConfigMap, LeaderApiClient, ListRequest, ListResponse, Node, Pod,
-            ResourceEvent, Secret, WatchRequest, WatchStream,
+            CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient,
+            LeaderCacheReadiness, LeaderWatch, LeaderWatchError, LeaderWatchFuture, WatchRequest,
         };
-        use crate::datastore::{NodeSubnet, Resource};
-        use crate::kubelet::outbox::payload::OutboxOperation;
-        use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
+        use crate::datastore::Resource;
         use crate::kubelet::pod_env::{EnvSourceReader, LeaderApiEnvSourceReader};
-        use crate::networking::wireguard::DataplanePeerMetadata;
-        use klights_types::ResourceKey;
+        use klights_leader_api::{
+            LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
+            ResourceQueryConsistency, ResourceQueryError, ResourceQueryFuture,
+        };
 
         struct FreshOnlyLeaderApiClient {
             resource: Resource,
@@ -952,112 +955,62 @@ mod tests {
             fresh_calls: AtomicUsize,
         }
 
-        #[async_trait]
-        impl LeaderApiClient for FreshOnlyLeaderApiClient {
-            async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-                self.cache_calls.fetch_add(1, Ordering::SeqCst);
-                Err(anyhow!(
-                    "env reads must not hit the worker cache for {key:?}"
-                ))
-            }
-            async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
-                self.fresh_calls.fetch_add(1, Ordering::SeqCst);
-                Ok((key.kind == self.resource.kind
-                    && key.namespace.as_deref() == self.resource.namespace.as_deref()
-                    && key.name == self.resource.name)
-                    .then(|| self.resource.clone()))
-            }
-            async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
-                Err(anyhow!("unexpected list_resources {req:?}"))
-            }
-            async fn watch_resources(
+        impl LeaderResourceQuery for FreshOnlyLeaderApiClient {
+            fn get_resource(
                 &self,
-                _req: WatchRequest,
-            ) -> Result<WatchStream<ResourceEvent>> {
-                Err(anyhow!("unexpected watch_resources"))
+                request: ResourceGetRequest,
+            ) -> ResourceQueryFuture<'_, Option<Resource>> {
+                Box::pin(async move {
+                    let consistency = request.consistency();
+                    let key = request.into_key();
+                    if consistency == ResourceQueryConsistency::Cached {
+                        self.cache_calls.fetch_add(1, Ordering::SeqCst);
+                        return Err(ResourceQueryError::query_failed(format!(
+                            "env reads must not hit the worker cache for {key:?}"
+                        )));
+                    }
+                    self.fresh_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok((key.kind == self.resource.kind
+                        && key.namespace.as_deref() == self.resource.namespace.as_deref()
+                        && key.name == self.resource.name)
+                        .then(|| self.resource.clone()))
+                })
             }
-            async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
-                Err(anyhow!("unexpected wait_cache_ready"))
-            }
-            async fn get_pod(&self, _ns: &str, _name: &str) -> Result<Option<Pod>> {
-                Err(anyhow!("unexpected get_pod"))
-            }
-            async fn get_pod_for_uid(
+
+            fn list_resources(
                 &self,
-                _ns: &str,
-                _name: &str,
-                _uid: &str,
-            ) -> Result<Option<Pod>> {
-                Err(anyhow!("unexpected get_pod_for_uid"))
-            }
-            async fn watch_pods_on_node(&self, _node: &str) -> Result<WatchStream<Pod>> {
-                Err(anyhow!("unexpected watch_pods_on_node"))
-            }
-            async fn list_pods_on_node(&self, _node: &str) -> Result<Vec<Pod>> {
-                Err(anyhow!("unexpected list_pods_on_node"))
-            }
-            async fn get_configmap(&self, _ns: &str, _name: &str) -> Result<Option<ConfigMap>> {
-                Err(anyhow!("env reads must not use the cached get_configmap"))
-            }
-            async fn get_secret(&self, _ns: &str, _name: &str) -> Result<Option<Secret>> {
-                Err(anyhow!("env reads must not use the cached get_secret"))
-            }
-            async fn get_node(&self, _name: &str) -> Result<Node> {
-                Err(anyhow!("unexpected get_node"))
-            }
-            async fn watch_node(&self, _name: &str) -> Result<WatchStream<Node>> {
-                Err(anyhow!("unexpected watch_node"))
-            }
-            async fn allocate_node_subnet(
-                &self,
-                _node: &str,
-                _cidr: &str,
-                _ip: &str,
-            ) -> Result<NodeSubnet> {
-                Err(anyhow!("unexpected allocate_node_subnet"))
-            }
-            async fn get_node_subnet(&self, _node: &str) -> Result<Option<NodeSubnet>> {
-                Err(anyhow!("unexpected get_node_subnet"))
-            }
-            async fn list_peer_subnets(&self, _node: &str) -> Result<Vec<NodeSubnet>> {
-                Err(anyhow!("unexpected list_peer_subnets"))
-            }
-            async fn get_node_dataplane(
-                &self,
-                _node: &str,
-            ) -> Result<Option<DataplanePeerMetadata>> {
-                Err(anyhow!("unexpected get_node_dataplane"))
-            }
-            async fn list_pod_cleanup_intents_for_node(
-                &self,
-                _node: &str,
-            ) -> Result<Vec<crate::datastore::PodCleanupIntent>> {
-                Err(anyhow!("unexpected list_pod_cleanup_intents_for_node"))
-            }
-            async fn delete_pod_cleanup_intent(
-                &self,
-                _node: &str,
-                _ns: &str,
-                _pod: &str,
-                _uid: &str,
-                _reason: &str,
-            ) -> Result<()> {
-                Err(anyhow!("unexpected delete_pod_cleanup_intent"))
-            }
-            async fn apply_outbox(
-                &self,
-                key: &str,
-                _operation: OutboxOperation,
-                _payload: Bytes,
-                _client_id: &str,
-                _stream_id: i64,
-                _stream_seq: i64,
-            ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-                Err(OutboxApplyError::Retryable(format!(
-                    "unexpected apply_outbox {key}"
-                )))
+                request: ResourceListRequest,
+            ) -> ResourceQueryFuture<'_, ResourceListResult> {
+                Box::pin(async move {
+                    Err(ResourceQueryError::query_failed(format!(
+                        "unexpected list_resources {request:?}"
+                    )))
+                })
             }
         }
+
+        impl LeaderWatch for FreshOnlyLeaderApiClient {
+            fn watch_resources(&self, _req: WatchRequest) -> LeaderWatchFuture<'_> {
+                Box::pin(async { Err(LeaderWatchError::unavailable("unexpected watch_resources")) })
+            }
+        }
+
+        impl LeaderCacheReadiness for FreshOnlyLeaderApiClient {
+            fn wait_cache_ready(&self, _scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+                Box::pin(async {
+                    Err(CacheReadinessError::unavailable(
+                        "unexpected wait_cache_ready",
+                    ))
+                })
+            }
+        }
+
+        crate::control_plane::client::impl_unavailable_leader_pod_effects!(
+            FreshOnlyLeaderApiClient
+        );
+
+        #[async_trait]
+        impl LeaderApiClient for FreshOnlyLeaderApiClient {}
 
         fn secret_resource() -> Resource {
             Resource {

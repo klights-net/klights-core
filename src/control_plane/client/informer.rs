@@ -4,15 +4,14 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::{Notify, RwLock};
 
-use crate::control_plane::client::{CacheScope, ListRequest, ResourceEvent};
+use crate::control_plane::client::{CacheReadinessRequest, ListRequest, ResourceEvent};
 use crate::datastore::{Resource, ResourceList};
-use crate::watch::EventType;
 use klights_types::ResourceKey;
 
 #[derive(Clone)]
 pub(super) struct InformerCache {
     resources: Arc<RwLock<HashMap<String, Resource>>>,
-    primed_scopes: Arc<RwLock<HashSet<CacheScope>>>,
+    primed_scopes: Arc<RwLock<HashSet<CacheReadinessRequest>>>,
     ready: Arc<Notify>,
 }
 
@@ -76,17 +75,17 @@ impl InformerCache {
     }
 
     pub(super) async fn apply_event(&self, event: &ResourceEvent) -> Result<Option<Resource>> {
-        if event.event.event_type == EventType::Bookmark {
+        if event.event_type() == crate::control_plane::client::WatchEventType::Bookmark {
             return Ok(None);
         }
-        let resource = Resource::try_from_watch_event(&event.event)?;
+        let resource = event.resource().clone();
         let key = resource_cache_key(
             &resource.api_version,
             &resource.kind,
             resource.namespace.as_deref(),
             &resource.name,
         );
-        let event_type = event.event.event_type;
+        let event_type = event.event_type();
         {
             let mut guard = self.resources.write().await;
             let should_apply = guard
@@ -97,30 +96,32 @@ impl InformerCache {
                 return Ok(None);
             }
             match event_type {
-                EventType::Deleted => {
+                crate::control_plane::client::WatchEventType::Deleted => {
                     guard.remove(&key);
                 }
-                EventType::Added | EventType::Modified => {
+                crate::control_plane::client::WatchEventType::Added
+                | crate::control_plane::client::WatchEventType::Modified => {
                     guard.insert(key, resource.clone());
                 }
                 // ERROR is a wire-only watch frame; never broadcast internally.
-                EventType::Bookmark | EventType::Error => {}
+                crate::control_plane::client::WatchEventType::Bookmark
+                | crate::control_plane::client::WatchEventType::Error => {}
             }
         }
         Ok(Some(resource))
     }
 
-    pub(super) async fn mark_primed(&self, scope: CacheScope) {
+    pub(super) async fn mark_primed(&self, scope: CacheReadinessRequest) {
         self.primed_scopes.write().await.insert(scope);
         self.ready.notify_waiters();
     }
 
     #[cfg(test)]
-    pub(super) async fn clear_scope_for_test(&self, scope: &CacheScope) {
+    pub(super) async fn clear_scope_for_test(&self, scope: &CacheReadinessRequest) {
         self.primed_scopes.write().await.remove(scope);
     }
 
-    pub(super) async fn wait_ready(&self, scope: CacheScope) -> Result<()> {
+    pub(super) async fn wait_ready(&self, scope: CacheReadinessRequest) -> Result<()> {
         loop {
             if self.primed_scopes.read().await.contains(&scope) {
                 return Ok(());
@@ -129,17 +130,20 @@ impl InformerCache {
         }
     }
 
-    pub(super) async fn is_ready(&self, scope: &CacheScope) -> bool {
+    pub(super) async fn is_ready(&self, scope: &CacheReadinessRequest) -> bool {
         self.primed_scopes.read().await.contains(scope)
     }
 }
 
-pub(super) fn scope_for_request(req: &ListRequest) -> CacheScope {
-    CacheScope::Resource {
-        api_version: req.api_version.clone(),
-        kind: req.kind.clone(),
-        namespace: req.namespace.clone(),
-    }
+pub(super) fn scope_for_request(req: &ListRequest) -> CacheReadinessRequest {
+    CacheReadinessRequest::try_new(
+        req.api_version.clone(),
+        req.kind.clone(),
+        req.namespace.clone(),
+        req.label_selector.clone(),
+        req.field_selector.clone(),
+    )
+    .expect("legacy LIST request identity was already validated")
 }
 
 fn resource_cache_key(

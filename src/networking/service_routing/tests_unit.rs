@@ -790,33 +790,8 @@ fn inventory_resource(
     }
 }
 
-#[async_trait::async_trait]
-impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClient {
-    async fn get_resource(
-        &self,
-        _key: klights_types::ResourceKey,
-    ) -> anyhow::Result<Option<crate::datastore::Resource>> {
-        self.cached_get_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(None)
-    }
-
-    async fn list_resources(
-        &self,
-        _req: crate::control_plane::client::ListRequest,
-    ) -> anyhow::Result<crate::control_plane::client::ListResponse> {
-        self.cached_list_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(crate::datastore::ResourceList {
-            items: Vec::new(),
-            resource_version: 1,
-            watch_replay_position: None,
-            continue_token: None,
-            remaining_item_count: None,
-        })
-    }
-
-    async fn list_resources_fresh(
+impl FreshServiceInventoryClient {
+    async fn fresh_list_for_test(
         &self,
         req: crate::control_plane::client::ListRequest,
     ) -> anyhow::Result<crate::control_plane::client::ListResponse> {
@@ -883,11 +858,6 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                         },
                         "subsets": if self.legacy_endpoints_empty {
                             json!([])
-                        } else if self.legacy_endpoints_partial {
-                            json!([{
-                                "addresses": legacy_addresses,
-                                "ports": self.endpoints_ports()
-                            }])
                         } else {
                             json!([{
                                 "addresses": legacy_addresses,
@@ -936,7 +906,7 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
         })
     }
 
-    async fn get_resource_fresh(
+    async fn fresh_get_for_test(
         &self,
         key: klights_types::ResourceKey,
     ) -> anyhow::Result<Option<crate::datastore::Resource>> {
@@ -961,13 +931,8 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
                         "name": "kube-dns",
                         "uid": "kube-dns-endpoints-uid",
                     },
-                "subsets": if self.legacy_endpoints_empty {
+                    "subsets": if self.legacy_endpoints_empty {
                         json!([])
-                    } else if self.legacy_endpoints_partial {
-                        json!([{
-                            "addresses": [{"ip": "10.50.0.2"}],
-                            "ports": self.endpoints_ports()
-                        }])
                     } else {
                         json!([{
                             "addresses": [{"ip": "10.50.0.2"}],
@@ -979,138 +944,75 @@ impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClie
         }
         Ok(None)
     }
+}
 
-    async fn watch_resources(
+impl klights_leader_api::LeaderResourceQuery for FreshServiceInventoryClient {
+    fn get_resource(
         &self,
-        _req: crate::control_plane::client::WatchRequest,
-    ) -> anyhow::Result<
-        crate::control_plane::client::WatchStream<crate::control_plane::client::ResourceEvent>,
-    > {
-        Ok(Box::pin(futures::stream::empty()))
+        request: klights_leader_api::ResourceGetRequest,
+    ) -> klights_leader_api::ResourceQueryFuture<'_, Option<crate::datastore::Resource>> {
+        Box::pin(async move {
+            if request.consistency() == klights_leader_api::ResourceQueryConsistency::Cached {
+                self.cached_get_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return Ok(None);
+            }
+            self.fresh_get_for_test(request.into_key())
+                .await
+                .map_err(crate::control_plane::client::query_error)
+        })
     }
 
-    async fn wait_cache_ready(
+    fn list_resources(
         &self,
-        _scope: crate::control_plane::client::CacheScope,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    async fn get_pod(
-        &self,
-        _ns: &str,
-        _name: &str,
-    ) -> anyhow::Result<Option<crate::control_plane::client::Pod>> {
-        Ok(None)
-    }
-
-    async fn get_pod_for_uid(
-        &self,
-        _ns: &str,
-        _name: &str,
-        _uid: &str,
-    ) -> anyhow::Result<Option<crate::control_plane::client::Pod>> {
-        Ok(None)
-    }
-
-    async fn watch_pods_on_node(
-        &self,
-        _node_name: &str,
-    ) -> anyhow::Result<crate::control_plane::client::WatchStream<crate::control_plane::client::Pod>>
-    {
-        Ok(Box::pin(futures::stream::empty()))
-    }
-
-    async fn list_pods_on_node(
-        &self,
-        _node_name: &str,
-    ) -> anyhow::Result<Vec<crate::control_plane::client::Pod>> {
-        Ok(Vec::new())
-    }
-
-    async fn get_configmap(
-        &self,
-        _ns: &str,
-        _name: &str,
-    ) -> anyhow::Result<Option<crate::control_plane::client::ConfigMap>> {
-        Ok(None)
-    }
-
-    async fn get_secret(
-        &self,
-        _ns: &str,
-        _name: &str,
-    ) -> anyhow::Result<Option<crate::control_plane::client::Secret>> {
-        Ok(None)
-    }
-
-    async fn get_node(&self, name: &str) -> anyhow::Result<crate::control_plane::client::Node> {
-        Err(anyhow::anyhow!("unexpected get_node for {name}"))
-    }
-
-    async fn watch_node(
-        &self,
-        _name: &str,
-    ) -> anyhow::Result<crate::control_plane::client::WatchStream<crate::control_plane::client::Node>>
-    {
-        Ok(Box::pin(futures::stream::empty()))
-    }
-
-    async fn allocate_node_subnet(
-        &self,
-        node_name: &str,
-        _cluster_cidr: &str,
-        _node_ip: &str,
-    ) -> anyhow::Result<crate::datastore::NodeSubnet> {
-        Err(anyhow::anyhow!(
-            "unexpected allocate_node_subnet for {node_name}"
-        ))
-    }
-
-    async fn get_node_subnet(
-        &self,
-        node_name: &str,
-    ) -> anyhow::Result<Option<crate::datastore::NodeSubnet>> {
-        Err(anyhow::anyhow!(
-            "unexpected get_node_subnet for {node_name}"
-        ))
-    }
-
-    async fn list_peer_subnets(
-        &self,
-        my_node_name: &str,
-    ) -> anyhow::Result<Vec<crate::datastore::NodeSubnet>> {
-        Err(anyhow::anyhow!(
-            "unexpected list_peer_subnets for {my_node_name}"
-        ))
-    }
-
-    async fn get_node_dataplane(
-        &self,
-        node_name: &str,
-    ) -> anyhow::Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
-        Err(anyhow::anyhow!(
-            "unexpected get_node_dataplane for {node_name}"
-        ))
-    }
-
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        _operation: crate::kubelet::outbox::payload::OutboxOperation,
-        _payload: bytes::Bytes,
-        _client_id: &str,
-        _stream_id: i64,
-        _stream_seq: i64,
-    ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
-        Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
-            format!("unexpected apply_outbox for {idempotency_key}"),
-        ))
+        request: klights_leader_api::ResourceListRequest,
+    ) -> klights_leader_api::ResourceQueryFuture<'_, klights_leader_api::ResourceListResult> {
+        Box::pin(async move {
+            if request.consistency() == klights_leader_api::ResourceQueryConsistency::Cached {
+                self.cached_list_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return klights_leader_api::ResourceListResult::try_new(
+                    Vec::new(),
+                    1,
+                    None,
+                    None,
+                    None,
+                );
+            }
+            let legacy = crate::control_plane::client::legacy_list_request(&request);
+            let list = self
+                .fresh_list_for_test(legacy)
+                .await
+                .map_err(crate::control_plane::client::query_error)?;
+            crate::control_plane::client::query_list_result(list)
+        })
     }
 }
+
+impl crate::control_plane::client::LeaderWatch for FreshServiceInventoryClient {
+    fn watch_resources(
+        &self,
+        _req: crate::control_plane::client::WatchRequest,
+    ) -> crate::control_plane::client::LeaderWatchFuture<'_> {
+        Box::pin(async {
+            Ok(Box::pin(futures::stream::empty()) as crate::control_plane::client::WatchStream)
+        })
+    }
+}
+
+impl crate::control_plane::client::LeaderCacheReadiness for FreshServiceInventoryClient {
+    fn wait_cache_ready(
+        &self,
+        _scope: crate::control_plane::client::CacheReadinessRequest,
+    ) -> crate::control_plane::client::CacheReadinessFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+crate::control_plane::client::impl_unavailable_leader_pod_effects!(FreshServiceInventoryClient);
+
+#[async_trait::async_trait]
+impl crate::control_plane::client::LeaderApiClient for FreshServiceInventoryClient {}
 
 #[tokio::test]
 async fn service_specs_from_api_uses_fresh_reads_for_routing_snapshot() {

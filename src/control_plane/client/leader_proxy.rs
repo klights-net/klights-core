@@ -28,22 +28,87 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
 use async_trait::async_trait;
+#[cfg(test)]
 use bytes::Bytes;
 use futures::StreamExt as _;
+use klights_leader_api::{
+    LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest,
+};
 use tokio::sync::watch;
 
 use crate::control_plane::client::{
-    CacheScope, ConfigMap, LeaderApiClient, ListRequest, ListResponse, Node, Pod,
-    ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest, ResourceEvent, Secret,
-    WatchRequest, WatchStream,
+    CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient,
+    LeaderCacheReadiness, LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal,
+    LeaderNodeSubnetAllocation, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
+    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
+    NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
+    NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
+    NodeSubnetAllocationError, NodeSubnetAllocationFuture, NodeSubnetAllocationRequest,
+    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, PeerSubnetsQuery,
+    PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
+    PodCleanupIntentFuture, PodCleanupIntentListRequest, ProjectedServiceAccountTokenFuture,
+    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
+    ResourceCommandRequest, ResourceCommandResult, ResourceGetRequest, ResourceListRequest,
+    ResourceListResult, ResourceQueryConsistency, ResourceQueryFuture, WatchRequest, WatchStream,
 };
-use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource};
-use crate::kubelet::outbox::payload::OutboxOperation;
-use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
-use crate::networking::wireguard::DataplanePeerMetadata;
-use klights_types::ResourceKey;
+use crate::datastore::Resource;
+
+#[cfg(test)]
+use crate::control_plane::client::pod_get_request;
+
+struct ArcPair<T: ?Sized> {
+    local: Option<Arc<T>>,
+    remote: Option<Arc<T>>,
+}
+
+impl<T: ?Sized> Clone for ArcPair<T> {
+    fn clone(&self) -> Self {
+        Self {
+            local: self.local.clone(),
+            remote: self.remote.clone(),
+        }
+    }
+}
+
+impl<T: ?Sized> ArcPair<T> {
+    fn empty() -> Self {
+        Self {
+            local: None,
+            remote: None,
+        }
+    }
+
+    fn set(&mut self, local: Arc<T>, remote: Arc<T>) {
+        self.local = Some(local);
+        self.remote = Some(remote);
+    }
+
+    fn target(&self, is_leader: bool) -> Option<&Arc<T>> {
+        if is_leader {
+            self.local.as_ref()
+        } else {
+            self.remote.as_ref()
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FocusedLeaderTargets {
+    resource_commands: ArcPair<dyn LeaderResourceCommand>,
+    node_lease_renewals: ArcPair<dyn LeaderNodeLeaseRenewal>,
+    outbox_deliveries: ArcPair<dyn LeaderOutboxDelivery>,
+}
+
+impl FocusedLeaderTargets {
+    fn empty() -> Self {
+        Self {
+            resource_commands: ArcPair::empty(),
+            node_lease_renewals: ArcPair::empty(),
+            outbox_deliveries: ArcPair::empty(),
+        }
+    }
+}
 
 /// Leader-aware `LeaderApiClient` that dispatches each call to a local
 /// `LocalApiClient` (reads, plus writes when self is the elected
@@ -53,6 +118,7 @@ use klights_types::ResourceKey;
 pub struct LeaderProxyApiClient {
     local: Arc<dyn LeaderApiClient>,
     remote: Arc<dyn LeaderApiClient>,
+    focused_targets: Option<Arc<FocusedLeaderTargets>>,
     is_leader_rx: watch::Receiver<bool>,
 }
 
@@ -72,8 +138,49 @@ impl LeaderProxyApiClient {
         Self {
             local,
             remote,
+            focused_targets: None,
             is_leader_rx,
         }
+    }
+
+    pub fn with_resource_command_targets(
+        mut self,
+        local: Arc<dyn LeaderResourceCommand>,
+        remote: Arc<dyn LeaderResourceCommand>,
+    ) -> Self {
+        self.focused_targets_mut()
+            .resource_commands
+            .set(local, remote);
+        self
+    }
+
+    pub fn with_outbox_delivery_targets(
+        mut self,
+        local: Arc<dyn LeaderOutboxDelivery>,
+        remote: Arc<dyn LeaderOutboxDelivery>,
+    ) -> Self {
+        self.focused_targets_mut()
+            .outbox_deliveries
+            .set(local, remote);
+        self
+    }
+
+    pub fn with_node_lease_renewal_targets(
+        mut self,
+        local: Arc<dyn LeaderNodeLeaseRenewal>,
+        remote: Arc<dyn LeaderNodeLeaseRenewal>,
+    ) -> Self {
+        self.focused_targets_mut()
+            .node_lease_renewals
+            .set(local, remote);
+        self
+    }
+
+    fn focused_targets_mut(&mut self) -> &mut FocusedLeaderTargets {
+        let targets = self
+            .focused_targets
+            .get_or_insert_with(|| Arc::new(FocusedLeaderTargets::empty()));
+        Arc::make_mut(targets)
     }
 
     fn is_leader(&self) -> bool {
@@ -88,209 +195,265 @@ impl LeaderProxyApiClient {
         }
     }
 
-    fn terminate_watch_on_leadership_change<T>(&self, stream: WatchStream<T>) -> WatchStream<T>
-    where
-        T: Send + 'static,
-    {
-        terminate_watch_on_leadership_change(stream, self.is_leader_rx.clone(), self.is_leader())
+    #[cfg(test)]
+    async fn deliver_test_outbox(
+        &self,
+        idempotency_key: &str,
+        operation: crate::kubelet::outbox::payload::OutboxOperation,
+        payload: Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
+    ) -> std::result::Result<
+        klights_leader_api::OutboxDeliveryResult,
+        klights_leader_api::OutboxDeliveryError,
+    > {
+        let request = OutboxDeliveryRequest::try_new(
+            idempotency_key,
+            operation.try_delivery_operation()?,
+            Arc::<[u8]>::from(payload.to_vec()),
+            client_id,
+            stream_id,
+            stream_seq,
+        )?;
+        self.deliver_outbox(request).await
     }
 }
 
-fn terminate_watch_on_leadership_change<T>(
-    stream: WatchStream<T>,
+impl LeaderResourceCommand for LeaderProxyApiClient {
+    fn submit_resource_command(
+        &self,
+        request: ResourceCommandRequest,
+    ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
+        let target = self
+            .focused_targets
+            .as_ref()
+            .and_then(|targets| targets.resource_commands.target(self.is_leader()));
+        match target {
+            Some(target) => target.submit_resource_command(request),
+            None => Box::pin(async {
+                Err(ResourceCommandError::retryable(
+                    "leader proxy resource-command target is not wired",
+                ))
+            }),
+        }
+    }
+}
+
+impl LeaderNodeLeaseRenewal for LeaderProxyApiClient {
+    fn renew_node_lease(
+        &self,
+        request: NodeLeaseRenewalRequest,
+    ) -> NodeLeaseRenewalFuture<'_, NodeLeaseRenewalResult> {
+        let target = self
+            .focused_targets
+            .as_ref()
+            .and_then(|targets| targets.node_lease_renewals.target(self.is_leader()));
+        match target {
+            Some(target) => target.renew_node_lease(request),
+            None => Box::pin(async {
+                Err(NodeLeaseRenewalError::unavailable(
+                    "leader proxy Node lease-renewal target is not wired",
+                ))
+            }),
+        }
+    }
+}
+
+fn terminate_watch_on_leadership_change(
+    stream: WatchStream,
     leadership_rx: watch::Receiver<bool>,
-    initial_is_leader: bool,
-) -> WatchStream<T>
-where
-    T: Send + 'static,
-{
+) -> WatchStream {
     Box::pin(futures::stream::unfold(
         (stream, leadership_rx),
         move |(mut stream, mut leadership_rx)| async move {
-            loop {
-                tokio::select! {
-                    changed = leadership_rx.changed() => {
-                        if changed.is_err() || *leadership_rx.borrow() != initial_is_leader {
-                            return None;
-                        }
-                    }
-                    item = stream.next() => {
-                        return item.map(|item| (item, (stream, leadership_rx)));
-                    }
+            tokio::select! {
+                biased;
+                changed = leadership_rx.changed() => {
+                    let _ = changed;
+                    None
+                }
+                item = stream.next() => {
+                    item.map(|item| (item, (stream, leadership_rx)))
                 }
             }
         },
     ))
 }
 
-#[async_trait]
-impl LeaderApiClient for LeaderProxyApiClient {
-    // --- Kubernetes API reads and watches go to the elected leader ---
-
-    async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-        self.leader_target().get_resource(key).await
-    }
-
-    async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
-        self.leader_target().get_resource_fresh(key).await
-    }
-
-    async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
-        self.leader_target().list_resources(req).await
-    }
-
-    async fn list_resources_fresh(&self, req: ListRequest) -> Result<ListResponse> {
-        self.leader_target().list_resources_fresh(req).await
-    }
-
-    async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-        let stream = self.leader_target().watch_resources(req).await?;
-        Ok(self.terminate_watch_on_leadership_change(stream))
-    }
-
-    async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()> {
-        self.leader_target().wait_cache_ready(scope).await
-    }
-
-    async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Pod>> {
-        self.leader_target().get_pod(ns, name).await
-    }
-
-    async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Pod>> {
-        self.leader_target().get_pod_for_uid(ns, name, uid).await
-    }
-
-    async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Pod>> {
-        let stream = self.leader_target().watch_pods_on_node(node_name).await?;
-        Ok(self.terminate_watch_on_leadership_change(stream))
-    }
-
-    async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Pod>> {
-        self.leader_target().list_pods_on_node(node_name).await
-    }
-
-    async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<ConfigMap>> {
-        self.leader_target().get_configmap(ns, name).await
-    }
-
-    async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
-        self.leader_target().get_secret(ns, name).await
-    }
-
-    async fn get_node(&self, name: &str) -> Result<Node> {
-        self.leader_target().get_node(name).await
-    }
-
-    async fn watch_node(&self, name: &str) -> Result<WatchStream<Node>> {
-        let stream = self.leader_target().watch_node(name).await?;
-        Ok(self.terminate_watch_on_leadership_change(stream))
-    }
-
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-        self.leader_target().get_node_subnet(node_name).await
-    }
-
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        self.leader_target().list_peer_subnets(my_node_name).await
-    }
-
-    async fn get_node_dataplane(&self, node_name: &str) -> Result<Option<DataplanePeerMetadata>> {
-        self.leader_target().get_node_dataplane(node_name).await
-    }
-
-    async fn list_pod_cleanup_intents_for_node(
+impl LeaderResourceQuery for LeaderProxyApiClient {
+    fn get_resource(
         &self,
-        node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
-        let local_is_leader = self.is_leader();
-        match self
-            .remote
-            .list_pod_cleanup_intents_for_node(node_name)
-            .await
-        {
-            Ok(intents) => Ok(intents),
-            Err(_) if local_is_leader => {
-                self.local
-                    .list_pod_cleanup_intents_for_node(node_name)
-                    .await
+        request: ResourceGetRequest,
+    ) -> ResourceQueryFuture<'_, Option<Resource>> {
+        let mut leadership_rx = self.is_leader_rx.clone();
+        let initial_is_leader = *leadership_rx.borrow_and_update();
+        let target = if initial_is_leader {
+            self.local.clone()
+        } else {
+            self.remote.clone()
+        };
+        Box::pin(async move {
+            let consistency = request.consistency();
+            let result = target.get_resource(request).await?;
+            if consistency == ResourceQueryConsistency::LeaderFresh
+                && leadership_rx.has_changed().unwrap_or(true)
+            {
+                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                    "leadership changed during leader-fresh resource query",
+                ));
             }
-            Err(err) => Err(err),
-        }
+            Ok(result)
+        })
     }
 
-    async fn delete_pod_cleanup_intent(
+    fn list_resources(
         &self,
-        node_name: &str,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        reason: &str,
-    ) -> Result<()> {
-        match self
-            .remote
-            .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(err) if self.is_leader() => {
-                let _ = err;
-                self.local
-                    .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
-                    .await
+        request: ResourceListRequest,
+    ) -> ResourceQueryFuture<'_, ResourceListResult> {
+        let mut leadership_rx = self.is_leader_rx.clone();
+        let initial_is_leader = *leadership_rx.borrow_and_update();
+        let target = if initial_is_leader {
+            self.local.clone()
+        } else {
+            self.remote.clone()
+        };
+        Box::pin(async move {
+            let consistency = request.consistency();
+            let result = target.list_resources(request).await?;
+            if consistency == ResourceQueryConsistency::LeaderFresh
+                && leadership_rx.has_changed().unwrap_or(true)
+            {
+                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                    "leadership changed during leader-fresh resource query",
+                ));
             }
-            Err(err) => Err(err),
-        }
+            Ok(result)
+        })
     }
+}
 
-    async fn get_cluster_membership(
-        &self,
-    ) -> Result<crate::control_plane::client::membership::ClusterMembership> {
-        // Membership is the carve-out: followers need local raft topology to
-        // locate the elected leader before they can forward ordinary API calls.
-        self.local.get_cluster_membership().await
+impl LeaderWatch for LeaderProxyApiClient {
+    fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
+        let mut leadership_rx = self.is_leader_rx.clone();
+        let initial_is_leader = *leadership_rx.borrow_and_update();
+        let target = if initial_is_leader {
+            self.local.clone()
+        } else {
+            self.remote.clone()
+        };
+        Box::pin(async move {
+            let stream = LeaderWatch::watch_resources(target.as_ref(), req).await?;
+            if leadership_rx.has_changed().unwrap_or(true) {
+                return Err(LeaderWatchError::unavailable(
+                    "leadership changed while establishing watch",
+                ));
+            }
+            Ok(terminate_watch_on_leadership_change(stream, leadership_rx))
+        })
     }
+}
 
-    // --- Writes dispatch on is_leader_rx ---
+impl LeaderCacheReadiness for LeaderProxyApiClient {
+    fn wait_cache_ready(&self, scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+        LeaderCacheReadiness::wait_cache_ready(self.leader_target().as_ref(), scope)
+    }
+}
 
-    async fn projected_service_account_token(
+impl LeaderProjectedServiceAccountToken for LeaderProxyApiClient {
+    fn issue_projected_service_account_token(
         &self,
         request: ProjectedServiceAccountTokenRequest,
-    ) -> Result<ProjectedServiceAccountToken> {
+    ) -> ProjectedServiceAccountTokenFuture<'_> {
         self.leader_target()
-            .projected_service_account_token(request)
-            .await
+            .issue_projected_service_account_token(request)
+    }
+}
+
+impl LeaderPodCleanupIntents for LeaderProxyApiClient {
+    fn list_pod_cleanup_intents(
+        &self,
+        request: PodCleanupIntentListRequest,
+    ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
+        Box::pin(async move {
+            let local_is_leader = self.is_leader();
+            match self.remote.list_pod_cleanup_intents(request.clone()).await {
+                Ok(intents) => Ok(intents),
+                Err(_) if local_is_leader => self.local.list_pod_cleanup_intents(request).await,
+                Err(error) => Err(error),
+            }
+        })
     }
 
-    async fn allocate_node_subnet(
+    fn acknowledge_pod_cleanup_intent(
         &self,
-        node_name: &str,
-        cluster_cidr: &str,
-        node_ip: &str,
-    ) -> Result<NodeSubnet> {
-        self.leader_target()
-            .allocate_node_subnet(node_name, cluster_cidr, node_ip)
-            .await
+        request: PodCleanupIntentAckRequest,
+    ) -> PodCleanupIntentFuture<'_, ()> {
+        Box::pin(async move {
+            match self
+                .remote
+                .acknowledge_pod_cleanup_intent(request.clone())
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(_) if self.is_leader() => {
+                    self.local.acknowledge_pod_cleanup_intent(request).await
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+}
+
+impl LeaderNodeSubnetAllocation for LeaderProxyApiClient {
+    fn allocate_node_subnet(
+        &self,
+        request: NodeSubnetAllocationRequest,
+    ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
+        self.leader_target().allocate_node_subnet(request)
+    }
+}
+
+impl LeaderNetworkTopologyQuery for LeaderProxyApiClient {
+    fn get_node_subnet(
+        &self,
+        request: NodeSubnetQuery,
+    ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
+        self.leader_target().get_node_subnet(request)
     }
 
-    async fn apply_outbox(
+    fn list_peer_subnets(
         &self,
-        idempotency_key: &str,
-        operation: OutboxOperation,
-        payload: Bytes,
-        client_id: &str,
-        stream_id: i64,
-        stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        self.leader_target()
-            .apply_outbox(
-                idempotency_key,
-                operation,
-                payload,
-                client_id,
-                stream_id,
-                stream_seq,
-            )
-            .await
+        request: PeerSubnetsQuery,
+    ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
+        self.leader_target().list_peer_subnets(request)
+    }
+
+    fn get_node_dataplane(
+        &self,
+        request: NodeDataplaneQuery,
+    ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
+        self.leader_target().get_node_dataplane(request)
+    }
+}
+
+#[async_trait]
+impl LeaderApiClient for LeaderProxyApiClient {}
+
+impl LeaderOutboxDelivery for LeaderProxyApiClient {
+    fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+        let target = self
+            .focused_targets
+            .as_ref()
+            .and_then(|targets| targets.outbox_deliveries.target(self.is_leader()));
+        match target {
+            Some(target) => target.deliver_outbox(request),
+            None => Box::pin(async {
+                Err(OutboxDeliveryError::unavailable(
+                    "leader proxy durable-delivery target is not wired",
+                ))
+            }),
+        }
     }
 }
 
@@ -325,94 +488,156 @@ impl StubRemoteForwarder {
     }
 }
 
-#[async_trait]
-impl LeaderApiClient for StubRemoteForwarder {
-    async fn get_resource(&self, _key: ResourceKey) -> Result<Option<Resource>> {
-        Ok(None)
-    }
-    async fn list_resources(&self, _req: ListRequest) -> Result<ListResponse> {
-        Ok(crate::datastore::ResourceList {
-            items: vec![],
-            resource_version: 0,
-            watch_replay_position: None,
-            continue_token: None,
-            remaining_item_count: None,
+impl LeaderResourceQuery for StubRemoteForwarder {
+    fn get_resource(
+        &self,
+        request: ResourceGetRequest,
+    ) -> ResourceQueryFuture<'_, Option<Resource>> {
+        let message = self.unavailable();
+        Box::pin(async move {
+            if request.consistency() == ResourceQueryConsistency::LeaderFresh {
+                Err(crate::control_plane::client::ResourceQueryError::retryable(
+                    message,
+                ))
+            } else {
+                Ok(None)
+            }
         })
     }
-    async fn watch_resources(&self, _req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-        anyhow::bail!("{}", self.unavailable())
-    }
-    async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
-        Ok(())
-    }
-    async fn get_pod(&self, _ns: &str, _name: &str) -> Result<Option<Pod>> {
-        Ok(None)
-    }
-    async fn get_pod_for_uid(&self, _ns: &str, _name: &str, _uid: &str) -> Result<Option<Pod>> {
-        Ok(None)
-    }
-    async fn watch_pods_on_node(&self, _n: &str) -> Result<WatchStream<Pod>> {
-        anyhow::bail!("{}", self.unavailable())
-    }
-    async fn list_pods_on_node(&self, _n: &str) -> Result<Vec<Pod>> {
-        Ok(vec![])
-    }
-    async fn get_configmap(&self, _ns: &str, _name: &str) -> Result<Option<ConfigMap>> {
-        Ok(None)
-    }
-    async fn get_secret(&self, _ns: &str, _name: &str) -> Result<Option<Secret>> {
-        Ok(None)
-    }
-    async fn get_node(&self, _name: &str) -> Result<Node> {
-        anyhow::bail!("{}", self.unavailable())
-    }
-    async fn watch_node(&self, _name: &str) -> Result<WatchStream<Node>> {
-        anyhow::bail!("{}", self.unavailable())
-    }
-    async fn allocate_node_subnet(&self, _n: &str, _c: &str, _ip: &str) -> Result<NodeSubnet> {
-        anyhow::bail!("{}", self.unavailable())
-    }
-    async fn get_node_subnet(&self, _n: &str) -> Result<Option<NodeSubnet>> {
-        Ok(None)
-    }
-    async fn list_peer_subnets(&self, _n: &str) -> Result<Vec<NodeSubnet>> {
-        Ok(vec![])
-    }
-    async fn get_node_dataplane(&self, _n: &str) -> Result<Option<DataplanePeerMetadata>> {
-        Ok(None)
-    }
-    async fn list_pod_cleanup_intents_for_node(
+
+    fn list_resources(
         &self,
-        node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
-        let _ = node_name;
-        anyhow::bail!("{}", self.unavailable())
+        request: ResourceListRequest,
+    ) -> ResourceQueryFuture<'_, ResourceListResult> {
+        let message = self.unavailable();
+        Box::pin(async move {
+            if request.consistency() == ResourceQueryConsistency::LeaderFresh {
+                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                    message,
+                ));
+            }
+            ResourceListResult::try_new(
+                Vec::new(),
+                0,
+                None,
+                request.continue_token().map(str::to_owned),
+                None,
+            )
+        })
     }
-    async fn delete_pod_cleanup_intent(
+}
+
+impl LeaderResourceCommand for StubRemoteForwarder {
+    fn submit_resource_command(
         &self,
-        _node_name: &str,
-        _namespace: &str,
-        _pod_name: &str,
-        _pod_uid: &str,
-        _reason: &str,
-    ) -> Result<()> {
-        anyhow::bail!("{}", self.unavailable())
+        _request: ResourceCommandRequest,
+    ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(ResourceCommandError::retryable(message)) })
     }
-    async fn get_cluster_membership(
+}
+
+impl LeaderNodeLeaseRenewal for StubRemoteForwarder {
+    fn renew_node_lease(
         &self,
-    ) -> Result<crate::control_plane::client::membership::ClusterMembership> {
-        anyhow::bail!("{}", self.unavailable())
+        _request: NodeLeaseRenewalRequest,
+    ) -> NodeLeaseRenewalFuture<'_, NodeLeaseRenewalResult> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(NodeLeaseRenewalError::unavailable(message)) })
     }
-    async fn apply_outbox(
+}
+
+impl LeaderWatch for StubRemoteForwarder {
+    fn watch_resources(&self, _req: WatchRequest) -> LeaderWatchFuture<'_> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(LeaderWatchError::unavailable(message)) })
+    }
+}
+
+impl LeaderCacheReadiness for StubRemoteForwarder {
+    fn wait_cache_ready(&self, _scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(CacheReadinessError::unavailable(message)) })
+    }
+}
+
+impl LeaderProjectedServiceAccountToken for StubRemoteForwarder {
+    fn issue_projected_service_account_token(
         &self,
-        _k: &str,
-        _o: OutboxOperation,
-        _p: Bytes,
-        _client_id: &str,
-        _stream_id: i64,
-        _stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        Err(OutboxApplyError::Retryable(self.unavailable()))
+        _request: ProjectedServiceAccountTokenRequest,
+    ) -> ProjectedServiceAccountTokenFuture<'_> {
+        let message = self.unavailable();
+        Box::pin(async move {
+            Err(
+                crate::control_plane::client::ProjectedServiceAccountTokenError::unavailable(
+                    message,
+                ),
+            )
+        })
+    }
+}
+
+impl LeaderPodCleanupIntents for StubRemoteForwarder {
+    fn list_pod_cleanup_intents(
+        &self,
+        _request: PodCleanupIntentListRequest,
+    ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(PodCleanupIntentError::unavailable(message)) })
+    }
+
+    fn acknowledge_pod_cleanup_intent(
+        &self,
+        _request: PodCleanupIntentAckRequest,
+    ) -> PodCleanupIntentFuture<'_, ()> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(PodCleanupIntentError::unavailable(message)) })
+    }
+}
+
+impl LeaderNodeSubnetAllocation for StubRemoteForwarder {
+    fn allocate_node_subnet(
+        &self,
+        _request: NodeSubnetAllocationRequest,
+    ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(NodeSubnetAllocationError::retryable(message)) })
+    }
+}
+
+impl LeaderNetworkTopologyQuery for StubRemoteForwarder {
+    fn get_node_subnet(
+        &self,
+        _request: NodeSubnetQuery,
+    ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(NetworkTopologyError::retryable(message)) })
+    }
+
+    fn list_peer_subnets(
+        &self,
+        _request: PeerSubnetsQuery,
+    ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(NetworkTopologyError::retryable(message)) })
+    }
+
+    fn get_node_dataplane(
+        &self,
+        _request: NodeDataplaneQuery,
+    ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(NetworkTopologyError::retryable(message)) })
+    }
+}
+
+#[async_trait]
+impl LeaderApiClient for StubRemoteForwarder {}
+
+impl LeaderOutboxDelivery for StubRemoteForwarder {
+    fn deliver_outbox(&self, _request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+        let message = self.unavailable();
+        Box::pin(async move { Err(OutboxDeliveryError::unavailable(message)) })
     }
 }
 
@@ -426,7 +651,14 @@ mod tests {
     //! logic is pure and unit-testable.
 
     use super::*;
-    use crate::control_plane::client::membership::ClusterMembership;
+    use crate::control_plane::client::node_get_request;
+    use crate::kubelet::outbox::payload::OutboxOperation;
+    use klights_cluster_core::StorageCommand;
+    use klights_leader_api::{
+        LeaderResourceCommand, ResourceCommandError, ResourceCommandFuture, ResourceCommandRequest,
+        ResourceCommandResult,
+    };
+    use klights_types::ResourceKey;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -441,15 +673,16 @@ mod tests {
         watch_resources: AtomicUsize,
         get_pod: AtomicUsize,
         get_node: AtomicUsize,
-        watch_pods_on_node: AtomicUsize,
-        watch_node: AtomicUsize,
-        get_cluster_membership: AtomicUsize,
         projected_service_account_token: AtomicUsize,
         allocate_node_subnet: AtomicUsize,
         list_pod_cleanup_intents: AtomicUsize,
         delete_pod_cleanup_intents: AtomicUsize,
         cleanup_intents: Mutex<Vec<PodCleanupIntent>>,
         apply_outbox: AtomicUsize,
+        submit_resource_command: AtomicUsize,
+        renew_node_lease: AtomicUsize,
+        demote_on_get: Mutex<Option<(watch::Sender<bool>, bool)>>,
+        demote_on_watch: Mutex<Option<(watch::Sender<bool>, bool)>>,
     }
 
     impl RecordingApiClient {
@@ -463,158 +696,184 @@ mod tests {
         fn with_cleanup_intent(self: &Arc<Self>, intent: PodCleanupIntent) {
             self.cleanup_intents.lock().unwrap().push(intent);
         }
+
+        fn demote_during_get(&self, sender: watch::Sender<bool>) {
+            *self.demote_on_get.lock().unwrap() = Some((sender, false));
+        }
+
+        fn demote_during_watch(&self, sender: watch::Sender<bool>) {
+            *self.demote_on_watch.lock().unwrap() = Some((sender, false));
+        }
+
+        fn flap_during_get(&self, sender: watch::Sender<bool>) {
+            *self.demote_on_get.lock().unwrap() = Some((sender, true));
+        }
+
+        fn flap_during_watch(&self, sender: watch::Sender<bool>) {
+            *self.demote_on_watch.lock().unwrap() = Some((sender, true));
+        }
+    }
+
+    impl LeaderResourceQuery for RecordingApiClient {
+        fn get_resource(
+            &self,
+            request: ResourceGetRequest,
+        ) -> ResourceQueryFuture<'_, Option<Resource>> {
+            match request.key().kind.as_str() {
+                "Pod" => {
+                    self.get_pod.fetch_add(1, Ordering::Relaxed);
+                }
+                "Node" => {
+                    self.get_node.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {
+                    self.get_resource.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if let Some((sender, restore)) = self.demote_on_get.lock().unwrap().take() {
+                sender.send(false).expect("demote during get");
+                if restore {
+                    sender.send(true).expect("restore after transient demotion");
+                }
+            }
+            Box::pin(async { Ok(None) })
+        }
+
+        fn list_resources(
+            &self,
+            _request: ResourceListRequest,
+        ) -> ResourceQueryFuture<'_, ResourceListResult> {
+            self.list_resources.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { ResourceListResult::try_new(Vec::new(), 0, None, None, None) })
+        }
+    }
+
+    impl LeaderResourceCommand for RecordingApiClient {
+        fn submit_resource_command(
+            &self,
+            _request: ResourceCommandRequest,
+        ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
+            self.submit_resource_command.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Ok(ResourceCommandResult::Ack {
+                    resource_version: 1,
+                })
+            })
+        }
+    }
+
+    impl LeaderNodeLeaseRenewal for RecordingApiClient {
+        fn renew_node_lease(
+            &self,
+            _request: NodeLeaseRenewalRequest,
+        ) -> NodeLeaseRenewalFuture<'_, NodeLeaseRenewalResult> {
+            self.renew_node_lease.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(NodeLeaseRenewalResult::Renewed) })
+        }
+    }
+
+    impl LeaderWatch for RecordingApiClient {
+        fn watch_resources(&self, _req: WatchRequest) -> LeaderWatchFuture<'_> {
+            self.watch_resources.fetch_add(1, Ordering::Relaxed);
+            if let Some((sender, restore)) = self.demote_on_watch.lock().unwrap().take() {
+                sender.send(false).expect("demote during watch open");
+                if restore {
+                    sender.send(true).expect("restore after transient demotion");
+                }
+            }
+            Box::pin(async { Ok(Box::pin(futures::stream::pending()) as WatchStream) })
+        }
+    }
+
+    impl LeaderCacheReadiness for RecordingApiClient {
+        fn wait_cache_ready(&self, _scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl LeaderProjectedServiceAccountToken for RecordingApiClient {
+        fn issue_projected_service_account_token(
+            &self,
+            _request: ProjectedServiceAccountTokenRequest,
+        ) -> ProjectedServiceAccountTokenFuture<'_> {
+            self.projected_service_account_token
+                .fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                crate::control_plane::client::ProjectedServiceAccountToken::try_new(format!(
+                    "{}-token",
+                    self.name
+                ))
+            })
+        }
+    }
+
+    impl LeaderPodCleanupIntents for RecordingApiClient {
+        fn list_pod_cleanup_intents(
+            &self,
+            _request: PodCleanupIntentListRequest,
+        ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
+            self.list_pod_cleanup_intents
+                .fetch_add(1, Ordering::Relaxed);
+            let intents = self.cleanup_intents.lock().unwrap().clone();
+            Box::pin(async move { Ok(intents) })
+        }
+
+        fn acknowledge_pod_cleanup_intent(
+            &self,
+            _request: PodCleanupIntentAckRequest,
+        ) -> PodCleanupIntentFuture<'_, ()> {
+            self.delete_pod_cleanup_intents
+                .fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl LeaderNodeSubnetAllocation for RecordingApiClient {
+        fn allocate_node_subnet(
+            &self,
+            _request: NodeSubnetAllocationRequest,
+        ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
+            self.allocate_node_subnet.fetch_add(1, Ordering::Relaxed);
+            let message = format!("recording client {} allocate_node_subnet", self.name);
+            Box::pin(async move { Err(NodeSubnetAllocationError::retryable(message)) })
+        }
+    }
+
+    impl LeaderNetworkTopologyQuery for RecordingApiClient {
+        fn get_node_subnet(
+            &self,
+            request: NodeSubnetQuery,
+        ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
+            let node_name = request.into_node_name();
+            Box::pin(async move { NodeSubnetResult::try_from_wire(&node_name, false, None) })
+        }
+
+        fn list_peer_subnets(
+            &self,
+            request: PeerSubnetsQuery,
+        ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
+            let node_name = request.into_node_name();
+            Box::pin(async move { PeerSubnetsResult::try_new(&node_name, Vec::new()) })
+        }
+
+        fn get_node_dataplane(
+            &self,
+            request: NodeDataplaneQuery,
+        ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
+            let node_name = request.into_node_name();
+            Box::pin(async move { NodeDataplaneResult::try_from_wire(&node_name, false, None) })
+        }
     }
 
     #[async_trait]
-    impl LeaderApiClient for RecordingApiClient {
-        async fn get_resource(&self, _key: ResourceKey) -> Result<Option<Resource>> {
-            self.get_resource.fetch_add(1, Ordering::Relaxed);
-            Ok(None)
-        }
+    impl LeaderApiClient for RecordingApiClient {}
 
-        async fn list_resources(&self, _req: ListRequest) -> Result<ListResponse> {
-            self.list_resources.fetch_add(1, Ordering::Relaxed);
-            Ok(crate::datastore::ResourceList {
-                items: vec![],
-                resource_version: 0,
-                watch_replay_position: None,
-                continue_token: None,
-                remaining_item_count: None,
-            })
-        }
-
-        async fn watch_resources(&self, _req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-            self.watch_resources.fetch_add(1, Ordering::Relaxed);
-            Ok(Box::pin(futures::stream::pending()))
-        }
-
-        async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
-            Ok(())
-        }
-
-        async fn get_pod(&self, _ns: &str, _name: &str) -> Result<Option<Pod>> {
-            self.get_pod.fetch_add(1, Ordering::Relaxed);
-            Ok(None)
-        }
-
-        async fn get_pod_for_uid(&self, _ns: &str, _name: &str, _uid: &str) -> Result<Option<Pod>> {
-            Ok(None)
-        }
-
-        async fn watch_pods_on_node(&self, _node: &str) -> Result<WatchStream<Pod>> {
-            self.watch_pods_on_node.fetch_add(1, Ordering::Relaxed);
-            Ok(Box::pin(futures::stream::pending()))
-        }
-
-        async fn list_pods_on_node(&self, _node: &str) -> Result<Vec<Pod>> {
-            Ok(vec![])
-        }
-
-        async fn get_configmap(&self, _ns: &str, _name: &str) -> Result<Option<ConfigMap>> {
-            Ok(None)
-        }
-
-        async fn get_secret(&self, _ns: &str, _name: &str) -> Result<Option<Secret>> {
-            Ok(None)
-        }
-
-        async fn get_node(&self, _name: &str) -> Result<Node> {
-            self.get_node.fetch_add(1, Ordering::Relaxed);
-            Ok(Resource {
-                id: 0,
-                api_version: "v1".into(),
-                kind: "Node".into(),
-                namespace: None,
-                name: "stub".into(),
-                uid: "stub".into(),
-                resource_version: 0,
-                data: Arc::new(serde_json::json!({})),
-            })
-        }
-
-        async fn watch_node(&self, _name: &str) -> Result<WatchStream<Node>> {
-            self.watch_node.fetch_add(1, Ordering::Relaxed);
-            Ok(Box::pin(futures::stream::pending()))
-        }
-
-        async fn projected_service_account_token(
-            &self,
-            _request: ProjectedServiceAccountTokenRequest,
-        ) -> Result<ProjectedServiceAccountToken> {
-            self.projected_service_account_token
-                .fetch_add(1, Ordering::Relaxed);
-            Ok(ProjectedServiceAccountToken {
-                token: format!("{}-token", self.name),
-            })
-        }
-
-        async fn allocate_node_subnet(
-            &self,
-            _node_name: &str,
-            _cluster_cidr: &str,
-            _node_ip: &str,
-        ) -> Result<NodeSubnet> {
-            self.allocate_node_subnet.fetch_add(1, Ordering::Relaxed);
-            // Dispatch tests assert on the counter; return a synthetic
-            // error so we don't need to construct a real NodeSubnet.
-            anyhow::bail!("recording client {} allocate_node_subnet", self.name)
-        }
-
-        async fn get_node_subnet(&self, _node: &str) -> Result<Option<NodeSubnet>> {
-            Ok(None)
-        }
-
-        async fn list_peer_subnets(&self, _my_node: &str) -> Result<Vec<NodeSubnet>> {
-            Ok(vec![])
-        }
-
-        async fn get_node_dataplane(&self, _node: &str) -> Result<Option<DataplanePeerMetadata>> {
-            Ok(None)
-        }
-
-        async fn list_pod_cleanup_intents_for_node(
-            &self,
-            _node_name: &str,
-        ) -> Result<Vec<PodCleanupIntent>> {
-            self.list_pod_cleanup_intents
-                .fetch_add(1, Ordering::Relaxed);
-            Ok(self.cleanup_intents.lock().unwrap().clone())
-        }
-
-        async fn delete_pod_cleanup_intent(
-            &self,
-            _node_name: &str,
-            _namespace: &str,
-            _pod_name: &str,
-            _pod_uid: &str,
-            _reason: &str,
-        ) -> Result<()> {
-            self.delete_pod_cleanup_intents
-                .fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        }
-
-        async fn get_cluster_membership(&self) -> Result<ClusterMembership> {
-            self.get_cluster_membership.fetch_add(1, Ordering::Relaxed);
-            Ok(ClusterMembership {
-                cluster_id: format!("{}-cluster", self.name),
-                voters: vec![self.name.to_string()],
-                term: 1,
-                leader_hint: Some(self.name.to_string()),
-            })
-        }
-
-        async fn apply_outbox(
-            &self,
-            _idempotency_key: &str,
-            _operation: OutboxOperation,
-            _payload: Bytes,
-            _client_id: &str,
-            _stream_id: i64,
-            _stream_seq: i64,
-        ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
+    impl LeaderOutboxDelivery for RecordingApiClient {
+        fn deliver_outbox(&self, _request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
             self.apply_outbox.fetch_add(1, Ordering::Relaxed);
-            Ok(OutboxApplyResult::Applied { applied_rv: 0 })
+            Box::pin(async {
+                Ok(klights_leader_api::OutboxDeliveryResult::Applied { applied_rv: 1 })
+            })
         }
     }
 
@@ -624,8 +883,80 @@ mod tests {
         initial_leader: bool,
     ) -> (LeaderProxyApiClient, watch::Sender<bool>) {
         let (tx, rx) = watch::channel(initial_leader);
-        let proxy = LeaderProxyApiClient::new(local, remote, rx);
+        let proxy = LeaderProxyApiClient::new(local.clone(), remote.clone(), rx)
+            .with_resource_command_targets(local.clone(), remote.clone())
+            .with_outbox_delivery_targets(local.clone(), remote.clone())
+            .with_node_lease_renewal_targets(local, remote);
         (proxy, tx)
+    }
+
+    #[tokio::test]
+    async fn node_effect_lease_dispatch_switches_per_call_without_local_follower_mutation() {
+        let local = RecordingApiClient::new("local");
+        let remote = RecordingApiClient::new("remote");
+        let (proxy, tx) = make_proxy(local.clone(), remote.clone(), false);
+        let request = NodeLeaseRenewalRequest::try_new("cp-1", "2026-07-18T12:34:56Z", 30)
+            .expect("valid lease renewal");
+
+        proxy
+            .renew_node_lease(request.clone())
+            .await
+            .expect("follower forwards renewal");
+        assert_eq!(local.renew_node_lease.load(Ordering::Relaxed), 0);
+        assert_eq!(remote.renew_node_lease.load(Ordering::Relaxed), 1);
+
+        tx.send(true).expect("promote proxy");
+        proxy
+            .renew_node_lease(request)
+            .await
+            .expect("leader renews locally");
+        assert_eq!(local.renew_node_lease.load(Ordering::Relaxed), 1);
+        assert_eq!(remote.renew_node_lease.load(Ordering::Relaxed), 1);
+    }
+
+    fn config_map_create_request() -> ResourceCommandRequest {
+        ResourceCommandRequest::try_new(StorageCommand::CreateResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            data: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "settings"}
+            }),
+        })
+        .expect("valid command")
+    }
+
+    #[tokio::test]
+    async fn resource_command_dispatch_tracks_leadership_without_local_fallback() {
+        let local = RecordingApiClient::new("local");
+        let remote = RecordingApiClient::new("remote");
+        let (proxy, tx) = make_proxy(local.clone(), remote.clone(), true);
+
+        LeaderResourceCommand::submit_resource_command(&proxy, config_map_create_request())
+            .await
+            .expect("local command");
+        assert_eq!(local.submit_resource_command.load(Ordering::Relaxed), 1);
+        assert_eq!(remote.submit_resource_command.load(Ordering::Relaxed), 0);
+
+        tx.send(false).expect("demote");
+        LeaderResourceCommand::submit_resource_command(&proxy, config_map_create_request())
+            .await
+            .expect("remote command");
+        assert_eq!(local.submit_resource_command.load(Ordering::Relaxed), 1);
+        assert_eq!(remote.submit_resource_command.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn stub_resource_command_is_retryable_and_never_falls_back() {
+        let stub = StubRemoteForwarder::new("cp2".to_string());
+        let error =
+            LeaderResourceCommand::submit_resource_command(&stub, config_map_create_request())
+                .await
+                .expect_err("stub must fail closed");
+        assert!(matches!(error, ResourceCommandError::Retryable { .. }));
     }
 
     /// Self-is-leader: every write lands on the local client.
@@ -636,7 +967,7 @@ mod tests {
         let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), true);
 
         proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "k-1",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -647,7 +978,10 @@ mod tests {
             .await
             .expect("apply_outbox");
         proxy
-            .allocate_node_subnet("n", "10.0.0.0/16", "10.0.0.1")
+            .allocate_node_subnet(
+                NodeSubnetAllocationRequest::try_new("n", "10.0.0.0/16", "10.0.0.1")
+                    .expect("valid request"),
+            )
             .await
             .expect_err("recording client returns Err");
         assert_eq!(local.apply_outbox.load(Ordering::Relaxed), 1);
@@ -665,7 +999,7 @@ mod tests {
         let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), false);
 
         proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "k-2",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -676,7 +1010,10 @@ mod tests {
             .await
             .expect("apply_outbox");
         proxy
-            .allocate_node_subnet("n", "10.0.0.0/16", "10.0.0.1")
+            .allocate_node_subnet(
+                NodeSubnetAllocationRequest::try_new("n", "10.0.0.0/16", "10.0.0.1")
+                    .expect("valid request"),
+            )
             .await
             .expect_err("recording client returns Err");
 
@@ -688,25 +1025,26 @@ mod tests {
 
     #[tokio::test]
     async fn leader_proxy_dispatches_projected_serviceaccount_token_as_write() {
-        let request = ProjectedServiceAccountTokenRequest {
-            namespace: "kube-system".to_string(),
-            service_account_name: "coredns".to_string(),
-            audiences: vec!["https://kubernetes.default.svc.cluster.local".to_string()],
-            expiration_seconds: 3600,
-            bound_pod_name: Some("coredns".to_string()),
-            bound_pod_uid: Some("pod-uid".to_string()),
-            bound_node_name: Some("mn-controlplane1".to_string()),
-            bound_node_uid: Some("node-uid".to_string()),
-        };
+        let request = ProjectedServiceAccountTokenRequest::try_new(
+            "kube-system",
+            "coredns",
+            vec!["https://kubernetes.default.svc.cluster.local".to_string()],
+            3600,
+            "coredns",
+            "pod-uid",
+            "mn-controlplane1",
+            Some("node-uid".to_string()),
+        )
+        .unwrap();
 
         let local = RecordingApiClient::new("local");
         let remote = RecordingApiClient::new("remote");
         let (leader_proxy, _tx) = make_proxy(local.clone(), remote.clone(), true);
         let leader_token = leader_proxy
-            .projected_service_account_token(request.clone())
+            .issue_projected_service_account_token(request.clone())
             .await
             .expect("leader token");
-        assert_eq!(leader_token.token, "local-token");
+        assert_eq!(leader_token.token(), "local-token");
         assert_eq!(
             local
                 .projected_service_account_token
@@ -724,10 +1062,10 @@ mod tests {
         let remote = RecordingApiClient::new("remote");
         let (follower_proxy, _tx) = make_proxy(local.clone(), remote.clone(), false);
         let follower_token = follower_proxy
-            .projected_service_account_token(request)
+            .issue_projected_service_account_token(request)
             .await
             .expect("follower token");
-        assert_eq!(follower_token.token, "remote-token");
+        assert_eq!(follower_token.token(), "remote-token");
         assert_eq!(
             local
                 .projected_service_account_token
@@ -749,7 +1087,9 @@ mod tests {
         let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), false);
 
         proxy
-            .list_pod_cleanup_intents_for_node("mn-controlplane1")
+            .list_pod_cleanup_intents(
+                PodCleanupIntentListRequest::try_new("mn-controlplane1").unwrap(),
+            )
             .await
             .expect("list cleanup intents");
 
@@ -761,25 +1101,41 @@ mod tests {
     async fn leader_proxy_reads_cleanup_intents_from_remote_when_local_leader_is_stale() {
         let local = RecordingApiClient::new("local");
         let remote = RecordingApiClient::new("remote");
-        remote.with_cleanup_intent(PodCleanupIntent {
-            node_name: "mn-controlplane1".to_string(),
-            namespace: "kube-system".to_string(),
-            pod_name: "coredns-old".to_string(),
-            pod_uid: "uid-old".to_string(),
-            reason: crate::datastore::POD_CLEANUP_REASON_NODE_LOST.to_string(),
-            resource_version: 205,
-            created_at_ms: 0,
-            pod_data: serde_json::json!({}),
-        });
+        remote.with_cleanup_intent(
+            PodCleanupIntent::try_new(
+                "mn-controlplane1",
+                "kube-system",
+                "coredns-old",
+                "uid-old",
+                crate::datastore::POD_CLEANUP_REASON_NODE_LOST,
+                205,
+                1_700_000_000_000,
+                Resource::try_from_data(Arc::new(serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "kube-system",
+                        "name": "coredns-old",
+                        "uid": "uid-old",
+                        "resourceVersion": "204"
+                    },
+                    "spec": {"nodeName": "mn-controlplane1"}
+                })))
+                .unwrap(),
+            )
+            .unwrap(),
+        );
         let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), true);
 
         let intents = proxy
-            .list_pod_cleanup_intents_for_node("mn-controlplane1")
+            .list_pod_cleanup_intents(
+                PodCleanupIntentListRequest::try_new("mn-controlplane1").unwrap(),
+            )
             .await
             .expect("list cleanup intents");
 
         assert_eq!(intents.len(), 1);
-        assert_eq!(intents[0].pod_uid, "uid-old");
+        assert_eq!(intents[0].pod_uid(), "uid-old");
         assert_eq!(remote.list_pod_cleanup_intents.load(Ordering::Relaxed), 1);
         assert_eq!(local.list_pod_cleanup_intents.load(Ordering::Relaxed), 0);
     }
@@ -791,12 +1147,15 @@ mod tests {
         let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), true);
 
         proxy
-            .delete_pod_cleanup_intent(
-                "mn-controlplane1",
-                "kube-system",
-                "coredns-old",
-                "uid-old",
-                crate::datastore::POD_CLEANUP_REASON_NODE_LOST,
+            .acknowledge_pod_cleanup_intent(
+                PodCleanupIntentAckRequest::try_new(
+                    "mn-controlplane1",
+                    "kube-system",
+                    "coredns-old",
+                    "uid-old",
+                    crate::datastore::POD_CLEANUP_REASON_NODE_LOST,
+                )
+                .unwrap(),
             )
             .await
             .expect("delete cleanup intent");
@@ -840,46 +1199,50 @@ mod tests {
 
     async fn exercise_read_dispatch(proxy: &LeaderProxyApiClient) {
         proxy
-            .get_resource(ResourceKey {
-                api_version: "v1".into(),
-                kind: "Pod".into(),
-                namespace: Some("default".into()),
-                name: "x".into(),
-            })
+            .get_resource(
+                ResourceGetRequest::try_new(
+                    ResourceKey {
+                        api_version: "v1".into(),
+                        kind: "ConfigMap".into(),
+                        namespace: Some("default".into()),
+                        name: "x".into(),
+                    },
+                    ResourceQueryConsistency::Cached,
+                )
+                .expect("valid request"),
+            )
             .await
             .expect("get");
-        proxy.get_pod("default", "x").await.expect("get_pod");
-        proxy.get_node("n").await.expect("get_node");
         proxy
-            .list_resources(ListRequest {
-                api_version: "v1".into(),
-                kind: "Pod".into(),
-                namespace: None,
-                label_selector: None,
-                field_selector: None,
-                limit: None,
-                continue_token: None,
-            })
+            .get_resource(
+                pod_get_request("default", "x", ResourceQueryConsistency::Cached)
+                    .expect("valid Pod request"),
+            )
+            .await
+            .expect("get_pod");
+        proxy
+            .get_resource(
+                node_get_request("n", ResourceQueryConsistency::Cached)
+                    .expect("valid Node request"),
+            )
+            .await
+            .expect("get_node");
+        proxy
+            .list_resources(
+                ResourceListRequest::try_new(
+                    "v1",
+                    "Pod",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    ResourceQueryConsistency::Cached,
+                )
+                .expect("valid list request"),
+            )
             .await
             .expect("list");
-    }
-
-    #[tokio::test]
-    async fn leader_proxy_membership_read_stays_local() {
-        for is_leader in [false, true] {
-            let local = RecordingApiClient::new("local");
-            let remote = RecordingApiClient::new("remote");
-            let (proxy, _tx) = make_proxy(local.clone(), remote.clone(), is_leader);
-
-            let membership = proxy
-                .get_cluster_membership()
-                .await
-                .expect("cluster membership");
-
-            assert_eq!(membership.cluster_id, "local-cluster");
-            assert_eq!(local.get_cluster_membership.load(Ordering::Relaxed), 1);
-            assert_eq!(remote.get_cluster_membership.load(Ordering::Relaxed), 0);
-        }
     }
 
     #[tokio::test]
@@ -892,15 +1255,10 @@ mod tests {
             let remote = RecordingApiClient::new("remote");
             let (proxy, tx) = make_proxy(local.clone(), remote.clone(), initial_leader);
             let mut stream = proxy
-                .watch_resources(WatchRequest {
-                    api_version: "v1".into(),
-                    kind: "Pod".into(),
-                    namespace: None,
-                    label_selector: None,
-                    field_selector: None,
-                    start_resource_version: None,
-                    start_watch_replay_position: None,
-                })
+                .watch_resources(
+                    WatchRequest::try_new("v1", "Pod", None, None, None, None, None)
+                        .expect("valid watch"),
+                )
                 .await
                 .expect("watch");
 
@@ -924,6 +1282,61 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn leader_proxy_rejects_samples_and_watches_when_demoted_during_open() {
+        let local = RecordingApiClient::new("local");
+        let remote = RecordingApiClient::new("remote");
+        let (proxy, tx) = make_proxy(local.clone(), remote, true);
+        local.demote_during_get(tx.clone());
+        assert!(matches!(
+            proxy
+                .get_resource(
+                    pod_get_request("default", "web", ResourceQueryConsistency::LeaderFresh)
+                        .unwrap(),
+                )
+                .await,
+            Err(crate::control_plane::client::ResourceQueryError::Retryable { .. })
+        ));
+
+        tx.send(true).expect("promote for watch race");
+        local.demote_during_watch(tx);
+        assert!(matches!(
+            proxy
+                .watch_resources(
+                    WatchRequest::try_new("v1", "Pod", None, None, None, None, None).unwrap(),
+                )
+                .await,
+            Err(LeaderWatchError::Unavailable { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn leader_proxy_rejects_transient_leadership_flaps_during_fresh_open() {
+        let local = RecordingApiClient::new("local");
+        let remote = RecordingApiClient::new("remote");
+        let (proxy, tx) = make_proxy(local.clone(), remote, true);
+        local.flap_during_get(tx.clone());
+        assert!(matches!(
+            proxy
+                .get_resource(
+                    pod_get_request("default", "web", ResourceQueryConsistency::LeaderFresh)
+                        .unwrap(),
+                )
+                .await,
+            Err(crate::control_plane::client::ResourceQueryError::Retryable { .. })
+        ));
+
+        local.flap_during_watch(tx);
+        assert!(matches!(
+            proxy
+                .watch_resources(
+                    WatchRequest::try_new("v1", "Pod", None, None, None, None, None).unwrap(),
+                )
+                .await,
+            Err(LeaderWatchError::Unavailable { .. })
+        ));
+    }
+
     /// Leader-change is a state flip on the same instance: same
     /// proxy, different watch value, next write dispatches to the
     /// new target. No reconstruction, no rewiring.
@@ -935,7 +1348,7 @@ mod tests {
 
         // Initially leader: write goes local.
         proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "pre",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -951,7 +1364,7 @@ mod tests {
         // Lose leadership: next write goes remote.
         tx.send(false).expect("send loss");
         proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "lost",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -967,7 +1380,7 @@ mod tests {
         // Regain leadership: next write goes local again.
         tx.send(true).expect("send regain");
         proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "regain",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -996,118 +1409,125 @@ mod tests {
         #[derive(Default)]
         struct NoLeaderRemote;
 
-        #[async_trait]
-        impl LeaderApiClient for NoLeaderRemote {
-            async fn get_resource(&self, _key: ResourceKey) -> Result<Option<Resource>> {
-                Ok(None)
+        impl LeaderResourceQuery for NoLeaderRemote {
+            fn get_resource(
+                &self,
+                _request: ResourceGetRequest,
+            ) -> ResourceQueryFuture<'_, Option<Resource>> {
+                Box::pin(async { Ok(None) })
             }
-            async fn list_resources(&self, _req: ListRequest) -> Result<ListResponse> {
-                Ok(crate::datastore::ResourceList {
-                    items: vec![],
-                    resource_version: 0,
-                    watch_replay_position: None,
-                    continue_token: None,
-                    remaining_item_count: None,
+
+            fn list_resources(
+                &self,
+                _request: ResourceListRequest,
+            ) -> ResourceQueryFuture<'_, ResourceListResult> {
+                Box::pin(async { ResourceListResult::try_new(Vec::new(), 0, None, None, None) })
+            }
+        }
+
+        impl LeaderWatch for NoLeaderRemote {
+            fn watch_resources(&self, _req: WatchRequest) -> LeaderWatchFuture<'_> {
+                Box::pin(async { Err(LeaderWatchError::unavailable("no leader")) })
+            }
+        }
+
+        impl LeaderCacheReadiness for NoLeaderRemote {
+            fn wait_cache_ready(&self, _scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+                Box::pin(async { Err(CacheReadinessError::unavailable("no leader")) })
+            }
+        }
+
+        impl LeaderProjectedServiceAccountToken for NoLeaderRemote {
+            fn issue_projected_service_account_token(
+                &self,
+                _request: ProjectedServiceAccountTokenRequest,
+            ) -> ProjectedServiceAccountTokenFuture<'_> {
+                Box::pin(async {
+                    Err(
+                        crate::control_plane::client::ProjectedServiceAccountTokenError::unavailable(
+                            "no leader",
+                        ),
+                    )
                 })
             }
-            async fn watch_resources(
+        }
+
+        impl LeaderPodCleanupIntents for NoLeaderRemote {
+            fn list_pod_cleanup_intents(
                 &self,
-                _req: WatchRequest,
-            ) -> Result<WatchStream<ResourceEvent>> {
-                anyhow::bail!("no leader: watch unavailable")
+                _request: PodCleanupIntentListRequest,
+            ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
+                Box::pin(async { Err(PodCleanupIntentError::unavailable("no leader")) })
             }
-            async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
-                Ok(())
-            }
-            async fn get_pod(&self, _ns: &str, _name: &str) -> Result<Option<Pod>> {
-                Ok(None)
-            }
-            async fn get_pod_for_uid(
+
+            fn acknowledge_pod_cleanup_intent(
                 &self,
-                _ns: &str,
-                _name: &str,
-                _uid: &str,
-            ) -> Result<Option<Pod>> {
-                Ok(None)
+                _request: PodCleanupIntentAckRequest,
+            ) -> PodCleanupIntentFuture<'_, ()> {
+                Box::pin(async { Err(PodCleanupIntentError::unavailable("no leader")) })
             }
-            async fn watch_pods_on_node(&self, _n: &str) -> Result<WatchStream<Pod>> {
-                anyhow::bail!("no leader")
-            }
-            async fn list_pods_on_node(&self, _n: &str) -> Result<Vec<Pod>> {
-                Ok(vec![])
-            }
-            async fn get_configmap(&self, _ns: &str, _name: &str) -> Result<Option<ConfigMap>> {
-                Ok(None)
-            }
-            async fn get_secret(&self, _ns: &str, _name: &str) -> Result<Option<Secret>> {
-                Ok(None)
-            }
-            async fn get_node(&self, _name: &str) -> Result<Node> {
-                anyhow::bail!("no leader")
-            }
-            async fn watch_node(&self, _name: &str) -> Result<WatchStream<Node>> {
-                anyhow::bail!("no leader")
-            }
-            async fn allocate_node_subnet(
+        }
+
+        impl LeaderNodeSubnetAllocation for NoLeaderRemote {
+            fn allocate_node_subnet(
                 &self,
-                _n: &str,
-                _c: &str,
-                _ip: &str,
-            ) -> Result<NodeSubnet> {
-                anyhow::bail!("no leader currently elected; retry later")
+                _request: NodeSubnetAllocationRequest,
+            ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
+                Box::pin(async {
+                    Err(NodeSubnetAllocationError::retryable(
+                        "no leader currently elected; retry later",
+                    ))
+                })
             }
-            async fn get_node_subnet(&self, _n: &str) -> Result<Option<NodeSubnet>> {
-                Ok(None)
-            }
-            async fn list_peer_subnets(&self, _n: &str) -> Result<Vec<NodeSubnet>> {
-                Ok(vec![])
-            }
-            async fn get_node_dataplane(&self, _n: &str) -> Result<Option<DataplanePeerMetadata>> {
-                Ok(None)
-            }
-            async fn list_pod_cleanup_intents_for_node(
+        }
+
+        impl LeaderNetworkTopologyQuery for NoLeaderRemote {
+            fn get_node_subnet(
                 &self,
-                _node_name: &str,
-            ) -> Result<Vec<PodCleanupIntent>> {
-                Ok(vec![])
+                _request: NodeSubnetQuery,
+            ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
+                Box::pin(async { Err(NetworkTopologyError::NotLeader) })
             }
-            async fn delete_pod_cleanup_intent(
+
+            fn list_peer_subnets(
                 &self,
-                _node_name: &str,
-                _namespace: &str,
-                _pod_name: &str,
-                _pod_uid: &str,
-                _reason: &str,
-            ) -> Result<()> {
-                anyhow::bail!("no leader")
+                _request: PeerSubnetsQuery,
+            ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
+                Box::pin(async { Err(NetworkTopologyError::NotLeader) })
             }
-            async fn get_cluster_membership(&self) -> Result<ClusterMembership> {
-                anyhow::bail!("no leader")
-            }
-            async fn apply_outbox(
+
+            fn get_node_dataplane(
                 &self,
-                _k: &str,
-                _o: OutboxOperation,
-                _p: Bytes,
-                _client_id: &str,
-                _stream_id: i64,
-                _stream_seq: i64,
-            ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-                Err(OutboxApplyError::Retryable(
-                    "no leader currently elected; retry later".to_string(),
-                ))
+                _request: NodeDataplaneQuery,
+            ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
+                Box::pin(async { Err(NetworkTopologyError::NotLeader) })
+            }
+        }
+
+        #[async_trait]
+        impl LeaderApiClient for NoLeaderRemote {}
+
+        impl LeaderOutboxDelivery for NoLeaderRemote {
+            fn deliver_outbox(&self, _request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+                Box::pin(async {
+                    Err(OutboxDeliveryError::unavailable(
+                        "no leader currently elected; retry later",
+                    ))
+                })
             }
         }
 
         let local = RecordingApiClient::new("local");
-        let remote: Arc<dyn LeaderApiClient> = Arc::new(NoLeaderRemote);
+        let remote = Arc::new(NoLeaderRemote);
+        let remote_api: Arc<dyn LeaderApiClient> = remote.clone();
         let (_tx, rx) = watch::channel(false); // follower
-        let proxy = LeaderProxyApiClient::new(local.clone(), remote, rx);
+        let proxy = LeaderProxyApiClient::new(local.clone(), remote_api, rx)
+            .with_outbox_delivery_targets(local.clone(), remote);
 
         // apply_outbox must surface the remote's Retryable, not panic
         // or fall back to local.
         let err = proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "no-leader",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -1118,7 +1538,7 @@ mod tests {
             .await
             .expect_err("must surface no-leader error");
         match err {
-            OutboxApplyError::Retryable(msg) => {
+            OutboxDeliveryError::Retryable(msg) => {
                 assert!(
                     msg.contains("no leader"),
                     "error must identify the no-leader condition, got: {msg}"
@@ -1130,7 +1550,10 @@ mod tests {
         // allocate_node_subnet must also surface a clean error (no
         // panic, no hang, no silent local fallback).
         let err = proxy
-            .allocate_node_subnet("n", "10.0.0.0/16", "10.0.0.1")
+            .allocate_node_subnet(
+                NodeSubnetAllocationRequest::try_new("n", "10.0.0.0/16", "10.0.0.1")
+                    .expect("valid request"),
+            )
             .await
             .expect_err("must surface no-leader error");
         assert!(
@@ -1166,18 +1589,21 @@ mod tests {
     async fn stub_remote_forwarder_refuses_writes_with_retryable() {
         let stub = StubRemoteForwarder::new("cp2".into());
         let err = stub
-            .apply_outbox(
-                "boot",
-                OutboxOperation::PodStatus,
-                Bytes::from_static(b"x"),
-                "client",
-                1,
-                1,
+            .deliver_outbox(
+                OutboxDeliveryRequest::try_new(
+                    "boot",
+                    klights_leader_api::OutboxDeliveryOperation::PodStatus,
+                    Arc::<[u8]>::from(&b"x"[..]),
+                    "client",
+                    1,
+                    1,
+                )
+                .expect("valid delivery request"),
             )
             .await
             .expect_err("stub must refuse");
         match err {
-            OutboxApplyError::Retryable(msg) => {
+            OutboxDeliveryError::Retryable(msg) => {
                 assert!(msg.contains("cp2"), "msg must name this node: {msg}");
                 assert!(
                     msg.contains("not yet wired"),
@@ -1190,12 +1616,10 @@ mod tests {
         // controlplanes use a real RemoteApiClient for follower reads; the
         // stub is only reachable for non-HA seed/worker construction.
         assert!(
-            stub.get_resource(ResourceKey {
-                api_version: "v1".into(),
-                kind: "Pod".into(),
-                namespace: Some("default".into()),
-                name: "x".into(),
-            })
+            stub.get_resource(
+                pod_get_request("default", "x", ResourceQueryConsistency::Cached)
+                    .expect("valid Pod request"),
+            )
             .await
             .expect("read pass")
             .is_none()
@@ -1213,15 +1637,16 @@ mod tests {
         use crate::control_plane::client::local::LocalApiClient;
         let db = crate::datastore::test_support::in_memory().await;
         let (tx, rx) = watch::channel(true); // simulate seed cp1
-        let local_real: Arc<dyn LeaderApiClient> =
-            Arc::new(LocalApiClient::new(Arc::new(db), "cp1".into(), rx.clone()));
-        let stub_remote: Arc<dyn LeaderApiClient> =
-            Arc::new(StubRemoteForwarder::new("cp1".into()));
-        let proxy = LeaderProxyApiClient::new(local_real, stub_remote, rx);
+        let local_real = Arc::new(LocalApiClient::new(Arc::new(db), "cp1".into(), rx.clone()));
+        let stub_remote = Arc::new(StubRemoteForwarder::new("cp1".into()));
+        let local_api: Arc<dyn LeaderApiClient> = local_real.clone();
+        let remote_api: Arc<dyn LeaderApiClient> = stub_remote.clone();
+        let proxy = LeaderProxyApiClient::new(local_api, remote_api, rx)
+            .with_outbox_delivery_targets(local_real, stub_remote);
 
         // As leader: write reaches local, succeeds (no Pod precondition).
         let res = proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "boot-1",
                 OutboxOperation::PodStatus,
                 pod_status_minimal_payload(),
@@ -1235,8 +1660,8 @@ mod tests {
         // is the call REACHED the local arm (would be Retryable from
         // the stub otherwise).
         match res {
-            Err(OutboxApplyError::NotFound(_)) => {} // reached local, terminal
-            Err(OutboxApplyError::Retryable(msg)) if msg.contains("not yet wired") => {
+            Err(OutboxDeliveryError::NotFound(_)) => {} // reached local, terminal
+            Err(OutboxDeliveryError::Retryable(msg)) if msg.contains("not yet wired") => {
                 panic!("write reached stub remote — proxy dispatched WRONG side when leader=true");
             }
             other => {
@@ -1249,7 +1674,7 @@ mod tests {
         // Lose leadership: the same instance now routes to remote.
         tx.send(false).expect("demote");
         let err = proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "boot-2",
                 OutboxOperation::PodStatus,
                 pod_status_minimal_payload(),
@@ -1260,7 +1685,7 @@ mod tests {
             .await
             .expect_err("non-leader write goes to stub remote");
         match err {
-            OutboxApplyError::Retryable(msg) => {
+            OutboxDeliveryError::Retryable(msg) => {
                 assert!(
                     msg.contains("not yet wired"),
                     "must hit the stub remote, got: {msg}"
@@ -1300,18 +1725,21 @@ mod tests {
     /// dispatch happens inline.
     #[test]
     fn leader_proxy_holds_no_background_resources() {
-        // The struct has exactly three fields: two Arcs + one watch
-        // receiver. No supervisor, no spawn handle, no timer.
-        // size_of asserts the layout has not silently grown.
+        // The dispatcher has exactly four thin fields: two public API
+        // trait-object Arcs, one optional Arc to the focused target bundle,
+        // and one watch receiver. Both target pairs live behind that single
+        // heap pointer. There is no supervisor, spawn handle, timer, or
+        // background task state.
         use std::mem::size_of;
-        let three_arc_sized =
-            size_of::<Arc<dyn LeaderApiClient>>() * 2 + size_of::<watch::Receiver<bool>>();
-        assert!(
-            size_of::<LeaderProxyApiClient>() <= three_arc_sized + 32,
+        let thin_dispatcher_fields = size_of::<Arc<dyn LeaderApiClient>>() * 2
+            + size_of::<watch::Receiver<bool>>()
+            + size_of::<Option<Arc<FocusedLeaderTargets>>>();
+        assert_eq!(
+            size_of::<LeaderProxyApiClient>(),
+            thin_dispatcher_fields,
             "LeaderProxyApiClient must stay a thin per-call dispatcher; \
              field growth probably introduced spawn / timer / supervisor state \
-             that violates HR #1 (zero idle CPU). If a new field is justified, \
-             update this bound."
+             that violates HR #1 (zero idle CPU)."
         );
     }
 
@@ -1355,34 +1783,31 @@ mod tests {
         // Leader member: cluster_api proxy whose local arm IS the
         // shared leader backend. is_leader=true.
         let (_tx_l, rx_l) = watch::channel(true);
-        let leader_proxy = LeaderProxyApiClient::new(
-            leader_backend.clone(),
-            RecordingApiClient::new("leader-unused-remote"),
-            rx_l,
-        );
+        let leader_unused_remote = RecordingApiClient::new("leader-unused-remote");
+        let leader_proxy =
+            LeaderProxyApiClient::new(leader_backend.clone(), leader_unused_remote.clone(), rx_l)
+                .with_outbox_delivery_targets(leader_backend.clone(), leader_unused_remote);
 
         // Follower 1: cluster_api proxy whose REMOTE arm is the
         // shared leader backend (modeling the gRPC forward).
         // is_leader=false.
         let (_tx_f1, rx_f1) = watch::channel(false);
-        let follower1_proxy = LeaderProxyApiClient::new(
-            RecordingApiClient::new("f1-local-unused"),
-            leader_backend.clone(),
-            rx_f1,
-        );
+        let follower1_local = RecordingApiClient::new("f1-local-unused");
+        let follower1_proxy =
+            LeaderProxyApiClient::new(follower1_local.clone(), leader_backend.clone(), rx_f1)
+                .with_outbox_delivery_targets(follower1_local, leader_backend.clone());
 
         // Follower 2: same shape as follower 1.
         let (_tx_f2, rx_f2) = watch::channel(false);
-        let follower2_proxy = LeaderProxyApiClient::new(
-            RecordingApiClient::new("f2-local-unused"),
-            leader_backend.clone(),
-            rx_f2,
-        );
+        let follower2_local = RecordingApiClient::new("f2-local-unused");
+        let follower2_proxy =
+            LeaderProxyApiClient::new(follower2_local.clone(), leader_backend.clone(), rx_f2)
+                .with_outbox_delivery_targets(follower2_local, leader_backend.clone());
 
         // Each member issues one write. All three calls must reach
         // the shared leader backend.
         leader_proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "leader-write",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -1393,7 +1818,7 @@ mod tests {
             .await
             .expect("leader write");
         follower1_proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "f1-write",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -1404,7 +1829,7 @@ mod tests {
             .await
             .expect("follower1 write");
         follower2_proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "f2-write",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -1431,8 +1856,8 @@ mod tests {
     async fn promotion_does_not_rewire_cluster_api_or_proposer() {
         let local = RecordingApiClient::new("local");
         let remote = RecordingApiClient::new("remote");
-        let (tx, rx) = watch::channel(false); // start as follower
-        let proxy = Arc::new(LeaderProxyApiClient::new(local.clone(), remote.clone(), rx));
+        let (proxy, tx) = make_proxy(local.clone(), remote.clone(), false);
+        let proxy = Arc::new(proxy);
 
         // Capture the addresses of the underlying Arcs BEFORE
         // promotion to prove no reconstruction happens.
@@ -1442,7 +1867,7 @@ mod tests {
 
         // Follower write → remote.
         proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "pre",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -1460,7 +1885,7 @@ mod tests {
 
         // Same proxy instance now dispatches writes to local.
         proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "post-promote",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -1492,12 +1917,11 @@ mod tests {
     async fn seed_loses_leadership_proxies_writes_to_remote() {
         let local = RecordingApiClient::new("local");
         let remote = RecordingApiClient::new("remote");
-        let (tx, rx) = watch::channel(true); // start as leader
-        let proxy = LeaderProxyApiClient::new(local.clone(), remote.clone(), rx);
+        let (proxy, tx) = make_proxy(local.clone(), remote.clone(), true);
 
         // As leader, writes go to local
         proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "key",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"x"),
@@ -1515,7 +1939,7 @@ mod tests {
 
         // After leadership loss, writes go to remote
         proxy
-            .apply_outbox(
+            .deliver_test_outbox(
                 "key2",
                 OutboxOperation::PodStatus,
                 Bytes::from_static(b"y"),

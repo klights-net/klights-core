@@ -1204,6 +1204,37 @@ pub trait DatastoreBackend: Send + Sync {
             .await
     }
 
+    /// Internal committed-apply signal used to decide whether a newly applied
+    /// outbox entry produced a resource effect. Backends with a canonical
+    /// commit outcome override this so callers do not infer the answer with an
+    /// additional resource lookup.
+    async fn apply_outbox_transactionally_with_watermark_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        let result = self
+            .apply_outbox_transactionally_with_watermark(
+                idempotency_key,
+                operation,
+                payload,
+                authoring_node,
+                watermark,
+            )
+            .await?;
+        let resource_changed = matches!(
+            result,
+            crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
+        );
+        Ok((result, resource_changed))
+    }
+
     /// T1.4: build a materialized `LogApplyCommit` for a regular (non-outbox)
     /// raft write without touching the applied_outbox ledger. The leader's
     /// proposer encodes the returned commit and submits it through
@@ -1237,7 +1268,6 @@ pub trait DatastoreBackend: Send + Sync {
         crate::datastore::sqlite::BuildOutboxOutcome,
         crate::kubelet::outbox::OutboxApplyError,
     >;
-
     async fn build_log_apply_commit_for_outbox_with_watermark(
         &self,
         idempotency_key: &str,
@@ -2113,6 +2143,17 @@ pub trait AppliedOutboxStore: Send + Sync {
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
         crate::kubelet::outbox::OutboxApplyResult,
+        crate::kubelet::outbox::OutboxApplyError,
+    >;
+    async fn apply_outbox_transactionally_with_watermark_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        (crate::kubelet::outbox::OutboxApplyResult, bool),
         crate::kubelet::outbox::OutboxApplyError,
     >;
     async fn build_log_apply_commit_for_command(

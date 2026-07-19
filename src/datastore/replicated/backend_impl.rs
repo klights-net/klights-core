@@ -1352,6 +1352,46 @@ impl DatastoreBackend for ReplicatedDatastore {
             .await
     }
 
+    async fn apply_outbox_transactionally_with_watermark_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        let payload_decoded = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(
+            payload,
+        )
+        .map_err(|err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()))?;
+        let command = payload_decoded.command;
+        if operation == crate::kubelet::outbox::payload::OutboxOperation::LeaseRenew.as_str() {
+            crate::node_lease_tracker::ensure_lease_renew_command(&command, authoring_node)
+                .map_err(|err| {
+                    crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(err.to_string())
+                })?;
+            return Ok((
+                crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 },
+                false,
+            ));
+        }
+        let proposer = self
+            .require_raft_proposer()
+            .map_err(|e| crate::kubelet::outbox::OutboxApplyError::Retryable(e.to_string()))?;
+        proposer
+            .propose_outbox_command_effect(
+                idempotency_key,
+                operation,
+                command,
+                authoring_node,
+                watermark,
+            )
+            .await
+    }
+
     async fn build_log_apply_commit_for_command(
         &self,
         command: StorageCommand,
@@ -2598,6 +2638,28 @@ impl crate::datastore::AppliedOutboxStore for ReplicatedDatastore {
         crate::kubelet::outbox::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+            watermark,
+        )
+        .await
+    }
+
+    async fn apply_outbox_transactionally_with_watermark_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark_effect(
             self,
             idempotency_key,
             operation,

@@ -1,28 +1,42 @@
-use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::StreamExt;
-
+use klights_leader_api::{
+    LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest,
+};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use tokio::sync::watch;
 
 use crate::control_plane::client::{
-    CacheScope, ConfigMap, LeaderApiClient, ListRequest, ListResponse, Node, Pod,
-    ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest, ResourceEvent, Secret,
-    WatchRequest, WatchStream,
+    CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient, LeaderCacheReadiness,
+    LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal, LeaderNodeLifecycleStatus,
+    LeaderNodeSubnetAllocation, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
+    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
+    NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery, NodeDataplaneResult,
+    NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest, NodeLeaseRenewalResult,
+    NodeLifecycleStatusError, NodeLifecycleStatusFuture, NodeLifecycleStatusRequest,
+    NodeLifecycleStatusResult, NodeSubnetAllocationError, NodeSubnetAllocationFuture,
+    NodeSubnetAllocationRequest, NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult,
+    PeerSubnetsQuery, PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest,
+    PodCleanupIntentError, PodCleanupIntentFuture, PodCleanupIntentListRequest,
+    ProjectedServiceAccountTokenError, ProjectedServiceAccountTokenFuture,
+    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
+    ResourceCommandRequest, ResourceCommandResult, ResourceGetRequest, ResourceListRequest,
+    ResourceListResult, ResourceQueryFuture, WatchRequest, focused_dataplane, focused_node_subnet,
+    focused_watch_event, query_error, query_list_result,
 };
 use crate::controller_dispatcher::ControllerDispatcher;
+use crate::datastore::command::StorageCommand;
 use crate::datastore::replicated::WriteRejection;
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{
-    DatastoreBackendWatchStore, DatastoreHandle, NodeSubnet, PodCleanupIntent, Resource,
-    SnapshotAtRv, WatchReplayAnchorStore, WatchTarget,
+    DatastoreBackendWatchStore, DatastoreHandle, PodCleanupIntent as StoredPodCleanupIntent,
+    Resource, SnapshotAtRv, WatchReplayAnchorStore, WatchTarget,
 };
-use crate::kubelet::outbox::payload::OutboxOperation;
-use crate::kubelet::outbox::{OutboxApplyClient, OutboxApplyError, OutboxApplyResult};
-use crate::networking::wireguard::DataplanePeerMetadata;
-use klights_types::ResourceKey;
+use crate::kubelet::outbox::OutboxApplyError;
+use crate::kubelet::pod_repository::store::PodStore;
+
+#[cfg(test)]
+use crate::control_plane::client::{ResourceQueryConsistency, pod_get_request};
 
 /// T6 step 1: builds a `watch::Receiver<bool>` that is permanently true.
 ///
@@ -47,21 +61,30 @@ pub fn always_leader_watch() -> watch::Receiver<bool> {
     rx
 }
 
-pub(crate) async fn read_projected_service_account_token_bound_pod(
-    db: &DatastoreHandle,
-    request: &ProjectedServiceAccountTokenRequest,
-) -> Result<Option<Resource>> {
-    let Some(pod_name) = request.bound_pod_name.as_deref() else {
-        return Ok(None);
-    };
-
-    db.get_resource("v1", "Pod", Some(&request.namespace), pod_name)
-        .await
+pub(crate) fn focused_pod_cleanup_intent(
+    intent: StoredPodCleanupIntent,
+) -> std::result::Result<PodCleanupIntent, PodCleanupIntentError> {
+    let snapshot = Resource::try_from_data(Arc::new(intent.pod_data)).map_err(|error| {
+        PodCleanupIntentError::corrupt_intent(format!(
+            "cleanup intent Pod snapshot has invalid identity: {error}"
+        ))
+    })?;
+    PodCleanupIntent::try_new(
+        intent.node_name,
+        intent.namespace,
+        intent.pod_name,
+        intent.pod_uid,
+        intent.reason,
+        intent.resource_version,
+        intent.created_at_ms,
+        snapshot,
+    )
 }
 
 #[derive(Clone)]
 pub struct LocalApiClient {
     db: DatastoreHandle,
+    pod_store: Arc<PodStore>,
     raft: crate::datastore::raft::state_machine::N1Raft,
     authoring_node: String,
     containerd_namespace: String,
@@ -118,26 +141,16 @@ impl LocalApiClient {
         node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
         is_leader_rx: watch::Receiver<bool>,
     ) -> Self {
+        let pod_store = Arc::new(PodStore::new(db.clone()));
         Self {
             raft: crate::datastore::raft::state_machine::N1Raft::new(db.clone()),
             db,
+            pod_store,
             authoring_node,
             containerd_namespace,
             node_lease_tracker,
             controller_dispatcher: Arc::new(OnceCell::new()),
             is_leader_rx,
-        }
-    }
-
-    /// T6 step 1: returns `Ok(())` when this node is the elected raft
-    /// leader, `Err(WriteRejection::FollowerWrite)` otherwise. Every
-    /// mutation method on the `LeaderApiClient` and `OutboxApplyClient`
-    /// impls calls this before touching the datastore.
-    fn check_leader(&self) -> Result<()> {
-        if *self.is_leader_rx.borrow() {
-            Ok(())
-        } else {
-            Err(anyhow!(WriteRejection::FollowerWrite))
         }
     }
 
@@ -155,6 +168,30 @@ impl LocalApiClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn deliver_test_outbox(
+        &self,
+        idempotency_key: &str,
+        operation: crate::kubelet::outbox::payload::OutboxOperation,
+        payload: bytes::Bytes,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
+    ) -> std::result::Result<
+        klights_leader_api::OutboxDeliveryResult,
+        klights_leader_api::OutboxDeliveryError,
+    > {
+        let request = OutboxDeliveryRequest::try_new(
+            idempotency_key,
+            operation.try_delivery_operation()?,
+            Arc::<[u8]>::from(payload.to_vec()),
+            client_id,
+            stream_id,
+            stream_seq,
+        )?;
+        self.deliver_outbox(request).await
+    }
+
     /// Wire in the leader's `ControllerDispatcher`. Called from the bootstrap
     /// runtime once the dispatcher has been built. Idempotent: a second call
     /// is silently ignored (OnceCell::set returns Err on repeat).
@@ -168,482 +205,798 @@ impl LocalApiClient {
     }
 }
 
-#[async_trait]
-impl LeaderApiClient for LocalApiClient {
-    async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-        self.db
-            .get_resource(
-                &key.api_version,
-                &key.kind,
-                key.namespace.as_deref(),
-                &key.name,
+impl LeaderResourceQuery for LocalApiClient {
+    fn get_resource(
+        &self,
+        request: ResourceGetRequest,
+    ) -> ResourceQueryFuture<'_, Option<Resource>> {
+        Box::pin(async move {
+            let leader_fresh = request.consistency()
+                == crate::control_plane::client::ResourceQueryConsistency::LeaderFresh;
+            let mut leadership_rx = self.is_leader_rx.clone();
+            let sampled_is_leader = *leadership_rx.borrow_and_update();
+            if leader_fresh && !sampled_is_leader {
+                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                    "leader-fresh resource query reached a non-leader local client",
+                ));
+            }
+            let key = request.key();
+            let resource = self
+                .db
+                .get_resource(
+                    &key.api_version,
+                    &key.kind,
+                    key.namespace.as_deref(),
+                    &key.name,
+                )
+                .await
+                .map_err(query_error)?;
+            if leader_fresh && leadership_rx.has_changed().unwrap_or(true) {
+                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                    "leadership changed during local leader-fresh resource query",
+                ));
+            }
+            Ok(resource)
+        })
+    }
+
+    fn list_resources(
+        &self,
+        request: ResourceListRequest,
+    ) -> ResourceQueryFuture<'_, ResourceListResult> {
+        Box::pin(async move {
+            let leader_fresh = request.consistency()
+                == crate::control_plane::client::ResourceQueryConsistency::LeaderFresh;
+            let mut leadership_rx = self.is_leader_rx.clone();
+            let sampled_is_leader = *leadership_rx.borrow_and_update();
+            if leader_fresh && !sampled_is_leader {
+                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                    "leader-fresh resource query reached a non-leader local client",
+                ));
+            }
+            let list = self
+                .db
+                .list_resources(
+                    request.api_version(),
+                    request.kind(),
+                    request.namespace(),
+                    crate::datastore::ResourceListQuery::new(
+                        request.label_selector(),
+                        request.field_selector(),
+                        request.limit(),
+                        request.continue_token(),
+                    ),
+                )
+                .await
+                .map_err(query_error)?;
+            if leader_fresh && leadership_rx.has_changed().unwrap_or(true) {
+                return Err(crate::control_plane::client::ResourceQueryError::retryable(
+                    "leadership changed during local leader-fresh resource query",
+                ));
+            }
+            query_list_result(list)
+        })
+    }
+}
+
+pub(crate) async fn submit_resource_command_to_store(
+    db: &DatastoreHandle,
+    request: ResourceCommandRequest,
+) -> std::result::Result<ResourceCommandResult, ResourceCommandError> {
+    use crate::datastore::ResourcePatchRequest;
+    use crate::datastore::command::StorageCommand;
+
+    let result = match request.into_command() {
+        StorageCommand::CreateResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+        } => ResourceCommandResult::Resource(
+            db.create_resource(&api_version, &kind, namespace.as_deref(), &name, data)
+                .await
+                .map_err(resource_command_store_error)?,
+        ),
+        StorageCommand::UpdateResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            data,
+            expected_rv: _,
+            preconditions,
+        } => ResourceCommandResult::Resource(
+            db.update_resource_with_preconditions(
+                &api_version,
+                &kind,
+                namespace.as_deref(),
+                &name,
+                data,
+                preconditions,
             )
             .await
-    }
-
-    async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
-        self.get_resource(key).await
-    }
-
-    async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
-        self.db
-            .list_resources(
-                &req.api_version,
-                &req.kind,
-                req.namespace.as_deref(),
-                crate::datastore::ResourceListQuery::new(
-                    req.label_selector.as_deref(),
-                    req.field_selector.as_deref(),
-                    req.limit,
-                    req.continue_token.as_deref(),
-                ),
+            .map_err(resource_command_store_error)?,
+        ),
+        StorageCommand::PatchResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            patch_kind,
+            patch,
+            preconditions,
+            strict_resource_version,
+        } => ResourceCommandResult::Resource(
+            db.patch_resource_latest_with_preconditions(
+                &api_version,
+                &kind,
+                namespace.as_deref(),
+                &name,
+                ResourcePatchRequest {
+                    patch_kind,
+                    patch,
+                    preconditions,
+                    strict_resource_version,
+                },
             )
             .await
-    }
+            .map_err(resource_command_store_error)?
+            .ok_or_else(|| ResourceCommandError::NotFound {
+                message: format!("{api_version}/{kind}/{name} not found"),
+            })?,
+        ),
+        StorageCommand::DeleteResource {
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+        } => {
+            let resource_version = db
+                .delete_resource_with_preconditions_observed_rv(
+                    &api_version,
+                    &kind,
+                    namespace.as_deref(),
+                    &name,
+                    preconditions,
+                )
+                .await
+                .map_err(resource_command_store_error)?;
+            ResourceCommandResult::Ack { resource_version }
+        }
+        StorageCommand::DeleteResourceWithTombstone {
+            api_version,
+            kind,
+            namespace,
+            name,
+            preconditions,
+            grace_seconds,
+        } => ResourceCommandResult::Resource(
+            db.delete_resource_without_watch_with_tombstone(
+                &api_version,
+                &kind,
+                namespace.as_deref(),
+                &name,
+                preconditions,
+                grace_seconds,
+            )
+            .await
+            .map_err(resource_command_store_error)?,
+        ),
+        command => {
+            return Err(ResourceCommandError::UnsupportedCommand {
+                command: command.variant_name(),
+            });
+        }
+    };
+    Ok(result)
+}
 
-    async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-        let topic = crate::watch::WatchTopic::new(&req.api_version, &req.kind);
-        let legacy_start_rv = req.start_resource_version.unwrap_or(0).max(0);
-        let requested_position = req.start_watch_replay_position;
-        let has_selector = super::watch_request_has_selector(&req);
-        let watch_anchor = DatastoreBackendWatchStore::new(self.db.clone());
-        // Capture the durable handoff before any selector baseline await. No
-        // await occurs between final establishment and signal subscription;
-        // replay closes every interval beginning at this early anchor.
-        let early_anchor = if requested_position.is_none() {
-            Some(watch_anchor.current_watch_replay_position().await?)
-        } else {
-            None
+fn resource_command_store_error(error: anyhow::Error) -> ResourceCommandError {
+    if let Some(error) = error.downcast_ref::<crate::datastore::errors::DatastoreError>() {
+        return match error {
+            crate::datastore::errors::DatastoreError::Conflict { message } => {
+                ResourceCommandError::Conflict {
+                    message: message.clone(),
+                }
+            }
+            crate::datastore::errors::DatastoreError::NotFound { message } => {
+                ResourceCommandError::NotFound {
+                    message: message.clone(),
+                }
+            }
         };
-        let mut selector_membership = crate::watch::SelectorMembership::default();
-        let mut current_baseline_position = None;
-        if has_selector {
-            let snapshot_position = requested_position.or_else(|| {
-                (legacy_start_rv > 0).then(|| {
+    }
+    if crate::datastore::errors::is_conflict_error(&error) {
+        return ResourceCommandError::Conflict {
+            message: error.to_string(),
+        };
+    }
+    if format!("{error:#}")
+        .to_ascii_lowercase()
+        .contains("not found")
+    {
+        return ResourceCommandError::NotFound {
+            message: error.to_string(),
+        };
+    }
+    ResourceCommandError::submission_failed(error.to_string())
+}
+
+impl LeaderResourceCommand for LocalApiClient {
+    fn submit_resource_command(
+        &self,
+        request: ResourceCommandRequest,
+    ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
+        Box::pin(async move {
+            if !*self.is_leader_rx.borrow() {
+                return Err(ResourceCommandError::NotLeader);
+            }
+            submit_resource_command_to_store(&self.db, request).await
+        })
+    }
+}
+
+impl LeaderNodeLeaseRenewal for LocalApiClient {
+    fn renew_node_lease(
+        &self,
+        request: NodeLeaseRenewalRequest,
+    ) -> NodeLeaseRenewalFuture<'_, NodeLeaseRenewalResult> {
+        Box::pin(async move {
+            if !*self.is_leader_rx.borrow() {
+                return Err(NodeLeaseRenewalError::NotLeader);
+            }
+            let (node_name, renew_time, lease_duration_seconds) = request.into_parts();
+            self.node_lease_tracker
+                .record_from_lease_object(
+                    &node_name,
+                    &serde_json::json!({
+                        "metadata": {
+                            "name": node_name,
+                            "namespace": "kube-node-lease"
+                        },
+                        "spec": {
+                            "holderIdentity": node_name,
+                            "leaseDurationSeconds": lease_duration_seconds,
+                            "renewTime": renew_time
+                        }
+                    }),
+                )
+                .await
+                .map_err(|error| NodeLeaseRenewalError::InvalidRequest {
+                    field: "lease.renew_time",
+                    message: error.to_string(),
+                })?;
+            Ok(NodeLeaseRenewalResult::Renewed)
+        })
+    }
+}
+
+impl LeaderNodeLifecycleStatus for LocalApiClient {
+    fn submit_node_lifecycle_status(
+        &self,
+        request: NodeLifecycleStatusRequest,
+    ) -> NodeLifecycleStatusFuture<'_, NodeLifecycleStatusResult> {
+        Box::pin(async move {
+            if !*self.is_leader_rx.borrow() {
+                return Err(NodeLifecycleStatusError::NotLeader);
+            }
+            let get = crate::control_plane::client::node_get_request(
+                request.node_name(),
+                crate::control_plane::client::ResourceQueryConsistency::LeaderFresh,
+            )
+            .map_err(|error| NodeLifecycleStatusError::apply_failed(error.to_string()))?;
+            let current = LeaderResourceQuery::get_resource(self, get)
+                .await
+                .map_err(|error| NodeLifecycleStatusError::apply_failed(error.to_string()))?
+                .ok_or(NodeLifecycleStatusError::NotFound)?;
+            if current.uid != request.node_uid() {
+                return Err(NodeLifecycleStatusError::UidMismatch);
+            }
+            if current.resource_version != request.resource_version() {
+                return Err(NodeLifecycleStatusError::conflict(format!(
+                    "Node resourceVersion changed from {} to {}",
+                    request.resource_version(),
+                    current.resource_version
+                )));
+            }
+            let command = request.into_command();
+            let StorageCommand::UpdateStatus {
+                api_version,
+                kind,
+                namespace,
+                name,
+                status,
+                preconditions,
+                ..
+            } = command
+            else {
+                unreachable!("NodeLifecycleStatusRequest admits only UpdateStatus")
+            };
+            let resource = self
+                .db
+                .update_status_only_with_preconditions(
+                    &api_version,
+                    &kind,
+                    namespace.as_deref(),
+                    &name,
+                    status,
+                    preconditions,
+                )
+                .await
+                .map_err(node_lifecycle_status_store_error)?;
+            Ok(NodeLifecycleStatusResult::Updated {
+                resource_version: resource.resource_version,
+            })
+        })
+    }
+}
+
+fn node_lifecycle_status_store_error(error: anyhow::Error) -> NodeLifecycleStatusError {
+    let message = format!("{error:#}");
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("uid mismatch") {
+        NodeLifecycleStatusError::UidMismatch
+    } else if lower.contains("not found") || lower.contains("query returned no rows") {
+        NodeLifecycleStatusError::NotFound
+    } else if lower.contains("conflict") || lower.contains("precondition") {
+        NodeLifecycleStatusError::conflict(message)
+    } else if lower.contains("not raft leader") || lower.contains("follower") {
+        NodeLifecycleStatusError::NotLeader
+    } else {
+        NodeLifecycleStatusError::apply_failed(message)
+    }
+}
+
+impl LeaderWatch for LocalApiClient {
+    fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
+        Box::pin(async move {
+            let topic = crate::watch::WatchTopic::new(req.api_version(), req.kind());
+            let legacy_start_rv = req.start_resource_version().unwrap_or(0).max(0);
+            let requested_position = req.start_watch_replay_position();
+            let has_selector = super::watch_request_has_selector(&req);
+            let watch_anchor = DatastoreBackendWatchStore::new(self.db.clone());
+            // Capture the durable handoff before any selector baseline await. No
+            // await occurs between final establishment and signal subscription;
+            // replay closes every interval beginning at this early anchor.
+            let early_anchor = if requested_position.is_none() {
+                Some(
+                    watch_anchor
+                        .current_watch_replay_position()
+                        .await
+                        .map_err(|error| LeaderWatchError::transport(error.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let mut selector_membership = crate::watch::SelectorMembership::default();
+            let mut current_baseline_position = None;
+            if has_selector {
+                let snapshot_position = requested_position.or_else(|| {
+                    (legacy_start_rv > 0).then(|| {
                     crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(
                         legacy_start_rv,
                         early_anchor.unwrap_or_default().event_id,
                     )
                 })
-            });
-            let query = || {
-                crate::datastore::ResourceListQuery::new(
-                    req.label_selector.as_deref(),
-                    req.field_selector.as_deref(),
-                    None,
-                    None,
-                )
-            };
-            let baseline = if let Some(snapshot_position) = snapshot_position {
-                match watch_anchor
-                    .snapshot_resources_at_position(
-                        std::slice::from_ref(&watch_target_for_request(&req)),
-                        req.label_selector.as_deref(),
-                        req.field_selector.as_deref(),
-                        snapshot_position,
+                });
+                let query = || {
+                    crate::datastore::ResourceListQuery::new(
+                        req.label_selector(),
+                        req.field_selector(),
+                        None,
+                        None,
                     )
-                    .await?
-                {
-                    SnapshotAtRv::List(list) => list,
-                    SnapshotAtRv::Current => {
-                        self.db
-                            .list_resources(
-                                &req.api_version,
-                                &req.kind,
-                                req.namespace.as_deref(),
-                                query(),
-                            )
-                            .await?
-                    }
-                    SnapshotAtRv::Expired => {
-                        anyhow::bail!(
-                            "local selector watch membership snapshot at position {snapshot_position:?} expired"
+                };
+                let baseline = if let Some(snapshot_position) = snapshot_position {
+                    match watch_anchor
+                        .snapshot_resources_at_position(
+                            std::slice::from_ref(&watch_target_for_request(&req)),
+                            req.label_selector(),
+                            req.field_selector(),
+                            snapshot_position,
                         )
-                    }
-                }
-            } else {
-                self.db
-                    .list_resources(
-                        &req.api_version,
-                        &req.kind,
-                        req.namespace.as_deref(),
-                        query(),
-                    )
-                    .await?
-            };
-            selector_membership.replace_from_resources(&baseline.items);
-            current_baseline_position = baseline.watch_replay_position;
-        }
-        let replay_position = if let Some(position) = requested_position {
-            position
-        } else if legacy_start_rv > 0 {
-            crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(
-                legacy_start_rv,
-                early_anchor.unwrap_or_default().event_id,
-            )
-        } else if let Some(position) = current_baseline_position {
-            position
-        } else {
-            early_anchor.unwrap_or_default()
-        };
-        let start_rv = legacy_start_rv.max(replay_position.resource_version);
-        let signal_rx = self.db.subscribe_watch_signals(topic.clone());
-        let replay_source = DatastoreWatchReplaySource::new(
-            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                self.db.clone(),
-            )),
-            vec![watch_target_for_request(&req)],
-        );
-        let scope = watch_delivery_scope_for_request(&req);
-        let stream = async_stream::stream! {
-            let mut cursor = crate::watch::SignalWatchCursor::new_many_at_position(
-                signal_rx,
-                replay_source,
-                vec![topic],
-                scope,
-                start_rv,
-                replay_position,
-                crate::watch::WindowPolicy::default_watch_delivery(),
-            );
-            if let Err(err) = cursor.prime_replay_or_expired().await
-            {
-                yield Err(local_watch_cursor_error(err, cursor.accepted_rv()));
-                return;
-            }
-            loop {
-                match cursor.next_event().await {
-                    Ok(event) => {
-                        let matches = super::watch_request_matches_event(&req, &event);
-                        let event = if has_selector {
-                            selector_membership.transition(event, matches)
-                        } else {
-                            matches.then_some(event)
-                        };
-                        if let Some(event) = event {
-                            yield Ok(ResourceEvent {
-                                event,
-                                resume_position: Some(cursor.processed_position()),
+                        .await
+                        .map_err(|error| LeaderWatchError::transport(error.to_string()))?
+                    {
+                        SnapshotAtRv::List(list) => list,
+                        SnapshotAtRv::Current => self
+                            .db
+                            .list_resources(req.api_version(), req.kind(), req.namespace(), query())
+                            .await
+                            .map_err(|error| LeaderWatchError::transport(error.to_string()))?,
+                        SnapshotAtRv::Expired => {
+                            return Err(LeaderWatchError::ReplayExpired {
+                                accepted_resource_version: snapshot_position.resource_version,
                             });
                         }
                     }
-                    Err(crate::watch::WatchCursorError::Closed) => {
-                        yield Err(anyhow!("local watch signal channel closed"));
-                        return;
-                    }
-                    Err(err) => {
-                        yield Err(local_watch_cursor_error(err, cursor.accepted_rv()));
-                        return;
+                } else {
+                    self.db
+                        .list_resources(req.api_version(), req.kind(), req.namespace(), query())
+                        .await
+                        .map_err(|error| LeaderWatchError::transport(error.to_string()))?
+                };
+                selector_membership.replace_from_resources(&baseline.items);
+                current_baseline_position = baseline.watch_replay_position;
+            }
+            let replay_position = if let Some(position) = requested_position {
+                position
+            } else if legacy_start_rv > 0 {
+                crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(
+                    legacy_start_rv,
+                    early_anchor.unwrap_or_default().event_id,
+                )
+            } else if let Some(position) = current_baseline_position {
+                position
+            } else {
+                early_anchor.unwrap_or_default()
+            };
+            let start_rv = legacy_start_rv.max(replay_position.resource_version);
+            let signal_rx = self.db.subscribe_watch_signals(topic.clone());
+            let replay_source = DatastoreWatchReplaySource::new(
+                std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                    self.db.clone(),
+                )),
+                vec![watch_target_for_request(&req)],
+            );
+            let scope = watch_delivery_scope_for_request(&req);
+            let stream = async_stream::stream! {
+                let mut cursor = crate::watch::SignalWatchCursor::new_many_at_position(
+                    signal_rx,
+                    replay_source,
+                    vec![topic],
+                    scope,
+                    start_rv,
+                    replay_position,
+                    crate::watch::WindowPolicy::default_watch_delivery(),
+                );
+                if let Err(err) = cursor.prime_replay_or_expired().await
+                {
+                    yield Err(local_watch_cursor_error(err, cursor.accepted_rv()));
+                    return;
+                }
+                loop {
+                    match cursor.next_event().await {
+                        Ok(event) => {
+                            let matches = super::watch_request_matches_event(&req, &event);
+                            let event = if has_selector {
+                                selector_membership.transition(event, matches)
+                            } else {
+                                matches.then_some(event)
+                            };
+                            if let Some(event) = event {
+                                yield focused_watch_event(
+                                    event,
+                                    Some(cursor.processed_position()),
+                                ).and_then(|event| {
+                                    event.validate_for(&req)?;
+                                    Ok(event)
+                                });
+                            }
+                        }
+                        Err(crate::watch::WatchCursorError::Closed) => {
+                            yield Err(LeaderWatchError::unavailable(
+                                "local watch signal channel closed",
+                            ));
+                            return;
+                        }
+                        Err(err) => {
+                            yield Err(local_watch_cursor_error(err, cursor.accepted_rv()));
+                            return;
+                        }
                     }
                 }
-            }
-        };
-        Ok(Box::pin(stream))
+            };
+            Ok(Box::pin(stream) as crate::control_plane::client::WatchStream)
+        })
     }
+}
 
-    async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
-        Ok(())
+impl LeaderCacheReadiness for LocalApiClient {
+    fn wait_cache_ready(&self, _scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+        Box::pin(async { Ok(()) })
     }
+}
 
-    async fn projected_service_account_token(
+impl LeaderProjectedServiceAccountToken for LocalApiClient {
+    fn issue_projected_service_account_token(
         &self,
         request: ProjectedServiceAccountTokenRequest,
-    ) -> Result<ProjectedServiceAccountToken> {
-        self.check_leader()?;
-        let bound_pod = read_projected_service_account_token_bound_pod(&self.db, &request).await?;
-        let signing_key_pem =
-            crate::auth::read_service_account_signing_key_async(&self.containerd_namespace)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Failed to read ServiceAccount signing key for {}",
-                        self.containerd_namespace
-                    )
-                })?;
-        crate::control_plane::service_account_tokens::issue_projected_service_account_token(
-            self.db.as_ref(),
-            &signing_key_pem,
-            &request,
-            bound_pod.as_ref(),
-        )
-        .await
-    }
-
-    async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Pod>> {
-        self.get_resource(ResourceKey {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: Some(ns.to_string()),
-            name: name.to_string(),
-        })
-        .await
-    }
-
-    async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Pod>> {
-        Ok(self
-            .get_pod(ns, name)
-            .await?
-            .filter(|pod| pod.uid.as_str() == uid))
-    }
-
-    async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Pod>> {
-        let watch = self
-            .watch_resources(WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: Some(format!("spec.nodeName={node_name}")),
-                start_resource_version: None,
-                start_watch_replay_position: None,
-            })
-            .await?;
-        let node_name = node_name.to_string();
-        Ok(Box::pin(watch.filter_map(move |event| {
-            let node_name = node_name.clone();
-            async move {
-                match event {
-                    Ok(event)
-                        if event
-                            .event
-                            .object
-                            .pointer("/spec/nodeName")
-                            .and_then(|value| value.as_str())
-                            == Some(node_name.as_str()) =>
-                    {
-                        Some(Ok(Resource::from_watch_event(event.event)))
-                    }
-                    Ok(_) => None,
-                    Err(err) => Some(Err(err)),
-                }
+    ) -> ProjectedServiceAccountTokenFuture<'_> {
+        Box::pin(async move {
+            if !*self.is_leader_rx.borrow() {
+                return Err(ProjectedServiceAccountTokenError::NotLeader);
             }
-        })))
-    }
-
-    async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Pod>> {
-        Ok(self
-            .list_resources(ListRequest {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: Some(format!("spec.nodeName={node_name}")),
-                limit: None,
-                continue_token: None,
-            })
-            .await?
-            .items)
-    }
-
-    async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<ConfigMap>> {
-        self.get_resource(ResourceKey {
-            api_version: "v1".to_string(),
-            kind: "ConfigMap".to_string(),
-            namespace: Some(ns.to_string()),
-            name: name.to_string(),
-        })
-        .await
-    }
-
-    async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
-        self.get_resource(ResourceKey {
-            api_version: "v1".to_string(),
-            kind: "Secret".to_string(),
-            namespace: Some(ns.to_string()),
-            name: name.to_string(),
-        })
-        .await
-    }
-
-    async fn get_node(&self, name: &str) -> Result<Node> {
-        self.get_resource(ResourceKey {
-            api_version: "v1".to_string(),
-            kind: "Node".to_string(),
-            namespace: None,
-            name: name.to_string(),
-        })
-        .await?
-        .ok_or_else(|| anyhow!("Node {name} not found"))
-    }
-
-    async fn watch_node(&self, name: &str) -> Result<WatchStream<Node>> {
-        let watch = self
-            .watch_resources(WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "Node".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: None,
-                start_resource_version: None,
-                start_watch_replay_position: None,
-            })
-            .await?;
-        let name = name.to_string();
-        Ok(Box::pin(watch.filter_map(move |event| {
-            let name = name.clone();
-            async move {
-                match event {
-                    Ok(event)
-                        if event
-                            .event
-                            .object
-                            .pointer("/metadata/name")
-                            .and_then(|value| value.as_str())
-                            == Some(name.as_str()) =>
-                    {
-                        Some(Ok(Resource::from_watch_event(event.event)))
-                    }
-                    Ok(_) => None,
-                    Err(err) => Some(Err(err)),
-                }
+            if request.bound_node_name() != self.authoring_node {
+                return Err(ProjectedServiceAccountTokenError::Unauthorized);
             }
-        })))
-    }
-
-    async fn allocate_node_subnet(
-        &self,
-        node_name: &str,
-        cluster_cidr: &str,
-        node_ip: &str,
-    ) -> Result<NodeSubnet> {
-        self.check_leader()?;
-        self.db
-            .allocate_node_subnet(node_name, cluster_cidr, node_ip)
-            .await
-    }
-
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-        self.db.get_node_subnet(node_name).await
-    }
-
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        self.db.list_peer_subnets(my_node_name).await
-    }
-
-    async fn get_node_dataplane(&self, node_name: &str) -> Result<Option<DataplanePeerMetadata>> {
-        self.db.get_node_dataplane(node_name).await
-    }
-
-    async fn list_pod_cleanup_intents_for_node(
-        &self,
-        node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
-        self.db.list_pod_cleanup_intents_for_node(node_name).await
-    }
-
-    async fn delete_pod_cleanup_intent(
-        &self,
-        node_name: &str,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        reason: &str,
-    ) -> Result<()> {
-        self.check_leader()?;
-        self.db
-            .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
-            .await
-    }
-
-    async fn get_cluster_membership(
-        &self,
-    ) -> Result<crate::control_plane::client::membership::ClusterMembership> {
-        crate::bootstrap::cluster_meta::read_cluster_membership(self.db.as_ref()).await
-    }
-
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        operation: OutboxOperation,
-        payload: Bytes,
-        client_id: &str,
-        stream_id: i64,
-        stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        // T6 step 1 inner gate. Refuse all apply_outbox calls when this
-        // node is not the elected leader, including LeaseRenew — the
-        // node_lease_tracker is leader-only authoritative state, and a
-        // follower must not record lease renewals locally either.
-        self.check_leader_outbox()?;
-        if operation == OutboxOperation::LeaseRenew {
-            let decoded = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(&payload)
-                .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
-            self.node_lease_tracker
-                .record_from_command(&decoded.command, &self.authoring_node)
-                .await
-                .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
-            return Ok(OutboxApplyResult::Applied { applied_rv: 0 });
-        }
-        let outcome = self
-            .raft
-            .propose_outbox_with_watermark(
-                idempotency_key,
-                operation,
-                payload,
-                &self.authoring_node,
-                (stream_seq > 0).then(|| crate::log_apply::OutboxStreamWatermark {
-                    client_id: client_id.to_string(),
-                    stream_id,
-                    stream_seq,
-                }),
-            )
-            .await?;
-        if let Some(command) = outcome.command.as_ref() {
-            crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
-                self.controller_dispatcher.get(),
-                command,
-                outcome.resource.as_ref(),
+            let signing_key_pem =
+                crate::auth::read_service_account_signing_key_async(&self.containerd_namespace)
+                    .await
+                    .map_err(|error| {
+                        ProjectedServiceAccountTokenError::signing_failed(format!(
+                            "ServiceAccount signing key for {} is unavailable: {error}",
+                            self.containerd_namespace
+                        ))
+                    })?;
+            crate::control_plane::service_account_tokens::issue_projected_service_account_token(
                 self.db.as_ref(),
+                self.pod_store.as_ref(),
+                &signing_key_pem,
+                &request,
             )
-            .await;
-        }
-        Ok(outcome.result)
+            .await
+        })
+    }
+}
+
+impl LeaderPodCleanupIntents for LocalApiClient {
+    fn list_pod_cleanup_intents(
+        &self,
+        request: PodCleanupIntentListRequest,
+    ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
+        Box::pin(async move {
+            if !*self.is_leader_rx.borrow() {
+                return Err(PodCleanupIntentError::NotLeader);
+            }
+            if request.node_name() != self.authoring_node {
+                return Err(PodCleanupIntentError::Unauthorized);
+            }
+            self.db
+                .list_pod_cleanup_intents_for_node(request.node_name())
+                .await
+                .map_err(|error| PodCleanupIntentError::unavailable(error.to_string()))?
+                .into_iter()
+                .map(focused_pod_cleanup_intent)
+                .collect()
+        })
+    }
+
+    fn acknowledge_pod_cleanup_intent(
+        &self,
+        request: PodCleanupIntentAckRequest,
+    ) -> PodCleanupIntentFuture<'_, ()> {
+        Box::pin(async move {
+            if !*self.is_leader_rx.borrow() {
+                return Err(PodCleanupIntentError::NotLeader);
+            }
+            if request.node_name() != self.authoring_node {
+                return Err(PodCleanupIntentError::Unauthorized);
+            }
+            let (node_name, namespace, pod_name, pod_uid, reason) = request.into_parts();
+            self.db
+                .delete_pod_cleanup_intent(&node_name, &namespace, &pod_name, &pod_uid, &reason)
+                .await
+                .map_err(|error| PodCleanupIntentError::unavailable(error.to_string()))
+        })
+    }
+}
+
+impl LeaderNodeSubnetAllocation for LocalApiClient {
+    fn allocate_node_subnet(
+        &self,
+        request: NodeSubnetAllocationRequest,
+    ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
+        Box::pin(async move {
+            if !*self.is_leader_rx.borrow() {
+                return Err(NodeSubnetAllocationError::NotLeader);
+            }
+            let (node_name, cluster_cidr, node_ip) = request.into_parts();
+            let subnet = self
+                .db
+                .allocate_node_subnet(&node_name, &cluster_cidr, &node_ip.to_string())
+                .await
+                .map_err(|error| {
+                    let message = error.to_string();
+                    if super::node_subnet_allocation_is_exhausted(&message) {
+                        NodeSubnetAllocationError::exhausted(cluster_cidr.clone())
+                    } else if message.to_ascii_lowercase().contains("conflict") {
+                        NodeSubnetAllocationError::conflict(message)
+                    } else {
+                        NodeSubnetAllocationError::allocation_failed(message)
+                    }
+                })?;
+            let subnet = focused_node_subnet(subnet)
+                .map_err(|error| NodeSubnetAllocationError::corrupt_response(error.to_string()))?;
+            NodeSubnetAllocationResult::try_from_wire(&node_name, Some(subnet))
+        })
+    }
+}
+
+impl LeaderNetworkTopologyQuery for LocalApiClient {
+    fn get_node_subnet(
+        &self,
+        request: NodeSubnetQuery,
+    ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
+        Box::pin(async move {
+            if !*self.is_leader_rx.borrow() {
+                return Err(NetworkTopologyError::NotLeader);
+            }
+            let node_name = request.into_node_name();
+            let subnet = self
+                .db
+                .get_node_subnet(&node_name)
+                .await
+                .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?
+                .map(focused_node_subnet)
+                .transpose()?;
+            NodeSubnetResult::try_from_wire(&node_name, subnet.is_some(), subnet)
+        })
+    }
+
+    fn list_peer_subnets(
+        &self,
+        request: PeerSubnetsQuery,
+    ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
+        Box::pin(async move {
+            if !*self.is_leader_rx.borrow() {
+                return Err(NetworkTopologyError::NotLeader);
+            }
+            let node_name = request.into_node_name();
+            let subnets = self
+                .db
+                .list_peer_subnets(&node_name)
+                .await
+                .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?
+                .into_iter()
+                .map(focused_node_subnet)
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            PeerSubnetsResult::try_new(&node_name, subnets)
+        })
+    }
+
+    fn get_node_dataplane(
+        &self,
+        request: NodeDataplaneQuery,
+    ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
+        Box::pin(async move {
+            if !*self.is_leader_rx.borrow() {
+                return Err(NetworkTopologyError::NotLeader);
+            }
+            let node_name = request.into_node_name();
+            let metadata = self
+                .db
+                .get_node_dataplane(&node_name)
+                .await
+                .map_err(|error| NetworkTopologyError::query_failed(error.to_string()))?
+                .map(focused_dataplane)
+                .transpose()?;
+            NodeDataplaneResult::try_from_wire(&node_name, metadata.is_some(), metadata)
+        })
     }
 }
 
 #[async_trait]
-impl OutboxApplyClient for LocalApiClient {
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        operation: OutboxOperation,
-        payload: Bytes,
-        client_id: &str,
-        stream_id: i64,
-        stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        LeaderApiClient::apply_outbox(
-            self,
-            idempotency_key,
-            operation,
-            payload,
-            client_id,
-            stream_id,
-            stream_seq,
-        )
-        .await
+impl LeaderApiClient for LocalApiClient {}
+
+impl LeaderOutboxDelivery for LocalApiClient {
+    fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+        Box::pin(async move {
+            self.check_leader_outbox()?;
+            let (idempotency_key, operation, payload, client_id, stream_id, stream_seq) =
+                request.into_parts();
+            let watermark = crate::control_plane::client::apply::outbox_stream_watermark(
+                &client_id, stream_id, stream_seq,
+            );
+            let decoded = match crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(
+                payload.as_ref(),
+            ) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    let terminal =
+                        OutboxDeliveryError::invalid("delivery.payload", error.to_string());
+                    crate::control_plane::client::apply::consume_terminal_outbox_sequence(
+                        self.db.as_ref(),
+                        &idempotency_key,
+                        operation.into(),
+                        &self.authoring_node,
+                        watermark.clone(),
+                    )
+                    .await?;
+                    return Err(terminal);
+                }
+            };
+            if let Err(error) = crate::control_plane::client::apply::authorize_outbox_command(
+                operation,
+                &decoded.command,
+                &self.authoring_node,
+            ) {
+                crate::control_plane::client::apply::consume_terminal_outbox_sequence(
+                    self.db.as_ref(),
+                    &idempotency_key,
+                    operation.into(),
+                    &self.authoring_node,
+                    watermark.clone(),
+                )
+                .await?;
+                return Err(error);
+            }
+            if operation == klights_leader_api::OutboxDeliveryOperation::PodMetadata
+                && let Err(error) =
+                    crate::control_plane::client::apply::authorize_live_pod_metadata_command(
+                        self.db.as_ref(),
+                        &decoded.command,
+                        &self.authoring_node,
+                    )
+                    .await
+            {
+                if error.is_terminal() {
+                    crate::control_plane::client::apply::consume_terminal_outbox_sequence(
+                        self.db.as_ref(),
+                        &idempotency_key,
+                        operation.into(),
+                        &self.authoring_node,
+                        watermark.clone(),
+                    )
+                    .await?;
+                }
+                return Err(error);
+            }
+            if operation == klights_leader_api::OutboxDeliveryOperation::NodeStatus
+                && let Err(error) =
+                    klights_leader_api::NodeSelfStatusRequest::validate_command(&decoded.command)
+                        .map_err(|error| match error {
+                            klights_leader_api::NodeSelfStatusError::InvalidRequest {
+                                field,
+                                message,
+                            } => OutboxDeliveryError::invalid(field, message),
+                            other => {
+                                OutboxDeliveryError::invalid("delivery.payload", other.to_string())
+                            }
+                        })
+            {
+                crate::control_plane::client::apply::consume_terminal_outbox_sequence(
+                    self.db.as_ref(),
+                    &idempotency_key,
+                    operation.into(),
+                    &self.authoring_node,
+                    watermark.clone(),
+                )
+                .await?;
+                return Err(error);
+            }
+            let outcome = self
+                .raft
+                .propose_outbox_with_watermark(
+                    &idempotency_key,
+                    operation.into(),
+                    bytes::Bytes::from_owner(payload),
+                    &self.authoring_node,
+                    watermark,
+                )
+                .await?;
+            if let Some(command) = outcome.command.as_ref() {
+                crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
+                    self.controller_dispatcher.get(),
+                    command,
+                    outcome.resource.as_ref(),
+                    self.db.as_ref(),
+                )
+                .await;
+            }
+            Ok(outcome.result)
+        })
     }
 }
 
 fn watch_target_for_request(req: &WatchRequest) -> WatchTarget {
-    if let Some(namespace) = req.namespace.as_ref() {
-        return WatchTarget::namespaced_in_namespace(
-            req.api_version.clone(),
-            req.kind.clone(),
-            namespace.clone(),
-        );
+    if let Some(namespace) = req.namespace() {
+        return WatchTarget::namespaced_in_namespace(req.api_version(), req.kind(), namespace);
     }
-    if crate::datastore::sqlite::scope::is_namespaced(&req.kind) {
-        WatchTarget::namespaced(req.api_version.clone(), req.kind.clone())
+    if crate::datastore::sqlite::scope::is_namespaced(req.kind()) {
+        WatchTarget::namespaced(req.api_version(), req.kind())
     } else {
-        WatchTarget::cluster(req.api_version.clone(), req.kind.clone())
+        WatchTarget::cluster(req.api_version(), req.kind())
     }
 }
 
 fn watch_delivery_scope_for_request(req: &WatchRequest) -> crate::watch::WatchDeliveryScope {
-    if let Some(namespace) = req.namespace.as_ref() {
-        return crate::watch::WatchDeliveryScope::Namespaced(namespace.clone());
+    if let Some(namespace) = req.namespace() {
+        return crate::watch::WatchDeliveryScope::Namespaced(namespace.to_string());
     }
-    if crate::datastore::sqlite::scope::is_namespaced(&req.kind) {
+    if crate::datastore::sqlite::scope::is_namespaced(req.kind()) {
         crate::watch::WatchDeliveryScope::NamespacedAll
     } else {
         crate::watch::WatchDeliveryScope::Cluster
@@ -653,13 +1006,17 @@ fn watch_delivery_scope_for_request(req: &WatchRequest) -> crate::watch::WatchDe
 fn local_watch_cursor_error(
     err: crate::watch::WatchCursorError,
     accepted_rv: i64,
-) -> anyhow::Error {
+) -> LeaderWatchError {
     match err {
-        crate::watch::WatchCursorError::Expired => {
-            anyhow!("local watch replay window expired: resume rv {accepted_rv} requires relist")
+        crate::watch::WatchCursorError::Expired => LeaderWatchError::ReplayExpired {
+            accepted_resource_version: accepted_rv,
+        },
+        crate::watch::WatchCursorError::Replay(err) => {
+            LeaderWatchError::transport(format!("local watch replay failed: {err}"))
         }
-        crate::watch::WatchCursorError::Replay(err) => anyhow!("local watch replay failed: {err}"),
-        crate::watch::WatchCursorError::Closed => anyhow!("local watch signal channel closed"),
+        crate::watch::WatchCursorError::Closed => {
+            LeaderWatchError::unavailable("local watch signal channel closed")
+        }
     }
 }
 
@@ -674,13 +1031,16 @@ mod inner_gate_tests {
     //! writes the moment the receiver observes `true`.
 
     use super::*;
-    use crate::control_plane::client::LeaderApiClient;
-    use crate::control_plane::client::ListRequest;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::command::StorageCommand;
     use crate::datastore::{ReplicatedCreateOptions, ResourceListQuery};
     use crate::kubelet::outbox::OutboxApplyError;
     use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+    use futures::StreamExt as _;
+    use klights_leader_api::{
+        LeaderResourceCommand, ResourceCommandError, ResourceCommandRequest, ResourceCommandResult,
+        ResourceQueryError, WatchEventType,
+    };
     use klights_types::ResourceKey;
 
     fn pod_status_payload() -> bytes::Bytes {
@@ -701,26 +1061,6 @@ mod inner_gate_tests {
             OutboxPayload::from_command(command)
                 .encode_protobuf()
                 .expect("encode pod status payload"),
-        )
-    }
-
-    fn lease_renew_payload(node_name: &str) -> bytes::Bytes {
-        let command = StorageCommand::CreateResource {
-            api_version: "coordination.k8s.io/v1".to_string(),
-            kind: "Lease".to_string(),
-            namespace: Some("kube-node-lease".to_string()),
-            name: node_name.to_string(),
-            data: serde_json::json!({
-                "apiVersion": "coordination.k8s.io/v1",
-                "kind": "Lease",
-                "metadata": {"name": node_name, "namespace": "kube-node-lease"},
-                "spec": {"holderIdentity": node_name, "renewTime": "2026-05-29T05:00:00.000000Z"}
-            }),
-        };
-        bytes::Bytes::from(
-            OutboxPayload::from_command(command)
-                .encode_protobuf()
-                .expect("encode lease renew payload"),
         )
     }
 
@@ -751,17 +1091,17 @@ mod inner_gate_tests {
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
 
-        let err = LeaderApiClient::apply_outbox(
-            &client,
-            "idem-1",
-            OutboxOperation::PodStatus,
-            pod_status_payload(),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect_err("non-leader apply_outbox must be rejected");
+        let err = client
+            .deliver_test_outbox(
+                "idem-1",
+                OutboxOperation::PodStatus,
+                pod_status_payload(),
+                "client",
+                1,
+                1,
+            )
+            .await
+            .expect_err("non-leader apply_outbox must be rejected");
         match err {
             OutboxApplyError::Retryable(msg) => {
                 assert!(
@@ -773,30 +1113,216 @@ mod inner_gate_tests {
         }
     }
 
-    /// Apply gate covers `LeaseRenew` too. The node_lease_tracker is
-    /// leader-only authoritative state; a follower must not record
-    /// renewals locally either.
     #[tokio::test]
-    async fn local_api_client_refuses_apply_outbox_lease_renew_when_not_leader() {
+    async fn outbox_terminal_decision_local_invalid_and_malformed_rows_consume_in_order() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            "node-a",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": "node-a", "uid": "node-uid-a"},
+                "status": {"conditions": []}
+            }),
+        )
+        .await
+        .expect("create local Node");
+        let client = LocalApiClient::new(
+            db.clone(),
+            "node-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        );
+        let command = StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "node-a".to_string(),
+            status: serde_json::json!({"conditions": []}),
+            expected_rv: Some(7),
+            preconditions: ResourcePreconditions {
+                uid: Some("node-uid-a".to_string()),
+                resource_version: Some(7),
+            },
+            observed_status_stamp: None,
+        };
+        let payload = bytes::Bytes::from(
+            OutboxPayload::from_command(command)
+                .encode_protobuf()
+                .expect("encode invalid worker Node status"),
+        );
+
+        let error = client
+            .deliver_test_outbox(
+                "invalid-node-status-rv",
+                OutboxOperation::NodeStatus,
+                payload,
+                "client",
+                1,
+                1,
+            )
+            .await
+            .expect_err("local focused delivery must enforce NodeSelfStatusRequest validation");
+        assert!(matches!(
+            error,
+            klights_leader_api::OutboxDeliveryError::InvalidRequest {
+                field: "status.resource_version",
+                ..
+            }
+        ));
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap()[0].stream_seq,
+            1,
+            "local authorization rejection must durably consume sequence one"
+        );
+
+        let valid_status = || {
+            bytes::Bytes::from(
+                OutboxPayload::from_command(StorageCommand::UpdateStatus {
+                    api_version: "v1".to_string(),
+                    kind: "Node".to_string(),
+                    namespace: None,
+                    name: "node-a".to_string(),
+                    status: serde_json::json!({"conditions": []}),
+                    expected_rv: None,
+                    preconditions: ResourcePreconditions::uid("node-uid-a"),
+                    observed_status_stamp: None,
+                })
+                .encode_protobuf()
+                .expect("encode valid local Node status"),
+            )
+        };
+        client
+            .deliver_test_outbox(
+                "valid-node-status-after-invalid",
+                OutboxOperation::NodeStatus,
+                valid_status(),
+                "client",
+                1,
+                2,
+            )
+            .await
+            .expect("sequence two applies after terminal authorization decision");
+
+        let malformed = client
+            .deliver_test_outbox(
+                "malformed-node-status",
+                OutboxOperation::NodeStatus,
+                bytes::Bytes::from_static(&[0xff, 0x00, 0x81]),
+                "client",
+                1,
+                3,
+            )
+            .await
+            .expect_err("malformed delivery stays fail-closed");
+        assert!(malformed.is_terminal());
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap()[0].stream_seq,
+            3,
+            "malformed sequence must receive a durable terminal decision"
+        );
+        client
+            .deliver_test_outbox(
+                "valid-node-status-after-malformed",
+                OutboxOperation::NodeStatus,
+                valid_status(),
+                "client",
+                1,
+                4,
+            )
+            .await
+            .expect("sequence four applies after malformed terminal decision");
+    }
+
+    #[tokio::test]
+    async fn local_resource_command_is_leader_gated_before_datastore_mutation() {
         let db = crate::datastore::test_support::in_memory().await;
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
+        let request = ResourceCommandRequest::try_new(StorageCommand::CreateResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            data: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "settings"}
+            }),
+        })
+        .expect("valid command");
 
-        let err = LeaderApiClient::apply_outbox(
+        let error = LeaderResourceCommand::submit_resource_command(&client, request)
+            .await
+            .expect_err("a follower must reject resource commands");
+        assert_eq!(error, ResourceCommandError::NotLeader);
+        assert!(
+            client
+                .db
+                .get_resource("v1", "ConfigMap", Some("default"), "settings")
+                .await
+                .expect("read after rejection")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_resource_command_returns_the_created_resource() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let (_tx, rx) = watch::channel(true);
+        let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
+        let request = ResourceCommandRequest::try_new(StorageCommand::CreateResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            data: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "settings"}
+            }),
+        })
+        .expect("valid command");
+
+        let result = LeaderResourceCommand::submit_resource_command(&client, request)
+            .await
+            .expect("leader command");
+        assert!(
+            matches!(result, ResourceCommandResult::Resource(resource) if resource.name == "settings")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_resource_command_maps_duplicate_create_to_conflict() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let (_tx, rx) = watch::channel(true);
+        let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
+        let command = StorageCommand::CreateResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            data: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "settings"}
+            }),
+        };
+        LeaderResourceCommand::submit_resource_command(
             &client,
-            "idem-lease",
-            OutboxOperation::LeaseRenew,
-            lease_renew_payload("node-a"),
-            "",
-            0,
-            0,
+            ResourceCommandRequest::try_new(command.clone()).expect("valid command"),
         )
         .await
-        .expect_err("non-leader lease renew must be rejected");
-        assert!(
-            matches!(err, OutboxApplyError::Retryable(_)),
-            "lease renew gate must surface as Retryable, got {err:?}"
-        );
+        .expect("first create");
+        let error = LeaderResourceCommand::submit_resource_command(
+            &client,
+            ResourceCommandRequest::try_new(command).expect("valid command"),
+        )
+        .await
+        .expect_err("duplicate create must conflict");
+        assert!(matches!(error, ResourceCommandError::Conflict { .. }));
     }
 
     /// `allocate_node_subnet` writes cluster state and must be gated.
@@ -806,18 +1332,74 @@ mod inner_gate_tests {
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
 
-        let err = client
-            .allocate_node_subnet("node-a", "10.50.0.0/16", "10.99.0.10")
-            .await
-            .expect_err("non-leader subnet allocation must be rejected");
+        let request = klights_leader_api::NodeSubnetAllocationRequest::try_new(
+            "node-a",
+            "10.50.0.0/16",
+            "10.99.0.10",
+        )
+        .expect("valid allocation request");
+        let err =
+            klights_leader_api::LeaderNodeSubnetAllocation::allocate_node_subnet(&client, request)
+                .await
+                .expect_err("non-leader subnet allocation must be rejected");
         assert!(
-            err.to_string().contains("follower"),
-            "expected FollowerWrite, got: {err}"
+            matches!(
+                err,
+                klights_leader_api::NodeSubnetAllocationError::NotLeader
+            ),
+            "expected typed NotLeader, got: {err}"
         );
     }
 
-    /// Reads are unconditionally allowed regardless of leadership state.
-    /// Followers serve reads of their own raft-applied cluster.db.
+    #[tokio::test]
+    async fn local_api_client_maps_subnet_exhaustion_to_typed_error() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let (_tx, rx) = watch::channel(true);
+        let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
+
+        for node_name in ["node-a", "node-b"] {
+            let request = klights_leader_api::NodeSubnetAllocationRequest::try_new(
+                node_name,
+                "10.50.0.0/24",
+                "10.99.0.10",
+            )
+            .expect("valid allocation request");
+            let result = klights_leader_api::LeaderNodeSubnetAllocation::allocate_node_subnet(
+                &client, request,
+            )
+            .await;
+            if node_name == "node-a" {
+                result.expect("the only /24 must be allocated");
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(klights_leader_api::NodeSubnetAllocationError::Exhausted { .. })
+                    ),
+                    "the second allocation must report typed exhaustion, got {result:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_api_client_refuses_network_topology_query_when_not_leader() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let (_tx, rx) = watch::channel(false);
+        let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
+        let request =
+            klights_leader_api::NodeSubnetQuery::try_new("node-a").expect("valid topology query");
+
+        let err = klights_leader_api::LeaderNetworkTopologyQuery::get_node_subnet(&client, request)
+            .await
+            .expect_err("non-leader topology query must fail closed");
+        assert!(matches!(
+            err,
+            klights_leader_api::NetworkTopologyError::NotLeader
+        ));
+    }
+
+    /// Cached reads may use follower-applied state, but LeaderFresh must not.
     #[tokio::test]
     async fn local_api_client_allows_reads_when_not_leader() {
         let db = crate::datastore::test_support::in_memory().await;
@@ -833,7 +1415,10 @@ mod inner_gate_tests {
         };
         assert!(
             client
-                .get_resource(key.clone())
+                .get_resource(
+                    ResourceGetRequest::try_new(key.clone(), ResourceQueryConsistency::Cached)
+                        .expect("valid Pod request"),
+                )
                 .await
                 .expect("read allowed")
                 .is_some(),
@@ -841,29 +1426,63 @@ mod inner_gate_tests {
         );
         assert!(
             client
-                .get_pod("default", "web")
+                .get_resource(
+                    pod_get_request("default", "web", ResourceQueryConsistency::Cached)
+                        .expect("valid Pod request"),
+                )
                 .await
                 .expect("read allowed")
                 .is_some(),
             "non-leader get_pod must succeed"
         );
         let listed = client
-            .list_resources(ListRequest {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: Some("default".to_string()),
-                label_selector: None,
-                field_selector: None,
-                continue_token: None,
-                limit: None,
-            })
+            .list_resources(
+                ResourceListRequest::try_new(
+                    "v1",
+                    "Pod",
+                    Some("default".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    ResourceQueryConsistency::Cached,
+                )
+                .expect("valid Pod list request"),
+            )
             .await
             .expect("list allowed");
         assert_eq!(
-            listed.items.len(),
+            listed.items().len(),
             1,
             "non-leader list_resources must succeed"
         );
+        assert!(matches!(
+            client
+                .get_resource(
+                    ResourceGetRequest::try_new(key, ResourceQueryConsistency::LeaderFresh)
+                        .expect("valid fresh Pod request"),
+                )
+                .await,
+            Err(ResourceQueryError::Retryable { .. })
+        ));
+        assert!(matches!(
+            client
+                .list_resources(
+                    ResourceListRequest::try_new(
+                        "v1",
+                        "Pod",
+                        Some("default".to_string()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        ResourceQueryConsistency::LeaderFresh,
+                    )
+                    .expect("valid fresh Pod list request"),
+                )
+                .await,
+            Err(ResourceQueryError::Retryable { .. })
+        ));
     }
 
     #[tokio::test]
@@ -887,15 +1506,18 @@ mod inner_gate_tests {
         let (_tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(db.clone(), "node-a".to_string(), rx);
         let mut stream = client
-            .watch_resources(WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: Some("spec.nodeName=node-a".to_string()),
-                start_resource_version: None,
-                start_watch_replay_position: None,
-            })
+            .watch_resources(
+                WatchRequest::try_new(
+                    "v1",
+                    "Pod",
+                    None,
+                    None,
+                    Some("spec.nodeName=node-a".to_string()),
+                    None,
+                    None,
+                )
+                .expect("valid Pod watch"),
+            )
             .await
             .unwrap();
 
@@ -917,8 +1539,8 @@ mod inner_gate_tests {
             .expect("leave transition should arrive")
             .expect("stream should remain open")
             .expect("event should decode");
-        assert_eq!(event.event.event_type, crate::watch::EventType::Deleted);
-        assert_eq!(event.event.object["metadata"]["name"], "moving");
+        assert_eq!(event.event_type(), WatchEventType::Deleted);
+        assert_eq!(event.resource().data["metadata"]["name"], "moving");
     }
 
     #[tokio::test]
@@ -1004,15 +1626,18 @@ mod inner_gate_tests {
         let (_tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(db, "node-a".to_string(), rx);
         let mut stream = client
-            .watch_resources(WatchRequest {
-                api_version: "v1".into(),
-                kind: "ConfigMap".into(),
-                namespace: Some("default".into()),
-                label_selector: Some("track=yes".into()),
-                field_selector: None,
-                start_resource_version: Some(50),
-                start_watch_replay_position: Some(list_position),
-            })
+            .watch_resources(
+                WatchRequest::try_new(
+                    "v1",
+                    "ConfigMap",
+                    Some("default".into()),
+                    Some("track=yes".into()),
+                    None,
+                    Some(50),
+                    Some(list_position),
+                )
+                .expect("valid positioned selector watch"),
+            )
             .await
             .unwrap();
 
@@ -1021,11 +1646,11 @@ mod inner_gate_tests {
             .expect("retained lower-RV leave must replay")
             .expect("watch remains open")
             .expect("event decodes");
-        assert_eq!(event.event.event_type, crate::watch::EventType::Deleted);
-        assert_eq!(event.event.object["metadata"]["labels"]["track"], "yes");
+        assert_eq!(event.event_type(), WatchEventType::Deleted);
+        assert_eq!(event.resource().data["metadata"]["labels"]["track"], "yes");
         assert!(
             event
-                .resume_position
+                .resume_position()
                 .is_some_and(|position| position.event_id > list_position.event_id),
             "resume cursor must advance through the lower-RV mutation"
         );
@@ -1050,15 +1675,18 @@ mod inner_gate_tests {
         let (_tx, rx) = watch::channel(true);
         let client = LocalApiClient::new(db.clone(), "node-a".to_string(), rx);
         let mut stream = client
-            .watch_resources(WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "ConfigMap".to_string(),
-                namespace: Some("default".to_string()),
-                label_selector: None,
-                field_selector: None,
-                start_resource_version: None,
-                start_watch_replay_position: None,
-            })
+            .watch_resources(
+                WatchRequest::try_new(
+                    "v1",
+                    "ConfigMap",
+                    Some("default".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("valid ConfigMap watch"),
+            )
             .await
             .unwrap();
         db.create_resource(
@@ -1080,7 +1708,7 @@ mod inner_gate_tests {
             .expect("post-establishment event should arrive")
             .expect("stream should remain open")
             .expect("event should decode");
-        assert_eq!(event.event.object["metadata"]["name"], "fresh");
+        assert_eq!(event.resource().data["metadata"]["name"], "fresh");
     }
 
     /// Promotion is a watch flip. The same client instance must start
@@ -1094,32 +1722,32 @@ mod inner_gate_tests {
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
 
         // Pre-promotion: write refused.
-        let pre = LeaderApiClient::apply_outbox(
-            &client,
-            "idem-2",
-            OutboxOperation::PodStatus,
-            pod_status_payload(),
-            "client",
-            1,
-            1,
-        )
-        .await;
+        let pre = client
+            .deliver_test_outbox(
+                "idem-2",
+                OutboxOperation::PodStatus,
+                pod_status_payload(),
+                "client",
+                1,
+                1,
+            )
+            .await;
         assert!(pre.is_err(), "pre-promotion write must be refused");
 
         // Promotion: flip the watch.
         tx.send(true).expect("send promotion signal");
 
         // Post-promotion: same client instance, write succeeds.
-        let post = LeaderApiClient::apply_outbox(
-            &client,
-            "idem-3",
-            OutboxOperation::PodStatus,
-            pod_status_payload(),
-            "client",
-            1,
-            1,
-        )
-        .await;
+        let post = client
+            .deliver_test_outbox(
+                "idem-3",
+                OutboxOperation::PodStatus,
+                pod_status_payload(),
+                "client",
+                1,
+                1,
+            )
+            .await;
         assert!(
             post.is_ok(),
             "post-promotion write must succeed on the same instance, got: {post:?}"
@@ -1137,58 +1765,60 @@ mod inner_gate_tests {
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
 
         // Pre-demotion: write succeeds.
-        let pre = LeaderApiClient::apply_outbox(
-            &client,
-            "idem-4",
-            OutboxOperation::PodStatus,
-            pod_status_payload(),
-            "client",
-            1,
-            1,
-        )
-        .await;
+        let pre = client
+            .deliver_test_outbox(
+                "idem-4",
+                OutboxOperation::PodStatus,
+                pod_status_payload(),
+                "client",
+                1,
+                1,
+            )
+            .await;
         assert!(pre.is_ok(), "pre-demotion write must succeed");
 
         // Demotion: flip the watch to false.
         tx.send(false).expect("send demotion signal");
 
         // Post-demotion: same client instance, write refused.
-        let post = LeaderApiClient::apply_outbox(
-            &client,
-            "idem-5",
-            OutboxOperation::PodStatus,
-            pod_status_payload(),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect_err("post-demotion write must be refused");
+        let post = client
+            .deliver_test_outbox(
+                "idem-5",
+                OutboxOperation::PodStatus,
+                pod_status_payload(),
+                "client",
+                1,
+                1,
+            )
+            .await
+            .expect_err("post-demotion write must be refused");
         assert!(
             matches!(post, OutboxApplyError::Retryable(_)),
             "demoted write surfaces as Retryable, got {post:?}"
         );
     }
 
-    /// The `OutboxApplyClient` trait delegates to `LeaderApiClient::apply_outbox`
-    /// so the same gate fires for outbox-dispatcher-driven applies. The
-    /// dispatcher uses this trait — it must see `Retryable` and re-enqueue.
+    /// The focused delivery port uses the same leader gate as every local
+    /// mutation and must surface a retryable result after demotion.
     #[tokio::test]
     async fn outbox_apply_client_respects_leader_gate() {
         let db = crate::datastore::test_support::in_memory().await;
         make_pod(&db).await;
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db), "node-a".to_string(), rx);
-        let trait_obj: &dyn OutboxApplyClient = &client;
+        let trait_obj: &dyn klights_leader_api::LeaderOutboxDelivery = &client;
 
         let err = trait_obj
-            .apply_outbox(
-                "idem-6",
-                OutboxOperation::PodStatus,
-                pod_status_payload(),
-                "client",
-                1,
-                1,
+            .deliver_outbox(
+                klights_leader_api::OutboxDeliveryRequest::try_new(
+                    "idem-6",
+                    klights_leader_api::OutboxDeliveryOperation::PodStatus,
+                    Arc::<[u8]>::from(pod_status_payload().to_vec()),
+                    "client",
+                    1,
+                    1,
+                )
+                .expect("valid delivery request"),
             )
             .await
             .expect_err("non-leader outbox apply must be refused");
@@ -1258,17 +1888,17 @@ mod inner_gate_tests {
         let (_tx, rx) = watch::channel(false);
         let client = LocalApiClient::new(Arc::new(db.clone()), "node-a".to_string(), rx);
 
-        let err = LeaderApiClient::apply_outbox(
-            &client,
-            "n1raft-audit",
-            OutboxOperation::PodStatus,
-            pod_status_payload(),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect_err("non-leader apply_outbox must refuse before reaching N1Raft");
+        let err = client
+            .deliver_test_outbox(
+                "n1raft-audit",
+                OutboxOperation::PodStatus,
+                pod_status_payload(),
+                "client",
+                1,
+                1,
+            )
+            .await
+            .expect_err("non-leader apply_outbox must refuse before reaching N1Raft");
         assert!(matches!(err, OutboxApplyError::Retryable(_)));
 
         // Confirm N1Raft never executed: the Pod's resource_version

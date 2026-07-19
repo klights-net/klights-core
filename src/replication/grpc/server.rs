@@ -10,13 +10,14 @@ use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{ResourcePreconditions, WatchReplayPosition, WatchTarget};
+use crate::kubelet::pod_repository::store::PodStore;
 use crate::metrics::{
     NodeMetricsContainerSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResponse,
 };
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 use crate::replication::grpc::{
-    JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, watch_replay_expired_status,
-    watch_replay_position_from_proto, watch_replay_position_to_proto,
+    JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, resource_command_request_from_proto,
+    watch_replay_expired_status, watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
 use crate::replication::protocol::{
     ExecStreamChannel, FollowerControlMessage, JoinResponse, JoinRole, NodeExecRequest,
@@ -193,8 +194,12 @@ pub fn insert_tonic_tcp_connect_info<B>(
 pub struct GrpcReplicationServer {
     service: Arc<ReplicationService>,
     db: DatastoreHandle,
+    pod_store: Arc<PodStore>,
     controller_dispatcher: Option<Arc<ControllerDispatcher>>,
     node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+    node_self_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
+    node_self_status: Option<Arc<dyn klights_leader_api::LeaderNodeSelfStatus>>,
+    node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
     /// Phase 3 raft RPC dispatcher. Populated by the leader bootstrap
     /// (P3-11c) when raft mode is wired. When None, the three Raft
     /// RPCs respond with `RaftRpcRouterError::Disabled` so the client
@@ -225,11 +230,16 @@ impl GrpcReplicationServer {
         node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     ) -> Self {
         let controlplane_ca_files = ControlplaneCaFiles::new(service.task_supervisor());
+        let pod_store = Arc::new(PodStore::new(db.clone()));
         Self {
             service,
             db,
+            pod_store,
             controller_dispatcher,
             node_lease_tracker,
+            node_self_query: None,
+            node_self_status: None,
+            node_lifecycle_status: None,
             raft_rpc_router: None,
             controlplane_join_handler: None,
             controlplane_ca_files,
@@ -243,6 +253,30 @@ impl GrpcReplicationServer {
     /// transport policy (and let tests shrink it to milliseconds).
     pub fn with_watch_heartbeat_interval(mut self, interval: Duration) -> Self {
         self.watch_heartbeat_interval = interval;
+        self
+    }
+
+    pub fn with_node_query(
+        mut self,
+        query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    ) -> Self {
+        self.node_self_query = Some(query);
+        self
+    }
+
+    pub fn with_node_self_status(
+        mut self,
+        status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus>,
+    ) -> Self {
+        self.node_self_status = Some(status);
+        self
+    }
+
+    pub fn with_node_lifecycle_status(
+        mut self,
+        status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
+    ) -> Self {
+        self.node_lifecycle_status = Some(status);
         self
     }
 
@@ -346,6 +380,29 @@ impl GrpcReplicationServer {
         Ok(())
     }
 
+    fn sample_raft_leadership(
+        &self,
+    ) -> std::result::Result<Option<tokio::sync::watch::Receiver<bool>>, Status> {
+        let Some(mut leadership_rx) = self.is_leader_rx.clone() else {
+            return Ok(None);
+        };
+        if !*leadership_rx.borrow_and_update() {
+            return Err(Status::failed_precondition("not raft leader"));
+        }
+        Ok(Some(leadership_rx))
+    }
+
+    fn require_raft_leadership_unchanged(
+        leadership_rx: Option<&tokio::sync::watch::Receiver<bool>>,
+    ) -> std::result::Result<(), Status> {
+        if leadership_rx.is_some_and(|rx| rx.has_changed().unwrap_or(true)) {
+            return Err(Status::failed_precondition(
+                "raft leadership changed during leader-fresh read",
+            ));
+        }
+        Ok(())
+    }
+
     /// Authenticate a raft consensus RPC (append-entries / vote /
     /// install-snapshot). Raft peers are all control-plane voters. They must
     /// present their node (`system:node:<name>` + `system:nodes`) client
@@ -355,16 +412,25 @@ impl GrpcReplicationServer {
         &self,
         request: &Request<T>,
     ) -> std::result::Result<(), Status> {
+        self.require_controlplane_node_auth(request, "raft consensus RPCs")
+            .await
+    }
+
+    async fn require_controlplane_node_auth<T>(
+        &self,
+        request: &Request<T>,
+        action: &'static str,
+    ) -> std::result::Result<(), Status> {
         let Some(cert) = request
             .extensions()
             .get::<crate::auth::TlsClientCertificate>()
         else {
-            return Err(Status::unauthenticated(
-                "raft RPC requires a node client certificate",
-            ));
+            return Err(Status::unauthenticated(format!(
+                "{action} require a node client certificate"
+            )));
         };
         let user = crate::auth::user_from_cert(&cert.0).map_err(|err| {
-            Status::unauthenticated(format!("invalid raft peer certificate: {err}"))
+            Status::unauthenticated(format!("invalid control-plane node certificate: {err}"))
         })?;
         let identity = crate::auth::AuthenticatedIdentity::client_cert(user.username, user.groups);
         let _node_name = identity
@@ -378,7 +444,7 @@ impl GrpcReplicationServer {
                     .any(|group| group == crate::auth::NODES_GROUP)
             })
             .ok_or_else(|| {
-                Status::unauthenticated("raft peer certificate must be a node identity")
+                Status::unauthenticated("control-plane certificate must be a node identity")
             })?;
 
         // A node client certificate is necessary but NOT sufficient: every
@@ -398,9 +464,9 @@ impl GrpcReplicationServer {
             .iter()
             .any(|group| group == crate::auth::CONTROLPLANE_NODES_GROUP)
         {
-            return Err(Status::permission_denied(
-                "raft consensus RPCs require a system:controlplanes node certificate",
-            ));
+            return Err(Status::permission_denied(format!(
+                "{action} require a system:controlplanes node certificate"
+            )));
         }
         Ok(())
     }
@@ -514,7 +580,12 @@ fn caller_node_authority<T>(request: &Request<T>) -> CallerAuthority {
         return CallerAuthority::Unrestricted;
     };
     let identity = crate::auth::AuthenticatedIdentity::client_cert(user.username, user.groups);
-    let is_node = identity.username.starts_with("system:node:")
+    let is_controlplane = identity
+        .groups
+        .iter()
+        .any(|group| group == crate::auth::CONTROLPLANE_NODES_GROUP);
+    let is_node = !is_controlplane
+        && identity.username.starts_with("system:node:")
         && identity.groups.iter().any(|group| group == "system:nodes");
     if is_node {
         let node = identity
@@ -540,6 +611,51 @@ fn enforce_node_authority(
             "node \"{node}\" may not act for node \"{claimed_node}\""
         ))),
     }
+}
+
+async fn consume_terminal_outbox_sequence_for_rpc(
+    db: &dyn crate::datastore::DatastoreBackend,
+    idempotency_key: &str,
+    operation: crate::kubelet::outbox::payload::OutboxOperation,
+    authenticated_node: &str,
+    watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+) -> std::result::Result<(), Status> {
+    crate::control_plane::client::apply::consume_terminal_outbox_sequence(
+        db,
+        idempotency_key,
+        operation,
+        authenticated_node,
+        watermark,
+    )
+    .await
+    .map_err(|error| {
+        Status::unavailable(format!(
+            "failed to durably consume terminal outbox sequence: {error}"
+        ))
+    })
+}
+
+fn apply_outbox_error_response(
+    error: klights_leader_api::OutboxDeliveryError,
+) -> Response<generated::ApplyOutboxResponse> {
+    let error_type = match &error {
+        klights_leader_api::OutboxDeliveryError::Retryable(_) => "Retryable",
+        klights_leader_api::OutboxDeliveryError::NotFound(_) => "NotFound",
+        klights_leader_api::OutboxDeliveryError::UidMismatch { .. } => "UidMismatch",
+        klights_leader_api::OutboxDeliveryError::ConflictTerminal(_) => "ConflictTerminal",
+        klights_leader_api::OutboxDeliveryError::InvalidRequest { .. } => "InvalidRequest",
+        klights_leader_api::OutboxDeliveryError::NotLeader => "NotLeader",
+        klights_leader_api::OutboxDeliveryError::Timeout => "Timeout",
+        klights_leader_api::OutboxDeliveryError::Cancelled => "Cancelled",
+        klights_leader_api::OutboxDeliveryError::CorruptResponse { .. } => "CorruptResponse",
+        _ => "CorruptResponse",
+    };
+    Response::new(generated::ApplyOutboxResponse {
+        already_applied: false,
+        applied_rv: 0,
+        error: Some(error.to_string()),
+        error_type: Some(error_type.to_string()),
+    })
 }
 
 pub fn mount_service(
@@ -570,6 +686,9 @@ pub fn mount_service_with_controller_dispatcher(
         "",
         None,
         None,
+        None,
+        None,
+        None,
         transport_policy,
     )
 }
@@ -592,6 +711,9 @@ pub fn mount_service_full(
     containerd_namespace: &str,
     is_leader_rx: Option<tokio::sync::watch::Receiver<bool>>,
     local_node_name: Option<String>,
+    node_self_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
+    node_self_status: Option<Arc<dyn klights_leader_api::LeaderNodeSelfStatus>>,
+    node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
     transport_policy: Arc<crate::replication::grpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
     mount_service_full_with_policy(
@@ -605,6 +727,9 @@ pub fn mount_service_full(
         containerd_namespace,
         is_leader_rx,
         local_node_name,
+        node_self_query,
+        node_self_status,
+        node_lifecycle_status,
         transport_policy,
     )
 }
@@ -629,6 +754,9 @@ pub fn mount_service_full_with_policy(
     containerd_namespace: &str,
     is_leader_rx: Option<tokio::sync::watch::Receiver<bool>>,
     local_node_name: Option<String>,
+    node_self_query: Option<Arc<dyn klights_leader_api::LeaderResourceQuery>>,
+    node_self_status: Option<Arc<dyn klights_leader_api::LeaderNodeSelfStatus>>,
+    node_lifecycle_status: Option<Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>>,
     transport_policy: Arc<crate::replication::grpc::transport_policy::GrpcTransportPolicy>,
 ) -> axum::Router {
     let mut grpc = match (controller_dispatcher, node_lease_tracker) {
@@ -660,6 +788,15 @@ pub fn mount_service_full_with_policy(
     }
     if let Some(local_node_name) = local_node_name {
         grpc = grpc.with_local_node_name(local_node_name);
+    }
+    if let Some(query) = node_self_query {
+        grpc = grpc.with_node_query(query);
+    }
+    if let Some(status) = node_self_status {
+        grpc = grpc.with_node_self_status(status);
+    }
+    if let Some(status) = node_lifecycle_status {
+        grpc = grpc.with_node_lifecycle_status(status);
     }
     if let Some(router) = raft_rpc_router {
         grpc = grpc.with_raft_rpc_router(router);
@@ -761,9 +898,18 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 .update_node_dataplane(dataplane.clone())
                 .await
                 .map_err(|err| Status::internal(err.to_string()))?;
-            refresh_node_external_ip_from_dataplane(self.db.as_ref(), &dataplane)
-                .await
-                .map_err(|err| Status::internal(err.to_string()))?;
+            if let (Some(query), Some(status)) = (
+                self.node_self_query.as_deref(),
+                self.node_lifecycle_status.as_deref(),
+            ) {
+                refresh_joining_node_from_dataplane(self.db.as_ref(), query, status, &dataplane)
+                    .await
+                    .map_err(|err| Status::internal(err.to_string()))?;
+            } else {
+                refresh_node_routing_metadata_from_dataplane(self.db.as_ref(), &dataplane)
+                    .await
+                    .map_err(|err| Status::internal(err.to_string()))?;
+            }
         }
         let joined_node_name = dataplane.node_name.clone();
         let (mut control_rx, follower_session) = if accepted {
@@ -781,6 +927,8 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         // names so future Raft work has a tap-in point.
         let db_for_observed_endpoint = self.db.clone();
         let local_node_name_for_observed_endpoint = self.local_node_name.clone();
+        let node_self_query_for_observed_endpoint = self.node_self_query.clone();
+        let node_self_status_for_observed_endpoint = self.node_self_status.clone();
         let _db = self.db.clone();
         let _controller_dispatcher = self.controller_dispatcher.clone();
         let mut entries = if accepted {
@@ -875,9 +1023,18 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                                     }
                                 }
                                 Some(generated::follower_message::Payload::ObservedLeaderEndpoint(observed)) => {
-                                    if let Some(local_node_name) = local_node_name_for_observed_endpoint.as_deref()
+                                    if let (
+                                        Some(local_node_name),
+                                        Some(node_query),
+                                        Some(node_status),
+                                    ) = (
+                                        local_node_name_for_observed_endpoint.as_deref(),
+                                        node_self_query_for_observed_endpoint.as_deref(),
+                                        node_self_status_for_observed_endpoint.as_deref(),
+                                    )
                                         && let Err(err) = refresh_local_node_external_ip_from_observed_endpoint(
-                                            db_for_observed_endpoint.as_ref(),
+                                            node_query,
+                                            node_status,
                                             local_node_name,
                                             &observed.endpoint,
                                         ).await
@@ -1058,36 +1215,35 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         }))
     }
 
-    async fn get_cluster_membership(
-        &self,
-        request: Request<generated::ClusterMembershipRequest>,
-    ) -> std::result::Result<Response<generated::ClusterMembershipResponse>, Status> {
-        self.require_steady_state_auth(&request).await?;
-        let membership = self.service.handle_cluster_membership().await;
-        Ok(Response::new(generated::ClusterMembershipResponse {
-            cluster_id: membership.cluster_id,
-            voters: membership.voters,
-            term: membership.term,
-            leader_hint: membership.leader_hint.unwrap_or_default(),
-        }))
-    }
-
     async fn get_resource(
         &self,
         request: Request<generated::GetResourceRequest>,
     ) -> std::result::Result<Response<generated::GetResourceResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
+        let leadership_rx = self.sample_raft_leadership()?;
         let req = request.into_inner();
+        let query = klights_leader_api::ResourceGetRequest::try_new(
+            klights_types::ResourceKey {
+                api_version: req.api_version,
+                kind: req.kind,
+                namespace: req.namespace,
+                name: req.name,
+            },
+            klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let key = query.key();
         let resource = self
             .db
             .get_resource(
-                &req.api_version,
-                &req.kind,
-                req.namespace.as_deref(),
-                &req.name,
+                &key.api_version,
+                &key.kind,
+                key.namespace.as_deref(),
+                &key.name,
             )
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
+        Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
         Ok(Response::new(match resource {
             Some(resource) => generated::GetResourceResponse {
                 found: true,
@@ -1105,22 +1261,35 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::ListResourcesRequest>,
     ) -> std::result::Result<Response<generated::ListResourcesResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
+        let leadership_rx = self.sample_raft_leadership()?;
         let req = request.into_inner();
+        let query = klights_leader_api::ResourceListRequest::try_new(
+            req.api_version,
+            req.kind,
+            req.namespace,
+            req.label_selector,
+            req.field_selector,
+            req.limit,
+            req.continue_token,
+            klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let list = self
             .db
             .list_resources(
-                &req.api_version,
-                &req.kind,
-                req.namespace.as_deref(),
+                query.api_version(),
+                query.kind(),
+                query.namespace(),
                 crate::datastore::ResourceListQuery::new(
-                    req.label_selector.as_deref(),
-                    req.field_selector.as_deref(),
-                    req.limit,
-                    req.continue_token.as_deref(),
+                    query.label_selector(),
+                    query.field_selector(),
+                    query.limit(),
+                    query.continue_token(),
                 ),
             )
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
+        Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
         let items: Vec<generated::ResourceObject> =
             list.items.iter().map(resource_to_proto).collect();
         Ok(Response::new(generated::ListResourcesResponse {
@@ -1135,6 +1304,23 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         }))
     }
 
+    async fn submit_resource_command(
+        &self,
+        request: Request<generated::SubmitResourceCommandRequest>,
+    ) -> std::result::Result<Response<generated::SubmitResourceCommandResponse>, Status> {
+        self.require_controlplane_node_auth(&request, "resource command submissions")
+            .await?;
+        self.require_raft_leader()?;
+        let request = resource_command_request_from_proto(request.into_inner())
+            .map_err(resource_command_status)?;
+        let result = crate::control_plane::client::local::submit_resource_command_to_store(
+            &self.db, request,
+        )
+        .await
+        .map_err(resource_command_status)?;
+        Ok(Response::new(resource_command_result_to_proto(result)))
+    }
+
     async fn watch_resources(
         &self,
         request: Request<generated::WatchResourcesRequest>,
@@ -1143,8 +1329,20 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         // Issue #4: a worker watch must be served by the current raft leader.
         // Reject establishment on a stale follower so the worker reconnects to
         // the new leader instead of streaming from a deposed node.
-        self.require_raft_leader()?;
+        let leadership_rx = self.sample_raft_leadership()?;
         let req = request.into_inner();
+        klights_leader_api::WatchRequest::try_new(
+            req.api_version.clone(),
+            req.kind.clone(),
+            req.namespace.clone(),
+            req.label_selector.clone(),
+            req.field_selector.clone(),
+            Some(req.start_resource_version),
+            req.start_watch_replay_position
+                .as_ref()
+                .map(watch_replay_position_from_proto),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let topic = crate::watch::WatchTopic::new(&req.api_version, &req.kind);
         // For new peers, the exact position came from the same read snapshot as
         // LIST. For legacy scalar-RV peers, capture a durable high-water mark
@@ -1164,10 +1362,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 .await
                 .map_err(|err| Status::internal(err.to_string()))?;
             WatchReplayPosition::from_resource_version_through_event_id(
-                req.start_resource_version.max(0),
+                req.start_resource_version,
                 anchor.event_id,
             )
         };
+        Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
         // No await is permitted between the durable anchor above and this
         // subscription. Replay closes the anchor->subscribe interval.
         let signal_rx = self.db.subscribe_watch_signals(topic.clone());
@@ -1185,12 +1384,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         // change. Without this a deposed leader's broadcast goes silent and the
         // worker waits up to its ~60s idle watchdog before reconnecting, reading
         // stale informer-cached state in the window.
-        let mut leader_rx = self.is_leader_rx.clone();
+        let mut leader_rx = leadership_rx;
         let stream = async_stream::stream! {
             let mut last_rv = req
                 .start_resource_version
-                .max(replay_position.resource_version)
-                .max(0);
+                .max(replay_position.resource_version);
             let mut cursor = crate::watch::SignalWatchCursor::new_many_at_position(
                 signal_rx,
                 replay_source,
@@ -1299,38 +1497,33 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         self.require_raft_leader()?;
         let caller = caller_node_authority(&request);
         let req = request.into_inner();
-        if let Some(node_name) = req.bound_node_name.as_deref() {
-            enforce_node_authority(&caller, node_name)?;
-        }
-        let token_request = crate::control_plane::client::ProjectedServiceAccountTokenRequest {
-            namespace: req.namespace,
-            service_account_name: req.service_account_name,
-            audiences: req.audiences,
-            expiration_seconds: req.expiration_seconds,
-            bound_pod_name: req.bound_pod_name,
-            bound_pod_uid: req.bound_pod_uid,
-            bound_node_name: req.bound_node_name,
-            bound_node_uid: req.bound_node_uid,
-        };
-        let bound_pod =
-            crate::control_plane::client::local::read_projected_service_account_token_bound_pod(
-                &self.db,
-                &token_request,
+        let token_request =
+            crate::control_plane::client::ProjectedServiceAccountTokenRequest::try_new(
+                req.namespace,
+                req.service_account_name,
+                req.audiences,
+                req.expiration_seconds,
+                req.bound_pod_name.unwrap_or_default(),
+                req.bound_pod_uid.unwrap_or_default(),
+                req.bound_node_name.unwrap_or_default(),
+                req.bound_node_uid,
             )
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(projected_token_error_to_status)?;
+        enforce_node_authority(&caller, token_request.bound_node_name())?;
         let signing_key_pem = self.service_account_signing_key_pem().await?;
         let token =
             crate::control_plane::service_account_tokens::issue_projected_service_account_token(
                 self.db.as_ref(),
+                self.pod_store.as_ref(),
                 &signing_key_pem,
                 &token_request,
-                bound_pod.as_ref(),
             )
             .await
-            .map_err(|err| Status::permission_denied(err.to_string()))?;
+            .map_err(projected_token_error_to_status)?;
         Ok(Response::new(
-            generated::ProjectedServiceAccountTokenResponse { token: token.token },
+            generated::ProjectedServiceAccountTokenResponse {
+                token: token.into_token(),
+            },
         ))
     }
 
@@ -1342,35 +1535,179 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         self.require_raft_leader()?;
         let caller = caller_node_authority(&request);
         let req = request.into_inner();
-        // NodeRestriction: the outbox author must be the calling node.
+        let authenticated_node = match &caller {
+            CallerAuthority::Node(node_name) => node_name.as_str(),
+            CallerAuthority::Unrestricted => {
+                return Err(Status::permission_denied(
+                    "durable outbox delivery requires an authenticated node client certificate",
+                ));
+            }
+        };
+        // NodeRestriction: the legacy wire author must equal the certificate-bound author.
         enforce_node_authority(&caller, &req.authoring_node)?;
-        let operation =
-            crate::kubelet::outbox::payload::OutboxOperation::try_from(req.operation.as_str())
+        let delivery_operation =
+            klights_leader_api::OutboxDeliveryOperation::try_from_wire_name(&req.operation)
                 .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        let payload = bytes::Bytes::from(req.payload_proto);
-        let command_for_side_effects =
-            crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(&payload)
-                .ok()
-                .map(|payload| payload.command);
-        if let Some(command) = command_for_side_effects.as_ref() {
-            crate::control_plane::client::apply::reject_node_author_mismatch(
-                command,
-                &req.authoring_node,
-            )
-            .map_err(|err| Status::permission_denied(err.to_string()))?;
-        }
-        let watermark = crate::control_plane::client::apply::outbox_stream_watermark(
-            &req.client_id,
+        let delivery_request = klights_leader_api::OutboxDeliveryRequest::try_new(
+            req.idempotency_key,
+            delivery_operation,
+            std::sync::Arc::<[u8]>::from(req.payload_proto),
+            req.client_id,
             req.stream_id,
             req.stream_seq,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (idempotency_key, delivery_operation, payload, client_id, stream_id, stream_seq) =
+            delivery_request.into_parts();
+        let operation = delivery_operation.into();
+        let watermark = crate::control_plane::client::apply::outbox_stream_watermark(
+            &client_id, stream_id, stream_seq,
         );
+        let payload = bytes::Bytes::from_owner(payload);
+        let decoded_payload =
+            match crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(&payload) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    consume_terminal_outbox_sequence_for_rpc(
+                        self.db.as_ref(),
+                        &idempotency_key,
+                        operation,
+                        authenticated_node,
+                        watermark.clone(),
+                    )
+                    .await?;
+                    return Ok(apply_outbox_error_response(
+                        klights_leader_api::OutboxDeliveryError::invalid(
+                            "delivery.payload",
+                            format!("invalid outbox payload: {error}"),
+                        ),
+                    ));
+                }
+            };
+        if let Err(error) = crate::control_plane::client::apply::authorize_outbox_command(
+            delivery_operation,
+            &decoded_payload.command,
+            authenticated_node,
+        ) {
+            consume_terminal_outbox_sequence_for_rpc(
+                self.db.as_ref(),
+                &idempotency_key,
+                operation,
+                authenticated_node,
+                watermark.clone(),
+            )
+            .await?;
+            return Ok(apply_outbox_error_response(error));
+        }
+        if delivery_operation == klights_leader_api::OutboxDeliveryOperation::PodMetadata
+            && let Err(error) =
+                crate::control_plane::client::apply::authorize_live_pod_metadata_command(
+                    self.db.as_ref(),
+                    &decoded_payload.command,
+                    authenticated_node,
+                )
+                .await
+        {
+            if error.is_terminal() {
+                consume_terminal_outbox_sequence_for_rpc(
+                    self.db.as_ref(),
+                    &idempotency_key,
+                    operation,
+                    authenticated_node,
+                    watermark.clone(),
+                )
+                .await?;
+                return Ok(apply_outbox_error_response(error));
+            }
+            return Err(Status::unavailable(error.to_string()));
+        }
+        if operation == crate::kubelet::outbox::payload::OutboxOperation::NodeStatus {
+            if let Err(error) = klights_leader_api::NodeSelfStatusRequest::validate_command(
+                &decoded_payload.command,
+            ) {
+                consume_terminal_outbox_sequence_for_rpc(
+                    self.db.as_ref(),
+                    &idempotency_key,
+                    operation,
+                    authenticated_node,
+                    watermark.clone(),
+                )
+                .await?;
+                return Ok(apply_outbox_error_response(
+                    klights_leader_api::OutboxDeliveryError::invalid(
+                        "delivery.payload",
+                        error.to_string(),
+                    ),
+                ));
+            }
+            let crate::datastore::command::StorageCommand::UpdateStatus {
+                name,
+                preconditions,
+                ..
+            } = &decoded_payload.command
+            else {
+                unreachable!("NodeSelfStatusRequest validation admits only UpdateStatus")
+            };
+            if name != authenticated_node {
+                consume_terminal_outbox_sequence_for_rpc(
+                    self.db.as_ref(),
+                    &idempotency_key,
+                    operation,
+                    authenticated_node,
+                    watermark.clone(),
+                )
+                .await?;
+                return Ok(apply_outbox_error_response(
+                    klights_leader_api::OutboxDeliveryError::conflict(format!(
+                        "node {} cannot publish Node status for {name}",
+                        authenticated_node
+                    )),
+                ));
+            }
+            let current = self
+                .db
+                .get_resource("v1", "Node", None, name)
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?;
+            let Some(current) = current else {
+                consume_terminal_outbox_sequence_for_rpc(
+                    self.db.as_ref(),
+                    &idempotency_key,
+                    operation,
+                    authenticated_node,
+                    watermark.clone(),
+                )
+                .await?;
+                return Ok(apply_outbox_error_response(
+                    klights_leader_api::OutboxDeliveryError::not_found(format!(
+                        "v1/Node/{name} not found"
+                    )),
+                ));
+            };
+            if preconditions.uid.as_deref() != Some(current.uid.as_str()) {
+                consume_terminal_outbox_sequence_for_rpc(
+                    self.db.as_ref(),
+                    &idempotency_key,
+                    operation,
+                    authenticated_node,
+                    watermark.clone(),
+                )
+                .await?;
+                return Ok(apply_outbox_error_response(
+                    klights_leader_api::OutboxDeliveryError::uid_mismatch(
+                        preconditions.uid.clone().unwrap_or_default(),
+                        current.uid,
+                    ),
+                ));
+            }
+        }
         let result =
             crate::control_plane::client::apply::apply_outbox_to_local_leader_with_resource(
                 self.db.as_ref(),
-                &req.idempotency_key,
+                &idempotency_key,
                 operation,
                 payload,
-                &req.authoring_node,
+                authenticated_node,
                 watermark,
             )
             .await;
@@ -1378,17 +1715,16 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
             Ok(crate::control_plane::client::apply::LocalOutboxApply {
                 result: crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv },
                 resource,
+                command: Some(command),
                 ..
             }) => {
-                if let Some(command) = command_for_side_effects.as_ref() {
-                    crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
-                        self.controller_dispatcher.as_ref(),
-                        command,
-                        resource.as_ref(),
-                        self.db.as_ref(),
-                    )
-                    .await;
-                }
+                crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
+                    self.controller_dispatcher.as_ref(),
+                    &command,
+                    resource.as_ref(),
+                    self.db.as_ref(),
+                )
+                .await;
                 Ok(Response::new(generated::ApplyOutboxResponse {
                     already_applied: false,
                     applied_rv,
@@ -1396,6 +1732,15 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     error_type: None,
                 }))
             }
+            Ok(crate::control_plane::client::apply::LocalOutboxApply {
+                result: crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv },
+                ..
+            }) => Ok(Response::new(generated::ApplyOutboxResponse {
+                already_applied: false,
+                applied_rv,
+                error: None,
+                error_type: None,
+            })),
             Ok(crate::control_plane::client::apply::LocalOutboxApply {
                 result: crate::kubelet::outbox::OutboxApplyResult::AlreadyApplied { applied_rv },
                 ..
@@ -1405,22 +1750,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 error: None,
                 error_type: None,
             })),
-            Err(err) => {
-                let error_type = match &err {
-                    crate::kubelet::outbox::OutboxApplyError::Retryable(_) => "Retryable",
-                    crate::kubelet::outbox::OutboxApplyError::NotFound(_) => "NotFound",
-                    crate::kubelet::outbox::OutboxApplyError::UidMismatch { .. } => "UidMismatch",
-                    crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(_) => {
-                        "ConflictTerminal"
-                    }
-                };
-                Ok(Response::new(generated::ApplyOutboxResponse {
-                    already_applied: false,
-                    applied_rv: 0,
-                    error: Some(err.to_string()),
-                    error_type: Some(error_type.to_string()),
-                }))
-            }
+            Err(err) => Ok(apply_outbox_error_response(err)),
         }
     }
 
@@ -1434,6 +1764,11 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         let req = request.into_inner();
         // NodeRestriction: a node may only renew its own lease.
         enforce_node_authority(&caller, &req.node_name)?;
+        if req.lease_duration_seconds <= 0 {
+            return Err(Status::invalid_argument(
+                "lease_duration_seconds must be positive",
+            ));
+        }
         validate_node_lease_renew_time_skew(&req.renew_time, chrono::Utc::now())?;
         self.node_lease_tracker
             .record_from_lease_object(
@@ -1445,11 +1780,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                     },
                     "spec": {
                         "holderIdentity": req.node_name,
-                        "leaseDurationSeconds": if req.lease_duration_seconds > 0 {
-                            req.lease_duration_seconds
-                        } else {
-                            crate::node_lease_tracker::DEFAULT_NODE_LEASE_DURATION_SECONDS
-                        },
+                        "leaseDurationSeconds": req.lease_duration_seconds,
                         "renewTime": req.renew_time
                     }
                 }),
@@ -1465,17 +1796,32 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
     ) -> std::result::Result<Response<generated::NodeSubnetResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
         self.require_raft_leader()?;
-        // NOTE: subnet allocation is intentionally NOT node-restricted — the
-        // overlay controller legitimately allocates subnets for peer nodes
-        // (see controllers/node_subnet.rs), so this is not a per-node-self RPC.
+        let authority = caller_node_authority(&request);
         let req = request.into_inner();
+        enforce_node_authority(&authority, &req.node_name)?;
+        let focused_request = klights_leader_api::NodeSubnetAllocationRequest::try_new(
+            req.node_name,
+            req.cluster_cidr,
+            &req.node_ip,
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let (node_name, cluster_cidr, node_ip) = focused_request.into_parts();
         let subnet = self
             .db
-            .allocate_node_subnet(&req.node_name, &req.cluster_cidr, &req.node_ip)
+            .allocate_node_subnet(&node_name, &cluster_cidr, &node_ip.to_string())
             .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+            .map_err(|error| {
+                let message = error.to_string();
+                if crate::control_plane::client::node_subnet_allocation_is_exhausted(&message) {
+                    Status::resource_exhausted(message)
+                } else if message.to_ascii_lowercase().contains("conflict") {
+                    Status::aborted(message)
+                } else {
+                    Status::internal(message)
+                }
+            })?;
         Ok(Response::new(generated::NodeSubnetResponse {
-            subnet: Some(node_subnet_to_proto(subnet)),
+            subnet: Some(node_subnet_to_proto(subnet)?),
         }))
     }
 
@@ -1484,16 +1830,19 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::GetNodeSubnetRequest>,
     ) -> std::result::Result<Response<generated::GetNodeSubnetResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
+        self.require_raft_leader()?;
         let req = request.into_inner();
+        let query = klights_leader_api::NodeSubnetQuery::try_new(req.node_name)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let subnet = self
             .db
-            .get_node_subnet(&req.node_name)
+            .get_node_subnet(query.node_name())
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(match subnet {
             Some(subnet) => generated::GetNodeSubnetResponse {
                 found: true,
-                subnet: Some(node_subnet_to_proto(subnet)),
+                subnet: Some(node_subnet_to_proto(subnet)?),
             },
             None => generated::GetNodeSubnetResponse {
                 found: false,
@@ -1507,14 +1856,24 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::ListPeerSubnetsRequest>,
     ) -> std::result::Result<Response<generated::ListPeerSubnetsResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
+        self.require_raft_leader()?;
         let req = request.into_inner();
+        let query = klights_leader_api::PeerSubnetsQuery::try_new(req.my_node_name)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let items = self
             .db
-            .list_peer_subnets(&req.my_node_name)
+            .list_peer_subnets(query.node_name())
             .await
             .map_err(|err| Status::internal(err.to_string()))?
             .into_iter()
-            .map(node_subnet_to_proto)
+            .map(crate::control_plane::client::focused_node_subnet)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let items = klights_leader_api::PeerSubnetsResult::try_new(query.node_name(), items)
+            .map_err(|error| Status::internal(error.to_string()))?
+            .into_vec()
+            .into_iter()
+            .map(focused_node_subnet_to_proto)
             .collect();
         Ok(Response::new(generated::ListPeerSubnetsResponse { items }))
     }
@@ -1524,16 +1883,19 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::GetNodeDataplaneRequest>,
     ) -> std::result::Result<Response<generated::GetNodeDataplaneResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
+        self.require_raft_leader()?;
         let req = request.into_inner();
+        let query = klights_leader_api::NodeDataplaneQuery::try_new(req.node_name)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let metadata = self
             .db
-            .get_node_dataplane(&req.node_name)
+            .get_node_dataplane(query.node_name())
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(match metadata {
             Some(metadata) => generated::GetNodeDataplaneResponse {
                 found: true,
-                metadata: Some(dataplane_metadata_to_proto(metadata)),
+                metadata: Some(dataplane_metadata_to_proto(metadata)?),
             },
             None => generated::GetNodeDataplaneResponse {
                 found: false,
@@ -1585,15 +1947,26 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
     ) -> std::result::Result<Response<generated::ListPodCleanupIntentsForNodeResponse>, Status>
     {
         self.require_steady_state_auth(&request).await?;
+        self.require_raft_leader()?;
+        let caller = caller_node_authority(&request);
         let req = request.into_inner();
+        let request =
+            crate::control_plane::client::PodCleanupIntentListRequest::try_new(req.node_name)
+                .map_err(pod_cleanup_intent_error_to_status)?;
+        enforce_node_authority(&caller, request.node_name())?;
         let items = self
             .db
-            .list_pod_cleanup_intents_for_node(&req.node_name)
+            .list_pod_cleanup_intents_for_node(request.node_name())
             .await
-            .map_err(|err| Status::internal(err.to_string()))?
+            .map_err(|error| Status::internal(error.to_string()))?
             .into_iter()
-            .map(pod_cleanup_intent_to_proto)
-            .collect();
+            .map(crate::control_plane::client::local::focused_pod_cleanup_intent)
+            .map(|intent| {
+                intent
+                    .map_err(pod_cleanup_intent_error_to_status)
+                    .and_then(pod_cleanup_intent_to_proto)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Response::new(
             generated::ListPodCleanupIntentsForNodeResponse { items },
         ))
@@ -1604,18 +1977,22 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         request: Request<generated::DeletePodCleanupIntentRequest>,
     ) -> std::result::Result<Response<generated::DeletePodCleanupIntentResponse>, Status> {
         self.require_steady_state_auth(&request).await?;
+        self.require_raft_leader()?;
         let caller = caller_node_authority(&request);
         let req = request.into_inner();
+        let request = crate::control_plane::client::PodCleanupIntentAckRequest::try_new(
+            req.node_name,
+            req.namespace,
+            req.pod_name,
+            req.pod_uid,
+            req.reason,
+        )
+        .map_err(pod_cleanup_intent_error_to_status)?;
         // NodeRestriction: a node may only clear its own pod cleanup intents.
-        enforce_node_authority(&caller, &req.node_name)?;
+        enforce_node_authority(&caller, request.node_name())?;
+        let (node_name, namespace, pod_name, pod_uid, reason) = request.into_parts();
         self.db
-            .delete_pod_cleanup_intent(
-                &req.node_name,
-                &req.namespace,
-                &req.pod_name,
-                &req.pod_uid,
-                &req.reason,
-            )
+            .delete_pod_cleanup_intent(&node_name, &namespace, &pod_name, &pod_uid, &reason)
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(Response::new(generated::DeletePodCleanupIntentResponse {}))
@@ -1979,6 +2356,45 @@ where
 }
 
 fn resource_to_proto(resource: &crate::datastore::Resource) -> generated::ResourceObject {
+    let mut data = (*resource.data).clone();
+    if let Some(root) = data.as_object_mut() {
+        root.insert(
+            "apiVersion".to_string(),
+            serde_json::Value::String(resource.api_version.clone()),
+        );
+        root.insert(
+            "kind".to_string(),
+            serde_json::Value::String(resource.kind.clone()),
+        );
+        let metadata = root
+            .entry("metadata".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(metadata) = metadata.as_object_mut() {
+            metadata.insert(
+                "name".to_string(),
+                serde_json::Value::String(resource.name.clone()),
+            );
+            match &resource.namespace {
+                Some(namespace) => {
+                    metadata.insert(
+                        "namespace".to_string(),
+                        serde_json::Value::String(namespace.clone()),
+                    );
+                }
+                None => {
+                    metadata.remove("namespace");
+                }
+            }
+            metadata.insert(
+                "uid".to_string(),
+                serde_json::Value::String(resource.uid.clone()),
+            );
+            metadata.insert(
+                "resourceVersion".to_string(),
+                serde_json::Value::String(resource.resource_version.to_string()),
+            );
+        }
+    }
     generated::ResourceObject {
         api_version: resource.api_version.clone(),
         kind: resource.kind.clone(),
@@ -1986,48 +2402,157 @@ fn resource_to_proto(resource: &crate::datastore::Resource) -> generated::Resour
         name: resource.name.clone(),
         uid: resource.uid.clone(),
         resource_version: resource.resource_version,
-        data_json: serde_json::to_vec(&resource.data).unwrap_or_default(),
+        data_json: serde_json::to_vec(&data).unwrap_or_default(),
     }
 }
 
-fn node_subnet_to_proto(subnet: crate::datastore::NodeSubnet) -> generated::NodeSubnetObject {
-    let forwarded: crate::replication::protocol::ForwardedNodeSubnet = subnet.into();
+fn resource_command_result_to_proto(
+    result: klights_leader_api::ResourceCommandResult,
+) -> generated::SubmitResourceCommandResponse {
+    use generated::submit_resource_command_response::Result as WireResult;
+    let result = match result {
+        klights_leader_api::ResourceCommandResult::Resource(resource) => {
+            WireResult::Resource(resource_to_proto(&resource))
+        }
+        klights_leader_api::ResourceCommandResult::Ack { resource_version } => {
+            WireResult::Ack(generated::ResourceCommandAck { resource_version })
+        }
+    };
+    generated::SubmitResourceCommandResponse {
+        result: Some(result),
+    }
+}
+
+fn resource_command_status(error: klights_leader_api::ResourceCommandError) -> Status {
+    use klights_leader_api::ResourceCommandError;
+    match error {
+        ResourceCommandError::InvalidRequest { .. }
+        | ResourceCommandError::UnsupportedCommand { .. } => {
+            Status::invalid_argument(error.to_string())
+        }
+        ResourceCommandError::PodDeletionForbidden | ResourceCommandError::Unauthorized => {
+            Status::permission_denied(error.to_string())
+        }
+        ResourceCommandError::NotLeader => Status::failed_precondition(error.to_string()),
+        ResourceCommandError::Conflict { .. } => Status::aborted(error.to_string()),
+        ResourceCommandError::NotFound { .. } => Status::not_found(error.to_string()),
+        ResourceCommandError::Retryable { .. } => Status::unavailable(error.to_string()),
+        ResourceCommandError::Timeout => Status::deadline_exceeded(error.to_string()),
+        ResourceCommandError::Cancelled => Status::cancelled(error.to_string()),
+        ResourceCommandError::SubmissionFailed { .. }
+        | ResourceCommandError::CorruptResponse { .. } => Status::internal(error.to_string()),
+        _ => Status::internal("unknown resource command error"),
+    }
+}
+
+fn node_subnet_to_proto(
+    subnet: crate::datastore::NodeSubnet,
+) -> std::result::Result<generated::NodeSubnetObject, Status> {
+    crate::control_plane::client::focused_node_subnet(subnet)
+        .map(focused_node_subnet_to_proto)
+        .map_err(|error| Status::internal(error.to_string()))
+}
+
+fn focused_node_subnet_to_proto(
+    subnet: klights_leader_api::NodeSubnet,
+) -> generated::NodeSubnetObject {
     generated::NodeSubnetObject {
-        node_name: forwarded.node_name,
-        subnet: forwarded.subnet,
-        subnet_base_int: forwarded.subnet_base_int,
-        gateway_ip: forwarded.gateway_ip,
-        node_ip: forwarded.node_ip,
-        mode: forwarded.mode,
-        hostport_range: forwarded.hostport_range,
+        node_name: subnet.node_name().to_string(),
+        subnet: subnet.subnet().to_string(),
+        subnet_base_int: subnet.subnet_base_int(),
+        gateway_ip: subnet.gateway_ip().to_string(),
+        node_ip: subnet.node_ip().to_string(),
+        mode: match subnet.mode() {
+            klights_leader_api::NetworkNodeMode::Root => "root",
+            klights_leader_api::NetworkNodeMode::Rootless => "rootless",
+        }
+        .to_string(),
+        hostport_range: subnet.hostport_range().map(|range| range.to_string()),
     }
 }
 
 fn dataplane_metadata_to_proto(
     metadata: DataplanePeerMetadata,
-) -> generated::DataplaneMetadataObject {
-    generated::DataplaneMetadataObject {
-        node_name: metadata.node_name,
-        mode: metadata.mode.as_str().to_string(),
-        encryption: metadata.encryption.as_str().to_string(),
-        public_key: metadata.public_key.map(|key| key.to_string()),
-        endpoint: metadata.endpoint.to_string(),
-        port: metadata.port.map(u32::from),
-    }
+) -> std::result::Result<generated::DataplaneMetadataObject, Status> {
+    let metadata = crate::control_plane::client::focused_dataplane(metadata)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    Ok(generated::DataplaneMetadataObject {
+        node_name: metadata.node_name().to_string(),
+        mode: match metadata.mode() {
+            klights_leader_api::NetworkNodeMode::Root => "root",
+            klights_leader_api::NetworkNodeMode::Rootless => "rootless",
+        }
+        .to_string(),
+        encryption: match metadata.encryption() {
+            klights_leader_api::DataplaneEncryption::WireGuard => "enabled",
+            klights_leader_api::DataplaneEncryption::Direct => "disabled",
+        }
+        .to_string(),
+        public_key: metadata.public_key().map(str::to_owned),
+        endpoint: metadata.endpoint().to_string(),
+        port: metadata.port().map(u32::from),
+    })
 }
 
 fn pod_cleanup_intent_to_proto(
-    intent: crate::datastore::PodCleanupIntent,
-) -> generated::PodCleanupIntentObject {
-    generated::PodCleanupIntentObject {
-        node_name: intent.node_name,
-        namespace: intent.namespace,
-        pod_name: intent.pod_name,
-        pod_uid: intent.pod_uid,
-        reason: intent.reason,
-        resource_version: intent.resource_version,
-        created_at_ms: intent.created_at_ms,
-        pod_data_json: serde_json::to_vec(&intent.pod_data).unwrap_or_default(),
+    intent: crate::control_plane::client::PodCleanupIntent,
+) -> std::result::Result<generated::PodCleanupIntentObject, Status> {
+    let (node_name, namespace, pod_name, pod_uid, reason, resource_version, created_at_ms, pod) =
+        intent.into_parts();
+    let pod_data_json = serde_json::to_vec(pod.data.as_ref()).map_err(|error| {
+        pod_cleanup_intent_error_to_status(
+            crate::control_plane::client::PodCleanupIntentError::corrupt_intent(format!(
+                "encode Pod cleanup intent snapshot for {namespace}/{pod_name} uid={pod_uid}: {error}"
+            )),
+        )
+    })?;
+    Ok(generated::PodCleanupIntentObject {
+        node_name,
+        namespace,
+        pod_name,
+        pod_uid,
+        reason,
+        resource_version,
+        created_at_ms,
+        pod_data_json,
+    })
+}
+
+fn projected_token_error_to_status(
+    error: crate::control_plane::client::ProjectedServiceAccountTokenError,
+) -> Status {
+    use crate::control_plane::client::ProjectedServiceAccountTokenError as Error;
+    let message = error.to_string();
+    match error {
+        Error::InvalidRequest { .. } => Status::invalid_argument(message),
+        Error::NotLeader => Status::failed_precondition("not raft leader"),
+        Error::Unauthorized | Error::BindingMismatch { .. } => Status::permission_denied(message),
+        Error::ServiceAccountNotFound | Error::BoundPodNotFound | Error::BoundNodeNotFound => {
+            Status::not_found(message)
+        }
+        Error::CorruptResource { .. } | Error::CorruptResponse { .. } => Status::data_loss(message),
+        Error::SigningFailed { .. } => Status::failed_precondition(message),
+        Error::Unavailable { .. } | Error::Transport { .. } => Status::unavailable(message),
+        Error::Timeout => Status::deadline_exceeded(message),
+        Error::Cancelled => Status::cancelled(message),
+        _ => Status::internal(message),
+    }
+}
+
+fn pod_cleanup_intent_error_to_status(
+    error: crate::control_plane::client::PodCleanupIntentError,
+) -> Status {
+    use crate::control_plane::client::PodCleanupIntentError as Error;
+    let message = error.to_string();
+    match error {
+        Error::InvalidRequest { .. } => Status::invalid_argument(message),
+        Error::NotLeader => Status::failed_precondition("not raft leader"),
+        Error::Unauthorized => Status::permission_denied(message),
+        Error::CorruptIntent { .. } => Status::data_loss(message),
+        Error::Unavailable { .. } | Error::Transport { .. } => Status::unavailable(message),
+        Error::Timeout => Status::deadline_exceeded(message),
+        Error::Cancelled => Status::cancelled(message),
+        _ => Status::internal(message),
     }
 }
 
@@ -2130,22 +2655,15 @@ fn selector_may_change_membership(req: &generated::WatchResourcesRequest) -> boo
     })
 }
 
-/// Complete when the raft leadership signal reports this node is no longer the
-/// leader (or its sender is dropped). Used by the gRPC watch stream loop
-/// (`watch_resources`) to terminate promptly on a leadership change. Checks the
-/// current value first, then awaits the next change. `watch::Receiver::changed`
-/// is cancel-safe, so polling this inside a `select!` each loop iteration (and
-/// dropping the pending future when the broadcast recv wins) loses no
-/// transition: the next iteration re-checks the current value.
+/// Complete on any raft leadership-signal version change (or when its sender is
+/// dropped). Even a demote/promote flap invalidates the leader-fresh watch
+/// sample. `watch::Receiver::changed` is cancel-safe, so dropping the pending
+/// future when the broadcast receive wins loses no transition.
 async fn watch_leadership_lost(leader_rx: &mut tokio::sync::watch::Receiver<bool>) {
     if !*leader_rx.borrow() {
         return;
     }
-    while leader_rx.changed().await.is_ok() {
-        if !*leader_rx.borrow() {
-            return;
-        }
-    }
+    let _ = leader_rx.changed().await;
 }
 
 fn watch_target_for_request(req: &generated::WatchResourcesRequest) -> WatchTarget {
@@ -2181,10 +2699,23 @@ fn watch_delivery_scope_for_request(
     }
 }
 
-async fn refresh_node_external_ip_from_dataplane(
+async fn refresh_joining_node_from_dataplane(
+    db: &dyn DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
+    dataplane: &DataplanePeerMetadata,
+) -> Result<()> {
+    refresh_node_routing_metadata_from_dataplane(db, dataplane).await?;
+    publish_joining_node_external_ip(query, node_status, dataplane).await
+}
+
+async fn refresh_node_routing_metadata_from_dataplane(
     db: &dyn DatastoreBackend,
     dataplane: &DataplanePeerMetadata,
 ) -> Result<()> {
+    // Registration/dataplane projection only: this full-object CAS stamps
+    // routing metadata but deliberately does not mutate Node status. ExternalIP
+    // is published separately through the exact UID+RV status capability.
     let Some(resource) = db
         .get_resource("v1", "Node", None, &dataplane.node_name)
         .await?
@@ -2192,7 +2723,7 @@ async fn refresh_node_external_ip_from_dataplane(
         return Ok(());
     };
     let mut data = (*resource.data).clone();
-    if !crate::kubelet::node::stamp_node_routing_metadata_and_external_ip_from_store(
+    if !crate::kubelet::node::stamp_node_routing_metadata_from_store(
         db,
         &dataplane.node_name,
         &mut data,
@@ -2213,8 +2744,48 @@ async fn refresh_node_external_ip_from_dataplane(
     Ok(())
 }
 
+async fn publish_joining_node_external_ip(
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
+    dataplane: &DataplanePeerMetadata,
+) -> Result<()> {
+    let get = klights_leader_api::node_get_request(
+        &dataplane.node_name,
+        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+    )?;
+    let Some(resource) = query.get_resource(get).await? else {
+        return Ok(());
+    };
+    let mut data = (*resource.data).clone();
+    if !crate::kubelet::node::set_node_external_ip(&mut data, &dataplane.endpoint.to_string()) {
+        return Ok(());
+    }
+    let status = data
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let request = klights_leader_api::NodeLifecycleStatusRequest::try_new(
+        crate::datastore::command::StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: dataplane.node_name.clone(),
+            status,
+            expected_rv: Some(resource.resource_version),
+            preconditions: ResourcePreconditions::uid_and_resource_version(
+                resource.uid,
+                resource.resource_version,
+            ),
+            observed_status_stamp: None,
+        },
+    )?;
+    node_status.submit_node_lifecycle_status(request).await?;
+    Ok(())
+}
+
 async fn refresh_local_node_external_ip_from_observed_endpoint(
-    db: &dyn DatastoreBackend,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    node_status: &dyn klights_leader_api::LeaderNodeSelfStatus,
     node_name: &str,
     endpoint: &str,
 ) -> Result<()> {
@@ -2225,8 +2796,9 @@ async fn refresh_local_node_external_ip_from_observed_endpoint(
     let endpoint_ip = endpoint
         .parse::<std::net::IpAddr>()
         .with_context(|| format!("observed leader endpoint must be an IP address: {endpoint}"))?;
-    crate::kubelet::node::update_existing_node_external_ip_if_changed(
-        db,
+    crate::kubelet::node::publish_node_external_ip_if_changed(
+        query,
+        node_status,
         node_name,
         &endpoint_ip.to_string(),
     )
@@ -2467,9 +3039,7 @@ mod tests {
         ControlplaneJoinHandler, ControlplaneJoinOutcome, RaftRpcRouterError,
     };
     use crate::replication::grpc::{
-        generated::{
-            self, ClusterMembershipRequest, JoinRequest, JoinRole, MetadataRequest, SnapshotRequest,
-        },
+        generated::{self, JoinRequest, JoinRole, MetadataRequest, SnapshotRequest},
         server::validate_join_metadata,
     };
     use crate::replication::protocol::ReplicationEntry;
@@ -2480,6 +3050,72 @@ mod tests {
         ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
         server_reflection_request, server_reflection_response,
     };
+
+    #[test]
+    fn resource_proto_body_uses_authoritative_identity_and_resource_version() {
+        let resource = crate::datastore::Resource {
+            id: 7,
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "canonical".to_string(),
+            uid: "uid-canonical".to_string(),
+            resource_version: 42,
+            data: Arc::new(serde_json::json!({
+                "apiVersion": "stale/v1",
+                "kind": "Stale",
+                "metadata": {
+                    "namespace": "stale",
+                    "name": "stale",
+                    "uid": "uid-stale"
+                }
+            })),
+        };
+
+        let wire = super::resource_to_proto(&resource);
+        let body: serde_json::Value =
+            serde_json::from_slice(&wire.data_json).expect("resource JSON");
+        assert_eq!(body["apiVersion"], "v1");
+        assert_eq!(body["kind"], "ConfigMap");
+        assert_eq!(body["metadata"]["namespace"], "default");
+        assert_eq!(body["metadata"]["name"], "canonical");
+        assert_eq!(body["metadata"]["uid"], "uid-canonical");
+        assert_eq!(body["metadata"]["resourceVersion"], "42");
+    }
+
+    #[derive(Default)]
+    struct RecordingNodeLifecycleStatus {
+        requests: Mutex<Vec<klights_leader_api::NodeLifecycleStatusRequest>>,
+    }
+
+    impl RecordingNodeLifecycleStatus {
+        fn take_request(&self) -> klights_leader_api::NodeLifecycleStatusRequest {
+            self.requests
+                .lock()
+                .expect("recording Node lifecycle status mutex poisoned")
+                .pop()
+                .expect("one Node lifecycle status request")
+        }
+    }
+
+    impl klights_leader_api::LeaderNodeLifecycleStatus for RecordingNodeLifecycleStatus {
+        fn submit_node_lifecycle_status(
+            &self,
+            request: klights_leader_api::NodeLifecycleStatusRequest,
+        ) -> klights_leader_api::NodeLifecycleStatusFuture<
+            '_,
+            klights_leader_api::NodeLifecycleStatusResult,
+        > {
+            let resource_version = request.resource_version() + 1;
+            self.requests
+                .lock()
+                .expect("recording Node lifecycle status mutex poisoned")
+                .push(request);
+            Box::pin(async move {
+                Ok(klights_leader_api::NodeLifecycleStatusResult::Updated { resource_version })
+            })
+        }
+    }
 
     #[test]
     fn node_lease_renew_time_skew_allows_100_seconds_but_rejects_101() {
@@ -2737,6 +3373,11 @@ mod tests {
             .unwrap();
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let node_status = Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+            db.clone(),
+            "test-leader".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
         let app = super::mount_service_full(
             axum::Router::new(),
             service.clone(),
@@ -2748,6 +3389,9 @@ mod tests {
             "",
             None,
             None,
+            Some(node_status.clone()),
+            None,
+            Some(node_status),
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2817,6 +3461,9 @@ mod tests {
             None,
             None,
             "",
+            None,
+            None,
+            None,
             None,
             None,
             policy,
@@ -3372,6 +4019,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_get_and_list_reject_non_leader_and_raw_invalid_requests() {
+        let (follower, _leader_tx) = grpc_leader_server(false).await;
+        let get = generated::GetResourceRequest {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web".to_string(),
+        };
+        let list = generated::ListResourcesRequest {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            label_selector: None,
+            field_selector: None,
+            limit: None,
+            continue_token: None,
+        };
+        assert_eq!(
+            follower
+                .get_resource(request_with_node_client_cert(get.clone(), "worker-1"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            follower
+                .list_resources(request_with_node_client_cert(list, "worker-1"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        let (leader, _leader_tx) = grpc_leader_server(true).await;
+        let mut invalid_get = get;
+        invalid_get.api_version.clear();
+        assert_eq!(
+            leader
+                .get_resource(request_with_node_client_cert(invalid_get, "worker-1"))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+        let mut invalid_watch = watch_pods_request();
+        invalid_watch.start_resource_version = -1;
+        assert_eq!(
+            leader
+                .watch_resources(request_with_node_client_cert(invalid_watch, "worker-1"))
+                .await
+                .err()
+                .expect("negative watch cursor must be rejected")
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn network_topology_queries_reject_non_leader() {
+        let (grpc, _leader_tx) = grpc_leader_server(false).await;
+        let rejected = grpc
+            .get_node_subnet(request_with_node_client_cert(
+                generated::GetNodeSubnetRequest {
+                    node_name: "worker-1".to_string(),
+                },
+                "worker-1",
+            ))
+            .await
+            .expect_err("a non-leader must reject topology queries");
+        assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn node_certificate_may_allocate_subnet_only_for_itself() {
+        let (grpc, _leader_tx) = grpc_leader_server(true).await;
+        let status = grpc
+            .allocate_node_subnet(request_with_node_client_cert(
+                generated::AllocateNodeSubnetRequest {
+                    node_name: "worker-2".to_string(),
+                    cluster_cidr: "10.42.0.0/16".to_string(),
+                    node_ip: "192.0.2.22".to_string(),
+                },
+                "worker-1",
+            ))
+            .await
+            .expect_err("a worker node must not allocate a peer subnet");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn controlplane_certificate_may_allocate_peer_subnet() {
+        let (grpc, _leader_tx) = grpc_leader_server(true).await;
+        let response = grpc
+            .allocate_node_subnet(request_with_controlplane_client_cert(
+                generated::AllocateNodeSubnetRequest {
+                    node_name: "worker-2".to_string(),
+                    cluster_cidr: "10.42.0.0/16".to_string(),
+                    node_ip: "192.0.2.22".to_string(),
+                },
+                "controlplane-1",
+            ))
+            .await
+            .expect("control-plane authority may allocate a peer subnet")
+            .into_inner();
+        let subnet = response.subnet.expect("allocation payload");
+        assert_eq!(subnet.node_name, "worker-2");
+        assert_eq!(subnet.subnet, "10.42.0.0/24");
+    }
+
+    #[tokio::test]
+    async fn subnet_exhaustion_maps_to_resource_exhausted() {
+        let (grpc, _leader_tx) = grpc_leader_server(true).await;
+        for node_name in ["worker-1", "worker-2"] {
+            let result = grpc
+                .allocate_node_subnet(request_with_controlplane_client_cert(
+                    generated::AllocateNodeSubnetRequest {
+                        node_name: node_name.to_string(),
+                        cluster_cidr: "10.42.0.0/24".to_string(),
+                        node_ip: "192.0.2.22".to_string(),
+                    },
+                    "controlplane-1",
+                ))
+                .await;
+            if node_name == "worker-1" {
+                result.expect("the only /24 must be allocated");
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("the second allocation must exhaust the CIDR")
+                        .code(),
+                    tonic::Code::ResourceExhausted
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn watch_resources_terminates_promptly_on_leadership_loss() {
         use futures::StreamExt;
         let (grpc, leader_tx) = grpc_leader_server(true).await;
@@ -3727,6 +4512,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_resource_command_rejects_worker_certificate_before_decode() {
+        let grpc = raft_test_server().await;
+        let status = grpc
+            .submit_resource_command(request_with_node_client_cert(
+                generated::SubmitResourceCommandRequest {
+                    command_protobuf: Vec::new(),
+                },
+                "worker-a",
+            ))
+            .await
+            .expect_err("worker identity must not submit generic resource commands");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn submit_resource_command_rejects_follower_before_decode() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let grpc = raft_test_server().await.with_leader_gate(rx);
+        let status = grpc
+            .submit_resource_command(request_with_controlplane_client_cert(
+                generated::SubmitResourceCommandRequest {
+                    command_protobuf: Vec::new(),
+                },
+                "cp2",
+            ))
+            .await
+            .expect_err("follower must reject before decoding or mutating");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn submit_resource_command_rejects_generic_pod_hard_delete() {
+        let grpc = raft_test_server().await;
+        let command = crate::datastore::command::StorageCommand::DeleteResource {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web".to_string(),
+            preconditions: crate::datastore::ResourcePreconditions::uid("pod-uid"),
+        };
+        let status = grpc
+            .submit_resource_command(request_with_controlplane_client_cert(
+                generated::SubmitResourceCommandRequest {
+                    command_protobuf: crate::datastore::command::encode_command_protobuf(&command)
+                        .expect("encode command"),
+                },
+                "cp1",
+            ))
+            .await
+            .expect_err("generic Pod hard delete must fail closed");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn submit_resource_command_accepts_controlplane_create() {
+        let grpc = raft_test_server().await;
+        let command = crate::datastore::command::StorageCommand::CreateResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+            namespace: Some("default".to_string()),
+            name: "settings".to_string(),
+            data: serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"namespace": "default", "name": "settings"}
+            }),
+        };
+        let response = grpc
+            .submit_resource_command(request_with_controlplane_client_cert(
+                generated::SubmitResourceCommandRequest {
+                    command_protobuf: crate::datastore::command::encode_command_protobuf(&command)
+                        .expect("encode command"),
+                },
+                "cp1",
+            ))
+            .await
+            .expect("control-plane create")
+            .into_inner();
+        assert!(matches!(
+            response.result,
+            Some(generated::submit_resource_command_response::Result::Resource(resource))
+                if resource.kind == "ConfigMap" && resource.name == "settings"
+        ));
+    }
+
+    #[tokio::test]
     async fn raft_append_entries_rejects_bootstrap_token() {
         let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
@@ -3878,6 +4749,363 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_effect_rpc_rejects_nonpositive_lease_duration_before_tracker_mutation() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let grpc =
+            super::GrpcReplicationServer::new_with_node_lease_tracker(service, db, tracker.clone());
+
+        for duration in [0, -1] {
+            let status = grpc
+                .renew_node_lease(request_with_node_client_cert(
+                    generated::RenewNodeLeaseRequest {
+                        node_name: "worker-1".to_string(),
+                        renew_time: crate::utils::k8s_time_format(chrono::Utc::now()),
+                        lease_duration_seconds: duration,
+                    },
+                    "worker-1",
+                ))
+                .await
+                .expect_err("nonpositive lease duration must be rejected");
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        }
+        assert!(tracker.observed("worker-1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn outbox_terminal_decision_rpc_rejects_smuggling_and_malformed_rows_in_order() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let created = db
+            .create_resource(
+                "v1",
+                "Node",
+                None,
+                "worker-1",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {"name": "worker-1", "uid": "node-uid-1"}
+                }),
+            )
+            .await
+            .expect("create worker Node");
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let grpc = super::GrpcReplicationServer::new(service, db.clone());
+        let command = StorageCommand::PatchResource {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "worker-1".to_string(),
+            patch_kind: crate::datastore::types::PatchKind::Merge,
+            patch: serde_json::json!({"metadata": {"labels": {"smuggled": "true"}}}),
+            preconditions: ResourcePreconditions::uid("node-uid-1"),
+            strict_resource_version: false,
+        };
+        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+            .encode_protobuf()
+            .expect("encode payload");
+
+        let rejected = grpc
+            .apply_outbox(request_with_node_client_cert(
+                generated::ApplyOutboxRequest {
+                    idempotency_key: "smuggled-node-patch".to_string(),
+                    operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                        .as_str()
+                        .to_string(),
+                    payload_proto: payload,
+                    authoring_node: "worker-1".to_string(),
+                    client_id: "worker-1".to_string(),
+                    stream_id: 1,
+                    stream_seq: 1,
+                },
+                "worker-1",
+            ))
+            .await
+            .expect("durably consumed authorization failures use the typed response");
+        assert_eq!(
+            rejected.into_inner().error_type.as_deref(),
+            Some("ConflictTerminal")
+        );
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap()[0].stream_seq,
+            1,
+            "RPC authorization rejection must durably consume sequence one"
+        );
+
+        let stored = db
+            .get_resource("v1", "Node", None, "worker-1")
+            .await
+            .expect("read Node")
+            .expect("Node exists");
+        assert_eq!(stored.resource_version, created.resource_version);
+        assert!(stored.data.pointer("/metadata/labels/smuggled").is_none());
+
+        let valid_status_payload = || {
+            crate::kubelet::outbox::payload::OutboxPayload::from_command(
+                StorageCommand::UpdateStatus {
+                    api_version: "v1".to_string(),
+                    kind: "Node".to_string(),
+                    namespace: None,
+                    name: "worker-1".to_string(),
+                    status: serde_json::json!({"conditions": []}),
+                    expected_rv: None,
+                    preconditions: ResourcePreconditions::uid("node-uid-1"),
+                    observed_status_stamp: None,
+                },
+            )
+            .encode_protobuf()
+            .expect("encode valid RPC Node status")
+        };
+        grpc.apply_outbox(request_with_node_client_cert(
+            generated::ApplyOutboxRequest {
+                idempotency_key: "valid-after-smuggling".to_string(),
+                operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                    .as_str()
+                    .to_string(),
+                payload_proto: valid_status_payload(),
+                authoring_node: "worker-1".to_string(),
+                client_id: "worker-1".to_string(),
+                stream_id: 1,
+                stream_seq: 2,
+            },
+            "worker-1",
+        ))
+        .await
+        .expect("sequence two applies after RPC terminal authorization decision");
+
+        let malformed = grpc
+            .apply_outbox(request_with_node_client_cert(
+                generated::ApplyOutboxRequest {
+                    idempotency_key: "malformed-rpc-row".to_string(),
+                    operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                        .as_str()
+                        .to_string(),
+                    payload_proto: vec![0xff, 0x00, 0x81],
+                    authoring_node: "worker-1".to_string(),
+                    client_id: "worker-1".to_string(),
+                    stream_id: 1,
+                    stream_seq: 3,
+                },
+                "worker-1",
+            ))
+            .await
+            .expect("durably consumed malformed delivery uses the typed response");
+        assert_eq!(
+            malformed.into_inner().error_type.as_deref(),
+            Some("InvalidRequest")
+        );
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap()[0].stream_seq,
+            3,
+            "malformed RPC sequence must receive a durable terminal decision"
+        );
+        grpc.apply_outbox(request_with_node_client_cert(
+            generated::ApplyOutboxRequest {
+                idempotency_key: "valid-after-malformed".to_string(),
+                operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                    .as_str()
+                    .to_string(),
+                payload_proto: valid_status_payload(),
+                authoring_node: "worker-1".to_string(),
+                client_id: "worker-1".to_string(),
+                stream_id: 1,
+                stream_seq: 4,
+            },
+            "worker-1",
+        ))
+        .await
+        .expect("sequence four applies after malformed RPC terminal decision");
+    }
+
+    #[tokio::test]
+    async fn node_effect_rpc_rejects_wrong_uid_before_committed_apply() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let created = db
+            .create_resource(
+                "v1",
+                "Node",
+                None,
+                "worker-1",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {"name": "worker-1", "uid": "node-uid-1"},
+                    "status": {"conditions": []}
+                }),
+            )
+            .await
+            .expect("create worker Node");
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let grpc = super::GrpcReplicationServer::new(service, db.clone());
+        let command = StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "worker-1".to_string(),
+            status: serde_json::json!({"conditions": [{"type": "Ready", "status": "True"}]}),
+            expected_rv: None,
+            preconditions: ResourcePreconditions::uid("wrong-node-uid"),
+            observed_status_stamp: None,
+        };
+        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+            .encode_protobuf()
+            .expect("encode payload");
+
+        let response = grpc
+            .apply_outbox(request_with_node_client_cert(
+                generated::ApplyOutboxRequest {
+                    idempotency_key: "wrong-node-uid".to_string(),
+                    operation: crate::kubelet::outbox::payload::OutboxOperation::NodeStatus
+                        .as_str()
+                        .to_string(),
+                    payload_proto: payload,
+                    authoring_node: "worker-1".to_string(),
+                    client_id: "worker-1".to_string(),
+                    stream_id: 1,
+                    stream_seq: 1,
+                },
+                "worker-1",
+            ))
+            .await
+            .expect("durably consumed UID mismatch uses the typed response");
+        assert_eq!(
+            response.into_inner().error_type.as_deref(),
+            Some("UidMismatch")
+        );
+        let stored = db
+            .get_resource("v1", "Node", None, "worker-1")
+            .await
+            .expect("read Node")
+            .expect("Node exists");
+        assert_eq!(stored.resource_version, created.resource_version);
+    }
+
+    #[tokio::test]
+    async fn outbox_transport_contract_rpc_rejects_unvalidated_stream_identity() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let grpc = super::GrpcReplicationServer::new(service, db.clone());
+        let command = StorageCommand::UpdateNodeDataplane {
+            node_name: "worker-1".to_string(),
+            mode: "root".to_string(),
+            encryption: "enabled".to_string(),
+            public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
+            endpoint: "192.0.2.10".to_string(),
+            port: Some(7679),
+        };
+        let payload = crate::kubelet::outbox::payload::OutboxPayload::from_command(command)
+            .encode_protobuf()
+            .expect("encode dataplane payload");
+
+        let status = grpc
+            .apply_outbox(request_with_node_client_cert(
+                generated::ApplyOutboxRequest {
+                    idempotency_key: String::new(),
+                    operation: "NodeDataplane".to_string(),
+                    payload_proto: payload,
+                    authoring_node: "worker-1".to_string(),
+                    client_id: String::new(),
+                    stream_id: 0,
+                    stream_seq: 0,
+                },
+                "worker-1",
+            ))
+            .await
+            .expect_err("raw RPC must pass the focused request constructor before apply");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(
+            db.get_node_dataplane("worker-1").await.unwrap().is_none(),
+            "invalid delivery identity must be rejected before datastore or Raft work",
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_intent_list_requires_current_leader_and_same_node_authority() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let (_leader_tx, follower_rx) = tokio::sync::watch::channel(false);
+        let follower = super::GrpcReplicationServer::new(service.clone(), db.clone())
+            .with_leader_gate(follower_rx);
+
+        let status = follower
+            .list_pod_cleanup_intents_for_node(request_with_node_client_cert(
+                generated::ListPodCleanupIntentsForNodeRequest {
+                    node_name: "worker-1".to_string(),
+                },
+                "worker-1",
+            ))
+            .await
+            .expect_err("follower must not serve cleanup intents");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), "not raft leader");
+
+        let leader = super::GrpcReplicationServer::new(service, db);
+        let status = leader
+            .list_pod_cleanup_intents_for_node(request_with_node_client_cert(
+                generated::ListPodCleanupIntentsForNodeRequest {
+                    node_name: "worker-2".to_string(),
+                },
+                "worker-1",
+            ))
+            .await
+            .expect_err("node must not list another node's cleanup intents");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn cleanup_intent_ack_requires_current_leader_before_mutation() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
+        let (_leader_tx, follower_rx) = tokio::sync::watch::channel(false);
+        let follower = super::GrpcReplicationServer::new(service, db).with_leader_gate(follower_rx);
+
+        let status = follower
+            .delete_pod_cleanup_intent(request_with_node_client_cert(
+                generated::DeletePodCleanupIntentRequest {
+                    node_name: "worker-1".to_string(),
+                    namespace: "default".to_string(),
+                    pod_name: "web".to_string(),
+                    pod_uid: "pod-uid".to_string(),
+                    reason: "NodeLost".to_string(),
+                },
+                "worker-1",
+            ))
+            .await
+            .expect_err("follower must not acknowledge cleanup intents");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), "not raft leader");
+    }
+
+    #[tokio::test]
+    async fn projected_token_rpc_requires_exact_bound_pod_uid_and_node() {
+        let grpc = raft_test_server().await;
+        let status = grpc
+            .projected_service_account_token(request_with_node_client_cert(
+                generated::ProjectedServiceAccountTokenRequest {
+                    namespace: "default".to_string(),
+                    service_account_name: "default".to_string(),
+                    audiences: vec!["api".to_string()],
+                    expiration_seconds: 3_600,
+                    bound_pod_name: Some("web".to_string()),
+                    bound_pod_uid: None,
+                    bound_node_name: Some("worker-1".to_string()),
+                    bound_node_uid: None,
+                },
+                "worker-1",
+            ))
+            .await
+            .expect_err("node-originated issuance requires the exact bound Pod UID");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn renew_node_lease_rejects_renew_time_skew_over_100_seconds() {
         let db = crate::datastore::test_support::in_memory().await;
         let db: DatastoreHandle = Arc::new(db);
@@ -3932,7 +5160,7 @@ mod tests {
             .encode_protobuf()
             .unwrap();
 
-        let result = grpc
+        let response = grpc
             .apply_outbox(request_with_node_client_cert(
                 generated::ApplyOutboxRequest {
                     idempotency_key: "dataplane-worker-2-from-worker-1".to_string(),
@@ -3947,12 +5175,11 @@ mod tests {
                 },
                 "worker-1",
             ))
-            .await;
-        let Err(status) = result else {
-            panic!("node dataplane outbox must be bound to authoring node");
-        };
+            .await
+            .expect("durably consumed author mismatch uses a typed response")
+            .into_inner();
 
-        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(response.error_type.as_deref(), Some("ConflictTerminal"));
         assert!(
             db.get_node_dataplane("worker-2").await.unwrap().is_none(),
             "rejected dataplane update must not write peer metadata"
@@ -4083,7 +5310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observed_leader_endpoint_stamps_local_node_external_ip() {
+    async fn node_effect_observed_leader_endpoint_enqueues_external_ip_status() {
         let db = crate::datastore::test_support::in_memory().await;
         let addresses =
             crate::kubelet::node::NodeRegistrationAddresses::new("172.31.10.2".to_string(), None);
@@ -4100,18 +5327,53 @@ mod tests {
         .await
         .unwrap();
 
-        super::refresh_local_node_external_ip_from_observed_endpoint(&db, "leader-a", "10.99.0.10")
-            .await
-            .expect("observed leader endpoint should update local Node");
+        let query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
+            Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+                Arc::new(db.clone()),
+                "leader-a".to_string(),
+                crate::control_plane::client::local::always_leader_watch(),
+            ));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            Arc::new(TaskSupervisor::new(TaskCategoryConfig::default())),
+            None,
+            "sqlite:observed-leader-endpoint-status",
+        )
+        .await
+        .expect("open node-local outbox");
+        let publisher = crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+            "leader-a",
+            query.clone(),
+            Arc::new(crate::kubelet::outbox::Outbox::new(node_local.clone())),
+        );
 
-        let node = db
-            .get_resource("v1", "Node", None, "leader-a")
+        super::refresh_local_node_external_ip_from_observed_endpoint(
+            query.as_ref(),
+            &publisher,
+            "leader-a",
+            "10.99.0.10",
+        )
+        .await
+        .expect("observed leader endpoint should enqueue local Node status");
+
+        let row = node_local
+            .claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
             .await
-            .unwrap()
-            .expect("leader Node should exist");
-        let addresses = node
-            .data
-            .pointer("/status/addresses")
+            .expect("inspect outbox")
+            .expect("external IP status row");
+        assert_eq!(
+            row.operation,
+            crate::kubelet::outbox::payload::OutboxOperation::NodeStatus.as_str()
+        );
+        let payload =
+            crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(&row.payload_proto)
+                .expect("decode status payload");
+        let StorageCommand::UpdateStatus { status, .. } = payload.command else {
+            panic!("external IP publication must be status-only")
+        };
+        let addresses = status
+            .pointer("/addresses")
             .and_then(|value| value.as_array())
             .unwrap();
         assert!(addresses.iter().any(|address| {
@@ -4123,43 +5385,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_cluster_membership_rpc_returns_voters() {
+    async fn node_effect_join_external_ip_uses_fresh_exact_status_after_metadata_cas() {
         let db = Arc::new(crate::datastore::test_support::in_memory().await);
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(db.as_ref())
+        let created = db
+            .create_resource(
+                "v1",
+                "Node",
+                None,
+                "worker-1",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {"name": "worker-1", "uid": "worker-uid-1"},
+                    "status": {
+                        "conditions": [{"type": "Ready", "status": "True"}],
+                        "addresses": [{"type": "InternalIP", "address": "10.0.0.8"}]
+                    }
+                }),
+            )
             .await
-            .unwrap();
-        let cluster_id = db
-            .get_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)
+            .expect("create joining Node");
+        let dataplane = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            "worker-1".to_string(),
+            crate::networking::wireguard::DataplaneMode::Root,
+            crate::networking::wireguard::DataplaneEncryption::Enabled,
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
+            Some("192.0.2.80".to_string()),
+            Some(51_820),
+        )
+        .expect("valid dataplane metadata");
+        db.update_node_dataplane(dataplane.clone())
             .await
-            .unwrap()
-            .unwrap();
-        crate::bootstrap::cluster_meta::write_cluster_membership(
+            .expect("store joining dataplane metadata");
+        let query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
+            Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+                db.clone(),
+                "leader-a".to_string(),
+                crate::control_plane::client::local::always_leader_watch(),
+            ));
+        let status = Arc::new(RecordingNodeLifecycleStatus::default());
+        let node_uid = created.uid.clone();
+
+        super::refresh_joining_node_from_dataplane(
             db.as_ref(),
-            &crate::control_plane::client::membership::ClusterMembership {
-                cluster_id: cluster_id.clone(),
-                voters: vec!["mn-leader".to_string(), "mn-leader-2".to_string()],
-                term: 3,
-                leader_hint: Some("mn-leader-2".to_string()),
-            },
+            query.as_ref(),
+            status.as_ref(),
+            &dataplane,
         )
         .await
-        .unwrap();
-        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-        let service = Arc::new(ReplicationService::new(db.clone(), supervisor));
-        let grpc = super::GrpcReplicationServer::new(service, db);
+        .expect("split joining Node projection");
 
-        let response = grpc
-            .get_cluster_membership(request_with_node_client_cert(
-                ClusterMembershipRequest {},
-                "worker-1",
-            ))
+        let stored = db
+            .get_resource("v1", "Node", None, "worker-1")
             .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(response.cluster_id, cluster_id);
-        assert_eq!(response.voters, vec!["mn-leader", "mn-leader-2"]);
-        assert_eq!(response.term, 3);
-        assert_eq!(response.leader_hint, "mn-leader-2");
+            .expect("read joining Node")
+            .expect("joining Node remains present");
+        assert!(stored.resource_version > created.resource_version);
+        assert_eq!(
+            stored
+                .data
+                .pointer("/metadata/annotations/klights.io~1dataplane-endpoint")
+                .and_then(serde_json::Value::as_str),
+            Some("192.0.2.80")
+        );
+        assert!(
+            stored
+                .data
+                .pointer("/status/addresses")
+                .and_then(serde_json::Value::as_array)
+                .expect("stored Node addresses")
+                .iter()
+                .all(|address| address["type"] != "ExternalIP"),
+            "metadata CAS must not full-update Node status"
+        );
+
+        let request = status.take_request();
+        assert_eq!(request.node_name(), "worker-1");
+        assert_eq!(request.node_uid(), node_uid);
+        assert_eq!(request.resource_version(), stored.resource_version);
+        let StorageCommand::UpdateStatus {
+            status,
+            preconditions,
+            expected_rv,
+            ..
+        } = request.into_command()
+        else {
+            panic!("join ExternalIP must use status-only authority")
+        };
+        assert_eq!(expected_rv, Some(stored.resource_version));
+        assert_eq!(
+            preconditions,
+            ResourcePreconditions::uid_and_resource_version(created.uid, stored.resource_version,)
+        );
+        assert_eq!(
+            status.pointer("/conditions/0/status"),
+            Some(&serde_json::json!("True")),
+            "fresh post-metadata status must preserve concurrent condition state"
+        );
+        assert!(
+            status
+                .pointer("/addresses")
+                .and_then(serde_json::Value::as_array)
+                .expect("published status addresses")
+                .iter()
+                .any(|address| {
+                    address["type"] == "ExternalIP" && address["address"] == "192.0.2.80"
+                })
+        );
     }
 
     #[tokio::test]

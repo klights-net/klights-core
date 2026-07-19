@@ -6,9 +6,9 @@ service Replication {
   rpc Connect(stream FollowerMessage) returns (stream LeaderMessage);
   rpc Snapshot(SnapshotRequest) returns (stream ReplicationEntry);
   rpc GetMetadata(MetadataRequest) returns (MetadataResponse);
-  rpc GetClusterMembership(ClusterMembershipRequest) returns (ClusterMembershipResponse);
   rpc GetResource(GetResourceRequest) returns (GetResourceResponse);
   rpc ListResources(ListResourcesRequest) returns (ListResourcesResponse);
+  rpc SubmitResourceCommand(SubmitResourceCommandRequest) returns (SubmitResourceCommandResponse);
   rpc WatchResources(WatchResourcesRequest) returns (stream WatchEvent);
   rpc ProjectedServiceAccountToken(ProjectedServiceAccountTokenRequest) returns (ProjectedServiceAccountTokenResponse);
   rpc ApplyOutbox(ApplyOutboxRequest) returns (ApplyOutboxResponse);
@@ -249,15 +249,6 @@ message MetadataResponse {
   uint64 supported_features = 5;
 }
 
-message ClusterMembershipRequest {}
-
-message ClusterMembershipResponse {
-  string cluster_id = 1;
-  repeated string voters = 2;
-  int64 term = 3;
-  string leader_hint = 4;
-}
-
 message ReplicationEntry {
   bytes command_protobuf = 1;
   bytes meta_protobuf = 2;
@@ -289,6 +280,23 @@ message GetResourceRequest {
 message GetResourceResponse {
   bool found = 1;
   optional ResourceObject resource = 2;
+}
+
+// Independent control-plane-only generic resource mutation. This deliberately
+// does not reuse the worker outbox RPC or the reserved stream-forward tags.
+message SubmitResourceCommandRequest {
+  bytes command_protobuf = 1;
+}
+
+message SubmitResourceCommandResponse {
+  oneof result {
+    ResourceObject resource = 1;
+    ResourceCommandAck ack = 2;
+  }
+}
+
+message ResourceCommandAck {
+  int64 resource_version = 1;
 }
 
 message ResourceObject {
@@ -405,6 +413,7 @@ message ListPeerSubnetsRequest {
 }
 
 message NodeSubnetObject {
+  reserved 5;
   string node_name = 1;
   string subnet = 2;
   uint32 subnet_base_int = 3;

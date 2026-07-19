@@ -76,6 +76,33 @@ pub trait RaftProposer: Send + Sync {
         crate::kubelet::outbox::OutboxApplyResult,
         crate::kubelet::outbox::OutboxApplyError,
     >;
+
+    async fn propose_outbox_command_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        command: StorageCommand,
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        let result = self
+            .propose_outbox_command(
+                idempotency_key,
+                operation,
+                command,
+                authoring_node,
+                watermark,
+            )
+            .await?;
+        let resource_changed = matches!(
+            result,
+            crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
+        );
+        Ok((result, resource_changed))
+    }
 }
 
 // ---------------------------------------------------------------------------

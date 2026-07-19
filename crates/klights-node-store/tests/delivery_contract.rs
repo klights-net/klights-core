@@ -562,8 +562,10 @@ struct ReferenceRow {
     id: i64,
     subject: String,
     stream_id: i64,
+    stream_seq: i64,
     priority: OutboxPriority,
     supersedable_status: bool,
+    terminal_delete: bool,
     enqueued_ms: i64,
     due_ms: i64,
     lease: Option<(String, i64)>,
@@ -573,6 +575,7 @@ struct ReferenceRow {
 #[derive(Default)]
 struct ReferenceOutbox {
     rows: Vec<ReferenceRow>,
+    dead_sequences: Vec<(i64, i64)>,
 }
 
 impl ReferenceOutbox {
@@ -586,13 +589,24 @@ impl ReferenceOutbox {
                         .lease
                         .as_ref()
                         .is_none_or(|(_, leased_until_ms)| *leased_until_ms <= now_ms)
-                    && !self.rows.iter().any(|older| {
-                        !older.complete
-                            && older.id < candidate.id
-                            && (older.subject == candidate.subject
-                                || (candidate.stream_id > 0
-                                    && older.stream_id == candidate.stream_id))
-                    })
+                    && if candidate.stream_id > 0 && candidate.stream_seq > 0 {
+                        !self.rows.iter().any(|older| {
+                            !older.complete
+                                && older.stream_id == candidate.stream_id
+                                && older.stream_seq > 0
+                                && older.stream_seq < candidate.stream_seq
+                        }) && !self.dead_sequences.iter().any(|&(stream_id, stream_seq)| {
+                            stream_id == candidate.stream_id
+                                && stream_seq > 0
+                                && stream_seq < candidate.stream_seq
+                        })
+                    } else {
+                        !self.rows.iter().any(|older| {
+                            !older.complete
+                                && older.subject == candidate.subject
+                                && older.id < candidate.id
+                        })
+                    }
             })
             .collect();
         let has_supersedable_status = eligible
@@ -637,6 +651,47 @@ impl ReferenceOutbox {
         row.lease = None;
         true
     }
+
+    fn dead_letter(&mut self, id: i64) -> bool {
+        let Some(row) = self
+            .rows
+            .iter_mut()
+            .find(|row| row.id == id && !row.complete)
+        else {
+            return false;
+        };
+        self.dead_sequences.push((row.stream_id, row.stream_seq));
+        row.complete = true;
+        true
+    }
+
+    fn delete_dead_letter(&mut self, stream_id: i64, stream_seq: i64) -> bool {
+        if stream_id > 0 && stream_seq > 0 {
+            return false;
+        }
+        let before = self.dead_sequences.len();
+        self.dead_sequences
+            .retain(|sequence| *sequence != (stream_id, stream_seq));
+        self.dead_sequences.len() != before
+    }
+
+    fn replay(&mut self, id: i64) -> bool {
+        let Some(row) = self
+            .rows
+            .iter_mut()
+            .find(|row| row.id == id && row.complete)
+        else {
+            return false;
+        };
+        let before = self.dead_sequences.len();
+        self.dead_sequences
+            .retain(|sequence| *sequence != (row.stream_id, row.stream_seq));
+        if self.dead_sequences.len() == before {
+            return false;
+        }
+        row.complete = false;
+        true
+    }
 }
 
 fn reference_row(
@@ -649,8 +704,10 @@ fn reference_row(
         id,
         subject: subject.into(),
         stream_id,
+        stream_seq: id,
         priority,
         supersedable_status: false,
+        terminal_delete: false,
         enqueued_ms: id,
         due_ms: 0,
         lease: None,
@@ -662,16 +719,20 @@ fn reference_row(
 fn reference_claim_contract_is_fifo_stream_ordered_and_priority_first() {
     let mut status = reference_row(1, "pod-a", 10, OutboxPriority::Workload);
     status.supersedable_status = true;
+    let mut terminal = reference_row(2, "pod-a", 10, OutboxPriority::Lease);
+    terminal.terminal_delete = true;
     let mut outbox = ReferenceOutbox {
         rows: vec![
             status,
-            reference_row(2, "pod-a", 10, OutboxPriority::Lease),
+            terminal,
             reference_row(3, "pod-b", 10, OutboxPriority::NodeHealth),
             reference_row(4, "pod-c", 20, OutboxPriority::Diagnostic),
             reference_row(5, "pod-d", 30, OutboxPriority::Lease),
         ],
+        dead_sequences: Vec::new(),
     };
 
+    assert!(outbox.rows[1].terminal_delete);
     assert_eq!(outbox.claim(100, 256, "claimer-a", 10), [5, 1, 4]);
     assert!(outbox.complete(1, "claimer-a"));
     assert_eq!(outbox.claim(101, 256, "claimer-b", 10), [2]);
@@ -686,6 +747,7 @@ fn reference_batch_contract_caps_zero_exact_and_oversized_limits() {
             rows: (1..=300)
                 .map(|id| reference_row(id, format!("subject-{id}"), id, OutboxPriority::Workload))
                 .collect(),
+            dead_sequences: Vec::new(),
         };
         assert_eq!(outbox.claim(10_000, limit, "batch", 10).len(), expected);
     }
@@ -699,6 +761,7 @@ fn reference_leases_expire_and_cas_tokens_isolate_independent_claimers() {
             reference_row(2, "pod-a", 10, OutboxPriority::Workload),
             reference_row(3, "pod-b", 20, OutboxPriority::Workload),
         ],
+        dead_sequences: Vec::new(),
     };
 
     assert_eq!(outbox.claim(100, 1, "claimer-a", 10), [1]);
@@ -710,4 +773,23 @@ fn reference_leases_expire_and_cas_tokens_isolate_independent_claimers() {
     assert_eq!(outbox.claim(110, 2, "claimer-c", 10), [1]);
     assert!(outbox.complete(1, "claimer-c"));
     assert_eq!(outbox.claim(111, 2, "claimer-d", 10), [2]);
+}
+
+#[test]
+fn reference_assigned_dead_letter_blocks_terminal_until_exact_replay() {
+    let status = reference_row(1, "pod-a", 10, OutboxPriority::Workload);
+    let mut terminal = reference_row(2, "pod-a", 10, OutboxPriority::Lease);
+    terminal.terminal_delete = true;
+    let mut outbox = ReferenceOutbox {
+        rows: vec![status, terminal],
+        dead_sequences: Vec::new(),
+    };
+
+    assert!(outbox.dead_letter(1));
+    assert!(!outbox.delete_dead_letter(10, 1));
+    assert_eq!(outbox.claim(100, 1, "blocked", 10), Vec::<i64>::new());
+    assert!(outbox.replay(1));
+    assert_eq!(outbox.claim(100, 1, "replayed", 10), [1]);
+    assert!(outbox.complete(1, "replayed"));
+    assert_eq!(outbox.claim(100, 1, "terminal", 10), [2]);
 }

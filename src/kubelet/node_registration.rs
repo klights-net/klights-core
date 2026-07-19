@@ -1,7 +1,7 @@
 use crate::datastore::command::StorageCommand;
 use crate::datastore::{DatastoreBackend, ResourcePreconditions};
 use crate::kubelet::node;
-use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{Outbox, OutboxSendRoute};
 use crate::utils::k8s_time_now;
 use anyhow::{Context, Result};
@@ -422,7 +422,7 @@ async fn capture_node_registration_snapshot(
 pub(crate) async fn register_node_snapshot(
     db: &dyn DatastoreBackend,
     outbox: Option<&Outbox>,
-    cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+    _cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
     dataplane_health: Option<&crate::networking::dataplane_health::DataplaneHealth>,
     snapshot: &NodeRegistrationSnapshot,
 ) -> Result<()> {
@@ -583,7 +583,7 @@ pub(crate) async fn register_node_snapshot(
         if let Some(outbox) = outbox {
             let route = node::send_node_command(
                 Some(outbox),
-                OutboxOperation::NodeStatus,
+                OutboxOperation::NodeRegistration,
                 node_name,
                 existing.uid.as_str(),
                 StorageCommand::UpdateResource {
@@ -626,56 +626,6 @@ pub(crate) async fn register_node_snapshot(
             name: node_name.to_string(),
             data: node.clone(),
         };
-
-        // Bug 4 Option C.2: synchronously apply the registration command
-        // via the cluster API so the Node exists on the leader before any
-        // controller (e.g. node_subnet watcher) tries to read it. The
-        // outbox enqueue below is a safety net for the case where this
-        // direct call fails or the leader processes the outbox first.
-        if let Some(ref api) = cluster_api {
-            let payload = OutboxPayload::from_command(create_command.clone());
-            match payload.encode_protobuf() {
-                Ok(proto) => {
-                    let idempotency_key = format!(
-                        "NodeRegistration:v1/Node/{}:{}",
-                        node_name,
-                        uuid::Uuid::new_v4()
-                    );
-                    match api
-                        .apply_outbox(
-                            &idempotency_key,
-                            OutboxOperation::NodeRegistration,
-                            bytes::Bytes::from(proto),
-                            "",
-                            0,
-                            0,
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            tracing::info!(
-                                "Node {} registration applied synchronously via cluster API",
-                                node_name
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Node {} sync registration failed (outbox will retry): {:#}",
-                                node_name,
-                                e
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Node {} sync registration encode failed (outbox will retry): {:#}",
-                        node_name,
-                        e
-                    );
-                }
-            }
-        }
 
         let route = node::send_node_command(
             Some(outbox),

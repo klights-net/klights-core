@@ -7,17 +7,32 @@ pub mod pod_status_side_effects;
 pub mod remote;
 pub mod worker_store;
 
-use std::pin::Pin;
-
-use anyhow::Result;
 use async_trait::async_trait;
-use bytes::Bytes;
-use futures::Stream;
-use klights_types::ResourceKey;
+pub use klights_leader_api::{
+    CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, DataplaneEncryption,
+    HostPortRange as LeaderHostPortRange, LeaderCacheReadiness, LeaderNetworkTopologyQuery,
+    LeaderNodeLeaseRenewal, LeaderNodeLifecycleStatus, LeaderNodeSelfStatus,
+    LeaderNodeSubnetAllocation, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
+    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
+    NetworkDataplane, NetworkNodeMode, NetworkTopologyError, NetworkTopologyFuture,
+    NodeDataplaneQuery, NodeDataplaneResult, NodeLeaseRenewalError, NodeLeaseRenewalFuture,
+    NodeLeaseRenewalRequest, NodeLeaseRenewalResult, NodeLifecycleStatusError,
+    NodeLifecycleStatusFuture, NodeLifecycleStatusRequest, NodeLifecycleStatusResult,
+    NodeSelfStatusError, NodeSelfStatusFuture, NodeSelfStatusRequest, NodeSelfStatusResult,
+    NodeSubnetAllocationError, NodeSubnetAllocationFuture, NodeSubnetAllocationRequest,
+    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, PeerSubnetsQuery,
+    PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
+    PodCleanupIntentFuture, PodCleanupIntentListRequest, ProjectedServiceAccountToken,
+    ProjectedServiceAccountTokenError, ProjectedServiceAccountTokenFuture,
+    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
+    ResourceCommandRequest, ResourceCommandResult, ResourceEvent, ResourceGetRequest,
+    ResourceListRequest, ResourceListResult, ResourceQueryConsistency, ResourceQueryError,
+    ResourceQueryFuture, WatchEventType, WatchRequest, WatchResumeCursor, WatchStream,
+    config_map_get_request, node_get_request, pod_get_request, pods_on_node_list_request,
+    secret_get_request,
+};
 
-use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource, ResourceList, WatchReplayPosition};
-use crate::kubelet::outbox::payload::OutboxOperation;
-use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
+use crate::datastore::{NodeSubnet, Resource, ResourceList};
 use crate::networking::wireguard::DataplanePeerMetadata;
 use crate::watch::WatchEvent;
 
@@ -25,7 +40,109 @@ pub type Pod = Resource;
 pub type ConfigMap = Resource;
 pub type Secret = Resource;
 pub type Node = Resource;
-pub type WatchStream<T> = Pin<Box<dyn Stream<Item = Result<T>> + Send>>;
+
+pub(crate) fn focused_node_subnet(
+    subnet: NodeSubnet,
+) -> std::result::Result<klights_leader_api::NodeSubnet, NetworkTopologyError> {
+    let mode = match subnet.mode {
+        crate::controllers::annotations::NodePeerMode::Root => NetworkNodeMode::Root,
+        crate::controllers::annotations::NodePeerMode::Rootless => NetworkNodeMode::Rootless,
+    };
+    let hostport_range = subnet
+        .hostport_range
+        .map(|range| LeaderHostPortRange::try_new(range.start, range.end))
+        .transpose()?;
+    klights_leader_api::NodeSubnet::try_new(
+        subnet.node_name.into_string(),
+        subnet.subnet.to_string(),
+        subnet.subnet_base_int,
+        subnet.gateway_ip,
+        subnet.node_ip,
+        mode,
+        hostport_range,
+    )
+}
+
+pub(crate) fn legacy_node_subnet(
+    subnet: klights_leader_api::NodeSubnet,
+) -> std::result::Result<NodeSubnet, NetworkTopologyError> {
+    let node_name = crate::networking::NodeName::parse(subnet.node_name())
+        .map_err(NetworkTopologyError::corrupt_response)?;
+    let pod_subnet = crate::networking::PodSubnet::parse(subnet.subnet())
+        .map_err(NetworkTopologyError::corrupt_response)?;
+    let mode = match subnet.mode() {
+        NetworkNodeMode::Root => crate::controllers::annotations::NodePeerMode::Root,
+        NetworkNodeMode::Rootless => crate::controllers::annotations::NodePeerMode::Rootless,
+    };
+    let hostport_range =
+        subnet
+            .hostport_range()
+            .map(|range| crate::networking::types::HostPortRange {
+                start: range.start(),
+                end: range.end(),
+            });
+    Ok(NodeSubnet {
+        node_name,
+        subnet: pod_subnet,
+        subnet_base_int: subnet.subnet_base_int(),
+        gateway_ip: subnet.gateway_ip(),
+        node_ip: subnet.node_ip(),
+        mode,
+        hostport_range,
+    })
+}
+
+pub(crate) fn focused_dataplane(
+    metadata: DataplanePeerMetadata,
+) -> std::result::Result<NetworkDataplane, NetworkTopologyError> {
+    NetworkDataplane::try_new(
+        metadata.node_name,
+        match metadata.mode {
+            crate::networking::wireguard::DataplaneMode::Root => NetworkNodeMode::Root,
+            crate::networking::wireguard::DataplaneMode::Rootless => NetworkNodeMode::Rootless,
+        },
+        match metadata.encryption {
+            crate::networking::wireguard::DataplaneEncryption::Enabled => {
+                DataplaneEncryption::WireGuard
+            }
+            crate::networking::wireguard::DataplaneEncryption::Disabled => {
+                DataplaneEncryption::Direct
+            }
+        },
+        metadata.public_key.as_ref().map(|key| key.as_str()),
+        metadata.endpoint,
+        metadata.port,
+    )
+}
+
+pub(crate) fn legacy_dataplane(
+    metadata: NetworkDataplane,
+) -> std::result::Result<DataplanePeerMetadata, NetworkTopologyError> {
+    let mode = match metadata.mode() {
+        NetworkNodeMode::Root => crate::networking::wireguard::DataplaneMode::Root,
+        NetworkNodeMode::Rootless => crate::networking::wireguard::DataplaneMode::Rootless,
+    };
+    let encryption = match metadata.encryption() {
+        DataplaneEncryption::WireGuard => {
+            crate::networking::wireguard::DataplaneEncryption::Enabled
+        }
+        DataplaneEncryption::Direct => crate::networking::wireguard::DataplaneEncryption::Disabled,
+    };
+    DataplanePeerMetadata::try_new(
+        metadata.node_name().to_string(),
+        mode,
+        encryption,
+        metadata.public_key().map(str::to_owned),
+        Some(metadata.endpoint().to_string()),
+        metadata.port(),
+    )
+    .map_err(|error| NetworkTopologyError::corrupt_response(error.to_string()))
+}
+
+pub(crate) fn node_subnet_allocation_is_exhausted(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("exhaust") || lower.contains("query returned no rows")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRequest {
@@ -40,78 +157,56 @@ pub struct ListRequest {
 
 pub type ListResponse = ResourceList;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WatchRequest {
-    pub api_version: String,
-    pub kind: String,
-    pub namespace: Option<String>,
-    pub label_selector: Option<String>,
-    pub field_selector: Option<String>,
-    pub start_resource_version: Option<i64>,
-    /// Exact durable cursor, preferred over the legacy scalar RV when present.
-    pub start_watch_replay_position: Option<WatchReplayPosition>,
+pub(crate) fn query_error(error: impl std::fmt::Display) -> ResourceQueryError {
+    ResourceQueryError::query_failed(error.to_string())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectedServiceAccountTokenRequest {
-    pub namespace: String,
-    pub service_account_name: String,
-    pub audiences: Vec<String>,
-    pub expiration_seconds: i64,
-    pub bound_pod_name: Option<String>,
-    pub bound_pod_uid: Option<String>,
-    pub bound_node_name: Option<String>,
-    pub bound_node_uid: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectedServiceAccountToken {
-    pub token: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum CacheScope {
-    Cluster,
-    Resource {
-        api_version: String,
-        kind: String,
-        namespace: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct ResourceEvent {
-    pub event: WatchEvent,
-    /// Resume point covered by this event. Consumers retain it only after the
-    /// event has been safely applied.
-    pub resume_position: Option<WatchReplayPosition>,
-}
-
-/// Advance a reflector's reconnect cursor after (and only after) the event is
-/// safely applied. An omitted composite position deliberately clears any older
-/// exact cursor so rolling-upgrade peers fall back to the advanced scalar RV.
-pub(crate) fn advance_watch_resume_after_apply(
-    resource_version: &mut Option<i64>,
-    replay_position: &mut Option<WatchReplayPosition>,
-    delivered_resource_version: Option<i64>,
-    delivered_replay_position: Option<WatchReplayPosition>,
-) {
-    if let Some(rv) = delivered_resource_version {
-        *resource_version = Some(resource_version.unwrap_or(0).max(rv));
+pub(crate) fn legacy_list_request(request: &ResourceListRequest) -> ListRequest {
+    ListRequest {
+        api_version: request.api_version().to_string(),
+        kind: request.kind().to_string(),
+        namespace: request.namespace().map(str::to_owned),
+        label_selector: request.label_selector().map(str::to_owned),
+        field_selector: request.field_selector().map(str::to_owned),
+        limit: request.limit(),
+        continue_token: request.continue_token().map(str::to_owned),
     }
-    *replay_position = delivered_replay_position;
+}
+
+pub(crate) fn query_list_result(
+    list: ResourceList,
+) -> std::result::Result<ResourceListResult, ResourceQueryError> {
+    ResourceListResult::try_new(
+        list.items,
+        list.resource_version,
+        list.watch_replay_position,
+        list.continue_token,
+        list.remaining_item_count,
+    )
+}
+
+pub(crate) fn legacy_list_response(result: ResourceListResult) -> ResourceList {
+    let (items, resource_version, position, continue_token, remaining_item_count) =
+        result.into_parts();
+    ResourceList {
+        items,
+        resource_version,
+        watch_replay_position: position,
+        continue_token,
+        remaining_item_count,
+    }
 }
 
 pub(crate) fn watch_request_matches_event(req: &WatchRequest, event: &WatchEvent) -> bool {
-    crate::watch::WatchEventSelection::new(&req.api_version, &req.kind)
-        .namespace(req.namespace.as_deref())
-        .label_selector(req.label_selector.as_deref())
-        .field_selector(req.field_selector.as_deref())
+    crate::watch::WatchEventSelection::new(req.api_version(), req.kind())
+        .namespace(req.namespace())
+        .label_selector(req.label_selector())
+        .field_selector(req.field_selector())
         .matches(event)
 }
 
 pub(crate) fn watch_request_has_selector(req: &WatchRequest) -> bool {
-    selectors_present(req.label_selector.as_deref(), req.field_selector.as_deref())
+    selectors_present(req.label_selector(), req.field_selector())
 }
 
 pub(crate) fn selectors_present(label: Option<&str>, field: Option<&str>) -> bool {
@@ -119,75 +214,171 @@ pub(crate) fn selectors_present(label: Option<&str>, field: Option<&str>) -> boo
         || field.is_some_and(|selector| !selector.trim().is_empty())
 }
 
-#[async_trait]
-pub trait LeaderApiClient: Send + Sync {
-    async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>>;
-    async fn list_resources(&self, req: ListRequest) -> Result<ListResponse>;
-    async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
-        self.get_resource(key).await
+pub(crate) fn legacy_watch_event(event: &ResourceEvent) -> WatchEvent {
+    WatchEvent {
+        event_type: match event.event_type() {
+            WatchEventType::Added => crate::watch::EventType::Added,
+            WatchEventType::Modified => crate::watch::EventType::Modified,
+            WatchEventType::Deleted => crate::watch::EventType::Deleted,
+            WatchEventType::Bookmark => crate::watch::EventType::Bookmark,
+            WatchEventType::Error => crate::watch::EventType::Error,
+        },
+        object: event.resource().data.clone(),
+        encoded_payload: None,
     }
-    async fn list_resources_fresh(&self, req: ListRequest) -> Result<ListResponse> {
-        self.list_resources(req).await
-    }
-    async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>>;
-    async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()>;
-    async fn projected_service_account_token(
-        &self,
-        request: ProjectedServiceAccountTokenRequest,
-    ) -> Result<ProjectedServiceAccountToken> {
-        let _ = request;
-        anyhow::bail!("projected ServiceAccount token requests are not supported by this client")
-    }
-
-    async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Pod>>;
-    async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Pod>>;
-    async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Pod>>;
-    async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Pod>>;
-    async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<ConfigMap>>;
-    async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>>;
-    async fn get_node(&self, name: &str) -> Result<Node>;
-    async fn watch_node(&self, name: &str) -> Result<WatchStream<Node>>;
-    async fn allocate_node_subnet(
-        &self,
-        node_name: &str,
-        cluster_cidr: &str,
-        node_ip: &str,
-    ) -> Result<NodeSubnet>;
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>>;
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>>;
-    async fn get_node_dataplane(&self, node_name: &str) -> Result<Option<DataplanePeerMetadata>>;
-    async fn list_pod_cleanup_intents_for_node(
-        &self,
-        node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
-        let _ = node_name;
-        Ok(Vec::new())
-    }
-    async fn delete_pod_cleanup_intent(
-        &self,
-        node_name: &str,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        reason: &str,
-    ) -> Result<()> {
-        let _ = (node_name, namespace, pod_name, pod_uid, reason);
-        Ok(())
-    }
-    async fn get_cluster_membership(&self) -> Result<membership::ClusterMembership> {
-        anyhow::bail!("cluster membership RPC is not implemented by this client")
-    }
-
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        operation: OutboxOperation,
-        payload: Bytes,
-        client_id: &str,
-        stream_id: i64,
-        stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError>;
 }
+
+pub(crate) fn focused_watch_event(
+    event: WatchEvent,
+    resume_position: Option<crate::datastore::WatchReplayPosition>,
+) -> std::result::Result<ResourceEvent, LeaderWatchError> {
+    let event_type = match event.event_type {
+        crate::watch::EventType::Added => WatchEventType::Added,
+        crate::watch::EventType::Modified => WatchEventType::Modified,
+        crate::watch::EventType::Deleted => WatchEventType::Deleted,
+        crate::watch::EventType::Bookmark => WatchEventType::Bookmark,
+        crate::watch::EventType::Error => WatchEventType::Error,
+    };
+    ResourceEvent::try_new(
+        event_type,
+        Resource::from_watch_event_ref(&event),
+        resume_position,
+    )
+}
+
+#[async_trait]
+pub trait LeaderApiClient:
+    LeaderResourceQuery
+    + LeaderWatch
+    + LeaderCacheReadiness
+    + LeaderProjectedServiceAccountToken
+    + LeaderPodCleanupIntents
+    + LeaderNodeSubnetAllocation
+    + LeaderNetworkTopologyQuery
+    + Send
+    + Sync
+{
+}
+
+#[cfg(test)]
+macro_rules! impl_unavailable_leader_pod_effects {
+    ($client:ty) => {
+        impl klights_leader_api::LeaderProjectedServiceAccountToken for $client {
+            fn issue_projected_service_account_token(
+                &self,
+                _request: klights_leader_api::ProjectedServiceAccountTokenRequest,
+            ) -> klights_leader_api::ProjectedServiceAccountTokenFuture<'_> {
+                Box::pin(async {
+                    Err(
+                        klights_leader_api::ProjectedServiceAccountTokenError::unavailable(
+                            "projected token issuance is not used by this test client",
+                        ),
+                    )
+                })
+            }
+        }
+
+        impl klights_leader_api::LeaderPodCleanupIntents for $client {
+            fn list_pod_cleanup_intents(
+                &self,
+                _request: klights_leader_api::PodCleanupIntentListRequest,
+            ) -> klights_leader_api::PodCleanupIntentFuture<
+                '_,
+                Vec<klights_leader_api::PodCleanupIntent>,
+            > {
+                Box::pin(async {
+                    Err(klights_leader_api::PodCleanupIntentError::unavailable(
+                        "cleanup intents are not used by this test client",
+                    ))
+                })
+            }
+
+            fn acknowledge_pod_cleanup_intent(
+                &self,
+                _request: klights_leader_api::PodCleanupIntentAckRequest,
+            ) -> klights_leader_api::PodCleanupIntentFuture<'_, ()> {
+                Box::pin(async {
+                    Err(klights_leader_api::PodCleanupIntentError::unavailable(
+                        "cleanup-intent acknowledgement is not used by this test client",
+                    ))
+                })
+            }
+        }
+
+        $crate::control_plane::client::impl_unavailable_leader_network!($client);
+    };
+}
+
+#[cfg(test)]
+pub(crate) use impl_unavailable_leader_pod_effects;
+
+#[cfg(test)]
+macro_rules! impl_unavailable_leader_network {
+    ($client:ty) => {
+        impl klights_leader_api::LeaderNodeSubnetAllocation for $client {
+            fn allocate_node_subnet(
+                &self,
+                _request: klights_leader_api::NodeSubnetAllocationRequest,
+            ) -> klights_leader_api::NodeSubnetAllocationFuture<
+                '_,
+                klights_leader_api::NodeSubnetAllocationResult,
+            > {
+                Box::pin(async {
+                    Err(klights_leader_api::NodeSubnetAllocationError::retryable(
+                        "network allocation is not used by this test client",
+                    ))
+                })
+            }
+        }
+
+        impl klights_leader_api::LeaderNetworkTopologyQuery for $client {
+            fn get_node_subnet(
+                &self,
+                _request: klights_leader_api::NodeSubnetQuery,
+            ) -> klights_leader_api::NetworkTopologyFuture<
+                '_,
+                klights_leader_api::NodeSubnetResult,
+            > {
+                Box::pin(async {
+                    Err(klights_leader_api::NetworkTopologyError::retryable(
+                        "network topology is not used by this test client",
+                    ))
+                })
+            }
+
+            fn list_peer_subnets(
+                &self,
+                _request: klights_leader_api::PeerSubnetsQuery,
+            ) -> klights_leader_api::NetworkTopologyFuture<
+                '_,
+                klights_leader_api::PeerSubnetsResult,
+            > {
+                Box::pin(async {
+                    Err(klights_leader_api::NetworkTopologyError::retryable(
+                        "network topology is not used by this test client",
+                    ))
+                })
+            }
+
+            fn get_node_dataplane(
+                &self,
+                _request: klights_leader_api::NodeDataplaneQuery,
+            ) -> klights_leader_api::NetworkTopologyFuture<
+                '_,
+                klights_leader_api::NodeDataplaneResult,
+            > {
+                Box::pin(async {
+                    Err(klights_leader_api::NetworkTopologyError::retryable(
+                        "network topology is not used by this test client",
+                    ))
+                })
+            }
+        }
+    };
+}
+
+#[cfg(test)]
+pub(crate) use impl_unavailable_leader_network;
 
 #[cfg(test)]
 mod tests {
@@ -197,51 +388,258 @@ mod tests {
 
     use bytes::Bytes;
 
-    use crate::control_plane::client::LeaderApiClient;
     use crate::control_plane::client::local::LocalApiClient;
-    use crate::control_plane::client::membership;
+    use crate::control_plane::client::{
+        LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderPodCleanupIntents,
+        LeaderResourceQuery, NodeDataplaneQuery, NodeSubnetAllocationRequest, NodeSubnetQuery,
+        PeerSubnetsQuery, PodCleanupIntentAckRequest, ResourceQueryConsistency, pod_get_request,
+    };
+
+    #[test]
+    fn concrete_leader_clients_implement_focused_pod_effect_ports() {
+        fn assert_ports<T>()
+        where
+            T: klights_leader_api::LeaderProjectedServiceAccountToken
+                + klights_leader_api::LeaderPodCleanupIntents,
+        {
+        }
+
+        assert_ports::<crate::control_plane::client::local::LocalApiClient>();
+        assert_ports::<crate::control_plane::client::remote::RemoteApiClient>();
+        assert_ports::<crate::control_plane::client::leader_proxy::LeaderProxyApiClient>();
+        assert_ports::<crate::control_plane::client::leader_proxy::StubRemoteForwarder>();
+    }
+
+    #[test]
+    fn node_effect_ports_have_the_frozen_authority_split() {
+        fn assert_lease<T: klights_leader_api::LeaderNodeLeaseRenewal>() {}
+        fn assert_local_lifecycle<T: klights_leader_api::LeaderNodeLifecycleStatus>() {}
+
+        assert_lease::<crate::control_plane::client::local::LocalApiClient>();
+        assert_lease::<crate::control_plane::client::remote::RemoteApiClient>();
+        assert_lease::<crate::control_plane::client::leader_proxy::LeaderProxyApiClient>();
+        assert_lease::<crate::control_plane::client::leader_proxy::StubRemoteForwarder>();
+        assert_local_lifecycle::<crate::control_plane::client::local::LocalApiClient>();
+    }
+
+    #[tokio::test]
+    async fn node_effect_ports_gate_follower_lease_before_tracker_mutation() {
+        let db: crate::datastore::DatastoreHandle =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
+        let (_leader_tx, follower_rx) = tokio::sync::watch::channel(false);
+        let local =
+            crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker(
+                db,
+                "cp-1".to_string(),
+                tracker.clone(),
+                follower_rx,
+            );
+        let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
+            "cp-1",
+            crate::utils::k8s_time_format(chrono::Utc::now()),
+            30,
+        )
+        .expect("valid renewal");
+
+        let error = klights_leader_api::LeaderNodeLeaseRenewal::renew_node_lease(&local, request)
+            .await
+            .expect_err("follower must reject local lease renewal");
+        assert_eq!(error, klights_leader_api::NodeLeaseRenewalError::NotLeader);
+        assert!(
+            tracker.observed("cp-1").await.is_none(),
+            "leadership must be checked before the in-memory tracker is mutated"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_effect_ports_remote_rejects_cross_node_before_transport() {
+        let remote =
+            crate::control_plane::client::remote::RemoteApiClient::new_for_tests("worker-1");
+        let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
+            "worker-2",
+            crate::utils::k8s_time_format(chrono::Utc::now()),
+            30,
+        )
+        .expect("valid renewal shape");
+        assert!(matches!(
+            klights_leader_api::LeaderNodeLeaseRenewal::renew_node_lease(&remote, request).await,
+            Err(klights_leader_api::NodeLeaseRenewalError::Unauthorized { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn node_effect_lease_renewal_has_no_cluster_rv_watch_or_lease_row() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
+        let client =
+            crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker(
+                Arc::new(db.clone()),
+                "cp-1".to_string(),
+                tracker.clone(),
+                crate::control_plane::client::local::always_leader_watch(),
+            );
+        let before_rv = db.get_current_resource_version().await.expect("read RV");
+        let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
+            "cp-1",
+            crate::utils::k8s_time_format(chrono::Utc::now()),
+            30,
+        )
+        .expect("valid renewal");
+        klights_leader_api::LeaderNodeLeaseRenewal::renew_node_lease(&client, request)
+            .await
+            .expect("renew in memory");
+
+        assert!(tracker.observed("cp-1").await.is_some());
+        assert_eq!(
+            db.get_current_resource_version().await.expect("read RV"),
+            before_rv
+        );
+        assert!(
+            db.get_resource(
+                "coordination.k8s.io/v1",
+                "Lease",
+                Some("kube-node-lease"),
+                "cp-1",
+            )
+            .await
+            .expect("read Lease")
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn node_effect_lifecycle_status_preserves_spec_metadata_and_conflicts_stale_rv() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let created = db
+            .create_resource(
+                "v1",
+                "Node",
+                None,
+                "worker-a",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {
+                        "name": "worker-a",
+                        "uid": "node-uid-a",
+                        "labels": {"owned-by": "control-plane"}
+                    },
+                    "spec": {"unschedulable": true},
+                    "status": {"conditions": []}
+                }),
+            )
+            .await
+            .expect("create Node");
+        let client = crate::control_plane::client::local::LocalApiClient::new(
+            Arc::new(db.clone()),
+            "cp-1".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        );
+        let command = StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "worker-a".to_string(),
+            status: serde_json::json!({
+                "conditions": [{"type": "Ready", "status": "Unknown"}]
+            }),
+            expected_rv: Some(created.resource_version),
+            preconditions: ResourcePreconditions::from_resource(&created),
+            observed_status_stamp: None,
+        };
+        let request = klights_leader_api::NodeLifecycleStatusRequest::try_new(command.clone())
+            .expect("valid lifecycle CAS");
+        let result = klights_leader_api::LeaderNodeLifecycleStatus::submit_node_lifecycle_status(
+            &client, request,
+        )
+        .await
+        .expect("apply lifecycle status");
+        assert!(matches!(
+            result,
+            klights_leader_api::NodeLifecycleStatusResult::Updated { resource_version }
+                if resource_version > created.resource_version
+        ));
+
+        let stored = db
+            .get_resource("v1", "Node", None, "worker-a")
+            .await
+            .expect("read Node")
+            .expect("Node exists");
+        assert_eq!(
+            stored.data.pointer("/spec/unschedulable"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            stored.data.pointer("/metadata/labels/owned-by"),
+            Some(&serde_json::json!("control-plane"))
+        );
+        assert_eq!(
+            stored.data.pointer("/status/conditions/0/status"),
+            Some(&serde_json::json!("Unknown"))
+        );
+
+        let stale = klights_leader_api::NodeLifecycleStatusRequest::try_new(command)
+            .expect("same old CAS remains structurally valid");
+        assert!(matches!(
+            klights_leader_api::LeaderNodeLifecycleStatus::submit_node_lifecycle_status(
+                &client, stale,
+            )
+            .await,
+            Err(klights_leader_api::NodeLifecycleStatusError::Conflict { .. })
+        ));
+    }
     use crate::datastore::ResourcePreconditions;
-    use crate::datastore::backend::DatastoreBackend;
     use crate::datastore::command::StorageCommand;
     use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
     use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
 
     #[test]
-    fn watch_resume_advances_only_to_the_applied_event_and_falls_back_for_legacy_peers() {
-        let list_position = crate::datastore::WatchReplayPosition {
-            resource_version: 41,
-            event_id: 91,
-            resource_version_filter_through_event_id: 0,
-        };
-        let event_position = crate::datastore::WatchReplayPosition {
-            resource_version: 42,
-            event_id: 92,
-            resource_version_filter_through_event_id: 0,
-        };
-        for (name, delivered_position, expected_position) in [
-            ("composite", Some(event_position), Some(event_position)),
-            ("legacy", None, None),
-        ] {
-            let mut rv = Some(41);
-            let mut position = Some(list_position);
-            let event = super::ResourceEvent {
-                event: crate::watch::WatchEvent::modified(serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "ConfigMap",
-                    "metadata": {"name": name, "resourceVersion": "42"}
-                })),
-                resume_position: delivered_position,
-            };
-            super::advance_watch_resume_after_apply(
-                &mut rv,
-                &mut position,
-                event.event.resource_version(),
-                event.resume_position,
-            );
-            assert_eq!(rv, Some(42), "{name}");
-            assert_eq!(position, expected_position, "{name}");
+    fn positioned_watch_adapters_implement_focused_ports() {
+        fn assert_focused<
+            T: klights_leader_api::LeaderWatch + klights_leader_api::LeaderCacheReadiness,
+        >() {
         }
+
+        assert_focused::<crate::control_plane::client::local::LocalApiClient>();
+        assert_focused::<crate::control_plane::client::remote::RemoteApiClient>();
+        assert_focused::<crate::control_plane::client::leader_proxy::LeaderProxyApiClient>();
+        assert_focused::<crate::control_plane::client::leader_proxy::StubRemoteForwarder>();
+    }
+
+    #[tokio::test]
+    async fn stub_watch_and_readiness_are_typed_unavailable() {
+        let stub = crate::control_plane::client::leader_proxy::StubRemoteForwarder::new(
+            "cp-stub".to_string(),
+        );
+        let watch = klights_leader_api::WatchRequest::try_new(
+            "v1",
+            "Pod",
+            None,
+            None,
+            None,
+            Some(41),
+            None,
+        )
+        .expect("valid watch");
+        assert!(matches!(
+            klights_leader_api::LeaderWatch::watch_resources(&stub, watch).await,
+            Err(klights_leader_api::LeaderWatchError::Unavailable { .. })
+        ));
+
+        let readiness = klights_leader_api::CacheReadinessRequest::try_new(
+            "v1",
+            "Pod",
+            None,
+            None,
+            Some("spec.nodeName=worker-a".to_string()),
+        )
+        .expect("valid readiness scope");
+        assert!(matches!(
+            klights_leader_api::LeaderCacheReadiness::wait_cache_ready(&stub, readiness).await,
+            Err(klights_leader_api::CacheReadinessError::Unavailable { .. })
+        ));
     }
 
     fn pod_status_payload(uid: &str) -> Bytes {
@@ -287,35 +685,8 @@ mod tests {
         )
     }
 
-    fn node_lease_renew_payload(node_name: &str, renew_time: &str) -> Bytes {
-        let command = StorageCommand::CreateResource {
-            api_version: "coordination.k8s.io/v1".to_string(),
-            kind: "Lease".to_string(),
-            namespace: Some("kube-node-lease".to_string()),
-            name: node_name.to_string(),
-            data: serde_json::json!({
-                "apiVersion": "coordination.k8s.io/v1",
-                "kind": "Lease",
-                "metadata": {
-                    "name": node_name,
-                    "namespace": "kube-node-lease"
-                },
-                "spec": {
-                    "holderIdentity": node_name,
-                    "leaseDurationSeconds": 50,
-                    "renewTime": renew_time
-                }
-            }),
-        };
-        Bytes::from(
-            OutboxPayload::from_command(command)
-                .encode_protobuf()
-                .expect("encode lease renew payload"),
-        )
-    }
-
     #[tokio::test]
-    async fn local_client_reads_pods_and_filters_uid() {
+    async fn local_client_reads_pods_through_focused_resource_query() {
         let db = crate::datastore::test_support::in_memory().await;
         db.create_resource(
             "v1",
@@ -343,25 +714,69 @@ mod tests {
 
         assert!(
             client
-                .get_pod("default", "web")
+                .get_resource(
+                    pod_get_request("default", "web", ResourceQueryConsistency::Cached)
+                        .expect("valid Pod request"),
+                )
                 .await
                 .expect("get pod")
                 .is_some()
         );
-        assert!(
-            client
-                .get_pod_for_uid("default", "web", "uid-1")
-                .await
-                .expect("get pod for uid")
-                .is_some()
+    }
+
+    #[tokio::test]
+    async fn cleanup_intent_ack_is_idempotent_and_never_touches_same_name_pod_row() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let replacement = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "web",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "web",
+                        "uid": "replacement-uid"
+                    },
+                    "spec": {
+                        "nodeName": "node-a",
+                        "containers": [{"name": "app", "image": "nginx"}]
+                    }
+                }),
+            )
+            .await
+            .expect("create same-name replacement Pod");
+        let client = LocalApiClient::new(
+            Arc::new(db.clone()),
+            "node-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
         );
-        assert!(
+        let ack = PodCleanupIntentAckRequest::try_new(
+            "node-a",
+            "default",
+            "web",
+            "old-uid",
+            crate::datastore::POD_CLEANUP_REASON_NODE_LOST,
+        )
+        .unwrap();
+
+        for _ in 0..2 {
             client
-                .get_pod_for_uid("default", "web", "uid-2")
+                .acknowledge_pod_cleanup_intent(ack.clone())
                 .await
-                .expect("get stale uid")
-                .is_none()
-        );
+                .expect("missing cleanup intent acknowledgement is idempotent");
+        }
+
+        let stored = db
+            .get_resource("v1", "Pod", Some("default"), "web")
+            .await
+            .unwrap()
+            .expect("same-name replacement Pod must remain");
+        assert_eq!(stored.uid, "replacement-uid");
+        assert_eq!(stored.resource_version, replacement.resource_version);
     }
 
     #[tokio::test]
@@ -392,28 +807,28 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         );
 
-        let first = LeaderApiClient::apply_outbox(
-            &client,
-            "stable-key",
-            OutboxOperation::PodStatus,
-            pod_status_payload("uid-1"),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect("first apply");
-        let duplicate = LeaderApiClient::apply_outbox(
-            &client,
-            "stable-key",
-            OutboxOperation::PodStatus,
-            pod_status_payload("uid-1"),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect("duplicate apply");
+        let first = client
+            .deliver_test_outbox(
+                "stable-key",
+                OutboxOperation::PodStatus,
+                pod_status_payload("uid-1"),
+                "client",
+                1,
+                1,
+            )
+            .await
+            .expect("first apply");
+        let duplicate = client
+            .deliver_test_outbox(
+                "stable-key",
+                OutboxOperation::PodStatus,
+                pod_status_payload("uid-1"),
+                "client",
+                1,
+                1,
+            )
+            .await
+            .expect("duplicate apply");
         assert!(matches!(first, OutboxApplyResult::Applied { .. }));
         assert!(matches!(
             duplicate,
@@ -431,19 +846,54 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("Running")
         );
+        let rv_before_mismatch = stored.resource_version;
+        let watch_before_mismatch = db
+            .current_watch_replay_position()
+            .await
+            .expect("watch position before assigned UID mismatch");
 
-        let err = LeaderApiClient::apply_outbox(
-            &client,
-            "uid-mismatch-key",
-            OutboxOperation::PodStatus,
-            pod_status_payload("uid-2"),
-            "client",
-            0,
-            0,
-        )
-        .await
-        .expect_err("unwatermarked uid mismatch");
+        let err = client
+            .deliver_test_outbox(
+                "uid-mismatch-key",
+                OutboxOperation::PodStatus,
+                pod_status_payload("uid-2"),
+                "client",
+                1,
+                2,
+            )
+            .await
+            .expect_err("assigned uid mismatch");
         assert!(matches!(err, OutboxApplyError::UidMismatch { .. }));
+        assert_eq!(
+            db.get_current_resource_version().await.expect("read RV"),
+            rv_before_mismatch,
+            "terminal UID mismatch must not allocate a public resourceVersion"
+        );
+        assert_eq!(
+            db.current_watch_replay_position()
+                .await
+                .expect("watch position after assigned UID mismatch"),
+            watch_before_mismatch,
+            "terminal UID mismatch must not append watch history"
+        );
+        let ledger = db
+            .get_applied_outbox("uid-mismatch-key")
+            .await
+            .expect("read terminal ledger")
+            .expect("terminal ledger row");
+        assert!(matches!(
+            crate::datastore::command::decode_response_protobuf(&ledger.result_proto),
+            Ok(crate::datastore::command::StorageResponse::Error { message })
+                if message.contains("delivery UID mismatch")
+        ));
+        assert_eq!(
+            db.list_outbox_stream_watermarks()
+                .await
+                .expect("read terminal watermark")[0]
+                .stream_seq,
+            2,
+            "terminal UID mismatch must consume its exact assigned sequence"
+        );
     }
 
     #[tokio::test]
@@ -475,119 +925,22 @@ mod tests {
         );
 
         assert_eq!(client.last_raft_commit_index_for_test().await, 0);
-        let applied = LeaderApiClient::apply_outbox(
-            &client,
-            "raft-client-key",
-            OutboxOperation::PodStatus,
-            pod_status_payload("uid-1"),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect("apply outbox through local client");
+        let applied = client
+            .deliver_test_outbox(
+                "raft-client-key",
+                OutboxOperation::PodStatus,
+                pod_status_payload("uid-1"),
+                "client",
+                1,
+                1,
+            )
+            .await
+            .expect("apply outbox through local client");
 
         let OutboxApplyResult::Applied { applied_rv } = applied else {
             panic!("first local apply must commit a new write");
         };
         assert_eq!(client.last_raft_commit_index_for_test().await, applied_rv);
-    }
-
-    #[tokio::test]
-    async fn local_client_lease_renew_updates_memory_without_cluster_db_write() {
-        let db = crate::datastore::test_support::in_memory().await;
-        let tracker = Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new_for_test(
-            chrono::DateTime::parse_from_rfc3339("2026-05-25T14:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-        ));
-        let client = LocalApiClient::new_with_node_lease_tracker(
-            Arc::new(db.clone()),
-            "worker-a".to_string(),
-            tracker.clone(),
-            crate::control_plane::client::local::always_leader_watch(),
-        );
-        let before_rv = db.get_current_resource_version().await.unwrap();
-
-        let applied = LeaderApiClient::apply_outbox(
-            &client,
-            "lease-renew-memory-key",
-            OutboxOperation::LeaseRenew,
-            node_lease_renew_payload("worker-a", "2026-05-25T14:00:10.000000Z"),
-            "",
-            0,
-            0,
-        )
-        .await
-        .expect("lease renew should be accepted");
-
-        assert!(matches!(
-            applied,
-            OutboxApplyResult::Applied { applied_rv: 0 }
-        ));
-        assert_eq!(
-            db.get_current_resource_version().await.unwrap(),
-            before_rv,
-            "node Lease renew must not advance cluster resourceVersion"
-        );
-        assert!(
-            db.get_resource(
-                "coordination.k8s.io/v1",
-                "Lease",
-                Some("kube-node-lease"),
-                "worker-a",
-            )
-            .await
-            .unwrap()
-            .is_none(),
-            "node Lease renew must not create or update a cluster.db Lease row"
-        );
-        assert!(
-            db.list_applied_outbox().await.unwrap().is_empty(),
-            "in-memory heartbeats must not write the replicated applied_outbox ledger"
-        );
-        // T3: `list_log_apply_entries_after` removed.
-        let observed = tracker
-            .observed("worker-a")
-            .await
-            .expect("heartbeat tracked");
-        assert_eq!(observed.renew_time_string(), "2026-05-25T14:00:10Z");
-    }
-
-    #[tokio::test]
-    async fn local_client_returns_cluster_membership() {
-        let db = crate::datastore::test_support::in_memory().await;
-        crate::bootstrap::cluster_meta::ensure_cluster_metadata(&db)
-            .await
-            .expect("ensure metadata");
-        let cluster_id = db
-            .get_klights_meta(crate::bootstrap::cluster_meta::KEY_CLUSTER_ID)
-            .await
-            .unwrap()
-            .unwrap();
-        crate::bootstrap::cluster_meta::write_cluster_membership(
-            &db,
-            &membership::ClusterMembership {
-                cluster_id: cluster_id.clone(),
-                voters: vec!["mn-leader".to_string()],
-                term: 1,
-                leader_hint: Some("mn-leader".to_string()),
-            },
-        )
-        .await
-        .unwrap();
-
-        let client = LocalApiClient::new(
-            Arc::new(db),
-            "mn-leader".to_string(),
-            crate::control_plane::client::local::always_leader_watch(),
-        );
-        let membership = client.get_cluster_membership().await.unwrap();
-
-        assert_eq!(membership.cluster_id, cluster_id);
-        assert_eq!(membership.voters, vec!["mn-leader"]);
-        assert_eq!(membership.term, 1);
-        assert_eq!(membership.leader_hint.as_deref(), Some("mn-leader"));
     }
 
     #[tokio::test]
@@ -669,17 +1022,17 @@ mod tests {
             "worker-a".to_string(),
             crate::control_plane::client::local::always_leader_watch(),
         );
-        let applied = LeaderApiClient::apply_outbox(
-            &client,
-            "worker-pod-actor-finalize-delete",
-            OutboxOperation::PodMetadata,
-            pod_delete_payload_for("worker-finalize-ns", "worker-pod", "worker-pod-uid"),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect("apply worker pod delete outbox");
+        let applied = client
+            .deliver_test_outbox(
+                "worker-pod-actor-finalize-delete",
+                OutboxOperation::PodMetadata,
+                pod_delete_payload_for("worker-finalize-ns", "worker-pod", "worker-pod-uid"),
+                "client",
+                1,
+                1,
+            )
+            .await
+            .expect("apply worker pod delete outbox");
         assert!(matches!(applied, OutboxApplyResult::Applied { .. }));
 
         assert!(
@@ -766,17 +1119,17 @@ mod tests {
             .await;
         client.set_controller_dispatcher(dispatcher);
 
-        let applied = LeaderApiClient::apply_outbox(
-            &client,
-            "foreground-child-actor-finalize-delete",
-            OutboxOperation::PodMetadata,
-            pod_delete_payload("foreground-child", "foreground-child-uid"),
-            "client",
-            1,
-            1,
-        )
-        .await
-        .expect("apply pod delete outbox");
+        let applied = client
+            .deliver_test_outbox(
+                "foreground-child-actor-finalize-delete",
+                OutboxOperation::PodMetadata,
+                pod_delete_payload("foreground-child", "foreground-child-uid"),
+                "client",
+                1,
+                1,
+            )
+            .await
+            .expect("apply pod delete outbox");
         assert!(matches!(applied, OutboxApplyResult::Applied { .. }));
 
         assert!(
@@ -810,27 +1163,37 @@ mod tests {
         );
 
         let subnet = client
-            .allocate_node_subnet("node-a", "10.42.0.0/16", "192.0.2.10")
+            .allocate_node_subnet(
+                NodeSubnetAllocationRequest::try_new("node-a", "10.42.0.0/16", "192.0.2.10")
+                    .expect("valid allocation request"),
+            )
             .await
-            .expect("allocate local subnet through leader API");
-        assert_eq!(subnet.node_name.as_str(), "node-a");
-        assert_eq!(subnet.subnet.to_string(), "10.42.0.0/24");
+            .expect("allocate local subnet through leader API")
+            .into_subnet();
+        assert_eq!(subnet.node_name(), "node-a");
+        assert_eq!(subnet.subnet(), "10.42.0.0/24");
 
         let stored = client
-            .get_node_subnet("node-a")
+            .get_node_subnet(NodeSubnetQuery::try_new("node-a").expect("valid query"))
             .await
             .expect("get local subnet through leader API")
+            .into_option()
             .expect("allocated subnet should exist");
         assert_eq!(stored, subnet);
 
         let peer = client
-            .allocate_node_subnet("node-b", "10.42.0.0/16", "192.0.2.11")
+            .allocate_node_subnet(
+                NodeSubnetAllocationRequest::try_new("node-b", "10.42.0.0/16", "192.0.2.11")
+                    .expect("valid allocation request"),
+            )
             .await
-            .expect("allocate peer subnet");
+            .expect("allocate peer subnet")
+            .into_subnet();
         let peers = client
-            .list_peer_subnets("node-a")
+            .list_peer_subnets(PeerSubnetsQuery::try_new("node-a").expect("valid query"))
             .await
-            .expect("list peer subnets through leader API");
+            .expect("list peer subnets through leader API")
+            .into_vec();
         assert_eq!(peers, vec![peer]);
 
         let metadata = DataplanePeerMetadata::try_new(
@@ -847,10 +1210,14 @@ mod tests {
             .expect("store dataplane metadata");
         assert_eq!(
             client
-                .get_node_dataplane("node-b")
+                .get_node_dataplane(NodeDataplaneQuery::try_new("node-b").expect("valid query"),)
                 .await
-                .expect("get dataplane metadata through leader API"),
-            Some(metadata)
+                .expect("get dataplane metadata through leader API")
+                .into_option(),
+            Some(
+                crate::control_plane::client::focused_dataplane(metadata)
+                    .expect("valid focused metadata"),
+            )
         );
     }
 }

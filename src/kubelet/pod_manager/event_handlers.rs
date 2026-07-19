@@ -264,24 +264,35 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
             };
         if orphan_enqueued
             && let Some(key) = node_lost_cleanup_intent_key_for_deleted_pod(&event, node_name)
-            && let Err(err) = cluster_api
-                .delete_pod_cleanup_intent(
-                    &key.node_name,
-                    &key.namespace,
-                    &key.pod_name,
-                    &key.pod_uid,
-                    crate::datastore::POD_CLEANUP_REASON_NODE_LOST,
-                )
-                .await
         {
-            tracing::warn!(
-                node = %key.node_name,
-                namespace = %key.namespace,
-                pod = %key.pod_name,
-                uid = %key.pod_uid,
-                error = %err,
-                "failed to delete NodeLost pod cleanup intent after deleted-pod orphan enqueue"
-            );
+            match crate::control_plane::client::PodCleanupIntentAckRequest::try_new(
+                key.node_name.as_str(),
+                key.namespace.as_str(),
+                key.pod_name.as_str(),
+                key.pod_uid.as_str(),
+                crate::datastore::POD_CLEANUP_REASON_NODE_LOST,
+            ) {
+                Ok(request) => {
+                    if let Err(err) = cluster_api.acknowledge_pod_cleanup_intent(request).await {
+                        tracing::warn!(
+                            node = %key.node_name,
+                            namespace = %key.namespace,
+                            pod = %key.pod_name,
+                            uid = %key.pod_uid,
+                            error = %err,
+                            "failed to acknowledge NodeLost pod cleanup intent after deleted-pod orphan handoff"
+                        );
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    node = %key.node_name,
+                    namespace = %key.namespace,
+                    pod = %key.pod_name,
+                    uid = %key.pod_uid,
+                    error = %err,
+                    "refused invalid NodeLost pod cleanup-intent acknowledgement key"
+                ),
+            }
         }
     }
 }

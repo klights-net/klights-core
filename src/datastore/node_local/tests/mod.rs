@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::node_local::{
-    NodeLocalBackend, NodeLocalDb, NodeLocalHandle, OutboxInsert, SqliteNodeLocalDb, selector,
+    NodeLocalBackend, NodeLocalDb, NodeLocalHandle, OutboxFailureDisposition, OutboxInsert,
+    SqliteNodeLocalDb, selector,
 };
 use crate::datastore::sqlite::{DbExecutor, opener};
 use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
@@ -34,6 +35,15 @@ async fn open_sqlite_node_local_backend_handle() -> NodeLocalHandle {
     Arc::new(db)
 }
 
+async fn open_node_local_on_disk(path: &std::path::Path) -> NodeLocalDb {
+    let mut opts = opener::OpenOpts::node_disk(path.to_path_buf());
+    opts.allow_existing_perms = true;
+    let executor = DbExecutor::open_with_opts(opts, supervisor(), "sqlite:node-local-disk-test")
+        .await
+        .expect("open disk node-local executor");
+    NodeLocalDb::from_executor(executor).expect("create disk node-local db")
+}
+
 fn test_outbox_insert(key: &str, subject_key: &str, now_ms: i64) -> OutboxInsert {
     test_outbox_insert_with_operation(key, subject_key, "PodStatus", now_ms)
 }
@@ -58,6 +68,51 @@ fn test_outbox_insert_with_operation(
         payload_proto: vec![],
         next_due_ms: now_ms,
     }
+}
+
+#[tokio::test]
+async fn outbox_failure_threshold_is_atomic_and_lease_bound() {
+    let db = open_node_local_in_memory().await;
+    db.enqueue_outbox(test_outbox_insert(
+        "atomic-dead-letter",
+        "v1/Pod/default/web/pod-uid",
+        1,
+    ))
+    .await
+    .unwrap();
+    db.set_outbox_attempt_for_test("atomic-dead-letter", 719)
+        .await
+        .unwrap();
+    let row = db
+        .claim_next_due_outbox(1, 1_000, "owned-lease")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        db.record_outbox_failure(row.id, "stale-lease", 10, "retry", 720)
+            .await
+            .unwrap(),
+        OutboxFailureDisposition::LeaseLost
+    );
+    assert!(db.list_dead_letter().await.unwrap().is_empty());
+    assert_eq!(
+        db.record_outbox_failure(row.id, "owned-lease", 10, "retry", 720)
+            .await
+            .unwrap(),
+        OutboxFailureDisposition::DeadLettered
+    );
+    let dead = db.list_dead_letter().await.unwrap();
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].attempts, 720);
+    assert_eq!(dead[0].last_error, "retry");
+    assert_eq!(
+        db.record_outbox_failure(row.id, "owned-lease", 10, "duplicate", 720)
+            .await
+            .unwrap(),
+        OutboxFailureDisposition::LeaseLost
+    );
+    assert_eq!(db.list_dead_letter().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -93,6 +148,279 @@ async fn node_local_outbox_assigns_monotonic_seq_per_stream() {
     assert_eq!(first.stream_id, second.stream_id);
     assert_eq!(first.stream_seq, 1);
     assert_eq!(second.stream_seq, 2);
+}
+
+#[tokio::test]
+async fn legacy_outbox_stream_identity_is_repaired_durably_before_delivery() {
+    use klights_leader_api::{OutboxDeliveryOperation, OutboxDeliveryRequest};
+
+    let directory = tempfile::tempdir().expect("create node-local restart fixture");
+    let path = directory.path().join("node.db");
+    let mut legacy = test_outbox_insert(
+        "legacy-pre-stream-row",
+        "v1/Pod/default/legacy/legacy-uid",
+        100,
+    );
+    legacy.payload_proto = vec![1];
+
+    let db = open_node_local_on_disk(&path).await;
+    db.enqueue_outbox(legacy)
+        .await
+        .expect("seed durable row using current shape");
+    db.clear_outbox_stream_identity_for_test("legacy-pre-stream-row")
+        .await
+        .expect("model a pre-stream-schema row after column migration");
+    drop(db);
+
+    let db = open_node_local_on_disk(&path).await;
+    let first = db
+        .claim_next_due_outbox(100, 1_000, "legacy-first-lease")
+        .await
+        .expect("claim legacy row after restart")
+        .expect("legacy row must remain deliverable");
+    assert!(!first.client_id.is_empty());
+    assert!(first.stream_id > 0);
+    assert_eq!(first.stream_seq, 1);
+    OutboxDeliveryRequest::try_new(
+        first.idempotency_key.clone(),
+        OutboxDeliveryOperation::PodStatus,
+        std::sync::Arc::from(first.payload_proto.clone()),
+        first.client_id.clone(),
+        first.stream_id,
+        first.stream_seq,
+    )
+    .expect("claim must repair identity before request validation can drop the row");
+    assert!(
+        db.mark_outbox_attempt_failed(
+            first.id,
+            "legacy-first-lease",
+            200,
+            "leader temporarily unavailable",
+        )
+        .await
+        .expect("release legacy row for retry")
+    );
+
+    let mut successor = test_outbox_insert(
+        "post-migration-successor",
+        "v1/Pod/default/legacy/legacy-uid",
+        110,
+    );
+    successor.payload_proto = vec![2];
+    db.enqueue_outbox(successor)
+        .await
+        .expect("enqueue same-stream successor");
+    assert!(
+        db.claim_next_due_outbox(150, 1_000, "blocked-successor")
+            .await
+            .expect("query blocked successor")
+            .is_none(),
+        "the repaired legacy head must block its strict-stream successor"
+    );
+    drop(db);
+
+    let db = open_node_local_on_disk(&path).await;
+    let retried = db
+        .claim_next_due_outbox(200, 1_000, "legacy-restart-lease")
+        .await
+        .expect("claim repaired row after second restart")
+        .expect("repaired row survives restart");
+    assert_eq!(retried.client_id, first.client_id);
+    assert_eq!(
+        (retried.stream_id, retried.stream_seq),
+        (first.stream_id, 1)
+    );
+    assert!(
+        db.complete_outbox(retried.id, "legacy-restart-lease")
+            .await
+            .expect("complete legacy row after leader decision")
+    );
+
+    let successor = db
+        .claim_next_due_outbox(201, 1_000, "successor-lease")
+        .await
+        .expect("claim successor")
+        .expect("successor progresses after legacy decision");
+    assert_eq!(successor.client_id, first.client_id);
+    assert_eq!(successor.stream_id, first.stream_id);
+    assert_eq!(successor.stream_seq, 2);
+}
+
+#[tokio::test]
+async fn legacy_outbox_upgrade_repairs_fifo_before_successor_enqueue() {
+    let directory = tempfile::tempdir().expect("create node-local upgrade fixture");
+    let path = directory.path().join("node.db");
+    let subject = "v1/Pod/default/legacy-upgrade/legacy-uid";
+
+    let db = open_node_local_on_disk(&path).await;
+    for (key, enqueued_ms) in [
+        ("legacy-live-head", 100),
+        ("legacy-dead-head", 101),
+        ("legacy-live-tail", 102),
+    ] {
+        db.enqueue_outbox(test_outbox_insert(key, subject, enqueued_ms))
+            .await
+            .expect("seed pre-stream row");
+    }
+    assert!(
+        db.move_outbox_to_dead_letter_if_max_attempts("legacy-dead-head", 0)
+            .await
+            .expect("move legacy middle row to dead letter")
+    );
+    db.clear_all_outbox_stream_identity_for_test()
+        .await
+        .expect("model pre-stream live and dead-letter rows");
+    drop(db);
+
+    let db = open_node_local_on_disk(&path).await;
+    db.enqueue_outbox(test_outbox_insert("current-successor", subject, 103))
+        .await
+        .expect("enqueue current row before any legacy claim");
+
+    let first = db
+        .claim_next_due_outbox(200, 1_000, "legacy-head-lease")
+        .await
+        .expect("claim repaired legacy head")
+        .expect("legacy head remains first");
+    assert_eq!(first.idempotency_key, "legacy-live-head");
+    assert_eq!(first.stream_seq, 1);
+    assert!(
+        db.complete_outbox(first.id, "legacy-head-lease")
+            .await
+            .expect("complete legacy head")
+    );
+
+    let dead = db
+        .list_dead_letter()
+        .await
+        .expect("list repaired dead letter");
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].idempotency_key, "legacy-dead-head");
+    assert_eq!(dead[0].client_id, first.client_id);
+    assert_eq!(dead[0].stream_id, first.stream_id);
+    assert_eq!(dead[0].stream_seq, 2);
+    assert!(
+        db.claim_next_due_outbox(200, 1_000, "blocked-live-tail")
+            .await
+            .expect("query behind repaired dead letter")
+            .is_none(),
+        "the repaired dead-letter sequence must block later legacy/current rows"
+    );
+
+    assert!(
+        db.replay_dead_letter(dead[0].id)
+            .await
+            .expect("replay exact repaired dead-letter head")
+    );
+    let replay_now = i64::MAX / 4;
+    let replayed = db
+        .claim_next_due_outbox(replay_now, 1_000, "legacy-dead-replay")
+        .await
+        .expect("claim replayed legacy dead-letter row")
+        .expect("replayed dead-letter row is the exact next sequence");
+    assert_eq!(replayed.idempotency_key, "legacy-dead-head");
+    assert_eq!(replayed.stream_seq, 2);
+    assert!(
+        db.complete_outbox(replayed.id, "legacy-dead-replay")
+            .await
+            .expect("complete replayed legacy dead-letter row")
+    );
+
+    for (expected_key, expected_seq, token) in [
+        ("legacy-live-tail", 3, "legacy-tail-lease"),
+        ("current-successor", 4, "current-successor-lease"),
+    ] {
+        let row = db
+            .claim_next_due_outbox(replay_now, 1_000, token)
+            .await
+            .expect("claim ordered successor")
+            .expect("ordered successor is deliverable");
+        assert_eq!(row.idempotency_key, expected_key);
+        assert_eq!(row.client_id, first.client_id);
+        assert_eq!(row.stream_id, first.stream_id);
+        assert_eq!(row.stream_seq, expected_seq);
+        assert!(
+            db.complete_outbox(row.id, token)
+                .await
+                .expect("complete ordered successor")
+        );
+    }
+}
+
+#[tokio::test]
+async fn node_local_outbox_commits_stream_sequence_before_enqueue_returns() {
+    let db = open_node_local_in_memory().await;
+    let subject = "v1/Pod/default/atomic-sequence/pod-uid";
+
+    db.enqueue_outbox(test_outbox_insert("atomic-sequence-1", subject, 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.outbox_stream_position_for_test("atomic-sequence-1")
+            .await
+            .unwrap(),
+        Some((
+            crate::datastore::node_local::sqlite::outbox_stream_id(subject),
+            1
+        )),
+        "the durable sequence must exist before any claim or delivery can observe the row",
+    );
+
+    db.enqueue_outbox(test_outbox_insert("atomic-sequence-2", subject, 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.outbox_stream_position_for_test("atomic-sequence-2")
+            .await
+            .unwrap(),
+        Some((
+            crate::datastore::node_local::sqlite::outbox_stream_id(subject),
+            2
+        )),
+        "enqueue must allocate the next sequence in the same transaction",
+    );
+}
+
+#[tokio::test]
+async fn outbox_durability_next_wake_tracks_the_fifo_blocker_not_blocked_younger_work() {
+    let db = open_node_local_in_memory().await;
+    let subject = "v1/Pod/default/fifo-wake/pod-uid";
+
+    db.enqueue_outbox(test_outbox_insert("fifo-blocker", subject, 500))
+        .await
+        .unwrap();
+    db.enqueue_outbox(test_outbox_insert("fifo-blocked-younger", subject, 100))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.next_outbox_wake_ms(200).await.unwrap(),
+        Some(500),
+        "a past-due younger row cannot cause a wake loop while an older FIFO row is future-due",
+    );
+}
+
+#[tokio::test]
+async fn outbox_durability_next_wake_tracks_an_older_active_lease() {
+    let db = open_node_local_in_memory().await;
+    let subject = "v1/Pod/default/leased-fifo-wake/pod-uid";
+
+    db.enqueue_outbox(test_outbox_insert("leased-fifo-blocker", subject, 100))
+        .await
+        .unwrap();
+    db.enqueue_outbox(test_outbox_insert("leased-fifo-younger", subject, 100))
+        .await
+        .unwrap();
+    db.claim_next_due_outbox(100, 400, "active-lease")
+        .await
+        .unwrap()
+        .expect("claim older blocker");
+
+    assert_eq!(
+        db.next_outbox_wake_ms(200).await.unwrap(),
+        Some(500),
+        "the older row's lease expiry, not a blocked younger due time, controls the next wake",
+    );
 }
 
 #[tokio::test]

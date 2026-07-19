@@ -652,6 +652,9 @@ mod tests {
             &leader_namespace,
             None,
             None,
+            None,
+            None,
+            None,
             crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

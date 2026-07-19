@@ -2027,6 +2027,7 @@ dependencies = [
  "klights-cluster-core",
  "klights-cluster-store",
  "klights-internal-protobuf",
+ "klights-leader-api",
  "klights-types",
  "kube",
  "libc",
@@ -2150,6 +2151,12 @@ version = "0.0.0"
 [[package]]
 name = "klights-leader-api"
 version = "0.0.0"
+dependencies = [
+ "futures-core",
+ "klights-cluster-core",
+ "klights-types",
+ "serde_json",
+]
 
 [[package]]
 name = "klights-network-api"

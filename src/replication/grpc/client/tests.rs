@@ -28,6 +28,7 @@ mod cases {
     use crate::replication::service::ReplicationService;
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use futures::StreamExt as _;
+    use klights_leader_api::{OutboxDeliveryOperation, OutboxDeliveryRequest};
     use tokio_util::sync::CancellationToken;
 
     use crate::leader_tls_policy::LeaderTlsVerification;
@@ -42,6 +43,327 @@ mod cases {
             mode: DataplaneMode::Root,
             encryption: DataplaneEncryption::Disabled,
         }
+    }
+
+    #[test]
+    fn node_lease_renewal_rpc_preserves_focused_error_kinds() {
+        use klights_leader_api::NodeLeaseRenewalError;
+
+        let cases = [
+            (
+                super::super::UnaryRpcError::Status(tonic::Status::invalid_argument("bad lease")),
+                NodeLeaseRenewalError::InvalidRequest {
+                    field: "lease",
+                    message: "bad lease".to_string(),
+                },
+            ),
+            (
+                super::super::UnaryRpcError::Status(tonic::Status::permission_denied("wrong node")),
+                NodeLeaseRenewalError::Unauthorized {
+                    message: "wrong node".to_string(),
+                },
+            ),
+            (
+                super::super::UnaryRpcError::Retryable(
+                    "status: FailedPrecondition, message: not raft leader".to_string(),
+                ),
+                NodeLeaseRenewalError::NotLeader,
+            ),
+            (
+                super::super::UnaryRpcError::Status(tonic::Status::unavailable("leader down")),
+                NodeLeaseRenewalError::Unavailable {
+                    message: "leader down".to_string(),
+                },
+            ),
+            (
+                super::super::UnaryRpcError::Retryable("connect failed".to_string()),
+                NodeLeaseRenewalError::Retryable {
+                    message: "connect failed".to_string(),
+                },
+            ),
+            (
+                super::super::UnaryRpcError::Status(tonic::Status::deadline_exceeded("late")),
+                NodeLeaseRenewalError::Timeout,
+            ),
+            (
+                super::super::UnaryRpcError::Status(tonic::Status::cancelled("shutdown")),
+                NodeLeaseRenewalError::Cancelled,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                super::super::node_lease_renewal_error_from_unary(error),
+                expected
+            );
+        }
+    }
+
+    fn outbox_delivery_request(
+        key: impl Into<String>,
+        payload: bytes::Bytes,
+        stream_id: i64,
+        stream_seq: i64,
+    ) -> OutboxDeliveryRequest {
+        let payload = if payload.is_empty() {
+            Arc::<[u8]>::from(&b"test"[..])
+        } else {
+            Arc::<[u8]>::from(payload.to_vec())
+        };
+        OutboxDeliveryRequest::try_new(
+            key,
+            OutboxDeliveryOperation::PodStatus,
+            payload,
+            "client",
+            stream_id,
+            stream_seq,
+        )
+        .expect("valid delivery request")
+    }
+
+    #[test]
+    fn outbox_transport_contract_unknown_response_error_fails_closed() {
+        for error_type in [Some("FutureServerError"), None] {
+            let error = super::super::outbox_error_from_response(
+                error_type,
+                "unrecognized server decision".to_string(),
+            );
+            assert!(matches!(
+                &error,
+                klights_leader_api::OutboxDeliveryError::CorruptResponse { .. }
+            ));
+            assert!(error.is_retryable());
+        }
+    }
+
+    #[test]
+    fn outbox_transport_terminal_decisions_require_typed_consumed_responses() {
+        let response_error =
+            super::super::decode_apply_outbox_response(generated::ApplyOutboxResponse {
+                already_applied: true,
+                applied_rv: 41,
+                error: Some("conflict".to_string()),
+                error_type: Some("ConflictTerminal".to_string()),
+            })
+            .expect_err("success evidence and a terminal decision are contradictory");
+        assert!(matches!(
+            &response_error,
+            klights_leader_api::OutboxDeliveryError::CorruptResponse { .. }
+        ));
+        assert!(response_error.is_retryable());
+
+        for status in [
+            tonic::Status::not_found("Pod is absent"),
+            tonic::Status::failed_precondition("uid mismatch"),
+            tonic::Status::already_exists("resource conflict"),
+            tonic::Status::invalid_argument("malformed command"),
+        ] {
+            let status_error = super::super::outbox_error_from_status(status);
+            assert!(
+                status_error.is_retryable(),
+                "a gRPC status carries no durable sequence-consumption proof: {status_error}"
+            );
+            assert!(!status_error.is_terminal());
+        }
+    }
+
+    #[test]
+    fn outbox_response_codec_preserves_absent_already_applied_resource_version() {
+        let decoded = super::super::decode_apply_outbox_response(generated::ApplyOutboxResponse {
+            already_applied: true,
+            applied_rv: 0,
+            error: None,
+            error_type: None,
+        })
+        .expect("zero is the stable wire encoding for an absent replay RV");
+        assert_eq!(
+            decoded,
+            klights_leader_api::OutboxDeliveryResult::AlreadyApplied { applied_rv: None }
+        );
+    }
+
+    #[test]
+    fn outbox_response_codec_rejects_zero_resource_version_for_new_apply() {
+        let error = super::super::decode_apply_outbox_response(generated::ApplyOutboxResponse {
+            already_applied: false,
+            applied_rv: 0,
+            error: None,
+            error_type: None,
+        })
+        .expect_err("a new committed apply must carry a positive public resourceVersion");
+        assert!(matches!(
+            &error,
+            klights_leader_api::OutboxDeliveryError::CorruptResponse { .. }
+        ));
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn outbox_response_codec_preserves_positive_resource_versions() {
+        for (already_applied, expected) in [
+            (
+                false,
+                klights_leader_api::OutboxDeliveryResult::Applied { applied_rv: 19 },
+            ),
+            (
+                true,
+                klights_leader_api::OutboxDeliveryResult::AlreadyApplied {
+                    applied_rv: Some(19),
+                },
+            ),
+        ] {
+            let decoded =
+                super::super::decode_apply_outbox_response(generated::ApplyOutboxResponse {
+                    already_applied,
+                    applied_rv: 19,
+                    error: None,
+                    error_type: None,
+                })
+                .expect("positive wire resourceVersion");
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    fn resource_object() -> generated::ResourceObject {
+        generated::ResourceObject {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web".to_string(),
+            uid: "uid-web".to_string(),
+            resource_version: 42,
+            data_json: serde_json::to_vec(&serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "web",
+                    "uid": "uid-web",
+                    "resourceVersion": "42"
+                }
+            }))
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn get_response_rejects_presence_contradictions() {
+        for response in [
+            generated::GetResourceResponse {
+                found: true,
+                resource: None,
+            },
+            generated::GetResourceResponse {
+                found: false,
+                resource: Some(resource_object()),
+            },
+        ] {
+            assert!(matches!(
+                super::super::resource_from_get_response(response),
+                Err(klights_leader_api::ResourceQueryError::CorruptResponse { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn resource_response_rejects_each_wire_body_identity_mismatch() {
+        let mut cases = Vec::new();
+        let mut api_version = resource_object();
+        api_version.api_version = "apps/v1".to_string();
+        cases.push(api_version);
+        let mut kind = resource_object();
+        kind.kind = "Node".to_string();
+        cases.push(kind);
+        let mut namespace = resource_object();
+        namespace.namespace = Some("other".to_string());
+        cases.push(namespace);
+        let mut name = resource_object();
+        name.name = "other".to_string();
+        cases.push(name);
+        let mut uid = resource_object();
+        uid.uid = "other-uid".to_string();
+        cases.push(uid);
+        let mut resource_version = resource_object();
+        resource_version.resource_version = 43;
+        cases.push(resource_version);
+
+        for resource in cases {
+            assert!(matches!(
+                super::super::resource_from_proto(resource),
+                Err(klights_leader_api::ResourceQueryError::CorruptResponse { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn list_response_rejects_negative_or_contradictory_metadata() {
+        let base = || generated::ListResourcesResponse {
+            items: vec![resource_object()],
+            total: 1,
+            continue_token: None,
+            resource_version: 42,
+            remaining_item_count: None,
+            watch_replay_position: Some(generated::WatchReplayPosition {
+                resource_version: 42,
+                event_id: 9,
+                resource_version_filter_through_event_id: 9,
+            }),
+        };
+        let mut negative = base();
+        negative.watch_replay_position.as_mut().unwrap().event_id = -1;
+        let mut wrong_total = base();
+        wrong_total.total = 2;
+        let mut wrong_rv = base();
+        wrong_rv
+            .watch_replay_position
+            .as_mut()
+            .unwrap()
+            .resource_version = 41;
+        for response in [negative, wrong_total, wrong_rv] {
+            assert!(matches!(
+                super::super::validate_list_response_metadata(&response),
+                Err(klights_leader_api::ResourceQueryError::CorruptResponse { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn watch_wire_decode_preserves_event_id_and_rejects_unknown_type() {
+        let wire = |event_type: &str| generated::WatchEvent {
+            event_type: event_type.to_string(),
+            resource: Some(generated::ResourceObject {
+                api_version: "v1".to_string(),
+                kind: "Pod".to_string(),
+                namespace: Some("default".to_string()),
+                name: "web".to_string(),
+                uid: "uid-web".to_string(),
+                resource_version: 42,
+                data_json: serde_json::to_vec(&serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "web",
+                        "uid": "uid-web",
+                        "resourceVersion": "42"
+                    }
+                }))
+                .expect("encode test Pod"),
+            }),
+            resume_position: Some(generated::WatchReplayPosition {
+                resource_version: 42,
+                event_id: 92,
+                resource_version_filter_through_event_id: 73,
+            }),
+        };
+
+        let event = super::super::resource_event_from_proto(wire("MODIFIED"))
+            .expect("decode positioned event");
+        assert_eq!(event.resume_position().unwrap().event_id, 92);
+        assert!(matches!(
+            super::super::resource_event_from_proto(wire("RENAMED")),
+            Err(crate::control_plane::client::LeaderWatchError::UnknownEventType { .. })
+        ));
     }
 
     fn default_transport_policy()
@@ -456,6 +778,9 @@ mod cases {
             "",
             Some(leader_rx),
             None,
+            None,
+            None,
+            None,
             default_transport_policy(),
         );
         let app = mount_test_service_with_node_cert(app, "worker-1");
@@ -495,6 +820,9 @@ mod cases {
             None,
             "",
             Some(leader_rx),
+            None,
+            None,
+            None,
             None,
             default_transport_policy(),
         )
@@ -643,15 +971,18 @@ mod cases {
         client.set_all_leader_endpoints(vec![stale_endpoint.clone(), leader_endpoint.clone()]);
 
         let mut stream = client
-            .watch_resources_rpc(crate::control_plane::client::WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: Some("spec.nodeName=worker-1".to_string()),
-                start_resource_version: None,
-                start_watch_replay_position: None,
-            })
+            .watch_resources_rpc(
+                crate::control_plane::client::WatchRequest::try_new(
+                    "v1",
+                    "Pod",
+                    None,
+                    None,
+                    Some("spec.nodeName=worker-1".to_string()),
+                    None,
+                    None,
+                )
+                .expect("valid Pod watch"),
+            )
             .await
             .expect("watch open should fail over to the current leader");
         assert_eq!(
@@ -689,11 +1020,14 @@ mod cases {
             .expect("watch should receive leader events")
             .expect("watch stream should stay open")
             .expect("watch event should decode");
-        assert_eq!(event.event.event_type, crate::watch::EventType::Added);
+        assert_eq!(
+            event.event_type(),
+            crate::control_plane::client::WatchEventType::Added
+        );
         assert_eq!(
             event
-                .event
-                .object
+                .resource()
+                .data
                 .pointer("/metadata/name")
                 .and_then(|v| v.as_str()),
             Some("scheduled")
@@ -728,15 +1062,18 @@ mod cases {
         client.set_all_leader_endpoints(vec![original.clone(), failed_candidate]);
 
         let result = client
-            .watch_resources_rpc(crate::control_plane::client::WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "ConfigMap".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: None,
-                start_resource_version: Some(41),
-                start_watch_replay_position: None,
-            })
+            .watch_resources_rpc(
+                crate::control_plane::client::WatchRequest::try_new(
+                    "v1",
+                    "ConfigMap",
+                    None,
+                    None,
+                    None,
+                    Some(41),
+                    None,
+                )
+                .expect("valid ConfigMap watch"),
+            )
             .await;
         assert!(
             result.is_err(),
@@ -774,15 +1111,18 @@ mod cases {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            client.watch_resources_rpc(crate::control_plane::client::WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "ConfigMap".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: None,
-                start_resource_version: Some(41),
-                start_watch_replay_position: None,
-            }),
+            client.watch_resources_rpc(
+                crate::control_plane::client::WatchRequest::try_new(
+                    "v1",
+                    "ConfigMap",
+                    None,
+                    None,
+                    None,
+                    Some(41),
+                    None,
+                )
+                .expect("valid ConfigMap watch"),
+            ),
         )
         .await
         .expect("watch open must be bounded by the transport policy");
@@ -870,15 +1210,18 @@ mod cases {
         client.set_all_leader_endpoints(vec![stale_endpoint.clone(), leader_endpoint.clone()]);
 
         let mut stream = client
-            .watch_resources_rpc(crate::control_plane::client::WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "ConfigMap".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: None,
-                start_resource_version: Some(resume_rv),
-                start_watch_replay_position: None,
-            })
+            .watch_resources_rpc(
+                crate::control_plane::client::WatchRequest::try_new(
+                    "v1",
+                    "ConfigMap",
+                    None,
+                    None,
+                    None,
+                    Some(resume_rv),
+                    None,
+                )
+                .expect("valid replay watch"),
+            )
             .await
             .expect("watch open should fail over to the current leader");
         assert_eq!(
@@ -892,14 +1235,10 @@ mod cases {
             .expect("expired replay should produce a stream item")
             .expect("watch stream should yield")
             .expect_err("expired replay must surface as a stream error");
-        assert!(
-            err.chain().any(|cause| {
-                cause
-                    .downcast_ref::<tonic::Status>()
-                    .is_some_and(crate::replication::grpc::is_watch_replay_expired_status)
-            }),
-            "worker relist detection depends on preserving the typed replay-expired status: {err:#}"
-        );
+        assert!(matches!(
+            err,
+            crate::control_plane::client::LeaderWatchError::ReplayExpired { .. }
+        ));
 
         stale_handle.abort();
         leader_handle.abort();
@@ -1137,18 +1476,23 @@ mod cases {
         // status path (`apply_outbox`) used to build a fresh TLS channel
         // per call. With the Status lane pool the build count must settle
         // at <= the pool size after the first call and never grow after.
-        use crate::kubelet::outbox::OutboxApplyClient;
+        use klights_leader_api::{
+            LeaderOutboxDelivery, OutboxDeliveryOperation, OutboxDeliveryRequest,
+        };
         let (client, _service, _db, handle) = client_and_service().await;
 
         // First status RPC builds the Status-lane pool.
         let _ = client
-            .apply_outbox(
-                "status-key-0",
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
-                bytes::Bytes::new(),
-                "client",
-                1,
-                1,
+            .deliver_outbox(
+                OutboxDeliveryRequest::try_new(
+                    "status-key-0",
+                    OutboxDeliveryOperation::PodStatus,
+                    Arc::<[u8]>::from(&b"test"[..]),
+                    "client",
+                    1,
+                    1,
+                )
+                .expect("valid delivery request"),
             )
             .await;
         let after_first = client.channel_build_count();
@@ -1160,13 +1504,16 @@ mod cases {
 
         for i in 1..20 {
             let _ = client
-                .apply_outbox(
-                    &format!("status-key-{i}"),
-                    crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
-                    bytes::Bytes::new(),
-                    "client",
-                    1,
-                    i,
+                .deliver_outbox(
+                    OutboxDeliveryRequest::try_new(
+                        format!("status-key-{i}"),
+                        OutboxDeliveryOperation::PodStatus,
+                        Arc::<[u8]>::from(&b"test"[..]),
+                        "client",
+                        1,
+                        i,
+                    )
+                    .expect("valid delivery request"),
                 )
                 .await;
         }
@@ -1194,7 +1541,7 @@ mod cases {
         // never a second mutation.
         use crate::datastore::ResourcePreconditions;
         use crate::kubelet::outbox::OutboxApplyResult;
-        use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+        use crate::kubelet::outbox::payload::OutboxPayload;
 
         let (client, _service, db, handle) = client_and_service().await;
 
@@ -1243,14 +1590,7 @@ mod cases {
 
         // First send: the leader commits and records the idempotency ledger.
         let first = client
-            .apply_outbox_rpc(
-                key,
-                OutboxOperation::PodStatus,
-                payload.clone(),
-                "client",
-                1,
-                1,
-            )
+            .apply_outbox_rpc(outbox_delivery_request(key, payload.clone(), 1, 1))
             .await
             .expect("first apply must commit");
         let applied_rv = match first {
@@ -1279,7 +1619,7 @@ mod cases {
         // The first response was "lost" on the wire; the dispatcher retries the
         // SAME key. The leader must replay the ledger as AlreadyApplied.
         let second = client
-            .apply_outbox_rpc(key, OutboxOperation::PodStatus, payload, "client", 1, 1)
+            .apply_outbox_rpc(outbox_delivery_request(key, payload, 1, 1))
             .await
             .expect("lost-response retry must succeed");
         assert!(
@@ -1370,14 +1710,12 @@ mod cases {
         let started = std::time::Instant::now();
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            client.apply_outbox_rpc(
+            client.apply_outbox_rpc(outbox_delivery_request(
                 "deadline-key",
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
                 bytes::Bytes::new(),
-                "client",
                 1,
                 1,
-            ),
+            )),
         )
         .await;
 
@@ -1602,7 +1940,6 @@ mod cases {
         }
 
         assert_bounded!("metadata", client.metadata());
-        assert_bounded!("cluster_membership", client.cluster_membership());
         assert_bounded!(
             "get_resource_rpc",
             client.get_resource_rpc(ResourceKey {
@@ -1626,16 +1963,19 @@ mod cases {
         );
         assert_bounded!(
             "projected_service_account_token_rpc",
-            client.projected_service_account_token_rpc(ProjectedServiceAccountTokenRequest {
-                namespace: "default".to_string(),
-                service_account_name: "default".to_string(),
-                audiences: vec!["api".to_string()],
-                expiration_seconds: 3600,
-                bound_pod_name: None,
-                bound_pod_uid: None,
-                bound_node_name: None,
-                bound_node_uid: None,
-            })
+            client.projected_service_account_token_rpc(
+                ProjectedServiceAccountTokenRequest::try_new(
+                    "default",
+                    "default",
+                    vec!["api".to_string()],
+                    3600,
+                    "p",
+                    "uid",
+                    "worker-1",
+                    None,
+                )
+                .unwrap()
+            )
         );
         let controlplane_registration =
             crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
@@ -1666,19 +2006,35 @@ mod cases {
         );
         assert_bounded!(
             "allocate_node_subnet_rpc",
-            client.allocate_node_subnet_rpc("worker-1", "10.42.0.0/16", "127.0.0.1")
+            client.allocate_node_subnet_rpc(
+                crate::control_plane::client::NodeSubnetAllocationRequest::try_new(
+                    "worker-1",
+                    "10.42.0.0/16",
+                    "127.0.0.1",
+                )
+                .expect("valid request"),
+            )
         );
         assert_bounded!(
             "get_node_subnet_rpc",
-            client.get_node_subnet_rpc("worker-1")
+            client.get_node_subnet_rpc(
+                crate::control_plane::client::NodeSubnetQuery::try_new("worker-1")
+                    .expect("valid query"),
+            )
         );
         assert_bounded!(
             "list_peer_subnets_rpc",
-            client.list_peer_subnets_rpc("worker-1")
+            client.list_peer_subnets_rpc(
+                crate::control_plane::client::PeerSubnetsQuery::try_new("worker-1")
+                    .expect("valid query"),
+            )
         );
         assert_bounded!(
             "get_node_dataplane_rpc",
-            client.get_node_dataplane_rpc("worker-1")
+            client.get_node_dataplane_rpc(
+                crate::control_plane::client::NodeDataplaneQuery::try_new("worker-1")
+                    .expect("valid query"),
+            )
         );
         assert_bounded!(
             "observe_peer_endpoint_rpc",
@@ -1686,24 +2042,46 @@ mod cases {
         );
         assert_bounded!(
             "list_pod_cleanup_intents_for_node_rpc",
-            client.list_pod_cleanup_intents_for_node_rpc("worker-1")
+            client.list_pod_cleanup_intents_for_node_rpc(
+                crate::control_plane::client::PodCleanupIntentListRequest::try_new("worker-1")
+                    .unwrap()
+            )
         );
         assert_bounded!(
             "delete_pod_cleanup_intent_rpc",
-            client.delete_pod_cleanup_intent_rpc("worker-1", "default", "p", "uid", "gone")
+            client.delete_pod_cleanup_intent_rpc(
+                crate::control_plane::client::PodCleanupIntentAckRequest::try_new(
+                    "worker-1", "default", "p", "uid", "gone"
+                )
+                .unwrap()
+            )
         );
         assert_bounded!(
             "apply_outbox_rpc",
-            client.apply_outbox_rpc(
-                "k",
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
-                bytes::Bytes::new(),
-                "client",
-                1,
-                1,
-            )
+            client.apply_outbox_rpc(outbox_delivery_request("k", bytes::Bytes::new(), 1, 1,))
         );
         handle.abort();
+    }
+
+    #[test]
+    fn cleanup_intent_wire_decode_rejects_noncanonical_pod_snapshot_with_typed_error() {
+        let error = crate::replication::grpc::client::pod_cleanup_intent_from_proto(
+            crate::replication::grpc::generated::PodCleanupIntentObject {
+                node_name: "worker-1".to_string(),
+                namespace: "default".to_string(),
+                pod_name: "web".to_string(),
+                pod_uid: "pod-uid".to_string(),
+                reason: "NodeLost".to_string(),
+                resource_version: 22,
+                created_at_ms: 1_700_000_000_000,
+                pod_data_json: br#"{"apiVersion":"v1","kind":"Pod","metadata":{"namespace":"default","name":"web","uid":"other-uid","resourceVersion":"17"},"spec":{"nodeName":"worker-1"}}"#.to_vec(),
+            },
+        )
+        .expect_err("mismatched Pod UID must fail closed");
+        assert!(matches!(
+            error,
+            klights_leader_api::PodCleanupIntentError::CorruptIntent { .. }
+        ));
     }
 
     #[tokio::test]
@@ -2405,14 +2783,11 @@ mod cases {
             .await
             .unwrap();
 
-        let watch_req = || crate::control_plane::client::WatchRequest {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: None,
-            label_selector: None,
-            field_selector: None,
-            start_resource_version: None,
-            start_watch_replay_position: None,
+        let watch_req = || {
+            crate::control_plane::client::WatchRequest::try_new(
+                "v1", "Pod", None, None, None, None, None,
+            )
+            .expect("valid Pod watch")
         };
 
         // Warm the Read lane by opening a watch stream. The stream itself
@@ -2764,5 +3139,86 @@ mod cases {
             Some("127.0.0.1".to_string()),
             "connector must record the peer IP after stream setup"
         );
+    }
+
+    #[test]
+    fn node_subnet_wire_decode_rejects_redundancy_and_shape_mismatches() {
+        let valid = generated::NodeSubnetObject {
+            node_name: "node-a".to_string(),
+            subnet: "10.42.1.0/24".to_string(),
+            subnet_base_int: u32::from(std::net::Ipv4Addr::new(10, 42, 1, 0)),
+            gateway_ip: "10.42.1.0".to_string(),
+            node_ip: "192.0.2.10".to_string(),
+            mode: "root".to_string(),
+            hostport_range: None,
+        };
+        assert!(crate::replication::grpc::client::node_subnet_from_proto(valid.clone()).is_ok());
+
+        for invalid in [
+            generated::NodeSubnetObject {
+                subnet: "10.42.1.0/25".to_string(),
+                ..valid.clone()
+            },
+            generated::NodeSubnetObject {
+                subnet_base_int: u32::from(std::net::Ipv4Addr::new(10, 42, 9, 0)),
+                ..valid.clone()
+            },
+            generated::NodeSubnetObject {
+                gateway_ip: "10.42.1.1".to_string(),
+                ..valid.clone()
+            },
+            generated::NodeSubnetObject {
+                mode: "unknown".to_string(),
+                ..valid.clone()
+            },
+            generated::NodeSubnetObject {
+                mode: "rootless".to_string(),
+                ..valid
+            },
+        ] {
+            assert!(matches!(
+                crate::replication::grpc::client::node_subnet_from_proto(invalid),
+                Err(klights_leader_api::NetworkTopologyError::CorruptResponse { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn dataplane_wire_decode_rejects_unknown_and_overlay_shaped_direct_routes() {
+        let direct = generated::DataplaneMetadataObject {
+            node_name: "node-a".to_string(),
+            mode: "root".to_string(),
+            encryption: "disabled".to_string(),
+            public_key: None,
+            endpoint: "192.0.2.10".to_string(),
+            port: None,
+        };
+        assert!(
+            crate::replication::grpc::client::dataplane_metadata_from_proto(direct.clone()).is_ok()
+        );
+
+        for invalid in [
+            generated::DataplaneMetadataObject {
+                mode: "unknown".to_string(),
+                ..direct.clone()
+            },
+            generated::DataplaneMetadataObject {
+                encryption: "unknown".to_string(),
+                ..direct.clone()
+            },
+            generated::DataplaneMetadataObject {
+                public_key: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
+                ..direct.clone()
+            },
+            generated::DataplaneMetadataObject {
+                port: Some(7_679),
+                ..direct
+            },
+        ] {
+            assert!(matches!(
+                crate::replication::grpc::client::dataplane_metadata_from_proto(invalid),
+                Err(klights_leader_api::NetworkTopologyError::CorruptResponse { .. })
+            ));
+        }
     }
 }

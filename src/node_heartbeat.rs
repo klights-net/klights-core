@@ -26,6 +26,7 @@ fn is_node_heartbeat_event(event: &WatchEvent, node_name: &str) -> bool {
         == Some(node_name)
 }
 
+#[cfg(test)]
 pub(crate) fn build_lease(node_name: &str) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "coordination.k8s.io/v1",
@@ -43,11 +44,6 @@ pub(crate) fn build_lease(node_name: &str) -> serde_json::Value {
 }
 
 #[async_trait]
-pub trait NodeLeaseRenewClient: Send + Sync {
-    async fn renew_node_lease(&self, node_name: &str, lease: &serde_json::Value) -> Result<()>;
-}
-
-#[async_trait]
 pub trait NodeHeartbeatWatchSource: Send + Sync {
     fn subscribe_watch_signals(
         &self,
@@ -57,73 +53,6 @@ pub trait NodeHeartbeatWatchSource: Send + Sync {
     fn replay_source(&self, targets: Vec<WatchTarget>) -> BoxedWatchReplaySource;
 
     async fn current_resource_version(&self) -> Result<i64>;
-}
-
-#[async_trait]
-impl NodeLeaseRenewClient for crate::node_lease_tracker::NodeLeaseTracker {
-    async fn renew_node_lease(&self, node_name: &str, lease: &serde_json::Value) -> Result<()> {
-        self.record_from_lease_object(node_name, lease).await?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl NodeLeaseRenewClient for crate::replication::grpc::client::ReplicationGrpcClient {
-    async fn renew_node_lease(&self, node_name: &str, lease: &serde_json::Value) -> Result<()> {
-        if self.node_name() != node_name {
-            anyhow::bail!(
-                "heartbeat client for node {} cannot renew Lease for {node_name}",
-                self.node_name()
-            );
-        }
-        let renew_time = lease
-            .pointer("/spec/renewTime")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| anyhow::anyhow!("node heartbeat Lease missing spec.renewTime"))?;
-        let lease_duration_seconds = lease
-            .pointer("/spec/leaseDurationSeconds")
-            .and_then(|value| value.as_i64())
-            .filter(|seconds| *seconds > 0)
-            .unwrap_or(crate::node_lease_tracker::DEFAULT_NODE_LEASE_DURATION_SECONDS);
-        self.renew_node_lease_rpc(renew_time, lease_duration_seconds)
-            .await
-    }
-}
-
-/// Switches lease renewals between local leader-tracker updates and
-/// remote leader lease renewal calls based on runtime leadership
-/// status. Leader-class control-plane followers should send renewals
-/// to the leader RPC endpoint so followers' liveness is visible to all
-/// nodes; once elected leader, renewals revert to local tracker updates.
-pub struct LeaseRenewClient {
-    local: std::sync::Arc<crate::node_lease_tracker::NodeLeaseTracker>,
-    remote: std::sync::Arc<dyn NodeLeaseRenewClient>,
-    is_leader_rx: tokio::sync::watch::Receiver<bool>,
-}
-
-impl LeaseRenewClient {
-    pub fn new(
-        local: std::sync::Arc<crate::node_lease_tracker::NodeLeaseTracker>,
-        remote: std::sync::Arc<dyn NodeLeaseRenewClient>,
-        is_leader_rx: tokio::sync::watch::Receiver<bool>,
-    ) -> Self {
-        Self {
-            local,
-            remote,
-            is_leader_rx,
-        }
-    }
-}
-
-#[async_trait]
-impl NodeLeaseRenewClient for LeaseRenewClient {
-    async fn renew_node_lease(&self, node_name: &str, lease: &serde_json::Value) -> Result<()> {
-        if *self.is_leader_rx.borrow() {
-            self.local.renew_node_lease(node_name, lease).await
-        } else {
-            self.remote.renew_node_lease(node_name, lease).await
-        }
-    }
 }
 
 // Derived from the canonical node-lease cadence so the renewal timer and the
@@ -139,7 +68,7 @@ pub(crate) const NODE_HEARTBEAT_INTERVAL: Duration =
 /// cluster.db.
 pub async fn run_heartbeat_with_lease_client(
     watch_source: std::sync::Arc<dyn NodeHeartbeatWatchSource>,
-    lease_client: std::sync::Arc<dyn NodeLeaseRenewClient>,
+    lease_client: std::sync::Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     node_name: String,
     cancel_token: tokio_util::sync::CancellationToken,
     task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
@@ -157,7 +86,7 @@ pub async fn run_heartbeat_with_lease_client(
 
 pub(crate) async fn run_heartbeat_with_interval(
     watch_source: std::sync::Arc<dyn NodeHeartbeatWatchSource>,
-    lease_client: std::sync::Arc<dyn NodeLeaseRenewClient>,
+    lease_client: std::sync::Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     node_name: String,
     cancel_token: tokio_util::sync::CancellationToken,
     task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
@@ -242,7 +171,18 @@ pub(crate) async fn run_heartbeat_with_interval(
     }
 }
 
-async fn renew_lease_with_client(client: &dyn NodeLeaseRenewClient, node_name: &str) -> Result<()> {
-    let lease = build_lease(node_name);
-    client.renew_node_lease(node_name, &lease).await
+async fn renew_lease_with_client(
+    client: &dyn klights_leader_api::LeaderNodeLeaseRenewal,
+    node_name: &str,
+) -> Result<()> {
+    let request = klights_leader_api::NodeLeaseRenewalRequest::try_new(
+        node_name,
+        k8s_microtime_now(),
+        crate::node_lease_tracker::DEFAULT_NODE_LEASE_DURATION_SECONDS,
+    )?;
+    client
+        .renew_node_lease(request)
+        .await
+        .map(|_| ())
+        .map_err(anyhow::Error::from)
 }

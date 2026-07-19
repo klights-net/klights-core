@@ -210,12 +210,11 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
 
         let live = if let Some(cluster_api) = &self.cluster_api {
             cluster_api
-                .get_resource_fresh(klights_types::ResourceKey {
-                    api_version: "v1".to_string(),
-                    kind: "Pod".to_string(),
-                    namespace: Some(ns.to_string()),
-                    name: name.to_string(),
-                })
+                .get_resource(crate::control_plane::client::pod_get_request(
+                    ns,
+                    name,
+                    crate::control_plane::client::ResourceQueryConsistency::LeaderFresh,
+                )?)
                 .await?
         } else {
             self.store.get(ns, name).await?

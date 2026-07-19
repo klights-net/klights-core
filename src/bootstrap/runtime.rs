@@ -208,6 +208,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     let node_local = ds.node_local;
     let outbox_runtime = ds.outbox;
     let node_lease_tracker = ds.node_lease_tracker;
+    let node_lease_renewal_client = ds.node_lease_renewal_client;
     let control_plane_lease_client = ds.control_plane_lease_client;
     let raft_node = ds.raft_node;
     let member_feature_probe = ds.member_feature_probe;
@@ -345,6 +346,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
         outbox_runtime: outbox_runtime.clone(),
         control_plane_lease_client: control_plane_lease_client.clone(),
         node_lease_tracker: node_lease_tracker.clone(),
+        node_lease_renewal_client: node_lease_renewal_client.clone(),
         network: network.clone(),
         services: services.clone(),
         local_api_client: local_api_client.clone(),

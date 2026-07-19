@@ -42,6 +42,7 @@ pub struct DatastorePhase {
     pub node_local: crate::datastore::node_local::handle::NodeLocalHandle,
     pub outbox: Arc<crate::kubelet::outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+    pub node_lease_renewal_client: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal>,
     /// P3-11c: when this node is a leader-class boot under raft mode,
     /// `raft_node` holds the live `RaftNode` so later phases (kubelet
     /// label task — Step D — and the gRPC server's RaftRpcRouter /
@@ -63,6 +64,9 @@ pub struct DatastorePhase {
 
 struct RemoteForwarderParts {
     forwarder: Arc<dyn crate::control_plane::client::LeaderApiClient>,
+    resource_commands: Arc<dyn crate::control_plane::client::LeaderResourceCommand>,
+    outbox_deliveries: Arc<dyn klights_leader_api::LeaderOutboxDelivery>,
+    node_lease_renewals: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal>,
     remote_api_client: Option<Arc<crate::control_plane::client::remote::RemoteApiClient>>,
     lease_client: Option<Arc<crate::replication::grpc::client::ReplicationGrpcClient>>,
 }
@@ -142,13 +146,27 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         local_dataplane.clone(),
         grpc_transport_policy.clone(),
     );
-    let cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient> = Arc::new(
+    let leader_proxy = Arc::new(
         crate::control_plane::client::leader_proxy::LeaderProxyApiClient::new(
             local_api_client.clone(),
             remote_parts.forwarder,
             is_leader_rx.clone(),
+        )
+        .with_resource_command_targets(
+            local_api_client.clone(),
+            remote_parts.resource_commands.clone(),
+        )
+        .with_outbox_delivery_targets(local_api_client.clone(), remote_parts.outbox_deliveries)
+        .with_node_lease_renewal_targets(
+            local_api_client.clone(),
+            remote_parts.node_lease_renewals,
         ),
     );
+    let cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient> = leader_proxy.clone();
+    let outbox_delivery_client: Arc<dyn klights_leader_api::LeaderOutboxDelivery> =
+        leader_proxy.clone();
+    let node_lease_renewal_client: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal> =
+        leader_proxy.clone();
 
     // For joining controlplanes, cluster metadata is delivered by the
     // replication layer (raft install_snapshot/apply path in raft mode, or
@@ -417,6 +435,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 let join_raft = raft.clone();
                 let join_db_handle = db_handle.clone();
                 let join_cluster_api = cluster_api.clone();
+                let join_resource_commands = leader_proxy.clone();
                 supervisor
                     .spawn_delay(
                         "controlplane_join_task",
@@ -516,6 +535,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                                         if let Err(err) =
                                             crate::kubelet::node::refresh_current_git_commit_annotation_via_leader(
                                                 join_cluster_api.as_ref(),
+                                                join_resource_commands.as_ref(),
                                                 &node_name,
                                             )
                                             .await
@@ -594,9 +614,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             node_local.clone(),
             notify.clone(),
         ));
-        let apply_client: Arc<dyn crate::kubelet::outbox::OutboxApplyClient> = Arc::new(
-            crate::kubelet::outbox::LeaderApiOutboxClient::new(cluster_api.clone()),
-        );
+        let apply_client = outbox_delivery_client.clone();
         let node_local_for_retry = node_local.clone();
         let supervisor_for_retry = supervisor.clone();
         let notify_for_retry = notify.clone();
@@ -672,6 +690,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
 
     match crate::node_admin::start_node_admin(
         node_local.clone(),
+        outbox.notify_handle(),
         supervisor.clone(),
         shutdown_token.clone(),
     )
@@ -692,6 +711,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         node_local,
         outbox,
         node_lease_tracker,
+        node_lease_renewal_client,
         raft_node,
         member_feature_probe,
         skip_seed_bootstrap,
@@ -742,8 +762,12 @@ fn build_remote_forwarder(
         _ => {
             // Seed leader / worker: no HA control-plane
             // remote forwarding target is available in this role.
+            let stub = Arc::new(StubRemoteForwarder::new(config.node_name.clone()));
             return RemoteForwarderParts {
-                forwarder: Arc::new(StubRemoteForwarder::new(config.node_name.clone())),
+                forwarder: stub.clone(),
+                resource_commands: stub.clone(),
+                outbox_deliveries: stub.clone(),
+                node_lease_renewals: stub,
                 remote_api_client: None,
                 lease_client: None,
             };
@@ -789,6 +813,9 @@ fn build_remote_forwarder(
     ));
     RemoteForwarderParts {
         forwarder: remote.clone(),
+        resource_commands: remote.clone(),
+        outbox_deliveries: remote.clone(),
+        node_lease_renewals: remote.clone(),
         remote_api_client: Some(remote),
         lease_client: Some(grpc),
     }
@@ -1405,14 +1432,17 @@ mod tests {
         // this test environment. The assertion is that the failure is
         // a real gRPC/network error, NOT the stub's signature message.
         let err = remote_parts
-            .forwarder
-            .apply_outbox(
-                "test",
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
-                bytes::Bytes::from_static(b"x"),
-                "client",
-                1,
-                1,
+            .outbox_deliveries
+            .deliver_outbox(
+                klights_leader_api::OutboxDeliveryRequest::try_new(
+                    "test",
+                    klights_leader_api::OutboxDeliveryOperation::PodStatus,
+                    std::sync::Arc::<[u8]>::from(&b"x"[..]),
+                    "client",
+                    1,
+                    1,
+                )
+                .expect("valid delivery request"),
             )
             .await
             .expect_err("connection to nonexistent leader fails");

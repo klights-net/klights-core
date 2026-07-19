@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
-use crate::control_plane::client::{CacheScope, LeaderApiClient};
+use crate::control_plane::client::{CacheReadinessRequest, LeaderApiClient, LeaderCacheReadiness};
 use crate::datastore::node_local::NodeLocalHandle;
 use crate::kubelet::pod_lifecycle_core::message::LifecycleMessage;
 use crate::kubelet::pod_lifecycle_router::{
@@ -26,6 +26,7 @@ pub enum CriStreamLifecycle {
 pub struct CriReconnectReconciler {
     node_name: String,
     cluster_api: Arc<dyn LeaderApiClient>,
+    cache_readiness: Arc<dyn LeaderCacheReadiness>,
     node_local: NodeLocalHandle,
     cri: Arc<dyn CriRuntime>,
     container_control: Arc<dyn ContainerRuntimeControl>,
@@ -41,9 +42,11 @@ impl CriReconnectReconciler {
         container_control: Arc<dyn ContainerRuntimeControl>,
         router: Arc<PodLifecycleRouter>,
     ) -> Self {
+        let cache_readiness: Arc<dyn LeaderCacheReadiness> = cluster_api.clone();
         Self {
             node_name,
             cluster_api,
+            cache_readiness,
             node_local,
             cri,
             container_control,
@@ -52,20 +55,26 @@ impl CriReconnectReconciler {
     }
 
     pub async fn run_once(&self) -> Result<Vec<CriInventoryAction>> {
-        self.cluster_api
-            .wait_cache_ready(CacheScope::Resource {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: None,
-            })
+        self.cache_readiness
+            .wait_cache_ready(CacheReadinessRequest::try_new(
+                "v1",
+                "Pod",
+                None,
+                None,
+                Some(format!("spec.nodeName={}", self.node_name)),
+            )?)
             .await
             .context("wait for pod cache before CRI reconnect reconcile")?;
 
         let runtime_rows = self.node_local.list_pod_runtime().await?;
         let leader_pods = self
             .cluster_api
-            .list_pods_on_node(&self.node_name)
+            .list_resources(crate::control_plane::client::pods_on_node_list_request(
+                &self.node_name,
+                crate::control_plane::client::ResourceQueryConsistency::Cached,
+            )?)
             .await?
+            .into_items()
             .into_iter()
             .map(|pod| (*pod.data).clone())
             .collect::<Vec<_>>();

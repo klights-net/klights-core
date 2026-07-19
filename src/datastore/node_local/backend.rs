@@ -10,8 +10,8 @@ use crate::datastore::{
 use klights_types::PodIdentity;
 
 use super::{
-    DeadLetterRow, OutboxInsert, OutboxRow, OutboxStats, PodRuntimeRow, PodStatusCheckpoint,
-    ProbeStateRow, ReplicationCheckpoint, SqliteNodeLocalDb,
+    DeadLetterRow, OutboxFailureDisposition, OutboxInsert, OutboxRow, OutboxStats, PodRuntimeRow,
+    PodStatusCheckpoint, ProbeStateRow, ReplicationCheckpoint, SqliteNodeLocalDb,
 };
 
 #[async_trait]
@@ -46,6 +46,14 @@ pub trait NodeLocalBackend: Send + Sync {
         backoff_until_ms: i64,
         error: &str,
     ) -> Result<bool>;
+    async fn record_outbox_failure(
+        &self,
+        id: i64,
+        lease_token: &str,
+        backoff_until_ms: i64,
+        error: &str,
+        max_attempts: i64,
+    ) -> Result<OutboxFailureDisposition>;
     async fn complete_outbox(&self, id: i64, lease_token: &str) -> Result<bool>;
     async fn requeue_expired_outbox_leases(&self, now_ms: i64) -> Result<usize>;
     async fn next_outbox_wake_ms(&self, now_ms: i64) -> Result<Option<i64>>;
@@ -233,6 +241,25 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
             lease_token,
             backoff_until_ms,
             error,
+        )
+        .await
+    }
+
+    async fn record_outbox_failure(
+        &self,
+        id: i64,
+        lease_token: &str,
+        backoff_until_ms: i64,
+        error: &str,
+        max_attempts: i64,
+    ) -> Result<OutboxFailureDisposition> {
+        SqliteNodeLocalDb::record_outbox_failure(
+            self,
+            id,
+            lease_token,
+            backoff_until_ms,
+            error,
+            max_attempts,
         )
         .await
     }

@@ -59,6 +59,7 @@ pub struct BootstrapRunArgs<'a> {
     pub replication_service_for_router: Option<Arc<crate::replication::ReplicationService>>,
     pub outbox_runtime: Arc<crate::kubelet::outbox::Outbox>,
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+    pub node_lease_renewal_client: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal>,
     pub network: Arc<crate::networking::Network>,
     pub services: Arc<dyn crate::networking::ServiceRouter>,
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
@@ -159,6 +160,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         replication_service_for_router,
         outbox_runtime,
         node_lease_tracker,
+        node_lease_renewal_client,
         control_plane_lease_client,
         network,
         services,
@@ -606,10 +608,21 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     }
 
     let leader_peer_endpoint_observer_handle = if replication_service_for_router.is_some() {
+        let endpoint_query: Arc<dyn klights_leader_api::LeaderResourceQuery> = cluster_api.clone();
+        let endpoint_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
+            Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+                config.node_name.clone(),
+                endpoint_query.clone(),
+                outbox_runtime.clone(),
+            ));
         match crate::bootstrap::observed_endpoint::start_leader_peer_endpoint_observer(
             db_handle.clone(),
-            config.clone(),
-            node_mode.clone(),
+            crate::bootstrap::observed_endpoint::LeaderPeerEndpointObserverDeps::new(
+                endpoint_query,
+                endpoint_status,
+                config.clone(),
+                node_mode.clone(),
+            ),
             supervisor.clone(),
             grpc_transport_policy.clone(),
             shutdown_token.clone(),
@@ -905,8 +918,6 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
     };
 
     // Heartbeat
-    let is_leader_rx_for_heartbeat = is_leader_rx.clone();
-    let control_plane_lease_client_for_heartbeat = control_plane_lease_client.clone();
     let heartbeat_handle = {
         let watch_source = Arc::new(
             crate::bootstrap::kubelet_ports::DatastorePodWatchSource::new(Arc::new(
@@ -916,15 +927,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let cfg = Arc::clone(config);
         let cancel = shutdown_token.clone();
         let s = supervisor.clone();
-        let lease_client: Arc<dyn kubelet::node::NodeLeaseRenewClient> =
-            match control_plane_lease_client_for_heartbeat {
-                Some(lease_client) => Arc::new(kubelet::node::LeaseRenewClient::new(
-                    node_lease_tracker.clone(),
-                    lease_client,
-                    is_leader_rx_for_heartbeat,
-                )),
-                None => node_lease_tracker.clone(),
-            };
+        let lease_client = node_lease_renewal_client.clone();
         supervisor
             .spawn_async(
                 crate::task_supervisor::TaskCategory::Background,
@@ -972,6 +975,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let cancel = shutdown_token.clone();
         let rv = node_lifecycle_start_resource_version;
         let raft_node_for_lifecycle = raft_node.clone();
+        let node_lifecycle_status = local_api_client.clone();
         Some(
             supervisor
                 .spawn_async(
@@ -980,6 +984,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                     async move {
                         controllers::node_lifecycle::run_node_lifecycle_controller(
                             state,
+                            node_lifecycle_status,
                             cancel,
                             rv,
                             is_leader_rx,
@@ -1028,6 +1033,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             }
             None => (None, None),
         };
+        let grpc_node_query: Arc<dyn klights_leader_api::LeaderResourceQuery> =
+            local_api_client.clone();
+        let grpc_node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus> =
+            Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+                config.node_name.clone(),
+                grpc_node_query.clone(),
+                outbox_runtime.clone(),
+            ));
         crate::replication::grpc::server::mount_service_full(
             api::build_router(state_with_cri),
             rs,
@@ -1039,6 +1052,9 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             &config.containerd_namespace,
             Some(is_leader_rx_for_grpc),
             Some(config.node_name.clone()),
+            Some(grpc_node_query),
+            Some(grpc_node_status),
+            Some(local_api_client),
             grpc_transport_policy,
         )
     } else {

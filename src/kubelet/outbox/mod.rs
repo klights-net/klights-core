@@ -4,20 +4,24 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use async_trait::async_trait;
-use bytes::Bytes;
+use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryRequest};
 use serde_json::Value;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::Resource;
 use crate::datastore::command::StorageCommand;
 use crate::datastore::node_local::sqlite::{PodStatusCheckpoint, RuntimeObservationCheckpoint};
-use crate::datastore::node_local::{NodeLocalHandle, OutboxInsert, OutboxRow};
+use crate::datastore::node_local::{
+    NodeLocalHandle, OutboxFailureDisposition, OutboxInsert, OutboxRow,
+};
 use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 use self::payload::{OutboxOperation, OutboxPayload};
+
+pub(crate) use klights_leader_api::{
+    OutboxDeliveryError as OutboxApplyError, OutboxDeliveryResult as OutboxApplyResult,
+};
 
 // bug-grpc: lease must outlast a worst-case pipelined WAN apply so a slow
 // `apply_outbox` does not expire its own claim mid-flight (which would let
@@ -35,20 +39,6 @@ pub const PRODUCTION_DISPATCH_BATCH_SIZE: usize = 16;
 // bug-grpc: backoff after a transient dispatch-iteration error so the
 // dispatcher loop never exits (worker status reporting must not die).
 const DISPATCH_ERROR_BACKOFF_MS: u64 = 500;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutboxApplyResult {
-    Applied { applied_rv: i64 },
-    AlreadyApplied { applied_rv: Option<i64> },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutboxApplyError {
-    Retryable(String),
-    NotFound(String),
-    UidMismatch { expected: String, actual: String },
-    ConflictTerminal(String),
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboxSendRoute {
@@ -74,104 +64,6 @@ impl<'a> OutboxSendPlanner<'a> {
         };
         outbox.enqueue_command(command).await?;
         Ok(OutboxSendRoute::Enqueued)
-    }
-}
-
-impl std::fmt::Display for OutboxApplyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Retryable(err) => write!(f, "retryable outbox apply error: {err}"),
-            Self::NotFound(err) => write!(f, "outbox target not found: {err}"),
-            Self::UidMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "outbox UID mismatch: expected {expected}, actual {actual}"
-                )
-            }
-            Self::ConflictTerminal(err) => write!(f, "terminal outbox conflict: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for OutboxApplyError {}
-
-impl OutboxApplyError {
-    fn is_terminal(&self) -> bool {
-        matches!(
-            self,
-            Self::NotFound(_) | Self::UidMismatch { .. } | Self::ConflictTerminal(_)
-        )
-    }
-}
-
-#[async_trait]
-pub trait OutboxApplyClient: Send + Sync {
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        operation: OutboxOperation,
-        payload: Bytes,
-        client_id: &str,
-        stream_id: i64,
-        stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError>;
-}
-
-#[async_trait]
-impl OutboxApplyClient for crate::replication::grpc::client::ReplicationGrpcClient {
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        operation: OutboxOperation,
-        payload: Bytes,
-        client_id: &str,
-        stream_id: i64,
-        stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        self.apply_outbox_rpc(
-            idempotency_key,
-            operation,
-            payload,
-            client_id,
-            stream_id,
-            stream_seq,
-        )
-        .await
-    }
-}
-
-#[derive(Clone)]
-pub struct LeaderApiOutboxClient {
-    client: Arc<dyn LeaderApiClient>,
-}
-
-impl LeaderApiOutboxClient {
-    pub const fn new(client: Arc<dyn LeaderApiClient>) -> Self {
-        Self { client }
-    }
-}
-
-#[async_trait]
-impl OutboxApplyClient for LeaderApiOutboxClient {
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        operation: OutboxOperation,
-        payload: Bytes,
-        client_id: &str,
-        stream_id: i64,
-        stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        self.client
-            .apply_outbox(
-                idempotency_key,
-                operation,
-                payload,
-                client_id,
-                stream_id,
-                stream_seq,
-            )
-            .await
     }
 }
 
@@ -266,6 +158,10 @@ impl Outbox {
             notify,
             stamp: Arc::new(tokio::sync::Mutex::new(StampState::default())),
         }
+    }
+
+    pub(crate) fn notify_handle(&self) -> Arc<Notify> {
+        self.notify.clone()
     }
 
     /// Issue a strictly-monotonic per-node status stamp for an outbound Pod
@@ -680,8 +576,9 @@ pub enum DispatchOutcome {
 
 pub struct OutboxDispatcher {
     node_db: NodeLocalHandle,
-    client: Arc<dyn OutboxApplyClient>,
+    client: Arc<dyn LeaderOutboxDelivery>,
     notify: Arc<Notify>,
+    lease_renewal_supervisor: Option<Arc<TaskSupervisor>>,
     lease_ms: i64,
     batch_mode: bool,
     batch_size: usize,
@@ -697,7 +594,7 @@ pub struct OutboxDispatcher {
 impl OutboxDispatcher {
     pub fn new(
         node_db: NodeLocalHandle,
-        client: Arc<dyn OutboxApplyClient>,
+        client: Arc<dyn LeaderOutboxDelivery>,
         notify: Arc<Notify>,
     ) -> Self {
         Self::new_with_rtt_estimator(
@@ -710,7 +607,7 @@ impl OutboxDispatcher {
 
     pub fn new_with_rtt_estimator(
         node_db: NodeLocalHandle,
-        client: Arc<dyn OutboxApplyClient>,
+        client: Arc<dyn LeaderOutboxDelivery>,
         notify: Arc<Notify>,
         rtt: std::sync::Arc<crate::datastore::raft::rtt_estimator::RttEstimator>,
     ) -> Self {
@@ -718,6 +615,7 @@ impl OutboxDispatcher {
             node_db,
             client,
             notify,
+            lease_renewal_supervisor: None,
             lease_ms: DEFAULT_LEASE_MS,
             batch_mode: false,
             batch_size: 16,
@@ -729,7 +627,7 @@ impl OutboxDispatcher {
 
     pub(crate) fn production(
         node_db: NodeLocalHandle,
-        client: Arc<dyn OutboxApplyClient>,
+        client: Arc<dyn LeaderOutboxDelivery>,
         notify: Arc<Notify>,
     ) -> Self {
         Self::new(node_db, client, notify).with_batch_mode(PRODUCTION_DISPATCH_BATCH_SIZE)
@@ -766,33 +664,47 @@ impl OutboxDispatcher {
     }
 
     #[cfg(test)]
-    pub fn for_tests(node_db: NodeLocalHandle, client: Arc<dyn OutboxApplyClient>) -> Self {
+    pub fn for_tests(node_db: NodeLocalHandle, client: Arc<dyn LeaderOutboxDelivery>) -> Self {
         Self::new(node_db, client, Arc::new(Notify::new()))
     }
 
     #[cfg(test)]
     pub fn for_tests_with_rtt_estimator(
         node_db: NodeLocalHandle,
-        client: Arc<dyn OutboxApplyClient>,
+        client: Arc<dyn LeaderOutboxDelivery>,
         rtt: std::sync::Arc<crate::datastore::raft::rtt_estimator::RttEstimator>,
     ) -> Self {
         Self::new_with_rtt_estimator(node_db, client, Arc::new(Notify::new()), rtt)
     }
 
     #[cfg(test)]
+    pub fn for_tests_with_lease_renewal(
+        node_db: NodeLocalHandle,
+        client: Arc<dyn LeaderOutboxDelivery>,
+        supervisor: Arc<TaskSupervisor>,
+        lease_ms: i64,
+    ) -> Self {
+        let mut dispatcher = Self::new(node_db, client, Arc::new(Notify::new()));
+        dispatcher.lease_renewal_supervisor = Some(supervisor);
+        dispatcher.lease_ms = lease_ms.max(1);
+        dispatcher
+    }
+
+    #[cfg(test)]
     pub fn batch_mode_for_tests(
         node_db: NodeLocalHandle,
-        client: Arc<dyn OutboxApplyClient>,
+        client: Arc<dyn LeaderOutboxDelivery>,
         batch_size: usize,
     ) -> Self {
         Self::new(node_db, client, Arc::new(Notify::new())).with_batch_mode(batch_size)
     }
 
     pub async fn start(
-        self,
+        mut self,
         supervisor: Arc<TaskSupervisor>,
         cancel: CancellationToken,
     ) -> Result<SupervisedJoinHandle<()>> {
+        self.lease_renewal_supervisor = Some(supervisor.clone());
         let supervisor_for_run = supervisor.clone();
         supervisor
             .spawn_async(
@@ -944,23 +856,57 @@ impl OutboxDispatcher {
             );
             return;
         };
+        let assigned_stream_position = row.stream_id > 0 && row.stream_seq > 0;
         let operation = match OutboxOperation::try_from(row.operation.as_str()) {
-            Ok(operation) => operation,
+            Ok(operation) => Some(operation),
             Err(err) => {
                 tracing::warn!(
                     idempotency_key = %row.idempotency_key,
                     error = %err,
-                    "unknown outbox operation, completing as terminal"
+                    assigned_stream_position,
+                    "unknown outbox operation"
                 );
-                self.dispatch_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.complete_row(row.id, lease_token, &row.idempotency_key)
-                    .await;
-                return;
+                if assigned_stream_position {
+                    None
+                } else {
+                    self.dispatch_total
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.complete_row(row.id, lease_token, &row.idempotency_key)
+                        .await;
+                    return;
+                }
             }
         };
+        let mut use_terminal_sentinel = operation.is_none();
+        let delivery_operation = if let Some(operation) = operation {
+            match operation.try_delivery_operation() {
+                Ok(operation) => operation,
+                Err(err) => {
+                    tracing::warn!(
+                        idempotency_key = %row.idempotency_key,
+                        error = %err,
+                        assigned_stream_position,
+                        "non-deliverable outbox operation"
+                    );
+                    if assigned_stream_position {
+                        use_terminal_sentinel = true;
+                        klights_leader_api::OutboxDeliveryOperation::PodStatus
+                    } else {
+                        self.dispatch_total
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.complete_row(row.id, lease_token, &row.idempotency_key)
+                            .await;
+                        return;
+                    }
+                }
+            }
+        } else {
+            klights_leader_api::OutboxDeliveryOperation::PodStatus
+        };
 
-        let records_checkpoint = operation.supersedable_pod_status() && !row.pod_uid.is_empty();
+        let mut records_checkpoint = !use_terminal_sentinel
+            && operation.is_some_and(OutboxOperation::supersedable_pod_status)
+            && !row.pod_uid.is_empty();
         if records_checkpoint {
             tracing::info!(
                 target: "klights::outbox_dispatch",
@@ -971,16 +917,95 @@ impl OutboxDispatcher {
             );
         }
         let dispatch_start = std::time::Instant::now();
+        let delivery_payload = if use_terminal_sentinel {
+            match payload::terminal_decision_payload(&row.idempotency_key) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    tracing::warn!(
+                        idempotency_key = %row.idempotency_key,
+                        error = %err,
+                        "failed to encode assigned terminal outbox decision"
+                    );
+                    let backoff_until_ms = now_ms.saturating_add(adaptive_jittered_backoff_ms(
+                        row.attempt,
+                        &row.idempotency_key,
+                        self.rtt.estimate_ms(),
+                    ));
+                    if let Err(error) = self
+                        .node_db
+                        .mark_outbox_attempt_failed(
+                            row.id,
+                            lease_token,
+                            backoff_until_ms,
+                            &err.to_string(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(outbox_id = row.id, error = %error, "mark terminal-decision encode failure failed");
+                    }
+                    return;
+                }
+            }
+        } else {
+            row.payload_proto.clone()
+        };
+        let request = match OutboxDeliveryRequest::try_new(
+            row.idempotency_key.clone(),
+            delivery_operation,
+            Arc::<[u8]>::from(delivery_payload),
+            row.client_id.clone(),
+            row.stream_id,
+            row.stream_seq,
+        ) {
+            Ok(request) => request,
+            Err(err) => {
+                tracing::warn!(
+                    idempotency_key = %row.idempotency_key,
+                    error = %err,
+                    "invalid durable outbox request"
+                );
+                let has_exact_delivery_identity = !row.idempotency_key.is_empty()
+                    && !row.client_id.is_empty()
+                    && row.stream_id > 0
+                    && row.stream_seq > 0;
+                if has_exact_delivery_identity {
+                    let sentinel = payload::terminal_decision_payload(&row.idempotency_key)
+                        .and_then(|payload| {
+                            OutboxDeliveryRequest::try_new(
+                                row.idempotency_key.clone(),
+                                klights_leader_api::OutboxDeliveryOperation::PodStatus,
+                                Arc::<[u8]>::from(payload),
+                                row.client_id.clone(),
+                                row.stream_id,
+                                row.stream_seq,
+                            )
+                            .map_err(anyhow::Error::from)
+                        });
+                    if let Ok(request) = sentinel {
+                        records_checkpoint = false;
+                        request
+                    } else {
+                        self.dead_letter_invalid_claimed_row(
+                            &row,
+                            lease_token,
+                            &format!("invalid assigned outbox request: {err}"),
+                        )
+                        .await;
+                        return;
+                    }
+                } else {
+                    self.dead_letter_invalid_claimed_row(
+                        &row,
+                        lease_token,
+                        &format!("invalid unaddressable outbox request: {err}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        };
         let applied = self
-            .client
-            .apply_outbox(
-                &row.idempotency_key,
-                operation,
-                Bytes::from(row.payload_proto.clone()),
-                &row.client_id,
-                row.stream_id,
-                row.stream_seq,
-            )
+            .deliver_with_lease_renewal(&row, lease_token, request)
             .await;
         let elapsed_ms = dispatch_start.elapsed().as_millis() as u64;
         if records_checkpoint {
@@ -990,7 +1015,9 @@ impl OutboxDispatcher {
                 pod_uid = %row.pod_uid,
                 attempt = row.attempt,
                 elapsed_ms,
-                resolved = !matches!(applied, Err(OutboxApplyError::Retryable(_))),
+                resolved = !applied
+                    .as_ref()
+                    .is_err_and(|error| error.is_retryable() || !error.is_terminal()),
                 "outbox dispatch: pod-status row apply_outbox resolved"
             );
         }
@@ -1027,46 +1054,51 @@ impl OutboxDispatcher {
                     );
                 }
             }
-            Err(OutboxApplyError::Retryable(err)) => {
+            Err(err) if err.is_retryable() || !err.is_terminal() => {
                 self.dispatch_errors_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if row.attempt + 1 >= MAX_OUTBOX_ATTEMPTS {
-                    tracing::warn!(
-                        idempotency_key = %row.idempotency_key,
-                        attempts = %(row.attempt + 1),
-                        "outbox row exceeded max attempts, moving to dead letter"
-                    );
-                    if let Err(err) = self
-                        .node_db
-                        .move_outbox_to_dead_letter_if_max_attempts(
-                            &row.idempotency_key,
-                            MAX_OUTBOX_ATTEMPTS,
-                        )
-                        .await
-                    {
-                        tracing::warn!(idempotency_key = %row.idempotency_key, error = %err, "dead-letter move failed");
+                let error = err.to_string();
+                let backoff_until_ms = now_ms.saturating_add(adaptive_jittered_backoff_ms(
+                    row.attempt,
+                    &row.idempotency_key,
+                    self.rtt.estimate_ms(),
+                ));
+                match self
+                    .node_db
+                    .record_outbox_failure(
+                        row.id,
+                        lease_token,
+                        backoff_until_ms,
+                        &error,
+                        MAX_OUTBOX_ATTEMPTS,
+                    )
+                    .await
+                {
+                    Ok(OutboxFailureDisposition::DeadLettered) => {
+                        tracing::warn!(
+                            idempotency_key = %row.idempotency_key,
+                            attempts = %row.attempt.saturating_add(1),
+                            "outbox row exceeded max attempts, moving to dead letter"
+                        );
+                        if records_checkpoint
+                            && let Err(err) = self
+                                .node_db
+                                .delete_pod_status_checkpoint(&row.pod_uid)
+                                .await
+                        {
+                            tracing::warn!(pod_uid = %row.pod_uid, error = %err, "delete checkpoint failed");
+                        }
                     }
-                    if records_checkpoint
-                        && let Err(err) = self
-                            .node_db
-                            .delete_pod_status_checkpoint(&row.pod_uid)
-                            .await
-                    {
-                        tracing::warn!(pod_uid = %row.pod_uid, error = %err, "delete checkpoint failed");
-                    }
-                } else {
-                    let backoff_until_ms = now_ms.saturating_add(adaptive_jittered_backoff_ms(
-                        row.attempt,
-                        &row.idempotency_key,
-                        self.rtt.estimate_ms(),
-                    ));
-                    if let Err(err) = self
-                        .node_db
-                        .mark_outbox_attempt_failed(row.id, lease_token, backoff_until_ms, &err)
-                        .await
-                    {
-                        tracing::warn!(outbox_id = row.id, error = %err, "mark outbox attempt failed");
-                    }
+                    Ok(OutboxFailureDisposition::RetryScheduled) => {}
+                    Ok(OutboxFailureDisposition::LeaseLost) => tracing::warn!(
+                        outbox_id = row.id,
+                        "outbox failure was not recorded because the lease was lost"
+                    ),
+                    Err(move_err) => tracing::warn!(
+                        outbox_id = row.id,
+                        error = %move_err,
+                        "record outbox failure or dead-letter move failed"
+                    ),
                 }
             }
             // All remaining `OutboxApplyError` variants (NotFound,
@@ -1075,14 +1107,6 @@ impl OutboxDispatcher {
                 debug_assert!(err.is_terminal());
                 self.dispatch_total
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if records_checkpoint
-                    && let Err(err) = self
-                        .node_db
-                        .delete_pod_status_checkpoint(&row.pod_uid)
-                        .await
-                {
-                    tracing::warn!(pod_uid = %row.pod_uid, error = %err, "delete checkpoint failed");
-                }
                 if actor_owned_pod_delete_needs_dead_letter(&row, &err) {
                     tracing::warn!(
                         idempotency_key = %row.idempotency_key,
@@ -1091,16 +1115,30 @@ impl OutboxDispatcher {
                     );
                     match self
                         .node_db
-                        .move_outbox_to_dead_letter_if_max_attempts(&row.idempotency_key, 0)
+                        .record_outbox_failure(row.id, lease_token, now_ms, &err.to_string(), 1)
                         .await
                     {
-                        Ok(true) => return,
-                        Ok(false) => {
+                        Ok(OutboxFailureDisposition::DeadLettered) => {
+                            if records_checkpoint
+                                && let Err(error) = self
+                                    .node_db
+                                    .delete_pod_status_checkpoint(&row.pod_uid)
+                                    .await
+                            {
+                                tracing::warn!(pod_uid = %row.pod_uid, error = %error, "delete checkpoint failed");
+                            }
+                            return;
+                        }
+                        Ok(OutboxFailureDisposition::LeaseLost) => {
                             tracing::warn!(
                                 idempotency_key = %row.idempotency_key,
                                 "actor-owned Pod delete terminal row was not moved to dead letter"
                             );
+                            return;
                         }
+                        Ok(OutboxFailureDisposition::RetryScheduled) => unreachable!(
+                            "max_attempts=1 must dead-letter the first recorded failure"
+                        ),
                         Err(move_err) => {
                             tracing::warn!(
                                 idempotency_key = %row.idempotency_key,
@@ -1111,6 +1149,14 @@ impl OutboxDispatcher {
                         }
                     }
                 }
+                if records_checkpoint
+                    && let Err(error) = self
+                        .node_db
+                        .delete_pod_status_checkpoint(&row.pod_uid)
+                        .await
+                {
+                    tracing::warn!(pod_uid = %row.pod_uid, error = %error, "delete checkpoint failed");
+                }
                 tracing::debug!(
                     idempotency_key = %row.idempotency_key,
                     error = %err,
@@ -1118,6 +1164,74 @@ impl OutboxDispatcher {
                 );
                 self.complete_row(row.id, lease_token, &row.idempotency_key)
                     .await;
+            }
+        }
+    }
+
+    async fn dead_letter_invalid_claimed_row(
+        &self,
+        row: &OutboxRow,
+        lease_token: &str,
+        error: &str,
+    ) {
+        match self
+            .node_db
+            .record_outbox_failure(row.id, lease_token, row.next_due_ms, error, 1)
+            .await
+        {
+            Ok(OutboxFailureDisposition::DeadLettered) => tracing::warn!(
+                outbox_id = row.id,
+                "invalid durable outbox row moved to dead letter"
+            ),
+            Ok(OutboxFailureDisposition::LeaseLost) => tracing::warn!(
+                outbox_id = row.id,
+                "invalid durable outbox row retained after lease loss"
+            ),
+            Ok(OutboxFailureDisposition::RetryScheduled) => {
+                unreachable!("max_attempts=1 must dead-letter the first recorded failure")
+            }
+            Err(error) => tracing::warn!(
+                outbox_id = row.id,
+                error = %error,
+                "failed to durably dead-letter invalid outbox row"
+            ),
+        }
+    }
+
+    async fn deliver_with_lease_renewal(
+        &self,
+        row: &OutboxRow,
+        lease_token: &str,
+        request: OutboxDeliveryRequest,
+    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
+        let Some(supervisor) = self.lease_renewal_supervisor.as_ref() else {
+            return self.client.deliver_outbox(request).await;
+        };
+
+        let mut delivery = self.client.deliver_outbox(request);
+        let renewal_period = Duration::from_millis((self.lease_ms / 3).max(1) as u64);
+        let timer_name = format!("kubelet_outbox_lease_renewal/{}", row.id);
+        loop {
+            tokio::select! {
+                result = &mut delivery => return result,
+                timer_result = supervisor.sleep(timer_name.clone(), renewal_period) => {
+                    timer_result.map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
+                    if supervisor.root_cancellation_token().is_cancelled() {
+                        return Err(OutboxApplyError::cancelled());
+                    }
+                    let leased_until_ms = now_ms().saturating_add(self.lease_ms.max(1));
+                    let renewed = self
+                        .node_db
+                        .renew_outbox_lease(row.id, lease_token, leased_until_ms)
+                        .await
+                        .map_err(|error| OutboxApplyError::Retryable(error.to_string()))?;
+                    if !renewed {
+                        return Err(OutboxApplyError::Retryable(format!(
+                            "outbox lease lost while delivery was in flight for row {}",
+                            row.id,
+                        )));
+                    }
+                }
             }
         }
     }
@@ -1288,8 +1402,7 @@ mod tests {
     mod dead_letter_tests;
     use std::sync::Arc;
 
-    use async_trait::async_trait;
-    use bytes::Bytes;
+    use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryFuture, OutboxDeliveryRequest};
     use std::collections::HashSet;
     use tokio::sync::{Mutex, Notify};
 
@@ -1301,9 +1414,90 @@ mod tests {
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     use super::{
-        DispatchOutcome, Outbox, OutboxApplyClient, OutboxApplyError, OutboxApplyResult,
-        OutboxCommand, OutboxDispatcher, OutboxSubject,
+        DispatchOutcome, Outbox, OutboxApplyError, OutboxApplyResult, OutboxCommand,
+        OutboxDispatcher, OutboxSubject,
     };
+
+    #[test]
+    fn dispatcher_constructor_requires_only_the_focused_delivery_port() {
+        let constructor: fn(NodeLocalHandle, Arc<dyn LeaderOutboxDelivery>) -> OutboxDispatcher =
+            OutboxDispatcher::for_tests;
+        let _ = constructor;
+    }
+
+    #[derive(Default)]
+    struct BlockingOutboxDelivery {
+        started: Notify,
+        release: Notify,
+    }
+
+    impl LeaderOutboxDelivery for BlockingOutboxDelivery {
+        fn deliver_outbox(&self, _request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+            Box::pin(async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                OutboxApplyResult::try_applied(1)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn in_flight_delivery_renews_its_claim_lease_until_rpc_completion() {
+        let node_db = node_db().await;
+        let outbox = Outbox::new(node_db.clone());
+        let client = Arc::new(BlockingOutboxDelivery::default());
+        let lease_ms = 120;
+        let dispatcher = Arc::new(OutboxDispatcher::for_tests_with_lease_renewal(
+            node_db.clone(),
+            client.clone(),
+            supervisor(),
+            lease_ms,
+        ));
+        let claimed_at = super::now_ms();
+        outbox
+            .enqueue_command(OutboxCommand::new(
+                "lease-renewal",
+                OutboxOperation::PodStatus,
+                OutboxSubject::new(
+                    "v1/Pod/default/lease-renewal/uid-lease-renewal",
+                    Some("default".to_string()),
+                    "lease-renewal",
+                    Some("uid-lease-renewal".to_string()),
+                ),
+                "uid-lease-renewal",
+                pod_status_command("default", "lease-renewal", "uid-lease-renewal"),
+                claimed_at,
+            ))
+            .await
+            .expect("enqueue lease-renewal row");
+
+        let dispatch = tokio::spawn({
+            let dispatcher = dispatcher.clone();
+            async move { dispatcher.dispatch_due_once(claimed_at).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.started.notified())
+            .await
+            .expect("delivery must start");
+
+        tokio::time::sleep(std::time::Duration::from_millis(lease_ms as u64 * 2)).await;
+        assert_eq!(
+            node_db
+                .requeue_expired_outbox_leases(super::now_ms())
+                .await
+                .expect("requeue expired leases while RPC is active"),
+            0,
+            "the active RPC must renew before its claim can expire"
+        );
+
+        client.release.notify_one();
+        assert_eq!(
+            dispatch
+                .await
+                .expect("join dispatch")
+                .expect("dispatch row"),
+            DispatchOutcome::Dispatched
+        );
+    }
 
     fn supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))
@@ -1470,23 +1664,19 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl OutboxApplyClient for FakeApplyClient {
-        async fn apply_outbox(
-            &self,
-            idempotency_key: &str,
-            _operation: OutboxOperation,
-            _payload: Bytes,
-            _client_id: &str,
-            _stream_id: i64,
-            _stream_seq: i64,
-        ) -> Result<OutboxApplyResult, OutboxApplyError> {
-            self.calls.lock().await.push(idempotency_key.to_string());
-            self.responses
-                .lock()
-                .await
-                .pop()
-                .unwrap_or(Ok(OutboxApplyResult::Applied { applied_rv: 1 }))
+    impl LeaderOutboxDelivery for FakeApplyClient {
+        fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+            Box::pin(async move {
+                self.calls
+                    .lock()
+                    .await
+                    .push(request.idempotency_key().to_string());
+                self.responses
+                    .lock()
+                    .await
+                    .pop()
+                    .unwrap_or(Ok(OutboxApplyResult::Applied { applied_rv: 1 }))
+            })
         }
     }
 
@@ -1506,28 +1696,22 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl OutboxApplyClient for IdempotentApplyClient {
-        async fn apply_outbox(
-            &self,
-            idempotency_key: &str,
-            _operation: OutboxOperation,
-            _payload: Bytes,
-            _client_id: &str,
-            _stream_id: i64,
-            _stream_seq: i64,
-        ) -> Result<OutboxApplyResult, OutboxApplyError> {
-            self.calls.lock().await.push(idempotency_key.to_string());
-            let mut applied = self.applied.lock().await;
-            if applied.insert(idempotency_key.to_string()) {
-                Ok(OutboxApplyResult::Applied {
-                    applied_rv: applied.len() as i64,
-                })
-            } else {
-                Ok(OutboxApplyResult::AlreadyApplied {
-                    applied_rv: Some(applied.len() as i64),
-                })
-            }
+    impl LeaderOutboxDelivery for IdempotentApplyClient {
+        fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+            Box::pin(async move {
+                let idempotency_key = request.idempotency_key().to_string();
+                self.calls.lock().await.push(idempotency_key.clone());
+                let mut applied = self.applied.lock().await;
+                if applied.insert(idempotency_key) {
+                    Ok(OutboxApplyResult::Applied {
+                        applied_rv: applied.len() as i64,
+                    })
+                } else {
+                    Ok(OutboxApplyResult::AlreadyApplied {
+                        applied_rv: Some(applied.len() as i64),
+                    })
+                }
+            })
         }
     }
 
@@ -1547,23 +1731,16 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl OutboxApplyClient for InFlightTrackingClient {
-        async fn apply_outbox(
-            &self,
-            _idempotency_key: &str,
-            _operation: OutboxOperation,
-            _payload: Bytes,
-            _client_id: &str,
-            _stream_id: i64,
-            _stream_seq: i64,
-        ) -> Result<OutboxApplyResult, OutboxApplyError> {
-            use std::sync::atomic::Ordering;
-            let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max.fetch_max(now, Ordering::SeqCst);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            self.current.fetch_sub(1, Ordering::SeqCst);
-            Ok(OutboxApplyResult::Applied { applied_rv: 1 })
+    impl LeaderOutboxDelivery for InFlightTrackingClient {
+        fn deliver_outbox(&self, _request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.current.fetch_sub(1, Ordering::SeqCst);
+                Ok(OutboxApplyResult::Applied { applied_rv: 1 })
+            })
         }
     }
 
@@ -1916,7 +2093,15 @@ mod tests {
             dispatcher.dispatch_due_once(1_100).await.expect("dispatch"),
             DispatchOutcome::Dispatched
         );
-        assert_eq!(client.calls().await, vec!["lease-renew"]);
+        assert!(
+            client.calls().await.is_empty(),
+            "LeaseRenew uses the focused lease port and must not reach durable delivery"
+        );
+        assert_eq!(
+            dispatcher.dispatch_due_once(1_100).await.expect("dispatch"),
+            DispatchOutcome::Dispatched
+        );
+        assert_eq!(client.calls().await, vec!["pod-status-00"]);
     }
 
     #[tokio::test]
@@ -1997,13 +2182,19 @@ mod tests {
                 .expect("claim")
                 .expect("row");
             client
-                .apply_outbox(
-                    &row.idempotency_key,
-                    OutboxOperation::try_from(row.operation.as_str()).expect("operation"),
-                    Bytes::from(row.payload_proto),
-                    &row.client_id,
-                    row.stream_id,
-                    row.stream_seq,
+                .deliver_outbox(
+                    OutboxDeliveryRequest::try_new(
+                        row.idempotency_key,
+                        OutboxOperation::try_from(row.operation.as_str())
+                            .expect("operation")
+                            .try_delivery_operation()
+                            .expect("durable operation"),
+                        Arc::<[u8]>::from(row.payload_proto),
+                        row.client_id,
+                        row.stream_id,
+                        row.stream_seq,
+                    )
+                    .expect("valid delivery request"),
                 )
                 .await
                 .expect("simulate leader effect before crash");
@@ -2641,12 +2832,22 @@ mod tests {
             dispatcher.dispatch_due_once(1_001).await.expect("dispatch"),
             DispatchOutcome::Dispatched
         );
+        assert_eq!(
+            dispatcher.dispatch_due_once(1_002).await.expect("dispatch"),
+            DispatchOutcome::Dispatched,
+            "strict stream FIFO must consume the older status decision before actor delete"
+        );
         assert!(
             matches!(
-                dispatcher.dispatch_due_once(1_002).await.expect("dispatch"),
+                dispatcher.dispatch_due_once(1_003).await.expect("dispatch"),
                 DispatchOutcome::Idle { .. }
             ),
             "actor-finalize delete should complete superseded status rows"
+        );
+        let dead_letters = node_db.list_dead_letter().await.expect("list dead letter");
+        assert!(
+            dead_letters.is_empty(),
+            "ordered actor-finalize delete must not dead-letter: {dead_letters:?}"
         );
         assert!(
             cluster_db
@@ -2655,6 +2856,317 @@ mod tests {
                 .expect("read pod")
                 .is_none(),
             "stale status conflicts must not block the actor-owned delete row"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbox_terminal_decision_unknown_operation_consumes_assigned_sequence() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        assert_eq!(
+            crate::datastore::resource_version_assignment::read_resource_version_assignment_mode(
+                &cluster_db,
+            )
+            .await
+            .expect("read assignment mode"),
+            crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned,
+            "this regression explicitly covers legacy leader-assigned resourceVersions"
+        );
+        let (node_db, sqlite_node_db) =
+            crate::datastore::node_local::selector::open_node_local_with_sqlite(
+                BackendKind::Sqlite,
+                None,
+                supervisor(),
+                None,
+                "sqlite:outbox-terminal-unknown-test",
+            )
+            .await
+            .expect("open node-local test db");
+        let sqlite_node_db = sqlite_node_db.expect("SQLite test backend");
+        node_db
+            .enqueue_outbox(crate::datastore::node_local::OutboxInsert {
+                idempotency_key: "unknown-operation-seq-1".to_string(),
+                enqueued_ms: 1_000,
+                subject_key: "v1/Pod/default/after-unknown/uid-after-unknown".to_string(),
+                subject_api_version: "v1".to_string(),
+                subject_kind: "Pod".to_string(),
+                subject_namespace: Some("default".to_string()),
+                subject_name: "after-unknown".to_string(),
+                subject_uid: Some("uid-after-unknown".to_string()),
+                pod_uid: "uid-after-unknown".to_string(),
+                operation: OutboxOperation::PodStatus.as_str().to_string(),
+                payload_proto: vec![0xff],
+                next_due_ms: 1_000,
+            })
+            .await
+            .expect("enqueue legacy row before unknown operation migration");
+        let position_before_corruption = sqlite_node_db
+            .outbox_stream_position_for_test("unknown-operation-seq-1")
+            .await
+            .expect("read assigned position before corruption")
+            .expect("assigned position exists");
+        assert_eq!(
+            sqlite_node_db
+                .outbox_operation_for_test("unknown-operation-seq-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("PodStatus")
+        );
+        sqlite_node_db
+            .set_outbox_operation_for_test("unknown-operation-seq-1", "FutureUnknownOperation")
+            .await
+            .expect("simulate an assigned legacy/corrupt operation value");
+        assert_eq!(
+            sqlite_node_db
+                .outbox_operation_for_test("unknown-operation-seq-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("FutureUnknownOperation")
+        );
+        assert_eq!(
+            sqlite_node_db
+                .outbox_stream_position_for_test("unknown-operation-seq-1")
+                .await
+                .unwrap(),
+            Some(position_before_corruption),
+            "the test corruption must change only operation, not stream identity"
+        );
+        let outbox = Outbox::new(node_db.clone());
+        outbox
+            .enqueue_command(OutboxCommand::new(
+                "known-operation-seq-2",
+                OutboxOperation::PodStatus,
+                OutboxSubject::new(
+                    "v1/Pod/default/after-unknown/uid-after-unknown",
+                    Some("default".to_string()),
+                    "after-unknown",
+                    Some("uid-after-unknown".to_string()),
+                ),
+                "uid-after-unknown",
+                pod_status_command("default", "after-unknown", "uid-after-unknown"),
+                1_001,
+            ))
+            .await
+            .expect("enqueue known successor row");
+        let client_id = node_db
+            .get_node_meta("outbox_client_id")
+            .await
+            .expect("read outbox client id")
+            .expect("outbox client id exists");
+        let first_position = sqlite_node_db
+            .outbox_stream_position_for_test("unknown-operation-seq-1")
+            .await
+            .expect("read unknown row position")
+            .expect("unknown row position exists");
+        let second_position = sqlite_node_db
+            .outbox_stream_position_for_test("known-operation-seq-2")
+            .await
+            .expect("read successor row position")
+            .expect("successor row position exists");
+        assert_eq!(first_position.1, 1);
+        assert_eq!(second_position, (first_position.0, 2));
+        let client = Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+            Arc::new(cluster_db.clone()),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let dispatcher = OutboxDispatcher::for_tests(node_db.clone(), client);
+        let resource_version_before = cluster_db
+            .get_current_resource_version()
+            .await
+            .expect("read public resourceVersion before terminal decision");
+        let watch_position_before = cluster_db
+            .current_watch_replay_position()
+            .await
+            .expect("read watch position before terminal decision");
+
+        assert_eq!(
+            dispatcher
+                .dispatch_due_once(1_001)
+                .await
+                .expect("dispatch unknown"),
+            DispatchOutcome::Dispatched
+        );
+        assert_eq!(
+            cluster_db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![crate::log_apply::OutboxStreamWatermark {
+                client_id: client_id.clone(),
+                stream_id: first_position.0,
+                stream_seq: 1,
+            }],
+            "an assigned unknown operation requires a leader terminal decision"
+        );
+        assert_eq!(
+            cluster_db.get_current_resource_version().await.unwrap(),
+            resource_version_before,
+            "the terminal sentinel must not allocate a public resourceVersion"
+        );
+        assert_eq!(
+            cluster_db.current_watch_replay_position().await.unwrap(),
+            watch_position_before,
+            "the terminal sentinel must not append watch history"
+        );
+        assert!(
+            cluster_db
+                .get_resource("v1", "Pod", Some("__klights-terminal-outbox__"), "decision",)
+                .await
+                .expect("read terminal sentinel target")
+                .is_none(),
+            "the terminal sentinel must not create or update a Pod"
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch_due_once(1_002)
+                .await
+                .expect("dispatch successor"),
+            DispatchOutcome::Dispatched
+        );
+        assert_eq!(
+            cluster_db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![crate::log_apply::OutboxStreamWatermark {
+                client_id,
+                stream_id: first_position.0,
+                stream_seq: 2,
+            }],
+            "the known successor must apply after the terminal decision"
+        );
+        assert!(
+            node_db
+                .claim_next_due_outbox(1_003, 1_000, "assert-empty")
+                .await
+                .expect("claim after drain")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn assigned_empty_payload_uses_a_durable_terminal_sentinel() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let node_db = crate::datastore::node_local::selector::open_node_local(
+            BackendKind::Sqlite,
+            None,
+            supervisor(),
+            None,
+            "sqlite:assigned-empty-payload-test",
+        )
+        .await
+        .unwrap();
+        node_db
+            .enqueue_outbox(crate::datastore::node_local::OutboxInsert {
+                idempotency_key: "assigned-empty-payload".to_string(),
+                enqueued_ms: 1,
+                subject_key: "v1/Pod/default/web/pod-uid".to_string(),
+                subject_api_version: "v1".to_string(),
+                subject_kind: "Pod".to_string(),
+                subject_namespace: Some("default".to_string()),
+                subject_name: "web".to_string(),
+                subject_uid: Some("pod-uid".to_string()),
+                pod_uid: "pod-uid".to_string(),
+                operation: OutboxOperation::PodStatus.as_str().to_string(),
+                payload_proto: Vec::new(),
+                next_due_ms: 1,
+            })
+            .await
+            .unwrap();
+        let client_id = node_db
+            .get_node_meta("outbox_client_id")
+            .await
+            .unwrap()
+            .unwrap();
+        let client = Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+            Arc::new(cluster_db.clone()),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let dispatcher = OutboxDispatcher::for_tests(node_db.clone(), client);
+
+        assert_eq!(
+            dispatcher.dispatch_due_once(1).await.unwrap(),
+            DispatchOutcome::Dispatched
+        );
+        let watermark = cluster_db.list_outbox_stream_watermarks().await.unwrap();
+        assert_eq!(watermark.len(), 1);
+        assert_eq!(watermark[0].client_id, client_id);
+        assert_eq!(watermark[0].stream_seq, 1);
+        assert!(node_db.list_dead_letter().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn outbox_terminal_decision_unknown_operation_transport_failure_requeues() {
+        let (node_db, sqlite_node_db) =
+            crate::datastore::node_local::selector::open_node_local_with_sqlite(
+                BackendKind::Sqlite,
+                None,
+                supervisor(),
+                None,
+                "sqlite:outbox-terminal-unknown-retry-test",
+            )
+            .await
+            .expect("open node-local test db");
+        let sqlite_node_db = sqlite_node_db.expect("SQLite test backend");
+        node_db
+            .enqueue_outbox(crate::datastore::node_local::OutboxInsert {
+                idempotency_key: "unknown-operation-retry".to_string(),
+                enqueued_ms: 1_000,
+                subject_key: "internal/unknown-operation-retry".to_string(),
+                subject_api_version: "internal".to_string(),
+                subject_kind: "Unknown".to_string(),
+                subject_namespace: None,
+                subject_name: "unknown-operation-retry".to_string(),
+                subject_uid: None,
+                pod_uid: String::new(),
+                operation: OutboxOperation::PodStatus.as_str().to_string(),
+                payload_proto: vec![0xff],
+                next_due_ms: 1_000,
+            })
+            .await
+            .expect("enqueue row before operation corruption");
+        let position_before_corruption = sqlite_node_db
+            .outbox_stream_position_for_test("unknown-operation-retry")
+            .await
+            .expect("read assigned position before corruption")
+            .expect("assigned position exists");
+        sqlite_node_db
+            .set_outbox_operation_for_test("unknown-operation-retry", "FutureUnknownOperation")
+            .await
+            .expect("simulate assigned corrupt operation");
+        assert_eq!(
+            sqlite_node_db
+                .outbox_operation_for_test("unknown-operation-retry")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("FutureUnknownOperation")
+        );
+        assert_eq!(
+            sqlite_node_db
+                .outbox_stream_position_for_test("unknown-operation-retry")
+                .await
+                .unwrap(),
+            Some(position_before_corruption),
+            "the test corruption must preserve the exact assigned watermark"
+        );
+        let client = Arc::new(FakeApplyClient::default());
+        client
+            .push_response(Err(OutboxApplyError::Retryable(
+                "leader unavailable".to_string(),
+            )))
+            .await;
+        let dispatcher = OutboxDispatcher::for_tests(node_db, client.clone());
+
+        assert_eq!(
+            dispatcher
+                .dispatch_due_once(1_000)
+                .await
+                .expect("dispatch unknown"),
+            DispatchOutcome::Dispatched
+        );
+        assert_eq!(client.calls().await, vec!["unknown-operation-retry"]);
+        assert_eq!(
+            sqlite_node_db.outbox_stats().await.unwrap().pending,
+            1,
+            "transport/follower failure must retain the assigned row for retry"
         );
     }
 
@@ -2700,7 +3212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_status_and_event_writes_enqueue_outbox_rows() {
+    async fn node_registration_and_event_writes_enqueue_outbox_rows() {
         let db = Arc::new(
             crate::datastore::sqlite::Datastore::new_in_memory()
                 .await
@@ -2732,7 +3244,7 @@ mod tests {
             None,
         )
         .await
-        .expect("enqueue node status");
+        .expect("enqueue node registration");
         let pod = serde_json::json!({
             "apiVersion": "v1",
             "kind": "Pod",
@@ -2770,7 +3282,7 @@ mod tests {
                 .expect("complete");
         }
 
-        assert_eq!(operations, vec!["NodeStatus", "EventCreate"]);
+        assert_eq!(operations, vec!["NodeRegistration", "EventCreate"]);
         assert!(
             db.list_resources(
                 "v1",

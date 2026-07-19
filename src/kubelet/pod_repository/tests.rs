@@ -12,10 +12,14 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::control_plane::client::{
-    CacheScope, LeaderApiClient, ListRequest, ListResponse, ResourceEvent, WatchRequest,
-    WatchStream,
+    CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient, LeaderCacheReadiness,
+    LeaderWatch, LeaderWatchFuture, ListRequest, ListResponse, WatchRequest, WatchStream,
+    legacy_list_request, query_list_result,
 };
-use klights_types::ResourceKey;
+use klights_leader_api::{
+    LeaderResourceQuery, ResourceGetRequest, ResourceListRequest, ResourceListResult,
+    ResourceQueryConsistency, ResourceQueryFuture,
+};
 
 use super::state_only_writer::StateOnlyWriter;
 use super::store::{PodStore, UnscheduledPodDeleteOutcome};
@@ -103,198 +107,62 @@ impl FakeLeaderApiClient {
     }
 }
 
-#[async_trait::async_trait]
-impl LeaderApiClient for FakeLeaderApiClient {
-    async fn get_resource(&self, key: ResourceKey) -> Result<Option<crate::datastore::Resource>> {
-        if key.api_version == "v1"
-            && key.kind == "Pod"
-            && key.namespace.as_deref() == self.pod.namespace.as_deref()
-            && key.name == self.pod.name
-        {
-            return Ok(Some(self.pod.clone()));
-        }
-        Ok(None)
-    }
-
-    async fn get_resource_fresh(
+impl LeaderResourceQuery for FakeLeaderApiClient {
+    fn get_resource(
         &self,
-        key: ResourceKey,
-    ) -> Result<Option<crate::datastore::Resource>> {
-        let pod = self.fresh_pod.as_ref().unwrap_or(&self.pod);
-        if key.api_version == "v1"
-            && key.kind == "Pod"
-            && key.namespace.as_deref() == pod.namespace.as_deref()
-            && key.name == pod.name
-        {
-            return Ok(Some(pod.clone()));
-        }
-        Ok(None)
+        request: ResourceGetRequest,
+    ) -> ResourceQueryFuture<'_, Option<crate::datastore::Resource>> {
+        Box::pin(async move {
+            let consistency = request.consistency();
+            let key = request.into_key();
+            let pod = if consistency == ResourceQueryConsistency::LeaderFresh {
+                self.fresh_pod.as_ref().unwrap_or(&self.pod)
+            } else {
+                &self.pod
+            };
+            Ok((key.api_version == "v1"
+                && key.kind == "Pod"
+                && key.namespace.as_deref() == pod.namespace.as_deref()
+                && key.name == pod.name)
+                .then(|| pod.clone()))
+        })
     }
 
-    async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
-        let default_items = [self.pod.clone()];
-        let items = self.cached_list_items.as_deref().unwrap_or(&default_items);
-        Ok(self.pod_list_response(&req, items))
-    }
-
-    async fn list_resources_fresh(&self, req: ListRequest) -> Result<ListResponse> {
-        let default_items = self
-            .cached_list_items
-            .as_deref()
-            .unwrap_or_else(|| std::slice::from_ref(&self.pod));
-        let items = self.fresh_list_items.as_deref().unwrap_or(default_items);
-        Ok(self.pod_list_response(&req, items))
-    }
-
-    async fn watch_resources(&self, _req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-        Ok(Box::pin(futures::stream::empty()))
-    }
-
-    async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
-        Ok(())
-    }
-
-    async fn get_pod(
+    fn list_resources(
         &self,
-        ns: &str,
-        name: &str,
-    ) -> Result<Option<crate::control_plane::client::Pod>> {
-        if self.pod.namespace.as_deref() == Some(ns) && self.pod.name == name {
-            return Ok(Some(self.pod.clone()));
-        }
-        Ok(None)
-    }
-
-    async fn get_pod_for_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> Result<Option<crate::control_plane::client::Pod>> {
-        Ok(self
-            .get_pod(ns, name)
-            .await?
-            .filter(|pod| pod.uid.as_str() == uid))
-    }
-
-    async fn watch_pods_on_node(
-        &self,
-        _node_name: &str,
-    ) -> Result<WatchStream<crate::control_plane::client::Pod>> {
-        Ok(Box::pin(futures::stream::empty()))
-    }
-
-    async fn list_pods_on_node(
-        &self,
-        _node_name: &str,
-    ) -> Result<Vec<crate::control_plane::client::Pod>> {
-        Ok(vec![self.pod.clone()])
-    }
-
-    async fn get_configmap(
-        &self,
-        _ns: &str,
-        _name: &str,
-    ) -> Result<Option<crate::control_plane::client::ConfigMap>> {
-        Ok(None)
-    }
-
-    async fn get_secret(
-        &self,
-        _ns: &str,
-        _name: &str,
-    ) -> Result<Option<crate::control_plane::client::Secret>> {
-        Ok(None)
-    }
-
-    async fn get_node(&self, name: &str) -> Result<crate::control_plane::client::Node> {
-        Err(anyhow::anyhow!("unexpected node read for {name}"))
-    }
-
-    async fn watch_node(
-        &self,
-        _name: &str,
-    ) -> Result<WatchStream<crate::control_plane::client::Node>> {
-        Ok(Box::pin(futures::stream::empty()))
-    }
-
-    async fn allocate_node_subnet(
-        &self,
-        node_name: &str,
-        _cluster_cidr: &str,
-        _node_ip: &str,
-    ) -> Result<crate::datastore::NodeSubnet> {
-        Err(anyhow::anyhow!(
-            "unexpected node subnet allocation for {node_name}"
-        ))
-    }
-
-    async fn get_node_subnet(
-        &self,
-        node_name: &str,
-    ) -> Result<Option<crate::datastore::NodeSubnet>> {
-        Err(anyhow::anyhow!(
-            "unexpected node subnet read for {node_name}"
-        ))
-    }
-
-    async fn list_peer_subnets(
-        &self,
-        my_node_name: &str,
-    ) -> Result<Vec<crate::datastore::NodeSubnet>> {
-        Err(anyhow::anyhow!(
-            "unexpected peer subnet list for {my_node_name}"
-        ))
-    }
-
-    async fn get_node_dataplane(
-        &self,
-        node_name: &str,
-    ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
-        Err(anyhow::anyhow!(
-            "unexpected node dataplane read for {node_name}"
-        ))
-    }
-
-    async fn list_pod_cleanup_intents_for_node(
-        &self,
-        node_name: &str,
-    ) -> Result<Vec<crate::datastore::PodCleanupIntent>> {
-        Err(anyhow::anyhow!(
-            "unexpected pod cleanup intent list for {node_name}"
-        ))
-    }
-
-    async fn delete_pod_cleanup_intent(
-        &self,
-        node_name: &str,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        reason: &str,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!(
-            "unexpected pod cleanup intent delete for {node_name}/{namespace}/{pod_name}/{pod_uid}/{reason}"
-        ))
-    }
-
-    async fn apply_outbox(
-        &self,
-        _idempotency_key: &str,
-        _operation: crate::kubelet::outbox::payload::OutboxOperation,
-        _payload: bytes::Bytes,
-        _client_id: &str,
-        _stream_id: i64,
-        _stream_seq: i64,
-    ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
-        Ok(crate::kubelet::outbox::OutboxApplyResult::Applied {
-            applied_rv: self.pod.resource_version,
+        request: ResourceListRequest,
+    ) -> ResourceQueryFuture<'_, ResourceListResult> {
+        Box::pin(async move {
+            let default_items = self
+                .cached_list_items
+                .as_deref()
+                .unwrap_or_else(|| std::slice::from_ref(&self.pod));
+            let items = if request.consistency() == ResourceQueryConsistency::LeaderFresh {
+                self.fresh_list_items.as_deref().unwrap_or(default_items)
+            } else {
+                default_items
+            };
+            query_list_result(self.pod_list_response(&legacy_list_request(&request), items))
         })
     }
 }
+
+impl LeaderWatch for FakeLeaderApiClient {
+    fn watch_resources(&self, _req: WatchRequest) -> LeaderWatchFuture<'_> {
+        Box::pin(async { Ok(Box::pin(futures::stream::empty()) as WatchStream) })
+    }
+}
+
+impl LeaderCacheReadiness for FakeLeaderApiClient {
+    fn wait_cache_ready(&self, _scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+crate::control_plane::client::impl_unavailable_leader_pod_effects!(FakeLeaderApiClient);
+
+#[async_trait::async_trait]
+impl LeaderApiClient for FakeLeaderApiClient {}
 
 #[async_trait::async_trait]
 impl crate::side_effects::SideEffect for RecordingPodDeleteHook {
@@ -329,73 +197,76 @@ impl crate::side_effects::SideEffect for RecordingPodDeleteHook {
 }
 
 #[derive(Clone)]
-struct TestOutboxApplyClient {
+struct TestOutboxDelivery {
     db: crate::datastore::DatastoreHandle,
 }
 
-impl TestOutboxApplyClient {
+impl TestOutboxDelivery {
     fn new(db: crate::datastore::DatastoreHandle) -> Self {
         Self { db }
     }
 }
 
-#[async_trait::async_trait]
-impl crate::kubelet::outbox::OutboxApplyClient for TestOutboxApplyClient {
-    async fn apply_outbox(
+impl klights_leader_api::LeaderOutboxDelivery for TestOutboxDelivery {
+    fn deliver_outbox(
         &self,
-        _idempotency_key: &str,
-        _operation: crate::kubelet::outbox::payload::OutboxOperation,
-        payload: bytes::Bytes,
-        _client_id: &str,
-        _stream_id: i64,
-        _stream_seq: i64,
-    ) -> std::result::Result<
-        crate::kubelet::outbox::OutboxApplyResult,
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
-        let payload = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(&payload)
+        request: klights_leader_api::OutboxDeliveryRequest,
+    ) -> klights_leader_api::OutboxDeliveryFuture<'_> {
+        Box::pin(async move {
+            let payload = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(
+                request.payload().as_ref(),
+            )
             .map_err(|err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()))?;
-        let command = payload.command;
-        let current_rv = self
-            .db
-            .get_current_resource_version()
-            .await
-            .map_err(|err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()))?;
-        let meta = crate::datastore::command::CommandMeta {
-            command_id: crate::datastore::command::CommandId(format!(
-                "pod-repository-command-{}",
-                current_rv.saturating_add(1)
-            )),
-            codec_version: crate::datastore::command::COMMAND_CODEC_VERSION,
-            resource_version: current_rv.saturating_add(1),
-            uid: match &command {
-                crate::datastore::command::StorageCommand::UpdateResource {
-                    preconditions, ..
-                } => preconditions.uid.clone(),
-                crate::datastore::command::StorageCommand::DeleteResource {
-                    preconditions, ..
-                } => preconditions.uid.clone(),
-                crate::datastore::command::StorageCommand::PatchResource {
-                    preconditions, ..
-                } => preconditions.uid.clone(),
-                crate::datastore::command::StorageCommand::UpdateStatus {
-                    preconditions, ..
-                } => preconditions.uid.clone(),
-                _ => None,
-            },
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .and_then(|d| d.as_millis().try_into().ok())
-                .unwrap_or(0),
-            authoring_node: "test-outbox-client".to_string(),
-        };
-        self.db
-            .apply_replicated_command(command, meta)
-            .await
-            .map_err(|err| crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string()))?;
-        let applied_rv = self.db.get_current_resource_version().await.unwrap_or(0);
-        Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv })
+            let command = payload.command;
+            let current_rv = self
+                .db
+                .get_current_resource_version()
+                .await
+                .map_err(|err| {
+                    crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                })?;
+            let meta = crate::datastore::command::CommandMeta {
+                command_id: crate::datastore::command::CommandId(format!(
+                    "pod-repository-command-{}",
+                    current_rv.saturating_add(1)
+                )),
+                codec_version: crate::datastore::command::COMMAND_CODEC_VERSION,
+                resource_version: current_rv.saturating_add(1),
+                uid: match &command {
+                    crate::datastore::command::StorageCommand::UpdateResource {
+                        preconditions,
+                        ..
+                    } => preconditions.uid.clone(),
+                    crate::datastore::command::StorageCommand::DeleteResource {
+                        preconditions,
+                        ..
+                    } => preconditions.uid.clone(),
+                    crate::datastore::command::StorageCommand::PatchResource {
+                        preconditions,
+                        ..
+                    } => preconditions.uid.clone(),
+                    crate::datastore::command::StorageCommand::UpdateStatus {
+                        preconditions,
+                        ..
+                    } => preconditions.uid.clone(),
+                    _ => None,
+                },
+                timestamp_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| d.as_millis().try_into().ok())
+                    .unwrap_or(0),
+                authoring_node: "test-outbox-client".to_string(),
+            };
+            self.db
+                .apply_replicated_command(command, meta)
+                .await
+                .map_err(|err| {
+                    crate::kubelet::outbox::OutboxApplyError::Retryable(err.to_string())
+                })?;
+            let applied_rv = self.db.get_current_resource_version().await.unwrap_or(0);
+            Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv })
+        })
     }
 }
 
@@ -427,7 +298,7 @@ async fn drain_repo_outbox(
     db: crate::datastore::DatastoreHandle,
     node_db: &crate::datastore::node_local::NodeLocalHandle,
 ) -> Result<()> {
-    let client = std::sync::Arc::new(TestOutboxApplyClient::new(db));
+    let client = std::sync::Arc::new(TestOutboxDelivery::new(db));
     let dispatcher = crate::kubelet::outbox::OutboxDispatcher::for_tests(node_db.clone(), client);
     loop {
         let outcome = dispatcher.dispatch_due_once(i64::MAX / 4).await?;
@@ -1621,6 +1492,31 @@ async fn outbox_sandbox_annotation_uses_leader_api_and_outbox() {
         .expect("metadata row enqueued");
     assert_eq!(row.operation, "PodMetadata");
     assert_eq!(row.pod_uid, "uid-leader-sandbox");
+    let payload = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(
+        row.payload_proto.as_slice(),
+    )
+    .expect("decode sandbox metadata payload");
+    assert_eq!(
+        payload.command,
+        crate::datastore::command::StorageCommand::PatchResource {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "leader-sandbox".to_string(),
+            patch_kind: crate::datastore::PatchKind::Merge,
+            patch: json!({
+                "metadata": {
+                    "annotations": {"klights.dev/sandbox-id": "sandbox-abc"}
+                }
+            }),
+            preconditions: crate::datastore::ResourcePreconditions::uid_and_resource_version(
+                "uid-leader-sandbox",
+                11,
+            ),
+            strict_resource_version: true,
+        },
+        "worker sandbox publication must enqueue only its owned annotation patch"
+    );
 }
 
 #[tokio::test]

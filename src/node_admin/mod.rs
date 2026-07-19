@@ -8,6 +8,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use serde::Serialize;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::datastore::node_local::{DeadLetterRow, NodeLocalHandle};
@@ -16,6 +17,7 @@ use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor}
 #[derive(Clone)]
 struct AdminState {
     node_db: NodeLocalHandle,
+    outbox_notify: Arc<Notify>,
 }
 
 #[derive(Serialize)]
@@ -65,6 +67,7 @@ async fn dead_letter_replay(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if replayed {
+        state.outbox_notify.notify_one();
         Ok(StatusCode::OK)
     } else {
         Ok(StatusCode::NOT_FOUND)
@@ -87,8 +90,11 @@ async fn dead_letter_delete(
     }
 }
 
-fn build_router(node_db: NodeLocalHandle) -> Router {
-    let state = AdminState { node_db };
+fn build_router(node_db: NodeLocalHandle, outbox_notify: Arc<Notify>) -> Router {
+    let state = AdminState {
+        node_db,
+        outbox_notify,
+    };
     Router::new()
         .route("/klights/v1/outbox/status", get(outbox_status))
         .route("/klights/v1/outbox/dead-letter", get(dead_letter_list))
@@ -105,6 +111,7 @@ fn build_router(node_db: NodeLocalHandle) -> Router {
 
 pub async fn start_node_admin(
     node_db: NodeLocalHandle,
+    outbox_notify: Arc<Notify>,
     supervisor: Arc<TaskSupervisor>,
     cancel: CancellationToken,
 ) -> anyhow::Result<SupervisedJoinHandle<()>> {
@@ -113,7 +120,7 @@ pub async fn start_node_admin(
         .and_then(|v| v.parse().ok())
         .unwrap_or(7781);
 
-    let app = build_router(node_db);
+    let app = build_router(node_db, outbox_notify);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
 
     supervisor
@@ -139,6 +146,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::datastore::backend_kind::BackendKind;
+    use crate::datastore::node_local::sqlite::DeadLetterTestInsert;
     use crate::datastore::node_local::{NodeLocalHandle, OutboxInsert, selector};
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
@@ -187,6 +195,44 @@ mod tests {
         (ndb, id)
     }
 
+    async fn node_db_with_unassigned_dead_letter() -> (NodeLocalHandle, i64) {
+        let (ndb, sqlite) = selector::open_node_local_with_sqlite(
+            BackendKind::Sqlite,
+            None,
+            supervisor(),
+            None,
+            "sqlite:node-admin-unassigned-dead-letter-test",
+        )
+        .await
+        .expect("open node-local test db");
+        sqlite
+            .expect("SQLite backend")
+            .insert_dead_letter_test_only(DeadLetterTestInsert {
+                idempotency_key: "node-admin-unassigned-dl-key",
+                operation: "PodStatus",
+                subject_key: "v1/Pod/default/web/uid-1",
+                subject_api_version: "v1",
+                subject_kind: "Pod",
+                subject_namespace: Some("default"),
+                subject_name: "web",
+                subject_uid: Some("uid-1"),
+                pod_uid: "uid-1",
+                payload_proto: &[1, 2, 3],
+                attempts: 720,
+                last_error: "max attempts",
+                moved_at_ms: 2_000,
+            })
+            .await
+            .expect("insert unassigned dead letter");
+        let dead = ndb.list_dead_letter().await.expect("list dead letter");
+        let id = dead.first().expect("dead letter row").id;
+        (ndb, id)
+    }
+
+    fn build_router(node_db: NodeLocalHandle) -> axum::Router {
+        super::build_router(node_db, Arc::new(tokio::sync::Notify::new()))
+    }
+
     #[tokio::test]
     async fn outbox_status_endpoint_returns_metrics() {
         let ndb = node_db().await;
@@ -207,7 +253,7 @@ mod tests {
         .await
         .expect("enqueue");
 
-        let app = super::build_router(ndb);
+        let app = build_router(ndb);
         let response = app
             .oneshot(
                 Request::builder()
@@ -233,7 +279,7 @@ mod tests {
     async fn dead_letter_list_endpoint_returns_rows() {
         let (ndb, _id) = node_db_with_dead_letter().await;
 
-        let app = super::build_router(ndb);
+        let app = build_router(ndb);
         let response = app
             .oneshot(
                 Request::builder()
@@ -258,7 +304,8 @@ mod tests {
     async fn dead_letter_replay_re_enqueues_and_returns_ok() {
         let (ndb, id) = node_db_with_dead_letter().await;
 
-        let app = super::build_router(ndb.clone());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let app = super::build_router(ndb.clone(), notify.clone());
         let response = app
             .oneshot(
                 Request::builder()
@@ -272,6 +319,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
 
+        tokio::time::timeout(std::time::Duration::from_millis(50), notify.notified())
+            .await
+            .expect("successful replay must wake the idle dispatcher");
+
         // Dead letter should be empty
         let dead = ndb.list_dead_letter().await.expect("list dead letter");
         assert!(dead.is_empty());
@@ -279,9 +330,9 @@ mod tests {
 
     #[tokio::test]
     async fn dead_letter_delete_removes_and_returns_no_content() {
-        let (ndb, id) = node_db_with_dead_letter().await;
+        let (ndb, id) = node_db_with_unassigned_dead_letter().await;
 
-        let app = super::build_router(ndb.clone());
+        let app = build_router(ndb.clone());
         let response = app
             .oneshot(
                 Request::builder()
@@ -329,7 +380,7 @@ mod tests {
         .await
         .expect("enqueue");
 
-        let app = super::build_router(ndb);
+        let app = build_router(ndb);
         let response = app
             .oneshot(
                 Request::builder()
@@ -352,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn dead_letter_replay_nonexistent_returns_not_found() {
         let ndb = node_db().await;
-        let app = super::build_router(ndb);
+        let app = build_router(ndb);
         let response = app
             .oneshot(
                 Request::builder()

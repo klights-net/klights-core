@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::AppState;
+use crate::datastore::command::StorageCommand;
 use crate::datastore::raft::node::RaftNode;
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{
@@ -49,6 +50,52 @@ const NODE_NOT_READY_POD_EVICTION_GRACE_ENV: &str =
 // sheds leadership/membership — mitigated by the 24s detection, not eliminated.
 const DEFAULT_NODE_NOT_READY_POD_EVICTION_GRACE_SECONDS: i64 = 0;
 
+#[cfg(test)]
+struct TestNodeLifecycleStatus<'a>(&'a dyn DatastoreBackend);
+
+#[cfg(test)]
+impl klights_leader_api::LeaderNodeLifecycleStatus for TestNodeLifecycleStatus<'_> {
+    fn submit_node_lifecycle_status(
+        &self,
+        request: klights_leader_api::NodeLifecycleStatusRequest,
+    ) -> klights_leader_api::NodeLifecycleStatusFuture<
+        '_,
+        klights_leader_api::NodeLifecycleStatusResult,
+    > {
+        Box::pin(async move {
+            let StorageCommand::UpdateStatus {
+                api_version,
+                kind,
+                namespace,
+                name,
+                status,
+                preconditions,
+                ..
+            } = request.into_command()
+            else {
+                unreachable!("validated lifecycle request must be UpdateStatus")
+            };
+            let resource = self
+                .0
+                .update_status_only_with_preconditions(
+                    &api_version,
+                    &kind,
+                    namespace.as_deref(),
+                    &name,
+                    status,
+                    preconditions,
+                )
+                .await
+                .map_err(|error| {
+                    klights_leader_api::NodeLifecycleStatusError::apply_failed(error.to_string())
+                })?;
+            Ok(klights_leader_api::NodeLifecycleStatusResult::Updated {
+                resource_version: resource.resource_version,
+            })
+        })
+    }
+}
+
 pub trait NodeLifecyclePodRepository: PodReader + PodSubresourceWriter + PodObjectWriter {}
 
 impl<T> NodeLifecyclePodRepository for T where
@@ -56,9 +103,13 @@ impl<T> NodeLifecyclePodRepository for T where
 {
 }
 
-pub async fn mark_all_nodes_unknown_on_startup(state: &AppState) -> Result<()> {
+pub async fn mark_all_nodes_unknown_on_startup(
+    state: &AppState,
+    node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
+) -> Result<()> {
     mark_all_nodes_unknown_at_with_pods(
         state.db.as_ref(),
+        node_status,
         state.pod_repository.as_ref(),
         Some(state.side_effects.as_ref()),
         state.pod_lifecycle_router.as_deref(),
@@ -73,11 +124,14 @@ pub async fn mark_all_nodes_unknown_at(
     now: DateTime<Utc>,
 ) -> Result<()> {
     let pod_repository = crate::controllers::test_utils::pod_repository_for_test(db);
-    mark_all_nodes_unknown_at_with_pods(db, pod_repository.as_ref(), None, None, now).await
+    let node_status = TestNodeLifecycleStatus(db);
+    mark_all_nodes_unknown_at_with_pods(db, &node_status, pod_repository.as_ref(), None, None, now)
+        .await
 }
 
 async fn mark_all_nodes_unknown_at_with_pods(
     db: &dyn DatastoreBackend,
+    node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
     pod_repository: &dyn NodeLifecyclePodRepository,
     side_effects: Option<&crate::side_effects::SideEffectRegistry>,
     pod_lifecycle_router: Option<&PodLifecycleRouter>,
@@ -94,7 +148,7 @@ async fn mark_all_nodes_unknown_at_with_pods(
     for node in nodes.items {
         let mut data = Arc::unwrap_or_clone(node.data.clone());
         if mark_node_ready_unknown(&mut data, now) {
-            update_node_status(db, &node, data).await?;
+            update_node_status(node_status, &node, data).await?;
         }
         let _ = mark_pods_unknown_on_node(
             db,
@@ -116,8 +170,10 @@ pub async fn reconcile_node_lifecycle_once(
 ) -> Result<Option<Duration>> {
     let pod_repository = crate::controllers::test_utils::pod_repository_for_test(db);
     let tracker = node_lease_tracker_from_cluster_leases_for_test(db, now).await?;
+    let node_status = TestNodeLifecycleStatus(db);
     reconcile_node_lifecycle_once_with_tracker(
         db,
+        &node_status,
         pod_repository.as_ref(),
         &tracker,
         now,
@@ -149,8 +205,10 @@ pub async fn reconcile_node_lifecycle_once_with_tracker_for_test(
     now: DateTime<Utc>,
 ) -> Result<Option<Duration>> {
     let pod_repository = crate::controllers::test_utils::pod_repository_for_test(db);
+    let node_status = TestNodeLifecycleStatus(db);
     reconcile_node_lifecycle_once_with_tracker(
         db,
+        &node_status,
         pod_repository.as_ref(),
         node_lease_tracker,
         now,
@@ -162,6 +220,7 @@ pub async fn reconcile_node_lifecycle_once_with_tracker_for_test(
 
 async fn reconcile_node_lifecycle_once_with_tracker(
     db: &dyn DatastoreBackend,
+    node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
     pod_repository: &dyn NodeLifecyclePodRepository,
     node_lease_tracker: &NodeLeaseTracker,
     now: DateTime<Utc>,
@@ -217,7 +276,7 @@ async fn reconcile_node_lifecycle_once_with_tracker(
         };
 
         if changed {
-            update_node_status(db, &node, data).await?;
+            update_node_status(node_status, &node, data).await?;
         }
         if stale {
             merge_deadline(
@@ -329,6 +388,7 @@ async fn node_lease_tracker_from_cluster_leases_for_test(
 
 pub async fn run_node_lifecycle_controller(
     state: Arc<AppState>,
+    node_status: Arc<dyn klights_leader_api::LeaderNodeLifecycleStatus>,
     cancel: CancellationToken,
     _startup_resource_version: i64,
     mut is_leader_rx: watch::Receiver<bool>,
@@ -400,6 +460,7 @@ pub async fn run_node_lifecycle_controller(
 
         let next_deadline = match reconcile_node_lifecycle_once_with_tracker(
             db.as_ref(),
+            node_status.as_ref(),
             state.pod_repository.as_ref(),
             state.node_lease_tracker.as_ref(),
             Utc::now(),
@@ -634,20 +695,27 @@ async fn wait_for_retry(state: &AppState, cancel: &CancellationToken, attempt: u
     }
 }
 
-async fn update_node_status(db: &dyn DatastoreBackend, node: &Resource, data: Value) -> Result<()> {
+async fn update_node_status(
+    node_status: &dyn klights_leader_api::LeaderNodeLifecycleStatus,
+    node: &Resource,
+    data: Value,
+) -> Result<()> {
     let status = data.get("status").cloned().unwrap_or_else(|| json!({}));
-    db.update_status_only_with_preconditions(
-        "v1",
-        "Node",
-        None,
-        &node.name,
-        status,
-        ResourcePreconditions {
-            uid: Some(node.uid.clone()),
-            resource_version: Some(node.resource_version),
-        },
-    )
-    .await?;
+    let request =
+        klights_leader_api::NodeLifecycleStatusRequest::try_new(StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: node.name.clone(),
+            status,
+            expected_rv: Some(node.resource_version),
+            preconditions: ResourcePreconditions::uid_and_resource_version(
+                node.uid.clone(),
+                node.resource_version,
+            ),
+            observed_status_stamp: None,
+        })?;
+    node_status.submit_node_lifecycle_status(request).await?;
     Ok(())
 }
 
@@ -2179,6 +2247,7 @@ mod tests {
 
         super::reconcile_node_lifecycle_once_with_tracker(
             state.db.as_ref(),
+            &super::TestNodeLifecycleStatus(state.db.as_ref()),
             state.pod_repository.as_ref(),
             state.node_lease_tracker.as_ref(),
             Utc.with_ymd_and_hms(2026, 5, 13, 6, 34, 56).unwrap(),
@@ -2196,6 +2265,7 @@ mod tests {
         }
         super::reconcile_node_lifecycle_once_with_tracker(
             state.db.as_ref(),
+            &super::TestNodeLifecycleStatus(state.db.as_ref()),
             state.pod_repository.as_ref(),
             state.node_lease_tracker.as_ref(),
             Utc.with_ymd_and_hms(2026, 5, 13, 6, 35, 26).unwrap(),

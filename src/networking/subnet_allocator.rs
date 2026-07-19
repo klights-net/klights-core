@@ -1,4 +1,10 @@
-use crate::control_plane::client::LeaderApiClient;
+#[cfg(test)]
+use crate::control_plane::client::focused_node_subnet;
+use crate::control_plane::client::{
+    LeaderApiClient, LeaderNodeSubnetAllocation, NodeSubnetAllocationError,
+    NodeSubnetAllocationFuture, NodeSubnetAllocationRequest, NodeSubnetAllocationResult,
+    legacy_node_subnet,
+};
 use crate::datastore::NodeSubnet;
 use crate::task_supervisor::TaskSupervisor;
 use anyhow::{Context, Result};
@@ -9,16 +15,6 @@ const DEFAULT_MAX_ATTEMPTS: usize = 6;
 const DEFAULT_BACKOFF: Duration = Duration::from_secs(5);
 
 #[async_trait::async_trait]
-pub(crate) trait NodeSubnetAllocationClient: Send + Sync {
-    async fn allocate_node_subnet(
-        &self,
-        node_name: &str,
-        cluster_cidr: &str,
-        node_ip: &str,
-    ) -> Result<NodeSubnet>;
-}
-
-#[async_trait::async_trait]
 pub(crate) trait NodeSubnetAllocationStore: Send + Sync {
     async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>>;
 }
@@ -27,17 +23,12 @@ struct LeaderApiNodeSubnetAllocationClient {
     inner: Arc<dyn LeaderApiClient>,
 }
 
-#[async_trait::async_trait]
-impl NodeSubnetAllocationClient for LeaderApiNodeSubnetAllocationClient {
-    async fn allocate_node_subnet(
+impl LeaderNodeSubnetAllocation for LeaderApiNodeSubnetAllocationClient {
+    fn allocate_node_subnet(
         &self,
-        node_name: &str,
-        cluster_cidr: &str,
-        node_ip: &str,
-    ) -> Result<NodeSubnet> {
-        self.inner
-            .allocate_node_subnet(node_name, cluster_cidr, node_ip)
-            .await
+        request: NodeSubnetAllocationRequest,
+    ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
+        self.inner.allocate_node_subnet(request)
     }
 }
 
@@ -57,7 +48,7 @@ impl Default for NodeSubnetAllocationRetryPolicy {
 }
 
 pub(crate) struct NodeSubnetAllocator {
-    client: Arc<dyn NodeSubnetAllocationClient>,
+    client: Arc<dyn LeaderNodeSubnetAllocation>,
     supervisor: Arc<TaskSupervisor>,
     retry: NodeSubnetAllocationRetryPolicy,
 }
@@ -75,7 +66,7 @@ impl NodeSubnetAllocator {
     }
 
     pub(crate) fn with_policy(
-        client: Arc<dyn NodeSubnetAllocationClient>,
+        client: Arc<dyn LeaderNodeSubnetAllocation>,
         supervisor: Arc<TaskSupervisor>,
         retry: NodeSubnetAllocationRetryPolicy,
     ) -> Self {
@@ -96,15 +87,15 @@ impl NodeSubnetAllocator {
         let mut attempt = 1usize;
 
         loop {
-            match self
-                .client
-                .allocate_node_subnet(node_name, cluster_cidr, node_ip)
-                .await
-            {
-                Ok(subnet) => return Ok(subnet),
+            let request = NodeSubnetAllocationRequest::try_new(node_name, cluster_cidr, node_ip)
+                .map_err(anyhow::Error::new)?;
+            match self.client.allocate_node_subnet(request).await {
+                Ok(result) => {
+                    return legacy_node_subnet(result.into_subnet()).map_err(anyhow::Error::new);
+                }
                 Err(err) => {
                     if attempt >= max_attempts || !is_retryable_allocation_error(&err) {
-                        return Err(err);
+                        return Err(anyhow::Error::new(err));
                     }
 
                     tracing::warn!(
@@ -160,17 +151,13 @@ impl NodeSubnetAllocator {
     }
 }
 
-fn is_retryable_allocation_error(err: &anyhow::Error) -> bool {
-    err.chain().any(is_retryable_allocation_message)
-}
-
-fn is_retryable_allocation_message(cause: &(dyn std::error::Error + 'static)) -> bool {
-    let message = cause.to_string().to_ascii_lowercase();
-    message.contains("retryable unary rpc error")
-        || message.contains("deadline exceeded")
-        || message.contains("not raft leader")
-        || message.contains("transport")
-        || message.contains("unavailable")
+fn is_retryable_allocation_error(err: &NodeSubnetAllocationError) -> bool {
+    matches!(
+        err,
+        NodeSubnetAllocationError::NotLeader
+            | NodeSubnetAllocationError::Retryable { .. }
+            | NodeSubnetAllocationError::Timeout
+    )
 }
 
 #[cfg(test)]
@@ -188,7 +175,7 @@ mod tests {
     #[derive(Clone)]
     enum Outcome {
         Ok(NodeSubnet),
-        Err(&'static str),
+        Err(NodeSubnetAllocationError),
     }
 
     struct FakeAllocationClient {
@@ -248,25 +235,29 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl NodeSubnetAllocationClient for FakeAllocationClient {
-        async fn allocate_node_subnet(
+    impl LeaderNodeSubnetAllocation for FakeAllocationClient {
+        fn allocate_node_subnet(
             &self,
-            _node_name: &str,
-            _cluster_cidr: &str,
-            _node_ip: &str,
-        ) -> anyhow::Result<NodeSubnet> {
+            request: NodeSubnetAllocationRequest,
+        ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            match self
+            let outcome = self
                 .outcomes
                 .lock()
                 .expect("outcomes lock")
                 .pop_front()
-                .expect("test must provide enough outcomes")
-            {
-                Outcome::Ok(row) => Ok(row),
-                Outcome::Err(message) => anyhow::bail!("{message}"),
-            }
+                .expect("test must provide enough outcomes");
+            Box::pin(async move {
+                match outcome {
+                    Outcome::Ok(row) => {
+                        let subnet = focused_node_subnet(row).map_err(|error| {
+                            NodeSubnetAllocationError::corrupt_response(error.to_string())
+                        })?;
+                        NodeSubnetAllocationResult::try_from_wire(request.node_name(), Some(subnet))
+                    }
+                    Outcome::Err(error) => Err(error),
+                }
+            })
         }
     }
 
@@ -275,14 +266,14 @@ mod tests {
             node_name: NodeName::parse("node-a").unwrap(),
             subnet: PodSubnet::parse("10.50.1.0/24").unwrap(),
             subnet_base_int: u32::from(Ipv4Addr::new(10, 50, 1, 0)),
-            gateway_ip: Ipv4Addr::new(10, 50, 1, 1),
+            gateway_ip: Ipv4Addr::new(10, 50, 1, 0),
             node_ip: Ipv4Addr::new(192, 0, 2, 10),
             mode: crate::controllers::annotations::NodePeerMode::Root,
             hostport_range: None,
         }
     }
 
-    fn test_allocator(client: Arc<dyn NodeSubnetAllocationClient>) -> NodeSubnetAllocator {
+    fn test_allocator(client: Arc<dyn LeaderNodeSubnetAllocation>) -> NodeSubnetAllocator {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         NodeSubnetAllocator::with_policy(
             client,
@@ -297,10 +288,7 @@ mod tests {
     #[tokio::test]
     async fn retries_retryable_deadline_and_returns_success() {
         let client = FakeAllocationClient::new(vec![
-            Outcome::Err(
-                "gRPC AllocateNodeSubnet failed: retryable unary RPC error: \
-                 grpc_allocate_node_subnet deadline exceeded after 15s",
-            ),
+            Outcome::Err(NodeSubnetAllocationError::Timeout),
             Outcome::Ok(subnet_row()),
         ]);
         let allocator = test_allocator(client.clone());
@@ -316,15 +304,17 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_retry_non_retryable_errors() {
-        let client = FakeAllocationClient::new(vec![Outcome::Err("invalid cluster cidr")]);
+        let client = FakeAllocationClient::new(vec![Outcome::Err(
+            NodeSubnetAllocationError::conflict("node already owns a different subnet"),
+        )]);
         let allocator = test_allocator(client.clone());
 
         let err = allocator
-            .allocate("node-a", "not-a-cidr", "192.0.2.10")
+            .allocate("node-a", "10.50.0.0/16", "192.0.2.10")
             .await
             .expect_err("invalid input must fail immediately");
 
-        assert!(err.to_string().contains("invalid cluster cidr"));
+        assert!(err.to_string().contains("different subnet"));
         assert_eq!(client.calls(), 1);
     }
 
@@ -365,12 +355,15 @@ mod tests {
     }
 
     #[test]
-    fn retryable_detection_walks_wrapped_error_chain() {
-        let err = anyhow::anyhow!(
-            "retryable unary RPC error: grpc_allocate_node_subnet deadline exceeded after 15s"
-        )
-        .context("gRPC AllocateNodeSubnet failed");
-
-        assert!(is_retryable_allocation_error(&err));
+    fn retryable_detection_uses_typed_error_variants() {
+        assert!(is_retryable_allocation_error(
+            &NodeSubnetAllocationError::NotLeader
+        ));
+        assert!(is_retryable_allocation_error(
+            &NodeSubnetAllocationError::retryable("transport unavailable")
+        ));
+        assert!(!is_retryable_allocation_error(
+            &NodeSubnetAllocationError::conflict("terminal conflict")
+        ));
     }
 }

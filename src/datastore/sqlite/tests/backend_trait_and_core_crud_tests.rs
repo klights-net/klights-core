@@ -5590,7 +5590,9 @@ async fn build_reserved_rv_commit(
         )
         .await
         .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, applied_rv } = outcome
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit, applied_rv, ..
+    } = outcome
     else {
         panic!("expected a fresh materialized commit");
     };
@@ -5684,7 +5686,9 @@ async fn raft_terminal_conflict_rolls_back_materialized_reserved_rv() {
         )
         .await
         .unwrap();
-    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose { commit, applied_rv } = outcome
+    let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
+        commit, applied_rv, ..
+    } = outcome
     else {
         panic!("expected a materialized raft commit");
     };

@@ -20,6 +20,7 @@ mod ca_files;
 mod conversions;
 pub(crate) use conversions::{
     entry_from_proto, entry_to_proto, log_apply_commit_from_proto, log_apply_commit_to_proto,
+    resource_command_request_from_proto, resource_command_request_to_proto,
     watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
 pub const JOIN_TOKEN_METADATA_KEY: &str = "x-klights-join-token";
@@ -50,43 +51,42 @@ pub(crate) fn watch_replay_expired_status(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn is_watch_replay_expired_status(status: &tonic::Status) -> bool {
-    if status.code() != tonic::Code::OutOfRange {
-        return false;
-    }
-    if is_typed_watch_replay_expired_status(status) {
-        return true;
-    }
-    legacy_watch_replay_expired_status(status)
+    watch_replay_expired_resource_version(status).is_some()
 }
 
-fn is_typed_watch_replay_expired_status(status: &tonic::Status) -> bool {
-    let Some(reason) = status
+pub(crate) fn watch_replay_expired_resource_version(status: &tonic::Status) -> Option<i64> {
+    if status.code() != tonic::Code::OutOfRange {
+        return None;
+    }
+    if let Some(resource_version) = typed_watch_replay_expired_resource_version(status) {
+        return Some(resource_version);
+    }
+    legacy_watch_replay_expired_resource_version(status)
+}
+
+fn typed_watch_replay_expired_resource_version(status: &tonic::Status) -> Option<i64> {
+    let reason = status
         .metadata()
         .get(WATCH_REPLAY_EXPIRED_REASON_METADATA_KEY)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
+        .and_then(|value| value.to_str().ok())?;
     if reason != WATCH_REPLAY_EXPIRED_REASON {
-        return false;
+        return None;
     }
     let Ok(details) = generated::WatchReplayExpiredDetails::decode(status.details()) else {
-        return false;
+        return None;
     };
-    details.reason == WATCH_REPLAY_EXPIRED_REASON
+    (details.reason == WATCH_REPLAY_EXPIRED_REASON).then_some(details.accepted_resource_version)
 }
 
-fn legacy_watch_replay_expired_status(status: &tonic::Status) -> bool {
+fn legacy_watch_replay_expired_resource_version(status: &tonic::Status) -> Option<i64> {
     if !status.metadata().is_empty() || !status.details().is_empty() {
-        return false;
+        return None;
     }
-    let Some(resume_rv) = status
+    let resume_rv = status
         .message()
         .strip_prefix(LEGACY_WATCH_REPLAY_EXPIRED_PREFIX)
-        .and_then(|message| message.strip_suffix(LEGACY_WATCH_REPLAY_EXPIRED_SUFFIX))
-    else {
-        return false;
-    };
-    resume_rv.parse::<i64>().is_ok()
+        .and_then(|message| message.strip_suffix(LEGACY_WATCH_REPLAY_EXPIRED_SUFFIX))?;
+    resume_rv.parse::<i64>().ok()
 }

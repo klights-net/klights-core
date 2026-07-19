@@ -55,6 +55,9 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
         CREATE INDEX IF NOT EXISTS idx_outbox_stream_inflight
             ON outbox(stream_id, id)
             WHERE leased_until_ms > 0;
+        CREATE INDEX IF NOT EXISTS idx_outbox_stream_sequence
+            ON outbox(stream_id, stream_seq, id)
+            WHERE stream_id > 0;
 
         CREATE TABLE IF NOT EXISTS outbox_stream_sequences (
             stream_id INTEGER PRIMARY KEY,
@@ -171,6 +174,7 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
         CREATE TABLE IF NOT EXISTS outbox_dead_letter (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
             original_id         INTEGER NOT NULL,
+            client_id           TEXT NOT NULL DEFAULT '',
             idempotency_key     TEXT NOT NULL,
             enqueued_ms         INTEGER NOT NULL,
             subject_key         TEXT NOT NULL,
@@ -181,11 +185,16 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
             subject_uid         TEXT,
             pod_uid             TEXT NOT NULL DEFAULT '',
             operation           TEXT NOT NULL,
+            stream_id           INTEGER NOT NULL DEFAULT 0,
+            stream_seq          INTEGER NOT NULL DEFAULT 0,
             payload_proto       BLOB NOT NULL,
             attempts            INTEGER NOT NULL,
             last_error          TEXT NOT NULL,
             moved_at_ms         INTEGER NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS idx_outbox_dead_letter_stream_sequence
+            ON outbox_dead_letter(stream_id, stream_seq)
+            WHERE stream_id > 0 AND stream_seq > 0;
 
         CREATE TABLE IF NOT EXISTS _node_meta (
             key   TEXT PRIMARY KEY,
@@ -214,7 +223,100 @@ pub fn init_schema_in_conn(conn: &mut rusqlite::Connection) -> rusqlite::Result<
 
     migrate_outbox_stream_fields(conn)?;
     migrate_outbox_operation_classification(conn)?;
+    migrate_outbox_dead_letter_stream_fields(conn)?;
+    repair_legacy_outbox_stream_identity(conn)?;
     migrate_pod_endpoint_encrypted_direct_mode(conn)
+}
+
+fn repair_legacy_outbox_stream_identity(conn: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    #[derive(Clone, Copy)]
+    enum Location {
+        Live,
+        DeadLetter,
+    }
+
+    struct LegacyRow {
+        location: Location,
+        row_id: i64,
+        subject_key: String,
+        client_id: String,
+        stream_id: i64,
+        stream_seq: i64,
+    }
+
+    let tx = conn.transaction()?;
+    let rows = {
+        let mut stmt = tx.prepare(
+            "SELECT location, row_id, subject_key, client_id, stream_id, stream_seq FROM ( \
+                 SELECT 0 AS location, id AS row_id, id AS original_order, subject_key, \
+                        client_id, stream_id, stream_seq \
+                 FROM outbox \
+                 WHERE operation != 'LeaseRenew' \
+                   AND (client_id = '' OR stream_id <= 0 OR stream_seq <= 0) \
+                 UNION ALL \
+                 SELECT 1 AS location, id AS row_id, original_id AS original_order, subject_key, \
+                        client_id, stream_id, stream_seq \
+                 FROM outbox_dead_letter \
+                 WHERE operation != 'LeaseRenew' \
+                   AND (client_id = '' OR stream_id <= 0 OR stream_seq <= 0) \
+             ) ORDER BY original_order ASC, location ASC, row_id ASC",
+        )?;
+        stmt.query_map([], |row| {
+            Ok(LegacyRow {
+                location: if row.get::<_, i64>(0)? == 0 {
+                    Location::Live
+                } else {
+                    Location::DeadLetter
+                },
+                row_id: row.get(1)?,
+                subject_key: row.get(2)?,
+                client_id: row.get(3)?,
+                stream_id: row.get(4)?,
+                stream_seq: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if rows.is_empty() {
+        tx.commit()?;
+        return Ok(());
+    }
+
+    let stable_client_id = super::ensure_outbox_client_id_in_tx(&tx)?;
+    for row in rows {
+        let client_id = if row.client_id.is_empty() {
+            stable_client_id.as_str()
+        } else {
+            row.client_id.as_str()
+        };
+        let stream_id = if row.stream_id > 0 {
+            row.stream_id
+        } else {
+            super::outbox_stream_id(&row.subject_key)
+        };
+        let stream_seq = if row.stream_seq > 0 {
+            tx.execute(
+                "INSERT INTO outbox_stream_sequences (stream_id, last_seq) VALUES (?1, ?2) \
+                 ON CONFLICT(stream_id) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)",
+                rusqlite::params![stream_id, row.stream_seq],
+            )?;
+            row.stream_seq
+        } else {
+            super::allocate_next_outbox_stream_seq(&tx, stream_id)?
+        };
+        let table = match row.location {
+            Location::Live => "outbox",
+            Location::DeadLetter => "outbox_dead_letter",
+        };
+        tx.execute(
+            &format!(
+                "UPDATE {table} SET client_id = ?2, stream_id = ?3, stream_seq = ?4 WHERE id = ?1"
+            ),
+            rusqlite::params![row.row_id, client_id, stream_id, stream_seq],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn outbox_has_column(conn: &mut rusqlite::Connection, column_name: &str) -> rusqlite::Result<bool> {
@@ -260,6 +362,47 @@ fn migrate_outbox_stream_fields(conn: &mut rusqlite::Connection) -> rusqlite::Re
         ) WITHOUT ROWID",
         [],
     )?;
+    Ok(())
+}
+
+fn dead_letter_has_column(
+    conn: &mut rusqlite::Connection,
+    column_name: &str,
+) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(outbox_dead_letter)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_outbox_dead_letter_stream_fields(
+    conn: &mut rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    let mut migrated = false;
+    for (column, definition) in [
+        ("client_id", "TEXT NOT NULL DEFAULT ''"),
+        ("stream_id", "INTEGER NOT NULL DEFAULT 0"),
+        ("stream_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !dead_letter_has_column(conn, column)? {
+            conn.execute(
+                &format!("ALTER TABLE outbox_dead_letter ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+            migrated = true;
+        }
+    }
+    if migrated {
+        let fingerprint = compute_fingerprint(conn)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO _node_meta (key, value) VALUES ('schema_fingerprint', ?1)",
+            [&fingerprint],
+        )?;
+    }
     Ok(())
 }
 

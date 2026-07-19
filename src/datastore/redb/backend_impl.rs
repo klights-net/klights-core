@@ -2289,6 +2289,28 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         .await
     }
 
+    async fn apply_outbox_transactionally_with_watermark_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+        watermark: Option<crate::log_apply::OutboxStreamWatermark>,
+    ) -> std::result::Result<
+        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
+        crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark_effect(
+            self,
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+            watermark,
+        )
+        .await
+    }
+
     async fn build_log_apply_commit_for_command(
         &self,
         command: crate::datastore::command::StorageCommand,

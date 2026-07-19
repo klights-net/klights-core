@@ -60,8 +60,22 @@ pub async fn resolve_node_ip_from_leader_api(
     cluster_api: &dyn LeaderApiClient,
     node_name: &str,
 ) -> Option<String> {
-    match cluster_api.get_node(node_name).await {
-        Ok(node) => internal_ip_from_node(&node.data),
+    let request = match crate::control_plane::client::node_get_request(
+        node_name,
+        crate::control_plane::client::ResourceQueryConsistency::Cached,
+    ) {
+        Ok(request) => request,
+        Err(err) => {
+            tracing::debug!(node_name, error = %err, "invalid node resource query");
+            return None;
+        }
+    };
+    match cluster_api.get_resource(request).await {
+        Ok(Some(node)) => internal_ip_from_node(&node.data),
+        Ok(None) => {
+            tracing::debug!(node_name, "node resource not found for InternalIP lookup");
+            None
+        }
         Err(err) => {
             tracing::debug!(
                 node_name,

@@ -96,20 +96,24 @@ impl PodEndpointResolver for SqlitePodEndpointResolver {
         };
         Ok(Some(match row.mode {
             PodEndpointMode::EncryptedDirect => {
-                let encryption = self
+                let query =
+                    crate::control_plane::client::NodeDataplaneQuery::try_new(&row.node_name)?;
+                let Some(metadata) = self
                     .cluster_api
-                    .get_node_dataplane(&row.node_name)
+                    .get_node_dataplane(query)
                     .await?
-                    .map(|metadata| metadata.encryption)
-                    .unwrap_or(crate::networking::wireguard::DataplaneEncryption::Enabled);
-                match encryption {
-                    crate::networking::wireguard::DataplaneEncryption::Enabled => {
+                    .into_option()
+                else {
+                    return Ok(None);
+                };
+                match metadata.encryption() {
+                    crate::control_plane::client::DataplaneEncryption::WireGuard => {
                         Endpoint::EncryptedDirect {
                             pod_ip: row.pod_ip,
                             node_name: row.node_name,
                         }
                     }
-                    crate::networking::wireguard::DataplaneEncryption::Disabled => {
+                    crate::control_plane::client::DataplaneEncryption::Direct => {
                         Endpoint::UnencryptedDirect {
                             pod_ip: row.pod_ip,
                             node_name: row.node_name,
@@ -273,7 +277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolver_returns_encrypted_direct_for_encrypted_direct_row_by_default() {
+    async fn test_resolver_returns_none_when_dataplane_metadata_is_missing() {
         let (node_local, _cluster_db, resolver) = build_resolver().await;
         let row = sample_row(
             "uid-d",
@@ -281,14 +285,42 @@ mod tests {
             PodEndpointMode::EncryptedDirect,
         );
         node_local.upsert_endpoint(row).await.unwrap();
+        let resolved = resolver.resolve(Ipv4Addr::new(10, 42, 1, 5)).await.unwrap();
+        assert!(resolved.is_none(), "missing metadata must install no route");
+    }
+
+    #[tokio::test]
+    async fn test_resolver_returns_encrypted_direct_for_explicit_wireguard_metadata() {
+        let (node_local, cluster_db, resolver) = build_resolver().await;
+        let row = sample_row(
+            "uid-wg",
+            Ipv4Addr::new(10, 42, 1, 7),
+            PodEndpointMode::EncryptedDirect,
+        );
+        node_local.upsert_endpoint(row).await.unwrap();
+        cluster_db
+            .update_node_dataplane(
+                crate::networking::wireguard::DataplanePeerMetadata::try_new(
+                    "node-a".to_string(),
+                    crate::networking::wireguard::DataplaneMode::Root,
+                    crate::networking::wireguard::DataplaneEncryption::Enabled,
+                    Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string()),
+                    Some("192.0.2.10".to_string()),
+                    Some(7_679),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
         let resolved = resolver
-            .resolve(Ipv4Addr::new(10, 42, 1, 5))
+            .resolve(Ipv4Addr::new(10, 42, 1, 7))
             .await
             .unwrap()
-            .expect("encrypted-direct row must resolve");
+            .expect("explicit WireGuard metadata must resolve");
         match resolved {
             Endpoint::EncryptedDirect { pod_ip, node_name } => {
-                assert_eq!(pod_ip, Ipv4Addr::new(10, 42, 1, 5));
+                assert_eq!(pod_ip, Ipv4Addr::new(10, 42, 1, 7));
                 assert_eq!(node_name, "node-a");
             }
             other => panic!("expected EncryptedDirect, got {other:?}"),

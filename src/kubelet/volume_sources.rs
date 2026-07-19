@@ -3,13 +3,14 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::control_plane::client::LeaderApiClient;
-use crate::datastore::Resource;
+use klights_cluster_core::Resource;
+use klights_leader_api::{
+    LeaderProjectedServiceAccountToken, LeaderResourceQuery, ResourceGetRequest,
+    ResourceQueryConsistency,
+};
 use klights_types::ResourceKey;
 
-pub use crate::control_plane::client::{
-    ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest,
-};
+pub use klights_leader_api::{ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest};
 
 #[async_trait]
 pub trait VolumeSourceReader: Send + Sync {
@@ -34,12 +35,19 @@ pub trait VolumeSourceReader: Send + Sync {
 }
 
 pub struct LocalCacheVolumeSourceReader {
-    cluster_api: Arc<dyn LeaderApiClient>,
+    resource_query: Arc<dyn LeaderResourceQuery>,
+    projected_tokens: Arc<dyn LeaderProjectedServiceAccountToken>,
 }
 
 impl LocalCacheVolumeSourceReader {
-    pub fn new(cluster_api: Arc<dyn LeaderApiClient>) -> Self {
-        Self { cluster_api }
+    pub fn new(
+        resource_query: Arc<dyn LeaderResourceQuery>,
+        projected_tokens: Arc<dyn LeaderProjectedServiceAccountToken>,
+    ) -> Self {
+        Self {
+            resource_query,
+            projected_tokens,
+        }
     }
 
     async fn get(
@@ -49,14 +57,18 @@ impl LocalCacheVolumeSourceReader {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
-        self.cluster_api
-            .get_resource_fresh(ResourceKey {
-                api_version: api_version.to_string(),
-                kind: kind.to_string(),
-                namespace: namespace.map(str::to_string),
-                name: name.to_string(),
-            })
+        self.resource_query
+            .get_resource(ResourceGetRequest::try_new(
+                ResourceKey {
+                    api_version: api_version.to_string(),
+                    kind: kind.to_string(),
+                    namespace: namespace.map(str::to_string),
+                    name: name.to_string(),
+                },
+                ResourceQueryConsistency::LeaderFresh,
+            )?)
             .await
+            .map_err(anyhow::Error::new)
     }
 }
 
@@ -144,44 +156,42 @@ impl VolumeSourceReader for LocalCacheVolumeSourceReader {
         &self,
         request: ProjectedServiceAccountTokenRequest,
     ) -> Result<ProjectedServiceAccountToken> {
-        self.cluster_api
-            .projected_service_account_token(request)
+        self.projected_tokens
+            .issue_projected_service_account_token(request)
             .await
+            .map_err(anyhow::Error::new)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
-    use anyhow::{Result, anyhow};
-    use async_trait::async_trait;
-    use bytes::Bytes;
     use serde_json::json;
 
-    use crate::control_plane::client::{
-        CacheScope, LeaderApiClient, ListRequest, ListResponse, Node, Pod, ResourceEvent, Secret,
-        WatchRequest, WatchStream,
+    use klights_cluster_core::Resource;
+    use klights_leader_api::{
+        LeaderProjectedServiceAccountToken, LeaderResourceQuery,
+        ProjectedServiceAccountTokenFuture, ResourceGetRequest, ResourceListRequest,
+        ResourceListResult, ResourceQueryConsistency, ResourceQueryError, ResourceQueryFuture,
     };
-    use crate::datastore::{NodeSubnet, Resource, ResourceList};
-    use crate::kubelet::outbox::payload::OutboxOperation;
-    use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
-    use crate::networking::wireguard::DataplanePeerMetadata;
-    use klights_types::ResourceKey;
 
-    use super::{LocalCacheVolumeSourceReader, VolumeSourceReader};
+    use super::{
+        LocalCacheVolumeSourceReader, ProjectedServiceAccountToken,
+        ProjectedServiceAccountTokenRequest, VolumeSourceReader,
+    };
 
-    struct ExactGetLeaderApiClient {
+    struct ExactGetLeaderResourceQuery {
         resource: Resource,
         get_calls: AtomicUsize,
         fresh_get_calls: AtomicUsize,
         list_calls: AtomicUsize,
     }
 
-    impl ExactGetLeaderApiClient {
+    impl ExactGetLeaderResourceQuery {
         fn new(resource: Resource) -> Self {
             Self {
                 resource,
@@ -192,137 +202,61 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl LeaderApiClient for ExactGetLeaderApiClient {
-        async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-            self.get_calls.fetch_add(1, Ordering::SeqCst);
-            Err(anyhow!("unexpected cached get_resource for {key:?}"))
-        }
-
-        async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
-            self.fresh_get_calls.fetch_add(1, Ordering::SeqCst);
-            Ok((key.api_version == self.resource.api_version
-                && key.kind == self.resource.kind
-                && key.namespace.as_deref() == self.resource.namespace.as_deref()
-                && key.name == self.resource.name)
-                .then(|| self.resource.clone()))
-        }
-
-        async fn list_resources(&self, _req: ListRequest) -> Result<ListResponse> {
-            self.list_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(ResourceList {
-                items: Vec::new(),
-                resource_version: 0,
-                watch_replay_position: None,
-                continue_token: None,
-                remaining_item_count: None,
+    impl LeaderResourceQuery for ExactGetLeaderResourceQuery {
+        fn get_resource(
+            &self,
+            request: ResourceGetRequest,
+        ) -> ResourceQueryFuture<'_, Option<Resource>> {
+            Box::pin(async move {
+                let consistency = request.consistency();
+                let key = request.into_key();
+                if consistency == ResourceQueryConsistency::Cached {
+                    self.get_calls.fetch_add(1, Ordering::SeqCst);
+                    return Err(ResourceQueryError::query_failed(format!(
+                        "unexpected cached get_resource for {key:?}"
+                    )));
+                }
+                self.fresh_get_calls.fetch_add(1, Ordering::SeqCst);
+                Ok((key.api_version == self.resource.api_version
+                    && key.kind == self.resource.kind
+                    && key.namespace.as_deref() == self.resource.namespace.as_deref()
+                    && key.name == self.resource.name)
+                    .then(|| self.resource.clone()))
             })
         }
 
-        async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-            Err(anyhow!("unexpected watch_resources for {req:?}"))
-        }
-
-        async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()> {
-            Err(anyhow!("unexpected wait_cache_ready for {scope:?}"))
-        }
-
-        async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Pod>> {
-            Err(anyhow!("unexpected get_pod for {ns}/{name}"))
-        }
-
-        async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Pod>> {
-            Err(anyhow!("unexpected get_pod_for_uid for {ns}/{name}/{uid}"))
-        }
-
-        async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Pod>> {
-            Err(anyhow!("unexpected watch_pods_on_node for {node_name}"))
-        }
-
-        async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Pod>> {
-            Err(anyhow!("unexpected list_pods_on_node for {node_name}"))
-        }
-
-        async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
-            Err(anyhow!("unexpected get_configmap for {ns}/{name}"))
-        }
-
-        async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
-            Err(anyhow!("unexpected get_secret for {ns}/{name}"))
-        }
-
-        async fn get_node(&self, name: &str) -> Result<Node> {
-            Err(anyhow!("unexpected get_node for {name}"))
-        }
-
-        async fn watch_node(&self, name: &str) -> Result<WatchStream<Node>> {
-            Err(anyhow!("unexpected watch_node for {name}"))
-        }
-
-        async fn allocate_node_subnet(
+        fn list_resources(
             &self,
-            node_name: &str,
-            _cluster_cidr: &str,
-            _node_ip: &str,
-        ) -> Result<NodeSubnet> {
-            Err(anyhow!("unexpected allocate_node_subnet for {node_name}"))
-        }
-
-        async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-            Err(anyhow!("unexpected get_node_subnet for {node_name}"))
-        }
-
-        async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-            Err(anyhow!("unexpected list_peer_subnets for {my_node_name}"))
-        }
-
-        async fn get_node_dataplane(
-            &self,
-            node_name: &str,
-        ) -> Result<Option<DataplanePeerMetadata>> {
-            Err(anyhow!("unexpected get_node_dataplane for {node_name}"))
-        }
-
-        async fn list_pod_cleanup_intents_for_node(
-            &self,
-            node_name: &str,
-        ) -> Result<Vec<crate::datastore::PodCleanupIntent>> {
-            Err(anyhow!(
-                "unexpected list_pod_cleanup_intents_for_node for {node_name}"
-            ))
-        }
-
-        async fn delete_pod_cleanup_intent(
-            &self,
-            node_name: &str,
-            namespace: &str,
-            pod_name: &str,
-            pod_uid: &str,
-            reason: &str,
-        ) -> Result<()> {
-            Err(anyhow!(
-                "unexpected delete_pod_cleanup_intent for {node_name}/{namespace}/{pod_name}/{pod_uid}/{reason}"
-            ))
-        }
-
-        async fn apply_outbox(
-            &self,
-            idempotency_key: &str,
-            _operation: OutboxOperation,
-            _payload: Bytes,
-            _client_id: &str,
-            _stream_id: i64,
-            _stream_seq: i64,
-        ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-            Err(OutboxApplyError::Retryable(format!(
-                "unexpected apply_outbox for {idempotency_key}"
-            )))
+            _request: ResourceListRequest,
+        ) -> ResourceQueryFuture<'_, ResourceListResult> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { ResourceListResult::try_new(Vec::new(), 0, None, None, None) })
         }
     }
 
-    #[tokio::test]
-    async fn volume_reader_fetches_exact_namespaced_service_account_from_leader() {
-        let service_account = Resource {
+    #[derive(Default)]
+    struct RecordingProjectedTokenIssuer {
+        requests: Mutex<Vec<ProjectedServiceAccountTokenRequest>>,
+    }
+
+    impl RecordingProjectedTokenIssuer {
+        fn requests(&self) -> Vec<ProjectedServiceAccountTokenRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl LeaderProjectedServiceAccountToken for RecordingProjectedTokenIssuer {
+        fn issue_projected_service_account_token(
+            &self,
+            request: ProjectedServiceAccountTokenRequest,
+        ) -> ProjectedServiceAccountTokenFuture<'_> {
+            self.requests.lock().unwrap().push(request);
+            Box::pin(async { ProjectedServiceAccountToken::try_new("focused-volume-token") })
+        }
+    }
+
+    fn service_account_resource() -> Resource {
+        Resource {
             id: 1,
             api_version: "v1".to_string(),
             kind: "ServiceAccount".to_string(),
@@ -341,9 +275,14 @@ mod tests {
                 }
             })
             .into(),
-        };
-        let client = Arc::new(ExactGetLeaderApiClient::new(service_account));
-        let reader = LocalCacheVolumeSourceReader::new(client.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn volume_reader_fetches_exact_namespaced_service_account_from_leader() {
+        let query = Arc::new(ExactGetLeaderResourceQuery::new(service_account_resource()));
+        let issuer = Arc::new(RecordingProjectedTokenIssuer::default());
+        let reader = LocalCacheVolumeSourceReader::new(query.clone(), issuer);
 
         let found = reader
             .service_account("aggregator-test", "sample-apiserver")
@@ -354,16 +293,45 @@ mod tests {
             found.as_ref().map(|resource| resource.uid.as_str()),
             Some("sa-uid-sample")
         );
-        assert_eq!(client.fresh_get_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(query.fresh_get_calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            client.get_calls.load(Ordering::SeqCst),
+            query.get_calls.load(Ordering::SeqCst),
             0,
             "volume lookups must wait for the exact clusterdb client API response"
         );
         assert_eq!(
-            client.list_calls.load(Ordering::SeqCst),
+            query.list_calls.load(Ordering::SeqCst),
             0,
             "volume lookups must not rely on a stale primed list cache"
         );
+    }
+
+    #[tokio::test]
+    async fn volume_reader_delegates_projected_token_to_focused_issuer() {
+        let query = Arc::new(ExactGetLeaderResourceQuery::new(service_account_resource()));
+        let issuer = Arc::new(RecordingProjectedTokenIssuer::default());
+        let reader = LocalCacheVolumeSourceReader::new(query.clone(), issuer.clone());
+        let request = ProjectedServiceAccountTokenRequest::try_new(
+            "default",
+            "default",
+            vec!["api".to_string()],
+            3_600,
+            "web",
+            "web-uid",
+            "worker-1",
+            None,
+        )
+        .unwrap();
+
+        let token = reader
+            .projected_service_account_token(request.clone())
+            .await
+            .expect("focused issuer should return a projected token");
+
+        assert_eq!(token.token(), "focused-volume-token");
+        assert_eq!(issuer.requests(), vec![request]);
+        assert_eq!(query.fresh_get_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(query.get_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(query.list_calls.load(Ordering::SeqCst), 0);
     }
 }

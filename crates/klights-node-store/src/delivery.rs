@@ -147,7 +147,8 @@ impl TryFrom<i64> for OutboxPriority {
     }
 }
 
-/// Whether an older delivery can be removed after a newer terminal Pod delete.
+/// Whether a delivery is an obsolete Pod-status candidate after an ordered
+/// actor-owned terminal Pod delete has been decided by the leader.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum OutboxSupersedability {
     Never,
@@ -1320,8 +1321,9 @@ pub type DeliveryFuture<'a, T> =
 ///
 /// Enqueue is idempotent by `idempotency_key`. Persistence stores the supplied
 /// classification as columns and must not derive it from `operation` or decode
-/// `payload`. Per-subject stream identity is assigned by persistence; stream
-/// sequence is assigned exactly once when an item first becomes claimable.
+/// `payload`. Persistence assigns a per-subject stream identity and sequence
+/// atomically before a new enqueue returns. Legacy unassigned rows receive one
+/// sequence exactly once when they first become claimable.
 pub trait OutboxProducerStore: Send + Sync {
     fn enqueue_outbox(&self, entry: OutboxEnqueue) -> DeliveryFuture<'_, ()>;
 }
@@ -1330,12 +1332,13 @@ pub trait OutboxProducerStore: Send + Sync {
 ///
 /// Claims are atomic across independent claimers. A due row is eligible when
 /// its lease is absent or expires at or before `now_ms`. At most one row for a
-/// subject and one row for an assigned stream may be in flight: an older live
-/// row blocks a younger same-subject or same-stream row. A due actor-owned
-/// terminal Pod delete may bypass older, available, supersedable Pod-status
-/// rows for that subject; those rows remain until explicit UID-safe terminal
-/// completion. Across eligible rows, priority is Lease, NodeHealth, Workload,
-/// then Diagnostic, followed by `enqueued_ms` and row ID. While an eligible
+/// subject and one row for an assigned stream may be in flight. Assigned stream
+/// sequence is authoritative: every lower live or dead-letter sequence blocks
+/// a younger sequence, including an actor-owned terminal Pod delete. Exact
+/// replay restores the original sequence and remains eligible even if its
+/// SQLite row ID is newer. Legacy or unsequenced rows retain same-subject row-ID
+/// ordering. Across eligible rows, priority is Lease, NodeHealth, Workload, then
+/// Diagnostic, followed by `enqueued_ms` and row ID. While an eligible
 /// supersedable Pod-status row exists, unaged Diagnostic work remains last;
 /// otherwise it joins Workload immediately. Diagnostic work always ages into
 /// Workload after [`OUTBOX_DIAGNOSTIC_AGING_MS`].
@@ -1373,6 +1376,10 @@ pub trait OutboxDispatcherStore: Send + Sync {
 /// Moving preserves opaque bytes, classification, and any assigned sequencing
 /// facts. Replay consumes that persisted metadata, resets retry/lease state,
 /// and does not decode the payload or classify it from the operation string.
+/// An assigned dead-letter entry is a durable strict-stream blocker and cannot
+/// be deleted; it may leave dead-letter only through exact replay. Deletion is
+/// retained for legacy or unsequenced entries and returns `false` for an
+/// assigned stream entry.
 pub trait DeadLetterStore: Send + Sync {
     fn move_outbox_to_dead_letter_if_max_attempts(
         &self,

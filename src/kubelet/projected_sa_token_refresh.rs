@@ -185,21 +185,6 @@ fn pod_is_terminal_or_deleting(pod: &Value) -> bool {
         )
 }
 
-async fn lookup_node_uid(sources: &dyn VolumeSourceReader, node_name: &str) -> Option<String> {
-    sources
-        .node(node_name)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|res| {
-            res.data
-                .pointer("/metadata/uid")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
-}
-
 async fn mint_projected_service_account_token(
     sources: &dyn VolumeSourceReader,
     pod: &Value,
@@ -208,34 +193,33 @@ async fn mint_projected_service_account_token(
     let namespace = pod
         .pointer("/metadata/namespace")
         .and_then(|v| v.as_str())
-        .unwrap_or("default");
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("projected token Pod is missing metadata.namespace"))?;
     let pod_name = pod
         .pointer("/metadata/name")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let pod_uid = pod_uid(pod);
-    let node_name = pod_node_name(pod);
-    let node_uid = if let Some(node_name) = node_name {
-        lookup_node_uid(sources, node_name).await
-    } else {
-        None
-    };
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("projected token Pod is missing metadata.name"))?;
+    let pod_uid = pod_uid(pod)
+        .ok_or_else(|| anyhow::anyhow!("projected token Pod is missing metadata.uid"))?;
+    let node_name = pod_node_name(pod)
+        .ok_or_else(|| anyhow::anyhow!("projected token request is missing bound_node_name"))?;
     let service_account = pod_service_account_name(pod);
+    let request = crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest::try_new(
+        namespace,
+        service_account,
+        vec![token_ref.audience.clone()],
+        token_ref.expiration_seconds,
+        pod_name,
+        pod_uid,
+        node_name,
+        None,
+    )
+    .map_err(anyhow::Error::new)?;
     sources
-        .projected_service_account_token(
-            crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest {
-                namespace: namespace.to_string(),
-                service_account_name: service_account.to_string(),
-                audiences: vec![token_ref.audience.clone()],
-                expiration_seconds: token_ref.expiration_seconds,
-                bound_pod_name: Some(pod_name.to_string()),
-                bound_pod_uid: pod_uid.map(str::to_string),
-                bound_node_name: node_name.map(str::to_string),
-                bound_node_uid: node_uid,
-            },
-        )
+        .projected_service_account_token(request)
         .await
-        .map(|token| token.token)
+        .map(|token| token.into_token())
 }
 
 async fn write_projected_service_account_token_file(
@@ -532,11 +516,10 @@ mod tests {
             request: crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest,
         ) -> Result<crate::kubelet::volume_sources::ProjectedServiceAccountToken> {
             self.token_requests.lock().unwrap().push(request);
-            Ok(
-                crate::kubelet::volume_sources::ProjectedServiceAccountToken {
-                    token: "refreshed-from-leader".to_string(),
-                },
+            crate::kubelet::volume_sources::ProjectedServiceAccountToken::try_new(
+                "refreshed-from-leader",
             )
+            .map_err(anyhow::Error::new)
         }
     }
 
@@ -554,6 +537,53 @@ mod tests {
             super::refresh_delay_for_expiration_seconds(7 * 24 * 60 * 60),
             std::time::Duration::from_secs(24 * 60 * 60)
         );
+    }
+
+    #[tokio::test]
+    async fn projected_token_mint_fails_closed_for_unbound_pod() {
+        let pod = json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "unbound",
+                "uid": "pod-uid"
+            },
+            "spec": {
+                "serviceAccountName": "default"
+            }
+        });
+        let sources = RefreshSourceReader {
+            pod: resource("v1", "Pod", Some("default"), "unbound", pod.clone()),
+            service_account: resource(
+                "v1",
+                "ServiceAccount",
+                Some("default"),
+                "default",
+                json!({"metadata": {"namespace": "default", "name": "default", "uid": "sa-uid"}}),
+            ),
+            node: resource(
+                "v1",
+                "Node",
+                None,
+                "unused",
+                json!({"metadata": {"name": "unused", "uid": "node-uid"}}),
+            ),
+            token_requests: Mutex::new(Vec::new()),
+        };
+        let token_ref = super::ProjectedServiceAccountTokenRef {
+            volume_name: "kube-api-access-x".to_string(),
+            token_path: "token".to_string(),
+            audience: "api".to_string(),
+            expiration_seconds: 3_600,
+            mode: 0o644,
+        };
+
+        let error = super::mint_projected_service_account_token(&sources, &pod, &token_ref)
+            .await
+            .expect_err("unbound Pod must never receive a projected token");
+        assert!(error.to_string().contains("bound_node_name"));
+        assert!(sources.token_requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -639,17 +669,17 @@ mod tests {
         assert_eq!(token, "refreshed-from-leader");
         let requests = sources.token_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].namespace, "kube-system");
-        assert_eq!(requests[0].service_account_name, "coredns");
+        assert_eq!(requests[0].namespace(), "kube-system");
+        assert_eq!(requests[0].service_account_name(), "coredns");
         assert_eq!(
-            requests[0].audiences,
-            vec!["https://kubernetes.default.svc.cluster.local".to_string()]
+            requests[0].audiences(),
+            &["https://kubernetes.default.svc.cluster.local".to_string()]
         );
-        assert_eq!(requests[0].expiration_seconds, 7200);
-        assert_eq!(requests[0].bound_pod_name.as_deref(), Some("coredns"));
-        assert_eq!(requests[0].bound_pod_uid.as_deref(), Some("pod-uid"));
-        assert_eq!(requests[0].bound_node_name.as_deref(), Some("node-a"));
-        assert_eq!(requests[0].bound_node_uid.as_deref(), Some("node-uid"));
+        assert_eq!(requests[0].expiration_seconds(), 7200);
+        assert_eq!(requests[0].bound_pod_name(), "coredns");
+        assert_eq!(requests[0].bound_pod_uid(), "pod-uid");
+        assert_eq!(requests[0].bound_node_name(), "node-a");
+        assert_eq!(requests[0].bound_node_uid(), None);
     }
 
     #[tokio::test]

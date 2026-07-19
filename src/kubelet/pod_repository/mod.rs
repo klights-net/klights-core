@@ -21,7 +21,10 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 
 use crate::api::{AppError, DeleteOptions};
-use crate::control_plane::client::{LeaderApiClient, ListRequest};
+use crate::control_plane::client::{
+    LeaderApiClient, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
+    legacy_list_response,
+};
 use crate::controllers::gc::GcPodDeleteSink;
 use crate::datastore::{DatastoreHandle, Resource, ResourceList};
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
@@ -952,7 +955,10 @@ impl PodReader for PodRepository {
             // Running, so use the internal fresh read path here, then overlay
             // the node-local checkpoint so the worker reads its own writes.
             let pod = cluster_api
-                .get_resource_fresh(pod_resource_key(ns, name))
+                .get_resource(ResourceGetRequest::try_new(
+                    pod_resource_key(ns, name),
+                    ResourceQueryConsistency::LeaderFresh,
+                )?)
                 .await?;
             return self.overlay_local_status_checkpoint(pod).await;
         }
@@ -962,7 +968,10 @@ impl PodReader for PodRepository {
     async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Resource>> {
         if let Some(cluster_api) = &self.cluster_api {
             let pod = cluster_api
-                .get_resource_fresh(pod_resource_key(ns, name))
+                .get_resource(ResourceGetRequest::try_new(
+                    pod_resource_key(ns, name),
+                    ResourceQueryConsistency::LeaderFresh,
+                )?)
                 .await?
                 .filter(|pod| pod.uid == uid);
             return self.overlay_local_status_checkpoint(pod).await;
@@ -979,17 +988,19 @@ impl PodReader for PodRepository {
         continue_token: Option<&str>,
     ) -> Result<ResourceList> {
         if let Some(cluster_api) = &self.cluster_api {
-            return cluster_api
-                .list_resources_fresh(ListRequest {
-                    api_version: "v1".to_string(),
-                    kind: "Pod".to_string(),
-                    namespace: ns.map(str::to_string),
-                    label_selector: label_selector.map(str::to_string),
-                    field_selector: field_selector.map(str::to_string),
+            let list = cluster_api
+                .list_resources(ResourceListRequest::try_new(
+                    "v1",
+                    "Pod",
+                    ns.map(str::to_string),
+                    label_selector.map(str::to_string),
+                    field_selector.map(str::to_string),
                     limit,
-                    continue_token: continue_token.map(str::to_string),
-                })
-                .await;
+                    continue_token.map(str::to_string),
+                    ResourceQueryConsistency::LeaderFresh,
+                )?)
+                .await?;
+            return Ok(legacy_list_response(list));
         }
         self.store
             .list(ns, label_selector, field_selector, limit, continue_token)

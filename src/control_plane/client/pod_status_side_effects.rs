@@ -46,13 +46,31 @@ pub async fn enqueue_pod_status_side_effects(
     let Some(controller_dispatcher) = controller_dispatcher else {
         return;
     };
-    let is_pod_status_or_delete = matches!(
+    let is_endpoint_relevant_patch = matches!(
         command,
-        StorageCommand::UpdateStatus { api_version, kind, .. }
-            | StorageCommand::DeleteResource { api_version, kind, .. }
-        if api_version == "v1" && kind == "Pod"
+        StorageCommand::PatchResource {
+            api_version,
+            kind,
+            patch,
+            ..
+        } if api_version == "v1"
+            && kind == "Pod"
+            && patch
+                .pointer("/metadata")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|metadata| {
+                    metadata.contains_key("labels")
+                        || metadata.contains_key("deletionTimestamp")
+                })
     );
-    if !is_pod_status_or_delete {
+    let is_pod_status_delete_or_endpoint_patch = is_endpoint_relevant_patch
+        || matches!(
+            command,
+            StorageCommand::UpdateStatus { api_version, kind, .. }
+                | StorageCommand::DeleteResource { api_version, kind, .. }
+            if api_version == "v1" && kind == "Pod"
+        );
+    if !is_pod_status_delete_or_endpoint_patch {
         return;
     }
     let Some(resource) = resource else {
@@ -64,6 +82,29 @@ pub async fn enqueue_pod_status_side_effects(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if namespace.is_empty() {
+        return;
+    }
+    let service_keys = match crate::side_effects::service_pod::service_reconcile_keys_for_pod(
+        &resource.data,
+        db,
+        namespace,
+    )
+    .await
+    {
+        Ok(keys) => keys,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                namespace,
+                "failed to derive Service keys for pod status side effects"
+            );
+            Vec::new()
+        }
+    };
+    if is_endpoint_relevant_patch {
+        for key in service_keys {
+            controller_dispatcher.enqueue_reconcile_key(key).await;
+        }
         return;
     }
     let workload_keys = match crate::side_effects::workload_pod::workload_reconcile_keys_for_pod(
@@ -79,23 +120,6 @@ pub async fn enqueue_pod_status_side_effects(
                 error = %err,
                 namespace,
                 "failed to derive workload owner keys for pod status side effects"
-            );
-            Vec::new()
-        }
-    };
-    let service_keys = match crate::side_effects::service_pod::service_reconcile_keys_for_pod(
-        &resource.data,
-        db,
-        namespace,
-    )
-    .await
-    {
-        Ok(keys) => keys,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                namespace,
-                "failed to derive Service keys for pod status side effects"
             );
             Vec::new()
         }
@@ -580,5 +604,82 @@ mod tests {
             1,
             "worker-applied pod readiness must leave one fresh Service endpoint key queued"
         );
+    }
+
+    #[tokio::test]
+    async fn pod_label_patch_enqueues_matching_and_stale_targetref_services_only() {
+        let db = crate::datastore::test_support::in_memory().await;
+        for (name, selector) in [("matching", "new"), ("stale", "old")] {
+            db.create_resource(
+                "v1",
+                "Service",
+                Some("default"),
+                name,
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Service",
+                    "metadata": {"namespace": "default", "name": name},
+                    "spec": {"selector": {"app": selector}, "ports": [{"port": 80}]}
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        db.create_resource(
+            "v1",
+            "Endpoints",
+            Some("default"),
+            "stale",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Endpoints",
+                "metadata": {"namespace": "default", "name": "stale"},
+                "subsets": [{"addresses": [{
+                    "ip": "10.42.0.2",
+                    "targetRef": {"kind": "Pod", "namespace": "default", "name": "web", "uid": "pod-uid"}
+                }]}]
+            }),
+        )
+        .await
+        .unwrap();
+        let dispatcher = Arc::new(ControllerDispatcher::default());
+        let command = StorageCommand::PatchResource {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web".to_string(),
+            patch_kind: crate::datastore::PatchKind::Merge,
+            patch: json!({"metadata": {"labels": {"app": "new"}}}),
+            preconditions: ResourcePreconditions {
+                uid: Some("pod-uid".to_string()),
+                resource_version: None,
+            },
+            strict_resource_version: false,
+        };
+        let resource = ForwardedResource {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web".to_string(),
+            resource_version: 2,
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"namespace": "default", "name": "web", "uid": "pod-uid", "labels": {"app": "new"}},
+                "status": {"podIP": "10.42.0.2"}
+            }),
+        };
+
+        enqueue_pod_status_side_effects(Some(&dispatcher), &command, Some(&resource), &db).await;
+        let keys = dispatcher.queued_reconcile_keys_for_test().await;
+        assert!(
+            keys.iter()
+                .any(|key| key.kind == "Service" && key.name == "matching")
+        );
+        assert!(
+            keys.iter()
+                .any(|key| key.kind == "Service" && key.name == "stale")
+        );
+        assert!(keys.iter().all(|key| key.kind == "Service"));
     }
 }

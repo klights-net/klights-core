@@ -211,6 +211,12 @@ fn pending_reserved_rv_for_collection_in_tx(
 
 impl Datastore {
     #[cfg(test)]
+    pub(crate) fn resource_get_call_count_for_test(&self) -> u64 {
+        self.resource_get_call_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn install_list_resources_snapshot_pause_for_test(
         api_version: &str,
         kind: &str,
@@ -294,6 +300,10 @@ impl Datastore {
         namespace: Option<&str>,
         name: &str,
     ) -> Result<Option<Resource>> {
+        #[cfg(test)]
+        self.resource_get_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         if api_version == "v1" && kind == "Namespace" && namespace.is_none() {
             return self.get_namespace(name).await;
         }

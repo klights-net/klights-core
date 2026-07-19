@@ -12,6 +12,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt as _};
 use hyper_util::rt::TokioIo;
+use klights_leader_api::{
+    LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest,
+    OutboxDeliveryResult,
+};
 use tokio::sync::{Mutex, mpsc};
 use tokio_rustls::rustls::{
     DigitallySignedStruct, Error as TlsError, SignatureScheme,
@@ -23,21 +27,26 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use tower::Service;
 
 use crate::control_plane::client::{
-    ListRequest, ListResponse, ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest,
-    ResourceEvent, WatchRequest, WatchStream,
+    LeaderWatchError, ListRequest, ListResponse, NetworkTopologyError, NodeDataplaneQuery,
+    NodeDataplaneResult, NodeSubnetAllocationError, NodeSubnetAllocationRequest,
+    NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult, PeerSubnetsQuery,
+    PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest, PodCleanupIntentError,
+    PodCleanupIntentListRequest, ProjectedServiceAccountToken, ProjectedServiceAccountTokenError,
+    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandRequest,
+    ResourceCommandResult, ResourceEvent, WatchRequest, WatchStream,
 };
-use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource};
-use crate::kubelet::outbox::payload::OutboxOperation;
-use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
+use crate::datastore::Resource;
 use crate::leader_tls_policy::{LeaderTlsVerification, LeaderTlsVerificationPolicy};
 use crate::metrics::{NodeMetricsRequest, NodeMetricsResponse, NodeMetricsSampler};
-use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
+use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
 use crate::replication::grpc::generated::replication_client::ReplicationClient as TonicClient;
 use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
 use crate::replication::grpc::{
     JOIN_TOKEN_METADATA_KEY, entry_from_proto, generated, log_apply_commit_from_proto,
-    watch_replay_position_from_proto, watch_replay_position_to_proto,
+    resource_command_request_to_proto, watch_replay_position_from_proto,
+    watch_replay_position_to_proto,
 };
+use klights_leader_api::ResourceQueryError;
 use klights_types::ResourceKey;
 /// Response from SignControlplaneCsr RPC.
 pub struct SignControlplaneCsrResponse {
@@ -1254,32 +1263,6 @@ impl ReplicationGrpcClient {
         })
     }
 
-    pub async fn cluster_membership(
-        &self,
-    ) -> Result<crate::control_plane::client::membership::ClusterMembership> {
-        let response = self
-            .unary_call(
-                "grpc_get_cluster_membership",
-                ChannelLane::Read,
-                |mut client| async move {
-                    client
-                        .get_cluster_membership(generated::ClusterMembershipRequest {})
-                        .await
-                        .map(|r| r.into_inner())
-                },
-            )
-            .await
-            .map_err(|err| err.into_anyhow("gRPC GetClusterMembership failed"))?;
-        Ok(
-            crate::control_plane::client::membership::ClusterMembership {
-                cluster_id: response.cluster_id,
-                voters: response.voters,
-                term: response.term,
-                leader_hint: (!response.leader_hint.is_empty()).then_some(response.leader_hint),
-            },
-        )
-    }
-
     pub async fn snapshot(
         &self,
         last_applied_rv: i64,
@@ -1301,7 +1284,11 @@ impl ReplicationGrpcClient {
         Ok(entries)
     }
 
-    pub async fn get_resource_rpc(&self, key: ResourceKey) -> Result<Option<Resource>> {
+    pub async fn get_resource_rpc(
+        &self,
+        key: ResourceKey,
+    ) -> std::result::Result<Option<Resource>, ResourceQueryError> {
+        let expected_key = key.clone();
         let request = generated::GetResourceRequest {
             api_version: key.api_version,
             kind: key.kind,
@@ -1314,15 +1301,28 @@ impl ReplicationGrpcClient {
                 async move { client.get_resource(request).await.map(|r| r.into_inner()) }
             })
             .await
-            .map_err(|err| err.into_anyhow("gRPC GetResource failed"))?;
-        response
-            .resource
-            .map(resource_from_proto)
-            .transpose()
-            .map(|resource| if response.found { resource } else { None })
+            .map_err(resource_query_error_from_unary)?;
+        let resource = resource_from_get_response(response)?;
+        if resource.as_ref().is_some_and(|resource| {
+            resource.api_version != expected_key.api_version
+                || resource.kind != expected_key.kind
+                || resource.namespace != expected_key.namespace
+                || resource.name != expected_key.name
+        }) {
+            return Err(ResourceQueryError::corrupt_response(
+                "GetResource response identity does not match the requested key",
+            ));
+        }
+        Ok(resource)
     }
 
-    pub async fn list_resources_rpc(&self, req: ListRequest) -> Result<ListResponse> {
+    pub async fn list_resources_rpc(
+        &self,
+        req: ListRequest,
+    ) -> std::result::Result<ListResponse, ResourceQueryError> {
+        let expected_api_version = req.api_version.clone();
+        let expected_kind = req.kind.clone();
+        let expected_namespace = req.namespace.clone();
         let request = generated::ListResourcesRequest {
             api_version: req.api_version,
             kind: req.kind,
@@ -1342,12 +1342,24 @@ impl ReplicationGrpcClient {
                 },
             )
             .await
-            .map_err(|err| err.into_anyhow("gRPC ListResources failed"))?;
+            .map_err(resource_query_error_from_unary)?;
+        validate_list_response_metadata(&response)?;
         let items = response
             .items
             .into_iter()
             .map(resource_from_proto)
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if items.iter().any(|resource| {
+            resource.api_version != expected_api_version
+                || resource.kind != expected_kind
+                || expected_namespace
+                    .as_ref()
+                    .is_some_and(|namespace| resource.namespace.as_ref() != Some(namespace))
+        }) {
+            return Err(ResourceQueryError::corrupt_response(
+                "ListResources item identity is outside the requested scope",
+            ));
+        }
         Ok(ListResponse {
             items,
             resource_version: response.resource_version,
@@ -1360,19 +1372,45 @@ impl ReplicationGrpcClient {
         })
     }
 
+    pub async fn submit_resource_command_rpc(
+        &self,
+        request: ResourceCommandRequest,
+    ) -> std::result::Result<ResourceCommandResult, ResourceCommandError> {
+        let request = resource_command_request_to_proto(&request)
+            .map_err(|error| ResourceCommandError::submission_failed(error.to_string()))?;
+        let response = self
+            .unary_call(
+                "grpc_submit_resource_command",
+                ChannelLane::Status,
+                move |mut client| {
+                    let request = request.clone();
+                    async move {
+                        client
+                            .submit_resource_command(request)
+                            .await
+                            .map(|response| response.into_inner())
+                    }
+                },
+            )
+            .await
+            .map_err(resource_command_rpc_error)?;
+        resource_command_result_from_proto(response)
+    }
+
     pub async fn watch_resources_rpc(
         &self,
         req: WatchRequest,
-    ) -> Result<WatchStream<ResourceEvent>> {
+    ) -> std::result::Result<WatchStream, LeaderWatchError> {
+        let validation_request = req.clone();
         let request = generated::WatchResourcesRequest {
-            api_version: req.api_version,
-            kind: req.kind,
-            namespace: req.namespace,
-            field_selector: req.field_selector,
-            start_resource_version: req.start_resource_version.unwrap_or(0),
-            label_selector: req.label_selector,
+            api_version: req.api_version().to_string(),
+            kind: req.kind().to_string(),
+            namespace: req.namespace().map(str::to_owned),
+            field_selector: req.field_selector().map(str::to_owned),
+            start_resource_version: req.start_resource_version().unwrap_or(0),
+            label_selector: req.label_selector().map(str::to_owned),
             start_watch_replay_position: req
-                .start_watch_replay_position
+                .start_watch_replay_position()
                 .map(watch_replay_position_to_proto),
         };
         let response = self
@@ -1385,17 +1423,15 @@ impl ReplicationGrpcClient {
                 },
             )
             .await
-            .context("gRPC WatchResources failed")?;
-        let stream = response.into_inner().map(|event| {
+            .map_err(watch_rpc_error)?;
+        let stream = response.into_inner().map(move |event| {
             event
-                // Preserve the tonic::Status as the error source (rather than
-                // flattening it into a display string) so the worker reflector
-                // can detect the typed replay-window expiration marker and
-                // relist, matching the K8s "too old resource version" contract.
-                .map_err(|err| {
-                    anyhow::Error::from(err).context("gRPC WatchResources stream failed")
-                })
+                .map_err(watch_status_error)
                 .and_then(resource_event_from_proto)
+                .and_then(|event| {
+                    event.validate_for(&validation_request)?;
+                    Ok(event)
+                })
         });
         Ok(Box::pin(stream))
     }
@@ -1460,21 +1496,31 @@ impl ReplicationGrpcClient {
     pub async fn projected_service_account_token_rpc(
         &self,
         req: ProjectedServiceAccountTokenRequest,
-    ) -> Result<ProjectedServiceAccountToken> {
+    ) -> std::result::Result<ProjectedServiceAccountToken, ProjectedServiceAccountTokenError> {
+        let (
+            namespace,
+            service_account_name,
+            audiences,
+            expiration_seconds,
+            bound_pod_name,
+            bound_pod_uid,
+            bound_node_name,
+            bound_node_uid,
+        ) = req.into_parts();
         let request = generated::ProjectedServiceAccountTokenRequest {
-            namespace: req.namespace,
-            service_account_name: req.service_account_name,
-            audiences: req.audiences,
-            expiration_seconds: req.expiration_seconds,
-            bound_pod_name: req.bound_pod_name,
-            bound_pod_uid: req.bound_pod_uid,
-            bound_node_name: req.bound_node_name,
-            bound_node_uid: req.bound_node_uid,
+            namespace,
+            service_account_name,
+            audiences,
+            expiration_seconds,
+            bound_pod_name: Some(bound_pod_name),
+            bound_pod_uid: Some(bound_pod_uid),
+            bound_node_name: Some(bound_node_name),
+            bound_node_uid,
         };
         let response = self
             .unary_call(
                 "grpc_projected_service_account_token",
-                ChannelLane::Read,
+                ChannelLane::Status,
                 move |mut client| {
                     let request = request.clone();
                     async move {
@@ -1486,10 +1532,8 @@ impl ReplicationGrpcClient {
                 },
             )
             .await
-            .map_err(|err| err.into_anyhow("gRPC ProjectedServiceAccountToken failed"))?;
-        Ok(ProjectedServiceAccountToken {
-            token: response.token,
-        })
+            .map_err(projected_token_error_from_unary)?;
+        ProjectedServiceAccountToken::try_new(response.token)
     }
 
     /// bug-grpc A2: the single retry/deadline/failover path for **every**
@@ -1636,23 +1680,18 @@ impl ReplicationGrpcClient {
         }
     }
 
-    pub async fn apply_outbox_rpc(
+    pub(crate) async fn apply_outbox_rpc(
         &self,
-        idempotency_key: &str,
-        operation: OutboxOperation,
-        payload: Bytes,
-        client_id: &str,
-        stream_id: i64,
-        stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
+        request: OutboxDeliveryRequest,
+    ) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
         // bug-grpc A2: reimplemented on the generic `unary_call` executor.
         // Idempotency key + response decode stay here; the retry/deadline/
         // failover/lane-heal loop is shared.
-        let idempotency_key = idempotency_key.to_string();
-        let operation = operation.as_str().to_string();
+        let (idempotency_key, operation, payload, client_id, stream_id, stream_seq) =
+            request.into_parts();
+        let operation = operation.as_wire_name().to_string();
         let payload = payload.to_vec();
         let authoring_node = self.node_name().to_string();
-        let client_id = client_id.to_string();
         let response = match self
             .unary_call(
                 "grpc_apply_outbox",
@@ -1674,25 +1713,11 @@ impl ReplicationGrpcClient {
         {
             Ok(response) => response,
             Err(UnaryRpcError::Retryable(message)) => {
-                return Err(OutboxApplyError::Retryable(message));
+                return Err(OutboxDeliveryError::Retryable(message));
             }
             Err(UnaryRpcError::Status(status)) => return Err(outbox_error_from_status(status)),
         };
-        if let Some(error) = response.error {
-            return Err(outbox_error_from_response(
-                response.error_type.as_deref(),
-                error,
-            ));
-        }
-        if response.already_applied {
-            Ok(OutboxApplyResult::AlreadyApplied {
-                applied_rv: Some(response.applied_rv),
-            })
-        } else {
-            Ok(OutboxApplyResult::Applied {
-                applied_rv: response.applied_rv,
-            })
-        }
+        decode_apply_outbox_response(response)
     }
 
     /// P3-11c: opaque envelope dispatch for the three Raft consensus
@@ -1934,6 +1959,17 @@ impl ReplicationGrpcClient {
         renew_time: &str,
         lease_duration_seconds: i64,
     ) -> Result<()> {
+        self.renew_node_lease_focused_rpc(renew_time, lease_duration_seconds)
+            .await
+            .map_err(anyhow::Error::new)
+            .context("gRPC RenewNodeLease failed")
+    }
+
+    pub(crate) async fn renew_node_lease_focused_rpc(
+        &self,
+        renew_time: &str,
+        lease_duration_seconds: i64,
+    ) -> std::result::Result<(), klights_leader_api::NodeLeaseRenewalError> {
         // bug-grpc A2: Status-lane unary RPC — the same lossy-link wedge as
         // apply_outbox, now bounded by the shared executor's per-call deadline
         // and lane self-heal.
@@ -1958,24 +1994,24 @@ impl ReplicationGrpcClient {
         )
         .await
         .map(|_| ())
-        .map_err(|err| err.into_anyhow("gRPC RenewNodeLease failed"))
+        .map_err(node_lease_renewal_error_from_unary)
     }
 
     pub async fn allocate_node_subnet_rpc(
         &self,
-        node_name: &str,
-        cluster_cidr: &str,
-        node_ip: &str,
-    ) -> Result<NodeSubnet> {
+        request: NodeSubnetAllocationRequest,
+    ) -> std::result::Result<NodeSubnetAllocationResult, NodeSubnetAllocationError> {
+        let expected_node_name = request.node_name().to_string();
+        let (node_name, cluster_cidr, node_ip) = request.into_parts();
         let request = generated::AllocateNodeSubnetRequest {
-            node_name: node_name.to_string(),
-            cluster_cidr: cluster_cidr.to_string(),
+            node_name,
+            cluster_cidr,
             node_ip: node_ip.to_string(),
         };
         let response = self
             .unary_call(
                 "grpc_allocate_node_subnet",
-                ChannelLane::Read,
+                ChannelLane::Status,
                 move |mut client| {
                     let request = request.clone();
                     async move {
@@ -1987,16 +2023,22 @@ impl ReplicationGrpcClient {
                 },
             )
             .await
-            .map_err(|err| err.into_anyhow("gRPC AllocateNodeSubnet failed"))?;
+            .map_err(node_subnet_allocation_error_from_unary)?;
         let subnet = response
             .subnet
-            .ok_or_else(|| anyhow!("AllocateNodeSubnet response missing subnet"))?;
-        node_subnet_from_proto(subnet)
+            .map(node_subnet_from_proto)
+            .transpose()
+            .map_err(|error| NodeSubnetAllocationError::corrupt_response(error.to_string()))?;
+        NodeSubnetAllocationResult::try_from_wire(&expected_node_name, subnet)
     }
 
-    pub async fn get_node_subnet_rpc(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
+    pub async fn get_node_subnet_rpc(
+        &self,
+        request: NodeSubnetQuery,
+    ) -> std::result::Result<NodeSubnetResult, NetworkTopologyError> {
+        let node_name = request.into_node_name();
         let request = generated::GetNodeSubnetRequest {
-            node_name: node_name.to_string(),
+            node_name: node_name.clone(),
         };
         let response = self
             .unary_call(
@@ -2013,17 +2055,18 @@ impl ReplicationGrpcClient {
                 },
             )
             .await
-            .map_err(|err| err.into_anyhow("gRPC GetNodeSubnet failed"))?;
-        response
-            .subnet
-            .map(node_subnet_from_proto)
-            .transpose()
-            .map(|subnet| if response.found { subnet } else { None })
+            .map_err(network_topology_error_from_unary)?;
+        let subnet = response.subnet.map(node_subnet_from_proto).transpose()?;
+        NodeSubnetResult::try_from_wire(&node_name, response.found, subnet)
     }
 
-    pub async fn list_peer_subnets_rpc(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
+    pub async fn list_peer_subnets_rpc(
+        &self,
+        request: PeerSubnetsQuery,
+    ) -> std::result::Result<PeerSubnetsResult, NetworkTopologyError> {
+        let my_node_name = request.into_node_name();
         let request = generated::ListPeerSubnetsRequest {
-            my_node_name: my_node_name.to_string(),
+            my_node_name: my_node_name.clone(),
         };
         let response = self
             .unary_call(
@@ -2040,20 +2083,22 @@ impl ReplicationGrpcClient {
                 },
             )
             .await
-            .map_err(|err| err.into_anyhow("gRPC ListPeerSubnets failed"))?;
-        response
+            .map_err(network_topology_error_from_unary)?;
+        let subnets = response
             .items
             .into_iter()
             .map(node_subnet_from_proto)
-            .collect()
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        PeerSubnetsResult::try_new(&my_node_name, subnets)
     }
 
     pub async fn get_node_dataplane_rpc(
         &self,
-        node_name: &str,
-    ) -> Result<Option<DataplanePeerMetadata>> {
+        request: NodeDataplaneQuery,
+    ) -> std::result::Result<NodeDataplaneResult, NetworkTopologyError> {
+        let node_name = request.into_node_name();
         let request = generated::GetNodeDataplaneRequest {
-            node_name: node_name.to_string(),
+            node_name: node_name.clone(),
         };
         let response = self
             .unary_call(
@@ -2070,12 +2115,12 @@ impl ReplicationGrpcClient {
                 },
             )
             .await
-            .map_err(|err| err.into_anyhow("gRPC GetNodeDataplane failed"))?;
-        response
+            .map_err(network_topology_error_from_unary)?;
+        let metadata = response
             .metadata
             .map(dataplane_metadata_from_proto)
-            .transpose()
-            .map(|metadata| if response.found { metadata } else { None })
+            .transpose()?;
+        NodeDataplaneResult::try_from_wire(&node_name, response.found, metadata)
     }
 
     pub async fn observe_peer_endpoint_rpc(&self, node_name: &str) -> Result<Option<String>> {
@@ -2103,10 +2148,10 @@ impl ReplicationGrpcClient {
 
     pub async fn list_pod_cleanup_intents_for_node_rpc(
         &self,
-        node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
+        request: PodCleanupIntentListRequest,
+    ) -> std::result::Result<Vec<PodCleanupIntent>, PodCleanupIntentError> {
         let request = generated::ListPodCleanupIntentsForNodeRequest {
-            node_name: node_name.to_string(),
+            node_name: request.into_node_name(),
         };
         let response = self
             .unary_call(
@@ -2123,7 +2168,7 @@ impl ReplicationGrpcClient {
                 },
             )
             .await
-            .map_err(|err| err.into_anyhow("gRPC ListPodCleanupIntentsForNode failed"))?;
+            .map_err(pod_cleanup_intent_error_from_unary)?;
         response
             .items
             .into_iter()
@@ -2133,22 +2178,19 @@ impl ReplicationGrpcClient {
 
     pub async fn delete_pod_cleanup_intent_rpc(
         &self,
-        node_name: &str,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        reason: &str,
-    ) -> Result<()> {
+        request: PodCleanupIntentAckRequest,
+    ) -> std::result::Result<(), PodCleanupIntentError> {
+        let (node_name, namespace, pod_name, pod_uid, reason) = request.into_parts();
         let request = generated::DeletePodCleanupIntentRequest {
-            node_name: node_name.to_string(),
-            namespace: namespace.to_string(),
-            pod_name: pod_name.to_string(),
-            pod_uid: pod_uid.to_string(),
-            reason: reason.to_string(),
+            node_name,
+            namespace,
+            pod_name,
+            pod_uid,
+            reason,
         };
         self.unary_call(
             "grpc_delete_pod_cleanup_intent",
-            ChannelLane::Read,
+            ChannelLane::Status,
             move |mut client| {
                 let request = request.clone();
                 async move {
@@ -2161,7 +2203,7 @@ impl ReplicationGrpcClient {
         )
         .await
         .map(|_| ())
-        .map_err(|err| err.into_anyhow("gRPC DeletePodCleanupIntent failed"))
+        .map_err(pod_cleanup_intent_error_from_unary)
     }
 
     pub async fn stream_next(&self) -> Result<StreamItem> {
@@ -2946,125 +2988,405 @@ async fn handle_pod_log_follow_request(
 // with the trait itself. Workers now use ApplyOutbox via the new
 // LeaderApiClient surface.
 
-fn resource_from_proto(resource: generated::ResourceObject) -> Result<Resource> {
-    let data: serde_json::Value =
-        serde_json::from_slice(&resource.data_json).with_context(|| {
-            format!(
-                "decode {} {} resource JSON",
-                resource.api_version, resource.kind
-            )
-        })?;
-    Ok(Resource {
-        id: 0,
-        api_version: resource.api_version,
-        kind: resource.kind,
-        namespace: resource.namespace,
-        name: resource.name,
-        uid: resource.uid,
-        resource_version: resource.resource_version,
-        data: Arc::new(data),
-    })
+fn resource_from_get_response(
+    response: generated::GetResourceResponse,
+) -> std::result::Result<Option<Resource>, ResourceQueryError> {
+    match (response.found, response.resource) {
+        (true, Some(resource)) => resource_from_proto(resource).map(Some),
+        (false, None) => Ok(None),
+        (true, None) => Err(ResourceQueryError::corrupt_response(
+            "GetResource response marked found but omitted the resource",
+        )),
+        (false, Some(_)) => Err(ResourceQueryError::corrupt_response(
+            "GetResource response carried a resource while marked not found",
+        )),
+    }
 }
 
-fn resource_event_from_proto(event: generated::WatchEvent) -> Result<ResourceEvent> {
+fn validate_list_response_metadata(
+    response: &generated::ListResourcesResponse,
+) -> std::result::Result<(), ResourceQueryError> {
+    if response.resource_version < 0
+        || response.remaining_item_count.is_some_and(|count| count < 0)
+        || response.total != response.items.len() as i64
+        || response
+            .watch_replay_position
+            .as_ref()
+            .is_some_and(|position| {
+                position.resource_version < 0
+                    || position.event_id < 0
+                    || position.resource_version_filter_through_event_id < 0
+                    || position.resource_version != response.resource_version
+            })
+    {
+        return Err(ResourceQueryError::corrupt_response(
+            "ListResources response metadata is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+fn resource_from_proto(
+    resource: generated::ResourceObject,
+) -> std::result::Result<Resource, ResourceQueryError> {
+    let data: serde_json::Value = serde_json::from_slice(&resource.data_json).map_err(|error| {
+        ResourceQueryError::corrupt_response(format!(
+            "decode {} {} resource JSON: {error}",
+            resource.api_version, resource.kind
+        ))
+    })?;
+    let decoded = Resource::try_from_data(Arc::new(data)).map_err(|error| {
+        ResourceQueryError::corrupt_response(format!("invalid resource object identity: {error}"))
+    })?;
+    if decoded.api_version != resource.api_version
+        || decoded.kind != resource.kind
+        || decoded.namespace != resource.namespace
+        || decoded.name != resource.name
+        || decoded.uid != resource.uid
+        || decoded.resource_version != resource.resource_version
+    {
+        return Err(ResourceQueryError::corrupt_response(
+            "resource wire identity or resourceVersion does not match its object body",
+        ));
+    }
+    Ok(decoded)
+}
+
+fn resource_query_error_from_unary(error: UnaryRpcError) -> ResourceQueryError {
+    match error {
+        UnaryRpcError::Retryable(message) => ResourceQueryError::retryable(message),
+        UnaryRpcError::Status(status) => match status.code() {
+            tonic::Code::InvalidArgument => ResourceQueryError::InvalidRequest {
+                field: "rpc.request",
+                message: status.message().to_string(),
+            },
+            tonic::Code::DeadlineExceeded => ResourceQueryError::Timeout,
+            tonic::Code::Cancelled => ResourceQueryError::Cancelled,
+            tonic::Code::Unavailable | tonic::Code::FailedPrecondition => {
+                ResourceQueryError::retryable(status.to_string())
+            }
+            _ => ResourceQueryError::query_failed(status.to_string()),
+        },
+    }
+}
+
+fn resource_command_result_from_proto(
+    response: generated::SubmitResourceCommandResponse,
+) -> std::result::Result<ResourceCommandResult, ResourceCommandError> {
+    use generated::submit_resource_command_response::Result as WireResult;
+    match response.result {
+        Some(WireResult::Ack(ack)) => {
+            ResourceCommandResult::try_from_response(klights_cluster_core::StorageResponse::Ack {
+                resource_version: ack.resource_version,
+            })
+        }
+        Some(WireResult::Resource(wire)) => {
+            let data: serde_json::Value =
+                serde_json::from_slice(&wire.data_json).map_err(|error| {
+                    ResourceCommandError::corrupt_response(format!(
+                        "decode resource command response JSON: {error}"
+                    ))
+                })?;
+            let result = ResourceCommandResult::try_from_response(
+                klights_cluster_core::StorageResponse::Resource {
+                    resource_version: wire.resource_version,
+                    data,
+                },
+            )?;
+            let ResourceCommandResult::Resource(resource) = &result else {
+                unreachable!("resource response conversion returned a non-resource result")
+            };
+            if resource.api_version != wire.api_version
+                || resource.kind != wire.kind
+                || resource.namespace != wire.namespace
+                || resource.name != wire.name
+                || resource.uid != wire.uid
+            {
+                return Err(ResourceCommandError::corrupt_response(
+                    "resource command wire identity does not match its object",
+                ));
+            }
+            Ok(result)
+        }
+        None => Err(ResourceCommandError::corrupt_response(
+            "resource command response is missing its result",
+        )),
+    }
+}
+
+fn resource_command_rpc_error(error: UnaryRpcError) -> ResourceCommandError {
+    match error {
+        UnaryRpcError::Retryable(message) => ResourceCommandError::retryable(message),
+        UnaryRpcError::Status(status) => {
+            let message = status.message().to_string();
+            match status.code() {
+                tonic::Code::InvalidArgument => ResourceCommandError::InvalidRequest {
+                    field: "command",
+                    message,
+                },
+                tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+                    ResourceCommandError::Unauthorized
+                }
+                tonic::Code::FailedPrecondition => ResourceCommandError::NotLeader,
+                tonic::Code::AlreadyExists | tonic::Code::Aborted => {
+                    ResourceCommandError::Conflict { message }
+                }
+                tonic::Code::NotFound => ResourceCommandError::NotFound { message },
+                tonic::Code::DeadlineExceeded => ResourceCommandError::Timeout,
+                tonic::Code::Cancelled => ResourceCommandError::Cancelled,
+                tonic::Code::Unavailable => ResourceCommandError::retryable(message),
+                _ => ResourceCommandError::submission_failed(status.to_string()),
+            }
+        }
+    }
+}
+
+fn watch_status_error(status: tonic::Status) -> LeaderWatchError {
+    if let Some(accepted_resource_version) =
+        crate::replication::grpc::watch_replay_expired_resource_version(&status)
+    {
+        return LeaderWatchError::ReplayExpired {
+            accepted_resource_version,
+        };
+    }
+    match status.code() {
+        tonic::Code::Cancelled => LeaderWatchError::Cancelled,
+        tonic::Code::DeadlineExceeded => LeaderWatchError::Timeout,
+        tonic::Code::Unavailable | tonic::Code::FailedPrecondition => {
+            LeaderWatchError::unavailable(status.to_string())
+        }
+        _ => LeaderWatchError::transport(status.to_string()),
+    }
+}
+
+fn watch_rpc_error(error: anyhow::Error) -> LeaderWatchError {
+    if let Some(status) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<tonic::Status>())
+    {
+        return watch_status_error(status.clone());
+    }
+    LeaderWatchError::transport(format!("gRPC WatchResources failed: {error:#}"))
+}
+
+fn resource_event_from_proto(
+    event: generated::WatchEvent,
+) -> std::result::Result<ResourceEvent, LeaderWatchError> {
     let resume_position = event
         .resume_position
         .as_ref()
         .map(watch_replay_position_from_proto);
-    let resource = event
-        .resource
-        .ok_or_else(|| anyhow!("WatchResources event missing resource"))?;
-    let resource = resource_from_proto(resource)?;
-    Ok(ResourceEvent {
-        event: crate::watch::WatchEvent::from_type(&event.event_type, (*resource.data).clone()),
-        resume_position,
-    })
+    let resource = event.resource.ok_or_else(|| {
+        LeaderWatchError::malformed_event("WatchResources event missing resource")
+    })?;
+    let resource = resource_from_proto(resource)
+        .map_err(|error| LeaderWatchError::malformed_event(error.to_string()))?;
+    ResourceEvent::try_from_wire_type(&event.event_type, resource, resume_position)
 }
 
-fn node_subnet_from_proto(subnet: generated::NodeSubnetObject) -> Result<NodeSubnet> {
-    crate::replication::protocol::ForwardedNodeSubnet {
-        node_name: subnet.node_name,
-        subnet: subnet.subnet,
-        subnet_base_int: subnet.subnet_base_int,
-        gateway_ip: subnet.gateway_ip,
-        node_ip: subnet.node_ip,
-        mode: subnet.mode,
-        hostport_range: subnet.hostport_range,
-    }
-    .into_node_subnet()
+fn node_subnet_from_proto(
+    subnet: generated::NodeSubnetObject,
+) -> std::result::Result<klights_leader_api::NodeSubnet, NetworkTopologyError> {
+    let gateway_ip = subnet.gateway_ip.parse().map_err(|error| {
+        NetworkTopologyError::corrupt_response(format!(
+            "invalid node subnet gateway IP '{}': {error}",
+            subnet.gateway_ip
+        ))
+    })?;
+    let node_ip = subnet.node_ip.parse().map_err(|error| {
+        NetworkTopologyError::corrupt_response(format!(
+            "invalid node subnet node IP '{}': {error}",
+            subnet.node_ip
+        ))
+    })?;
+    let mode = match subnet.mode.as_str() {
+        "root" => klights_leader_api::NetworkNodeMode::Root,
+        "rootless" => klights_leader_api::NetworkNodeMode::Rootless,
+        other => {
+            return Err(NetworkTopologyError::corrupt_response(format!(
+                "invalid node subnet mode '{other}'"
+            )));
+        }
+    };
+    let hostport_range = subnet
+        .hostport_range
+        .as_deref()
+        .map(|raw| {
+            let (start, end) = raw.split_once('-').ok_or_else(|| {
+                NetworkTopologyError::corrupt_response(format!(
+                    "invalid node subnet host-port range '{raw}'"
+                ))
+            })?;
+            let start = start.parse::<u16>().map_err(|error| {
+                NetworkTopologyError::corrupt_response(format!(
+                    "invalid host-port range start '{start}': {error}"
+                ))
+            })?;
+            let end = end.parse::<u16>().map_err(|error| {
+                NetworkTopologyError::corrupt_response(format!(
+                    "invalid host-port range end '{end}': {error}"
+                ))
+            })?;
+            klights_leader_api::HostPortRange::try_new(start, end)
+        })
+        .transpose()?;
+    klights_leader_api::NodeSubnet::try_new(
+        subnet.node_name,
+        subnet.subnet,
+        subnet.subnet_base_int,
+        gateway_ip,
+        node_ip,
+        mode,
+        hostport_range,
+    )
 }
 
 fn dataplane_metadata_from_proto(
     metadata: generated::DataplaneMetadataObject,
-) -> Result<DataplanePeerMetadata> {
+) -> std::result::Result<klights_leader_api::NetworkDataplane, NetworkTopologyError> {
     let port = metadata
         .port
         .map(u16::try_from)
         .transpose()
-        .map_err(|_| anyhow!("dataplane metadata port exceeds u16"))?;
-    DataplanePeerMetadata::try_new(
+        .map_err(|_| NetworkTopologyError::corrupt_response("dataplane port exceeds u16"))?;
+    let mode = match metadata.mode.as_str() {
+        "root" => klights_leader_api::NetworkNodeMode::Root,
+        "rootless" => klights_leader_api::NetworkNodeMode::Rootless,
+        other => {
+            return Err(NetworkTopologyError::corrupt_response(format!(
+                "invalid dataplane mode '{other}'"
+            )));
+        }
+    };
+    let encryption = match metadata.encryption.as_str() {
+        "enabled" => klights_leader_api::DataplaneEncryption::WireGuard,
+        "disabled" => klights_leader_api::DataplaneEncryption::Direct,
+        other => {
+            return Err(NetworkTopologyError::corrupt_response(format!(
+                "invalid dataplane encryption '{other}'"
+            )));
+        }
+    };
+    let endpoint = metadata.endpoint.parse().map_err(|error| {
+        NetworkTopologyError::corrupt_response(format!(
+            "invalid dataplane endpoint '{}': {error}",
+            metadata.endpoint
+        ))
+    })?;
+    klights_leader_api::NetworkDataplane::try_new(
         metadata.node_name,
-        DataplaneMode::parse(&metadata.mode)?,
-        DataplaneEncryption::parse(Some(&metadata.encryption))?,
-        metadata.public_key,
-        Some(metadata.endpoint),
+        mode,
+        encryption,
+        metadata.public_key.as_deref(),
+        endpoint,
         port,
     )
 }
 
-fn pod_cleanup_intent_from_proto(
+pub(super) fn pod_cleanup_intent_from_proto(
     intent: generated::PodCleanupIntentObject,
-) -> Result<PodCleanupIntent> {
-    let pod_data = serde_json::from_slice(&intent.pod_data_json).with_context(|| {
-        format!(
-            "decode pod cleanup intent JSON for {}/{} uid={}",
+) -> std::result::Result<PodCleanupIntent, PodCleanupIntentError> {
+    let pod_data = serde_json::from_slice(&intent.pod_data_json).map_err(|error| {
+        PodCleanupIntentError::corrupt_intent(format!(
+            "decode Pod cleanup intent JSON for {}/{} uid={}: {error}",
             intent.namespace, intent.pod_name, intent.pod_uid
-        )
+        ))
     })?;
-    Ok(PodCleanupIntent {
-        node_name: intent.node_name,
-        namespace: intent.namespace,
-        pod_name: intent.pod_name,
-        pod_uid: intent.pod_uid,
-        reason: intent.reason,
-        resource_version: intent.resource_version,
-        created_at_ms: intent.created_at_ms,
-        pod_data,
-    })
+    let pod_snapshot = Resource::try_from_data(Arc::new(pod_data)).map_err(|error| {
+        PodCleanupIntentError::corrupt_intent(format!(
+            "decode Pod cleanup intent identity for {}/{} uid={}: {error}",
+            intent.namespace, intent.pod_name, intent.pod_uid
+        ))
+    })?;
+    PodCleanupIntent::try_new(
+        intent.node_name,
+        intent.namespace,
+        intent.pod_name,
+        intent.pod_uid,
+        intent.reason,
+        intent.resource_version,
+        intent.created_at_ms,
+        pod_snapshot,
+    )
 }
 
-fn outbox_error_from_response(error_type: Option<&str>, message: String) -> OutboxApplyError {
-    match error_type {
-        Some("NotFound") => OutboxApplyError::NotFound(message),
-        Some("UidMismatch") => OutboxApplyError::UidMismatch {
-            expected: "<unknown>".to_string(),
-            actual: "<unknown>".to_string(),
-        },
-        Some("ConflictTerminal") => OutboxApplyError::ConflictTerminal(message),
-        Some("Retryable") | None => OutboxApplyError::Retryable(message),
-        Some(_) => OutboxApplyError::Retryable(message),
+impl LeaderOutboxDelivery for ReplicationGrpcClient {
+    fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+        Box::pin(async move { self.apply_outbox_rpc(request).await })
     }
 }
 
-fn outbox_error_from_status(status: tonic::Status) -> OutboxApplyError {
-    let message = status.message().to_string();
+fn decode_apply_outbox_response(
+    response: generated::ApplyOutboxResponse,
+) -> std::result::Result<OutboxDeliveryResult, OutboxDeliveryError> {
+    if response.error.is_some() && (response.already_applied || response.applied_rv != 0) {
+        return Err(OutboxDeliveryError::corrupt_response(
+            "ApplyOutbox response carried both an error and successful apply evidence",
+        ));
+    }
+    match (response.error, response.error_type.as_deref()) {
+        (Some(message), error_type) => {
+            return Err(outbox_error_from_response(error_type, message));
+        }
+        (None, Some(error_type)) => {
+            return Err(OutboxDeliveryError::corrupt_response(format!(
+                "ApplyOutbox success response carried error_type {error_type:?} without an error",
+            )));
+        }
+        (None, None) => {}
+    }
+
+    if response.already_applied {
+        OutboxDeliveryResult::try_already_applied(
+            (response.applied_rv > 0).then_some(response.applied_rv),
+        )
+    } else {
+        OutboxDeliveryResult::try_applied(response.applied_rv).map_err(|error| {
+            OutboxDeliveryError::corrupt_response(format!(
+                "ApplyOutbox returned an invalid applied resourceVersion: {error}",
+            ))
+        })
+    }
+}
+
+fn outbox_error_from_response(error_type: Option<&str>, message: String) -> OutboxDeliveryError {
+    match error_type {
+        Some("NotFound") => OutboxDeliveryError::NotFound(message),
+        Some("UidMismatch") => OutboxDeliveryError::UidMismatch {
+            expected: "<unknown>".to_string(),
+            actual: "<unknown>".to_string(),
+        },
+        Some("ConflictTerminal") => OutboxDeliveryError::ConflictTerminal(message),
+        Some("Retryable") => OutboxDeliveryError::Retryable(message),
+        Some("InvalidRequest") => OutboxDeliveryError::InvalidRequest {
+            field: "server.delivery",
+            message,
+        },
+        Some("NotLeader") => OutboxDeliveryError::NotLeader,
+        Some("Timeout") => OutboxDeliveryError::Timeout,
+        Some("Cancelled") => OutboxDeliveryError::Cancelled,
+        Some("CorruptResponse") => OutboxDeliveryError::CorruptResponse { message },
+        Some(error_type) => OutboxDeliveryError::CorruptResponse {
+            message: format!("unknown ApplyOutbox error_type {error_type:?}: {message}"),
+        },
+        None => OutboxDeliveryError::CorruptResponse {
+            message: format!("ApplyOutbox error response omitted error_type: {message}"),
+        },
+    }
+}
+
+fn outbox_error_from_status(status: tonic::Status) -> OutboxDeliveryError {
     match status.code() {
-        tonic::Code::NotFound => OutboxApplyError::NotFound(message),
         tonic::Code::FailedPrecondition if is_not_raft_leader_status(&status) => {
-            OutboxApplyError::Retryable(status.to_string())
+            OutboxDeliveryError::NotLeader
         }
-        tonic::Code::FailedPrecondition
-            if message.to_ascii_lowercase().contains("uid mismatch") =>
-        {
-            OutboxApplyError::UidMismatch {
-                expected: "<unknown>".to_string(),
-                actual: "<unknown>".to_string(),
-            }
-        }
-        tonic::Code::FailedPrecondition | tonic::Code::AlreadyExists | tonic::Code::Aborted => {
-            OutboxApplyError::ConflictTerminal(message)
-        }
-        _ => OutboxApplyError::Retryable(status.to_string()),
+        tonic::Code::DeadlineExceeded => OutboxDeliveryError::Timeout,
+        tonic::Code::Cancelled => OutboxDeliveryError::Cancelled,
+        // A transport status does not prove that the leader durably consumed
+        // this exact stream position. Terminal decisions are accepted only in
+        // the typed response body, which the server emits after its
+        // ledger/watermark commit. Keep every other status retryable.
+        _ => OutboxDeliveryError::Retryable(status.to_string()),
     }
 }
 
@@ -3101,6 +3423,181 @@ impl UnaryRpcError {
 }
 
 impl std::error::Error for UnaryRpcError {}
+
+fn node_lease_renewal_error_from_unary(
+    error: UnaryRpcError,
+) -> klights_leader_api::NodeLeaseRenewalError {
+    use klights_leader_api::NodeLeaseRenewalError;
+
+    match error {
+        UnaryRpcError::Retryable(message)
+            if message.to_ascii_lowercase().contains("not raft leader") =>
+        {
+            NodeLeaseRenewalError::NotLeader
+        }
+        UnaryRpcError::Retryable(message) => NodeLeaseRenewalError::retryable(message),
+        UnaryRpcError::Status(status) => {
+            let message = status.message().to_string();
+            match status.code() {
+                tonic::Code::InvalidArgument => NodeLeaseRenewalError::InvalidRequest {
+                    field: "lease",
+                    message,
+                },
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                    NodeLeaseRenewalError::unauthorized(message)
+                }
+                tonic::Code::FailedPrecondition if is_not_raft_leader_status(&status) => {
+                    NodeLeaseRenewalError::NotLeader
+                }
+                tonic::Code::Unavailable => NodeLeaseRenewalError::unavailable(message),
+                tonic::Code::DeadlineExceeded => NodeLeaseRenewalError::Timeout,
+                tonic::Code::Cancelled => NodeLeaseRenewalError::Cancelled,
+                _ => NodeLeaseRenewalError::retryable(status.to_string()),
+            }
+        }
+    }
+}
+
+fn node_subnet_allocation_error_from_unary(error: UnaryRpcError) -> NodeSubnetAllocationError {
+    match error {
+        UnaryRpcError::Retryable(message)
+            if message.to_ascii_lowercase().contains("not raft leader") =>
+        {
+            NodeSubnetAllocationError::NotLeader
+        }
+        UnaryRpcError::Retryable(message) => NodeSubnetAllocationError::retryable(message),
+        UnaryRpcError::Status(status) => {
+            let message = status.message().to_string();
+            match status.code() {
+                tonic::Code::InvalidArgument => {
+                    NodeSubnetAllocationError::invalid_request("request", message)
+                }
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                    NodeSubnetAllocationError::unauthorized(message)
+                }
+                tonic::Code::AlreadyExists | tonic::Code::Aborted => {
+                    NodeSubnetAllocationError::conflict(message)
+                }
+                tonic::Code::ResourceExhausted => NodeSubnetAllocationError::exhausted(message),
+                tonic::Code::FailedPrecondition
+                    if message.to_ascii_lowercase().contains("not raft leader") =>
+                {
+                    NodeSubnetAllocationError::NotLeader
+                }
+                tonic::Code::DeadlineExceeded => NodeSubnetAllocationError::Timeout,
+                tonic::Code::Cancelled => NodeSubnetAllocationError::Cancelled,
+                _ => NodeSubnetAllocationError::allocation_failed(status.to_string()),
+            }
+        }
+    }
+}
+
+fn network_topology_error_from_unary(error: UnaryRpcError) -> NetworkTopologyError {
+    match error {
+        UnaryRpcError::Retryable(message)
+            if message.to_ascii_lowercase().contains("not raft leader") =>
+        {
+            NetworkTopologyError::NotLeader
+        }
+        UnaryRpcError::Retryable(message) => NetworkTopologyError::retryable(message),
+        UnaryRpcError::Status(status) => {
+            let message = status.message().to_string();
+            match status.code() {
+                tonic::Code::InvalidArgument => {
+                    NetworkTopologyError::invalid_request("request", message)
+                }
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                    NetworkTopologyError::unauthorized(message)
+                }
+                tonic::Code::FailedPrecondition
+                    if message.to_ascii_lowercase().contains("not raft leader") =>
+                {
+                    NetworkTopologyError::NotLeader
+                }
+                tonic::Code::DeadlineExceeded => NetworkTopologyError::Timeout,
+                tonic::Code::Cancelled => NetworkTopologyError::Cancelled,
+                _ => NetworkTopologyError::query_failed(status.to_string()),
+            }
+        }
+    }
+}
+
+fn projected_token_error_from_unary(error: UnaryRpcError) -> ProjectedServiceAccountTokenError {
+    match error {
+        UnaryRpcError::Retryable(message)
+            if message.to_ascii_lowercase().contains("not raft leader") =>
+        {
+            ProjectedServiceAccountTokenError::NotLeader
+        }
+        UnaryRpcError::Retryable(message) => {
+            ProjectedServiceAccountTokenError::unavailable(message)
+        }
+        UnaryRpcError::Status(status) => {
+            let message = status.message().to_string();
+            match status.code() {
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                    ProjectedServiceAccountTokenError::Unauthorized
+                }
+                tonic::Code::NotFound
+                    if message.to_ascii_lowercase().contains("serviceaccount") =>
+                {
+                    ProjectedServiceAccountTokenError::ServiceAccountNotFound
+                }
+                tonic::Code::NotFound if message.to_ascii_lowercase().contains("pod") => {
+                    ProjectedServiceAccountTokenError::BoundPodNotFound
+                }
+                tonic::Code::NotFound => ProjectedServiceAccountTokenError::BoundNodeNotFound,
+                tonic::Code::FailedPrecondition
+                    if message.to_ascii_lowercase().contains("not raft leader") =>
+                {
+                    ProjectedServiceAccountTokenError::NotLeader
+                }
+                tonic::Code::FailedPrecondition => {
+                    ProjectedServiceAccountTokenError::signing_failed(message)
+                }
+                tonic::Code::DataLoss => {
+                    ProjectedServiceAccountTokenError::corrupt_resource(message)
+                }
+                tonic::Code::DeadlineExceeded => ProjectedServiceAccountTokenError::Timeout,
+                tonic::Code::Cancelled => ProjectedServiceAccountTokenError::Cancelled,
+                tonic::Code::InvalidArgument => {
+                    ProjectedServiceAccountTokenError::corrupt_response(message)
+                }
+                _ => ProjectedServiceAccountTokenError::transport(status.to_string()),
+            }
+        }
+    }
+}
+
+fn pod_cleanup_intent_error_from_unary(error: UnaryRpcError) -> PodCleanupIntentError {
+    match error {
+        UnaryRpcError::Retryable(message)
+            if message.to_ascii_lowercase().contains("not raft leader") =>
+        {
+            PodCleanupIntentError::NotLeader
+        }
+        UnaryRpcError::Retryable(message) => PodCleanupIntentError::unavailable(message),
+        UnaryRpcError::Status(status) => {
+            let message = status.message().to_string();
+            match status.code() {
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                    PodCleanupIntentError::Unauthorized
+                }
+                tonic::Code::FailedPrecondition
+                    if message.to_ascii_lowercase().contains("not raft leader") =>
+                {
+                    PodCleanupIntentError::NotLeader
+                }
+                tonic::Code::DataLoss | tonic::Code::InvalidArgument => {
+                    PodCleanupIntentError::corrupt_intent(message)
+                }
+                tonic::Code::DeadlineExceeded => PodCleanupIntentError::Timeout,
+                tonic::Code::Cancelled => PodCleanupIntentError::Cancelled,
+                _ => PodCleanupIntentError::transport(status.to_string()),
+            }
+        }
+    }
+}
 
 fn is_not_raft_leader_status(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition

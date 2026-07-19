@@ -157,6 +157,7 @@ fn replace_resource_state_in_conn(
     // follower sequence; new snapshots set the exact leader boundary below.
     Datastore::set_watch_event_allocator_in_conn(&tx, 0)?;
     tx.execute(queries::REPLACE_STATE_DELETE_APPLIED_OUTBOX, [])?;
+    tx.execute("DELETE FROM outbox_stream_watermarks", [])?;
     tx.execute(queries::REPLACE_STATE_DELETE_POD_CLEANUP_INTENTS, [])?;
     tx.execute(queries::REPLACE_STATE_DELETE_NODE_DATAPLANE, [])?;
     tx.execute(queries::REPLACE_STATE_DELETE_NODE_SUBNETS, [])?;
@@ -527,6 +528,7 @@ pub(crate) fn apply_commit_in_tx_for_raft(
         LogApplyMutation::PutAppliedOutbox(row) => Some(row.clone()),
         _ => None,
     });
+    let terminal_watermark = commit.outbox_watermark.clone();
     if let Some(template) = outbox_template.as_ref()
         && let Some(existing) = applied_outbox_record_in_tx(tx, &template.idempotency_key)?
         && !is_uncommitted_outbox_placeholder(&existing)
@@ -644,6 +646,9 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             let message = err.to_string();
             let rejection = committed_rejection_from_conflict(&err, message.clone())?;
             rollback_uncommitted_metadata_rv_if_current_tx(tx, reserved_rv)?;
+            if let Some(watermark) = terminal_watermark.as_ref() {
+                upsert_outbox_watermark_in_tx(tx, watermark)?;
+            }
             if let Some(mut row) = outbox_template {
                 row.applied_rv = None;
                 row.result_proto = crate::datastore::command::encode_response_protobuf(
@@ -972,7 +977,12 @@ fn stamp_provisional_resource_version_in_tx(
 ) -> tokio_rusqlite::Result<LogApplyCommit> {
     let is_committed_apply_v1 =
         commit.resource_version_assignment == ResourceVersionAssignment::CommittedApplyV1;
-    let rv = if commit.resource_version == 0 {
+    let is_outbox_ledger_only = !commit.mutations.is_empty()
+        && commit
+            .mutations
+            .iter()
+            .all(|mutation| matches!(mutation, LogApplyMutation::PutAppliedOutbox(_)));
+    let rv = if commit.resource_version == 0 && !is_outbox_ledger_only {
         Datastore::next_resource_version_in_tx(tx)?
     } else {
         commit.resource_version
@@ -1464,6 +1474,78 @@ mod tests {
             .await
             .unwrap();
         assert!(applied.applied_rv.unwrap() > 10);
+    }
+
+    fn watermark_commit(
+        resource_version: i64,
+        client_id: &str,
+        stream_id: i64,
+        stream_seq: i64,
+    ) -> LogApplyCommit {
+        let mut commit = LogApplyCommit::new(resource_version, Vec::new());
+        commit.outbox_watermark = Some(OutboxStreamWatermark {
+            client_id: client_id.to_string(),
+            stream_id,
+            stream_seq,
+        });
+        commit
+    }
+
+    #[tokio::test]
+    async fn snapshot_replace_prunes_destination_only_and_higher_outbox_watermarks() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.apply_raft_log_apply_commit(watermark_commit(1, "destination-only", 1, 9))
+            .await
+            .unwrap();
+        db.apply_raft_log_apply_commit(watermark_commit(1, "shared", 2, 99))
+            .await
+            .unwrap();
+
+        db.replace_replicated_resource_state(
+            vec![watermark_commit(1, "shared", 2, 4)],
+            1,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![OutboxStreamWatermark {
+                client_id: "shared".to_string(),
+                stream_id: 2,
+                stream_seq: 4,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_replace_rolls_back_outbox_watermark_pruning() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        db.apply_raft_log_apply_commit(watermark_commit(1, "preserved", 7, 8))
+            .await
+            .unwrap();
+
+        db.replace_replicated_resource_state(
+            vec![watermark_commit(2, "snapshot", 8, 1)],
+            1,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("snapshot entry ahead of current_rv must roll back replacement");
+
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![OutboxStreamWatermark {
+                client_id: "preserved".to_string(),
+                stream_id: 7,
+                stream_seq: 8,
+            }]
+        );
     }
 
     #[tokio::test]
@@ -2283,10 +2365,124 @@ mod tests {
             .unwrap();
         let before_duplicate = db.get_current_resource_version().await.unwrap();
         let duplicate = db.apply_raft_log_apply_commit(commit).await.unwrap();
-        assert_eq!(duplicate.applied_rv, Some(before_duplicate));
+        assert_eq!(duplicate.applied_rv, Some(0));
         assert_eq!(
             db.get_current_resource_version().await.unwrap(),
             before_duplicate
+        );
+    }
+
+    #[tokio::test]
+    async fn outbox_terminal_decision_commits_error_ledger_and_watermark_without_public_rv() {
+        let db = Datastore::new_in_memory().await.unwrap();
+        enable_committed_apply_v1(&db).await;
+        db.create_resource(
+            "v1",
+            "ConfigMap",
+            Some("default"),
+            "terminal-existing",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "terminal-existing",
+                    "uid": "existing-uid"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let rv_before = db.get_current_resource_version().await.unwrap();
+        let watch_position_before = db.current_watch_replay_position().await.unwrap();
+        let ledger = |key: &str| {
+            LogApplyMutation::PutAppliedOutbox(crate::log_apply::LogApplyAppliedOutboxRow {
+                idempotency_key: key.to_string(),
+                subject_key: "v1/ConfigMap/default/terminal-existing".to_string(),
+                operation: "PodStatus".to_string(),
+                first_seen_ms: 1,
+                applied_rv: None,
+                result_proto: crate::datastore::command::encode_response_protobuf(
+                    &crate::datastore::command::StorageResponse::Ack {
+                        resource_version: 0,
+                    },
+                )
+                .unwrap(),
+                status_stamp: None,
+            })
+        };
+
+        let mut terminal = LogApplyCommit::new(
+            0,
+            vec![
+                v1_resource("terminal-existing", "different-uid"),
+                ledger("terminal-1"),
+            ],
+        );
+        terminal.outbox_watermark = Some(OutboxStreamWatermark {
+            client_id: "terminal-client".to_string(),
+            stream_id: 91,
+            stream_seq: 1,
+        });
+        let rejected = db
+            .apply_raft_log_apply_commit(committed_apply_v1(terminal))
+            .await
+            .unwrap();
+        assert!(rejected.error_message.is_some());
+        assert_eq!(db.get_current_resource_version().await.unwrap(), rv_before);
+        assert_eq!(
+            db.current_watch_replay_position().await.unwrap(),
+            watch_position_before,
+            "a terminal decision must not append public watch history"
+        );
+        assert_eq!(
+            db.get_resource("v1", "ConfigMap", Some("default"), "terminal-existing")
+                .await
+                .unwrap()
+                .expect("conflicting resource remains")
+                .uid,
+            "existing-uid",
+            "a terminal decision must not mutate its conflicting resource"
+        );
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap(),
+            vec![OutboxStreamWatermark {
+                client_id: "terminal-client".to_string(),
+                stream_id: 91,
+                stream_seq: 1,
+            }],
+            "a committed terminal decision must consume its assigned sequence"
+        );
+        let terminal_row = db
+            .get_applied_outbox("terminal-1")
+            .await
+            .unwrap()
+            .expect("terminal decision ledger row");
+        assert!(matches!(
+            crate::datastore::command::decode_response_protobuf(&terminal_row.result_proto),
+            Ok(crate::datastore::command::StorageResponse::Error { .. })
+        ));
+
+        let mut successor = LogApplyCommit::new(
+            0,
+            vec![
+                v1_resource("after-terminal", "after-terminal-uid"),
+                ledger("terminal-2"),
+            ],
+        );
+        successor.outbox_watermark = Some(OutboxStreamWatermark {
+            client_id: "terminal-client".to_string(),
+            stream_id: 91,
+            stream_seq: 2,
+        });
+        let applied = db
+            .apply_raft_log_apply_commit(committed_apply_v1(successor))
+            .await
+            .expect("next ordered sequence applies after terminal decision");
+        assert!(applied.error_message.is_none());
+        assert_eq!(
+            db.list_outbox_stream_watermarks().await.unwrap()[0].stream_seq,
+            2
         );
     }
 

@@ -3,23 +3,36 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::StreamExt as _;
+use klights_leader_api::{
+    LeaderOutboxDelivery, OutboxDeliveryError, OutboxDeliveryFuture, OutboxDeliveryRequest,
+};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use crate::control_plane::client::Pod;
 use crate::control_plane::client::informer::{InformerCache, scope_for_request};
 use crate::control_plane::client::{
-    CacheScope, ConfigMap, LeaderApiClient, ListRequest, ListResponse, Node, Pod,
-    ProjectedServiceAccountToken, ProjectedServiceAccountTokenRequest, ResourceEvent, Secret,
-    WatchRequest, WatchStream,
+    CacheReadinessError, CacheReadinessFuture, CacheReadinessRequest, LeaderApiClient,
+    LeaderCacheReadiness, LeaderNetworkTopologyQuery, LeaderNodeLeaseRenewal,
+    LeaderNodeSubnetAllocation, LeaderPodCleanupIntents, LeaderProjectedServiceAccountToken,
+    LeaderResourceCommand, LeaderResourceQuery, LeaderWatch, LeaderWatchError, LeaderWatchFuture,
+    ListRequest, NetworkTopologyError, NetworkTopologyFuture, NodeDataplaneQuery,
+    NodeDataplaneResult, NodeLeaseRenewalError, NodeLeaseRenewalFuture, NodeLeaseRenewalRequest,
+    NodeLeaseRenewalResult, NodeSubnetAllocationError, NodeSubnetAllocationFuture,
+    NodeSubnetAllocationRequest, NodeSubnetAllocationResult, NodeSubnetQuery, NodeSubnetResult,
+    PeerSubnetsQuery, PeerSubnetsResult, PodCleanupIntent, PodCleanupIntentAckRequest,
+    PodCleanupIntentError, PodCleanupIntentFuture, PodCleanupIntentListRequest,
+    ProjectedServiceAccountTokenError, ProjectedServiceAccountTokenFuture,
+    ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
+    ResourceCommandRequest, ResourceCommandResult, ResourceEvent, ResourceGetRequest,
+    ResourceListRequest, ResourceListResult, ResourceQueryConsistency, ResourceQueryFuture,
+    WatchRequest, WatchResumeCursor, WatchStream, focused_watch_event, legacy_list_request,
+    legacy_watch_event, query_error, query_list_result,
 };
-use crate::datastore::{NodeSubnet, PodCleanupIntent, Resource, ResourceList};
-use crate::kubelet::outbox::payload::OutboxOperation;
-use crate::kubelet::outbox::{OutboxApplyClient, OutboxApplyError, OutboxApplyResult};
-use crate::networking::wireguard::DataplanePeerMetadata;
+use crate::datastore::{Resource, ResourceList};
 use crate::replication::grpc::client::ReplicationGrpcClient;
 use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
-use klights_types::ResourceKey;
 
 /// bug-grpc: a worker watch stream that delivers neither an event nor a
 /// heartbeat BOOKMARK within this window is treated as wedged and dropped, so
@@ -34,7 +47,7 @@ const WATCH_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6
 /// Outcome of a single idle-bounded poll of a watch stream.
 enum IdleNext {
     /// The stream produced an item (event or decode error).
-    Item(Result<ResourceEvent>),
+    Item(std::result::Result<ResourceEvent, LeaderWatchError>),
     /// The stream ended (None) or the supervisor declined the timer.
     Closed,
     /// No item arrived within the idle window — the stream is wedged.
@@ -47,7 +60,7 @@ enum IdleNext {
 async fn next_event_within_idle(
     supervisor: Option<&Arc<TaskSupervisor>>,
     idle: std::time::Duration,
-    stream: &mut WatchStream<ResourceEvent>,
+    stream: &mut WatchStream,
 ) -> IdleNext {
     let Some(supervisor) = supervisor else {
         return match stream.next().await {
@@ -118,13 +131,13 @@ impl RemoteApiClient {
 
     /// Mark a cache scope as primed.
     #[cfg(test)]
-    pub async fn cache_prime_scope(&self, scope: CacheScope) {
+    pub async fn cache_prime_scope(&self, scope: CacheReadinessRequest) {
         self.cache.mark_primed(scope).await;
     }
 
     /// Clear a cache scope (simulates watch 410 Gone).
     #[cfg(test)]
-    pub async fn cache_clear_scope_for_test(&self, scope: &CacheScope) {
+    pub async fn cache_clear_scope_for_test(&self, scope: &CacheReadinessRequest) {
         self.cache.clear_scope_for_test(scope).await;
     }
 
@@ -205,15 +218,16 @@ impl RemoteApiClient {
                     }
                 }
             }
-            let watch_req = WatchRequest {
-                api_version: req.api_version.clone(),
-                kind: req.kind.clone(),
-                namespace: req.namespace.clone(),
-                label_selector: req.label_selector.clone(),
-                field_selector: req.field_selector.clone(),
-                start_resource_version: next_resource_version,
-                start_watch_replay_position: next_watch_replay_position,
-            };
+            let watch_req = WatchRequest::try_new(
+                req.api_version.clone(),
+                req.kind.clone(),
+                req.namespace.clone(),
+                req.label_selector.clone(),
+                req.field_selector.clone(),
+                next_resource_version,
+                next_watch_replay_position,
+            )
+            .expect("worker informer LIST identity and cursor are validated");
             let selector_req = watch_req.clone();
             match self.watch_resources(watch_req).await {
                 Ok(mut stream) => loop {
@@ -236,33 +250,43 @@ impl RemoteApiClient {
                             // before this event and reconnect, so catch-up replay
                             // re-delivers it — never advance past an event that
                             // was not applied (silent loss on reconnect).
-                            let event_rv = resource_event_version(&event);
-                            let resume_position = event.resume_position;
+                            let legacy_event = legacy_watch_event(&event);
                             let matches =
-                                super::watch_request_matches_event(&selector_req, &event.event);
+                                super::watch_request_matches_event(&selector_req, &legacy_event);
                             let (transitioned, membership_mutation) = if has_selector {
                                 let (event, mutation) = selector_membership
-                                    .prepare_transition(event.event, matches)
+                                    .prepare_transition(legacy_event, matches)
                                     .into_parts();
                                 (event, Some(mutation))
                             } else {
-                                (matches.then_some(event.event), None)
+                                (matches.then_some(legacy_event), None)
                             };
                             let Some(transitioned) = transitioned else {
                                 if let Some(mutation) = membership_mutation {
                                     selector_membership.commit(mutation);
                                 }
-                                super::advance_watch_resume_after_apply(
-                                    &mut next_resource_version,
-                                    &mut next_watch_replay_position,
-                                    event_rv,
-                                    resume_position,
-                                );
+                                let mut cursor = WatchResumeCursor::try_new(
+                                    next_resource_version,
+                                    next_watch_replay_position,
+                                )
+                                .expect("informer cursor remains valid");
+                                if let Err(err) = cursor.advance_after_apply(&event) {
+                                    tracing::warn!(error = %err, "remote informer cursor rejected event");
+                                    break;
+                                }
+                                next_resource_version = cursor.resource_version();
+                                next_watch_replay_position = cursor.replay_position();
                                 continue;
                             };
-                            let event = ResourceEvent {
-                                event: transitioned,
-                                resume_position,
+                            let event = match focused_watch_event(
+                                transitioned,
+                                event.resume_position(),
+                            ) {
+                                Ok(event) => event,
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "remote informer rejected selector transition");
+                                    break;
+                                }
                             };
                             if let Err(err) = self.cache.apply_event(&event).await {
                                 tracing::warn!(
@@ -276,12 +300,17 @@ impl RemoteApiClient {
                             if let Some(mutation) = membership_mutation {
                                 selector_membership.commit(mutation);
                             }
-                            super::advance_watch_resume_after_apply(
-                                &mut next_resource_version,
-                                &mut next_watch_replay_position,
-                                event_rv,
-                                event.resume_position,
-                            );
+                            let mut cursor = WatchResumeCursor::try_new(
+                                next_resource_version,
+                                next_watch_replay_position,
+                            )
+                            .expect("informer cursor remains valid");
+                            if let Err(err) = cursor.advance_after_apply(&event) {
+                                tracing::warn!(error = %err, "remote informer cursor rejected applied event");
+                                break;
+                            }
+                            next_resource_version = cursor.resource_version();
+                            next_watch_replay_position = cursor.replay_position();
                         }
                         IdleNext::Item(Err(err)) => {
                             if watch_error_requires_relist(&err) {
@@ -341,8 +370,15 @@ impl RemoteApiClient {
         }
     }
 
-    async fn prime_list_scope(&self, req: ListRequest) -> Result<ResourceList> {
-        let grpc = self.grpc()?;
+    async fn prime_list_scope(
+        &self,
+        req: ListRequest,
+    ) -> std::result::Result<ResourceList, crate::control_plane::client::ResourceQueryError> {
+        let grpc = self.grpc.as_ref().ok_or_else(|| {
+            crate::control_plane::client::ResourceQueryError::retryable(
+                "RemoteApiClient missing gRPC transport",
+            )
+        })?;
         let list = grpc.list_resources_rpc(req.clone()).await?;
         self.cache.replace_scope(&req, list.clone()).await;
         self.cache.mark_primed(scope_for_request(&req)).await;
@@ -353,15 +389,6 @@ impl RemoteApiClient {
         self.grpc
             .as_ref()
             .ok_or_else(|| anyhow!("RemoteApiClient missing gRPC transport"))
-    }
-
-    fn pod_key(ns: &str, name: &str) -> ResourceKey {
-        ResourceKey {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: Some(ns.to_string()),
-            name: name.to_string(),
-        }
     }
 
     fn list_pods_on_node_request(&self, node_name: &str) -> ListRequest {
@@ -407,296 +434,262 @@ impl RemoteApiClient {
     }
 }
 
-fn resource_event_version(event: &ResourceEvent) -> Option<i64> {
-    event.event.resource_version()
+fn watch_error_requires_relist(err: &LeaderWatchError) -> bool {
+    matches!(err, LeaderWatchError::ReplayExpired { .. })
 }
 
-fn watch_error_requires_relist(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<tonic::Status>()
-            .is_some_and(crate::replication::grpc::is_watch_replay_expired_status)
-    })
+impl LeaderResourceQuery for RemoteApiClient {
+    fn get_resource(
+        &self,
+        request: ResourceGetRequest,
+    ) -> ResourceQueryFuture<'_, Option<Resource>> {
+        Box::pin(async move {
+            let consistency = request.consistency();
+            let key = request.into_key();
+            if consistency == ResourceQueryConsistency::LeaderFresh {
+                let grpc = self.grpc.as_ref().ok_or_else(|| {
+                    crate::control_plane::client::ResourceQueryError::retryable(
+                        "leader-fresh resource query has no gRPC transport",
+                    )
+                })?;
+                let resource = grpc.get_resource_rpc(key.clone()).await?;
+                if let Some(resource) = &resource {
+                    self.cache.insert(resource.clone()).await;
+                }
+                return Ok(resource);
+            }
+
+            if let Some(resource) = self.cache.get(&key).await {
+                return Ok(Some(resource));
+            }
+            let legacy_request = ListRequest {
+                api_version: key.api_version.clone(),
+                kind: key.kind.clone(),
+                namespace: key.namespace.clone(),
+                label_selector: None,
+                field_selector: None,
+                limit: None,
+                continue_token: None,
+            };
+            let scope = scope_for_request(&legacy_request);
+            if self.cache.is_ready(&scope).await {
+                return Ok(None);
+            }
+            if self.grpc.is_some() {
+                self.prime_list_scope(legacy_request)
+                    .await
+                    .map_err(query_error)?;
+                return Ok(self.cache.get(&key).await);
+            }
+            Ok(None)
+        })
+    }
+
+    fn list_resources(
+        &self,
+        request: ResourceListRequest,
+    ) -> ResourceQueryFuture<'_, ResourceListResult> {
+        Box::pin(async move {
+            let consistency = request.consistency();
+            let legacy_request = legacy_list_request(&request);
+            let list = if consistency == ResourceQueryConsistency::LeaderFresh {
+                self.prime_list_scope(legacy_request).await?
+            } else {
+                let scope = scope_for_request(&legacy_request);
+                if self.cache.is_ready(&scope).await {
+                    self.cache.list(&legacy_request).await
+                } else if self.grpc.is_some() {
+                    self.prime_list_scope(legacy_request)
+                        .await
+                        .map_err(query_error)?
+                } else {
+                    self.cache.list(&legacy_request).await
+                }
+            };
+            query_list_result(list)
+        })
+    }
 }
 
-#[async_trait]
-impl LeaderApiClient for RemoteApiClient {
-    async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-        if let Some(resource) = self.cache.get(&key).await {
-            return Ok(Some(resource));
-        }
-        let req = ListRequest {
-            api_version: key.api_version.clone(),
-            kind: key.kind.clone(),
-            namespace: key.namespace.clone(),
-            label_selector: None,
-            field_selector: None,
-            limit: None,
-            continue_token: None,
-        };
-        let scope = scope_for_request(&req);
-        if self.cache.is_ready(&scope).await {
-            return Ok(None);
-        }
-        if self.grpc.is_some() {
-            self.prime_list_scope(req).await?;
-            return Ok(self.cache.get(&key).await);
-        }
-        Ok(None)
+impl LeaderResourceCommand for RemoteApiClient {
+    fn submit_resource_command(
+        &self,
+        request: ResourceCommandRequest,
+    ) -> ResourceCommandFuture<'_, ResourceCommandResult> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                ResourceCommandError::retryable("RemoteApiClient missing gRPC transport")
+            })?;
+            grpc.submit_resource_command_rpc(request).await
+        })
     }
+}
 
-    async fn list_resources(&self, req: ListRequest) -> Result<ListResponse> {
-        let scope = scope_for_request(&req);
-        if self.cache.is_ready(&scope).await {
-            return Ok(self.cache.list(&req).await);
-        }
-        if self.grpc.is_some() {
-            return self.prime_list_scope(req).await;
-        }
-        Ok(self.cache.list(&req).await)
+impl LeaderNodeLeaseRenewal for RemoteApiClient {
+    fn renew_node_lease(
+        &self,
+        request: NodeLeaseRenewalRequest,
+    ) -> NodeLeaseRenewalFuture<'_, NodeLeaseRenewalResult> {
+        Box::pin(async move {
+            if request.node_name() != self.node_name {
+                return Err(NodeLeaseRenewalError::unauthorized(format!(
+                    "node {} cannot renew the lease for {}",
+                    self.node_name,
+                    request.node_name()
+                )));
+            }
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                NodeLeaseRenewalError::unavailable("RemoteApiClient missing gRPC transport")
+            })?;
+            grpc.renew_node_lease_focused_rpc(
+                request.renew_time(),
+                request.lease_duration_seconds(),
+            )
+            .await?;
+            Ok(NodeLeaseRenewalResult::Renewed)
+        })
     }
+}
 
-    async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
-        let Some(grpc) = &self.grpc else {
-            return self.get_resource(key).await;
-        };
-        let resource = grpc.get_resource_rpc(key.clone()).await?;
-        if let Some(resource) = &resource {
-            self.cache.insert(resource.clone()).await;
-        }
-        Ok(resource)
+impl LeaderWatch for RemoteApiClient {
+    fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
+        Box::pin(async move {
+            self.grpc()
+                .map_err(|error| LeaderWatchError::unavailable(error.to_string()))?
+                .watch_resources_rpc(req)
+                .await
+        })
     }
+}
 
-    async fn list_resources_fresh(&self, req: ListRequest) -> Result<ListResponse> {
-        if self.grpc.is_some() {
-            return self.prime_list_scope(req).await;
-        }
-        self.list_resources(req).await
+impl LeaderCacheReadiness for RemoteApiClient {
+    fn wait_cache_ready(&self, scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+        Box::pin(async move {
+            if self.grpc.is_none() && !self.cache.is_ready(&scope).await {
+                return Err(CacheReadinessError::unavailable(format!(
+                    "cache scope {scope:?} not yet primed"
+                )));
+            }
+            self.cache
+                .wait_ready(scope)
+                .await
+                .map_err(|error| CacheReadinessError::unavailable(error.to_string()))
+        })
     }
+}
 
-    async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-        self.grpc()?.watch_resources_rpc(req).await
-    }
-
-    async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()> {
-        if self.grpc.is_none() && !self.cache.is_ready(&scope).await {
-            return Err(anyhow!("cache scope {scope:?} not yet primed"));
-        }
-        self.cache.wait_ready(scope).await
-    }
-
-    async fn projected_service_account_token(
+impl LeaderProjectedServiceAccountToken for RemoteApiClient {
+    fn issue_projected_service_account_token(
         &self,
         request: ProjectedServiceAccountTokenRequest,
-    ) -> Result<ProjectedServiceAccountToken> {
-        self.grpc()?
-            .projected_service_account_token_rpc(request)
-            .await
-    }
-
-    async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Pod>> {
-        self.get_resource(Self::pod_key(ns, name)).await
-    }
-
-    async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Pod>> {
-        Ok(self
-            .get_resource(Self::pod_key(ns, name))
-            .await?
-            .filter(|resource| resource.uid == uid))
-    }
-
-    async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Pod>> {
-        let watch = self
-            .watch_resources(WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: Some(format!("spec.nodeName={node_name}")),
-                start_resource_version: None,
-                start_watch_replay_position: None,
-            })
-            .await?;
-        let cache = self.cache.clone();
-        Ok(Box::pin(watch.filter_map(move |event| {
-            let cache = cache.clone();
-            async move {
-                match event {
-                    Ok(event) => match cache.apply_event(&event).await {
-                        Ok(Some(resource)) => Some(Ok(resource)),
-                        Ok(None) => None,
-                        Err(err) => Some(Err(err)),
-                    },
-                    Err(err) => Some(Err(err)),
-                }
-            }
-        })))
-    }
-
-    async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Pod>> {
-        Ok(self
-            .list_resources(self.list_pods_on_node_request(node_name))
-            .await?
-            .items)
-    }
-
-    async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<ConfigMap>> {
-        self.get_resource(ResourceKey {
-            api_version: "v1".to_string(),
-            kind: "ConfigMap".to_string(),
-            namespace: Some(ns.to_string()),
-            name: name.to_string(),
+    ) -> ProjectedServiceAccountTokenFuture<'_> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                ProjectedServiceAccountTokenError::unavailable(
+                    "RemoteApiClient missing gRPC transport",
+                )
+            })?;
+            grpc.projected_service_account_token_rpc(request).await
         })
-        .await
     }
+}
 
-    async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
-        self.get_resource(ResourceKey {
-            api_version: "v1".to_string(),
-            kind: "Secret".to_string(),
-            namespace: Some(ns.to_string()),
-            name: name.to_string(),
+impl LeaderPodCleanupIntents for RemoteApiClient {
+    fn list_pod_cleanup_intents(
+        &self,
+        request: PodCleanupIntentListRequest,
+    ) -> PodCleanupIntentFuture<'_, Vec<PodCleanupIntent>> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                PodCleanupIntentError::unavailable("RemoteApiClient missing gRPC transport")
+            })?;
+            grpc.list_pod_cleanup_intents_for_node_rpc(request).await
         })
-        .await
     }
 
-    async fn get_node(&self, name: &str) -> Result<Node> {
-        self.get_resource(ResourceKey {
-            api_version: "v1".to_string(),
-            kind: "Node".to_string(),
-            namespace: None,
-            name: name.to_string(),
+    fn acknowledge_pod_cleanup_intent(
+        &self,
+        request: PodCleanupIntentAckRequest,
+    ) -> PodCleanupIntentFuture<'_, ()> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                PodCleanupIntentError::unavailable("RemoteApiClient missing gRPC transport")
+            })?;
+            grpc.delete_pod_cleanup_intent_rpc(request).await
         })
-        .await
-        .and_then(|node| node.ok_or_else(|| anyhow!("Node {name} not found")))
     }
+}
 
-    async fn watch_node(&self, name: &str) -> Result<WatchStream<Node>> {
-        let watch = self
-            .watch_resources(WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "Node".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: Some(format!("metadata.name={name}")),
-                start_resource_version: None,
-                start_watch_replay_position: None,
-            })
-            .await?;
-        let cache = self.cache.clone();
-        Ok(Box::pin(watch.filter_map(move |event| {
-            let cache = cache.clone();
-            async move {
-                match event {
-                    Ok(event) => match cache.apply_event(&event).await {
-                        Ok(Some(resource)) => Some(Ok(resource)),
-                        Ok(None) => None,
-                        Err(err) => Some(Err(err)),
-                    },
-                    Err(err) => Some(Err(err)),
-                }
-            }
-        })))
-    }
-
-    async fn allocate_node_subnet(
+impl LeaderNodeSubnetAllocation for RemoteApiClient {
+    fn allocate_node_subnet(
         &self,
-        node_name: &str,
-        cluster_cidr: &str,
-        node_ip: &str,
-    ) -> Result<NodeSubnet> {
-        self.grpc()?
-            .allocate_node_subnet_rpc(node_name, cluster_cidr, node_ip)
-            .await
+        request: NodeSubnetAllocationRequest,
+    ) -> NodeSubnetAllocationFuture<'_, NodeSubnetAllocationResult> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                NodeSubnetAllocationError::retryable("RemoteApiClient missing gRPC transport")
+            })?;
+            grpc.allocate_node_subnet_rpc(request).await
+        })
     }
+}
 
-    async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-        self.grpc()?.get_node_subnet_rpc(node_name).await
-    }
-
-    async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        self.grpc()?.list_peer_subnets_rpc(my_node_name).await
-    }
-
-    async fn get_node_dataplane(&self, node_name: &str) -> Result<Option<DataplanePeerMetadata>> {
-        self.grpc()?.get_node_dataplane_rpc(node_name).await
-    }
-
-    async fn list_pod_cleanup_intents_for_node(
+impl LeaderNetworkTopologyQuery for RemoteApiClient {
+    fn get_node_subnet(
         &self,
-        node_name: &str,
-    ) -> Result<Vec<PodCleanupIntent>> {
-        self.grpc()?
-            .list_pod_cleanup_intents_for_node_rpc(node_name)
-            .await
+        request: NodeSubnetQuery,
+    ) -> NetworkTopologyFuture<'_, NodeSubnetResult> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                NetworkTopologyError::retryable("RemoteApiClient missing gRPC transport")
+            })?;
+            grpc.get_node_subnet_rpc(request).await
+        })
     }
 
-    async fn delete_pod_cleanup_intent(
+    fn list_peer_subnets(
         &self,
-        node_name: &str,
-        namespace: &str,
-        pod_name: &str,
-        pod_uid: &str,
-        reason: &str,
-    ) -> Result<()> {
-        self.grpc()?
-            .delete_pod_cleanup_intent_rpc(node_name, namespace, pod_name, pod_uid, reason)
-            .await
+        request: PeerSubnetsQuery,
+    ) -> NetworkTopologyFuture<'_, PeerSubnetsResult> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                NetworkTopologyError::retryable("RemoteApiClient missing gRPC transport")
+            })?;
+            grpc.list_peer_subnets_rpc(request).await
+        })
     }
 
-    async fn get_cluster_membership(
+    fn get_node_dataplane(
         &self,
-    ) -> Result<crate::control_plane::client::membership::ClusterMembership> {
-        self.grpc()?.cluster_membership().await
-    }
-
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        operation: OutboxOperation,
-        payload: Bytes,
-        client_id: &str,
-        stream_id: i64,
-        stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        let Some(grpc) = &self.grpc else {
-            return Err(OutboxApplyError::Retryable(
-                "RemoteApiClient missing gRPC transport".to_string(),
-            ));
-        };
-        grpc.apply_outbox_rpc(
-            idempotency_key,
-            operation,
-            payload,
-            client_id,
-            stream_id,
-            stream_seq,
-        )
-        .await
+        request: NodeDataplaneQuery,
+    ) -> NetworkTopologyFuture<'_, NodeDataplaneResult> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                NetworkTopologyError::retryable("RemoteApiClient missing gRPC transport")
+            })?;
+            grpc.get_node_dataplane_rpc(request).await
+        })
     }
 }
 
 #[async_trait]
-impl OutboxApplyClient for RemoteApiClient {
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        operation: OutboxOperation,
-        payload: Bytes,
-        client_id: &str,
-        stream_id: i64,
-        stream_seq: i64,
-    ) -> std::result::Result<OutboxApplyResult, OutboxApplyError> {
-        LeaderApiClient::apply_outbox(
-            self,
-            idempotency_key,
-            operation,
-            payload,
-            client_id,
-            stream_id,
-            stream_seq,
-        )
-        .await
+impl LeaderApiClient for RemoteApiClient {}
+
+impl LeaderOutboxDelivery for RemoteApiClient {
+    fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+        Box::pin(async move {
+            let grpc = self.grpc.as_ref().ok_or_else(|| {
+                OutboxDeliveryError::unavailable("RemoteApiClient missing gRPC transport")
+            })?;
+            if grpc.node_name() != self.node_name {
+                return Err(OutboxDeliveryError::unavailable(format!(
+                    "RemoteApiClient node identity {} does not match gRPC identity {}",
+                    self.node_name,
+                    grpc.node_name(),
+                )));
+            }
+            grpc.deliver_outbox(request).await
+        })
     }
 }
 
@@ -704,18 +697,24 @@ impl OutboxApplyClient for RemoteApiClient {
 mod tests {
     use std::sync::Arc;
 
-    use anyhow::anyhow;
     use bytes::Bytes;
     use futures::StreamExt as _;
     use serde_json::json;
 
     use crate::control_plane::client::remote::RemoteApiClient;
-    use crate::control_plane::client::{CacheScope, LeaderApiClient, ListRequest, WatchRequest};
+    use crate::control_plane::client::{
+        CacheReadinessError, CacheReadinessRequest, LeaderCacheReadiness,
+        LeaderNetworkTopologyQuery, LeaderNodeSubnetAllocation, LeaderResourceCommand,
+        LeaderResourceQuery, LeaderWatch, LeaderWatchError, NodeDataplaneQuery,
+        NodeSubnetAllocationError, NodeSubnetAllocationRequest, NodeSubnetQuery, PeerSubnetsQuery,
+        ResourceEvent, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
+        WatchEventType, WatchRequest, pod_get_request,
+    };
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::backend::DatastoreHandle;
     use crate::datastore::command::StorageCommand;
     use crate::kubelet::outbox::OutboxApplyError;
-    use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+    use crate::kubelet::outbox::payload::OutboxPayload;
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode};
     use crate::replication::grpc::client::{
         GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
@@ -723,6 +722,7 @@ mod tests {
     use crate::replication::protocol::JoinRole;
     use crate::replication::service::ReplicationService;
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryRequest};
     use klights_types::ResourceKey;
 
     fn dataplane() -> JoinDataplaneMetadata {
@@ -733,6 +733,12 @@ mod tests {
             mode: DataplaneMode::Root,
             encryption: DataplaneEncryption::Disabled,
         }
+    }
+
+    #[test]
+    fn remote_api_client_exposes_resource_command_capability() {
+        fn assert_capability<T: LeaderResourceCommand>() {}
+        assert_capability::<RemoteApiClient>();
     }
 
     /// Self-signed `system:node:<name>` certificate (DER) for simulating the
@@ -867,73 +873,28 @@ mod tests {
     }
 
     #[test]
-    fn watch_error_requires_relist_requires_typed_replay_marker() {
-        let marked = crate::replication::grpc::watch_replay_expired_status(51, "expired");
-        let err = anyhow::Error::from(marked).context("gRPC WatchResources failed");
+    fn watch_error_requires_relist_requires_typed_replay_expiry() {
+        let expired = LeaderWatchError::ReplayExpired {
+            accepted_resource_version: 51,
+        };
         assert!(
-            super::watch_error_requires_relist(&err),
-            "typed replay-expired status must trigger relist"
+            super::watch_error_requires_relist(&expired),
+            "typed replay expiry must trigger relist"
         );
 
-        let wrapped = crate::replication::grpc::watch_replay_expired_status(52, "expired");
-        let err = anyhow::Error::from(wrapped)
-            .context("inner wrapper")
-            .context("gRPC WatchResources stream failed");
-        assert!(
-            super::watch_error_requires_relist(&err),
-            "typed replay-expired status must be detected through wrappers"
-        );
-
-        let legacy = tonic::Status::out_of_range(
-            "WatchResources replay window expired: resume rv 52 requires relist",
-        );
-        let err = anyhow::Error::from(legacy).context("gRPC WatchResources stream failed");
-        assert!(
-            super::watch_error_requires_relist(&err),
-            "exact legacy replay-expired status from pre-marker leaders must trigger relist"
-        );
-
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert(
-            crate::replication::grpc::WATCH_REPLAY_EXPIRED_REASON_METADATA_KEY,
-            tonic::metadata::MetadataValue::from_static(
-                crate::replication::grpc::WATCH_REPLAY_EXPIRED_REASON,
-            ),
-        );
-        let malformed_marker = tonic::Status::with_details_and_metadata(
-            tonic::Code::OutOfRange,
-            "expired",
-            Bytes::from_static(b"not protobuf"),
-            metadata,
-        );
-
-        let cases = [
+        for (error, name) in [
             (
-                tonic::Status::out_of_range("expired but unmarked"),
-                "unmarked OutOfRange",
+                LeaderWatchError::transport("expired but unmarked"),
+                "transport",
             ),
-            (
-                tonic::Status::out_of_range("message exceeds configured maximum size"),
-                "message-size OutOfRange",
-            ),
-            (
-                tonic::Status::unavailable("transport gone"),
-                "non-OutOfRange gRPC error",
-            ),
-            (malformed_marker, "malformed replay-expired details"),
-        ];
-        for (status, name) in cases {
-            let err = anyhow::Error::from(status).context("gRPC WatchResources stream failed");
+            (LeaderWatchError::Timeout, "timeout"),
+            (LeaderWatchError::Cancelled, "cancelled"),
+        ] {
             assert!(
-                !super::watch_error_requires_relist(&err),
+                !super::watch_error_requires_relist(&error),
                 "{name} must not trigger relist"
             );
         }
-
-        assert!(
-            !super::watch_error_requires_relist(&anyhow!("410 Gone: too old resourceVersion")),
-            "display text alone must not trigger relist"
-        );
     }
 
     #[tokio::test]
@@ -950,7 +911,10 @@ mod tests {
         .unwrap();
 
         let pod = client
-            .get_pod("default", "web")
+            .get_resource(
+                pod_get_request("default", "web", ResourceQueryConsistency::Cached)
+                    .expect("valid Pod request"),
+            )
             .await
             .expect("remote cache-prime get pod")
             .expect("unready cache scope should be synchronously primed before reporting absence");
@@ -970,7 +934,10 @@ mod tests {
         .await
         .unwrap();
         let cached = client
-            .get_pod("default", "web")
+            .get_resource(
+                pod_get_request("default", "web", ResourceQueryConsistency::Cached)
+                    .expect("valid Pod request"),
+            )
             .await
             .expect("remote cached pod")
             .expect("pod should remain cached");
@@ -990,13 +957,16 @@ mod tests {
         let client = RemoteApiClient::new_for_tests("worker-1");
 
         let err = client
-            .apply_outbox(
-                "missing-grpc-watermarked-status",
-                OutboxOperation::PodStatus,
-                pod_status_payload("uid-1"),
-                "worker-client",
-                7,
-                1,
+            .deliver_outbox(
+                OutboxDeliveryRequest::try_new(
+                    "missing-grpc-watermarked-status",
+                    klights_leader_api::OutboxDeliveryOperation::PodStatus,
+                    Arc::<[u8]>::from(pod_status_payload("uid-1").to_vec()),
+                    "worker-client",
+                    7,
+                    1,
+                )
+                .expect("valid delivery request"),
             )
             .await
             .expect_err("missing gRPC must not acknowledge a sequenced outbox row");
@@ -1021,13 +991,16 @@ mod tests {
         .unwrap();
 
         let err = client
-            .apply_outbox(
-                "uid-mismatch",
-                OutboxOperation::PodStatus,
-                pod_status_payload("uid-2"),
-                "client",
-                0,
-                0,
+            .deliver_outbox(
+                OutboxDeliveryRequest::try_new(
+                    "uid-mismatch",
+                    klights_leader_api::OutboxDeliveryOperation::PodStatus,
+                    Arc::<[u8]>::from(pod_status_payload("uid-2").to_vec()),
+                    "client",
+                    1,
+                    1,
+                )
+                .expect("valid delivery request"),
             )
             .await
             .expect_err("unwatermarked leader uid mismatch must propagate");
@@ -1036,10 +1009,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn grpc_watch_pods_on_node_streams_leader_events() {
+    async fn grpc_focused_pod_watch_streams_leader_events() {
         let (client, db, handle) = remote_client_and_leader_db().await;
         let mut stream = client
-            .watch_pods_on_node("worker-1")
+            .watch_resources(
+                WatchRequest::try_new(
+                    "v1",
+                    "Pod",
+                    None,
+                    None,
+                    Some("spec.nodeName=worker-1".to_string()),
+                    None,
+                    None,
+                )
+                .expect("valid Pod watch"),
+            )
             .await
             .expect("open remote pod watch");
         db.create_resource(
@@ -1052,13 +1036,13 @@ mod tests {
         .await
         .unwrap();
 
-        let pod = stream
+        let event = stream
             .next()
             .await
             .expect("watch should yield")
             .expect("watch event should decode");
-        assert_eq!(pod.name, "watched");
-        assert_eq!(pod.uid, "uid-watch");
+        assert_eq!(event.resource().name, "watched");
+        assert_eq!(event.resource().uid, "uid-watch");
         handle.abort();
     }
 
@@ -1067,28 +1051,41 @@ mod tests {
         let (client, db, handle) = remote_client_and_leader_db().await;
 
         let subnet = client
-            .allocate_node_subnet("worker-1", "10.42.0.0/16", "192.0.2.20")
+            .allocate_node_subnet(
+                NodeSubnetAllocationRequest::try_new("worker-1", "10.42.0.0/16", "192.0.2.20")
+                    .expect("valid request"),
+            )
             .await
-            .expect("allocate worker subnet through typed gRPC");
-        assert_eq!(subnet.node_name.as_str(), "worker-1");
-        assert_eq!(subnet.subnet.to_string(), "10.42.0.0/24");
+            .expect("allocate worker subnet through typed gRPC")
+            .into_subnet();
+        assert_eq!(subnet.node_name(), "worker-1");
+        assert_eq!(subnet.subnet(), "10.42.0.0/24");
 
         let fetched = client
-            .get_node_subnet("worker-1")
+            .get_node_subnet(NodeSubnetQuery::try_new("worker-1").expect("valid query"))
             .await
             .expect("get worker subnet through typed gRPC")
+            .into_option()
             .expect("worker subnet should exist");
         assert_eq!(fetched, subnet);
 
-        let peer = client
-            .allocate_node_subnet("worker-2", "10.42.0.0/16", "192.0.2.21")
+        let peer_error = client
+            .allocate_node_subnet(
+                NodeSubnetAllocationRequest::try_new("worker-2", "10.42.0.0/16", "192.0.2.21")
+                    .expect("valid request"),
+            )
             .await
-            .expect("allocate peer subnet through typed gRPC");
+            .expect_err("worker certificate must not allocate a peer subnet");
+        assert!(matches!(
+            peer_error,
+            NodeSubnetAllocationError::Unauthorized { .. }
+        ));
         let peers = client
-            .list_peer_subnets("worker-1")
+            .list_peer_subnets(PeerSubnetsQuery::try_new("worker-1").expect("valid query"))
             .await
-            .expect("list peer subnets through typed gRPC");
-        assert_eq!(peers, vec![peer]);
+            .expect("list peer subnets through typed gRPC")
+            .into_vec();
+        assert!(peers.is_empty());
 
         let stored_metadata = db
             .get_node_dataplane("worker-1")
@@ -1096,10 +1093,17 @@ mod tests {
             .expect("dataplane metadata lookup")
             .expect("join should have stored worker dataplane metadata");
         let fetched_metadata = client
-            .get_node_dataplane("worker-1")
+            .get_node_dataplane(NodeDataplaneQuery::try_new("worker-1").expect("valid query"))
             .await
-            .expect("get worker dataplane metadata through typed gRPC");
-        assert_eq!(fetched_metadata, Some(stored_metadata));
+            .expect("get worker dataplane metadata through typed gRPC")
+            .into_option();
+        assert_eq!(
+            fetched_metadata,
+            Some(
+                crate::control_plane::client::focused_dataplane(stored_metadata)
+                    .expect("valid focused metadata"),
+            )
+        );
 
         handle.abort();
     }
@@ -1128,15 +1132,18 @@ mod tests {
         .unwrap();
 
         let mut stream = client
-            .watch_resources(WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: None,
-                label_selector: None,
-                field_selector: Some("spec.nodeName=worker-1".to_string()),
-                start_resource_version: Some(start_rv),
-                start_watch_replay_position: None,
-            })
+            .watch_resources(
+                WatchRequest::try_new(
+                    "v1",
+                    "Pod",
+                    None,
+                    None,
+                    Some("spec.nodeName=worker-1".to_string()),
+                    Some(start_rv),
+                    None,
+                )
+                .expect("valid continuation watch"),
+            )
             .await
             .expect("open continuation watch");
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
@@ -1146,13 +1153,13 @@ mod tests {
             .expect("watch event should decode");
         assert!(
             event
-                .resume_position
+                .resume_position()
                 .is_some_and(|position| position.event_id > 0),
             "gRPC watch events must carry an apply-order resume position"
         );
         let pod_name = event
-            .event
-            .object
+            .resource()
+            .data
             .pointer("/metadata/name")
             .and_then(|value| value.as_str());
         assert_eq!(pod_name, Some("missed"));
@@ -1175,21 +1182,23 @@ mod tests {
         )
         .await
         .unwrap();
-        let list_req = ListRequest {
-            api_version: "v1".to_string(),
-            kind: "ConfigMap".to_string(),
-            namespace: Some("default".to_string()),
-            label_selector: None,
-            field_selector: None,
-            limit: None,
-            continue_token: None,
-        };
+        let list_req = ResourceListRequest::try_new(
+            "v1",
+            "ConfigMap",
+            Some("default".to_string()),
+            None,
+            None,
+            None,
+            None,
+            ResourceQueryConsistency::LeaderFresh,
+        )
+        .expect("valid ConfigMap list request");
         let list = client
-            .list_resources_fresh(list_req)
+            .list_resources(list_req)
             .await
             .expect("list through gRPC");
         let list_position = list
-            .watch_replay_position
+            .watch_replay_position()
             .expect("gRPC LIST must preserve its atomic replay position");
         assert!(list_position.event_id > 0);
 
@@ -1207,15 +1216,18 @@ mod tests {
         .await
         .unwrap();
         let mut stream = client
-            .watch_resources(WatchRequest {
-                api_version: "v1".to_string(),
-                kind: "ConfigMap".to_string(),
-                namespace: Some("default".to_string()),
-                label_selector: None,
-                field_selector: None,
-                start_resource_version: Some(list.resource_version),
-                start_watch_replay_position: Some(list_position),
-            })
+            .watch_resources(
+                WatchRequest::try_new(
+                    "v1",
+                    "ConfigMap",
+                    Some("default".to_string()),
+                    None,
+                    None,
+                    Some(list.resource_version()),
+                    Some(list_position),
+                )
+                .expect("valid positioned ConfigMap watch"),
+            )
             .await
             .expect("resume watch from atomic list position");
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
@@ -1223,10 +1235,10 @@ mod tests {
             .expect("post-list event must replay")
             .expect("stream should yield")
             .expect("event should decode");
-        assert_eq!(event.event.object["metadata"]["name"], "after-list");
+        assert_eq!(event.resource().data["metadata"]["name"], "after-list");
         assert!(
             event
-                .resume_position
+                .resume_position()
                 .is_some_and(|position| position.event_id > list_position.event_id)
         );
         handle.abort();
@@ -1238,11 +1250,8 @@ mod tests {
         // Simulates: cache primed, disconnect clears scope, re-list repopulates.
         let client = RemoteApiClient::new_for_tests("worker-1");
 
-        let pod_scope = crate::control_plane::client::CacheScope::Resource {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: None,
-        };
+        let pod_scope = CacheReadinessRequest::try_new("v1", "Pod", None, None, None)
+            .expect("valid cache scope");
 
         // Prime the scope and insert data
         client.cache_prime_scope(pod_scope.clone()).await;
@@ -1265,7 +1274,13 @@ mod tests {
             .cache_insert_pod(make_pod("default", "web", "uid-2", "worker-1", "Running"))
             .await;
         assert!(client.wait_cache_ready(pod_scope).await.is_ok());
-        let pod = client.get_pod("default", "web").await.unwrap();
+        let pod = client
+            .get_resource(
+                pod_get_request("default", "web", ResourceQueryConsistency::Cached)
+                    .expect("valid Pod request"),
+            )
+            .await
+            .unwrap();
         assert!(pod.is_some());
         assert_eq!(pod.unwrap().uid, "uid-2");
     }
@@ -1278,7 +1293,12 @@ mod tests {
         let client = RemoteApiClient::new_for_tests("worker-1");
 
         // No pod in cache → cache miss → returns None
-        let result = client.get_pod("default", "nonexistent").await;
+        let result = client
+            .get_resource(
+                pod_get_request("default", "nonexistent", ResourceQueryConsistency::Cached)
+                    .expect("valid Pod request"),
+            )
+            .await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none(), "cache miss should return None");
 
@@ -1286,7 +1306,12 @@ mod tests {
         client
             .cache_insert_pod(make_pod("default", "web", "uid-1", "worker-1", "Running"))
             .await;
-        let result = client.get_pod("default", "web").await;
+        let result = client
+            .get_resource(
+                pod_get_request("default", "web", ResourceQueryConsistency::Cached)
+                    .expect("valid Pod request"),
+            )
+            .await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_some(), "cache hit should return pod");
     }
@@ -1294,22 +1319,26 @@ mod tests {
     #[tokio::test]
     async fn cache_based_get_resource_returns_primed_value() {
         let client = RemoteApiClient::new_for_tests("worker-1");
-        let scope = CacheScope::Resource {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: Some("default".to_string()),
-        };
+        let scope =
+            CacheReadinessRequest::try_new("v1", "Pod", Some("default".to_string()), None, None)
+                .expect("valid cache scope");
         let pod = make_pod("default", "web", "uid-1", "worker-1", "Running");
         client.cache_prime_scope(scope).await;
         client.cache_insert_pod(pod.clone()).await;
 
         let fetched = client
-            .get_resource(ResourceKey {
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: Some("default".to_string()),
-                name: "web".to_string(),
-            })
+            .get_resource(
+                ResourceGetRequest::try_new(
+                    ResourceKey {
+                        api_version: "v1".to_string(),
+                        kind: "Pod".to_string(),
+                        namespace: Some("default".to_string()),
+                        name: "web".to_string(),
+                    },
+                    ResourceQueryConsistency::Cached,
+                )
+                .expect("valid Pod request"),
+            )
             .await
             .expect("get_resource");
 
@@ -1324,53 +1353,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uid_bound_get_returns_none_on_uid_change() {
-        // Tests that get_pod_for_uid returns None when UID has changed
-        // (e.g., same-name replacement by StatefulSet). The cache key is
-        // (apiVersion, kind, namespace, name) — so inserting a replacement
-        // pod with a new UID overwrites the old entry, just as a watch
-        // MODIFIED event would.
+    async fn leader_fresh_get_never_falls_back_to_a_primed_cache_without_transport() {
         let client = RemoteApiClient::new_for_tests("worker-1");
+        let scope =
+            CacheReadinessRequest::try_new("v1", "Pod", Some("default".to_string()), None, None)
+                .expect("valid cache scope");
+        client.cache_prime_scope(scope).await;
         client
-            .cache_insert_pod(make_pod("default", "web", "uid-1", "worker-1", "Running"))
+            .cache_insert_pod(make_pod(
+                "default",
+                "web",
+                "stale-uid",
+                "worker-1",
+                "Running",
+            ))
             .await;
 
-        // Old UID is in cache → found
-        let result = client
-            .get_pod_for_uid("default", "web", "uid-1")
+        let error = client
+            .get_resource(
+                pod_get_request("default", "web", ResourceQueryConsistency::LeaderFresh)
+                    .expect("valid leader-fresh request"),
+            )
             .await
-            .unwrap();
-        assert!(result.is_some(), "uid-1 should be found");
-
-        // Different UID for same name → not found
-        let result = client
-            .get_pod_for_uid("default", "web", "uid-2")
+            .expect_err("leader-fresh must fail closed without a leader transport");
+        assert!(matches!(
+            error,
+            crate::control_plane::client::ResourceQueryError::Retryable { .. }
+        ));
+        let error = client
+            .list_resources(
+                ResourceListRequest::try_new(
+                    "v1",
+                    "Pod",
+                    Some("default".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    ResourceQueryConsistency::LeaderFresh,
+                )
+                .unwrap(),
+            )
             .await
-            .unwrap();
-        assert!(result.is_none(), "uid-2 should not be found");
+            .expect_err("leader-fresh LIST must fail closed without a leader transport");
+        assert!(matches!(
+            error,
+            crate::control_plane::client::ResourceQueryError::Retryable { .. }
+        ));
+    }
 
-        // Simulate replacement: new pod with uid-2 arrives via watch,
-        // overwriting the old cache entry (same key).
-        client
-            .cache_insert_pod(make_pod("default", "web", "uid-2", "worker-1", "Running"))
-            .await;
+    #[tokio::test]
+    async fn cache_readiness_keeps_selector_scopes_distinct() {
+        let client = RemoteApiClient::new_for_tests("worker-1");
+        let selected = CacheReadinessRequest::try_new(
+            "v1",
+            "Pod",
+            None,
+            None,
+            Some("spec.nodeName=worker-1".to_string()),
+        )
+        .expect("valid selected Pod scope");
+        let unfiltered = CacheReadinessRequest::try_new("v1", "Pod", None, None, None)
+            .expect("valid unfiltered Pod scope");
 
-        // Old UID query now returns None because the cache entry carries uid-2
-        let result = client
-            .get_pod_for_uid("default", "web", "uid-1")
-            .await
-            .unwrap();
-        assert!(
-            result.is_none(),
-            "old uid-1 should return None after replacement"
-        );
-
-        // New UID is found
-        let result = client
-            .get_pod_for_uid("default", "web", "uid-2")
-            .await
-            .unwrap();
-        assert!(result.is_some(), "uid-2 should be found after replacement");
+        client.cache_prime_scope(selected.clone()).await;
+        assert!(client.wait_cache_ready(selected).await.is_ok());
+        assert!(matches!(
+            client.wait_cache_ready(unfiltered).await,
+            Err(CacheReadinessError::Unavailable { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1378,13 +1429,16 @@ mod tests {
         let client = RemoteApiClient::new_for_tests("worker-1");
 
         let err = client
-            .apply_outbox(
-                "key-1",
-                crate::kubelet::outbox::payload::OutboxOperation::PodStatus,
-                bytes::Bytes::from_static(b"test"),
-                "client",
-                1,
-                1,
+            .deliver_outbox(
+                OutboxDeliveryRequest::try_new(
+                    "key-1",
+                    klights_leader_api::OutboxDeliveryOperation::PodStatus,
+                    Arc::<[u8]>::from(&b"test"[..]),
+                    "client",
+                    1,
+                    1,
+                )
+                .expect("valid delivery request"),
             )
             .await
             .expect_err("missing gRPC must not acknowledge an outbox row");
@@ -1454,8 +1508,7 @@ mod tests {
         // instead of blocking forever (the 10-minute pod-deletion stall).
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
 
-        let mut wedged: super::WatchStream<super::ResourceEvent> =
-            Box::pin(futures::stream::pending());
+        let mut wedged: super::WatchStream = Box::pin(futures::stream::pending());
         let started = std::time::Instant::now();
         let outcome = super::next_event_within_idle(
             Some(&supervisor),
@@ -1471,11 +1524,9 @@ mod tests {
 
         // A live stream passes its item straight through — no false idle.
         let pod = make_pod("default", "web", "uid-1", "worker-1", "Running");
-        let event = super::ResourceEvent {
-            event: crate::watch::WatchEvent::from_type("ADDED", (*pod.data).clone()),
-            resume_position: None,
-        };
-        let mut live: super::WatchStream<super::ResourceEvent> =
+        let event =
+            ResourceEvent::try_new(WatchEventType::Added, pod, None).expect("valid live event");
+        let mut live: super::WatchStream =
             Box::pin(futures::stream::once(async move { Ok(event) }));
         let outcome = super::next_event_within_idle(
             Some(&supervisor),
@@ -1500,27 +1551,18 @@ mod tests {
     async fn informer_apply_event_gates_cursor_advance() {
         let cache = crate::control_plane::client::informer::InformerCache::new();
 
-        // Undecodable event (no apiVersion/kind/metadata.name): apply must error
-        // so the driver does NOT advance the resume cursor past it.
-        let undecodable = super::ResourceEvent {
-            event: crate::watch::WatchEvent::from_type("ADDED", serde_json::json!({})),
-            resume_position: Some(crate::datastore::WatchReplayPosition {
-                resource_version: 41,
-                event_id: 99,
-                resource_version_filter_through_event_id: 0,
-            }),
-        };
-        assert!(
-            cache.apply_event(&undecodable).await.is_err(),
-            "an undecodable event must error so the resume cursor cannot advance past an unapplied event"
-        );
-
         // BOOKMARK: apply is a no-op success, so its RV is a safe resume point
         // the driver may advance to.
-        let bookmark = super::ResourceEvent {
-            event: crate::watch::WatchEvent::bookmark_typed(42, "v1", "Pod"),
-            resume_position: None,
-        };
+        let bookmark = ResourceEvent::try_new(
+            WatchEventType::Bookmark,
+            crate::datastore::Resource::from_data_lossy(Arc::new(serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"resourceVersion": "42"}
+            }))),
+            None,
+        )
+        .expect("valid bookmark");
         assert!(
             cache.apply_event(&bookmark).await.is_ok(),
             "a BOOKMARK must apply as a no-op success so its RV is a valid resume point"
@@ -1528,10 +1570,8 @@ mod tests {
 
         // A well-formed event applies successfully (cursor may advance).
         let pod = make_pod("default", "web", "uid-1", "worker-1", "Running");
-        let good = super::ResourceEvent {
-            event: crate::watch::WatchEvent::from_type("ADDED", (*pod.data).clone()),
-            resume_position: None,
-        };
+        let good =
+            ResourceEvent::try_new(WatchEventType::Added, pod, None).expect("valid Pod event");
         assert!(
             cache.apply_event(&good).await.is_ok(),
             "a well-formed event must apply so its RV becomes the resume point"

@@ -8,7 +8,13 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::control_plane::client::{LeaderApiClient, ListRequest, WatchRequest};
+use crate::control_plane::client::{
+    LeaderApiClient, LeaderWatch, LeaderWatchError, NodeDataplaneQuery,
+    NodeSubnetAllocationRequest, NodeSubnetQuery, PeerSubnetsQuery, PodCleanupIntentAckRequest,
+    PodCleanupIntentListRequest, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
+    WatchRequest, WatchResumeCursor, legacy_dataplane, legacy_list_response, legacy_node_subnet,
+    legacy_watch_event,
+};
 #[cfg(test)]
 use crate::datastore::command::{CommandMeta, StorageCommand};
 use crate::datastore::node_local::NodeLocalHandle;
@@ -28,6 +34,24 @@ use crate::watch::{EventType, WatchBus, WatchEvent, WatchSignal, WatchTopic};
 use klights_types::ResourceKey;
 
 const WORKER_WATCH_EVENT_HISTORY_CAPACITY: usize = 32_768;
+
+fn legacy_pod_cleanup_intent(
+    intent: crate::control_plane::client::PodCleanupIntent,
+) -> PodCleanupIntent {
+    let (node_name, namespace, pod_name, pod_uid, reason, resource_version, created_at_ms, pod) =
+        intent.into_parts();
+    let pod_data = Arc::try_unwrap(pod.data).unwrap_or_else(|shared| (*shared).clone());
+    PodCleanupIntent {
+        node_name,
+        namespace,
+        pod_name,
+        pod_uid,
+        reason,
+        resource_version,
+        created_at_ms,
+        pod_data,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ReflectedResourceKey {
@@ -263,6 +287,7 @@ fn worker_replay_boundaries(
 /// node-local runtime/network rows are served through `NodeLocalBackend`.
 pub struct WorkerStoreAdapter {
     cluster_api: Arc<dyn LeaderApiClient>,
+    leader_watch: Arc<dyn LeaderWatch>,
     node_local: NodeLocalHandle,
     watch_bus: Arc<WatchBus>,
     node_name: String,
@@ -278,8 +303,10 @@ impl WorkerStoreAdapter {
         node_local: NodeLocalHandle,
         node_name: String,
     ) -> Self {
+        let leader_watch: Arc<dyn LeaderWatch> = cluster_api.clone();
         Self {
             cluster_api,
+            leader_watch,
             node_local,
             watch_bus: Arc::new(WatchBus::new(1024)),
             node_name,
@@ -333,15 +360,18 @@ impl WorkerStoreAdapter {
     }
 
     fn worker_watch_requests(&self) -> Vec<WatchRequest> {
-        let mut reqs = vec![WatchRequest {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: None,
-            label_selector: None,
-            field_selector: Some(format!("spec.nodeName={}", self.node_name)),
-            start_resource_version: None,
-            start_watch_replay_position: None,
-        }];
+        let mut reqs = vec![
+            WatchRequest::try_new(
+                "v1",
+                "Pod",
+                None,
+                None,
+                Some(format!("spec.nodeName={}", self.node_name)),
+                None,
+                None,
+            )
+            .expect("worker Pod watch identity is valid"),
+        ];
         for (api_version, kind, namespace) in [
             ("v1", "Namespace", None),
             ("v1", "ConfigMap", None),
@@ -351,15 +381,18 @@ impl WorkerStoreAdapter {
             ("v1", "Node", None),
             ("coordination.k8s.io/v1", "Lease", Some("kube-node-lease")),
         ] {
-            reqs.push(WatchRequest {
-                api_version: api_version.to_string(),
-                kind: kind.to_string(),
-                namespace: namespace.map(str::to_string),
-                label_selector: None,
-                field_selector: None,
-                start_resource_version: None,
-                start_watch_replay_position: None,
-            });
+            reqs.push(
+                WatchRequest::try_new(
+                    api_version,
+                    kind,
+                    namespace.map(str::to_string),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("worker mirror watch identity is valid"),
+            );
         }
         reqs
     }
@@ -370,8 +403,8 @@ impl WorkerStoreAdapter {
         supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
         cancel: tokio_util::sync::CancellationToken,
     ) {
-        let mut next_resource_version = req.start_resource_version;
-        let mut next_watch_replay_position = req.start_watch_replay_position;
+        let mut next_resource_version = req.start_resource_version();
+        let mut next_watch_replay_position = req.start_watch_replay_position();
         let mut state = ReflectorState::default();
         let mut selector_membership = crate::watch::SelectorMembership::default();
         let has_selector = super::watch_request_has_selector(&req);
@@ -415,11 +448,15 @@ impl WorkerStoreAdapter {
                 }
             }
 
-            let mut watch_req = req.clone();
-            watch_req.start_resource_version = next_resource_version;
-            watch_req.start_watch_replay_position = next_watch_replay_position;
+            let watch_req = req
+                .clone()
+                .with_resume_cursor(
+                    WatchResumeCursor::try_new(next_resource_version, next_watch_replay_position)
+                        .expect("worker mirror cursor remains valid"),
+                )
+                .expect("worker mirror request remains valid");
             let selector_req = watch_req.clone();
-            match self.cluster_api.watch_resources(watch_req).await {
+            match self.leader_watch.watch_resources(watch_req).await {
                 Ok(mut stream) => {
                     use futures::StreamExt;
                     let mut relist_required = false;
@@ -431,34 +468,40 @@ impl WorkerStoreAdapter {
                                     Some(Ok(event)) => {
                                         reconnect_attempt = 0;
                                         immediate_expiry_relist_available = true;
-                                        let event_rv = event.event.resource_version();
-                                        let resume_position = event.resume_position;
+                                        let delivered = event.clone();
+                                        let event_rv = delivered.resource().resource_version;
+                                        let legacy_event = legacy_watch_event(&event);
                                         let matches = super::watch_request_matches_event(
                                             &selector_req,
-                                            &event.event,
+                                            &legacy_event,
                                         );
                                         let (transitioned, membership_mutation) = if has_selector {
                                             let (event, mutation) = selector_membership
-                                                .prepare_transition(event.event, matches)
+                                                .prepare_transition(legacy_event, matches)
                                                 .into_parts();
                                             (event, Some(mutation))
                                         } else {
-                                            (matches.then_some(event.event), None)
+                                            (matches.then_some(legacy_event), None)
                                         };
                                         let Some(transitioned) = transitioned
                                         else {
                                             if let Some(mutation) = membership_mutation {
                                                 selector_membership.commit(mutation);
                                             }
-                                            if let Some(rv) = event_rv {
-                                                self.observe_rv(rv);
+                                            if event_rv > 0 {
+                                                self.observe_rv(event_rv);
                                             }
-                                            super::advance_watch_resume_after_apply(
-                                                &mut next_resource_version,
-                                                &mut next_watch_replay_position,
-                                                event_rv,
-                                                resume_position,
-                                            );
+                                            let mut cursor = WatchResumeCursor::try_new(
+                                                next_resource_version,
+                                                next_watch_replay_position,
+                                            )
+                                            .expect("worker mirror cursor remains valid");
+                                            if let Err(err) = cursor.advance_after_apply(&delivered) {
+                                                tracing::warn!(error = %err, "worker mirror cursor rejected event");
+                                                break;
+                                            }
+                                            next_resource_version = cursor.resource_version();
+                                            next_watch_replay_position = cursor.replay_position();
                                             continue;
                                         };
                                         let transitioned = match self
@@ -478,15 +521,20 @@ impl WorkerStoreAdapter {
                                         if let Some(mutation) = membership_mutation {
                                             selector_membership.commit(mutation);
                                         }
-                                        if let Some(rv) = event_rv {
-                                            self.observe_rv(rv);
+                                        if event_rv > 0 {
+                                            self.observe_rv(event_rv);
                                         }
-                                        super::advance_watch_resume_after_apply(
-                                            &mut next_resource_version,
-                                            &mut next_watch_replay_position,
-                                            event_rv,
-                                            resume_position,
-                                        );
+                                        let mut cursor = WatchResumeCursor::try_new(
+                                            next_resource_version,
+                                            next_watch_replay_position,
+                                        )
+                                        .expect("worker mirror cursor remains valid");
+                                        if let Err(err) = cursor.advance_after_apply(&delivered) {
+                                            tracing::warn!(error = %err, "worker mirror cursor rejected applied event");
+                                            break;
+                                        }
+                                        next_resource_version = cursor.resource_version();
+                                        next_watch_replay_position = cursor.replay_position();
                                     }
                                     Some(Err(err)) => {
                                         if is_watch_window_expired(&err) {
@@ -560,16 +608,18 @@ impl WorkerStoreAdapter {
     ) -> Result<(i64, Option<WatchReplayPosition>)> {
         let list = self
             .cluster_api
-            .list_resources_fresh(ListRequest {
-                api_version: req.api_version.clone(),
-                kind: req.kind.clone(),
-                namespace: req.namespace.clone(),
-                label_selector: req.label_selector.clone(),
-                field_selector: req.field_selector.clone(),
-                limit: None,
-                continue_token: None,
-            })
+            .list_resources(ResourceListRequest::try_new(
+                req.api_version().to_string(),
+                req.kind().to_string(),
+                req.namespace().map(str::to_owned),
+                req.label_selector().map(str::to_owned),
+                req.field_selector().map(str::to_owned),
+                None,
+                None,
+                ResourceQueryConsistency::LeaderFresh,
+            )?)
             .await?;
+        let list = legacy_list_response(list);
         let resource_version = list.resource_version;
         let pending_membership = selector_membership.as_ref().map(|_| {
             let mut membership = crate::watch::SelectorMembership::default();
@@ -811,12 +861,8 @@ async fn sleep_before_watch_mirror_reconnect(
 ///
 /// The tonic::Status is carried as the error source by the gRPC client (see
 /// `watch_resources_rpc`), so walk the anyhow chain to find and inspect it.
-fn is_watch_window_expired(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<tonic::Status>()
-            .is_some_and(crate::replication::grpc::is_watch_replay_expired_status)
-    })
+fn is_watch_window_expired(err: &LeaderWatchError) -> bool {
+    matches!(err, LeaderWatchError::ReplayExpired { .. })
 }
 
 fn watch_event_topic(event: &WatchEvent) -> Option<WatchTopic> {
@@ -1036,7 +1082,13 @@ impl DatastoreBackend for WorkerStoreAdapter {
             namespace: namespace.map(str::to_string),
             name: name.to_string(),
         };
-        let resource = self.cluster_api.get_resource(key).await?;
+        let resource = self
+            .cluster_api
+            .get_resource(ResourceGetRequest::try_new(
+                key,
+                ResourceQueryConsistency::Cached,
+            )?)
+            .await?;
         if Self::is_pod_resource(api_version, kind)
             && resource
                 .as_ref()
@@ -1074,18 +1126,20 @@ impl DatastoreBackend for WorkerStoreAdapter {
         // items in arbitrary (hash-map) order, so sort by name before applying
         // the page so name-based continuation is deterministic and matches the
         // leader's ordering.
-        let mut list = self
+        let list = self
             .cluster_api
-            .list_resources(ListRequest {
-                api_version: api_version.to_string(),
-                kind: kind.to_string(),
-                namespace: namespace.map(str::to_string),
-                label_selector: label_selector.map(str::to_string),
+            .list_resources(ResourceListRequest::try_new(
+                api_version,
+                kind,
+                namespace.map(str::to_string),
+                label_selector.map(str::to_string),
                 field_selector,
-                limit: None,
-                continue_token: None,
-            })
+                None,
+                None,
+                ResourceQueryConsistency::Cached,
+            )?)
             .await?;
+        let mut list = legacy_list_response(list);
         self.observe_rv(list.resource_version);
         if page.limit().is_some() || page.continue_token().is_some() {
             list.items.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1204,7 +1258,13 @@ impl DatastoreBackend for WorkerStoreAdapter {
             namespace: None,
             name: name.to_string(),
         };
-        let resource = self.cluster_api.get_resource_fresh(key).await?;
+        let resource = self
+            .cluster_api
+            .get_resource(ResourceGetRequest::try_new(
+                key,
+                ResourceQueryConsistency::LeaderFresh,
+            )?)
+            .await?;
         if let Some(resource) = &resource {
             self.observe_rv(resource.resource_version);
         }
@@ -1660,9 +1720,14 @@ impl DatastoreBackend for WorkerStoreAdapter {
         cluster_cidr: &str,
         node_ip: &str,
     ) -> Result<NodeSubnet> {
-        self.cluster_api
-            .allocate_node_subnet(node_name, cluster_cidr, node_ip)
+        let request = NodeSubnetAllocationRequest::try_new(node_name, cluster_cidr, node_ip)
+            .map_err(anyhow::Error::new)?;
+        let result = self
+            .cluster_api
+            .allocate_node_subnet(request)
             .await
+            .map_err(anyhow::Error::new)?;
+        legacy_node_subnet(result.into_subnet()).map_err(anyhow::Error::new)
     }
 
     async fn update_node_peer_attributes(
@@ -1685,7 +1750,15 @@ impl DatastoreBackend for WorkerStoreAdapter {
         &self,
         node_name: &str,
     ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
-        self.cluster_api.get_node_dataplane(node_name).await
+        let request = NodeDataplaneQuery::try_new(node_name).map_err(anyhow::Error::new)?;
+        self.cluster_api
+            .get_node_dataplane(request)
+            .await
+            .map_err(anyhow::Error::new)?
+            .into_option()
+            .map(legacy_dataplane)
+            .transpose()
+            .map_err(anyhow::Error::new)
     }
 
     async fn list_pod_cleanup_intents_for_node(
@@ -1693,8 +1766,12 @@ impl DatastoreBackend for WorkerStoreAdapter {
         node_name: &str,
     ) -> Result<Vec<PodCleanupIntent>> {
         self.cluster_api
-            .list_pod_cleanup_intents_for_node(node_name)
+            .list_pod_cleanup_intents(
+                PodCleanupIntentListRequest::try_new(node_name).map_err(anyhow::Error::new)?,
+            )
             .await
+            .map(|intents| intents.into_iter().map(legacy_pod_cleanup_intent).collect())
+            .map_err(anyhow::Error::new)
     }
 
     async fn delete_pod_cleanup_intent(
@@ -1706,16 +1783,39 @@ impl DatastoreBackend for WorkerStoreAdapter {
         reason: &str,
     ) -> Result<()> {
         self.cluster_api
-            .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
+            .acknowledge_pod_cleanup_intent(
+                PodCleanupIntentAckRequest::try_new(
+                    node_name, namespace, pod_name, pod_uid, reason,
+                )
+                .map_err(anyhow::Error::new)?,
+            )
             .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-        self.cluster_api.get_node_subnet(node_name).await
+        let request = NodeSubnetQuery::try_new(node_name).map_err(anyhow::Error::new)?;
+        self.cluster_api
+            .get_node_subnet(request)
+            .await
+            .map_err(anyhow::Error::new)?
+            .into_option()
+            .map(legacy_node_subnet)
+            .transpose()
+            .map_err(anyhow::Error::new)
     }
 
     async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        self.cluster_api.list_peer_subnets(my_node_name).await
+        let request = PeerSubnetsQuery::try_new(my_node_name).map_err(anyhow::Error::new)?;
+        self.cluster_api
+            .list_peer_subnets(request)
+            .await
+            .map_err(anyhow::Error::new)?
+            .into_vec()
+            .into_iter()
+            .map(legacy_node_subnet)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::new)
     }
 
     async fn delete_node_subnet(&self, _node_name: &str) -> Result<()> {
@@ -1958,7 +2058,13 @@ impl crate::datastore::ResourceStore for WorkerStoreAdapter {
             namespace: namespace.map(str::to_string),
             name: name.to_string(),
         };
-        let resource = self.cluster_api.get_resource(key).await?;
+        let resource = self
+            .cluster_api
+            .get_resource(ResourceGetRequest::try_new(
+                key,
+                ResourceQueryConsistency::Cached,
+            )?)
+            .await?;
         if Self::is_pod_resource(api_version, kind)
             && resource
                 .as_ref()
@@ -2034,18 +2140,20 @@ impl crate::datastore::ResourceListStore for WorkerStoreAdapter {
         } else {
             field_selector.map(str::to_string)
         };
-        let mut list = self
+        let list = self
             .cluster_api
-            .list_resources(ListRequest {
-                api_version: api_version.to_string(),
-                kind: kind.to_string(),
-                namespace: namespace.map(str::to_string),
-                label_selector: label_selector.map(str::to_string),
+            .list_resources(ResourceListRequest::try_new(
+                api_version,
+                kind,
+                namespace.map(str::to_string),
+                label_selector.map(str::to_string),
                 field_selector,
-                limit: None,
-                continue_token: None,
-            })
+                None,
+                None,
+                ResourceQueryConsistency::Cached,
+            )?)
             .await?;
+        let mut list = legacy_list_response(list);
         self.observe_rv(list.resource_version);
         if page.limit().is_some() || page.continue_token().is_some() {
             list.items.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2436,9 +2544,14 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
         cluster_cidr: &str,
         node_ip: &str,
     ) -> Result<NodeSubnet> {
-        self.cluster_api
-            .allocate_node_subnet(node_name, cluster_cidr, node_ip)
+        let request = NodeSubnetAllocationRequest::try_new(node_name, cluster_cidr, node_ip)
+            .map_err(anyhow::Error::new)?;
+        let result = self
+            .cluster_api
+            .allocate_node_subnet(request)
             .await
+            .map_err(anyhow::Error::new)?;
+        legacy_node_subnet(result.into_subnet()).map_err(anyhow::Error::new)
     }
 
     async fn update_node_peer_attributes(
@@ -2461,15 +2574,40 @@ impl crate::datastore::NetworkMetadataStore for WorkerStoreAdapter {
         &self,
         node_name: &str,
     ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
-        self.cluster_api.get_node_dataplane(node_name).await
+        let request = NodeDataplaneQuery::try_new(node_name).map_err(anyhow::Error::new)?;
+        self.cluster_api
+            .get_node_dataplane(request)
+            .await
+            .map_err(anyhow::Error::new)?
+            .into_option()
+            .map(legacy_dataplane)
+            .transpose()
+            .map_err(anyhow::Error::new)
     }
 
     async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-        self.cluster_api.get_node_subnet(node_name).await
+        let request = NodeSubnetQuery::try_new(node_name).map_err(anyhow::Error::new)?;
+        self.cluster_api
+            .get_node_subnet(request)
+            .await
+            .map_err(anyhow::Error::new)?
+            .into_option()
+            .map(legacy_node_subnet)
+            .transpose()
+            .map_err(anyhow::Error::new)
     }
 
     async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-        self.cluster_api.list_peer_subnets(my_node_name).await
+        let request = PeerSubnetsQuery::try_new(my_node_name).map_err(anyhow::Error::new)?;
+        self.cluster_api
+            .list_peer_subnets(request)
+            .await
+            .map_err(anyhow::Error::new)?
+            .into_vec()
+            .into_iter()
+            .map(legacy_node_subnet)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::new)
     }
 
     async fn delete_node_subnet(&self, _node_name: &str) -> Result<()> {
@@ -2511,8 +2649,12 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
         node_name: &str,
     ) -> Result<Vec<PodCleanupIntent>> {
         self.cluster_api
-            .list_pod_cleanup_intents_for_node(node_name)
+            .list_pod_cleanup_intents(
+                PodCleanupIntentListRequest::try_new(node_name).map_err(anyhow::Error::new)?,
+            )
             .await
+            .map(|intents| intents.into_iter().map(legacy_pod_cleanup_intent).collect())
+            .map_err(anyhow::Error::new)
     }
 
     async fn delete_pod_cleanup_intent(
@@ -2524,8 +2666,14 @@ impl crate::datastore::PodCleanupStore for WorkerStoreAdapter {
         reason: &str,
     ) -> Result<()> {
         self.cluster_api
-            .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
+            .acknowledge_pod_cleanup_intent(
+                PodCleanupIntentAckRequest::try_new(
+                    node_name, namespace, pod_name, pod_uid, reason,
+                )
+                .map_err(anyhow::Error::new)?,
+            )
             .await
+            .map_err(anyhow::Error::new)
     }
 
     async fn delete_pod_cleanup_intents_for_node(&self, node_name: &str) -> Result<()> {
@@ -2578,7 +2726,9 @@ mod tests {
     use super::*;
     use crate::control_plane::client::local::LocalApiClient;
     use crate::control_plane::client::{
-        CacheScope, ConfigMap, Node, Pod, ResourceEvent, Secret, WatchStream,
+        CacheReadinessFuture, CacheReadinessRequest, LeaderCacheReadiness, LeaderResourceQuery,
+        LeaderWatch, LeaderWatchFuture, ResourceEvent, ResourceListResult, ResourceQueryFuture,
+        WatchEventType, WatchStream,
     };
     use crate::datastore::DatastoreBackend;
     use crate::kubelet::pod_lifecycle_router::{
@@ -2587,6 +2737,19 @@ mod tests {
     };
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::sync::atomic::AtomicUsize;
+
+    fn worker_pod_watch_request() -> WatchRequest {
+        WatchRequest::try_new(
+            "v1",
+            "Pod",
+            None,
+            None,
+            Some("spec.nodeName=worker-a".to_string()),
+            None,
+            None,
+        )
+        .expect("valid worker Pod watch")
+    }
 
     #[test]
     fn worker_replay_position_filter_matches_shared_position_semantics() {
@@ -2701,6 +2864,94 @@ mod tests {
                 },
             ),
             ReplayAvailability::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn network_metadata_surfaces_forward_through_focused_leader_ports() {
+        let cluster_db = crate::datastore::test_support::in_memory().await;
+        let dataplane = crate::networking::wireguard::DataplanePeerMetadata::try_new(
+            "worker-b".to_string(),
+            crate::networking::wireguard::DataplaneMode::Root,
+            crate::networking::wireguard::DataplaneEncryption::Disabled,
+            None,
+            Some("192.0.2.11".to_string()),
+            None,
+        )
+        .expect("valid direct-route dataplane metadata");
+        cluster_db
+            .update_node_dataplane(dataplane.clone())
+            .await
+            .expect("seed leader dataplane metadata");
+        let cluster_api = Arc::new(LocalApiClient::new(
+            Arc::new(cluster_db),
+            "worker-a".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        ));
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:worker-store-focused-network-forwarding-test",
+        )
+        .await
+        .expect("open node-local");
+        let adapter = WorkerStoreAdapter::new(cluster_api, node_local, "worker-a".to_string());
+
+        let worker_a = DatastoreBackend::allocate_node_subnet(
+            &adapter,
+            "worker-a",
+            "10.77.0.0/16",
+            "192.0.2.10",
+        )
+        .await
+        .expect("allocate through broad datastore compatibility surface");
+        let worker_b = crate::datastore::NetworkMetadataStore::allocate_node_subnet(
+            &adapter,
+            "worker-b",
+            "10.77.0.0/16",
+            "192.0.2.11",
+        )
+        .await
+        .expect("allocate through focused datastore surface");
+
+        assert_eq!(
+            crate::datastore::NetworkMetadataStore::get_node_subnet(&adapter, "worker-a")
+                .await
+                .expect("query focused surface"),
+            Some(worker_a.clone())
+        );
+        assert_eq!(
+            DatastoreBackend::get_node_subnet(&adapter, "worker-b")
+                .await
+                .expect("query compatibility surface"),
+            Some(worker_b.clone())
+        );
+        assert_eq!(
+            DatastoreBackend::list_peer_subnets(&adapter, "worker-a")
+                .await
+                .expect("list compatibility peers"),
+            vec![worker_b]
+        );
+        assert_eq!(
+            crate::datastore::NetworkMetadataStore::list_peer_subnets(&adapter, "worker-b")
+                .await
+                .expect("list focused peers"),
+            vec![worker_a]
+        );
+        assert_eq!(
+            DatastoreBackend::get_node_dataplane(&adapter, "worker-b")
+                .await
+                .expect("query compatibility dataplane"),
+            Some(dataplane.clone())
+        );
+        assert_eq!(
+            crate::datastore::NetworkMetadataStore::get_node_dataplane(&adapter, "worker-b")
+                .await
+                .expect("query focused dataplane"),
+            Some(dataplane)
         );
     }
 
@@ -2872,15 +3123,7 @@ mod tests {
         adapter.set_pod_lifecycle_router(Arc::new(PodLifecycleRouter::new_test_backend(
             backend.clone(),
         )));
-        let req = WatchRequest {
-            api_version: "v1".to_string(),
-            kind: "Pod".to_string(),
-            namespace: None,
-            label_selector: None,
-            field_selector: Some("spec.nodeName=worker-a".to_string()),
-            start_resource_version: None,
-            start_watch_replay_position: None,
-        };
+        let req = worker_pod_watch_request();
         let mut state = ReflectorState::default();
         let mut membership = crate::watch::SelectorMembership::default();
         let mut watch = adapter.watch_topic(WatchTopic::new("v1", "Pod"));
@@ -2930,73 +3173,28 @@ mod tests {
     }
 
     #[test]
-    fn is_watch_window_expired_requires_typed_replay_marker() {
-        let marked = crate::replication::grpc::watch_replay_expired_status(41, "expired");
-        let err = anyhow::Error::from(marked).context("gRPC WatchResources stream failed");
+    fn is_watch_window_expired_requires_typed_replay_expiry() {
+        let expired = LeaderWatchError::ReplayExpired {
+            accepted_resource_version: 41,
+        };
         assert!(
-            is_watch_window_expired(&err),
-            "typed replay-expired status must trigger a relist"
+            is_watch_window_expired(&expired),
+            "typed replay expiry must trigger a relist"
         );
 
-        let wrapped = crate::replication::grpc::watch_replay_expired_status(42, "expired");
-        let err = anyhow::Error::from(wrapped)
-            .context("inner wrapper")
-            .context("gRPC WatchResources stream failed");
-        assert!(
-            is_watch_window_expired(&err),
-            "typed replay-expired status must be detected through wrappers"
-        );
-
-        let legacy = tonic::Status::out_of_range(
-            "WatchResources replay window expired: resume rv 42 requires relist",
-        );
-        let err = anyhow::Error::from(legacy).context("gRPC WatchResources stream failed");
-        assert!(
-            is_watch_window_expired(&err),
-            "exact legacy replay-expired status from pre-marker leaders must trigger a relist"
-        );
-
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert(
-            crate::replication::grpc::WATCH_REPLAY_EXPIRED_REASON_METADATA_KEY,
-            tonic::metadata::MetadataValue::from_static(
-                crate::replication::grpc::WATCH_REPLAY_EXPIRED_REASON,
-            ),
-        );
-        let malformed_marker = tonic::Status::with_details_and_metadata(
-            tonic::Code::OutOfRange,
-            "expired",
-            bytes::Bytes::from_static(b"not protobuf"),
-            metadata,
-        );
-
-        let cases = [
+        for (error, name) in [
             (
-                tonic::Status::out_of_range("expired but unmarked"),
-                "unmarked OutOfRange",
+                LeaderWatchError::transport("expired but unmarked"),
+                "transport",
             ),
-            (
-                tonic::Status::out_of_range("message exceeds configured maximum size"),
-                "message-size OutOfRange",
-            ),
-            (
-                tonic::Status::unavailable("transport gone"),
-                "non-OutOfRange gRPC error",
-            ),
-            (malformed_marker, "malformed replay-expired details"),
-        ];
-        for (status, name) in cases {
-            let err = anyhow::Error::from(status).context("gRPC WatchResources stream failed");
+            (LeaderWatchError::Timeout, "timeout"),
+            (LeaderWatchError::Cancelled, "cancelled"),
+        ] {
             assert!(
-                !is_watch_window_expired(&err),
+                !is_watch_window_expired(&error),
                 "{name} must not trigger a relist"
             );
         }
-
-        assert!(
-            !is_watch_window_expired(&anyhow!("some other failure")),
-            "non-tonic errors must not trigger a relist"
-        );
     }
 
     fn reflected_resource(name: &str, uid: &str, rv: i64) -> Resource {
@@ -3146,104 +3344,110 @@ mod tests {
     #[derive(Default)]
     struct HandoffLeaderApi;
 
-    #[async_trait]
-    impl LeaderApiClient for HandoffLeaderApi {
-        async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-            if key.api_version == "v1" && key.kind == "Namespace" && key.name == "fresh-events" {
-                return Ok(None);
-            }
-            if key.api_version == "v1" && key.kind == "Pod" && key.name == "cached-deleted" {
-                return Ok(Some(Resource {
-                    id: 1,
-                    api_version: "v1".to_string(),
-                    kind: "Pod".to_string(),
-                    namespace: Some("default".to_string()),
-                    name: "cached-deleted".to_string(),
-                    uid: "uid-cached".to_string(),
-                    resource_version: 12,
-                    data: Arc::new(serde_json::json!({
-                        "apiVersion": "v1",
-                        "kind": "Pod",
-                        "metadata": {
-                            "namespace": "default",
-                            "name": "cached-deleted",
-                            "uid": "uid-cached",
-                            "resourceVersion": "12"
-                        },
-                        "spec": {
-                            "nodeName": "worker-a",
-                            "containers": [{"name": "app", "image": "nginx"}]
-                        }
-                    })),
-                }));
-            }
-            unreachable!("handoff test does not use get_resource for {key:?}")
-        }
-
-        async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
-            if key.api_version == "v1" && key.kind == "Namespace" && key.name == "fresh-events" {
-                return Ok(Some(Resource {
-                    id: 2,
-                    api_version: "v1".to_string(),
-                    kind: "Namespace".to_string(),
-                    namespace: None,
-                    name: "fresh-events".to_string(),
-                    uid: "uid-fresh-events".to_string(),
-                    resource_version: 13,
-                    data: Arc::new(serde_json::json!({
-                        "apiVersion": "v1",
-                        "kind": "Namespace",
-                        "metadata": {
-                            "name": "fresh-events",
-                            "uid": "uid-fresh-events",
-                            "resourceVersion": "13"
-                        },
-                        "status": {"phase": "Active"}
-                    })),
-                }));
-            }
-            if key.api_version == "v1" && key.kind == "Pod" && key.name == "cached-deleted" {
-                return Ok(None);
-            }
-            self.get_resource(key).await
-        }
-
-        async fn list_resources(&self, req: ListRequest) -> Result<ResourceList> {
-            let resource_version = if req.api_version == "v1" && req.kind == "Pod" {
-                assert_eq!(
-                    req.field_selector.as_deref(),
-                    Some("spec.nodeName=worker-a")
-                );
-                41
-            } else {
-                0
-            };
-            Ok(ResourceList {
-                items: Vec::new(),
-                resource_version,
-                watch_replay_position: (resource_version > 0).then_some(WatchReplayPosition {
-                    resource_version,
-                    event_id: 91,
-                    resource_version_filter_through_event_id: 0,
-                }),
-                continue_token: None,
-                remaining_item_count: None,
+    impl LeaderResourceQuery for HandoffLeaderApi {
+        fn get_resource(
+            &self,
+            request: ResourceGetRequest,
+        ) -> ResourceQueryFuture<'_, Option<Resource>> {
+            Box::pin(async move {
+                let consistency = request.consistency();
+                let key = request.into_key();
+                if key.api_version == "v1" && key.kind == "Namespace" && key.name == "fresh-events"
+                {
+                    return Ok(
+                        (consistency == ResourceQueryConsistency::LeaderFresh).then(|| Resource {
+                            id: 2,
+                            api_version: "v1".to_string(),
+                            kind: "Namespace".to_string(),
+                            namespace: None,
+                            name: "fresh-events".to_string(),
+                            uid: "uid-fresh-events".to_string(),
+                            resource_version: 13,
+                            data: Arc::new(serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Namespace",
+                                "metadata": {
+                                    "name": "fresh-events",
+                                    "uid": "uid-fresh-events",
+                                    "resourceVersion": "13"
+                                },
+                                "status": {"phase": "Active"}
+                            })),
+                        }),
+                    );
+                }
+                if key.api_version == "v1" && key.kind == "Pod" && key.name == "cached-deleted" {
+                    if consistency == ResourceQueryConsistency::LeaderFresh {
+                        return Ok(None);
+                    }
+                    return Ok(Some(Resource {
+                        id: 1,
+                        api_version: "v1".to_string(),
+                        kind: "Pod".to_string(),
+                        namespace: Some("default".to_string()),
+                        name: "cached-deleted".to_string(),
+                        uid: "uid-cached".to_string(),
+                        resource_version: 12,
+                        data: Arc::new(serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Pod",
+                            "metadata": {
+                                "namespace": "default",
+                                "name": "cached-deleted",
+                                "uid": "uid-cached",
+                                "resourceVersion": "12"
+                            },
+                            "spec": {
+                                "nodeName": "worker-a",
+                                "containers": [{"name": "app", "image": "nginx"}]
+                            }
+                        })),
+                    }));
+                }
+                unreachable!("handoff test does not use get_resource for {key:?}")
             })
         }
 
-        async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-            if req.api_version == "v1" && req.kind == "Pod" {
-                assert_eq!(req.start_resource_version, Some(41));
-                assert_eq!(
-                    req.start_watch_replay_position,
-                    Some(WatchReplayPosition {
-                        resource_version: 41,
+        fn list_resources(
+            &self,
+            request: ResourceListRequest,
+        ) -> ResourceQueryFuture<'_, ResourceListResult> {
+            Box::pin(async move {
+                let resource_version = if request.api_version() == "v1" && request.kind() == "Pod" {
+                    assert_eq!(request.field_selector(), Some("spec.nodeName=worker-a"));
+                    41
+                } else {
+                    0
+                };
+                ResourceListResult::try_new(
+                    Vec::new(),
+                    resource_version,
+                    (resource_version > 0).then_some(WatchReplayPosition {
+                        resource_version,
                         event_id: 91,
                         resource_version_filter_through_event_id: 0,
-                    })
-                );
-                let event = ResourceEvent {
-                    event: WatchEvent::modified(serde_json::json!({
+                    }),
+                    None,
+                    None,
+                )
+            })
+        }
+    }
+
+    impl LeaderWatch for HandoffLeaderApi {
+        fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
+            Box::pin(async move {
+                if req.api_version() == "v1" && req.kind() == "Pod" {
+                    assert_eq!(req.start_resource_version(), Some(41));
+                    assert_eq!(
+                        req.start_watch_replay_position(),
+                        Some(WatchReplayPosition {
+                            resource_version: 41,
+                            event_id: 91,
+                            resource_version_filter_through_event_id: 0,
+                        })
+                    );
+                    let resource = Resource::try_from_data(Arc::new(serde_json::json!({
                         "apiVersion": "v1",
                         "kind": "Pod",
                         "metadata": {
@@ -3257,111 +3461,37 @@ mod tests {
                             "containers": [{"name": "app", "image": "nginx"}]
                         },
                         "status": {"phase": "Pending"}
-                    })),
-                    resume_position: Some(WatchReplayPosition {
-                        resource_version: 42,
-                        event_id: 92,
-                        resource_version_filter_through_event_id: 0,
-                    }),
-                };
-                return Ok(Box::pin(futures::stream::once(async move { Ok(event) })));
-            }
-            Ok(Box::pin(futures::stream::pending()))
-        }
-
-        async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
-            Ok(())
-        }
-
-        async fn get_pod(&self, _ns: &str, _name: &str) -> Result<Option<Pod>> {
-            unreachable!("handoff test does not use get_pod")
-        }
-
-        async fn get_pod_for_uid(&self, _ns: &str, _name: &str, _uid: &str) -> Result<Option<Pod>> {
-            unreachable!("handoff test does not use get_pod_for_uid")
-        }
-
-        async fn watch_pods_on_node(&self, _node_name: &str) -> Result<WatchStream<Pod>> {
-            unreachable!("handoff test does not use watch_pods_on_node")
-        }
-
-        async fn list_pods_on_node(&self, _node_name: &str) -> Result<Vec<Pod>> {
-            unreachable!("handoff test does not use list_pods_on_node")
-        }
-
-        async fn get_configmap(&self, _ns: &str, _name: &str) -> Result<Option<ConfigMap>> {
-            unreachable!("handoff test does not use get_configmap")
-        }
-
-        async fn get_secret(&self, _ns: &str, _name: &str) -> Result<Option<Secret>> {
-            unreachable!("handoff test does not use get_secret")
-        }
-
-        async fn get_node(&self, _name: &str) -> Result<Node> {
-            unreachable!("handoff test does not use get_node")
-        }
-
-        async fn watch_node(&self, _name: &str) -> Result<WatchStream<Node>> {
-            unreachable!("handoff test does not use watch_node")
-        }
-
-        async fn allocate_node_subnet(
-            &self,
-            _node_name: &str,
-            _cluster_cidr: &str,
-            _node_ip: &str,
-        ) -> Result<NodeSubnet> {
-            unreachable!("handoff test does not use allocate_node_subnet")
-        }
-
-        async fn get_node_subnet(&self, _node_name: &str) -> Result<Option<NodeSubnet>> {
-            unreachable!("handoff test does not use get_node_subnet")
-        }
-
-        async fn list_peer_subnets(&self, _my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-            unreachable!("handoff test does not use list_peer_subnets")
-        }
-
-        async fn get_node_dataplane(
-            &self,
-            _node_name: &str,
-        ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
-            unreachable!("handoff test does not use get_node_dataplane")
-        }
-
-        async fn list_pod_cleanup_intents_for_node(
-            &self,
-            _node_name: &str,
-        ) -> Result<Vec<PodCleanupIntent>> {
-            unreachable!("handoff test does not use list_pod_cleanup_intents_for_node")
-        }
-
-        async fn delete_pod_cleanup_intent(
-            &self,
-            _node_name: &str,
-            _namespace: &str,
-            _pod_name: &str,
-            _pod_uid: &str,
-            _reason: &str,
-        ) -> Result<()> {
-            unreachable!("handoff test does not use delete_pod_cleanup_intent")
-        }
-
-        async fn apply_outbox(
-            &self,
-            _idempotency_key: &str,
-            _operation: crate::kubelet::outbox::payload::OutboxOperation,
-            _payload: bytes::Bytes,
-            _client_id: &str,
-            _stream_id: i64,
-            _stream_seq: i64,
-        ) -> std::result::Result<
-            crate::kubelet::outbox::OutboxApplyResult,
-            crate::kubelet::outbox::OutboxApplyError,
-        > {
-            unreachable!("handoff test does not use apply_outbox")
+                    })))
+                    .expect("valid handoff Pod");
+                    let event = ResourceEvent::try_new(
+                        WatchEventType::Modified,
+                        resource,
+                        Some(WatchReplayPosition {
+                            resource_version: 42,
+                            event_id: 92,
+                            resource_version_filter_through_event_id: 0,
+                        }),
+                    )
+                    .expect("valid positioned event");
+                    return Ok(
+                        Box::pin(futures::stream::once(async move { Ok(event) })) as WatchStream
+                    );
+                }
+                Ok(Box::pin(futures::stream::pending()) as WatchStream)
+            })
         }
     }
+
+    impl LeaderCacheReadiness for HandoffLeaderApi {
+        fn wait_cache_ready(&self, _scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    crate::control_plane::client::impl_unavailable_leader_pod_effects!(HandoffLeaderApi);
+
+    #[async_trait]
+    impl LeaderApiClient for HandoffLeaderApi {}
 
     #[tokio::test]
     async fn failed_pod_route_reconnects_and_replays_from_prior_exact_position() {
@@ -3396,15 +3526,7 @@ mod tests {
                 async move {
                     driver_adapter
                         .run_watch_mirror(
-                            WatchRequest {
-                                api_version: "v1".to_string(),
-                                kind: "Pod".to_string(),
-                                namespace: None,
-                                label_selector: None,
-                                field_selector: Some("spec.nodeName=worker-a".to_string()),
-                                start_resource_version: None,
-                                start_watch_replay_position: None,
-                            },
+                            worker_pod_watch_request(),
                             driver_supervisor,
                             driver_cancel,
                         )
@@ -3483,217 +3605,113 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl LeaderApiClient for OpenExpiredThenRelistLeaderApi {
-        async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-            HandoffLeaderApi.get_resource(key).await
+    impl LeaderResourceQuery for OpenExpiredThenRelistLeaderApi {
+        fn get_resource(
+            &self,
+            request: ResourceGetRequest,
+        ) -> ResourceQueryFuture<'_, Option<Resource>> {
+            HandoffLeaderApi.get_resource(request)
         }
 
-        async fn get_resource_fresh(&self, key: ResourceKey) -> Result<Option<Resource>> {
-            HandoffLeaderApi.get_resource_fresh(key).await
-        }
-
-        async fn list_resources(&self, req: ListRequest) -> Result<ResourceList> {
-            if req.api_version != "v1" || req.kind != "Pod" {
-                return Ok(ResourceList {
-                    items: Vec::new(),
-                    resource_version: 0,
-                    watch_replay_position: None,
-                    continue_token: None,
-                    remaining_item_count: None,
-                });
-            }
-            assert_eq!(
-                req.field_selector.as_deref(),
-                Some("spec.nodeName=worker-a")
-            );
-            let attempt = self.list_count.fetch_add(1, Ordering::SeqCst);
-            let (name, uid, resource_version) = if attempt == 0 {
-                ("removed-before-relist", "uid-removed", 41)
-            } else {
-                ("scheduled-after-relist", "uid-after-relist", 52)
-            };
-            let items = vec![Resource {
-                id: 1,
-                api_version: "v1".to_string(),
-                kind: "Pod".to_string(),
-                namespace: Some("default".to_string()),
-                name: name.to_string(),
-                uid: uid.to_string(),
-                resource_version,
-                data: Arc::new(serde_json::json!({
-                    "apiVersion": "v1",
-                    "kind": "Pod",
-                    "metadata": {
-                        "namespace": "default",
-                        "name": name,
-                        "uid": uid,
-                        "resourceVersion": resource_version.to_string()
-                    },
-                    "spec": {
-                        "nodeName": "worker-a",
-                        "containers": [{"name": "app", "image": "busybox"}]
-                    },
-                    "status": {"phase": "Pending"}
-                })),
-            }];
-            Ok(ResourceList {
-                items,
-                resource_version: if attempt == 0 { 41 } else { 52 },
-                watch_replay_position: None,
-                continue_token: None,
-                remaining_item_count: None,
+        fn list_resources(
+            &self,
+            request: ResourceListRequest,
+        ) -> ResourceQueryFuture<'_, ResourceListResult> {
+            Box::pin(async move {
+                if request.api_version() != "v1" || request.kind() != "Pod" {
+                    return ResourceListResult::try_new(Vec::new(), 0, None, None, None);
+                }
+                assert_eq!(request.field_selector(), Some("spec.nodeName=worker-a"));
+                let attempt = self.list_count.fetch_add(1, Ordering::SeqCst);
+                let (name, uid, resource_version) = if attempt == 0 {
+                    ("removed-before-relist", "uid-removed", 41)
+                } else {
+                    ("scheduled-after-relist", "uid-after-relist", 52)
+                };
+                let items = vec![Resource {
+                    id: 1,
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: name.to_string(),
+                    uid: uid.to_string(),
+                    resource_version,
+                    data: Arc::new(serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {
+                            "namespace": "default",
+                            "name": name,
+                            "uid": uid,
+                            "resourceVersion": resource_version.to_string()
+                        },
+                        "spec": {
+                            "nodeName": "worker-a",
+                            "containers": [{"name": "app", "image": "busybox"}]
+                        },
+                        "status": {"phase": "Pending"}
+                    })),
+                }];
+                ResourceListResult::try_new(
+                    items,
+                    if attempt == 0 { 41 } else { 52 },
+                    None,
+                    None,
+                    None,
+                )
             })
         }
+    }
 
-        async fn watch_resources(&self, req: WatchRequest) -> Result<WatchStream<ResourceEvent>> {
-            if req.api_version != "v1" || req.kind != "Pod" {
-                return Ok(Box::pin(futures::stream::pending()));
-            }
-            assert_eq!(
-                req.field_selector.as_deref(),
-                Some("spec.nodeName=worker-a")
-            );
-            let attempt = self.watch_count.fetch_add(1, Ordering::SeqCst);
-            self.watch_attempted.notify_waiters();
-            let should_expire =
-                attempt == 0 || matches!(self.expiry_mode, OpenExpiryMode::TypedAlways);
-            if should_expire {
-                let expected_rv = if attempt == 0 { 41 } else { 52 };
-                assert_eq!(req.start_resource_version, Some(expected_rv));
-                let status = match self.expiry_mode {
-                    OpenExpiryMode::TypedOnce | OpenExpiryMode::TypedAlways => {
-                        crate::replication::grpc::watch_replay_expired_status(
-                            expected_rv,
-                            format!(
-                                "WatchResources replay window expired: resume rv {expected_rv} requires relist"
-                            ),
-                        )
-                    }
-                    OpenExpiryMode::UnmarkedOnce => {
-                        tonic::Status::out_of_range("message exceeds configured maximum size")
-                    }
-                };
-                return Err(anyhow::Error::from(status).context("gRPC WatchResources failed"));
-            }
-            assert_eq!(
-                req.start_resource_version,
-                Some(match self.expiry_mode {
-                    OpenExpiryMode::TypedOnce | OpenExpiryMode::TypedAlways => 52,
-                    OpenExpiryMode::UnmarkedOnce => 41,
-                })
-            );
-            Ok(Box::pin(futures::stream::pending()))
-        }
-
-        async fn wait_cache_ready(&self, scope: CacheScope) -> Result<()> {
-            HandoffLeaderApi.wait_cache_ready(scope).await
-        }
-
-        async fn get_pod(&self, ns: &str, name: &str) -> Result<Option<Pod>> {
-            HandoffLeaderApi.get_pod(ns, name).await
-        }
-
-        async fn get_pod_for_uid(&self, ns: &str, name: &str, uid: &str) -> Result<Option<Pod>> {
-            HandoffLeaderApi.get_pod_for_uid(ns, name, uid).await
-        }
-
-        async fn watch_pods_on_node(&self, node_name: &str) -> Result<WatchStream<Pod>> {
-            HandoffLeaderApi.watch_pods_on_node(node_name).await
-        }
-
-        async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Pod>> {
-            HandoffLeaderApi.list_pods_on_node(node_name).await
-        }
-
-        async fn get_configmap(&self, ns: &str, name: &str) -> Result<Option<ConfigMap>> {
-            HandoffLeaderApi.get_configmap(ns, name).await
-        }
-
-        async fn get_secret(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
-            HandoffLeaderApi.get_secret(ns, name).await
-        }
-
-        async fn get_node(&self, name: &str) -> Result<Node> {
-            HandoffLeaderApi.get_node(name).await
-        }
-
-        async fn watch_node(&self, name: &str) -> Result<WatchStream<Node>> {
-            HandoffLeaderApi.watch_node(name).await
-        }
-
-        async fn allocate_node_subnet(
-            &self,
-            node_name: &str,
-            cluster_cidr: &str,
-            node_ip: &str,
-        ) -> Result<NodeSubnet> {
-            HandoffLeaderApi
-                .allocate_node_subnet(node_name, cluster_cidr, node_ip)
-                .await
-        }
-
-        async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-            HandoffLeaderApi.get_node_subnet(node_name).await
-        }
-
-        async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-            HandoffLeaderApi.list_peer_subnets(my_node_name).await
-        }
-
-        async fn get_node_dataplane(
-            &self,
-            node_name: &str,
-        ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
-            HandoffLeaderApi.get_node_dataplane(node_name).await
-        }
-
-        async fn list_pod_cleanup_intents_for_node(
-            &self,
-            node_name: &str,
-        ) -> Result<Vec<PodCleanupIntent>> {
-            HandoffLeaderApi
-                .list_pod_cleanup_intents_for_node(node_name)
-                .await
-        }
-
-        async fn delete_pod_cleanup_intent(
-            &self,
-            node_name: &str,
-            namespace: &str,
-            pod_name: &str,
-            pod_uid: &str,
-            reason: &str,
-        ) -> Result<()> {
-            HandoffLeaderApi
-                .delete_pod_cleanup_intent(node_name, namespace, pod_name, pod_uid, reason)
-                .await
-        }
-
-        async fn apply_outbox(
-            &self,
-            idempotency_key: &str,
-            operation: crate::kubelet::outbox::payload::OutboxOperation,
-            payload: bytes::Bytes,
-            client_id: &str,
-            stream_id: i64,
-            stream_seq: i64,
-        ) -> std::result::Result<
-            crate::kubelet::outbox::OutboxApplyResult,
-            crate::kubelet::outbox::OutboxApplyError,
-        > {
-            HandoffLeaderApi
-                .apply_outbox(
-                    idempotency_key,
-                    operation,
-                    payload,
-                    client_id,
-                    stream_id,
-                    stream_seq,
-                )
-                .await
+    impl LeaderWatch for OpenExpiredThenRelistLeaderApi {
+        fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
+            Box::pin(async move {
+                if req.api_version() != "v1" || req.kind() != "Pod" {
+                    return Ok(Box::pin(futures::stream::pending()) as WatchStream);
+                }
+                assert_eq!(req.field_selector(), Some("spec.nodeName=worker-a"));
+                let attempt = self.watch_count.fetch_add(1, Ordering::SeqCst);
+                self.watch_attempted.notify_waiters();
+                let should_expire =
+                    attempt == 0 || matches!(self.expiry_mode, OpenExpiryMode::TypedAlways);
+                if should_expire {
+                    let expected_rv = if attempt == 0 { 41 } else { 52 };
+                    assert_eq!(req.start_resource_version(), Some(expected_rv));
+                    return Err(match self.expiry_mode {
+                        OpenExpiryMode::TypedOnce | OpenExpiryMode::TypedAlways => {
+                            LeaderWatchError::ReplayExpired {
+                                accepted_resource_version: expected_rv,
+                            }
+                        }
+                        OpenExpiryMode::UnmarkedOnce => {
+                            LeaderWatchError::transport("message exceeds configured maximum size")
+                        }
+                    });
+                }
+                assert_eq!(
+                    req.start_resource_version(),
+                    Some(match self.expiry_mode {
+                        OpenExpiryMode::TypedOnce | OpenExpiryMode::TypedAlways => 52,
+                        OpenExpiryMode::UnmarkedOnce => 41,
+                    })
+                );
+                Ok(Box::pin(futures::stream::pending()) as WatchStream)
+            })
         }
     }
+
+    impl LeaderCacheReadiness for OpenExpiredThenRelistLeaderApi {
+        fn wait_cache_ready(&self, scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+            HandoffLeaderApi.wait_cache_ready(scope)
+        }
+    }
+
+    crate::control_plane::client::impl_unavailable_leader_pod_effects!(
+        OpenExpiredThenRelistLeaderApi
+    );
+
+    #[async_trait]
+    impl LeaderApiClient for OpenExpiredThenRelistLeaderApi {}
 
     #[tokio::test]
     async fn worker_pod_get_uses_worker_cache_not_fresh_leader_state() {
@@ -4636,15 +4654,7 @@ mod tests {
                 async move {
                     driver_adapter
                         .run_watch_mirror(
-                            WatchRequest {
-                                api_version: "v1".to_string(),
-                                kind: "Pod".to_string(),
-                                namespace: None,
-                                label_selector: None,
-                                field_selector: Some("spec.nodeName=worker-a".to_string()),
-                                start_resource_version: None,
-                                start_watch_replay_position: None,
-                            },
+                            worker_pod_watch_request(),
                             driver_supervisor,
                             driver_cancel,
                         )
@@ -4700,15 +4710,7 @@ mod tests {
                 async move {
                     driver_adapter
                         .run_watch_mirror(
-                            WatchRequest {
-                                api_version: "v1".to_string(),
-                                kind: "Pod".to_string(),
-                                namespace: None,
-                                label_selector: None,
-                                field_selector: Some("spec.nodeName=worker-a".to_string()),
-                                start_resource_version: None,
-                                start_watch_replay_position: None,
-                            },
+                            worker_pod_watch_request(),
                             driver_supervisor,
                             driver_cancel,
                         )
@@ -4799,194 +4801,150 @@ mod tests {
     async fn worker_store_routes_local_pod_watch_to_lifecycle_actor() {
         struct LocalPodLeaderApi;
 
-        #[async_trait]
-        impl LeaderApiClient for LocalPodLeaderApi {
-            async fn get_resource(&self, key: ResourceKey) -> Result<Option<Resource>> {
-                unreachable!("local pod watch test does not use get_resource for {key:?}")
+        impl LocalPodLeaderApi {
+            fn event(event_type: WatchEventType, data: Value) -> ResourceEvent {
+                ResourceEvent::try_new(
+                    event_type,
+                    Resource::try_from_data(Arc::new(data)).expect("valid test Pod"),
+                    None,
+                )
+                .expect("valid test watch event")
             }
+        }
 
-            async fn list_resources(&self, req: ListRequest) -> Result<ResourceList> {
-                Ok(ResourceList {
-                    items: Vec::new(),
-                    resource_version: if req.api_version == "v1" && req.kind == "Pod" {
-                        41
-                    } else {
-                        0
-                    },
-                    watch_replay_position: None,
-                    continue_token: None,
-                    remaining_item_count: None,
+        impl LeaderResourceQuery for LocalPodLeaderApi {
+            fn get_resource(
+                &self,
+                request: ResourceGetRequest,
+            ) -> ResourceQueryFuture<'_, Option<Resource>> {
+                Box::pin(async move {
+                    unreachable!(
+                        "local pod watch test does not use get_resource for {:?}",
+                        request.key()
+                    )
                 })
             }
 
-            async fn watch_resources(
+            fn list_resources(
                 &self,
-                req: WatchRequest,
-            ) -> Result<WatchStream<ResourceEvent>> {
-                if req.api_version == "v1" && req.kind == "Pod" {
-                    if req.start_resource_version != Some(41) {
-                        return Ok(Box::pin(futures::stream::pending()));
-                    }
-                    let events = vec![
-                        ResourceEvent {
-                            event: WatchEvent::added(serde_json::json!({
-                                "apiVersion": "v1",
-                                "kind": "Pod",
-                                "metadata": {
-                                    "namespace": "default",
-                                    "name": "startable",
-                                    "uid": "uid-startable",
-                                    "resourceVersion": "42"
-                                },
-                                "spec": {
-                                    "nodeName": "worker-a",
-                                    "containers": [{"name": "app", "image": "busybox"}]
-                                },
-                                "status": {"phase": "Pending"}
-                            })),
-                            resume_position: None,
+                request: ResourceListRequest,
+            ) -> ResourceQueryFuture<'_, ResourceListResult> {
+                Box::pin(async move {
+                    ResourceListResult::try_new(
+                        Vec::new(),
+                        if request.api_version() == "v1" && request.kind() == "Pod" {
+                            41
+                        } else {
+                            0
                         },
-                        ResourceEvent {
-                            event: WatchEvent::modified(serde_json::json!({
-                                "apiVersion": "v1",
-                                "kind": "Pod",
-                                "metadata": {
-                                    "namespace": "default",
-                                    "name": "terminating",
-                                    "uid": "uid-terminating",
-                                    "resourceVersion": "43",
-                                    "deletionTimestamp": "2026-06-21T02:07:04Z"
-                                },
-                                "spec": {
-                                    "nodeName": "worker-a",
-                                    "containers": [{"name": "app", "image": "busybox"}]
-                                },
-                                "status": {"phase": "Succeeded"}
-                            })),
-                            resume_position: None,
-                        },
-                        ResourceEvent {
-                            event: WatchEvent::added(serde_json::json!({
-                                "apiVersion": "v1",
-                                "kind": "Pod",
-                                "metadata": {
-                                    "namespace": "default",
-                                    "name": "moving-away",
-                                    "uid": "uid-moving-away",
-                                    "resourceVersion": "44"
-                                },
-                                "spec": {
-                                    "nodeName": "worker-a",
-                                    "containers": [{"name": "app", "image": "busybox"}]
-                                },
-                                "status": {"phase": "Running"}
-                            })),
-                            resume_position: None,
-                        },
-                        ResourceEvent {
-                            event: WatchEvent::modified(serde_json::json!({
-                                "apiVersion": "v1",
-                                "kind": "Pod",
-                                "metadata": {
-                                    "namespace": "default",
-                                    "name": "moving-away",
-                                    "uid": "uid-moving-away",
-                                    "resourceVersion": "45"
-                                },
-                                "spec": {
-                                    "nodeName": "worker-b",
-                                    "containers": [{"name": "app", "image": "busybox"}]
-                                },
-                                "status": {"phase": "Running"}
-                            })),
-                            resume_position: None,
-                        },
-                    ];
-                    return Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))));
-                }
-                Ok(Box::pin(futures::stream::pending()))
-            }
-
-            async fn wait_cache_ready(&self, _scope: CacheScope) -> Result<()> {
-                Ok(())
-            }
-
-            async fn get_pod(&self, _ns: &str, _name: &str) -> Result<Option<Pod>> {
-                unreachable!("local pod watch test does not use get_pod")
-            }
-
-            async fn get_pod_for_uid(
-                &self,
-                _ns: &str,
-                _name: &str,
-                _uid: &str,
-            ) -> Result<Option<Pod>> {
-                unreachable!("local pod watch test does not use get_pod_for_uid")
-            }
-
-            async fn watch_pods_on_node(&self, _node_name: &str) -> Result<WatchStream<Pod>> {
-                unreachable!("local pod watch test does not use watch_pods_on_node")
-            }
-
-            async fn list_pods_on_node(&self, _node_name: &str) -> Result<Vec<Pod>> {
-                unreachable!("local pod watch test does not use list_pods_on_node")
-            }
-
-            async fn get_configmap(&self, _ns: &str, _name: &str) -> Result<Option<ConfigMap>> {
-                Ok(None)
-            }
-
-            async fn get_secret(&self, _ns: &str, _name: &str) -> Result<Option<Secret>> {
-                Ok(None)
-            }
-
-            async fn get_node(&self, name: &str) -> Result<Node> {
-                unreachable!("local pod watch test does not use get_node for {name}")
-            }
-
-            async fn watch_node(&self, _name: &str) -> Result<WatchStream<Node>> {
-                Ok(Box::pin(futures::stream::pending()))
-            }
-
-            async fn allocate_node_subnet(
-                &self,
-                node_name: &str,
-                _cluster_cidr: &str,
-                _node_ip: &str,
-            ) -> Result<NodeSubnet> {
-                unreachable!("local pod watch test does not allocate subnet for {node_name}")
-            }
-
-            async fn get_node_subnet(&self, node_name: &str) -> Result<Option<NodeSubnet>> {
-                unreachable!("local pod watch test does not get subnet for {node_name}")
-            }
-
-            async fn list_peer_subnets(&self, my_node_name: &str) -> Result<Vec<NodeSubnet>> {
-                unreachable!("local pod watch test does not list peer subnets for {my_node_name}")
-            }
-
-            async fn get_node_dataplane(
-                &self,
-                node_name: &str,
-            ) -> Result<Option<crate::networking::wireguard::DataplanePeerMetadata>> {
-                unreachable!("local pod watch test does not get dataplane for {node_name}")
-            }
-
-            async fn apply_outbox(
-                &self,
-                _idempotency_key: &str,
-                _operation: crate::kubelet::outbox::payload::OutboxOperation,
-                _payload: bytes::Bytes,
-                _client_id: &str,
-                _stream_id: i64,
-                _stream_seq: i64,
-            ) -> std::result::Result<
-                crate::kubelet::outbox::OutboxApplyResult,
-                crate::kubelet::outbox::OutboxApplyError,
-            > {
-                unreachable!("local pod watch test does not apply outbox")
+                        None,
+                        None,
+                        None,
+                    )
+                })
             }
         }
+
+        impl LeaderWatch for LocalPodLeaderApi {
+            fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
+                Box::pin(async move {
+                    if req.api_version() == "v1" && req.kind() == "Pod" {
+                        if req.start_resource_version() != Some(41) {
+                            return Ok(Box::pin(futures::stream::pending()) as WatchStream);
+                        }
+                        let events = vec![
+                            Self::event(
+                                WatchEventType::Added,
+                                serde_json::json!({
+                                    "apiVersion": "v1",
+                                    "kind": "Pod",
+                                    "metadata": {
+                                        "namespace": "default",
+                                        "name": "startable",
+                                        "uid": "uid-startable",
+                                        "resourceVersion": "42"
+                                    },
+                                    "spec": {
+                                        "nodeName": "worker-a",
+                                        "containers": [{"name": "app", "image": "busybox"}]
+                                    },
+                                    "status": {"phase": "Pending"}
+                                }),
+                            ),
+                            Self::event(
+                                WatchEventType::Modified,
+                                serde_json::json!({
+                                    "apiVersion": "v1",
+                                    "kind": "Pod",
+                                    "metadata": {
+                                        "namespace": "default",
+                                        "name": "terminating",
+                                        "uid": "uid-terminating",
+                                        "resourceVersion": "43",
+                                        "deletionTimestamp": "2026-06-21T02:07:04Z"
+                                    },
+                                    "spec": {
+                                        "nodeName": "worker-a",
+                                        "containers": [{"name": "app", "image": "busybox"}]
+                                    },
+                                    "status": {"phase": "Succeeded"}
+                                }),
+                            ),
+                            Self::event(
+                                WatchEventType::Added,
+                                serde_json::json!({
+                                    "apiVersion": "v1",
+                                    "kind": "Pod",
+                                    "metadata": {
+                                        "namespace": "default",
+                                        "name": "moving-away",
+                                        "uid": "uid-moving-away",
+                                        "resourceVersion": "44"
+                                    },
+                                    "spec": {
+                                        "nodeName": "worker-a",
+                                        "containers": [{"name": "app", "image": "busybox"}]
+                                    },
+                                    "status": {"phase": "Running"}
+                                }),
+                            ),
+                            Self::event(
+                                WatchEventType::Modified,
+                                serde_json::json!({
+                                    "apiVersion": "v1",
+                                    "kind": "Pod",
+                                    "metadata": {
+                                        "namespace": "default",
+                                        "name": "moving-away",
+                                        "uid": "uid-moving-away",
+                                        "resourceVersion": "45"
+                                    },
+                                    "spec": {
+                                        "nodeName": "worker-b",
+                                        "containers": [{"name": "app", "image": "busybox"}]
+                                    },
+                                    "status": {"phase": "Running"}
+                                }),
+                            ),
+                        ];
+                        return Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok)))
+                            as WatchStream);
+                    }
+                    Ok(Box::pin(futures::stream::pending()) as WatchStream)
+                })
+            }
+        }
+
+        impl LeaderCacheReadiness for LocalPodLeaderApi {
+            fn wait_cache_ready(&self, _scope: CacheReadinessRequest) -> CacheReadinessFuture<'_> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        crate::control_plane::client::impl_unavailable_leader_pod_effects!(LocalPodLeaderApi);
+
+        #[async_trait]
+        impl LeaderApiClient for LocalPodLeaderApi {}
 
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
         let node_local = crate::datastore::node_local::selector::open_node_local(

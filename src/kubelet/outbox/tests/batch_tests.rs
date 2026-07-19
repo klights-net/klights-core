@@ -1,8 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use bytes::Bytes;
+use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryFuture, OutboxDeliveryRequest};
 use tokio::sync::Mutex;
 
 use crate::datastore::ResourcePreconditions;
@@ -11,8 +10,8 @@ use crate::datastore::command::StorageCommand;
 use crate::datastore::node_local::{NodeLocalHandle, selector};
 use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
 use crate::kubelet::outbox::{
-    DispatchOutcome, Outbox, OutboxApplyClient, OutboxApplyError, OutboxApplyResult, OutboxCommand,
-    OutboxDispatcher, OutboxSubject,
+    DispatchOutcome, Outbox, OutboxApplyError, OutboxApplyResult, OutboxCommand, OutboxDispatcher,
+    OutboxSubject,
 };
 use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
@@ -97,23 +96,19 @@ impl StackApplyClient {
     }
 }
 
-#[async_trait]
-impl OutboxApplyClient for StackApplyClient {
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        _operation: OutboxOperation,
-        _payload: Bytes,
-        _client_id: &str,
-        _stream_id: i64,
-        _stream_seq: i64,
-    ) -> Result<OutboxApplyResult, OutboxApplyError> {
-        self.calls.lock().await.push(idempotency_key.to_string());
-        self.responses
-            .lock()
-            .await
-            .pop()
-            .unwrap_or(Ok(OutboxApplyResult::Applied { applied_rv: 1 }))
+impl LeaderOutboxDelivery for StackApplyClient {
+    fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .await
+                .push(request.idempotency_key().to_string());
+            self.responses
+                .lock()
+                .await
+                .pop()
+                .unwrap_or(Ok(OutboxApplyResult::Applied { applied_rv: 1 }))
+        })
     }
 }
 
@@ -396,7 +391,7 @@ async fn batch_claim_blocks_younger_same_subject_while_older_leased() {
 }
 
 #[tokio::test]
-async fn single_claim_allows_actor_finalize_delete_to_leapfrog_backed_off_pod_status() {
+async fn outbox_strict_stream_single_claim_blocks_terminal_delete_behind_backoff() {
     let node_db = node_db().await;
     let outbox = Outbox::new(node_db.clone());
     let subject = OutboxSubject::new(
@@ -448,13 +443,23 @@ async fn single_claim_allows_actor_finalize_delete_to_leapfrog_backed_off_pod_st
     let claimed = node_db
         .claim_next_due_outbox(1_001, 100, "delete-lease")
         .await
-        .expect("claim delete")
-        .expect("actor-finalize delete must be due despite older status backoff");
-    assert_eq!(claimed.idempotency_key, "web-actor-finalize-delete");
+        .expect("claim while status is backed off");
+    assert!(
+        claimed.is_none(),
+        "a terminal delete must not create a strict leader-watermark sequence hole"
+    );
+    assert_eq!(
+        node_db
+            .next_outbox_wake_ms(1_001)
+            .await
+            .expect("next FIFO wake"),
+        Some(30_000),
+        "the lower stream sequence's backoff, not the younger terminal row, controls wakeup"
+    );
 }
 
 #[tokio::test]
-async fn batch_claim_allows_actor_finalize_delete_to_leapfrog_backed_off_pod_status() {
+async fn outbox_strict_stream_batch_claim_blocks_terminal_delete_behind_backoff() {
     let node_db = node_db().await;
     let outbox = Outbox::new(node_db.clone());
     let subject = "v1/Pod/default/web/uid-web";
@@ -507,16 +512,23 @@ async fn batch_claim_allows_actor_finalize_delete_to_leapfrog_backed_off_pod_sta
     let claimed = node_db
         .claim_due_outbox_batch(1_001, 16, 100, "delete-batch-lease")
         .await
-        .expect("claim delete batch");
-    assert_eq!(claimed.len(), 1);
+        .expect("claim while status is backed off");
+    assert!(
+        claimed.is_empty(),
+        "batch claim must preserve the same strict stream FIFO policy as single claim"
+    );
     assert_eq!(
-        claimed[0].idempotency_key,
-        "web-actor-finalize-delete-batch"
+        node_db
+            .next_outbox_wake_ms(1_001)
+            .await
+            .expect("next FIFO wake"),
+        Some(30_000),
+        "batch dispatch must sleep until the lower stream sequence is retryable"
     );
 }
 
 #[tokio::test]
-async fn batch_claim_leases_only_terminal_delete_when_older_status_is_also_due() {
+async fn outbox_strict_stream_batch_claim_leases_due_head_before_terminal_delete() {
     let node_db = node_db().await;
     let outbox = Outbox::new(node_db.clone());
     let subject = "v1/Pod/default/web/uid-web";
@@ -563,8 +575,8 @@ async fn batch_claim_leases_only_terminal_delete_when_older_status_is_also_due()
             .iter()
             .map(|row| row.idempotency_key.as_str())
             .collect::<Vec<_>>(),
-        vec!["web-actor-finalize-delete-due"],
-        "terminal delete must be the only leased row for this subject"
+        vec!["web-status-due-with-delete"],
+        "only the lowest due stream sequence may be leased for one subject"
     );
 }
 
@@ -636,10 +648,10 @@ async fn batch_claim_does_not_deadlock_different_subject_behind_superseded_statu
             .map(|row| row.idempotency_key.as_str())
             .collect::<Vec<_>>(),
         vec![
+            "web-status-superseded-stream-blocker",
             "same-stream-event-after-superseded-status",
-            "web-actor-finalize-delete-after-event"
         ],
-        "superseded status must not block independent subjects"
+        "strict Pod-stream FIFO must not block an independent subject"
     );
 }
 
@@ -724,7 +736,7 @@ async fn batch_claim_keeps_same_subject_blocked_while_status_is_in_flight() {
 }
 
 #[tokio::test]
-async fn terminal_delete_apply_completes_older_superseded_status_rows() {
+async fn outbox_strict_stream_delivery_applies_status_before_terminal_delete() {
     let node_db = node_db().await;
     let outbox = Outbox::new(node_db.clone());
     let client = Arc::new(StackApplyClient::default());
@@ -765,23 +777,38 @@ async fn terminal_delete_apply_completes_older_superseded_status_rows() {
         .expect("enqueue actor finalize delete");
 
     client
+        .push_response(Ok(OutboxApplyResult::Applied { applied_rv: 11 }))
+        .await;
+    client
         .push_response(Ok(OutboxApplyResult::Applied { applied_rv: 10 }))
         .await;
     assert_eq!(
         dispatcher
             .dispatch_due_once(1_001)
             .await
-            .expect("dispatch terminal delete"),
+            .expect("dispatch stream head"),
         DispatchOutcome::Dispatched
     );
+    assert_eq!(
+        client.calls().await,
+        vec!["web-status-superseded"],
+        "the terminal delete must not be delivered before its lower stream sequence"
+    );
 
-    assert!(
-        node_db
-            .claim_next_due_outbox(30_000, 100, "after-delete")
+    assert_eq!(
+        dispatcher
+            .dispatch_due_once(1_001)
             .await
-            .expect("claim after terminal delete")
-            .is_none(),
-        "older superseded status rows must be completed after terminal delete applies"
+            .expect("dispatch terminal delete after stream head"),
+        DispatchOutcome::Dispatched
+    );
+    assert_eq!(
+        client.calls().await,
+        vec![
+            "web-status-superseded",
+            "web-actor-finalize-delete-cleans-status"
+        ],
+        "terminal delivery may proceed only after the leader decides the lower sequence"
     );
 }
 
@@ -1057,28 +1084,22 @@ impl CrashRecoveryApplyClient {
     }
 }
 
-#[async_trait]
-impl OutboxApplyClient for CrashRecoveryApplyClient {
-    async fn apply_outbox(
-        &self,
-        idempotency_key: &str,
-        _operation: OutboxOperation,
-        _payload: Bytes,
-        _client_id: &str,
-        _stream_id: i64,
-        _stream_seq: i64,
-    ) -> Result<OutboxApplyResult, OutboxApplyError> {
-        self.calls.lock().await.push(idempotency_key.to_string());
-        let mut applied = self.applied.lock().await;
-        if applied.insert(idempotency_key.to_string()) {
-            Ok(OutboxApplyResult::Applied {
-                applied_rv: applied.len() as i64,
-            })
-        } else {
-            Ok(OutboxApplyResult::AlreadyApplied {
-                applied_rv: Some(applied.len() as i64),
-            })
-        }
+impl LeaderOutboxDelivery for CrashRecoveryApplyClient {
+    fn deliver_outbox(&self, request: OutboxDeliveryRequest) -> OutboxDeliveryFuture<'_> {
+        Box::pin(async move {
+            let idempotency_key = request.idempotency_key().to_string();
+            self.calls.lock().await.push(idempotency_key.clone());
+            let mut applied = self.applied.lock().await;
+            if applied.insert(idempotency_key) {
+                Ok(OutboxApplyResult::Applied {
+                    applied_rv: applied.len() as i64,
+                })
+            } else {
+                Ok(OutboxApplyResult::AlreadyApplied {
+                    applied_rv: Some(applied.len() as i64),
+                })
+            }
+        })
     }
 }
 
@@ -1118,17 +1139,22 @@ async fn crash_after_cluster_apply_before_node_complete_replays_from_ledger() {
 
         // Simulate successful cluster apply (ledger recorded).
         client
-            .apply_outbox(
-                "crash-key",
-                OutboxOperation::PodStatus,
-                Bytes::from(
-                    OutboxPayload::from_command(pod_status_command("default", "web", "uid-web"))
+            .deliver_outbox(
+                OutboxDeliveryRequest::try_new(
+                    "crash-key",
+                    klights_leader_api::OutboxDeliveryOperation::PodStatus,
+                    Arc::<[u8]>::from(
+                        OutboxPayload::from_command(pod_status_command(
+                            "default", "web", "uid-web",
+                        ))
                         .encode_protobuf()
                         .unwrap(),
-                ),
-                "client",
-                1,
-                1,
+                    ),
+                    "client",
+                    1,
+                    1,
+                )
+                .expect("valid delivery request"),
             )
             .await
             .expect("cluster apply");
@@ -1157,13 +1183,16 @@ async fn crash_after_cluster_apply_before_node_complete_replays_from_ledger() {
 
         // Pre-seed the leader with the same key to simulate ledger replay.
         client
-            .apply_outbox(
-                "crash-key",
-                OutboxOperation::PodStatus,
-                Bytes::new(),
-                "client",
-                1,
-                1,
+            .deliver_outbox(
+                OutboxDeliveryRequest::try_new(
+                    "crash-key",
+                    klights_leader_api::OutboxDeliveryOperation::PodStatus,
+                    Arc::<[u8]>::from(&b"test"[..]),
+                    "client",
+                    1,
+                    1,
+                )
+                .expect("valid delivery request"),
             )
             .await
             .expect("pre-seed ledger");

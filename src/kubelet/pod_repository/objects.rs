@@ -70,7 +70,13 @@ impl PodObjectService {
         expected_uid: Option<&str>,
     ) -> Result<Resource> {
         let pod = if let Some(cluster_api) = &self.cluster_api {
-            cluster_api.get_pod(ns, name).await?
+            cluster_api
+                .get_resource(crate::control_plane::client::pod_get_request(
+                    ns,
+                    name,
+                    crate::control_plane::client::ResourceQueryConsistency::Cached,
+                )?)
+                .await?
         } else {
             self.store.get(ns, name).await?
         }
@@ -157,6 +163,7 @@ impl PodObjectService {
         cas_rv: i64,
         current: &Resource,
     ) -> Result<Resource> {
+        let owner_references = Value::Array(owner_refs);
         let snapshot = std::sync::Arc::unwrap_or_clone(current.data.clone());
         let mut body: Value = snapshot;
         let metadata = body
@@ -167,7 +174,7 @@ impl PodObjectService {
         let metadata_obj = metadata
             .as_object_mut()
             .ok_or_else(|| anyhow!("Pod metadata is not a JSON object"))?;
-        metadata_obj.insert("ownerReferences".to_string(), Value::Array(owner_refs));
+        metadata_obj.insert("ownerReferences".to_string(), owner_references.clone());
 
         let pod_uid = current.uid.as_str();
         let subject_key = format!("v1/Pod/{ns}/{name}/{}", current.uid);
@@ -182,17 +189,18 @@ impl PodObjectService {
                     uid: Some(pod_uid.to_string()),
                 },
                 pod_uid: pod_uid.to_string(),
-                command: StorageCommand::UpdateResource {
+                command: StorageCommand::PatchResource {
                     api_version: "v1".to_string(),
                     kind: "Pod".to_string(),
                     namespace: Some(ns.to_string()),
                     name: name.to_string(),
-                    data: body.clone(),
-                    expected_rv: cas_rv,
+                    patch_kind: crate::datastore::PatchKind::Merge,
+                    patch: json!({"metadata": {"ownerReferences": owner_references}}),
                     preconditions: ResourcePreconditions {
                         uid: Some(current.uid.clone()),
                         resource_version: Some(cas_rv),
                     },
+                    strict_resource_version: true,
                 },
                 now_ms: now_ms(),
             })
@@ -266,8 +274,10 @@ impl PodObjectService {
         let label_obj = labels_value
             .as_object_mut()
             .ok_or_else(|| anyhow!("Pod labels are not a JSON object"))?;
+        let mut label_patch = serde_json::Map::new();
         for (key, value) in labels {
-            label_obj.insert(key, Value::String(value));
+            label_obj.insert(key.clone(), Value::String(value.clone()));
+            label_patch.insert(key, Value::String(value));
         }
 
         let pod_uid = current.uid.as_str();
@@ -283,17 +293,18 @@ impl PodObjectService {
                     uid: Some(pod_uid.to_string()),
                 },
                 pod_uid: pod_uid.to_string(),
-                command: StorageCommand::UpdateResource {
+                command: StorageCommand::PatchResource {
                     api_version: "v1".to_string(),
                     kind: "Pod".to_string(),
                     namespace: Some(ns.to_string()),
                     name: name.to_string(),
-                    data: body.clone(),
-                    expected_rv: cas_rv,
+                    patch_kind: crate::datastore::PatchKind::Merge,
+                    patch: json!({"metadata": {"labels": label_patch}}),
                     preconditions: ResourcePreconditions {
                         uid: Some(current.uid.clone()),
                         resource_version: Some(cas_rv),
                     },
+                    strict_resource_version: true,
                 },
                 now_ms: now_ms(),
             })
@@ -388,17 +399,22 @@ impl PodObjectService {
                     uid: Some(pod_uid.to_string()),
                 },
                 pod_uid: pod_uid.to_string(),
-                command: StorageCommand::UpdateResource {
+                command: StorageCommand::PatchResource {
                     api_version: "v1".to_string(),
                     kind: "Pod".to_string(),
                     namespace: Some(ns.to_string()),
                     name: name.to_string(),
-                    data: body.clone(),
-                    expected_rv: cas_rv,
+                    patch_kind: crate::datastore::PatchKind::Merge,
+                    patch: json!({
+                        "metadata": {
+                            "annotations": {(SANDBOX_ID_ANNOTATION): sandbox_id}
+                        }
+                    }),
                     preconditions: ResourcePreconditions {
                         uid: Some(current.uid.clone()),
                         resource_version: Some(cas_rv),
                     },
+                    strict_resource_version: true,
                 },
                 now_ms: now_ms(),
             })

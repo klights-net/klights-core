@@ -20,17 +20,39 @@ struct PeerEndpoint {
     endpoint: String,
 }
 
-pub async fn start_leader_peer_endpoint_observer(
-    db: DatastoreHandle,
+pub(crate) struct LeaderPeerEndpointObserverDeps {
+    query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus>,
     config: Arc<crate::KlightsConfig>,
     node_mode: NodeMode,
+}
+
+impl LeaderPeerEndpointObserverDeps {
+    pub(crate) fn new(
+        query: Arc<dyn klights_leader_api::LeaderResourceQuery>,
+        node_status: Arc<dyn klights_leader_api::LeaderNodeSelfStatus>,
+        config: Arc<crate::KlightsConfig>,
+        node_mode: NodeMode,
+    ) -> Self {
+        Self {
+            query,
+            node_status,
+            config,
+            node_mode,
+        }
+    }
+}
+
+pub(crate) async fn start_leader_peer_endpoint_observer(
+    db: DatastoreHandle,
+    deps: LeaderPeerEndpointObserverDeps,
     supervisor: Arc<TaskSupervisor>,
     grpc_transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
     shutdown_token: CancellationToken,
 ) -> Result<SupervisedJoinHandle<()>> {
     let client_identity = load_local_node_client_identity(
-        &config.containerd_namespace,
-        &config.node_name,
+        &deps.config.containerd_namespace,
+        &deps.config.node_name,
         supervisor.clone(),
     )
     .await?;
@@ -42,8 +64,7 @@ pub async fn start_leader_peer_endpoint_observer(
             async move {
                 run_leader_peer_endpoint_observer(
                     db,
-                    config,
-                    node_mode,
+                    deps,
                     client_identity,
                     supervisor_for_task,
                     grpc_transport_policy,
@@ -57,8 +78,7 @@ pub async fn start_leader_peer_endpoint_observer(
 
 async fn run_leader_peer_endpoint_observer(
     db: DatastoreHandle,
-    config: Arc<crate::KlightsConfig>,
-    node_mode: NodeMode,
+    deps: LeaderPeerEndpointObserverDeps,
     client_identity: ClientIdentity,
     supervisor: Arc<TaskSupervisor>,
     grpc_transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
@@ -70,8 +90,8 @@ async fn run_leader_peer_endpoint_observer(
     // entirely, leaving node_dataplane empty and the WireGuard tunnel unformed.
     if ensure_published_if_local_has_external_ip(
         db.as_ref(),
-        &config,
-        &node_mode,
+        &deps.config,
+        &deps.node_mode,
         supervisor.as_ref(),
     )
     .await
@@ -81,8 +101,7 @@ async fn run_leader_peer_endpoint_observer(
 
     if let Err(err) = observe_from_existing_nodes(
         db.as_ref(),
-        &config,
-        &node_mode,
+        &deps,
         &client_identity,
         supervisor.clone(),
         grpc_transport_policy.clone(),
@@ -107,8 +126,8 @@ async fn run_leader_peer_endpoint_observer(
                 }
                 if ensure_published_if_local_has_external_ip(
                     db.as_ref(),
-                    &config,
-                    &node_mode,
+                    &deps.config,
+                    &deps.node_mode,
                     supervisor.as_ref(),
                 )
                 .await
@@ -117,8 +136,7 @@ async fn run_leader_peer_endpoint_observer(
                 }
                 if let Err(err) = observe_from_existing_nodes(
                     db.as_ref(),
-                    &config,
-                    &node_mode,
+                    &deps,
                     &client_identity,
                     supervisor.clone(),
                     grpc_transport_policy.clone(),
@@ -137,8 +155,7 @@ async fn run_leader_peer_endpoint_observer(
 
 async fn observe_from_existing_nodes(
     db: &dyn crate::datastore::DatastoreBackend,
-    config: &crate::KlightsConfig,
-    node_mode: &NodeMode,
+    deps: &LeaderPeerEndpointObserverDeps,
     client_identity: &ClientIdentity,
     supervisor: Arc<TaskSupervisor>,
     grpc_transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
@@ -147,23 +164,20 @@ async fn observe_from_existing_nodes(
         .list_resources("v1", "Node", None, ResourceListQuery::all())
         .await?;
     for node in nodes.items {
-        let Some(peer) = peer_endpoint_from_node(&node.data, &config.node_name, config.tls_port)
+        let Some(peer) =
+            peer_endpoint_from_node(&node.data, &deps.config.node_name, deps.config.tls_port)
         else {
             continue;
         };
-        observe_from_peer(
+        if observe_from_peer(
             db,
-            config,
-            node_mode,
+            deps,
             client_identity,
             supervisor.clone(),
             grpc_transport_policy.clone(),
             peer,
         )
-        .await?;
-        if local_node_external_ip(db, &config.node_name)
-            .await?
-            .is_some()
+        .await?
         {
             return Ok(());
         }
@@ -173,21 +187,22 @@ async fn observe_from_existing_nodes(
 
 async fn observe_from_peer(
     db: &dyn crate::datastore::DatastoreBackend,
-    config: &crate::KlightsConfig,
-    node_mode: &NodeMode,
+    deps: &LeaderPeerEndpointObserverDeps,
     client_identity: &ClientIdentity,
     supervisor: Arc<TaskSupervisor>,
     grpc_transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
     peer: PeerEndpoint,
-) -> Result<()> {
+) -> Result<bool> {
     let client = ReplicationGrpcClient::new(
         GrpcClientConfig {
             leader_endpoint: peer.endpoint.clone(),
             token: String::new(),
-            node_name: config.node_name.clone(),
+            node_name: deps.config.node_name.clone(),
             role: JoinRole::Worker,
-            dataplane: placeholder_dataplane(node_mode),
-            ca_cert_path: Some(crate::paths::ca_cert_path(&config.containerd_namespace)),
+            dataplane: placeholder_dataplane(&deps.node_mode),
+            ca_cert_path: Some(crate::paths::ca_cert_path(
+                &deps.config.containerd_namespace,
+            )),
             skip_ca: false,
             client_cert_pem: Some(client_identity.client_cert_pem.clone()),
             client_key_pem: Some(client_identity.client_key_pem.clone()),
@@ -196,7 +211,7 @@ async fn observe_from_peer(
         grpc_transport_policy,
     );
     if let Some(endpoint) = client
-        .observe_peer_endpoint_rpc(&config.node_name)
+        .observe_peer_endpoint_rpc(&deps.config.node_name)
         .await
         .with_context(|| format!("observe peer endpoint from {}", peer.node_name))?
     {
@@ -204,9 +219,10 @@ async fn observe_from_peer(
             .parse::<std::net::IpAddr>()
             .with_context(|| format!("observed endpoint must be an IP address: {endpoint}"))?;
         let endpoint_ip = endpoint_ip.to_string();
-        crate::kubelet::node::update_existing_node_external_ip_if_changed(
-            db,
-            &config.node_name,
+        crate::kubelet::node::publish_node_external_ip_if_changed(
+            deps.query.as_ref(),
+            deps.node_status.as_ref(),
+            &deps.config.node_name,
             &endpoint_ip,
         )
         .await?;
@@ -214,14 +230,15 @@ async fn observe_from_peer(
         // peers can configure the WireGuard tunnel back to us.
         crate::bootstrap::init::dataplane::ensure_node_dataplane_published(
             db,
-            config,
-            node_mode,
+            &deps.config,
+            &deps.node_mode,
             &endpoint_ip,
             supervisor.as_ref(),
         )
         .await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 async fn local_node_external_ip(

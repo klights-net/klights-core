@@ -2,6 +2,7 @@ use std::fmt;
 
 use anyhow::{Result, anyhow};
 
+use crate::datastore::ResourcePreconditions;
 use crate::datastore::command::{StorageCommand, decode_command_protobuf, encode_command_protobuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,6 +118,59 @@ impl OutboxOperation {
                 | Self::EphemeralContainerStatuses
         )
     }
+
+    /// Convert the node-local scheduling classification into the public,
+    /// transport-neutral delivery operation. Lease renewal intentionally has
+    /// no durable-delivery representation: it owns a separate authenticated
+    /// leader capability.
+    pub fn try_delivery_operation(
+        self,
+    ) -> std::result::Result<
+        klights_leader_api::OutboxDeliveryOperation,
+        klights_leader_api::OutboxDeliveryError,
+    > {
+        use klights_leader_api::OutboxDeliveryOperation;
+
+        Ok(match self {
+            Self::PodStatus => OutboxDeliveryOperation::PodStatus,
+            Self::RuntimeReconcile => OutboxDeliveryOperation::RuntimeReconcile,
+            Self::ProbeReadiness => OutboxDeliveryOperation::ProbeReadiness,
+            Self::DeadlineExceeded => OutboxDeliveryOperation::DeadlineExceeded,
+            Self::ContainerStatusSnapshot => OutboxDeliveryOperation::ContainerStatusSnapshot,
+            Self::EphemeralContainerStatuses => OutboxDeliveryOperation::EphemeralContainerStatuses,
+            Self::PodMetadata => OutboxDeliveryOperation::PodMetadata,
+            Self::NodeRegistration => OutboxDeliveryOperation::NodeRegistration,
+            Self::NodeDataplane => OutboxDeliveryOperation::NodeDataplane,
+            Self::NodeStatus => OutboxDeliveryOperation::NodeStatus,
+            Self::EventCreate => OutboxDeliveryOperation::EventCreate,
+            Self::LeaseRenew => {
+                return Err(klights_leader_api::OutboxDeliveryError::invalid(
+                    "delivery.operation",
+                    "LeaseRenew uses LeaderNodeLeaseRenewal and is forbidden on durable delivery",
+                ));
+            }
+        })
+    }
+}
+
+impl From<klights_leader_api::OutboxDeliveryOperation> for OutboxOperation {
+    fn from(operation: klights_leader_api::OutboxDeliveryOperation) -> Self {
+        use klights_leader_api::OutboxDeliveryOperation;
+
+        match operation {
+            OutboxDeliveryOperation::PodStatus => Self::PodStatus,
+            OutboxDeliveryOperation::RuntimeReconcile => Self::RuntimeReconcile,
+            OutboxDeliveryOperation::ProbeReadiness => Self::ProbeReadiness,
+            OutboxDeliveryOperation::DeadlineExceeded => Self::DeadlineExceeded,
+            OutboxDeliveryOperation::ContainerStatusSnapshot => Self::ContainerStatusSnapshot,
+            OutboxDeliveryOperation::EphemeralContainerStatuses => Self::EphemeralContainerStatuses,
+            OutboxDeliveryOperation::PodMetadata => Self::PodMetadata,
+            OutboxDeliveryOperation::NodeRegistration => Self::NodeRegistration,
+            OutboxDeliveryOperation::NodeDataplane => Self::NodeDataplane,
+            OutboxDeliveryOperation::NodeStatus => Self::NodeStatus,
+            OutboxDeliveryOperation::EventCreate => Self::EventCreate,
+        }
+    }
 }
 
 impl fmt::Display for OutboxOperation {
@@ -199,6 +253,28 @@ mod classification_tests {
             assert!(!operation.supersedable_pod_status(), "{operation}");
         }
     }
+
+    #[test]
+    fn durable_delivery_conversion_is_exhaustive_and_rejects_lease_renewal() {
+        for operation in OutboxOperation::ALL {
+            if operation == OutboxOperation::LeaseRenew {
+                assert!(
+                    matches!(
+                        operation.try_delivery_operation(),
+                        Err(klights_leader_api::OutboxDeliveryError::InvalidRequest { .. })
+                    ),
+                    "lease renewal must remain on its focused renewal capability"
+                );
+                continue;
+            }
+
+            let delivery = operation
+                .try_delivery_operation()
+                .expect("every durable queue operation has one neutral delivery operation");
+            assert_eq!(delivery.as_wire_name(), operation.as_str());
+            assert_eq!(OutboxOperation::from(delivery), operation);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -220,4 +296,21 @@ impl OutboxPayload {
             command: decode_command_protobuf(bytes)?,
         })
     }
+}
+
+/// Encode the existing stale UID-bound Pod sentinel used to commit an outbox
+/// ledger and exact stream watermark without mutating a Kubernetes resource.
+/// The invalid namespace cannot collide with an API-created Pod.
+pub(crate) fn terminal_decision_payload(idempotency_key: &str) -> Result<Vec<u8>> {
+    OutboxPayload::from_command(StorageCommand::UpdateStatus {
+        api_version: "v1".to_string(),
+        kind: "Pod".to_string(),
+        namespace: Some("__klights-terminal-outbox__".to_string()),
+        name: "decision".to_string(),
+        status: serde_json::json!({}),
+        expected_rv: None,
+        preconditions: ResourcePreconditions::uid(idempotency_key),
+        observed_status_stamp: None,
+    })
+    .encode_protobuf()
 }

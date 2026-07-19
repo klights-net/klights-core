@@ -1,10 +1,14 @@
 use crate::datastore::command::StorageCommand;
 use crate::datastore::{DatastoreBackend, ResourcePreconditions};
-use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
+use crate::kubelet::outbox::payload::OutboxOperation;
+#[cfg(test)]
+use crate::kubelet::outbox::payload::OutboxPayload;
 use crate::kubelet::outbox::{
     Outbox, OutboxCommand, OutboxSendPlanner, OutboxSendRoute, OutboxSubject,
 };
-use anyhow::{Context, Result};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::Result;
 
 pub(crate) use crate::kubelet::node_leader_labels::clear_leader_label_from_other_nodes;
 pub(crate) use crate::kubelet::node_registration::register_node_snapshot;
@@ -17,16 +21,16 @@ pub(crate) use crate::kubelet::node_status_merge::preserve_existing_network_cond
 pub use crate::kubelet::node_status_merge::{
     merge_existing_node_mutable_fields, merge_node_status_for_update, set_node_external_ip,
 };
+#[cfg(test)]
+pub(super) use crate::kubelet::node_status_projection::stamp_current_git_commit_annotation;
 pub(super) use crate::kubelet::node_status_projection::{
-    NodeNetworkConditions, apply_network_conditions, stamp_current_git_commit_annotation,
+    NodeNetworkConditions, apply_network_conditions,
 };
 pub use crate::kubelet::node_status_projection::{
     set_node_dataplane_annotations, set_node_external_ip_from_dataplane_annotation,
     set_node_pod_cidr,
 };
-pub use crate::node_heartbeat::{
-    LeaseRenewClient, NodeLeaseRenewClient, run_heartbeat_with_lease_client,
-};
+pub use crate::node_heartbeat::run_heartbeat_with_lease_client;
 
 /// Get total memory in KiB from /proc/meminfo. Cached process-wide;
 /// total memory does not change during the kubelet's lifetime, and the
@@ -56,6 +60,95 @@ pub enum NodeNetworkRefreshResult {
     Updated,
 }
 
+/// Worker-owned Node status publisher. It verifies the exact Node UID with a
+/// current-leader read, then durably enqueues one status-only command. Remote
+/// delivery and retries remain the outbox dispatcher's responsibility, so a
+/// retry reuses the persisted row's idempotency and stream identity.
+pub struct OutboxNodeSelfStatusPublisher {
+    node_name: String,
+    query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
+    outbox: std::sync::Arc<Outbox>,
+}
+
+impl OutboxNodeSelfStatusPublisher {
+    pub fn new(
+        node_name: impl Into<String>,
+        query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
+        outbox: std::sync::Arc<Outbox>,
+    ) -> Self {
+        Self {
+            node_name: node_name.into(),
+            query,
+            outbox,
+        }
+    }
+}
+
+impl klights_leader_api::LeaderNodeSelfStatus for OutboxNodeSelfStatusPublisher {
+    fn submit_node_self_status(
+        &self,
+        request: klights_leader_api::NodeSelfStatusRequest,
+    ) -> klights_leader_api::NodeSelfStatusFuture<'_, klights_leader_api::NodeSelfStatusResult>
+    {
+        Box::pin(async move {
+            if request.node_name() != self.node_name {
+                return Err(klights_leader_api::NodeSelfStatusError::unauthorized(
+                    format!(
+                        "node {} cannot publish Node status for {}",
+                        self.node_name,
+                        request.node_name()
+                    ),
+                ));
+            }
+            let get = klights_leader_api::node_get_request(
+                &self.node_name,
+                klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+            )
+            .map_err(|error| {
+                klights_leader_api::NodeSelfStatusError::retryable(error.to_string())
+            })?;
+            let current = self
+                .query
+                .get_resource(get)
+                .await
+                .map_err(|error| {
+                    klights_leader_api::NodeSelfStatusError::retryable(error.to_string())
+                })?
+                .ok_or(klights_leader_api::NodeSelfStatusError::NotFound)?;
+            if current.uid != request.node_uid() {
+                return Err(klights_leader_api::NodeSelfStatusError::UidMismatch);
+            }
+
+            let node_uid = request.node_uid().to_string();
+            let command = request.into_command();
+            self.outbox
+                .enqueue_command(OutboxCommand {
+                    idempotency_key: format!(
+                        "NodeStatus:v1/Node/{}/{}:{}",
+                        self.node_name,
+                        node_uid,
+                        uuid::Uuid::new_v4()
+                    ),
+                    operation: OutboxOperation::NodeStatus,
+                    subject: OutboxSubject {
+                        key: format!("v1/Node/{}/{}", self.node_name, node_uid),
+                        namespace: None,
+                        name: self.node_name.clone(),
+                        uid: Some(node_uid),
+                    },
+                    pod_uid: String::new(),
+                    command,
+                    now_ms: epoch_ms(),
+                })
+                .await
+                .map_err(|error| {
+                    klights_leader_api::NodeSelfStatusError::enqueue_failed(error.to_string())
+                })?;
+            Ok(klights_leader_api::NodeSelfStatusResult::Enqueued)
+        })
+    }
+}
+
 /// Re-evaluate and persist the local node's `Ready`/`NetworkUnavailable`
 /// conditions from the current dataplane health. Event-driven: called by the
 /// peer-route watcher when peer connectivity changes, so a node stops reporting
@@ -65,6 +158,44 @@ pub enum NodeNetworkRefreshResult {
 /// Writes go through the outbox when provided (mandatory on non-leader nodes,
 /// which must not originate local cluster.db writes); the direct path is only
 /// for the leader. Returns true if a write was issued.
+pub async fn publish_node_network_conditions(
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    publisher: &dyn klights_leader_api::LeaderNodeSelfStatus,
+    node_name: &str,
+    dataplane_health: &crate::networking::dataplane_health::DataplaneHealth,
+) -> Result<NodeNetworkRefreshResult> {
+    let get = klights_leader_api::node_get_request(
+        node_name,
+        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+    )?;
+    let Some(existing) = query.get_resource(get).await? else {
+        return Ok(NodeNetworkRefreshResult::Missing);
+    };
+    let conditions = NodeNetworkConditions::from_health(Some(dataplane_health));
+    let mut node = existing.data.as_ref().clone();
+    if !apply_network_conditions(&mut node, &conditions) {
+        return Ok(NodeNetworkRefreshResult::Unchanged);
+    }
+    let status = node
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let request =
+        klights_leader_api::NodeSelfStatusRequest::try_new(StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: node_name.to_string(),
+            status,
+            expected_rv: None,
+            preconditions: ResourcePreconditions::uid(existing.uid),
+            observed_status_stamp: None,
+        })?;
+    publisher.submit_node_self_status(request).await?;
+    Ok(NodeNetworkRefreshResult::Updated)
+}
+
+#[cfg(test)]
 pub async fn refresh_node_network_conditions(
     db: &dyn DatastoreBackend,
     outbox: Option<&Outbox>,
@@ -127,39 +258,37 @@ pub async fn refresh_node_network_conditions(
 }
 
 pub async fn refresh_current_git_commit_annotation_via_leader(
-    cluster_api: &dyn crate::control_plane::client::LeaderApiClient,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    commands: &dyn klights_leader_api::LeaderResourceCommand,
     node_name: &str,
 ) -> Result<()> {
-    let command = current_git_commit_annotation_patch_command(node_name);
-    let payload = OutboxPayload::from_command(command)
-        .encode_protobuf()
-        .context("Failed to encode Node git-commit annotation patch")?;
-    let idempotency_key = format!(
-        "NodeGitCommitRefresh:v1/Node/{node_name}:{}:{}",
-        crate::version::GIT_COMMIT_SHORT,
-        uuid::Uuid::new_v4()
-    );
-    cluster_api
-        .apply_outbox(
-            &idempotency_key,
-            OutboxOperation::NodeStatus,
-            bytes::Bytes::from(payload),
-            node_name,
-            0,
-            0,
-        )
+    let get = klights_leader_api::node_get_request(
+        node_name,
+        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+    )?;
+    let Some(current) = query.get_resource(get).await? else {
+        return Ok(());
+    };
+    let command = current_git_commit_annotation_patch_command(&current);
+    let request = klights_leader_api::ResourceCommandRequest::try_new(command)?;
+    commands
+        .submit_resource_command(request)
         .await
         .map(|_| ())
-        .map_err(|err| anyhow::anyhow!("leader rejected Node git-commit annotation patch: {err}"))
+        .map_err(|error| {
+            anyhow::anyhow!("leader rejected Node git-commit annotation patch: {error}")
+        })
 }
 
-fn current_git_commit_annotation_patch_command(node_name: &str) -> StorageCommand {
+fn current_git_commit_annotation_patch_command(
+    node: &crate::datastore::Resource,
+) -> StorageCommand {
     use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
     StorageCommand::PatchResource {
         api_version: "v1".to_string(),
         kind: "Node".to_string(),
         namespace: None,
-        name: node_name.to_string(),
+        name: node.name.clone(),
         patch_kind: crate::datastore::types::PatchKind::Merge,
         patch: serde_json::json!({
             "metadata": {
@@ -168,8 +297,8 @@ fn current_git_commit_annotation_patch_command(node_name: &str) -> StorageComman
                 }
             }
         }),
-        preconditions: ResourcePreconditions::default(),
-        strict_resource_version: false,
+        preconditions: ResourcePreconditions::from_resource(node),
+        strict_resource_version: true,
     }
 }
 
@@ -207,8 +336,9 @@ pub(super) async fn send_node_command(
         .await
 }
 
-pub async fn update_existing_node_external_ip_if_changed(
-    db: &dyn DatastoreBackend,
+pub async fn publish_node_external_ip_if_changed(
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    publisher: &dyn klights_leader_api::LeaderNodeSelfStatus,
     node_name: &str,
     external_ip: &str,
 ) -> Result<()> {
@@ -216,22 +346,33 @@ pub async fn update_existing_node_external_ip_if_changed(
     if external_ip.is_empty() {
         return Ok(());
     }
-    let Some(resource) = db.get_resource("v1", "Node", None, node_name).await? else {
+    let get = klights_leader_api::node_get_request(
+        node_name,
+        klights_leader_api::ResourceQueryConsistency::LeaderFresh,
+    )?;
+    let Some(resource) = query.get_resource(get).await? else {
         return Ok(());
     };
     let mut data = (*resource.data).clone();
     if !set_node_external_ip(&mut data, external_ip) {
         return Ok(());
     }
-    db.update_resource_with_preconditions(
-        "v1",
-        "Node",
-        None,
-        node_name,
-        data,
-        ResourcePreconditions::from_resource(&resource),
-    )
-    .await?;
+    let status = data
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let request =
+        klights_leader_api::NodeSelfStatusRequest::try_new(StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: node_name.to_string(),
+            status,
+            expected_rv: None,
+            preconditions: ResourcePreconditions::uid(resource.uid),
+            observed_status_stamp: None,
+        })?;
+    publisher.submit_node_self_status(request).await?;
     Ok(())
 }
 
@@ -638,7 +779,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_commit_refresh_via_leader_patches_existing_node_annotation() {
+    async fn node_effect_git_commit_refresh_uses_uid_rv_resource_command() {
         use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
 
         let db = crate::datastore::test_support::in_memory().await;
@@ -669,7 +810,7 @@ mod tests {
             crate::control_plane::client::local::always_leader_watch(),
         );
 
-        refresh_current_git_commit_annotation_via_leader(&client, "node-a")
+        refresh_current_git_commit_annotation_via_leader(&client, &client, "node-a")
             .await
             .unwrap();
 
@@ -1682,18 +1823,20 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl NodeLeaseRenewClient for RecordingLeaseRenewClient {
-        async fn renew_node_lease(
+    impl klights_leader_api::LeaderNodeLeaseRenewal for RecordingLeaseRenewClient {
+        fn renew_node_lease(
             &self,
-            node_name: &str,
-            _lease: &serde_json::Value,
-        ) -> Result<()> {
+            request: klights_leader_api::NodeLeaseRenewalRequest,
+        ) -> klights_leader_api::NodeLeaseRenewalFuture<
+            '_,
+            klights_leader_api::NodeLeaseRenewalResult,
+        > {
+            let node_name = request.node_name().to_string();
             self.calls
                 .lock()
                 .expect("recording mutex must remain lockable")
-                .push(node_name.to_string());
-            Ok(())
+                .push(node_name);
+            Box::pin(async { Ok(klights_leader_api::NodeLeaseRenewalResult::Renewed) })
         }
     }
 
@@ -1738,40 +1881,139 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_renew_client_switches_to_remote_when_not_leader() {
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let tracker = std::sync::Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new());
-        let remote = std::sync::Arc::new(RecordingLeaseRenewClient::new());
-        let client = LeaseRenewClient::new(tracker.clone(), remote.clone(), rx);
+    async fn node_effect_self_status_uses_fresh_identity_and_only_durable_enqueue() {
+        use crate::datastore::backend_kind::BackendKind;
+        use crate::datastore::node_local::selector;
+        use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
-        let lease = build_lease("test-node");
-        client
-            .renew_node_lease("test-node", &lease)
+        let cluster: crate::datastore::DatastoreHandle =
+            std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
+        let created = cluster
+            .create_resource(
+                "v1",
+                "Node",
+                None,
+                "worker-a",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {"name": "worker-a", "uid": "node-uid-a"},
+                    "status": {"conditions": []}
+                }),
+            )
             .await
-            .expect("initial remote renew should succeed");
-        assert_eq!(
-            remote.call_count(),
-            1,
-            "non-leader should renew via remote client"
-        );
-        assert!(
-            tracker.observed("test-node").await.is_none(),
-            "non-leader renew should not touch local tracker"
-        );
+            .expect("create Node");
+        let leader_query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
+            std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+                cluster.clone(),
+                "cp-1".to_string(),
+                crate::control_plane::client::local::always_leader_watch(),
+            ));
+        let supervisor = std::sync::Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let node_local = selector::open_node_local(
+            BackendKind::Sqlite,
+            None,
+            supervisor,
+            None,
+            "sqlite:node-self-status-contract",
+        )
+        .await
+        .expect("open node-local db");
+        let outbox = std::sync::Arc::new(Outbox::new(node_local.clone()));
+        let publisher = OutboxNodeSelfStatusPublisher::new("worker-a", leader_query, outbox);
+        let command = StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Node".to_string(),
+            namespace: None,
+            name: "worker-a".to_string(),
+            status: serde_json::json!({
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }),
+            expected_rv: None,
+            preconditions: ResourcePreconditions::uid("node-uid-a"),
+            observed_status_stamp: None,
+        };
+        let request = klights_leader_api::NodeSelfStatusRequest::try_new(command.clone())
+            .expect("valid self status");
 
-        tx.send(true).expect("leadership watch should update");
-        client
-            .renew_node_lease("test-node", &lease)
+        let result =
+            klights_leader_api::LeaderNodeSelfStatus::submit_node_self_status(&publisher, request)
+                .await
+                .expect("enqueue status");
+        assert_eq!(result, klights_leader_api::NodeSelfStatusResult::Enqueued);
+
+        let unchanged = cluster
+            .get_resource("v1", "Node", None, "worker-a")
             .await
-            .expect("leader renew should succeed");
+            .expect("read Node")
+            .expect("Node exists");
         assert_eq!(
-            remote.call_count(),
-            1,
-            "leader renew should continue using local tracker"
+            unchanged.resource_version, created.resource_version,
+            "self-status publisher must not bypass the durable queue with direct leader apply"
         );
+        let row = node_local
+            .claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
+            .await
+            .expect("claim queued status")
+            .expect("one durable status row");
+        assert_eq!(row.operation, OutboxOperation::NodeStatus.as_str());
+        assert_eq!(row.subject_key, "v1/Node/worker-a/node-uid-a");
+        let decoded = OutboxPayload::decode_protobuf(&row.payload_proto)
+            .expect("decode durable status payload");
+        assert_eq!(decoded.command, command);
+    }
+
+    #[tokio::test]
+    async fn node_effect_self_status_rejects_cross_node_before_enqueue() {
+        use crate::datastore::backend_kind::BackendKind;
+        use crate::datastore::node_local::selector;
+        use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+
+        let cluster: crate::datastore::DatastoreHandle =
+            std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
+        let leader_query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
+            std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(
+                cluster,
+                "cp-1".to_string(),
+                crate::control_plane::client::local::always_leader_watch(),
+            ));
+        let node_local = selector::open_node_local(
+            BackendKind::Sqlite,
+            None,
+            std::sync::Arc::new(TaskSupervisor::new(TaskCategoryConfig::default())),
+            None,
+            "sqlite:node-self-status-cross-node",
+        )
+        .await
+        .expect("open node-local db");
+        let publisher = OutboxNodeSelfStatusPublisher::new(
+            "worker-a",
+            leader_query,
+            std::sync::Arc::new(Outbox::new(node_local.clone())),
+        );
+        let request =
+            klights_leader_api::NodeSelfStatusRequest::try_new(StorageCommand::UpdateStatus {
+                api_version: "v1".to_string(),
+                kind: "Node".to_string(),
+                namespace: None,
+                name: "worker-b".to_string(),
+                status: serde_json::json!({}),
+                expected_rv: None,
+                preconditions: ResourcePreconditions::uid("node-uid-b"),
+                observed_status_stamp: None,
+            })
+            .expect("valid shape");
+        assert!(matches!(
+            klights_leader_api::LeaderNodeSelfStatus::submit_node_self_status(&publisher, request)
+                .await,
+            Err(klights_leader_api::NodeSelfStatusError::Unauthorized { .. })
+        ));
         assert!(
-            tracker.observed("test-node").await.is_some(),
-            "leader renew should update local tracker"
+            node_local
+                .claim_next_due_outbox(i64::MAX / 2, 1_000, "inspect")
+                .await
+                .expect("inspect queue")
+                .is_none()
         );
     }
 

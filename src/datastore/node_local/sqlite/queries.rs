@@ -64,69 +64,43 @@ pub(super) const OUTBOX_ROW_SELECT: &str = "SELECT id, client_id, idempotency_ke
      subject_uid, pod_uid, operation, is_terminal_pod_delete, stream_id, stream_seq, \
      payload_proto, attempt, next_due_ms, leased_until_ms, lease_token, last_error \
      FROM outbox WHERE id = ?1";
-// Strict per-subject single-in-flight: a candidate is excluded if ANY older
-// same-subject row exists, regardless of whether that older row is currently
-// due or leased. The single-row and batch claim queries both use this one
-// predicate, so they cannot drift into different FIFO policies. Without it, a
-// younger same-subject row would be claimable while an older retry is
-// leased/in-flight, putting two snapshots of one Pod in flight concurrently;
-// they can then apply in raft order != stamp order and clobber the newer status.
-// Cross-subject pipelining is preserved because the exclusion only ever fires
-// for the SAME subject_key.
+// Strict per-stream single-in-flight: an assigned candidate is excluded while
+// any lower live or dead-letter sequence exists. Sequence, rather than row ID,
+// is authoritative so exact replay of a lower sequence remains claimable even
+// though replay inserts a newer SQLite row. Legacy/unsequenced rows retain the
+// older same-subject row-ID policy. Single and batch claims share this exact
+// predicate so they cannot drift into different FIFO policies.
 const OUTBOX_CLAIM_DUE_SELECT_AND_WHERE: &str = "WITH eligible AS ( \
      SELECT candidate.id, candidate.priority_class, candidate.enqueued_ms, \
             candidate.is_terminal_pod_delete, candidate.supersedable_pod_status \
      FROM outbox candidate \
      WHERE candidate.next_due_ms <= ?1 \
        AND (candidate.leased_until_ms = 0 OR candidate.leased_until_ms <= ?1) \
-       AND NOT ( \
-           candidate.is_terminal_pod_delete = 0 \
-           AND candidate.supersedable_pod_status = 1 \
-           AND EXISTS ( \
-               SELECT 1 FROM outbox terminal \
-               WHERE terminal.subject_key = candidate.subject_key \
-                 AND terminal.id > candidate.id \
-                 AND terminal.is_terminal_pod_delete = 1 \
-                 AND terminal.next_due_ms <= ?1 \
-                 AND (terminal.leased_until_ms = 0 OR terminal.leased_until_ms <= ?1) \
-           ) \
+       AND ( \
+           (candidate.stream_id > 0 AND candidate.stream_seq > 0 \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM outbox older_stream \
+                WHERE older_stream.stream_id = candidate.stream_id \
+                  AND ( \
+                      (older_stream.stream_seq > 0 \
+                       AND older_stream.stream_seq < candidate.stream_seq) \
+                      OR (older_stream.stream_seq = 0 \
+                          AND older_stream.id < candidate.id) \
+                  ) \
+            ) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM outbox_dead_letter dead_head \
+                WHERE dead_head.stream_id = candidate.stream_id \
+                  AND dead_head.stream_seq > 0 \
+                  AND dead_head.stream_seq < candidate.stream_seq \
+            )) \
+           OR ((candidate.stream_id <= 0 OR candidate.stream_seq <= 0) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM outbox older \
+                   WHERE older.subject_key = candidate.subject_key \
+                     AND older.id < candidate.id \
+               )) \
        ) \
-       AND NOT EXISTS ( \
-           SELECT 1 FROM outbox older \
-           WHERE older.subject_key = candidate.subject_key \
-             AND older.id < candidate.id \
-             AND NOT ( \
-                 candidate.is_terminal_pod_delete = 1 \
-                 AND older.is_terminal_pod_delete = 0 \
-                 AND older.supersedable_pod_status = 1 \
-                 AND (older.leased_until_ms = 0 OR older.leased_until_ms <= ?1) \
-             ) \
-       ) \
-       AND (candidate.stream_id = 0 OR NOT EXISTS ( \
-           SELECT 1 FROM outbox older_stream \
-           WHERE older_stream.stream_id = candidate.stream_id \
-             AND older_stream.id < candidate.id \
-             AND NOT ( \
-                 candidate.is_terminal_pod_delete = 1 \
-                 AND older_stream.subject_key = candidate.subject_key \
-                 AND older_stream.is_terminal_pod_delete = 0 \
-                 AND older_stream.supersedable_pod_status = 1 \
-                 AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
-             ) \
-             AND NOT ( \
-                 older_stream.is_terminal_pod_delete = 0 \
-                 AND older_stream.supersedable_pod_status = 1 \
-                 AND (older_stream.leased_until_ms = 0 OR older_stream.leased_until_ms <= ?1) \
-                 AND EXISTS ( \
-                     SELECT 1 FROM outbox superseding_terminal \
-                     WHERE superseding_terminal.subject_key = older_stream.subject_key \
-                       AND superseding_terminal.id > older_stream.id \
-                       AND superseding_terminal.is_terminal_pod_delete = 1 \
-                       AND superseding_terminal.next_due_ms <= ?1 \
-                       AND (superseding_terminal.leased_until_ms = 0 OR superseding_terminal.leased_until_ms <= ?1) \
-                 ) \
-             ) \
-       )) \
      ) SELECT id FROM eligible candidate ";
 
 static OUTBOX_CLAIM_NEXT_DUE_SQL: LazyLock<String> = LazyLock::new(|| outbox_claim_due_sql("1"));
@@ -170,7 +144,38 @@ pub(super) const OUTBOX_COMPLETE_SUPERSEDED_TERMINAL_POD_DELETE_STATUS: &str = "
      AND is_terminal_pod_delete = 0 \
      AND supersedable_pod_status = 1";
 pub(super) const OUTBOX_REQUEUE_EXPIRED: &str = "UPDATE outbox SET leased_until_ms = 0, lease_token = NULL WHERE leased_until_ms > 0 AND leased_until_ms <= ?1";
-pub(super) const OUTBOX_NEXT_WAKE: &str = "SELECT MIN(CASE WHEN leased_until_ms > ?1 THEN leased_until_ms ELSE next_due_ms END) FROM outbox";
+pub(super) const OUTBOX_NEXT_WAKE: &str = "WITH wake_candidates AS ( \
+     SELECT candidate.*, \
+            MAX(candidate.next_due_ms, CASE WHEN candidate.leased_until_ms > ?1 \
+                THEN candidate.leased_until_ms ELSE candidate.next_due_ms END) AS wake_ms \
+     FROM outbox candidate \
+     ) \
+     SELECT MIN(candidate.wake_ms) FROM wake_candidates candidate \
+     WHERE ( \
+         (candidate.stream_id > 0 AND candidate.stream_seq > 0 \
+          AND NOT EXISTS ( \
+              SELECT 1 FROM outbox older_stream \
+              WHERE older_stream.stream_id = candidate.stream_id \
+                AND ( \
+                    (older_stream.stream_seq > 0 \
+                     AND older_stream.stream_seq < candidate.stream_seq) \
+                    OR (older_stream.stream_seq = 0 \
+                        AND older_stream.id < candidate.id) \
+                ) \
+          ) \
+          AND NOT EXISTS ( \
+              SELECT 1 FROM outbox_dead_letter dead_head \
+              WHERE dead_head.stream_id = candidate.stream_id \
+                AND dead_head.stream_seq > 0 \
+                AND dead_head.stream_seq < candidate.stream_seq \
+          )) \
+         OR ((candidate.stream_id <= 0 OR candidate.stream_seq <= 0) \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM outbox older \
+                 WHERE older.subject_key = candidate.subject_key \
+                   AND older.id < candidate.id \
+             )) \
+     )";
 
 pub(super) const PROBE_STATE_UPSERT: &str = "INSERT INTO probe_state \
      (pod_uid, container_name, probe_kind, last_result_ms, last_success, consecutive_fail, next_eligible_ms) \
@@ -257,19 +262,25 @@ pub(super) const RAFT_META_SET: &str = "INSERT INTO raft_meta (key, value) VALUE
      ON CONFLICT(key) DO UPDATE SET value = excluded.value";
 
 pub(super) const DEAD_LETTER_INSERT: &str = "INSERT INTO outbox_dead_letter \
-     (original_id, idempotency_key, enqueued_ms, subject_key, subject_api_version, \
+     (original_id, client_id, idempotency_key, enqueued_ms, subject_key, subject_api_version, \
       subject_kind, subject_namespace, subject_name, subject_uid, pod_uid, \
-      operation, payload_proto, attempts, last_error, moved_at_ms) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)";
-pub(super) const DEAD_LETTER_LIST: &str = "SELECT id, original_id, idempotency_key, enqueued_ms, \
+      operation, stream_id, stream_seq, payload_proto, attempts, last_error, moved_at_ms) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)";
+pub(super) const DEAD_LETTER_LIST: &str = "SELECT id, original_id, client_id, idempotency_key, enqueued_ms, \
      subject_key, subject_api_version, subject_kind, subject_namespace, subject_name, \
-     subject_uid, pod_uid, operation, payload_proto, attempts, last_error, moved_at_ms \
+     subject_uid, pod_uid, operation, stream_id, stream_seq, payload_proto, attempts, last_error, moved_at_ms \
      FROM outbox_dead_letter ORDER BY id";
-pub(super) const DEAD_LETTER_GET: &str = "SELECT id, original_id, idempotency_key, enqueued_ms, \
+pub(super) const DEAD_LETTER_GET: &str = "SELECT id, original_id, client_id, idempotency_key, enqueued_ms, \
      subject_key, subject_api_version, subject_kind, subject_namespace, subject_name, \
-     subject_uid, pod_uid, operation, payload_proto, attempts, last_error, moved_at_ms \
+     subject_uid, pod_uid, operation, stream_id, stream_seq, payload_proto, attempts, last_error, moved_at_ms \
      FROM outbox_dead_letter WHERE id = ?1";
-pub(super) const DEAD_LETTER_DELETE: &str = "DELETE FROM outbox_dead_letter WHERE id = ?1";
+// Assigned stream entries may leave dead-letter only through exact replay.
+// Deleting one would erase the durable lower-sequence blocker without moving
+// the strict leader watermark and permanently strand every younger sequence.
+pub(super) const DEAD_LETTER_DELETE: &str = "DELETE FROM outbox_dead_letter \
+     WHERE id = ?1 AND (stream_id = 0 OR stream_seq = 0)";
+pub(super) const DEAD_LETTER_DELETE_AFTER_REPLAY: &str =
+    "DELETE FROM outbox_dead_letter WHERE id = ?1";
 pub(super) const DEAD_LETTER_COUNT: &str = "SELECT COUNT(*) FROM outbox_dead_letter";
 pub(super) const OUTBOX_COUNT: &str = "SELECT COUNT(*) FROM outbox";
 pub(super) const OUTBOX_OLDEST_ENQUEUED: &str = "SELECT MIN(enqueued_ms) FROM outbox";

@@ -350,7 +350,15 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         let peering = network.peering.clone();
         let supervisor_for_task = task_supervisor.clone();
         let health_for_peer_watch = dataplane_health.clone();
-        let outbox_for_peer_watch = outbox.clone();
+        let query_for_peer_watch: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
+            remote_api_client.clone();
+        let node_status_for_peer_watch: std::sync::Arc<
+            dyn klights_leader_api::LeaderNodeSelfStatus,
+        > = std::sync::Arc::new(crate::kubelet::node::OutboxNodeSelfStatusPublisher::new(
+            config.node_name.clone(),
+            query_for_peer_watch.clone(),
+            outbox.clone(),
+        ));
         let cancel = shutdown_token.clone();
         task_supervisor
             .spawn_async(
@@ -364,7 +372,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
                         peering,
                         supervisor_for_task,
                         Some(health_for_peer_watch),
-                        Some(outbox_for_peer_watch),
+                        query_for_peer_watch,
+                        node_status_for_peer_watch,
                         cancel,
                     )
                     .await;
@@ -520,8 +529,8 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         let cfc = std::sync::Arc::clone(&config);
         let c = shutdown_token.clone();
         let s = task_supervisor.clone();
-        let lease_client: std::sync::Arc<dyn kubelet::node::NodeLeaseRenewClient> =
-            follower_grpc_client.clone();
+        let lease_client: std::sync::Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal> =
+            remote_api_client.clone();
         task_supervisor
             .spawn_async(
                 crate::task_supervisor::TaskCategory::Background,

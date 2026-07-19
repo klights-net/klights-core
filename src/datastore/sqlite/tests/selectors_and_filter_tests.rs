@@ -833,6 +833,7 @@ async fn list_resources_response_rv_does_not_skip_reserved_unapplied_delete() {
     let crate::datastore::sqlite::BuildOutboxOutcome::NeedsPropose {
         commit,
         applied_rv: delete_rv,
+        ..
     } = outcome
     else {
         panic!("expected a fresh delete commit");

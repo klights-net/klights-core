@@ -597,11 +597,10 @@ mod tests {
             request: crate::kubelet::volume_sources::ProjectedServiceAccountTokenRequest,
         ) -> Result<crate::kubelet::volume_sources::ProjectedServiceAccountToken> {
             self.token_requests.lock().unwrap().push(request);
-            Ok(
-                crate::kubelet::volume_sources::ProjectedServiceAccountToken {
-                    token: self.token.clone(),
-                },
+            crate::kubelet::volume_sources::ProjectedServiceAccountToken::try_new(
+                self.token.clone(),
             )
+            .map_err(anyhow::Error::new)
         }
     }
 
@@ -715,13 +714,13 @@ mod tests {
         let requests = sources.token_requests();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
-        assert_eq!(request.namespace, "default");
-        assert_eq!(request.service_account_name, "default");
-        assert_eq!(request.audiences, vec!["oidc-discovery-test".to_string()]);
-        assert_eq!(request.expiration_seconds, 7200);
-        assert_eq!(request.bound_pod_name.as_deref(), Some("sa-pod"));
-        assert_eq!(request.bound_pod_uid.as_deref(), Some("pod-uid-a"));
-        assert_eq!(request.bound_node_name.as_deref(), Some("node-a"));
+        assert_eq!(request.namespace(), "default");
+        assert_eq!(request.service_account_name(), "default");
+        assert_eq!(request.audiences(), &["oidc-discovery-test".to_string()]);
+        assert_eq!(request.expiration_seconds(), 7200);
+        assert_eq!(request.bound_pod_name(), "sa-pod");
+        assert_eq!(request.bound_pod_uid(), "pod-uid-a");
+        assert_eq!(request.bound_node_name(), "node-a");
 
         let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
     }
@@ -746,6 +745,7 @@ mod tests {
             },
             "spec": {
                 "serviceAccountName": "default",
+                "nodeName": "worker-1",
                 "containers": [{"name": "app", "image": "busybox"}],
                 "volumes": [{
                     "name": "kube-api-access-x",
@@ -1019,7 +1019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_projected_service_account_token_includes_node_uid_when_node_exists() {
+    async fn test_projected_service_account_token_leaves_node_uid_resolution_to_leader() {
         let registry = VolumeRegistry::with_defaults();
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1088,11 +1088,11 @@ mod tests {
         let requests = sources.token_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].audiences,
-            vec!["oidc-discovery-test".to_string()]
+            requests[0].audiences(),
+            &["oidc-discovery-test".to_string()]
         );
-        assert_eq!(requests[0].bound_node_name.as_deref(), Some(node_name));
-        assert_eq!(requests[0].bound_node_uid.as_deref(), Some(node_uid));
+        assert_eq!(requests[0].bound_node_name(), node_name);
+        assert_eq!(requests[0].bound_node_uid(), None);
 
         let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
     }
@@ -1116,7 +1116,7 @@ mod tests {
                 "namespace": "default",
                 "uid": "pod-uid-a"
             },
-            "spec": {"serviceAccountName": "default"}
+            "spec": {"serviceAccountName": "default", "nodeName": "node-a"}
         });
         let sources = RecordingVolumeSourceReader::new(
             vec![test_resource(
@@ -1161,9 +1161,9 @@ mod tests {
 
         let requests = sources.token_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].service_account_name, "default");
-        assert_eq!(requests[0].bound_pod_name.as_deref(), Some(pod_name));
-        assert_eq!(requests[0].bound_pod_uid.as_deref(), Some("pod-uid-a"));
+        assert_eq!(requests[0].service_account_name(), "default");
+        assert_eq!(requests[0].bound_pod_name(), pod_name);
+        assert_eq!(requests[0].bound_pod_uid(), "pod-uid-a");
 
         let _ = std::fs::remove_dir_all(crate::paths::data_root_path(&runtime_ns));
     }
@@ -1187,7 +1187,7 @@ mod tests {
                 "namespace": "default",
                 "uid": "pod-uid-a"
             },
-            "spec": {"serviceAccountName": ""}
+            "spec": {"serviceAccountName": "", "nodeName": "node-a"}
         });
         let sources = RecordingVolumeSourceReader::new(
             vec![test_resource(
@@ -1233,7 +1233,8 @@ mod tests {
         let requests = sources.token_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].service_account_name, "default",
+            requests[0].service_account_name(),
+            "default",
             "empty serviceAccountName must request a token for the Kubernetes default ServiceAccount"
         );
 
@@ -1267,7 +1268,7 @@ mod tests {
                 "namespace": "default",
                 "uid": "pod-uid-a"
             },
-            "spec": {"serviceAccountName": "default"}
+            "spec": {"serviceAccountName": "default", "nodeName": "node-a"}
         });
         let sources = RecordingVolumeSourceReader::new(Vec::new(), "externally-issued-token");
         let volume = json!({

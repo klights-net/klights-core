@@ -323,23 +323,6 @@ impl ReplicationService {
         }
     }
 
-    pub async fn handle_cluster_membership(
-        &self,
-    ) -> crate::control_plane::client::membership::ClusterMembership {
-        match crate::bootstrap::cluster_meta::read_cluster_membership(self.db.as_ref()).await {
-            Ok(membership) => membership,
-            Err(e) => {
-                tracing::warn!("cluster membership request failed: {}", e);
-                crate::control_plane::client::membership::ClusterMembership {
-                    cluster_id: String::new(),
-                    voters: Vec::new(),
-                    term: 0,
-                    leader_hint: None,
-                }
-            }
-        }
-    }
-
     /// Subscribe to the entry watch channel.
     /// Returns a receiver that yields `Option<ReplicationEntry>`.
     pub fn subscribe_entries(&self) -> watch::Receiver<Option<ReplicationEntry>> {

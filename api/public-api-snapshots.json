@@ -3,11 +3,11 @@
   "schema": 2,
   "packages": {
     "klights": {
-      "count": 46372,
-      "sha256": "f77b199cb0b907b710702aaa5162fd4445a3e983cff216034d490a057de710ba",
+      "count": 45906,
+      "sha256": "ba07b3c6831f8b0b6ff953e75e574cfca3019e794bef4ad22c2b08c2a564bac7",
       "source": {
-        "count": 493209,
-        "sha256": "c464c858b13b950d5b7128cd8476ca37e77911709e7bd193fa4cbe97c198c91a"
+        "count": 500556,
+        "sha256": "c08fc0c750a48e195b718191c93972b97e3994aaef9cf2f047f5ca833162dcee"
       }
     },
     "klights-apiserver": {
@@ -59,11 +59,11 @@
       }
     },
     "klights-internal-protobuf": {
-      "count": 7652,
-      "sha256": "6252d2a04f6c758f0e1b0888c2fc1059e2b0d2f715c8be9a0de4afdeb49e9baf",
+      "count": 7756,
+      "sha256": "fc18c9aeb21c83c2f52bfda037bde0ab59942535365806e230c16312d080ea90",
       "source": {
-        "count": 1711,
-        "sha256": "6cf0ad083dbe4ed37d5284fbf993d0a514d82b1dc16fd8bc494ab671eda40a5f"
+        "count": 1720,
+        "sha256": "7e473df715afcb4032ea1582f7536870ce2d44073dab4cbdb654b1e98eae09fc"
       }
     },
     "klights-kube-protobuf": {
@@ -83,11 +83,11 @@
       }
     },
     "klights-leader-api": {
-      "count": 0,
-      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "count": 2416,
+      "sha256": "046a9b464545b56300e610febe22522c82451cd65be73311b8545f9858fb4d05",
       "source": {
-        "count": 0,
-        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        "count": 5360,
+        "sha256": "06d31d3900d30486304fc64b917ebef6bbfada700d46523a8d9711e08a0a354a"
       }
     },
     "klights-network-api": {
@@ -126,8 +126,8 @@
       "count": 2906,
       "sha256": "2ecac9bb1d42dc8f628673cfd279ef351af7f6c9425f1622c563611f4e728afb",
       "source": {
-        "count": 4606,
-        "sha256": "5e67e58447c014d3de9fd6b7e35f4eace35d33c7ba6479bfc0f9d4136e2ba916"
+        "count": 4688,
+        "sha256": "8c6bbdc9324df9f55d0a8783fbe578df55f24ce0f41b77bb5cc7caaa20b1a939"
       }
     },
     "klights-pod-api": {

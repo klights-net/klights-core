@@ -231,6 +231,7 @@ fn set_json_string_field(
     true
 }
 
+#[cfg(test)]
 pub(super) fn stamp_current_git_commit_annotation(node: &mut serde_json::Value) -> bool {
     use crate::controllers::annotations::GIT_COMMIT_ANNOTATION;
 
