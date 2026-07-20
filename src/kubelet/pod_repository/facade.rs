@@ -8,4 +8,30 @@ use super::background::PodRepositoryBackground;
 pub struct PodRepositoryParts {
     pub repository: super::PodRepository,
     pub background: PodRepositoryBackground,
+    deletion_finalizer_dependencies: super::PodDeletionFinalizerDependencies,
+}
+
+impl PodRepositoryParts {
+    pub(super) fn new(
+        repository: super::PodRepository,
+        background: PodRepositoryBackground,
+        deletion_finalizer_dependencies: super::PodDeletionFinalizerDependencies,
+    ) -> Self {
+        Self {
+            repository,
+            background,
+            deletion_finalizer_dependencies,
+        }
+    }
+
+    pub(crate) fn into_pod_subsystem_parts(
+        self,
+    ) -> (
+        super::PodRepository,
+        PodRepositoryBackground,
+        std::sync::Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
+    ) {
+        let finalizer = super::compose_pod_deletion_finalizer(self.deletion_finalizer_dependencies);
+        (self.repository, self.background, finalizer)
+    }
 }

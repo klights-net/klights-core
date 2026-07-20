@@ -5,7 +5,7 @@ use crate::control_plane::client::{
 use crate::datastore::{Resource, backend::DatastoreBackend};
 use crate::kubelet::pod_repository::store::PodStore;
 
-pub async fn issue_projected_service_account_token(
+pub(crate) async fn issue_projected_service_account_token(
     db: &dyn DatastoreBackend,
     pod_store: &PodStore,
     signing_key_pem: &str,

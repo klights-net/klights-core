@@ -1,1 +1,966 @@
-//! Pod lifecycle API contracts for klights.
+//! Focused, transport-neutral access contracts for Pod operations.
+//!
+//! Ordinary access deliberately does not grant datastore removal or
+//! lifecycle-actor control. Bound-Pod row removal and leader-side unscheduled
+//! row removal are distinct UID-qualified capabilities whose real
+//! implementations are kept private by root composition.
+
+use std::error::Error;
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
+
+use klights_cluster_core::Resource;
+use klights_types::PodIdentity;
+
+pub type PodRepositoryFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, PodRepositoryError>> + Send + 'a>>;
+pub type PodLifecycleFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), PodRoutingError>> + Send + 'a>>;
+pub type BoundPodFinalizationFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<BoundPodFinalizationOutcome, BoundPodFinalizationError>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type UnscheduledPodDeletionFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<UnscheduledPodDeletionOutcome, UnscheduledPodDeletionError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// UID- and observed-resourceVersion-qualified capability used only by the
+/// leader deferred-delete worker for Pods that have never been bound.
+///
+/// The real adapter remains private to root composition. Implementations must
+/// remove only a terminating, finalizer-free Pod whose `spec.nodeName` was
+/// empty at `observed_resource_version`; any intervening write defers to the
+/// lifecycle actor path.
+pub trait UnscheduledPodDeletion: Send + Sync {
+    fn delete_unscheduled_pod(
+        &self,
+        request: UnscheduledPodDeletionRequest,
+    ) -> UnscheduledPodDeletionFuture<'_>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnscheduledPodDeletionRequest {
+    identity: PodIdentity,
+    observed_resource_version: i64,
+}
+
+impl UnscheduledPodDeletionRequest {
+    pub fn try_new(
+        identity: PodIdentity,
+        observed_resource_version: i64,
+    ) -> Result<Self, UnscheduledPodDeletionError> {
+        validate_unscheduled_required("pod.identity.namespace", &identity.namespace)?;
+        validate_unscheduled_required("pod.identity.name", &identity.name)?;
+        validate_unscheduled_required("pod.identity.uid", &identity.uid)?;
+        if observed_resource_version <= 0 {
+            return Err(UnscheduledPodDeletionError::invalid_request(
+                "pod.observed_resource_version",
+                "must be positive",
+            ));
+        }
+        Ok(Self {
+            identity,
+            observed_resource_version,
+        })
+    }
+
+    pub fn identity(&self) -> &PodIdentity {
+        &self.identity
+    }
+
+    pub fn observed_resource_version(&self) -> i64 {
+        self.observed_resource_version
+    }
+
+    pub fn into_parts(self) -> (PodIdentity, i64) {
+        (self.identity, self.observed_resource_version)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnscheduledPodDeletionOutcome {
+    /// The requested UID is gone, including when its row was already absent or
+    /// the namespace/name slot now belongs to a replacement UID.
+    Removed,
+    /// The Pod was bound, was not terminating, or changed after observation.
+    /// Only lifecycle actor finalization may remove the surviving row.
+    DeferToActor,
+    /// The Pod still has finalizers and must remain until they clear.
+    FinalizersPending,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnscheduledPodDeletionError {
+    InvalidRequest {
+        field: &'static str,
+        message: String,
+    },
+    Unavailable {
+        message: String,
+    },
+}
+
+impl UnscheduledPodDeletionError {
+    pub fn invalid_request(field: &'static str, message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            field,
+            message: message.into(),
+        }
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for UnscheduledPodDeletionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { field, message } => {
+                write!(formatter, "invalid {field}: {message}")
+            }
+            Self::Unavailable { message } => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for UnscheduledPodDeletionError {}
+
+/// UID-qualified capability used only after the lifecycle actor has completed
+/// runtime cleanup for a bound Pod.
+///
+/// The contract is public so the lifecycle finalizer can receive an opaque
+/// trait object and tests can provide inert fakes. The real deleting adapter is
+/// private to root composition and is never exposed through ordinary Pod ports.
+pub trait BoundPodFinalization: Send + Sync {
+    fn finalize_bound_pod(
+        &self,
+        request: BoundPodFinalizationRequest,
+    ) -> BoundPodFinalizationFuture<'_>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BoundPodFinalizationRequest {
+    identity: PodIdentity,
+}
+
+impl BoundPodFinalizationRequest {
+    pub fn try_new(identity: PodIdentity) -> Result<Self, BoundPodFinalizationError> {
+        validate_bound_required("pod.identity.namespace", &identity.namespace)?;
+        validate_bound_required("pod.identity.name", &identity.name)?;
+        validate_bound_required("pod.identity.uid", &identity.uid)?;
+        Ok(Self { identity })
+    }
+
+    pub fn identity(&self) -> &PodIdentity {
+        &self.identity
+    }
+
+    pub fn into_identity(self) -> PodIdentity {
+        self.identity
+    }
+}
+
+/// Root-adapter disposition needed by the existing lifecycle finalizer to
+/// preserve its exact local post-delete maintenance behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundPodFinalizationOutcome {
+    /// The matching local row was removed.
+    Removed,
+    /// The UID-qualified operation was accepted by the leader-facing path.
+    Accepted,
+    /// The namespace/name slot no longer contains the requested UID.
+    IdentityChanged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BoundPodFinalizationError {
+    InvalidRequest {
+        field: &'static str,
+        message: String,
+    },
+    Unavailable {
+        message: String,
+    },
+}
+
+impl BoundPodFinalizationError {
+    pub fn invalid_request(field: &'static str, message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            field,
+            message: message.into(),
+        }
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for BoundPodFinalizationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { field, message } => {
+                write!(formatter, "invalid {field}: {message}")
+            }
+            Self::Unavailable { message } => formatter.write_str(message),
+        }
+    }
+}
+
+impl Error for BoundPodFinalizationError {}
+
+pub trait PodQuery: Send + Sync {
+    fn get_pod(&self, request: PodGetRequest) -> PodRepositoryFuture<'_, Option<Resource>>;
+
+    fn list_pods(&self, request: PodListRequest) -> PodRepositoryFuture<'_, PodListResult>;
+
+    fn list_pods_by_owner_uid(
+        &self,
+        request: PodOwnerListRequest,
+    ) -> PodRepositoryFuture<'_, Vec<Resource>>;
+}
+
+pub trait PodUpdate: Send + Sync {
+    fn update_pod(&self, request: PodUpdateRequest) -> PodRepositoryFuture<'_, Resource>;
+}
+
+pub trait PodMarkTerminating: Send + Sync {
+    fn mark_pod_terminating(
+        &self,
+        request: PodMarkTerminatingRequest,
+    ) -> PodRepositoryFuture<'_, Resource>;
+}
+
+pub trait PodLifecycleWakeup: Send + Sync {
+    fn wake_pod_lifecycle(&self, request: PodLifecycleWakeupRequest) -> PodLifecycleFuture<'_>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodGetRequest {
+    namespace: String,
+    name: String,
+    uid: Option<String>,
+}
+
+impl PodGetRequest {
+    pub fn try_by_name(
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<Self, PodRepositoryError> {
+        let namespace = namespace.into();
+        let name = name.into();
+        validate_required("pod.namespace", &namespace)?;
+        validate_required("pod.name", &name)?;
+        Ok(Self {
+            namespace,
+            name,
+            uid: None,
+        })
+    }
+
+    pub fn try_by_identity(identity: PodIdentity) -> Result<Self, PodRepositoryError> {
+        validate_required("pod.namespace", &identity.namespace)?;
+        validate_required("pod.name", &identity.name)?;
+        validate_required("pod.uid", &identity.uid)?;
+        Ok(Self {
+            namespace: identity.namespace,
+            name: identity.name,
+            uid: Some(identity.uid),
+        })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn uid(&self) -> Option<&str> {
+        self.uid.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodListRequest {
+    namespace: Option<String>,
+    label_selector: Option<String>,
+    field_selector: Option<String>,
+    limit: Option<i64>,
+    continue_token: Option<String>,
+}
+
+impl PodListRequest {
+    pub fn try_new(
+        namespace: Option<String>,
+        label_selector: Option<String>,
+        field_selector: Option<String>,
+        limit: Option<i64>,
+        continue_token: Option<String>,
+    ) -> Result<Self, PodRepositoryError> {
+        if let Some(namespace) = namespace.as_deref() {
+            validate_required("list.namespace", namespace)?;
+        }
+        if limit.is_some_and(|limit| limit < 0) {
+            return Err(PodRepositoryError::invalid_request(
+                "list.limit",
+                "must be non-negative",
+            ));
+        }
+        Ok(Self {
+            namespace,
+            label_selector,
+            field_selector,
+            limit,
+            continue_token,
+        })
+    }
+
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    pub fn label_selector(&self) -> Option<&str> {
+        self.label_selector.as_deref()
+    }
+
+    pub fn field_selector(&self) -> Option<&str> {
+        self.field_selector.as_deref()
+    }
+
+    pub fn limit(&self) -> Option<i64> {
+        self.limit
+    }
+
+    pub fn continue_token(&self) -> Option<&str> {
+        self.continue_token.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodOwnerListRequest {
+    namespace: String,
+    owner_uid: String,
+}
+
+impl PodOwnerListRequest {
+    pub fn try_new(
+        namespace: impl Into<String>,
+        owner_uid: impl Into<String>,
+    ) -> Result<Self, PodRepositoryError> {
+        let namespace = namespace.into();
+        let owner_uid = owner_uid.into();
+        validate_required("owner_list.namespace", &namespace)?;
+        validate_required("owner_list.owner_uid", &owner_uid)?;
+        Ok(Self {
+            namespace,
+            owner_uid,
+        })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn owner_uid(&self) -> &str {
+        &self.owner_uid
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PodListResult {
+    items: Vec<Resource>,
+    resource_version: i64,
+    continue_token: Option<String>,
+    remaining_item_count: Option<i64>,
+}
+
+impl PodListResult {
+    pub fn try_new(
+        items: Vec<Resource>,
+        resource_version: i64,
+        continue_token: Option<String>,
+        remaining_item_count: Option<i64>,
+    ) -> Result<Self, PodRepositoryError> {
+        if resource_version < 0 {
+            return Err(PodRepositoryError::invalid_request(
+                "list_result.resource_version",
+                "must be non-negative",
+            ));
+        }
+        if remaining_item_count.is_some_and(|remaining| remaining < 0) {
+            return Err(PodRepositoryError::invalid_request(
+                "list_result.remaining_item_count",
+                "must be non-negative",
+            ));
+        }
+        Ok(Self {
+            items,
+            resource_version,
+            continue_token,
+            remaining_item_count,
+        })
+    }
+
+    pub fn items(&self) -> &[Resource] {
+        &self.items
+    }
+
+    pub fn resource_version(&self) -> i64 {
+        self.resource_version
+    }
+
+    pub fn continue_token(&self) -> Option<&str> {
+        self.continue_token.as_deref()
+    }
+
+    pub fn remaining_item_count(&self) -> Option<i64> {
+        self.remaining_item_count
+    }
+
+    pub fn into_parts(self) -> (Vec<Resource>, i64, Option<String>, Option<i64>) {
+        (
+            self.items,
+            self.resource_version,
+            self.continue_token,
+            self.remaining_item_count,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodMutationTarget {
+    namespace: String,
+    name: String,
+    uid: Option<String>,
+}
+
+impl PodMutationTarget {
+    pub fn try_by_name(
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<Self, PodRepositoryError> {
+        let request = PodGetRequest::try_by_name(namespace, name)?;
+        Ok(Self {
+            namespace: request.namespace,
+            name: request.name,
+            uid: None,
+        })
+    }
+
+    pub fn try_by_identity(identity: PodIdentity) -> Result<Self, PodRepositoryError> {
+        let request = PodGetRequest::try_by_identity(identity)?;
+        Ok(Self {
+            namespace: request.namespace,
+            name: request.name,
+            uid: request.uid,
+        })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn uid(&self) -> Option<&str> {
+        self.uid.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodLabel {
+    key: String,
+    value: String,
+}
+
+impl PodLabel {
+    pub fn try_new(
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, PodRepositoryError> {
+        let key = key.into();
+        validate_required("label.key", &key)?;
+        Ok(Self {
+            key,
+            value: value.into(),
+        })
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    pub fn into_parts(self) -> (String, String) {
+        (self.key, self.value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodOwnerReference {
+    api_version: String,
+    kind: String,
+    name: String,
+    uid: String,
+    controller: Option<bool>,
+    block_owner_deletion: Option<bool>,
+}
+
+impl PodOwnerReference {
+    pub fn try_new(
+        api_version: impl Into<String>,
+        kind: impl Into<String>,
+        name: impl Into<String>,
+        uid: impl Into<String>,
+        controller: Option<bool>,
+        block_owner_deletion: Option<bool>,
+    ) -> Result<Self, PodRepositoryError> {
+        let api_version = api_version.into();
+        let kind = kind.into();
+        let name = name.into();
+        let uid = uid.into();
+        validate_required("owner_reference.api_version", &api_version)?;
+        validate_required("owner_reference.kind", &kind)?;
+        validate_required("owner_reference.name", &name)?;
+        validate_required("owner_reference.uid", &uid)?;
+        Ok(Self {
+            api_version,
+            kind,
+            name,
+            uid,
+            controller,
+            block_owner_deletion,
+        })
+    }
+
+    pub fn api_version(&self) -> &str {
+        &self.api_version
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn uid(&self) -> &str {
+        &self.uid
+    }
+
+    pub fn controller(&self) -> Option<bool> {
+        self.controller
+    }
+
+    pub fn block_owner_deletion(&self) -> Option<bool> {
+        self.block_owner_deletion
+    }
+
+    pub fn into_parts(self) -> (String, String, String, String, Option<bool>, Option<bool>) {
+        (
+            self.api_version,
+            self.kind,
+            self.name,
+            self.uid,
+            self.controller,
+            self.block_owner_deletion,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PodUpdateOperation {
+    MergeLabels(Vec<PodLabel>),
+    ReplaceOwnerReferences(Vec<PodOwnerReference>),
+    RecordSandboxId(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodUpdateRequest {
+    target: PodMutationTarget,
+    operation: PodUpdateOperation,
+}
+
+impl PodUpdateRequest {
+    pub fn merge_labels(target: PodMutationTarget, labels: Vec<PodLabel>) -> Self {
+        Self {
+            target,
+            operation: PodUpdateOperation::MergeLabels(labels),
+        }
+    }
+
+    pub fn replace_owner_references(
+        target: PodMutationTarget,
+        owner_references: Vec<PodOwnerReference>,
+    ) -> Self {
+        Self {
+            target,
+            operation: PodUpdateOperation::ReplaceOwnerReferences(owner_references),
+        }
+    }
+
+    pub fn try_record_sandbox_id(
+        target: PodMutationTarget,
+        sandbox_id: impl Into<String>,
+    ) -> Result<Self, PodRepositoryError> {
+        let sandbox_id = sandbox_id.into();
+        validate_required("sandbox_id", &sandbox_id)?;
+        Ok(Self {
+            target,
+            operation: PodUpdateOperation::RecordSandboxId(sandbox_id),
+        })
+    }
+
+    pub fn target(&self) -> &PodMutationTarget {
+        &self.target
+    }
+
+    pub fn labels(&self) -> Option<&[PodLabel]> {
+        match &self.operation {
+            PodUpdateOperation::MergeLabels(labels) => Some(labels),
+            _ => None,
+        }
+    }
+
+    pub fn owner_references(&self) -> Option<&[PodOwnerReference]> {
+        match &self.operation {
+            PodUpdateOperation::ReplaceOwnerReferences(owner_references) => Some(owner_references),
+            _ => None,
+        }
+    }
+
+    pub fn sandbox_id(&self) -> Option<&str> {
+        match &self.operation {
+            PodUpdateOperation::RecordSandboxId(sandbox_id) => Some(sandbox_id),
+            _ => None,
+        }
+    }
+
+    pub fn into_parts(self) -> (PodMutationTarget, PodUpdateOperation) {
+        (self.target, self.operation)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PodMarkTerminatingRequest {
+    target: PodMutationTarget,
+}
+
+impl PodMarkTerminatingRequest {
+    pub fn new(target: PodMutationTarget) -> Self {
+        Self { target }
+    }
+
+    pub fn target(&self) -> &PodMutationTarget {
+        &self.target
+    }
+
+    pub fn into_target(self) -> PodMutationTarget {
+        self.target
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PodLifecycleWakeupRequest {
+    identity: PodIdentity,
+    resource_version: i64,
+    pod: Resource,
+}
+
+impl PodLifecycleWakeupRequest {
+    pub fn try_from_pod(identity: PodIdentity, pod: Resource) -> Result<Self, PodRoutingError> {
+        validate_routing_required("pod.identity.namespace", &identity.namespace)?;
+        validate_routing_required("pod.identity.name", &identity.name)?;
+        validate_routing_required("pod.identity.uid", &identity.uid)?;
+        if pod.api_version != "v1" || pod.kind != "Pod" {
+            return Err(PodRoutingError::invalid_request(
+                "pod",
+                "must be a v1 Pod resource",
+            ));
+        }
+        let namespace = pod
+            .namespace
+            .as_deref()
+            .ok_or_else(|| PodRoutingError::invalid_request("pod.namespace", "must be present"))?;
+        validate_routing_required("pod.namespace", namespace)?;
+        validate_routing_required("pod.name", &pod.name)?;
+        validate_routing_required("pod.uid", &pod.uid)?;
+        if namespace != identity.namespace || pod.name != identity.name || pod.uid != identity.uid {
+            return Err(PodRoutingError::invalid_request(
+                "pod.identity",
+                format!(
+                    "expected {}, found {}/{}/{}",
+                    identity, namespace, pod.name, pod.uid
+                ),
+            ));
+        }
+        if pod.resource_version < 0 {
+            return Err(PodRoutingError::invalid_request(
+                "pod.resource_version",
+                "must be non-negative",
+            ));
+        }
+        Ok(Self {
+            identity,
+            resource_version: pod.resource_version,
+            pod,
+        })
+    }
+
+    pub fn identity(&self) -> &PodIdentity {
+        &self.identity
+    }
+
+    pub fn resource_version(&self) -> i64 {
+        self.resource_version
+    }
+
+    pub fn pod(&self) -> &Resource {
+        &self.pod
+    }
+
+    pub fn into_pod(self) -> Resource {
+        self.pod
+    }
+
+    pub fn into_parts(self) -> (PodIdentity, i64, Resource) {
+        (self.identity, self.resource_version, self.pod)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PodRepositoryError {
+    InvalidRequest {
+        field: &'static str,
+        message: String,
+    },
+    NotFound {
+        namespace: String,
+        name: String,
+    },
+    UidMismatch {
+        expected: String,
+        actual: String,
+    },
+    Conflict {
+        message: String,
+    },
+    Forbidden {
+        message: String,
+    },
+    Unprocessable {
+        message: String,
+    },
+    Internal {
+        message: String,
+    },
+    Unavailable {
+        message: String,
+    },
+    CorruptResponse {
+        message: String,
+    },
+    Timeout,
+    Cancelled,
+}
+
+impl PodRepositoryError {
+    pub fn invalid_request(field: &'static str, message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            field,
+            message: message.into(),
+        }
+    }
+
+    pub fn not_found(namespace: impl Into<String>, name: impl Into<String>) -> Self {
+        Self::NotFound {
+            namespace: namespace.into(),
+            name: name.into(),
+        }
+    }
+
+    pub fn uid_mismatch(expected: impl Into<String>, actual: impl Into<String>) -> Self {
+        Self::UidMismatch {
+            expected: expected.into(),
+            actual: actual.into(),
+        }
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict {
+            message: message.into(),
+        }
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable {
+            message: message.into(),
+        }
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::Forbidden {
+            message: message.into(),
+        }
+    }
+
+    pub fn unprocessable(message: impl Into<String>) -> Self {
+        Self::Unprocessable {
+            message: message.into(),
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal {
+            message: message.into(),
+        }
+    }
+
+    pub fn corrupt_response(message: impl Into<String>) -> Self {
+        Self::CorruptResponse {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for PodRepositoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { field, message } => {
+                write!(formatter, "invalid {field}: {message}")
+            }
+            Self::NotFound { namespace, name } => {
+                write!(formatter, "Pod {namespace}/{name} not found")
+            }
+            Self::UidMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "Pod UID mismatch: expected {expected}, found {actual}"
+                )
+            }
+            Self::Conflict { message } => write!(formatter, "Pod conflict: {message}"),
+            Self::Forbidden { message } => write!(formatter, "Pod operation forbidden: {message}"),
+            Self::Unprocessable { message } => write!(formatter, "invalid Pod: {message}"),
+            Self::Internal { message } => write!(formatter, "Pod repository failure: {message}"),
+            Self::Unavailable { message } => {
+                write!(formatter, "Pod repository unavailable: {message}")
+            }
+            Self::CorruptResponse { message } => {
+                write!(formatter, "invalid Pod response: {message}")
+            }
+            Self::Timeout => formatter.write_str("Pod repository request timed out"),
+            Self::Cancelled => formatter.write_str("Pod repository request cancelled"),
+        }
+    }
+}
+
+impl Error for PodRepositoryError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PodRoutingError {
+    InvalidRequest {
+        field: &'static str,
+        message: String,
+    },
+    Unavailable {
+        message: String,
+    },
+    Timeout,
+    Cancelled,
+}
+
+impl PodRoutingError {
+    pub fn invalid_request(field: &'static str, message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            field,
+            message: message.into(),
+        }
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for PodRoutingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { field, message } => {
+                write!(formatter, "invalid {field}: {message}")
+            }
+            Self::Unavailable { message } => {
+                write!(formatter, "Pod routing unavailable: {message}")
+            }
+            Self::Timeout => formatter.write_str("Pod routing timed out"),
+            Self::Cancelled => formatter.write_str("Pod routing cancelled"),
+        }
+    }
+}
+
+impl Error for PodRoutingError {}
+
+fn validate_required(field: &'static str, value: &str) -> Result<(), PodRepositoryError> {
+    if value.trim().is_empty() {
+        return Err(PodRepositoryError::invalid_request(
+            field,
+            "must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bound_required(
+    field: &'static str,
+    value: &str,
+) -> Result<(), BoundPodFinalizationError> {
+    if value.trim().is_empty() {
+        return Err(BoundPodFinalizationError::invalid_request(
+            field,
+            "must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unscheduled_required(
+    field: &'static str,
+    value: &str,
+) -> Result<(), UnscheduledPodDeletionError> {
+    if value.trim().is_empty() {
+        return Err(UnscheduledPodDeletionError::invalid_request(
+            field,
+            "must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_routing_required(field: &'static str, value: &str) -> Result<(), PodRoutingError> {
+    if value.trim().is_empty() {
+        return Err(PodRoutingError::invalid_request(field, "must not be empty"));
+    }
+    Ok(())
+}

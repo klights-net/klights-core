@@ -375,7 +375,7 @@ async fn pod_repository_build_parts_does_not_start_workqueue_until_background_st
     );
 
     // Explicit start must call workqueue.start().
-    parts.background.start();
+    parts.background.start().await.unwrap();
     assert!(
         parts.background.workqueue_start_called(),
         "background.start() must call workqueue.start()"
@@ -408,11 +408,11 @@ async fn pod_workqueue_runner_start_calls_workqueue_start_once() {
     assert!(!parts.background.workqueue_start_called());
 
     // Start must delegate to workqueue.start().
-    parts.background.start();
+    parts.background.start().await.unwrap();
     assert!(parts.background.workqueue_start_called());
 
     // Calling start again is idempotent (reconciler uses AtomicBool CAS).
-    parts.background.start();
+    parts.background.start().await.unwrap();
     assert!(parts.background.workqueue_start_called());
 }
 
@@ -2212,13 +2212,13 @@ async fn delete_unscheduled_removes_terminating_unscheduled_pod() {
         .create("default", "u1", make_pod("u1", None, None))
         .await
         .unwrap();
-    store
+    let marked = store
         .mark_deleting_latest("default", "u1", &created.uid, &delete_mark_body())
         .await
         .unwrap();
 
     let outcome = store
-        .delete_unscheduled_with_uid("default", "u1", &created.uid)
+        .delete_unscheduled_with_uid("default", "u1", &created.uid, marked.resource_version)
         .await
         .unwrap();
 
@@ -2236,13 +2236,13 @@ async fn delete_unscheduled_defers_when_kubelet_picked_pod_up() {
     let mut pod = make_pod("s1", None, None);
     pod["spec"]["nodeName"] = json!("node-a");
     let created = store.create("default", "s1", pod).await.unwrap();
-    store
+    let marked = store
         .mark_deleting_latest("default", "s1", &created.uid, &delete_mark_body())
         .await
         .unwrap();
 
     let outcome = store
-        .delete_unscheduled_with_uid("default", "s1", &created.uid)
+        .delete_unscheduled_with_uid("default", "s1", &created.uid, marked.resource_version)
         .await
         .unwrap();
 
@@ -2260,13 +2260,13 @@ async fn delete_unscheduled_waits_for_finalizers() {
     let mut pod = make_pod("f1", None, None);
     pod["metadata"]["finalizers"] = json!(["example.com/hold"]);
     let created = store.create("default", "f1", pod).await.unwrap();
-    store
+    let marked = store
         .mark_deleting_latest("default", "f1", &created.uid, &delete_mark_body())
         .await
         .unwrap();
 
     let outcome = store
-        .delete_unscheduled_with_uid("default", "f1", &created.uid)
+        .delete_unscheduled_with_uid("default", "f1", &created.uid, marked.resource_version)
         .await
         .unwrap();
 
@@ -2284,7 +2284,7 @@ async fn delete_unscheduled_refuses_non_terminating_pod() {
         .unwrap();
 
     let outcome = store
-        .delete_unscheduled_with_uid("default", "live1", &created.uid)
+        .delete_unscheduled_with_uid("default", "live1", &created.uid, created.resource_version)
         .await
         .unwrap();
 
@@ -2302,7 +2302,7 @@ async fn delete_unscheduled_is_idempotent_for_missing_or_replaced_uid() {
 
     // Missing Pod — nothing to remove.
     let outcome = store
-        .delete_unscheduled_with_uid("default", "ghost", "uid-x")
+        .delete_unscheduled_with_uid("default", "ghost", "uid-x", 1)
         .await
         .unwrap();
     assert_eq!(outcome, UnscheduledPodDeleteOutcome::Removed);
@@ -2312,12 +2312,12 @@ async fn delete_unscheduled_is_idempotent_for_missing_or_replaced_uid() {
         .create("default", "r1", make_pod("r1", None, None))
         .await
         .unwrap();
-    store
+    let marked = store
         .mark_deleting_latest("default", "r1", &created.uid, &delete_mark_body())
         .await
         .unwrap();
     let outcome = store
-        .delete_unscheduled_with_uid("default", "r1", "stale-uid")
+        .delete_unscheduled_with_uid("default", "r1", "stale-uid", marked.resource_version)
         .await
         .unwrap();
     assert_eq!(outcome, UnscheduledPodDeleteOutcome::Removed);
@@ -10809,6 +10809,188 @@ async fn delete_pod_marks_resource_terminating() {
 }
 
 #[tokio::test]
+async fn ordinary_pod_ports_preserve_query_update_and_graceful_mark_semantics() {
+    use klights_pod_api::{
+        PodGetRequest, PodLabel, PodListRequest, PodMarkTerminating, PodMarkTerminatingRequest,
+        PodMutationTarget, PodOwnerListRequest, PodOwnerReference, PodQuery, PodRepositoryError,
+        PodUpdate, PodUpdateRequest,
+    };
+
+    let repo = build_repo().await;
+    let created = create_basic_pod_via_api(&repo, "ordinary-port-pod").await;
+    let identity = PodIdentity::new("default", "ordinary-port-pod", &created.uid);
+
+    let queried = PodQuery::get_pod(
+        &repo,
+        PodGetRequest::try_by_identity(identity.clone()).unwrap(),
+    )
+    .await
+    .unwrap()
+    .expect("UID-qualified query must find the Pod");
+    assert_eq!(queried.uid, created.uid);
+
+    let listed = PodQuery::list_pods(
+        &repo,
+        PodListRequest::try_new(Some("default".to_string()), None, None, None, None).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(listed.items().iter().any(|pod| pod.uid == created.uid));
+
+    let updated = PodUpdate::update_pod(
+        &repo,
+        PodUpdateRequest::merge_labels(
+            PodMutationTarget::try_by_identity(identity.clone()).unwrap(),
+            vec![PodLabel::try_new("ordinary-port", "true").unwrap()],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        updated.data.pointer("/metadata/labels/ordinary-port"),
+        Some(&json!("true"))
+    );
+
+    let updated = PodUpdate::update_pod(
+        &repo,
+        PodUpdateRequest::replace_owner_references(
+            PodMutationTarget::try_by_identity(identity.clone()).unwrap(),
+            vec![
+                PodOwnerReference::try_new(
+                    "apps/v1",
+                    "ReplicaSet",
+                    "ordinary-owner",
+                    "ordinary-owner-uid",
+                    Some(true),
+                    Some(true),
+                )
+                .unwrap(),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        updated.data.pointer("/metadata/ownerReferences/0/uid"),
+        Some(&json!("ordinary-owner-uid"))
+    );
+
+    let updated = PodUpdate::update_pod(
+        &repo,
+        PodUpdateRequest::try_record_sandbox_id(
+            PodMutationTarget::try_by_identity(identity.clone()).unwrap(),
+            "ordinary-sandbox",
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        updated
+            .data
+            .pointer("/metadata/annotations/klights.dev~1sandbox-id"),
+        Some(&json!("ordinary-sandbox"))
+    );
+
+    let owned = PodQuery::list_pods_by_owner_uid(
+        &repo,
+        PodOwnerListRequest::try_new("default", "ordinary-owner-uid").unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].uid, created.uid);
+    let unowned = PodQuery::list_pods_by_owner_uid(
+        &repo,
+        PodOwnerListRequest::try_new("default", "missing-owner-uid").unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(unowned.is_empty());
+
+    let stale_identity = PodIdentity::new("default", "ordinary-port-pod", "stale-uid");
+    let stale_updates = vec![
+        PodUpdateRequest::merge_labels(
+            PodMutationTarget::try_by_identity(stale_identity.clone()).unwrap(),
+            vec![PodLabel::try_new("stale", "label").unwrap()],
+        ),
+        PodUpdateRequest::replace_owner_references(
+            PodMutationTarget::try_by_identity(stale_identity.clone()).unwrap(),
+            Vec::new(),
+        ),
+        PodUpdateRequest::try_record_sandbox_id(
+            PodMutationTarget::try_by_identity(stale_identity.clone()).unwrap(),
+            "stale-sandbox",
+        )
+        .unwrap(),
+    ];
+    for stale_update in stale_updates {
+        let error = PodUpdate::update_pod(&repo, stale_update)
+            .await
+            .expect_err("stale UID metadata update must reject a same-name replacement");
+        assert!(matches!(
+            error,
+            PodRepositoryError::UidMismatch {
+                ref expected,
+                ref actual,
+            } if expected == "stale-uid" && actual == &created.uid
+        ));
+    }
+
+    let mismatch = PodMarkTerminating::mark_pod_terminating(
+        &repo,
+        PodMarkTerminatingRequest::new(
+            PodMutationTarget::try_by_identity(PodIdentity::new(
+                "default",
+                "ordinary-port-pod",
+                "replacement-uid",
+            ))
+            .unwrap(),
+        ),
+    )
+    .await
+    .expect_err("a stale UID must not mark a same-name Pod terminating");
+    assert!(matches!(mismatch, PodRepositoryError::Conflict { .. }));
+
+    let terminating = PodMarkTerminating::mark_pod_terminating(
+        &repo,
+        PodMarkTerminatingRequest::new(PodMutationTarget::try_by_identity(identity).unwrap()),
+    )
+    .await
+    .unwrap();
+    assert!(terminating.data["metadata"]["deletionTimestamp"].is_string());
+    assert!(
+        PodReader::get_pod(&repo, "default", "ordinary-port-pod")
+            .await
+            .unwrap()
+            .is_some(),
+        "ordinary deletion may mark terminating but must not remove the Pod row"
+    );
+}
+
+#[test]
+fn ordinary_pod_error_mapping_preserves_kubernetes_error_categories() {
+    use klights_pod_api::PodRepositoryError;
+
+    assert!(matches!(
+        crate::api::AppError::from(PodRepositoryError::not_found("default", "web")),
+        crate::api::AppError::NotFound(_)
+    ));
+    assert!(matches!(
+        crate::api::AppError::from(PodRepositoryError::uid_mismatch("old", "new")),
+        crate::api::AppError::Conflict(_)
+    ));
+    assert!(matches!(
+        crate::api::AppError::from(PodRepositoryError::conflict("resource changed")),
+        crate::api::AppError::Conflict(_)
+    ));
+    assert!(matches!(
+        crate::api::AppError::from(PodRepositoryError::unavailable("leader unavailable")),
+        crate::api::AppError::ServiceUnavailable(_)
+    ));
+}
+
+#[tokio::test]
 async fn delete_pod_runs_side_effects_after_marking_terminating_with_original_pod() {
     use super::PodObjectWriter;
 
@@ -12201,10 +12383,15 @@ async fn deferred_delete_preserves_same_name_replacement() {
     {
         let mut pod = make_terminating_pod("picked-up", "uid-picked");
         pod["spec"]["nodeName"] = json!("node-a");
-        store.create("default", "picked-up", pod).await.unwrap();
+        let created = store.create("default", "picked-up", pod).await.unwrap();
 
         let outcome = store
-            .delete_unscheduled_with_uid("default", "picked-up", "uid-picked")
+            .delete_unscheduled_with_uid(
+                "default",
+                "picked-up",
+                "uid-picked",
+                created.resource_version,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -12225,13 +12412,13 @@ async fn deferred_delete_preserves_same_name_replacement() {
     //     (the old UID is already gone) without deleting the replacement.
     {
         let replacement = make_terminating_pod("replaced", "uid-new");
-        store
+        let created = store
             .create("default", "replaced", replacement)
             .await
             .unwrap();
 
         let outcome = store
-            .delete_unscheduled_with_uid("default", "replaced", "uid-old")
+            .delete_unscheduled_with_uid("default", "replaced", "uid-old", created.resource_version)
             .await
             .unwrap();
         assert_eq!(
@@ -12446,7 +12633,7 @@ async fn unscheduled_delete_compare_and_swap_rejects_node_bind_race() {
     assert_eq!(created.uid, "uid-bind");
 
     let outcome = store
-        .delete_unscheduled_with_uid("default", "bind-race", "uid-bind")
+        .delete_unscheduled_with_uid("default", "bind-race", "uid-bind", created.resource_version)
         .await
         .expect("CAS race must not propagate a hard error");
 
@@ -12492,7 +12679,7 @@ async fn unscheduled_delete_compare_and_swap_rejects_resource_version_race() {
     assert_eq!(created.uid, "uid-rv");
 
     let outcome = store
-        .delete_unscheduled_with_uid("default", "rv-race", "uid-rv")
+        .delete_unscheduled_with_uid("default", "rv-race", "uid-rv", created.resource_version)
         .await
         .expect("CAS race must not propagate a hard error");
 

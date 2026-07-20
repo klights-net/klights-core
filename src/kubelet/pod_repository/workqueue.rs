@@ -5,31 +5,76 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
+use klights_pod_api::{
+    PodLifecycleWakeup, PodLifecycleWakeupRequest, UnscheduledPodDeletion,
+    UnscheduledPodDeletionError, UnscheduledPodDeletionFuture, UnscheduledPodDeletionOutcome,
+    UnscheduledPodDeletionRequest,
+};
 use serde_json::{Map, Value, json};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::datastore::{DatastoreHandle, PodWorkqueueEntry, PodWorkqueueKind};
-use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
-use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::side_effects::SideEffectMetrics;
 use crate::task_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::PodIdentity;
 
-use super::delete_coordinator::{PodDeleteCoordinator, PodDeleteRetryDecision};
-use super::store::PodStore;
+use super::delete_coordinator::PodDeleteCoordinator;
+use super::store::{PodStore, UnscheduledPodDeleteOutcome};
 const MAX_ATTEMPTS: i64 = 720;
 const MIN_DELAY_MS: i64 = 5_000;
 const POD_DELETE_TARGET_NODE_PAYLOAD_KEY: &str = "target_node";
 const POD_DELETE_LAST_RESIGNAL_MS_PAYLOAD_KEY: &str = "last_resignal_ms";
 const REMOTE_POD_DELETE_RESIGNAL_MIN_INTERVAL_MS: i64 = 30_000;
 
-pub struct PodWorkqueue {
+/// Root-private adapter carrying the leader deferred-delete worker's narrow
+/// unscheduled-Pod row-removal authority.
+///
+/// Construction remains in this module, and the capability is stored only by
+/// `PodWorkqueue`; repository callers and lifecycle finalization never receive
+/// it.
+struct LeaderDeferredUnscheduledPodDeletion {
     store: Arc<PodStore>,
+}
+
+impl UnscheduledPodDeletion for LeaderDeferredUnscheduledPodDeletion {
+    fn delete_unscheduled_pod(
+        &self,
+        request: UnscheduledPodDeletionRequest,
+    ) -> UnscheduledPodDeletionFuture<'_> {
+        Box::pin(async move {
+            let (identity, observed_resource_version) = request.into_parts();
+            let outcome = self
+                .store
+                .delete_unscheduled_with_uid(
+                    &identity.namespace,
+                    &identity.name,
+                    &identity.uid,
+                    observed_resource_version,
+                )
+                .await
+                .map_err(|error| UnscheduledPodDeletionError::unavailable(error.to_string()))?;
+            Ok(match outcome {
+                UnscheduledPodDeleteOutcome::Removed => UnscheduledPodDeletionOutcome::Removed,
+                UnscheduledPodDeleteOutcome::DeferToActor => {
+                    UnscheduledPodDeletionOutcome::DeferToActor
+                }
+                UnscheduledPodDeleteOutcome::FinalizersPending => {
+                    UnscheduledPodDeletionOutcome::FinalizersPending
+                }
+            })
+        })
+    }
+}
+
+pub(super) struct PodWorkqueue {
+    store: Arc<PodStore>,
+    unscheduled_deletion: Option<Arc<dyn UnscheduledPodDeletion>>,
+    leadership: Option<watch::Receiver<bool>>,
     db: DatastoreHandle,
     supervisor: Arc<TaskSupervisor>,
     metrics: Arc<SideEffectMetrics>,
     wake: Arc<Notify>,
-    lifecycle_router: std::sync::Mutex<Option<Arc<PodLifecycleRouter>>>,
+    lifecycle_router: std::sync::Mutex<Option<Arc<dyn PodLifecycleWakeup>>>,
     local_node_name: std::sync::Mutex<Option<String>>,
     remote_pod_delete_resignal_sink:
         std::sync::Mutex<Option<std::sync::Weak<dyn crate::controllers::gc::GcPodDeleteSink>>>,
@@ -40,14 +85,48 @@ pub struct PodWorkqueue {
 }
 
 impl PodWorkqueue {
-    pub fn new(
+    pub(super) fn new(
         store: Arc<PodStore>,
         db: DatastoreHandle,
         supervisor: Arc<TaskSupervisor>,
         metrics: Arc<SideEffectMetrics>,
     ) -> Arc<Self> {
+        Self::new_with_unscheduled_deletion(store, db, supervisor, metrics, None, None)
+    }
+
+    pub(super) fn new_leader(
+        store: Arc<PodStore>,
+        db: DatastoreHandle,
+        supervisor: Arc<TaskSupervisor>,
+        metrics: Arc<SideEffectMetrics>,
+        leadership: watch::Receiver<bool>,
+    ) -> Arc<Self> {
+        let unscheduled_deletion: Arc<dyn UnscheduledPodDeletion> =
+            Arc::new(LeaderDeferredUnscheduledPodDeletion {
+                store: store.clone(),
+            });
+        Self::new_with_unscheduled_deletion(
+            store,
+            db,
+            supervisor,
+            metrics,
+            Some(unscheduled_deletion),
+            Some(leadership),
+        )
+    }
+
+    fn new_with_unscheduled_deletion(
+        store: Arc<PodStore>,
+        db: DatastoreHandle,
+        supervisor: Arc<TaskSupervisor>,
+        metrics: Arc<SideEffectMetrics>,
+        unscheduled_deletion: Option<Arc<dyn UnscheduledPodDeletion>>,
+        leadership: Option<watch::Receiver<bool>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
+            unscheduled_deletion,
+            leadership,
             db,
             supervisor,
             metrics,
@@ -60,9 +139,12 @@ impl PodWorkqueue {
         })
     }
 
-    pub(super) fn start(self: &Arc<Self>) {
+    pub(super) async fn start(self: &Arc<Self>) -> Result<()> {
         self.start_called.store(true, Ordering::Release);
-        // Reconciler starts lazily on first enqueue from async callers.
+        if self.leadership.is_some() {
+            self.ensure_reconciler_started().await?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -72,7 +154,7 @@ impl PodWorkqueue {
 
     pub(super) fn set_lifecycle_router_for_node(
         &self,
-        router: Arc<PodLifecycleRouter>,
+        router: Arc<dyn PodLifecycleWakeup>,
         local_node_name: String,
     ) {
         *self.lifecycle_router.lock().unwrap() = Some(router);
@@ -193,7 +275,50 @@ impl PodWorkqueue {
 
     async fn reconciler_loop(self: Arc<Self>) {
         let cancel = self.supervisor.root_cancellation_token();
+        let mut leadership = self.leadership.clone();
+        let mut was_leader = false;
+        let mut scan_on_gain = leadership
+            .as_ref()
+            .is_some_and(|receiver| *receiver.borrow());
         loop {
+            if let Some(receiver) = leadership.as_mut() {
+                while !*receiver.borrow() {
+                    tokio::select! {
+                        changed = receiver.changed() => {
+                            if changed.is_err() { return; }
+                            scan_on_gain = observe_leadership(receiver, &mut was_leader);
+                        }
+                        _ = cancel.cancelled() => return,
+                    }
+                }
+                if scan_on_gain {
+                    if let Err(error) = self
+                        .enqueue_terminating_unbound_pods_on_leadership_gain()
+                        .await
+                    {
+                        tracing::warn!(%error, "pod_workqueue: leadership handoff discovery failed");
+                        tokio::select! {
+                            _ = self.supervisor.sleep(
+                                "pod_workqueue_leadership_handoff_retry",
+                                Duration::from_millis(250),
+                            ) => {}
+                            changed = receiver.changed() => {
+                                if changed.is_err() { return; }
+                            }
+                            _ = cancel.cancelled() => return,
+                        }
+                        scan_on_gain = if *receiver.borrow() {
+                            true
+                        } else {
+                            observe_leadership(receiver, &mut was_leader)
+                        };
+                        continue;
+                    }
+                    scan_on_gain = false;
+                    was_leader = true;
+                    let _ = receiver.borrow_and_update();
+                }
+            }
             let next_due = match self.db.pod_workqueue_peek_next_due().await {
                 Ok(v) => v,
                 Err(e) => {
@@ -213,6 +338,12 @@ impl PodWorkqueue {
                 None => {
                     tokio::select! {
                         _ = self.wake.notified() => {}
+                        changed = leadership_changed(&mut leadership) => {
+                            if changed.is_err() { return; }
+                            scan_on_gain = leadership.as_mut().is_some_and(|receiver| {
+                                observe_leadership(receiver, &mut was_leader)
+                            });
+                        }
                         _ = cancel.cancelled() => return,
                     }
                     continue;
@@ -224,6 +355,13 @@ impl PodWorkqueue {
                         tokio::select! {
                             _ = self.supervisor.sleep("pod_workqueue_sleep_until_due", sleep_for) => {}
                             _ = self.wake.notified() => continue,
+                            changed = leadership_changed(&mut leadership) => {
+                                if changed.is_err() { return; }
+                                scan_on_gain = leadership.as_mut().is_some_and(|receiver| {
+                                    observe_leadership(receiver, &mut was_leader)
+                                });
+                                continue;
+                            }
                             _ = cancel.cancelled() => return,
                         }
                     }
@@ -244,6 +382,15 @@ impl PodWorkqueue {
                     continue;
                 }
             };
+            if self
+                .leadership
+                .as_ref()
+                .is_some_and(|receiver| !*receiver.borrow())
+            {
+                self.park_claimed_row(row, "leadership lost before deferred delete")
+                    .await;
+                continue;
+            }
 
             let category = match row.kind {
                 PodWorkqueueKind::Pod => TaskCategory::PodDeleteWorkqueue,
@@ -304,6 +451,15 @@ impl PodWorkqueue {
         }
 
         let err = result.expect_err("error is present");
+        if self
+            .leadership
+            .as_ref()
+            .is_some_and(|receiver| !*receiver.borrow())
+        {
+            self.park_claimed_row(row, "leadership lost during deferred delete")
+                .await;
+            return;
+        }
         if row.attempt_count >= MAX_ATTEMPTS {
             let _ = self
                 .db
@@ -330,6 +486,52 @@ impl PodWorkqueue {
             return;
         }
         self.wake.notify_one();
+    }
+
+    async fn park_claimed_row(&self, row: PodWorkqueueEntry, reason: &str) {
+        let pod = PodIdentity::new(&row.namespace, &row.name, &row.uid);
+        if let Err(error) = self
+            .db
+            .pod_workqueue_enqueue(
+                row.kind,
+                &pod,
+                row.payload,
+                row.attempt_count,
+                0,
+                Some(reason),
+            )
+            .await
+        {
+            tracing::error!(%error, "pod_workqueue: failed to park work after leadership loss");
+        }
+    }
+
+    async fn enqueue_terminating_unbound_pods_on_leadership_gain(&self) -> Result<()> {
+        let pods = self.store.list(None, None, None, None, None).await?;
+        for pod in pods.items {
+            let terminating = pod
+                .data
+                .pointer("/metadata/deletionTimestamp")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty());
+            let unbound = pod
+                .data
+                .pointer("/spec/nodeName")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.trim().is_empty());
+            if terminating && unbound && !pod.uid.is_empty() {
+                self.enqueue_deferred_delete_row_with_target_node(
+                    pod.namespace.unwrap_or_default(),
+                    pod.name,
+                    pod.uid,
+                    Duration::ZERO,
+                    None,
+                )
+                .await?;
+            }
+        }
+        self.wake.notify_one();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -371,27 +573,54 @@ impl PodWorkqueue {
                 );
             }
             Some(resource) if resource.uid == uid => {
-                // HR#11 exception: unscheduled-row removal and bind-race
-                // retry decisions are centralized in PodDeleteCoordinator.
-                let resource = match PodDeleteCoordinator::resolve_retry_resource(
-                    self.store.as_ref(),
-                    &ns,
-                    &name,
-                    &uid,
-                    resource,
-                )
-                .await?
+                let resource = if resource
+                    .data
+                    .pointer("/spec/nodeName")
+                    .and_then(|node| node.as_str())
+                    .is_none_or(|node| node.trim().is_empty())
                 {
-                    PodDeleteRetryDecision::Removed => return Ok(()),
-                    PodDeleteRetryDecision::FinalizersPending => {
-                        anyhow::bail!(
-                            "unscheduled pod {}/{} uid {} awaiting finalizer removal",
+                    let unscheduled_deletion = self.unscheduled_deletion.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pod deferred delete requires leader unscheduled-delete capability for {}/{} uid {}",
                             ns,
                             name,
                             uid
-                        );
+                        )
+                    })?;
+                    let request = UnscheduledPodDeletionRequest::try_new(
+                        PodIdentity::new(&ns, &name, &uid),
+                        resource.resource_version,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("invalid unscheduled Pod delete request: {error}")
+                    })?;
+                    match unscheduled_deletion
+                        .delete_unscheduled_pod(request)
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("unscheduled Pod delete failed: {error}")
+                        })? {
+                        UnscheduledPodDeletionOutcome::Removed => return Ok(()),
+                        UnscheduledPodDeletionOutcome::FinalizersPending => {
+                            anyhow::bail!(
+                                "unscheduled pod {}/{} uid {} awaiting finalizer removal",
+                                ns,
+                                name,
+                                uid
+                            );
+                        }
+                        UnscheduledPodDeletionOutcome::DeferToActor => {
+                            // A bind or any other write raced the observed-RV
+                            // CAS. Re-read so a now-bound Pod is routed only to
+                            // its lifecycle actor.
+                            match self.store.get(&ns, &name).await? {
+                                Some(fresh) if fresh.uid == uid => fresh,
+                                _ => return Ok(()),
+                            }
+                        }
                     }
-                    PodDeleteRetryDecision::Actor(resource) => resource,
+                } else {
+                    resource
                 };
                 if !self.should_process_deferred_pod_delete_for_target(
                     "pod deferred delete is not targeted to this node",
@@ -431,7 +660,7 @@ impl PodWorkqueue {
                         uid
                     );
                 }
-                self.wake_local_actor_for_pod_delete(&ns, &name, &uid, &resource)
+                self.wake_local_actor_for_pod_delete(&ns, &name, &uid, resource)
                     .await?;
                 anyhow::bail!(
                     "pod deferred delete waiting for kubelet cleanup for {}/{} uid {}",
@@ -573,7 +802,7 @@ impl PodWorkqueue {
         ns: &str,
         name: &str,
         uid: &str,
-        resource: &crate::datastore::Resource,
+        resource: crate::datastore::Resource,
     ) -> Result<()> {
         let Some(router) = self.lifecycle_router.lock().unwrap().clone() else {
             tracing::warn!(
@@ -584,12 +813,11 @@ impl PodWorkqueue {
             );
             return Ok(());
         };
+        let request =
+            PodLifecycleWakeupRequest::try_from_pod(PodIdentity::new(ns, name, uid), resource)
+                .map_err(|err| anyhow::anyhow!("invalid pod deferred delete actor wake: {err}"))?;
         router
-            .route(LifecycleMessage::WatchModified {
-                key: PodLifecycleKey::new(ns, name, uid),
-                resource_version: Some(resource.resource_version),
-                pod: std::sync::Arc::unwrap_or_clone(resource.data.clone()),
-            })
+            .wake_pod_lifecycle(request)
             .await
             .map_err(|err| anyhow::anyhow!("pod deferred delete actor wake failed: {err}"))
     }
@@ -673,6 +901,22 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+async fn leadership_changed(
+    leadership: &mut Option<watch::Receiver<bool>>,
+) -> Result<(), watch::error::RecvError> {
+    match leadership {
+        Some(receiver) => receiver.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn observe_leadership(receiver: &mut watch::Receiver<bool>, was_leader: &mut bool) -> bool {
+    let is_leader = *receiver.borrow_and_update();
+    let gained = is_leader && !*was_leader;
+    *was_leader = is_leader;
+    gained
 }
 
 fn pod_delete_target_payload(target_node: Option<&str>) -> Value {
@@ -781,9 +1025,90 @@ mod tests {
             crate::task_supervisor::TaskCategoryConfig::default(),
         ));
         let metrics = SideEffectMetrics::new();
+        let workqueue = PodWorkqueue::new_leader(
+            store,
+            db.clone(),
+            supervisor,
+            metrics,
+            crate::control_plane::client::local::always_leader_watch(),
+        );
+        *workqueue.local_node_name.lock().unwrap() = Some("node-a".to_string());
+        (workqueue, db)
+    }
+
+    async fn test_non_leader_workqueue() -> (Arc<PodWorkqueue>, DatastoreHandle) {
+        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let store = Arc::new(PodStore::new(db.clone()));
+        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let metrics = SideEffectMetrics::new();
         let workqueue = PodWorkqueue::new(store, db.clone(), supervisor, metrics);
         *workqueue.local_node_name.lock().unwrap() = Some("node-a".to_string());
         (workqueue, db)
+    }
+
+    #[tokio::test]
+    async fn leadership_gain_discovers_terminating_unbound_pod_without_local_queue_row() {
+        let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let store = Arc::new(PodStore::new(db.clone()));
+        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let (leader_tx, leader_rx) = tokio::sync::watch::channel(false);
+        let workqueue = PodWorkqueue::new_leader(
+            store,
+            db.clone(),
+            supervisor.clone(),
+            SideEffectMetrics::new(),
+            leader_rx,
+        );
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "handoff",
+            pod_with_uid_on_node("handoff", "uid-handoff", true, ""),
+        )
+        .await
+        .unwrap();
+
+        workqueue.start().await.unwrap();
+        supervisor
+            .sleep(
+                "leadership_handoff_follower_quiet",
+                Duration::from_millis(25),
+            )
+            .await
+            .unwrap();
+        assert!(
+            db.get_resource("v1", "Pod", Some("default"), "handoff")
+                .await
+                .unwrap()
+                .is_some(),
+            "follower must not process or lose the terminating Pod"
+        );
+        assert!(db.pod_workqueue_peek_next_due().await.unwrap().is_none());
+
+        leader_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if db
+                    .get_resource("v1", "Pod", Some("default"), "handoff")
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    break;
+                }
+                supervisor
+                    .sleep("leadership_handoff_wait", Duration::from_millis(10))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("new leader must discover and finalize the unbound Pod");
     }
 
     fn test_router(
@@ -885,6 +1210,48 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "unscheduled terminating Pod row must be removed so its namespace can finalize"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_leader_workqueue_cannot_remove_unscheduled_pod_row() {
+        let (workqueue, db) = test_non_leader_workqueue().await;
+        let created = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "worker-unscheduled",
+                unscheduled_pod_with_uid("worker-unscheduled", "uid-worker", true),
+            )
+            .await
+            .unwrap();
+
+        let error = workqueue
+            .run_pod_delete_full_with_target_node(
+                "default".to_string(),
+                "worker-unscheduled".to_string(),
+                "uid-worker".to_string(),
+                None,
+            )
+            .await
+            .expect_err("a non-leader workqueue must not own unscheduled row removal");
+
+        assert!(
+            error
+                .to_string()
+                .contains("leader unscheduled-delete capability"),
+            "unexpected error: {error:#}"
+        );
+        let live = db
+            .get_resource("v1", "Pod", Some("default"), "worker-unscheduled")
+            .await
+            .unwrap()
+            .expect("non-leader workqueue must preserve the Pod row");
+        assert_eq!(live.uid, "uid-worker");
+        assert_eq!(
+            live.resource_version, created.resource_version,
+            "denied non-leader deletion must not advance resourceVersion"
         );
     }
 

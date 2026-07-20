@@ -3219,6 +3219,36 @@ async fn eviction_denied_does_not_mark_pod_deletion() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+async fn eviction_malformed_json_and_protobuf_are_both_bad_requests() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let app = crate::api::test_support::build_test_router().await;
+    for (content_type, body) in [
+        ("application/json", Body::from("{")),
+        (
+            "application/vnd.kubernetes.protobuf",
+            Body::from(&b"k8s\0\xff"[..]),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/namespaces/default/pods/test-pod/eviction")
+                    .header("content-type", content_type)
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{content_type}");
+    }
+}
+
 /// Verify RecordingAuthorizer captures exact RBAC attributes for TokenRequest.
 #[tokio::test]
 async fn tokenrequest_authorization_has_correct_verb_and_resource() {

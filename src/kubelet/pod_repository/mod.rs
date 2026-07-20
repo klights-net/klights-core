@@ -41,9 +41,10 @@ pub mod delete_coordinator;
 pub mod facade;
 pub mod network;
 pub mod objects;
+pub(crate) mod ordinary_access;
 pub mod state_only_writer;
 pub mod status;
-pub mod store;
+pub(crate) mod store;
 pub mod subresource;
 pub mod types;
 pub mod watch;
@@ -457,7 +458,20 @@ pub struct PodRepository {
     supervisor: Arc<TaskSupervisor>,
     outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     cluster_api: Option<Arc<dyn LeaderApiClient>>,
+    #[cfg(test)]
     deletion_finalizer: Arc<dyn PodDeletionFinalizer>,
+}
+
+#[derive(Clone)]
+struct PodDeletionFinalizerDependencies {
+    store: Arc<PodStore>,
+    gc_pod_delete_sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink>,
+    cluster_api: Option<Arc<dyn LeaderApiClient>>,
+    outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
+    side_effects: Arc<SideEffectRegistry>,
+    metrics: Arc<SideEffectMetrics>,
+    supervisor: Arc<TaskSupervisor>,
+    deferred_runtime: status::DeferredRuntimeReducerHandle,
 }
 
 /// Finalizer decorator that releases repository-private deferred runtime state
@@ -480,6 +494,25 @@ impl DeferredRuntimeCleanupFinalizer {
     }
 }
 
+fn compose_pod_deletion_finalizer(
+    dependencies: PodDeletionFinalizerDependencies,
+) -> Arc<dyn PodDeletionFinalizer> {
+    let runtime_deletion_finalizer =
+        crate::kubelet::pod_runtime::deletion_finalizer::compose_real_pod_deletion_finalizer(
+            dependencies.store,
+            dependencies.gc_pod_delete_sink,
+            dependencies.cluster_api,
+            dependencies.outbox,
+            dependencies.side_effects,
+            dependencies.metrics,
+            dependencies.supervisor,
+        );
+    Arc::new(DeferredRuntimeCleanupFinalizer::new(
+        runtime_deletion_finalizer,
+        dependencies.deferred_runtime,
+    ))
+}
+
 #[async_trait]
 impl PodDeletionFinalizer for DeferredRuntimeCleanupFinalizer {
     async fn finalize_after_actor_cleanup(
@@ -494,6 +527,33 @@ impl PodDeletionFinalizer for DeferredRuntimeCleanupFinalizer {
     }
 }
 
+#[derive(Debug)]
+struct PodUidMismatch {
+    expected: String,
+    actual: String,
+    namespace: String,
+    name: String,
+}
+
+impl std::fmt::Display for PodUidMismatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Pod {}/{} UID mismatch: expected {}, found {}",
+            self.namespace,
+            self.name,
+            self.expected,
+            if self.actual.is_empty() {
+                "<empty>"
+            } else {
+                &self.actual
+            }
+        )
+    }
+}
+
+impl std::error::Error for PodUidMismatch {}
+
 fn ensure_pod_uid_matches(data: &Value, expected_uid: &str, ns: &str, name: &str) -> Result<()> {
     let live_uid = data
         .pointer("/metadata/uid")
@@ -503,17 +563,13 @@ fn ensure_pod_uid_matches(data: &Value, expected_uid: &str, ns: &str, name: &str
         return Ok(());
     }
 
-    Err(anyhow::anyhow!(
-        "Pod {}/{} UID mismatch: expected {}, found {}",
-        ns,
-        name,
-        expected_uid,
-        if live_uid.is_empty() {
-            "<empty>"
-        } else {
-            live_uid
-        }
-    ))
+    Err(PodUidMismatch {
+        expected: expected_uid.to_string(),
+        actual: live_uid.to_string(),
+        namespace: ns.to_string(),
+        name: name.to_string(),
+    }
+    .into())
 }
 
 impl PodRepository {
@@ -620,7 +676,7 @@ impl PodRepository {
 
     fn new_with_network_events_and_cluster_api(config: PodRepositoryBuildConfig) -> Self {
         let parts = Self::build_parts(config);
-        parts.background.start();
+        // Ordinary constructors retain lazy queue startup on first enqueue.
         parts.repository
     }
 
@@ -628,6 +684,22 @@ impl PodRepository {
     /// calling `workqueue.start()`. The returned `PodRepositoryBackground`
     /// must be started after lifecycle wiring is complete (Task 4.2).
     pub fn build_parts(config: PodRepositoryBuildConfig) -> facade::PodRepositoryParts {
+        Self::build_parts_with_leader_unscheduled_deletion(config, None)
+    }
+
+    /// Root leader/API composition only: build the single deferred-delete
+    /// workqueue that owns the never-bound Pod observed-RV CAS capability.
+    pub(crate) fn build_leader_parts(
+        config: PodRepositoryBuildConfig,
+        leadership: tokio::sync::watch::Receiver<bool>,
+    ) -> facade::PodRepositoryParts {
+        Self::build_parts_with_leader_unscheduled_deletion(config, Some(leadership))
+    }
+
+    fn build_parts_with_leader_unscheduled_deletion(
+        config: PodRepositoryBuildConfig,
+        leadership: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> facade::PodRepositoryParts {
         let PodRepositoryBuildConfig {
             db,
             supervisor,
@@ -639,12 +711,22 @@ impl PodRepository {
             cluster_api,
         } = config;
         let store = Arc::new(PodStore::new(db.clone()));
-        let workqueue = PodWorkqueue::new(
-            store.clone(),
-            db.clone(),
-            supervisor.clone(),
-            metrics.clone(),
-        );
+        let workqueue = if let Some(leadership) = leadership {
+            PodWorkqueue::new_leader(
+                store.clone(),
+                db.clone(),
+                supervisor.clone(),
+                metrics.clone(),
+                leadership,
+            )
+        } else {
+            PodWorkqueue::new(
+                store.clone(),
+                db.clone(),
+                supervisor.clone(),
+                metrics.clone(),
+            )
+        };
         let delete_coordinator = Arc::new(PodDeleteCoordinator::new(
             store.clone(),
             workqueue.clone(),
@@ -686,22 +768,19 @@ impl PodRepository {
         let gc_pod_delete_sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink> = api.clone();
         workqueue.set_remote_pod_delete_resignal_sink(Arc::downgrade(&gc_pod_delete_sink));
 
-        let runtime_deletion_finalizer: Arc<dyn PodDeletionFinalizer> = Arc::new(
-            crate::kubelet::pod_runtime::deletion_finalizer::RealPodDeletionFinalizer::new(
-                store.clone(),
-                gc_pod_delete_sink,
-                cluster_api.clone(),
-                outbox.clone(),
-                side_effects.clone(),
-                metrics.clone(),
-                supervisor.clone(),
-            ),
-        );
-        let deletion_finalizer: Arc<dyn PodDeletionFinalizer> =
-            Arc::new(DeferredRuntimeCleanupFinalizer::new(
-                runtime_deletion_finalizer,
-                status.deferred_runtime_handle(),
-            ));
+        let deletion_finalizer_dependencies = PodDeletionFinalizerDependencies {
+            store: store.clone(),
+            gc_pod_delete_sink,
+            cluster_api: cluster_api.clone(),
+            outbox: outbox.clone(),
+            side_effects: side_effects.clone(),
+            metrics: metrics.clone(),
+            supervisor: supervisor.clone(),
+            deferred_runtime: status.deferred_runtime_handle(),
+        };
+        #[cfg(test)]
+        let deletion_finalizer =
+            compose_pod_deletion_finalizer(deletion_finalizer_dependencies.clone());
 
         let repository = Self {
             store,
@@ -717,15 +796,14 @@ impl PodRepository {
             supervisor,
             outbox,
             cluster_api,
+            #[cfg(test)]
             deletion_finalizer,
         };
         let background = PodRepositoryBackground::new(workqueue);
-        facade::PodRepositoryParts {
-            repository,
-            background,
-        }
+        facade::PodRepositoryParts::new(repository, background, deletion_finalizer_dependencies)
     }
 
+    #[cfg(test)]
     pub async fn finalize_pod_deletion_after_actor_cleanup(
         &self,
         ns: &str,
@@ -743,6 +821,7 @@ impl PodRepository {
         }
     }
 
+    #[cfg(test)]
     pub fn deletion_finalizer(
         &self,
     ) -> Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer> {

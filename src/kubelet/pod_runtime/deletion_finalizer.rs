@@ -4,6 +4,11 @@ use crate::controllers::gc::GcPodDeleteSink;
 use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::kubelet::pod_runtime::service::{PodDeletionFinalizeResult, PodRuntimeKey};
+use klights_pod_api::{
+    BoundPodFinalization, BoundPodFinalizationError, BoundPodFinalizationFuture,
+    BoundPodFinalizationOutcome, BoundPodFinalizationRequest,
+};
+use klights_types::PodIdentity;
 
 fn pod_is_node_lost_terminal(pod: &serde_json::Value) -> bool {
     pod.pointer("/status/phase")
@@ -44,48 +49,27 @@ pub trait PodDeletionFinalizer: Send + Sync {
     ) -> anyhow::Result<PodDeletionFinalizeResult>;
 }
 
-/// Production actor-owned Pod deletion finalizer.
+/// Root-private adapter holding the actual bound-Pod row-removal authority.
 ///
-/// Moves the body of `PodRepository::finalize_pod_deletion_after_actor_cleanup`
-/// behind the `PodDeletionFinalizer` trait so the actor-owned hard-delete
-/// invariant can be source-guarded.
-pub struct RealPodDeletionFinalizer {
-    pub store: Arc<PodStore>,
-    gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
-    cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+/// The type and constructor stay private; root composition erases it behind
+/// `BoundPodFinalization` and hands that opaque capability only to
+/// `RealPodDeletionFinalizer`.
+struct RootBoundPodFinalization {
+    store: Arc<PodStore>,
+    route_via_leader: bool,
     outbox: Option<Arc<Outbox>>,
-    side_effects: Arc<crate::side_effects::SideEffectRegistry>,
-    metrics: Arc<crate::side_effects::SideEffectMetrics>,
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
 }
 
-impl RealPodDeletionFinalizer {
-    pub fn new(
-        store: Arc<PodStore>,
-        gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
-        cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
-        outbox: Option<Arc<Outbox>>,
-        side_effects: Arc<crate::side_effects::SideEffectRegistry>,
-        metrics: Arc<crate::side_effects::SideEffectMetrics>,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
-    ) -> Self {
+impl RootBoundPodFinalization {
+    fn new(store: Arc<PodStore>, route_via_leader: bool, outbox: Option<Arc<Outbox>>) -> Self {
         Self {
             store,
-            gc_pod_delete_sink,
-            cluster_api,
+            route_via_leader,
             outbox,
-            side_effects,
-            metrics,
-            supervisor,
         }
     }
 
-    async fn make_actor_finalize_delete_outbox_command(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> OutboxCommand {
+    fn make_actor_finalize_delete_outbox_command(ns: &str, name: &str, uid: &str) -> OutboxCommand {
         let subject_key = format!("v1/Pod/{ns}/{name}/{uid}");
         OutboxCommand {
             idempotency_key: format!(
@@ -113,6 +97,131 @@ impl RealPodDeletionFinalizer {
             },
             now_ms: crate::kubelet::pod_repository::current_epoch_millis(),
         }
+    }
+}
+
+impl BoundPodFinalization for RootBoundPodFinalization {
+    fn finalize_bound_pod(
+        &self,
+        request: BoundPodFinalizationRequest,
+    ) -> BoundPodFinalizationFuture<'_> {
+        Box::pin(async move {
+            let identity = request.into_identity();
+            let ns = identity.namespace;
+            let name = identity.name;
+            let uid = identity.uid;
+
+            if self.route_via_leader && self.outbox.is_none() {
+                return Err(BoundPodFinalizationError::unavailable(
+                    "outbox is unavailable for node-local queueing; caller must retry after outbox initialization",
+                ));
+            }
+
+            if let Some(outbox) = &self.outbox {
+                OutboxSendPlanner::new(Some(outbox.as_ref()))
+                    .route(Self::make_actor_finalize_delete_outbox_command(
+                        &ns, &name, &uid,
+                    ))
+                    .await
+                    .map_err(|error| BoundPodFinalizationError::unavailable(error.to_string()))?;
+                return Ok(BoundPodFinalizationOutcome::Accepted);
+            }
+
+            match self.store.delete_with_uid(&ns, &name, &uid).await {
+                Ok(()) => Ok(BoundPodFinalizationOutcome::Removed),
+                Err(error) if crate::datastore::errors::is_conflict_error(&error) => {
+                    tracing::warn!(
+                        namespace = %ns,
+                        pod = %name,
+                        requested_uid = %uid,
+                        error = %error,
+                        "actor-owned Pod finalization lost UID race; preserving live Pod"
+                    );
+                    Ok(BoundPodFinalizationOutcome::IdentityChanged)
+                }
+                Err(error) => Err(BoundPodFinalizationError::unavailable(error.to_string())),
+            }
+        })
+    }
+}
+
+/// Production actor-owned Pod deletion finalizer.
+///
+/// Moves the body of `PodRepository::finalize_pod_deletion_after_actor_cleanup`
+/// behind the `PodDeletionFinalizer` trait so the actor-owned hard-delete
+/// invariant can be source-guarded.
+pub(crate) struct RealPodDeletionFinalizer {
+    pub(crate) store: Arc<PodStore>,
+    gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
+    cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+    outbox: Option<Arc<Outbox>>,
+    bound_pod_finalization: Arc<dyn BoundPodFinalization>,
+    side_effects: Arc<crate::side_effects::SideEffectRegistry>,
+    metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+}
+
+struct RealPodDeletionFinalizerDependencies {
+    store: Arc<PodStore>,
+    gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
+    cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+    outbox: Option<Arc<Outbox>>,
+    side_effects: Arc<crate::side_effects::SideEffectRegistry>,
+    metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+}
+
+impl RealPodDeletionFinalizer {
+    fn with_bound_pod_finalization(
+        dependencies: RealPodDeletionFinalizerDependencies,
+        bound_pod_finalization: Arc<dyn BoundPodFinalization>,
+    ) -> Self {
+        let RealPodDeletionFinalizerDependencies {
+            store,
+            gc_pod_delete_sink,
+            cluster_api,
+            outbox,
+            side_effects,
+            metrics,
+            supervisor,
+        } = dependencies;
+        Self {
+            store,
+            gc_pod_delete_sink,
+            cluster_api,
+            outbox,
+            bound_pod_finalization,
+            side_effects,
+            metrics,
+            supervisor,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(
+        store: Arc<PodStore>,
+        gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
+        cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+        outbox: Option<Arc<Outbox>>,
+        side_effects: Arc<crate::side_effects::SideEffectRegistry>,
+        metrics: Arc<crate::side_effects::SideEffectMetrics>,
+        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    ) -> Self {
+        let bound_pod_finalization: Arc<dyn BoundPodFinalization> = Arc::new(
+            RootBoundPodFinalization::new(store.clone(), cluster_api.is_some(), outbox.clone()),
+        );
+        Self::with_bound_pod_finalization(
+            RealPodDeletionFinalizerDependencies {
+                store,
+                gc_pod_delete_sink,
+                cluster_api,
+                outbox,
+                side_effects,
+                metrics,
+                supervisor,
+            },
+            bound_pod_finalization,
+        )
     }
 
     async fn make_actor_delete_mark_outbox_command(
@@ -196,6 +305,32 @@ impl RealPodDeletionFinalizer {
             );
         }
     }
+}
+
+pub(crate) fn compose_real_pod_deletion_finalizer(
+    store: Arc<PodStore>,
+    gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
+    cluster_api: Option<Arc<dyn crate::control_plane::client::LeaderApiClient>>,
+    outbox: Option<Arc<Outbox>>,
+    side_effects: Arc<crate::side_effects::SideEffectRegistry>,
+    metrics: Arc<crate::side_effects::SideEffectMetrics>,
+    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+) -> Arc<dyn PodDeletionFinalizer> {
+    let bound_pod_finalization: Arc<dyn BoundPodFinalization> = Arc::new(
+        RootBoundPodFinalization::new(store.clone(), cluster_api.is_some(), outbox.clone()),
+    );
+    Arc::new(RealPodDeletionFinalizer::with_bound_pod_finalization(
+        RealPodDeletionFinalizerDependencies {
+            store,
+            gc_pod_delete_sink,
+            cluster_api,
+            outbox,
+            side_effects,
+            metrics,
+            supervisor,
+        },
+        bound_pod_finalization,
+    ))
 }
 
 #[async_trait::async_trait]
@@ -283,40 +418,20 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
             return Ok(PodDeletionFinalizeResult::FinalizersPending);
         }
 
-        if self.cluster_api.is_some() && self.outbox.is_none() {
-            return Err(anyhow::anyhow!(
-                "outbox is unavailable for node-local queueing; caller must retry after outbox initialization"
-            ));
-        }
-
-        if let Some(outbox) = &self.outbox {
-            OutboxSendPlanner::new(Some(outbox.as_ref()))
-                .route(
-                    self.make_actor_finalize_delete_outbox_command(ns, name, uid)
-                        .await,
-                )
-                .await?;
-            self.delete_status_checkpoint_after_finalization(uid).await;
+        let finalization_request =
+            BoundPodFinalizationRequest::try_new(PodIdentity::new(ns, name, uid))
+                .map_err(anyhow::Error::new)?;
+        let finalization_outcome = self
+            .bound_pod_finalization
+            .finalize_bound_pod(finalization_request)
+            .await
+            .map_err(anyhow::Error::new)?;
+        self.delete_status_checkpoint_after_finalization(uid).await;
+        if !matches!(finalization_outcome, BoundPodFinalizationOutcome::Removed) {
             return Ok(PodDeletionFinalizeResult::DeletedOrAlreadyGone);
         }
 
         let deleted_data = live.data.clone();
-        match self.store.delete_with_uid(ns, name, uid).await {
-            Ok(()) => {}
-            Err(err) if crate::datastore::errors::is_conflict_error(&err) => {
-                tracing::warn!(
-                    namespace = %ns,
-                    pod = %name,
-                    requested_uid = %uid,
-                    error = %err,
-                    "actor-owned Pod finalization lost UID race; preserving live Pod"
-                );
-                self.delete_status_checkpoint_after_finalization(uid).await;
-                return Ok(PodDeletionFinalizeResult::DeletedOrAlreadyGone);
-            }
-            Err(err) => return Err(err),
-        }
-        self.delete_status_checkpoint_after_finalization(uid).await;
 
         if let Err(err) = crate::controllers::gc::cascade_delete_with_uid(
             self.store.db().as_ref(),
@@ -385,5 +500,90 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
         .await;
         self.spawn_post_write_maintenance(ns).await;
         Ok(PodDeletionFinalizeResult::DeletedOrAlreadyGone)
+    }
+}
+
+#[cfg(test)]
+mod bound_finalization_tests {
+    use super::*;
+    use klights_pod_api::{
+        BoundPodFinalization, BoundPodFinalizationOutcome, BoundPodFinalizationRequest,
+    };
+    use klights_types::PodIdentity;
+
+    fn terminating_pod(name: &str, uid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": name,
+                "uid": uid,
+                "deletionTimestamp": "2026-07-20T00:00:00Z",
+                "deletionGracePeriodSeconds": 0
+            },
+            "spec": {
+                "nodeName": "worker-a",
+                "containers": [{"name": "app", "image": "nginx"}]
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn root_bound_finalization_adapter_removes_only_the_requested_uid() {
+        let (_datastore, db) = crate::datastore::test_support::in_memory_with_handle().await;
+        let store = Arc::new(PodStore::new(db.clone()));
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "same-name",
+            terminating_pod("same-name", "uid-current"),
+        )
+        .await
+        .expect("create current Pod");
+        let capability = RootBoundPodFinalization::new(store.clone(), false, None);
+
+        let stale = capability
+            .finalize_bound_pod(
+                BoundPodFinalizationRequest::try_new(PodIdentity::new(
+                    "default",
+                    "same-name",
+                    "uid-stale",
+                ))
+                .expect("stale UID request"),
+            )
+            .await
+            .expect("stale UID is a terminal no-op");
+        assert_eq!(stale, BoundPodFinalizationOutcome::IdentityChanged);
+        assert_eq!(
+            store
+                .get("default", "same-name")
+                .await
+                .expect("read current Pod")
+                .expect("current Pod remains")
+                .uid,
+            "uid-current"
+        );
+
+        let removed = capability
+            .finalize_bound_pod(
+                BoundPodFinalizationRequest::try_new(PodIdentity::new(
+                    "default",
+                    "same-name",
+                    "uid-current",
+                ))
+                .expect("current UID request"),
+            )
+            .await
+            .expect("current UID finalization");
+        assert_eq!(removed, BoundPodFinalizationOutcome::Removed);
+        assert!(
+            store
+                .get("default", "same-name")
+                .await
+                .expect("read after finalization")
+                .is_none()
+        );
     }
 }

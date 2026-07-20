@@ -10,7 +10,7 @@ use crate::datastore::{Resource, ResourcePreconditions};
 use crate::side_effects::SideEffectMetrics;
 use crate::task_supervisor::TaskSupervisor;
 
-use super::store::{PodStore, UnscheduledPodDeleteOutcome};
+use super::store::PodStore;
 use super::workqueue::PodWorkqueue;
 
 const MAX_DELETE_CONFLICT_RETRIES: u32 = 8;
@@ -20,12 +20,6 @@ pub(super) struct PodDeleteMarkOutcome {
     pub updated: Resource,
     pub previous: Value,
     pub uid: String,
-}
-
-pub(super) enum PodDeleteRetryDecision {
-    Removed,
-    FinalizersPending,
-    Actor(Resource),
 }
 
 #[async_trait]
@@ -48,13 +42,6 @@ pub(crate) trait PodDeleteStorePort: Send + Sync {
         body: Value,
         expected_rv: i64,
     ) -> Result<Resource>;
-
-    async fn delete_unscheduled_with_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> Result<UnscheduledPodDeleteOutcome>;
 }
 
 #[async_trait]
@@ -82,15 +69,6 @@ impl PodDeleteStorePort for PodStore {
         expected_rv: i64,
     ) -> Result<Resource> {
         PodStore::mark_deleting_at_resource_version(self, ns, name, uid, body, expected_rv).await
-    }
-
-    async fn delete_unscheduled_with_uid(
-        &self,
-        ns: &str,
-        name: &str,
-        uid: &str,
-    ) -> Result<UnscheduledPodDeleteOutcome> {
-        PodStore::delete_unscheduled_with_uid(self, ns, name, uid).await
     }
 }
 
@@ -176,7 +154,7 @@ pub struct PodDeleteCoordinator {
 }
 
 impl PodDeleteCoordinator {
-    pub(crate) fn new(
+    pub(super) fn new(
         store: Arc<PodStore>,
         workqueue: Arc<PodWorkqueue>,
         supervisor: Arc<TaskSupervisor>,
@@ -425,33 +403,6 @@ impl PodDeleteCoordinator {
             .await?;
         Ok(true)
     }
-
-    pub(super) async fn resolve_retry_resource(
-        store: &dyn PodDeleteStorePort,
-        ns: &str,
-        name: &str,
-        uid: &str,
-        resource: Resource,
-    ) -> Result<PodDeleteRetryDecision> {
-        if pod_target_node_from_pod_data(&resource.data).is_some() {
-            return Ok(PodDeleteRetryDecision::Actor(resource));
-        }
-
-        match store.delete_unscheduled_with_uid(ns, name, uid).await? {
-            UnscheduledPodDeleteOutcome::Removed => Ok(PodDeleteRetryDecision::Removed),
-            UnscheduledPodDeleteOutcome::FinalizersPending => {
-                Ok(PodDeleteRetryDecision::FinalizersPending)
-            }
-            UnscheduledPodDeleteOutcome::DeferToActor => {
-                // A bind raced the atomic delete; re-read so the node-targeted
-                // actor path routes to the now-assigned node.
-                match store.get(ns, name).await? {
-                    Some(fresh) if fresh.uid == uid => Ok(PodDeleteRetryDecision::Actor(fresh)),
-                    _ => Ok(PodDeleteRetryDecision::Removed),
-                }
-            }
-        }
-    }
 }
 
 fn ensure_resource_preconditions_match(
@@ -553,15 +504,6 @@ mod tests {
             _expected_rv: i64,
         ) -> Result<Resource> {
             self.mark_deleting_latest(ns, name, uid, &body).await
-        }
-
-        async fn delete_unscheduled_with_uid(
-            &self,
-            _ns: &str,
-            _name: &str,
-            _uid: &str,
-        ) -> Result<UnscheduledPodDeleteOutcome> {
-            Ok(UnscheduledPodDeleteOutcome::Removed)
         }
     }
 

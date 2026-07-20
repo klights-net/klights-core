@@ -198,7 +198,7 @@ pub struct PodApiService {
 }
 
 pub struct PodApiServiceDependencies {
-    pub store: Arc<PodStore>,
+    pub(crate) store: Arc<PodStore>,
     pub status_only: Arc<dyn StateOnlyWriter>,
     pub db: DatastoreHandle,
     pub supervisor: Arc<TaskSupervisor>,

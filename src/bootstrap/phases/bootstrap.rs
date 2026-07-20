@@ -327,18 +327,24 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             cni_readiness.clone(),
         )
     });
-    let pod_repository_parts = crate::kubelet::pod_repository::PodRepository::build_parts(
-        crate::kubelet::pod_repository::PodRepositoryBuildConfig {
-            db: kubelet_db_handle.clone(),
-            supervisor: supervisor.clone(),
-            side_effects: side_effects.clone(),
-            metrics: metrics.clone(),
-            network_events: crate::networking::global_pod_network_events(),
-            scheduling_mode,
-            outbox: Some(outbox_runtime.clone()),
-            cluster_api: Some(cluster_api.clone()),
-        },
-    );
+    let pod_repository_build_config = crate::kubelet::pod_repository::PodRepositoryBuildConfig {
+        db: kubelet_db_handle.clone(),
+        supervisor: supervisor.clone(),
+        side_effects: side_effects.clone(),
+        metrics: metrics.clone(),
+        network_events: crate::networking::global_pod_network_events(),
+        scheduling_mode,
+        outbox: Some(outbox_runtime.clone()),
+        cluster_api: Some(cluster_api.clone()),
+    };
+    let pod_repository_parts = if kubelet_uses_worker_store_adapter {
+        crate::kubelet::pod_repository::PodRepository::build_parts(pod_repository_build_config)
+    } else {
+        crate::kubelet::pod_repository::PodRepository::build_leader_parts(
+            pod_repository_build_config,
+            is_leader_rx.clone(),
+        )
+    };
     let pod_runtime_store = Arc::new(crate::datastore::DatastoreBackendPodRuntimeStore::new(
         kubelet_db_handle.clone(),
     ));
@@ -377,7 +383,10 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         },
     )
     .context("pod subsystem construction")?;
-    pod_subsystem.start();
+    pod_subsystem
+        .start()
+        .await
+        .context("pod subsystem startup")?;
     let pod_executor = pod_subsystem
         .build_executor()
         .await
@@ -394,7 +403,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         worker_store_adapter.set_pod_lifecycle_router(pod_lifecycle_router.clone());
     }
     let api_pod_repository = if kubelet_uses_worker_store_adapter {
-        let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
+        let parts = crate::kubelet::pod_repository::PodRepository::build_leader_parts(
             crate::kubelet::pod_repository::PodRepositoryBuildConfig {
                 db: db_handle.clone(),
                 supervisor: supervisor.clone(),
@@ -405,13 +414,18 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                 outbox: Some(outbox_runtime.clone()),
                 cluster_api: Some(cluster_api.clone()),
             },
+            is_leader_rx.clone(),
         );
         let repo = Arc::new(parts.repository);
         repo.set_pod_lifecycle_router_for_node(
             pod_lifecycle_router.clone(),
             config.node_name.clone(),
         );
-        parts.background.start();
+        parts
+            .background
+            .start()
+            .await
+            .context("API Pod repository background startup")?;
         repo
     } else {
         pod_repository.clone()

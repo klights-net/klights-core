@@ -31,7 +31,7 @@ const POD_KIND: &str = "Pod";
 
 /// Result of [`PodStore::delete_unscheduled_with_uid`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnscheduledPodDeleteOutcome {
+pub(super) enum UnscheduledPodDeleteOutcome {
     /// The Pod row was removed (or was already gone / superseded by a
     /// same-name replacement UID).
     Removed,
@@ -69,17 +69,10 @@ pub struct PodStore {
 }
 
 impl PodStore {
-    pub fn new(db: DatastoreHandle) -> Self {
+    pub(crate) fn new(db: DatastoreHandle) -> Self {
         Self {
             db,
             sandbox_gc_dirty: Arc::new(AtomicUsize::new(1)),
-        }
-    }
-
-    pub fn new_with_dirty(db: DatastoreHandle, dirty: Arc<AtomicUsize>) -> Self {
-        Self {
-            db,
-            sandbox_gc_dirty: dirty,
         }
     }
 
@@ -91,11 +84,11 @@ impl PodStore {
     /// set of repository services that legitimately need a non-Pod DB
     /// surface (see `mod.rs` doc comment). Outside `pod_repository/`,
     /// callers must always go through the typed methods.
-    pub fn db(&self) -> &DatastoreHandle {
+    pub(crate) fn db(&self) -> &DatastoreHandle {
         &self.db
     }
 
-    pub async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
+    pub(crate) async fn get(&self, ns: &str, name: &str) -> Result<Option<Resource>> {
         self.db
             .get_resource(POD_API_VERSION, POD_KIND, Some(ns), name)
             .await
@@ -312,7 +305,7 @@ impl PodStore {
             .await
     }
 
-    pub async fn delete_with_uid(&self, ns: &str, name: &str, uid: &str) -> Result<()> {
+    pub(crate) async fn delete_with_uid(&self, ns: &str, name: &str, uid: &str) -> Result<()> {
         self.mark_sandbox_dirty();
         self.db
             .delete_resource_with_preconditions(
@@ -345,11 +338,12 @@ impl PodStore {
     /// Once a kubelet has picked up a Pod (`spec.nodeName` set), only the Pod
     /// lifecycle actor may remove the row — this method refuses
     /// (`DeferToActor`).
-    pub async fn delete_unscheduled_with_uid(
+    pub(super) async fn delete_unscheduled_with_uid(
         &self,
         ns: &str,
         name: &str,
         uid: &str,
+        observed_resource_version: i64,
     ) -> Result<UnscheduledPodDeleteOutcome> {
         let Some(current) = self.get(ns, name).await? else {
             // Already gone (actor or a prior sweep finalized it) — idempotent.
@@ -358,6 +352,12 @@ impl PodStore {
         if current.uid != uid {
             // A same-name replacement Pod owns the slot now; our UID is gone.
             return Ok(UnscheduledPodDeleteOutcome::Removed);
+        }
+        if current.resource_version != observed_resource_version {
+            // The row changed after the deferred worker observed it as
+            // unbound. Never acquire a newer RV implicitly: the exact
+            // observation supplied by the worker is the delete CAS token.
+            return Ok(UnscheduledPodDeleteOutcome::DeferToActor);
         }
         // A kubelet has picked the Pod up — only the actor may remove the row.
         if pod_has_node_assignment(&current.data) {
@@ -395,7 +395,7 @@ impl PodStore {
                     uid: Some(uid.to_string()),
                     // Compare-and-swap on the observed RV: confirms no bind /
                     // kubelet pickup raced between the read above and here.
-                    resource_version: Some(current.resource_version),
+                    resource_version: Some(observed_resource_version),
                 },
             )
             .await

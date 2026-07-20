@@ -84,6 +84,8 @@ struct RuntimeServiceBuildRequest {
     runtime_store: Arc<dyn PodRuntimeStore>,
     slot_admission: Arc<dyn PodSlotAdmission>,
     event_sink: Arc<dyn PodEventSink>,
+    deletion_finalizer:
+        Arc<dyn crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer>,
 }
 
 impl PodSubsystem {
@@ -102,6 +104,8 @@ impl PodSubsystem {
         let runtime_node_role = config.runtime_node_role.clone();
         let outbox = config.outbox.clone();
         let parts = config.repository_parts;
+        let (repository, repository_background, deletion_finalizer) =
+            parts.into_pod_subsystem_parts();
 
         let registry = Arc::new(
             PodLifecycleRegistry::new(
@@ -115,7 +119,7 @@ impl PodSubsystem {
         );
         let lifecycle_router = Arc::new(PodLifecycleRouter::new_actor(registry));
         let lifecycle_service = PodLifecycleService::new(lifecycle_router.clone());
-        let repository = Arc::new(parts.repository);
+        let repository = Arc::new(repository);
         let probe_cri_runtime = config.cri.clone().map(|cri| {
             Arc::new(crate::kubelet::pod_runtime::cri::SharedCriRuntime::new(cri))
                 as Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>
@@ -145,13 +149,14 @@ impl PodSubsystem {
                 runtime_store: config.runtime_store.clone(),
                 slot_admission: config.slot_admission.clone(),
                 event_sink: config.event_sink.clone(),
+                deletion_finalizer,
             })?,
         };
 
         Ok(Self {
             supervisor,
             repository,
-            repository_background: parts.background,
+            repository_background,
             lifecycle_router,
             lifecycle_service,
             runtime,
@@ -185,6 +190,7 @@ impl PodSubsystem {
             runtime_store,
             slot_admission,
             event_sink,
+            deletion_finalizer,
         } = request;
         let cri =
             cri.ok_or_else(|| anyhow::anyhow!("missing PodRuntimeService dependencies: cri"))?;
@@ -273,7 +279,7 @@ impl PodSubsystem {
                 env_source: Arc::new(crate::kubelet::pod_env::LeaderApiEnvSourceReader::new(
                     cluster_api,
                 )),
-                finalizer: repository.deletion_finalizer(),
+                finalizer: deletion_finalizer,
                 supervisor,
                 config: crate::kubelet::pod_runtime::service::RuntimeConfig {
                     node_name,
@@ -297,8 +303,8 @@ impl PodSubsystem {
 
     /// Start background services: workqueue reconciler, watch runner,
     /// deadline timer runner. Idempotent (repeated calls are safe).
-    pub fn start(&self) {
-        self.repository_background.start();
+    pub async fn start(&self) -> Result<()> {
+        self.repository_background.start().await
     }
 
     /// Replace the work executor at runtime via the lifecycle service.
@@ -448,11 +454,11 @@ mod tests {
         assert!(!subsystem.repository_background.workqueue_start_called());
 
         // First start.
-        subsystem.start();
+        subsystem.start().await.unwrap();
         assert!(subsystem.repository_background.workqueue_start_called());
 
         // Second start is idempotent.
-        subsystem.start();
+        subsystem.start().await.unwrap();
         assert!(subsystem.repository_background.workqueue_start_called());
     }
 
@@ -594,9 +600,9 @@ mod tests {
         assert!(!subsystem.repository_background.workqueue_start_called());
 
         // Explicit start works and is idempotent.
-        subsystem.start();
+        subsystem.start().await.unwrap();
         assert!(subsystem.repository_background.workqueue_start_called());
-        subsystem.start(); // idempotent
+        subsystem.start().await.unwrap(); // idempotent
     }
 
     // ── Task 14.2: worker bootstrap wiring ──
@@ -619,7 +625,7 @@ mod tests {
         assert!(!subsystem.repository_background.workqueue_start_called());
 
         // Explicit start works.
-        subsystem.start();
+        subsystem.start().await.unwrap();
         assert!(subsystem.repository_background.workqueue_start_called());
     }
 

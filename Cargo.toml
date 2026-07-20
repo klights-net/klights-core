@@ -56,6 +56,7 @@ klights-cluster-store = { path = "crates/klights-cluster-store" }
 klights-leader-api = { path = "crates/klights-leader-api" }
 klights-node-store = { path = "crates/klights-node-store" }
 klights-node-api = { path = "crates/klights-node-api" }
+klights-pod-api = { path = "crates/klights-pod-api" }
 klights-internal-protobuf = { path = "crates/klights-internal-protobuf" }
 vergen = { version = "8", features = ["build", "cargo", "git", "gitcl", "rustc", "si"] }
 tonic-prost-build = "0.14"
@@ -188,6 +189,7 @@ klights-cluster-core = { workspace = true }
 klights-cluster-store = { workspace = true }
 klights-leader-api = { workspace = true }
 klights-node-api = { workspace = true }
+klights-pod-api = { workspace = true }
 klights-internal-protobuf = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -24,7 +24,7 @@ pub struct StatusOnlyWriterService {
 }
 
 impl StatusOnlyWriterService {
-    pub fn new(store: Arc<PodStore>) -> Self {
+    pub(crate) fn new(store: Arc<PodStore>) -> Self {
         Self { store }
     }
 }

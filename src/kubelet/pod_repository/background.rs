@@ -37,14 +37,15 @@ impl PodRepositoryBackground {
 
     /// Start deferred services: workqueue reconciler and other delayed
     /// background tasks.
-    pub fn start(&self) {
-        self.workqueue.start();
+    pub async fn start(&self) -> anyhow::Result<()> {
+        self.workqueue.start().await?;
         if let Some(ref runner) = self.watch_runner {
             runner.start();
         }
         if let Some(ref runner) = self.deadline_runner {
             runner.start();
         }
+        Ok(())
     }
 
     #[cfg(test)]

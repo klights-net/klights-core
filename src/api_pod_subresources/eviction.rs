@@ -8,7 +8,7 @@ pub async fn pod_eviction(
     // Parse the Eviction object from the request body (JSON or protobuf)
     let eviction: Value = if body.len() >= 4 && &body[..4] == b"k8s\x00" {
         crate::protobuf::decode_protobuf(&body[4..]).map_err(|e| {
-            AppError::InternalError(format!("failed to decode eviction protobuf: {}", e))
+            AppError::BadRequest(format!("failed to decode eviction protobuf: {}", e))
         })?
     } else if body.is_empty() {
         serde_json::json!({
@@ -21,8 +21,20 @@ pub async fn pod_eviction(
             .map_err(|e| AppError::BadRequest(format!("failed to parse eviction JSON: {}", e)))?
     };
 
+    let request =
+        klights_pod_api::PodGetRequest::try_by_name(&namespace, &name).map_err(AppError::from)?;
+    let Some(pod) = klights_pod_api::PodQuery::get_pod(state.pod_repository.as_ref(), request)
+        .await
+        .map_err(AppError::from)?
+    else {
+        return Err(AppError::NotFound(format!(
+            "pod {}/{} not found",
+            namespace, name
+        )));
+    };
+
     // Enforce PodDisruptionBudget before deleting the pod.
-    if !eviction_allowed_by_pdbs(&state, &namespace, &name).await? {
+    if !eviction_allowed_by_pdbs(&state, &pod).await? {
         let denied = serde_json::json!({
             "kind": "Status",
             "apiVersion": "v1",
@@ -44,18 +56,16 @@ pub async fn pod_eviction(
     }
 
     // Delete the pod — same effect as DELETE /pods/{name}
-    crate::kubelet::pod_repository::PodObjectWriter::delete_pod(
+    let target = klights_pod_api::PodMutationTarget::try_by_identity(
+        klights_types::PodIdentity::new(&namespace, &name, &pod.uid),
+    )
+    .map_err(AppError::from)?;
+    klights_pod_api::PodMarkTerminating::mark_pod_terminating(
         state.pod_repository.as_ref(),
-        &namespace,
-        &name,
+        klights_pod_api::PodMarkTerminatingRequest::new(target),
     )
     .await
-    .map_err(|e| {
-        AppError::InternalError(format!(
-            "eviction failed to delete pod {}/{}: {}",
-            namespace, name, e
-        ))
-    })?;
+    .map_err(AppError::from)?;
 
     tracing::info!("Evicted pod {}/{}", namespace, name);
 
@@ -65,21 +75,11 @@ pub async fn pod_eviction(
 
 async fn eviction_allowed_by_pdbs(
     state: &Arc<AppState>,
-    namespace: &str,
-    pod_name: &str,
+    pod: &crate::datastore::Resource,
 ) -> Result<bool, AppError> {
-    let Some(pod) = crate::kubelet::pod_repository::PodReader::get_pod(
-        state.pod_repository.as_ref(),
-        namespace,
-        pod_name,
-    )
-    .await?
-    else {
-        return Err(AppError::NotFound(format!(
-            "pod {}/{} not found",
-            namespace, pod_name
-        )));
-    };
+    let namespace = pod.namespace.as_deref().ok_or_else(|| {
+        AppError::InternalError("stored Pod is missing metadata.namespace".to_string())
+    })?;
 
     // Ensure PDB status reflects latest pod state before evaluating disruptionsAllowed.
     crate::controllers::pdb::reconcile_pdbs_for_namespace(

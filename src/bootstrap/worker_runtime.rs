@@ -446,7 +446,10 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         },
     )
     .context("pod subsystem construction")?;
-    pod_subsystem.start();
+    pod_subsystem
+        .start()
+        .await
+        .context("pod subsystem startup")?;
     let pod_executor = pod_subsystem
         .build_executor()
         .await
