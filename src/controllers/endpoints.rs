@@ -6,8 +6,6 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::controllers::common::is_pod_ready_value as is_pod_ready;
-
 async fn namespace_is_terminating(db: &dyn DatastoreBackend, namespace: &str) -> Result<bool> {
     let Some(ns) = db.get_namespace(namespace).await? else {
         return Ok(false);
@@ -251,7 +249,8 @@ fn build_desired_endpoints(
     let mut subset_group_indexes: BTreeMap<String, usize> = BTreeMap::new();
 
     for pod_resource in pods {
-        if pod_is_terminating(&pod_resource.data) {
+        let endpoint_state = crate::pod_endpoint_state::pod_endpoint_state(&pod_resource.data);
+        if pod_is_terminating(&pod_resource.data) || endpoint_state.is_terminal() {
             continue;
         }
         if !selector.matches_resource(&pod_resource.data) {
@@ -321,7 +320,7 @@ fn build_desired_endpoints(
                 idx
             };
 
-            if publish_not_ready || is_pod_ready(&pod_resource.data) {
+            if publish_not_ready || endpoint_state.is_ready() {
                 subset_groups[group_idx].addresses.push(addr);
             } else {
                 subset_groups[group_idx].not_ready_addresses.push(addr);
@@ -372,7 +371,8 @@ fn build_desired_endpointslices(
     let mut slice_group_indexes: BTreeMap<String, usize> = BTreeMap::new();
 
     for pod_resource in pods {
-        if pod_is_terminating(&pod_resource.data) {
+        let endpoint_state = crate::pod_endpoint_state::pod_endpoint_state(&pod_resource.data);
+        if pod_is_terminating(&pod_resource.data) || endpoint_state.is_terminal() {
             continue;
         }
         if !selector.matches_resource(&pod_resource.data) {
@@ -392,7 +392,7 @@ fn build_desired_endpointslices(
                 .and_then(|m| m.get("name"))
                 .and_then(|n| n.as_str())
         {
-            let is_ready = is_pod_ready(&pod_resource.data);
+            let is_ready = endpoint_state.is_ready();
             let mut target_ref = json!({
                 "kind": "Pod",
                 "namespace": namespace,

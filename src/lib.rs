@@ -26,6 +26,7 @@ pub mod node_heartbeat;
 pub mod node_lease_tracker;
 pub mod paths;
 pub mod pidfile;
+pub(crate) mod pod_endpoint_state;
 pub mod portforward;
 pub mod protobuf;
 pub mod replication;

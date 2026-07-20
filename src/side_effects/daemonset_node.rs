@@ -102,19 +102,19 @@ impl SideEffect for DaemonSetNodeReconcile {
                 crate::datastore::ResourceListQuery::all(),
             )
             .await?;
+        let mut keys = Vec::with_capacity(daemonsets.items.len());
         for daemonset in daemonsets.items {
             let Some(namespace) = daemonset.namespace.as_deref() else {
                 continue;
             };
-            dispatcher
-                .enqueue_reconcile_key(crate::controllers::workqueue::ReconcileKey::namespaced(
-                    "apps/v1",
-                    "DaemonSet",
-                    namespace,
-                    &daemonset.name,
-                ))
-                .await;
+            keys.push(klights_reconcile_api::ReconcileKey::namespaced(
+                "apps/v1",
+                "DaemonSet",
+                namespace,
+                &daemonset.name,
+            ));
         }
+        dispatcher.enqueue_reconcile_batch(keys).await?;
         Ok(())
     }
 }
@@ -174,7 +174,7 @@ mod tests {
         effect.apply(&node.data, &db).await.unwrap();
         assert_eq!(
             dispatcher.queued_reconcile_keys_for_test().await,
-            vec![crate::controllers::workqueue::ReconcileKey::namespaced(
+            vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "apps/v1",
                 "DaemonSet",
                 "default",
@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(pods.items.len(), 0);
         assert_eq!(
             dispatcher.queued_reconcile_keys_for_test().await,
-            vec![crate::controllers::workqueue::ReconcileKey::namespaced(
+            vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "apps/v1",
                 "DaemonSet",
                 "default",

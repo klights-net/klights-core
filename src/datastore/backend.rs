@@ -6,6 +6,109 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceMutationEffect {
+    Unchanged,
+    Changed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PodEndpointEffect {
+    NotApplicable,
+    Unchanged,
+    Changed,
+}
+
+// Keep the explicit stable implementation: derived impl metadata changes the
+// compiler-rendered public API digest despite identical behavior.
+#[allow(clippy::derivable_impls)]
+impl Default for PodEndpointEffect {
+    fn default() -> Self {
+        Self::NotApplicable
+    }
+}
+
+/// Transaction-derived metadata for an outbox apply. Its fields remain
+/// private so transport and API layers cannot synthesize apply effects.
+#[doc(hidden)]
+pub struct CommittedOutboxApply {
+    result: crate::kubelet::outbox::OutboxApplyResult,
+    resource_effect: ResourceMutationEffect,
+    pod_endpoint_effect: PodEndpointEffect,
+}
+
+impl CommittedOutboxApply {
+    pub(crate) const fn new(
+        result: crate::kubelet::outbox::OutboxApplyResult,
+        resource_effect: ResourceMutationEffect,
+        pod_endpoint_effect: PodEndpointEffect,
+    ) -> Self {
+        Self {
+            result,
+            resource_effect,
+            pod_endpoint_effect,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::kubelet::outbox::OutboxApplyResult,
+        ResourceMutationEffect,
+        PodEndpointEffect,
+    ) {
+        (self.result, self.resource_effect, self.pod_endpoint_effect)
+    }
+}
+
+async fn apply_with_default_endpoint_effect<F, Fut>(
+    payload: &[u8],
+    apply: F,
+) -> std::result::Result<CommittedOutboxApply, crate::kubelet::outbox::OutboxApplyError>
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: std::future::Future<
+            Output = std::result::Result<
+                crate::kubelet::outbox::OutboxApplyResult,
+                crate::kubelet::outbox::OutboxApplyError,
+            >,
+        > + Send,
+{
+    let is_pod_status = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(payload)
+        .ok()
+        .is_some_and(|payload| {
+            matches!(
+                payload.command,
+                StorageCommand::UpdateStatus {
+                    ref api_version,
+                    ref kind,
+                    ..
+                } if api_version == "v1" && kind == "Pod"
+            )
+        });
+    if is_pod_status {
+        return Err(crate::kubelet::outbox::OutboxApplyError::Retryable(
+            "backend must implement an atomic Pod endpoint effect for v1/Pod status apply"
+                .to_string(),
+        ));
+    }
+
+    let result = apply().await?;
+    let resource_effect = if matches!(
+        result,
+        crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
+    ) {
+        ResourceMutationEffect::Changed
+    } else {
+        ResourceMutationEffect::Unchanged
+    };
+    Ok(CommittedOutboxApply::new(
+        result,
+        resource_effect,
+        PodEndpointEffect::NotApplicable,
+    ))
+}
 use tokio::sync::broadcast;
 
 use crate::datastore::command::StorageCommand;
@@ -1215,24 +1318,17 @@ pub trait DatastoreBackend: Send + Sync {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<
-        (crate::kubelet::outbox::OutboxApplyResult, bool),
-        crate::kubelet::outbox::OutboxApplyError,
-    > {
-        let result = self
-            .apply_outbox_transactionally_with_watermark(
+    ) -> std::result::Result<CommittedOutboxApply, crate::kubelet::outbox::OutboxApplyError> {
+        apply_with_default_endpoint_effect(payload, || {
+            self.apply_outbox_transactionally_with_watermark(
                 idempotency_key,
                 operation,
                 payload,
                 authoring_node,
                 watermark,
             )
-            .await?;
-        let resource_changed = matches!(
-            result,
-            crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
-        );
-        Ok((result, resource_changed))
+        })
+        .await
     }
 
     /// T1.4: build a materialized `LogApplyCommit` for a regular (non-outbox)
@@ -2152,10 +2248,7 @@ pub trait AppliedOutboxStore: Send + Sync {
         payload: &[u8],
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
-    ) -> std::result::Result<
-        (crate::kubelet::outbox::OutboxApplyResult, bool),
-        crate::kubelet::outbox::OutboxApplyError,
-    >;
+    ) -> std::result::Result<CommittedOutboxApply, crate::kubelet::outbox::OutboxApplyError>;
     async fn build_log_apply_commit_for_command(
         &self,
         command: StorageCommand,
@@ -2515,3 +2608,63 @@ pub enum WatchBroadcastMode {
 /// New helper code can take `&dyn ResourceStore`, `&dyn WatchStore`, etc.
 /// directly — the focused traits expose only the methods they need.
 pub type DatastoreHandle = std::sync::Arc<dyn DatastoreBackend>;
+
+#[cfg(test)]
+mod endpoint_effect_default_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::apply_with_default_endpoint_effect;
+    use crate::datastore::ResourcePreconditions;
+    use crate::datastore::command::StorageCommand;
+    use crate::kubelet::outbox::payload::OutboxPayload;
+
+    struct FakeBackend {
+        mutation_called: AtomicBool,
+    }
+
+    impl FakeBackend {
+        async fn apply(
+            &self,
+        ) -> Result<
+            crate::kubelet::outbox::OutboxApplyResult,
+            crate::kubelet::outbox::OutboxApplyError,
+        > {
+            self.mutation_called.store(true, Ordering::SeqCst);
+            Ok(crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 1 })
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_backend_cannot_apply_pod_status_without_atomic_endpoint_effect() {
+        let payload = OutboxPayload::from_command(StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web".to_string(),
+            status: serde_json::json!({"podIP": "10.42.0.2"}),
+            expected_rv: Some(1),
+            preconditions: ResourcePreconditions::uid("uid-web"),
+            observed_status_stamp: None,
+        })
+        .encode_protobuf()
+        .expect("encode Pod status payload");
+        let backend = FakeBackend {
+            mutation_called: AtomicBool::new(false),
+        };
+
+        let error = match apply_with_default_endpoint_effect(&payload, || backend.apply()).await {
+            Err(error) => error,
+            Ok(_) => panic!("default endpoint-effect path must fail closed"),
+        };
+
+        assert!(matches!(
+            error,
+            crate::kubelet::outbox::OutboxApplyError::Retryable(message)
+                if message.contains("atomic Pod endpoint effect")
+        ));
+        assert!(
+            !backend.mutation_called.load(Ordering::SeqCst),
+            "fallback must reject before a backend mutation can commit"
+        );
+    }
+}

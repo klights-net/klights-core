@@ -2286,10 +2286,10 @@ mod tests {
         let keys = state.controller_dispatcher.pending_reconcile_keys().await;
         assert!(
             keys.iter().any(|key| {
-                key.api_version == "apps/v1"
-                    && key.kind == "ReplicaSet"
-                    && key.namespace.as_deref() == Some("default")
-                    && key.name == "owned-rs"
+                key.api_version() == "apps/v1"
+                    && key.kind() == "ReplicaSet"
+                    && key.namespace() == Some("default")
+                    && key.name() == "owned-rs"
             }),
             "NodeLost cleanup must enqueue the owning ReplicaSet so it can reschedule"
         );

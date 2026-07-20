@@ -1,7 +1,7 @@
-use crate::controllers::gc::GcPodDeleteSink;
 use crate::datastore::DatastoreBackend;
 use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 use anyhow::Result;
+use klights_reconcile_api::GcPodDeleteSink;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};

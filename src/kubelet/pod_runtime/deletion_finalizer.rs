@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::controllers::gc::GcPodDeleteSink;
 use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::kubelet::pod_runtime::service::{PodDeletionFinalizeResult, PodRuntimeKey};
@@ -8,6 +7,7 @@ use klights_pod_api::{
     BoundPodFinalization, BoundPodFinalizationError, BoundPodFinalizationFuture,
     BoundPodFinalizationOutcome, BoundPodFinalizationRequest,
 };
+use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 use klights_types::PodIdentity;
 
 fn pod_is_node_lost_terminal(pod: &serde_json::Value) -> bool {
@@ -18,16 +18,6 @@ fn pod_is_node_lost_terminal(pod: &serde_json::Value) -> bool {
             .pointer("/status/reason")
             .and_then(|value| value.as_str())
             == Some("NodeLost")
-}
-
-fn gc_pod_delete_error_means_gone_or_uid_changed(err: &anyhow::Error) -> bool {
-    let message = err.to_string();
-    message.contains("Resource not found")
-        || message.contains("Pod not found")
-        || message.contains("NotFound")
-        || message.contains("UID precondition failed")
-        || message.contains("uid precondition")
-        || message.contains("precondition failed")
 }
 
 fn pod_delete_grace_period_seconds(data: &serde_json::Value) -> i64 {
@@ -391,11 +381,11 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
             }
             match self
                 .gc_pod_delete_sink
-                .request_gc_pod_delete(ns, name, uid)
+                .request_gc_pod_delete(GcPodDeleteRequest::new(PodIdentity::new(ns, name, uid)))
                 .await
             {
                 Ok(()) => return Ok(PodDeletionFinalizeResult::FinalizersPending),
-                Err(err) if gc_pod_delete_error_means_gone_or_uid_changed(&err) => {
+                Err(err) if err.is_gone_or_identity_changed() => {
                     tracing::debug!(
                         namespace = %ns,
                         pod = %name,
@@ -405,7 +395,7 @@ impl PodDeletionFinalizer for RealPodDeletionFinalizer {
                     );
                     return Ok(PodDeletionFinalizeResult::DeletedOrAlreadyGone);
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(err.into()),
             }
         }
 

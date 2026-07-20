@@ -560,7 +560,7 @@ pub async fn finalize_after_update_if_ready(
         &updated.name,
         kind,
         namespace.map(str::to_string),
-        state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+        state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
     )
     .await
     {
@@ -665,6 +665,7 @@ mod tests {
                 error_message: None,
                 public_resource_changed: false,
                 applied_mutation: None,
+                pod_endpoint_effect: Default::default(),
             })
         }
 

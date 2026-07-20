@@ -32,27 +32,29 @@ impl RecordingGcPodDeleteSink {
     }
 }
 
-#[async_trait]
 impl GcPodDeleteSink for RecordingGcPodDeleteSink {
-    async fn request_gc_pod_delete(&self, namespace: &str, name: &str, uid: &str) -> Result<()> {
-        self.requests.lock().unwrap().push((
-            namespace.to_string(),
-            name.to_string(),
-            uid.to_string(),
-        ));
-        Ok(())
+    fn request_gc_pod_delete(&self, request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
+        Box::pin(async move {
+            let identity = request.into_identity();
+            self.requests
+                .lock()
+                .unwrap()
+                .push((identity.namespace, identity.name, identity.uid));
+            Ok(())
+        })
     }
 }
 
 /// No-op sink for existing tests that don't involve Pod children.
 struct NoOpGcPodDeleteSink;
 
-#[async_trait]
 impl GcPodDeleteSink for NoOpGcPodDeleteSink {
-    async fn request_gc_pod_delete(&self, _namespace: &str, _name: &str, _uid: &str) -> Result<()> {
-        anyhow::bail!(
-            "no-op sink must not be called for Pod deletes — use RecordingGcPodDeleteSink for Pod tests"
-        );
+    fn request_gc_pod_delete(&self, _request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
+        Box::pin(async {
+            Err(GcPodDeleteError::unavailable(
+                "no-op sink must not be called for Pod deletes — use RecordingGcPodDeleteSink for Pod tests",
+            ))
+        })
     }
 }
 
@@ -80,20 +82,21 @@ impl ConcurrentBlockingGcPodDeleteSink {
     }
 }
 
-#[async_trait]
 impl GcPodDeleteSink for ConcurrentBlockingGcPodDeleteSink {
-    async fn request_gc_pod_delete(&self, _namespace: &str, _name: &str, _uid: &str) -> Result<()> {
-        let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
-        let started = self.started.fetch_add(1, Ordering::SeqCst) + 1;
-        if started >= self.required_started {
-            self.notify.notify_waiters();
-        }
-        while self.started.load(Ordering::SeqCst) < self.required_started {
-            self.notify.notified().await;
-        }
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        Ok(())
+    fn request_gc_pod_delete(&self, _request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
+        Box::pin(async move {
+            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+            let started = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+            if started >= self.required_started {
+                self.notify.notify_waiters();
+            }
+            while self.started.load(Ordering::SeqCst) < self.required_started {
+                self.notify.notified().await;
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        })
     }
 }
 

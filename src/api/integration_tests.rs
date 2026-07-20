@@ -613,7 +613,7 @@ async fn test_delete_controller_managed_endpointslice_queues_service_reconcile()
     let keys = controller_dispatcher.queued_reconcile_keys_for_test().await;
     assert_eq!(
         keys,
-        vec![crate::controllers::workqueue::ReconcileKey::namespaced(
+        vec![klights_reconcile_api::ReconcileKey::namespaced(
             "v1", "Service", "default", "example"
         )],
         "EndpointSlice delete must queue the owning Service instead of reconciling inline"
@@ -642,9 +642,7 @@ async fn test_delete_controller_managed_endpointslice_queues_service_reconcile()
     let queued_key = controller_dispatcher.take_reconcile_key_for_test().await;
     assert_eq!(
         queued_key,
-        crate::controllers::workqueue::ReconcileKey::namespaced(
-            "v1", "Service", "default", "example"
-        )
+        klights_reconcile_api::ReconcileKey::namespaced("v1", "Service", "default", "example")
     );
     controller_dispatcher
         .reconcile(&service.data, &db, "test-node")

@@ -126,6 +126,7 @@ enum OutboxTxnOutcome {
     Applied {
         applied_rv: i64,
         pending: Option<PendingWatchEvent>,
+        pod_endpoint_effect: crate::datastore::PodEndpointEffect,
     },
     AlreadyApplied(Option<AppliedOutboxRecord>),
 }
@@ -2222,6 +2223,26 @@ impl Datastore {
         crate::kubelet::outbox::OutboxApplyResult,
         crate::kubelet::outbox::OutboxApplyError,
     > {
+        self.apply_outbox_transactionally_effect(
+            idempotency_key,
+            operation,
+            payload,
+            authoring_node,
+        )
+        .await
+        .map(|effect| effect.into_parts().0)
+    }
+
+    async fn apply_outbox_transactionally_effect(
+        &self,
+        idempotency_key: &str,
+        operation: &str,
+        payload: &[u8],
+        authoring_node: &str,
+    ) -> std::result::Result<
+        crate::datastore::CommittedOutboxApply,
+        crate::kubelet::outbox::OutboxApplyError,
+    > {
         use crate::control_plane::client::apply::subject_key_for_command;
         use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
         use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
@@ -2230,8 +2251,23 @@ impl Datastore {
         if operation == OutboxOperation::LeaseRenew.as_str() {
             crate::node_lease_tracker::ensure_lease_renew_command(&decoded.command, authoring_node)
                 .map_err(|err| OutboxApplyError::ConflictTerminal(err.to_string()))?;
-            return Ok(OutboxApplyResult::Applied { applied_rv: 0 });
+            return Ok(crate::datastore::CommittedOutboxApply::new(
+                OutboxApplyResult::Applied { applied_rv: 0 },
+                crate::datastore::ResourceMutationEffect::Unchanged,
+                crate::datastore::PodEndpointEffect::NotApplicable,
+            ));
         }
+        let pod_target = match &decoded.command {
+            crate::datastore::command::StorageCommand::UpdateStatus {
+                api_version,
+                kind,
+                namespace,
+                name,
+                ..
+            } if api_version == "v1" && kind == "Pod" => Some((namespace.clone(), name.clone())),
+            _ => None,
+        };
+        let is_pod_status = pod_target.is_some();
         let subject_key = subject_key_for_command(&decoded.command);
         let status_stamp = Self::pod_status_stamp_of(&decoded.command);
         let now = std::time::SystemTime::now()
@@ -2246,6 +2282,35 @@ impl Datastore {
         let outcome = self
             .db_call("db_apply_outbox_atomic", move |conn| {
                 let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let pod_state = |tx: &rusqlite::Transaction<'_>| {
+                    let Some((namespace, name)) = pod_target.as_ref() else {
+                        return Ok(None);
+                    };
+                    let bytes = match namespace.as_deref() {
+                        Some(namespace) => tx
+                            .query_row(
+                                queries::NAMESPACED_GET_DATA_FOR_DELETE,
+                                rusqlite::params!["v1", "Pod", namespace, name],
+                                |row| row.get::<_, Vec<u8>>(2),
+                            )
+                            .optional()?,
+                        None => tx
+                            .query_row(
+                                queries::CLUSTER_GET_DATA_FOR_DELETE,
+                                rusqlite::params!["v1", "Pod", name],
+                                |row| row.get::<_, Vec<u8>>(2),
+                            )
+                            .optional()?,
+                    };
+                    bytes
+                        .map(|bytes| {
+                            serde_json::from_slice(&bytes).map_err(
+                                crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error,
+                            )
+                        })
+                        .transpose()
+                };
+                let pod_before = pod_state(&tx)?;
 
                 let mut existing: Option<AppliedOutboxRecord> = tx
                     .query_row(queries::APPLIED_OUTBOX_GET, [&claim_key], |row| {
@@ -2293,6 +2358,19 @@ impl Datastore {
                     &claim_operation,
                     &authoring_node,
                 )?;
+                let pod_after = pod_state(&tx)?;
+                let pod_endpoint_effect = if pod_target.is_none() {
+                    crate::datastore::PodEndpointEffect::NotApplicable
+                } else if pod_before.as_ref().zip(pod_after.as_ref()).is_some_and(
+                    |(before, after)| {
+                        crate::pod_endpoint_state::pod_endpoint_state(before)
+                            .differs_from(&crate::pod_endpoint_state::pod_endpoint_state(after))
+                    },
+                ) {
+                    crate::datastore::PodEndpointEffect::Changed
+                } else {
+                    crate::datastore::PodEndpointEffect::Unchanged
+                };
                 tx.execute(
                     queries::APPLIED_OUTBOX_UPDATE_RESULT,
                     rusqlite::params![
@@ -2324,6 +2402,7 @@ impl Datastore {
                 Ok(OutboxTxnOutcome::Applied {
                     applied_rv: mutation.applied_rv.unwrap_or(0),
                     pending: mutation.pending,
+                    pod_endpoint_effect,
                 })
             })
             .await
@@ -2333,19 +2412,32 @@ impl Datastore {
             OutboxTxnOutcome::Applied {
                 applied_rv,
                 pending,
+                pod_endpoint_effect,
             } => {
                 if let Some(pending) = pending {
                     self.publish_watch_event(pending);
                 }
-                Ok(OutboxApplyResult::Applied { applied_rv })
+                Ok(crate::datastore::CommittedOutboxApply::new(
+                    OutboxApplyResult::Applied { applied_rv },
+                    crate::datastore::ResourceMutationEffect::Changed,
+                    pod_endpoint_effect,
+                ))
             }
             OutboxTxnOutcome::AlreadyApplied(record) => {
                 if let Some(message) = Self::cached_outbox_terminal_error(record.as_ref())? {
                     return Err(OutboxApplyError::ConflictTerminal(message));
                 }
-                Ok(OutboxApplyResult::AlreadyApplied {
-                    applied_rv: record.and_then(|record| record.applied_rv),
-                })
+                Ok(crate::datastore::CommittedOutboxApply::new(
+                    OutboxApplyResult::AlreadyApplied {
+                        applied_rv: record.and_then(|record| record.applied_rv),
+                    },
+                    crate::datastore::ResourceMutationEffect::Unchanged,
+                    if is_pod_status {
+                        crate::datastore::PodEndpointEffect::Unchanged
+                    } else {
+                        crate::datastore::PodEndpointEffect::NotApplicable
+                    },
+                ))
             }
         }
     }
@@ -2687,7 +2779,7 @@ impl Datastore {
             watermark,
         )
         .await
-        .map(|(result, _resource_changed)| result)
+        .map(|effect| effect.into_parts().0)
     }
 
     pub async fn apply_outbox_transactionally_with_watermark_effect(
@@ -2698,18 +2790,21 @@ impl Datastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::datastore::CommittedOutboxApply,
         crate::kubelet::outbox::OutboxApplyError,
     > {
         use crate::datastore::sqlite::BuildOutboxOutcome;
         use crate::kubelet::outbox::{OutboxApplyError, OutboxApplyResult};
 
         if watermark.is_none() {
-            let result = self
-                .apply_outbox_transactionally(idempotency_key, operation, payload, authoring_node)
-                .await?;
-            let resource_changed = matches!(result, OutboxApplyResult::Applied { .. });
-            return Ok((result, resource_changed));
+            return self
+                .apply_outbox_transactionally_effect(
+                    idempotency_key,
+                    operation,
+                    payload,
+                    authoring_node,
+                )
+                .await;
         }
 
         match self
@@ -2730,53 +2825,61 @@ impl Datastore {
                 if commit.resource_version_assignment
                     == crate::log_apply::ResourceVersionAssignment::LegacyLeaderAssigned
                 {
-                    self.apply_log_apply_commit(commit)
-                        .await
-                        .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
                     if let Some(error) = terminal_error {
+                        self.apply_log_apply_commit(commit)
+                            .await
+                            .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
                         return Err(error);
                     }
-                    return Ok((OutboxApplyResult::Applied { applied_rv }, applied_rv > 0));
+                    let result = self
+                        .apply_raft_log_apply_commit(commit)
+                        .await
+                        .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
+                    return Ok(crate::datastore::CommittedOutboxApply::new(
+                        OutboxApplyResult::Applied { applied_rv },
+                        if result.public_resource_changed {
+                            crate::datastore::ResourceMutationEffect::Changed
+                        } else {
+                            crate::datastore::ResourceMutationEffect::Unchanged
+                        },
+                        result.pod_endpoint_effect,
+                    ));
                 }
-                let outcome = self
-                    .apply_raft_log_apply_commit_outcome(commit)
+                let result = self
+                    .apply_raft_log_apply_commit(commit)
                     .await
                     .map_err(|err| OutboxApplyError::Retryable(err.to_string()))?;
                 if let Some(error) = terminal_error {
                     return Err(error);
                 }
-                match outcome {
-                    klights_cluster_core::CommittedApplyOutcome::Visible {
-                        resource_version,
-                        ..
-                    } => Ok((
-                        OutboxApplyResult::Applied {
-                            applied_rv: resource_version,
-                        },
-                        true,
-                    )),
-                    klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
-                        resource_version,
-                        ..
-                    } => Ok((
-                        OutboxApplyResult::Applied {
-                            applied_rv: resource_version,
-                        },
-                        false,
-                    )),
-                    klights_cluster_core::CommittedApplyOutcome::Rejected(rejection) => Err(
-                        OutboxApplyError::ConflictTerminal(rejection.message().to_string()),
-                    ),
-                    _ => Err(OutboxApplyError::Retryable(
-                        "unsupported committed outbox apply outcome".to_string(),
-                    )),
+                if let Some(message) = result.error_message {
+                    return Err(OutboxApplyError::ConflictTerminal(message));
                 }
+                Ok(crate::datastore::CommittedOutboxApply::new(
+                    OutboxApplyResult::Applied {
+                        applied_rv: result.applied_rv.unwrap_or(applied_rv),
+                    },
+                    if result.public_resource_changed {
+                        crate::datastore::ResourceMutationEffect::Changed
+                    } else {
+                        crate::datastore::ResourceMutationEffect::Unchanged
+                    },
+                    result.pod_endpoint_effect,
+                ))
             }
             BuildOutboxOutcome::AlreadyApplied { applied_rv } => {
-                Ok((OutboxApplyResult::AlreadyApplied { applied_rv }, false))
+                Ok(crate::datastore::CommittedOutboxApply::new(
+                    OutboxApplyResult::AlreadyApplied { applied_rv },
+                    crate::datastore::ResourceMutationEffect::Unchanged,
+                    crate::datastore::PodEndpointEffect::Unchanged,
+                ))
             }
             BuildOutboxOutcome::LeaseRenewShortcircuit => {
-                Ok((OutboxApplyResult::Applied { applied_rv: 0 }, false))
+                Ok(crate::datastore::CommittedOutboxApply::new(
+                    OutboxApplyResult::Applied { applied_rv: 0 },
+                    crate::datastore::ResourceMutationEffect::Unchanged,
+                    crate::datastore::PodEndpointEffect::NotApplicable,
+                ))
             }
         }
     }
@@ -4451,7 +4554,7 @@ impl DatastoreBackend for Datastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::datastore::CommittedOutboxApply,
         crate::kubelet::outbox::OutboxApplyError,
     > {
         Datastore::apply_outbox_transactionally_with_watermark_effect(

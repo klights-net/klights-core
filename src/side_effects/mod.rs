@@ -545,7 +545,7 @@ mod tests {
 
         assert_eq!(
             dispatcher.queued_reconcile_keys_for_test().await,
-            vec![crate::controllers::workqueue::ReconcileKey::namespaced(
+            vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "batch/v1",
                 "Job",
                 "default",
@@ -791,7 +791,7 @@ mod tests {
 
         assert_eq!(
             dispatcher.queued_reconcile_keys_for_test().await,
-            vec![crate::controllers::workqueue::ReconcileKey::namespaced(
+            vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "v1",
                 "ReplicationController",
                 "default",
@@ -893,7 +893,7 @@ mod tests {
 
         assert_eq!(
             dispatcher.queued_reconcile_keys_for_test().await,
-            vec![crate::controllers::workqueue::ReconcileKey::namespaced(
+            vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "apps/v1",
                 "ReplicaSet",
                 "default",
@@ -1003,19 +1003,19 @@ mod tests {
         let keys = dispatcher.queued_reconcile_keys_for_test().await;
         assert!(
             keys.iter().any(|key| {
-                key.api_version == "apps/v1"
-                    && key.kind == "ReplicaSet"
-                    && key.namespace.as_deref() == Some("default")
-                    && key.name == "web-rs"
+                key.api_version() == "apps/v1"
+                    && key.kind() == "ReplicaSet"
+                    && key.namespace() == Some("default")
+                    && key.name() == "web-rs"
             }),
             "pod mutation must still enqueue the owning ReplicaSet"
         );
         assert!(
             keys.iter().any(|key| {
-                key.api_version == "apps/v1"
-                    && key.kind == "Deployment"
-                    && key.namespace.as_deref() == Some("default")
-                    && key.name == "web-recreate"
+                key.api_version() == "apps/v1"
+                    && key.kind() == "Deployment"
+                    && key.namespace() == Some("default")
+                    && key.name() == "web-recreate"
             }),
             "ReplicaSet-owned Pod mutations must enqueue the parent Deployment from the central workload side effect"
         );
@@ -1100,7 +1100,7 @@ mod tests {
 
         assert!(
             dispatcher.queued_reconcile_keys_for_test().await.contains(
-                &crate::controllers::workqueue::ReconcileKey::namespaced(
+                &klights_reconcile_api::ReconcileKey::namespaced(
                     "batch/v1",
                     "Job",
                     "default",

@@ -2482,6 +2482,7 @@ impl crate::datastore::replicated::RaftProposer for StatusRacingRaftProposer {
             error_message: None,
             public_resource_changed: false,
             applied_mutation: None,
+            pod_endpoint_effect: outcome.pod_endpoint_effect,
         })
     }
 
@@ -3413,10 +3414,10 @@ async fn pod_status_subresource_readiness_change_enqueues_matching_service_once(
     let web_count = keys
         .iter()
         .filter(|key| {
-            key.api_version == "v1"
-                && key.kind == "Service"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "web"
+            key.api_version() == "v1"
+                && key.kind() == "Service"
+                && key.namespace() == Some("default")
+                && key.name() == "web"
         })
         .count();
     assert_eq!(
@@ -3425,10 +3426,10 @@ async fn pod_status_subresource_readiness_change_enqueues_matching_service_once(
     );
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "v1"
-                && key.kind == "Service"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "web"
+            key.api_version() == "v1"
+                && key.kind() == "Service"
+                && key.namespace() == Some("default")
+                && key.name() == "web"
         }),
         "a Pod readiness transition must enqueue matching Services so Endpoints leave notReadyAddresses"
     );
@@ -3520,7 +3521,7 @@ async fn pod_status_subresource_no_endpoint_change_does_not_enqueue_service() {
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter()
-            .all(|key| !(key.api_version == "v1" && key.kind == "Service")),
+            .all(|key| !(key.api_version() == "v1" && key.kind() == "Service")),
         "status-only changes that keep endpoint state stable must not enqueue Service reconcile: {keys:?}"
     );
 }
@@ -4685,12 +4686,8 @@ async fn apply_runtime_reconcile_status_enqueues_deployment_rollout_on_readiness
         "containerStatuses": [{"name": "c", "ready": false, "restartCount": 0}]
     });
     let created = repo.store.create("default", "web-pod", seed).await.unwrap();
-    let deployment_key = crate::controllers::workqueue::ReconcileKey::namespaced(
-        "apps/v1",
-        "Deployment",
-        "default",
-        "web",
-    );
+    let deployment_key =
+        klights_reconcile_api::ReconcileKey::namespaced("apps/v1", "Deployment", "default", "web");
     dispatcher
         .enqueue_reconcile_key(deployment_key.clone())
         .await;
@@ -4789,10 +4786,10 @@ async fn apply_runtime_reconcile_status_enqueues_statefulset_after_readiness_tra
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "apps/v1"
-                && key.kind == "StatefulSet"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "web"
+            key.api_version() == "apps/v1"
+                && key.kind() == "StatefulSet"
+                && key.namespace() == Some("default")
+                && key.name() == "web"
         }),
         "a readiness transition under a StatefulSet must enqueue it so OrderedReady creation can advance"
     );
@@ -4876,10 +4873,10 @@ async fn set_pod_status_enqueues_statefulset_after_terminal_failure_transition()
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "apps/v1"
-                && key.kind == "StatefulSet"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "web"
+            key.api_version() == "apps/v1"
+                && key.kind() == "StatefulSet"
+                && key.namespace() == Some("default")
+                && key.name() == "web"
         }),
         "a StatefulSet-owned pod entering Failed before readiness must enqueue its owner so the failed ordinal can be deleted and recreated"
     );
@@ -4952,10 +4949,10 @@ async fn replace_status_from_api_failed_daemonset_pod_enqueues_daemonset() {
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "apps/v1"
-                && key.kind == "DaemonSet"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "node-agent"
+            key.api_version() == "apps/v1"
+                && key.kind() == "DaemonSet"
+                && key.namespace() == Some("default")
+                && key.name() == "node-agent"
         }),
         "API /status writes that move a DaemonSet pod to Failed must enqueue the DaemonSet so it can delete and replace the terminal pod"
     );
@@ -5050,10 +5047,10 @@ async fn set_deadline_exceeded_enqueues_statefulset_and_does_not_write_owner_sta
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "apps/v1"
-                && key.kind == "StatefulSet"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "deadline-web"
+            key.api_version() == "apps/v1"
+                && key.kind() == "StatefulSet"
+                && key.namespace() == Some("default")
+                && key.name() == "deadline-web"
         }),
         "deadline failure must enqueue the StatefulSet once so it can replace the failed ordinal"
     );
@@ -5138,10 +5135,10 @@ async fn apply_runtime_reconcile_status_enqueues_job_after_readiness_transition(
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "batch/v1"
-                && key.kind == "Job"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "ready-job"
+            key.api_version() == "batch/v1"
+                && key.kind() == "Job"
+                && key.namespace() == Some("default")
+                && key.name() == "ready-job"
         }),
         "a readiness transition under a Job must enqueue it so status.ready is refreshed"
     );
@@ -5249,10 +5246,10 @@ async fn apply_runtime_reconcile_status_enqueues_replicaset_on_readiness_transit
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "apps/v1"
-                && key.kind == "ReplicaSet"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "standalone-rs"
+            key.api_version() == "apps/v1"
+                && key.kind() == "ReplicaSet"
+                && key.namespace() == Some("default")
+                && key.name() == "standalone-rs"
         }),
         "a readiness transition under a ReplicaSet must enqueue the ReplicaSet for top-down status refresh"
     );
@@ -5427,10 +5424,10 @@ async fn apply_runtime_reconcile_status_enqueues_daemonset_on_readiness_transiti
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "apps/v1"
-                && key.kind == "DaemonSet"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "ds-readiness"
+            key.api_version() == "apps/v1"
+                && key.kind() == "DaemonSet"
+                && key.namespace() == Some("default")
+                && key.name() == "ds-readiness"
         }),
         "a readiness transition under a DaemonSet must enqueue the DaemonSet for top-down status refresh"
     );
@@ -5500,10 +5497,10 @@ async fn apply_runtime_reconcile_status_enqueues_replicationcontroller_on_readin
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "v1"
-                && key.kind == "ReplicationController"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "rc-readiness"
+            key.api_version() == "v1"
+                && key.kind() == "ReplicationController"
+                && key.namespace() == Some("default")
+                && key.name() == "rc-readiness"
         }),
         "a readiness transition under a ReplicationController must enqueue it for top-down status refresh"
     );
@@ -8364,10 +8361,10 @@ async fn scheduler_preemption_marks_victim_terminating_and_enqueues_replicaset()
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "apps/v1"
-                && key.kind == "ReplicaSet"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "low-rs"
+            key.api_version() == "apps/v1"
+                && key.kind() == "ReplicaSet"
+                && key.namespace() == Some("default")
+                && key.name() == "low-rs"
         }),
         "scheduler preemption must enqueue the owning ReplicaSet so it observes the terminating pod and creates a replacement"
     );
@@ -10072,7 +10069,7 @@ async fn pod_annotation_patch_does_not_scan_services_or_enqueue_service() {
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter()
-            .all(|key| !(key.api_version == "v1" && key.kind == "Service")),
+            .all(|key| !(key.api_version() == "v1" && key.kind() == "Service")),
         "annotation-only patches must not enqueue Service reconciles"
     );
     assert_eq!(
@@ -11103,19 +11100,19 @@ async fn delete_pod_owned_by_replicaset_enqueues_parent_deployment() {
     let keys = dispatcher.pending_reconcile_keys().await;
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "apps/v1"
-                && key.kind == "ReplicaSet"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "rs-x"
+            key.api_version() == "apps/v1"
+                && key.kind() == "ReplicaSet"
+                && key.namespace() == Some("default")
+                && key.name() == "rs-x"
         }),
         "pod delete must still enqueue the owning ReplicaSet"
     );
     assert!(
         keys.iter().any(|key| {
-            key.api_version == "apps/v1"
-                && key.kind == "Deployment"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "web-recreate"
+            key.api_version() == "apps/v1"
+                && key.kind() == "Deployment"
+                && key.namespace() == Some("default")
+                && key.name() == "web-recreate"
         }),
         "pod delete under a ReplicaSet must enqueue the parent Deployment so Recreate rollouts continue after old pods are gone"
     );
@@ -11343,10 +11340,10 @@ async fn pod_delete_enqueues_service_reconcile_for_stale_endpoint_targetref() {
     assert_eq!(
         keys.iter()
             .filter(|key| {
-                key.api_version == "v1"
-                    && key.kind == "Service"
-                    && key.namespace.as_deref() == Some("default")
-                    && key.name == "web"
+                key.api_version() == "v1"
+                    && key.kind() == "Service"
+                    && key.namespace() == Some("default")
+                    && key.name() == "web"
             })
             .count(),
         1,
@@ -11488,26 +11485,26 @@ async fn pod_label_change_enqueues_old_and_new_matching_services_once() {
     let legacy_count = keys
         .iter()
         .filter(|key| {
-            key.api_version == "v1"
-                && key.kind == "Service"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "legacy"
+            key.api_version() == "v1"
+                && key.kind() == "Service"
+                && key.namespace() == Some("default")
+                && key.name() == "legacy"
         })
         .count();
     let current_count = keys
         .iter()
         .filter(|key| {
-            key.api_version == "v1"
-                && key.kind == "Service"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "current"
+            key.api_version() == "v1"
+                && key.kind() == "Service"
+                && key.namespace() == Some("default")
+                && key.name() == "current"
         })
         .count();
     assert_eq!(legacy_count, 1, "old selector match should enqueue once");
     assert_eq!(current_count, 1, "new selector match should enqueue once");
     assert_eq!(
         keys.iter()
-            .filter(|key| key.api_version == "v1" && key.kind == "Service")
+            .filter(|key| key.api_version() == "v1" && key.kind() == "Service")
             .count(),
         2,
         "only the old and new matching Services should be enqueued"
@@ -11608,7 +11605,7 @@ fn make_terminating_pod(name: &str, uid: &str) -> serde_json::Value {
 async fn build_finalizer() -> RealPodDeletionFinalizer {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let store = Arc::new(PodStore::new(db));
-    let gc_pod_delete_sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink> =
+    let gc_pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
         Arc::new(crate::controllers::gc::NoOpGcPodDeleteSink);
 
     RealPodDeletionFinalizer::new(
@@ -11657,7 +11654,7 @@ async fn deletion_finalizer_without_outbox_retries_later() {
         })),
     };
     let cluster_api = Arc::new(FakeLeaderApiClient::new(pod_resource));
-    let gc_pod_delete_sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink> =
+    let gc_pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
         Arc::new(crate::controllers::gc::NoOpGcPodDeleteSink);
     let finalizer = RealPodDeletionFinalizer::new(
         store.clone(),
@@ -11725,7 +11722,7 @@ async fn deletion_finalizer_reissues_missing_delete_mark_through_outbox() {
         })),
     };
     let cluster_api = Arc::new(FakeLeaderApiClient::new(pod_resource));
-    let gc_pod_delete_sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink> =
+    let gc_pod_delete_sink: Arc<dyn klights_reconcile_api::GcPodDeleteSink> =
         Arc::new(crate::controllers::gc::NoOpGcPodDeleteSink);
     let finalizer = RealPodDeletionFinalizer::new(
         store,
@@ -11990,7 +11987,8 @@ async fn deletion_finalizer_deletes_node_lost_terminal_with_uid_after_actor_clea
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
-    use crate::controllers::gc::{GcPodDeleteSink, cascade_delete_with_uid};
+    use crate::controllers::gc::cascade_delete_with_uid;
+    use klights_reconcile_api::GcPodDeleteSink;
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
@@ -12127,7 +12125,7 @@ async fn emptydir_survivor_diagnosis_records_mark_workqueue_and_actor_state() {
 
 #[tokio::test]
 async fn gc_marked_pod_enqueues_uid_bound_workqueue_entry() {
-    use crate::controllers::gc::GcPodDeleteSink;
+    use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     let supervisor = fixture_supervisor();
@@ -12156,7 +12154,11 @@ async fn gc_marked_pod_enqueues_uid_bound_workqueue_entry() {
     .unwrap();
 
     (&repo as &dyn GcPodDeleteSink)
-        .request_gc_pod_delete(ns, "picked-up", "uid-gc")
+        .request_gc_pod_delete(GcPodDeleteRequest::new(PodIdentity::new(
+            ns,
+            "picked-up",
+            "uid-gc",
+        )))
         .await
         .unwrap();
 
@@ -12189,6 +12191,74 @@ async fn gc_marked_pod_enqueues_uid_bound_workqueue_entry() {
         Some("node-a"),
         "workqueue row must target the owning kubelet actor"
     );
+}
+
+#[tokio::test]
+async fn gc_conflicts_are_identity_changed_only_after_an_authoritative_reread() {
+    use klights_reconcile_api::GcPodDeleteError;
+
+    let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
+    let repo = PodRepository::new(
+        db.clone(),
+        fixture_supervisor(),
+        fixture_side_effects(),
+        crate::side_effects::SideEffectMetrics::new(),
+    );
+    db.create_resource(
+        "v1",
+        "Pod",
+        Some("default"),
+        "current",
+        json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"namespace": "default", "name": "current", "uid": "uid-current"},
+            "spec": {"containers": [{"name": "c", "image": "pause"}]}
+        }),
+    )
+    .await
+    .unwrap();
+
+    for conflict in [
+        crate::api::AppError::Conflict("resourceVersion conflict".to_string()),
+        crate::api::AppError::Status {
+            code: axum::http::StatusCode::CONFLICT,
+            reason: "Conflict",
+            message: "admission conflict".to_string(),
+            details: json!({}),
+        },
+        crate::api::AppError::Conflict("retry budget exhausted".to_string()),
+    ] {
+        let same_uid = super::api::classify_gc_pod_delete_error(
+            repo.store.as_ref(),
+            &PodIdentity::new("default", "current", "uid-current"),
+            conflict,
+        )
+        .await;
+        assert!(
+            matches!(same_uid, GcPodDeleteError::Unavailable { .. }),
+            "same-UID conflicts must remain retryable: {same_uid:?}"
+        );
+    }
+
+    let replacement = super::api::classify_gc_pod_delete_error(
+        repo.store.as_ref(),
+        &PodIdentity::new("default", "current", "uid-old"),
+        crate::api::AppError::Conflict("UID precondition conflict".to_string()),
+    )
+    .await;
+    assert!(matches!(
+        replacement,
+        GcPodDeleteError::IdentityChanged { .. }
+    ));
+
+    let absent = super::api::classify_gc_pod_delete_error(
+        repo.store.as_ref(),
+        &PodIdentity::new("default", "absent", "uid-old"),
+        crate::api::AppError::Conflict("delete conflict".to_string()),
+    )
+    .await;
+    assert!(matches!(absent, GcPodDeleteError::NotFound { .. }));
 }
 
 // --- Task 8: Table-driven UID-bound pod repository deletion invariants ---

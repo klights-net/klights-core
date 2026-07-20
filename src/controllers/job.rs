@@ -233,7 +233,7 @@ async fn mark_job_foreground_deleting(
 async fn delete_finished_job_for_ttl(
     db: &dyn DatastoreBackend,
     resource: &Resource,
-    pod_delete_sink: &dyn crate::controllers::gc::GcPodDeleteSink,
+    pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
 ) -> Result<()> {
     if resource
         .data
@@ -826,7 +826,7 @@ pub async fn reconcile_job(
     db: &dyn DatastoreBackend,
     pod_reader: &dyn PodReader,
     pod_writer: &dyn PodObjectWriter,
-    pod_delete_sink: &dyn crate::controllers::gc::GcPodDeleteSink,
+    pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     job: &Value,
     node_name: &str,
 ) -> Result<Value> {

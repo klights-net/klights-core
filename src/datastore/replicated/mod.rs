@@ -85,7 +85,7 @@ pub trait RaftProposer: Send + Sync {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::datastore::CommittedOutboxApply,
         crate::kubelet::outbox::OutboxApplyError,
     > {
         let result = self
@@ -97,11 +97,19 @@ pub trait RaftProposer: Send + Sync {
                 watermark,
             )
             .await?;
-        let resource_changed = matches!(
+        let resource_effect = if matches!(
             result,
             crate::kubelet::outbox::OutboxApplyResult::Applied { .. }
-        );
-        Ok((result, resource_changed))
+        ) {
+            crate::datastore::ResourceMutationEffect::Changed
+        } else {
+            crate::datastore::ResourceMutationEffect::Unchanged
+        };
+        Ok(crate::datastore::CommittedOutboxApply::new(
+            result,
+            resource_effect,
+            crate::datastore::PodEndpointEffect::NotApplicable,
+        ))
     }
 }
 

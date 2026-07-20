@@ -1751,12 +1751,39 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 result: crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv },
                 resource,
                 command: Some(command),
+                pod_endpoint_effect,
                 ..
             }) => {
+                let controller_dispatcher = self.controller_dispatcher.as_ref();
+                let gc_pod_delete_sink = if matches!(
+                    &command,
+                    crate::datastore::command::StorageCommand::DeleteResource {
+                        api_version,
+                        kind,
+                        ..
+                    } if api_version == "v1" && kind == "Pod"
+                ) {
+                    match controller_dispatcher {
+                        Some(dispatcher) => dispatcher.current_pod_repository().await,
+                        None => None,
+                    }
+                } else {
+                    None
+                };
                 crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
-                    self.controller_dispatcher.as_ref(),
+                    controller_dispatcher.map(|dispatcher| {
+                        dispatcher.as_ref()
+                            as &dyn klights_reconcile_api::ControllerReconcileSink
+                    }),
+                    controller_dispatcher.map(|dispatcher| {
+                        dispatcher.as_ref() as &dyn klights_reconcile_api::ServiceReconcileSink
+                    }),
+                    gc_pod_delete_sink.as_deref().map(|sink| {
+                        sink as &dyn klights_reconcile_api::GcPodDeleteSink
+                    }),
                     &command,
                     resource.as_ref(),
+                    pod_endpoint_effect,
                     self.db.as_ref(),
                 )
                 .await;
@@ -6704,12 +6731,55 @@ mod tests {
         let keys = dispatcher.queued_reconcile_keys_for_test().await;
         assert!(
             keys.iter().any(|key| {
-                key.api_version == "v1"
-                    && key.kind == "Service"
-                    && key.namespace.as_deref() == Some("default")
-                    && key.name == "web"
+                key.api_version() == "v1"
+                    && key.kind() == "Service"
+                    && key.namespace() == Some("default")
+                    && key.name() == "web"
             }),
             "outbox-applied worker pod status must enqueue matching Services on the leader: {keys:?}"
+        );
+        let service = db
+            .get_resource("v1", "Service", Some("default"), "web")
+            .await
+            .unwrap()
+            .expect("Service row");
+        let pod_store = crate::kubelet::pod_repository::store::PodStore::new(db.clone());
+        crate::controllers::endpoints::reconcile_service_endpoints_batch(
+            db.as_ref(),
+            &pod_store,
+            crate::controllers::endpoints::ServiceEndpointBatchReconcileRequest {
+                service_name: "web",
+                service_uid: &service.uid,
+                namespace: "default",
+                selector: service.data.pointer("/spec/selector"),
+                service_ports: service.data.pointer("/spec/ports"),
+                publish_not_ready: false,
+            },
+        )
+        .await
+        .unwrap();
+        let endpoints = db
+            .get_resource("v1", "Endpoints", Some("default"), "web")
+            .await
+            .unwrap()
+            .expect("JSON Endpoints row after protobuf RPC status");
+        let slice = db
+            .get_resource(
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                Some("default"),
+                "web-klights",
+            )
+            .await
+            .unwrap()
+            .expect("JSON EndpointSlice row after protobuf RPC status");
+        assert_eq!(
+            endpoints.data.pointer("/subsets/0/addresses/0/ip"),
+            Some(&serde_json::json!("10.43.1.2"))
+        );
+        assert_eq!(
+            slice.data.pointer("/endpoints/0/conditions/ready"),
+            Some(&serde_json::json!(true))
         );
     }
 

@@ -1,16 +1,12 @@
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MutationOperation {
-    Create,
-    Update,
-    Patch,
-    DeleteMark,
-    HardDelete,
-}
+#[deprecated(
+    note = "use klights_reconcile_api::MutationOperation; remove in Phase 18.2 compatibility cleanup"
+)]
+pub type MutationOperation = klights_reconcile_api::MutationOperation;
 
 pub struct MutationEvent<'a> {
-    pub operation: MutationOperation,
+    pub operation: klights_reconcile_api::MutationOperation,
     pub resource: &'a Value,
     pub old_resource: Option<&'a Value>,
     pub persisted: bool,
@@ -24,12 +20,17 @@ pub async fn dispatch_mutation_event(
     metrics: &crate::side_effects::SideEffectMetrics,
     event: MutationEvent<'_>,
 ) {
-    if !event.persisted || event.dry_run.is_all() {
+    let facts = klights_reconcile_api::MutationFacts::new(
+        event.operation,
+        event.persisted,
+        event.dry_run.is_all(),
+    );
+    let Some(change) = facts.change() else {
         return;
-    }
+    };
     let _ = event.old_resource;
-    match event.operation {
-        MutationOperation::HardDelete => {
+    match change {
+        klights_reconcile_api::ResourceChange::Deleted => {
             crate::side_effects::run_delete_hooks_logged(
                 registry,
                 event.resource,
@@ -39,10 +40,8 @@ pub async fn dispatch_mutation_event(
             )
             .await;
         }
-        MutationOperation::Create
-        | MutationOperation::Update
-        | MutationOperation::Patch
-        | MutationOperation::DeleteMark => {
+        klights_reconcile_api::ResourceChange::Created
+        | klights_reconcile_api::ResourceChange::Updated => {
             crate::side_effects::run_hooks_logged(
                 registry,
                 event.resource,
@@ -61,6 +60,7 @@ mod tests {
     use crate::side_effects::{ErrorPolicy, SideEffect, SideEffectRegistry};
     use anyhow::Result;
     use async_trait::async_trait;
+    use klights_reconcile_api::MutationOperation;
     use serde_json::{Value, json};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

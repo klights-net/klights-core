@@ -2030,6 +2030,7 @@ dependencies = [
  "klights-leader-api",
  "klights-node-api",
  "klights-pod-api",
+ "klights-reconcile-api",
  "klights-types",
  "kube",
  "libc",
@@ -2199,6 +2200,9 @@ dependencies = [
 [[package]]
 name = "klights-reconcile-api"
 version = "0.0.0"
+dependencies = [
+ "klights-types",
+]
 
 [[package]]
 name = "klights-replication"

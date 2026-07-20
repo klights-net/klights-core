@@ -25,7 +25,6 @@ use crate::control_plane::client::{
     LeaderApiClient, ResourceGetRequest, ResourceListRequest, ResourceQueryConsistency,
     legacy_list_response,
 };
-use crate::controllers::gc::GcPodDeleteSink;
 use crate::datastore::{DatastoreHandle, Resource, ResourceList};
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult;
@@ -33,6 +32,7 @@ use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
 use crate::task_supervisor::TaskSupervisor;
 #[cfg(test)]
 use crate::watch::WatchEvent;
+use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 use klights_types::ResourceKey;
 
 pub mod api;
@@ -465,7 +465,7 @@ pub struct PodRepository {
 #[derive(Clone)]
 struct PodDeletionFinalizerDependencies {
     store: Arc<PodStore>,
-    gc_pod_delete_sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink>,
+    gc_pod_delete_sink: Arc<dyn GcPodDeleteSink>,
     cluster_api: Option<Arc<dyn LeaderApiClient>>,
     outbox: Option<Arc<crate::kubelet::outbox::Outbox>>,
     side_effects: Arc<SideEffectRegistry>,
@@ -765,7 +765,7 @@ impl PodRepository {
         );
         let network_svc = PodNetworkService::new(db, supervisor.clone(), network_events);
         let watch = PodWatchService::new(store.clone());
-        let gc_pod_delete_sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink> = api.clone();
+        let gc_pod_delete_sink: Arc<dyn GcPodDeleteSink> = api.clone();
         workqueue.set_remote_pod_delete_resignal_sink(Arc::downgrade(&gc_pod_delete_sink));
 
         let deletion_finalizer_dependencies = PodDeletionFinalizerDependencies {
@@ -988,11 +988,14 @@ impl PodRepository {
             return;
         };
 
-        dispatcher
-            .enqueue_reconcile_key(crate::controllers::workqueue::ReconcileKey::namespaced(
+        if let Err(err) = dispatcher
+            .enqueue_reconcile_batch(vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "batch/v1", "Job", namespace, job_name,
-            ))
-            .await;
+            )])
+            .await
+        {
+            tracing::warn!(error = %err, "failed to enqueue Job reconcile for terminal Pod");
+        }
     }
 }
 
@@ -1623,22 +1626,11 @@ impl PodApiWriter for PodRepository {
     }
 }
 
-#[async_trait]
 impl GcPodDeleteSink for PodRepository {
-    async fn request_gc_pod_delete(
+    fn request_gc_pod_delete(
         &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-    ) -> anyhow::Result<()> {
-        let options = DeleteOptions::with_uid_precondition(uid);
-        match self
-            .api
-            .api_delete_pod_for_gc(namespace, name, options, false)
-            .await
-        {
-            Ok(_outcome) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("{e:?}")),
-        }
+        request: GcPodDeleteRequest,
+    ) -> klights_reconcile_api::GcPodDeleteFuture<'_> {
+        self.api.request_gc_pod_delete(request)
     }
 }

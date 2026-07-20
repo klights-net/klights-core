@@ -4,5 +4,9 @@ pub mod options;
 pub mod response;
 pub mod write;
 
-pub use event::{MutationEvent, MutationOperation, dispatch_mutation_event};
+#[deprecated(
+    note = "use klights_reconcile_api::MutationOperation; remove in Phase 18.2 compatibility cleanup"
+)]
+pub type MutationOperation = klights_reconcile_api::MutationOperation;
+pub use event::{MutationEvent, dispatch_mutation_event};
 pub use options::{DeleteIntent, DryRunMode, PropagationPolicy};

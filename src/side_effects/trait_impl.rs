@@ -5,6 +5,7 @@ use crate::datastore::DatastoreBackend;
 use crate::kubelet::pod_repository::PodRepository;
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_reconcile_api::{ControllerReconcileSink, ServiceReconcileSink};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -46,24 +47,58 @@ impl PodRepositorySlot {
 /// instead of calling controllers inline from the mutation path.
 #[derive(Clone, Default)]
 pub struct ControllerDispatcherSlot {
-    inner: Arc<RwLock<Option<Arc<crate::controller_dispatcher::ControllerDispatcher>>>>,
+    inner: Arc<RwLock<ReconcileSinks>>,
+}
+
+#[derive(Default)]
+struct ReconcileSinks {
+    controller: Option<Arc<dyn ControllerReconcileSink>>,
+    service: Option<Arc<dyn ServiceReconcileSink>>,
 }
 
 impl ControllerDispatcherSlot {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(None)),
+            inner: Arc::new(RwLock::new(ReconcileSinks::default())),
         }
     }
 
-    pub fn set(&self, dispatcher: Arc<crate::controller_dispatcher::ControllerDispatcher>) {
+    #[cfg(test)]
+    pub(crate) fn with_service_reconcile_sink_for_test(
+        sink: Arc<dyn ServiceReconcileSink>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(ReconcileSinks {
+                controller: None,
+                service: Some(sink),
+            })),
+        }
+    }
+
+    pub fn set<T>(&self, dispatcher: Arc<T>)
+    where
+        T: ControllerReconcileSink + ServiceReconcileSink + 'static,
+    {
         if let Ok(mut guard) = self.inner.write() {
-            *guard = Some(dispatcher);
+            *guard = ReconcileSinks {
+                controller: Some(dispatcher.clone()),
+                service: Some(dispatcher),
+            };
         }
     }
 
-    pub fn get(&self) -> Option<Arc<crate::controller_dispatcher::ControllerDispatcher>> {
-        self.inner.read().ok().and_then(|g| g.clone())
+    pub fn get(&self) -> Option<Arc<dyn ControllerReconcileSink>> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|guard| guard.controller.clone())
+    }
+
+    pub fn service(&self) -> Option<Arc<dyn ServiceReconcileSink>> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|guard| guard.service.clone())
     }
 }
 
@@ -135,10 +170,10 @@ impl SideEffectRegistry {
 
     /// Late-bind the process-wide controller dispatcher. Bootstrap calls this
     /// after both the registry and dispatcher have been constructed.
-    pub fn set_controller_dispatcher(
-        &self,
-        dispatcher: Arc<crate::controller_dispatcher::ControllerDispatcher>,
-    ) {
+    pub fn set_controller_dispatcher<T>(&self, dispatcher: Arc<T>)
+    where
+        T: ControllerReconcileSink + ServiceReconcileSink + 'static,
+    {
         self.controller_dispatcher.set(dispatcher);
     }
 
@@ -501,7 +536,7 @@ mod tests {
         let keys = dispatcher.queued_reconcile_keys_for_test().await;
         assert_eq!(
             keys,
-            vec![crate::controllers::workqueue::ReconcileKey::namespaced(
+            vec![klights_reconcile_api::ReconcileKey::namespaced(
                 "apps/v1",
                 "DaemonSet",
                 "default",

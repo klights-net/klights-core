@@ -573,7 +573,7 @@ async fn delete_service(
         &svc_name,
         "Service",
         Some(namespace.clone()),
-        state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+        state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
     )
     .await
     {
@@ -591,7 +591,7 @@ async fn delete_service(
         state.db.as_ref(),
         &state.metrics,
         crate::api::mutation::MutationEvent {
-            operation: crate::api::mutation::MutationOperation::DeleteMark,
+            operation: klights_reconcile_api::MutationOperation::DeleteMark,
             resource: &resource.data,
             old_resource: None,
             persisted: true,

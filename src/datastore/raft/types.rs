@@ -60,6 +60,10 @@ pub struct StorageCommandResult {
     #[serde(default, skip_serializing_if = "is_false")]
     pub public_resource_changed: bool,
     pub applied_mutation: Option<AppliedMutation>,
+    /// Ephemeral local handoff from committed SQLite apply to the leader-side
+    /// side-effect dispatcher. It is never serialized into a Raft response.
+    #[serde(skip)]
+    pub(crate) pod_endpoint_effect: crate::datastore::PodEndpointEffect,
 }
 
 const fn is_false(value: &bool) -> bool {

@@ -128,16 +128,17 @@ pub async fn apply_outbox_to_local_leader(
     .result)
 }
 
-pub struct LocalOutboxApply {
-    pub result: OutboxApplyResult,
-    pub resource: Option<ForwardedResource>,
+pub(crate) struct LocalOutboxApply {
+    pub(crate) result: OutboxApplyResult,
+    pub(crate) resource: Option<ForwardedResource>,
     /// Set when the apply newly persisted a mutation (Applied result). None
     /// for AlreadyApplied — the side-effect dispatcher must not re-fire on
     /// duplicate applies.
-    pub command: Option<StorageCommand>,
+    pub(crate) command: Option<StorageCommand>,
+    pub(crate) pod_endpoint_effect: crate::datastore::PodEndpointEffect,
 }
 
-pub async fn apply_outbox_to_local_leader_with_resource(
+pub(crate) async fn apply_outbox_to_local_leader_with_resource(
     db: &dyn DatastoreBackend,
     idempotency_key: &str,
     operation: OutboxOperation,
@@ -158,6 +159,7 @@ pub async fn apply_outbox_to_local_leader_with_resource(
         result: applied.result,
         resource: applied.resource,
         command: applied.command,
+        pod_endpoint_effect: applied.pod_endpoint_effect,
     })
 }
 

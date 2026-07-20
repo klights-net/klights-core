@@ -1459,10 +1459,10 @@ async fn test_unmanaged_job_without_ttl_survives_immediate_success_cycle() {
         .await;
     assert!(
         queued.iter().any(|key| {
-            key.api_version == "batch/v1"
-                && key.kind == "Job"
-                && key.namespace.as_deref() == Some("default")
-                && key.name == "ttl-success-job"
+            key.api_version() == "batch/v1"
+                && key.kind() == "Job"
+                && key.namespace() == Some("default")
+                && key.name() == "ttl-success-job"
         }),
         "Pod status side effects should enqueue the owning Job after terminal status"
     );

@@ -2,8 +2,8 @@ use crate::api::AppError;
 use crate::api::state::AppState;
 use crate::auth::identity::AuthenticatedIdentity;
 use crate::auth::request_attributes::AuthorizationRequest;
-use crate::controllers::workqueue::ReconcileKey;
 use axum::{Extension, Json, extract::State};
+use klights_reconcile_api::ReconcileKey;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -102,12 +102,12 @@ pub async fn pod_lifecycle_debug_dump(
 }
 
 fn reconcile_key_to_string(key: ReconcileKey) -> String {
-    match key.namespace {
+    match key.namespace() {
         Some(namespace) => {
-            format!("{}/{}/{}", key.api_version, key.kind, namespace).replace("//", "/")
+            format!("{}/{}/{}", key.api_version(), key.kind(), namespace).replace("//", "/")
                 + "/"
-                + &key.name
+                + key.name()
         }
-        None => format!("{}/{}/{}", key.api_version, key.kind, key.name),
+        None => format!("{}/{}/{}", key.api_version(), key.kind(), key.name()),
     }
 }

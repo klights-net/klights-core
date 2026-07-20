@@ -452,7 +452,7 @@ async fn reconcile_custom_resource_owner_refs(
     if let Err(e) = controllers::gc::reconcile_owner_references(
         state.db.as_ref(),
         resource.clone(),
-        state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+        state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
     )
     .await
     {
@@ -1580,7 +1580,7 @@ async fn delete_collection_cr_inner(
             crate::api::mutation::delete::DeleteResult::HardDeleted(deleted) => {
                 dispatch_custom_resource_mutation_event(
                     state,
-                    crate::api::mutation::MutationOperation::HardDelete,
+                    klights_reconcile_api::MutationOperation::HardDelete,
                     &deleted.data,
                     "custom_delete_collection_hard_delete",
                 )
@@ -1594,7 +1594,7 @@ async fn delete_collection_cr_inner(
                         &deleted.kind,
                         deleted.namespace.clone(),
                         state.pod_repository.as_ref()
-                            as &dyn crate::controllers::gc::GcPodDeleteSink,
+                            as &dyn klights_reconcile_api::GcPodDeleteSink,
                     )
                     .await
                 {
@@ -1608,7 +1608,7 @@ async fn delete_collection_cr_inner(
             crate::api::mutation::delete::DeleteResult::MarkedTerminating(marked) => {
                 dispatch_custom_resource_mutation_event(
                     state,
-                    crate::api::mutation::MutationOperation::DeleteMark,
+                    klights_reconcile_api::MutationOperation::DeleteMark,
                     &marked.data,
                     "custom_delete_collection_mark",
                 )
@@ -1662,7 +1662,7 @@ pub async fn delete_collection_custom_resources(
 
 async fn dispatch_custom_resource_mutation_event(
     state: &Arc<AppState>,
-    operation: crate::api::mutation::MutationOperation,
+    operation: klights_reconcile_api::MutationOperation,
     resource: &serde_json::Value,
     context: &'static str,
 ) {
@@ -1685,7 +1685,7 @@ async fn dispatch_custom_resource_mutation_event(
 async fn after_persisted_custom_resource_write(
     state: &Arc<AppState>,
     resource: &Resource,
-    operation: crate::api::mutation::MutationOperation,
+    operation: klights_reconcile_api::MutationOperation,
     owner_ref_context: &'static str,
     event_context: &'static str,
 ) {
@@ -1826,7 +1826,7 @@ impl<'a> CreateStrategy for CustomResourceCreateStrategy<'a> {
         after_persisted_custom_resource_write(
             self.state,
             &resource,
-            crate::api::mutation::MutationOperation::Create,
+            klights_reconcile_api::MutationOperation::Create,
             self.log_context,
             "custom_create",
         )
@@ -1962,7 +1962,7 @@ impl<'a> UpdateStrategy for CustomResourceUpdateStrategy<'a> {
         after_persisted_custom_resource_write(
             self.state,
             &resource,
-            crate::api::mutation::MutationOperation::Update,
+            klights_reconcile_api::MutationOperation::Update,
             self.log_context,
             "custom_update",
         )
@@ -2113,7 +2113,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
                 after_persisted_custom_resource_write(
                     self.state,
                     &resource,
-                    crate::api::mutation::MutationOperation::Create,
+                    klights_reconcile_api::MutationOperation::Create,
                     self.apply_create_context,
                     "custom_apply_create",
                 )
@@ -2197,7 +2197,7 @@ impl<'a> PatchStrategy for CustomResourcePatchStrategy<'a> {
         after_persisted_custom_resource_write(
             self.state,
             &resource,
-            crate::api::mutation::MutationOperation::Patch,
+            klights_reconcile_api::MutationOperation::Patch,
             self.patch_context,
             "custom_patch",
         )
@@ -2390,7 +2390,7 @@ async fn delete_cr_inner(
         crate::api::mutation::delete::DeleteResult::MarkedTerminating(updated) => {
             dispatch_custom_resource_mutation_event(
                 state,
-                crate::api::mutation::MutationOperation::DeleteMark,
+                klights_reconcile_api::MutationOperation::DeleteMark,
                 &updated.data,
                 "custom_delete_mark",
             )
@@ -2398,7 +2398,7 @@ async fn delete_cr_inner(
             if let Err(e) = controllers::gc::finalize_foreground_owner_if_ready(
                 state.db.as_ref(),
                 &updated,
-                state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+                state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
             )
             .await
             {
@@ -2433,7 +2433,7 @@ async fn delete_cr_inner(
         crate::api::mutation::delete::DeleteResult::HardDeleted(deleted) => {
             dispatch_custom_resource_mutation_event(
                 state,
-                crate::api::mutation::MutationOperation::HardDelete,
+                klights_reconcile_api::MutationOperation::HardDelete,
                 &deleted.data,
                 "custom_delete_hard_delete",
             )
@@ -2446,7 +2446,7 @@ async fn delete_cr_inner(
                     &deleted.name,
                     &info.kind,
                     ns.map(str::to_string),
-                    state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+                    state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
                 )
                 .await
             {

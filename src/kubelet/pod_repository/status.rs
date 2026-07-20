@@ -11,7 +11,6 @@ use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::control_plane::client::LeaderApiClient;
-use crate::controllers::workqueue::ReconcileKey;
 use crate::datastore::Resource;
 use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
@@ -20,6 +19,7 @@ use crate::kubelet::pod_status_logic::{
     compute_initialized_condition, get_condition_last_transition_time,
 };
 use crate::side_effects::ControllerDispatcherSlot;
+use klights_reconcile_api::ReconcileKey;
 
 use super::state_only_writer::StateOnlyWriter;
 use super::store::PodStore;
@@ -1530,7 +1530,15 @@ impl PodStatusService {
             return Ok(());
         };
 
-        dispatcher.enqueue_controller_owner_for_pod(pod).await;
+        let namespace = pod
+            .pointer("/metadata/namespace")
+            .and_then(|value| value.as_str())
+            .unwrap_or("default");
+        dispatcher
+            .enqueue_reconcile_batch(
+                crate::side_effects::workload_pod::workload_owner_keys_for_pod(pod, namespace),
+            )
+            .await?;
 
         Ok(())
     }
@@ -1562,13 +1570,13 @@ impl PodStatusService {
         // child availability: once replacement pods become Ready, the owning
         // Deployment must reconcile once to scale old ReplicaSets down.
         dispatcher
-            .enqueue_reconcile_key(ReconcileKey::namespaced(
+            .enqueue_reconcile_batch(vec![ReconcileKey::namespaced(
                 "apps/v1",
                 "Deployment",
                 namespace,
                 &deployment_name,
-            ))
-            .await;
+            )])
+            .await?;
         Ok(())
     }
 

@@ -472,6 +472,7 @@ impl RaftLogApplyOutcome {
     fn try_new(
         committed_outcome: klights_cluster_core::CommittedApplyOutcome,
         pending: Vec<PendingWatchEvent>,
+        pod_endpoint_effect: crate::datastore::PodEndpointEffect,
     ) -> tokio_rusqlite::Result<Self> {
         let result = match &committed_outcome {
             klights_cluster_core::CommittedApplyOutcome::Visible {
@@ -484,6 +485,7 @@ impl RaftLogApplyOutcome {
                 applied_mutation: resource
                     .clone()
                     .map(crate::datastore::raft::types::AppliedMutation::Resource),
+                pod_endpoint_effect,
             },
             klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
                 resource_version,
@@ -493,6 +495,7 @@ impl RaftLogApplyOutcome {
                 error_message: None,
                 public_resource_changed: false,
                 applied_mutation: None,
+                pod_endpoint_effect,
             },
             klights_cluster_core::CommittedApplyOutcome::Rejected(rejection) => {
                 crate::datastore::raft::types::StorageCommandResult {
@@ -500,6 +503,7 @@ impl RaftLogApplyOutcome {
                     error_message: Some(rejection.message().to_string()),
                     public_resource_changed: false,
                     applied_mutation: None,
+                    pod_endpoint_effect,
                 }
             }
             _ => {
@@ -516,10 +520,72 @@ impl RaftLogApplyOutcome {
     }
 }
 
+fn pod_status_target(commit: &LogApplyCommit) -> Option<(Option<String>, String)> {
+    commit.mutations.iter().find_map(|mutation| match mutation {
+        LogApplyMutation::PutResource(row)
+            if row.api_version == "v1" && row.kind == "Pod" && row.status_only =>
+        {
+            Some((row.namespace.clone(), row.name.clone()))
+        }
+        _ => None,
+    })
+}
+
+fn pod_state_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    target: Option<&(Option<String>, String)>,
+) -> tokio_rusqlite::Result<Option<serde_json::Value>> {
+    let Some((namespace, name)) = target else {
+        return Ok(None);
+    };
+    let bytes = match namespace.as_deref() {
+        Some(namespace) => tx
+            .query_row(
+                queries::NAMESPACED_GET_DATA_FOR_DELETE,
+                rusqlite::params!["v1", "Pod", namespace, name],
+                |row| row.get::<_, Vec<u8>>(2),
+            )
+            .optional()?,
+        None => tx
+            .query_row(
+                queries::CLUSTER_GET_DATA_FOR_DELETE,
+                rusqlite::params!["v1", "Pod", name],
+                |row| row.get::<_, Vec<u8>>(2),
+            )
+            .optional()?,
+    };
+    bytes
+        .map(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(crate::datastore::sqlite::crud::helpers::serde_to_sqlite_error)
+        })
+        .transpose()
+}
+
+fn pod_endpoint_effect(
+    target: Option<&(Option<String>, String)>,
+    before: Option<&serde_json::Value>,
+    after: Option<&serde_json::Value>,
+) -> crate::datastore::PodEndpointEffect {
+    if target.is_none() {
+        return crate::datastore::PodEndpointEffect::NotApplicable;
+    }
+    if before.zip(after).is_some_and(|(before, after)| {
+        crate::pod_endpoint_state::pod_endpoint_state(before)
+            .differs_from(&crate::pod_endpoint_state::pod_endpoint_state(after))
+    }) {
+        crate::datastore::PodEndpointEffect::Changed
+    } else {
+        crate::datastore::PodEndpointEffect::Unchanged
+    }
+}
+
 pub(crate) fn apply_commit_in_tx_for_raft(
     tx: &rusqlite::Transaction<'_>,
     commit: LogApplyCommit,
 ) -> tokio_rusqlite::Result<RaftLogApplyOutcome> {
+    let pod_target = pod_status_target(&commit);
+    let pod_before = pod_state_in_tx(tx, pod_target.as_ref())?;
     let reserved_rv = commit.resource_version;
     validate_live_raft_resource_version_assignment(tx, &commit)?;
     let before_position = WatchReplayPosition {
@@ -542,7 +608,15 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             false,
             klights_cluster_core::NoPublicChangeReason::DuplicateIdempotencyKey,
         )?;
-        return RaftLogApplyOutcome::try_new(outcome, Vec::new());
+        return RaftLogApplyOutcome::try_new(
+            outcome,
+            Vec::new(),
+            pod_endpoint_effect(
+                pod_target.as_ref(),
+                pod_before.as_ref(),
+                pod_before.as_ref(),
+            ),
+        );
     }
 
     // A duplicate watermark has already been applied. Do not allocate a V1
@@ -559,6 +633,11 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                 reason: klights_cluster_core::NoPublicChangeReason::DuplicateWatermark,
             },
             Vec::new(),
+            pod_endpoint_effect(
+                pod_target.as_ref(),
+                pod_before.as_ref(),
+                pod_before.as_ref(),
+            ),
         );
     }
 
@@ -612,6 +691,11 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                     reason,
                 },
                 pending,
+                pod_endpoint_effect(
+                    pod_target.as_ref(),
+                    pod_before.as_ref(),
+                    pod_before.as_ref(),
+                ),
             );
         }
     }
@@ -641,7 +725,12 @@ pub(crate) fn apply_commit_in_tx_for_raft(
                     reason: klights_cluster_core::NoPublicChangeReason::LedgerOnly,
                 }
             };
-            RaftLogApplyOutcome::try_new(outcome, pending)
+            let pod_after = pod_state_in_tx(tx, pod_target.as_ref())?;
+            RaftLogApplyOutcome::try_new(
+                outcome,
+                pending,
+                pod_endpoint_effect(pod_target.as_ref(), pod_before.as_ref(), pod_after.as_ref()),
+            )
         }
         Err(err) if is_terminal_apply_conflict(&err) => {
             tx.execute("ROLLBACK TO raft_apply_attempt", [])?;
@@ -667,6 +756,11 @@ pub(crate) fn apply_commit_in_tx_for_raft(
             RaftLogApplyOutcome::try_new(
                 klights_cluster_core::CommittedApplyOutcome::Rejected(rejection),
                 Vec::new(),
+                pod_endpoint_effect(
+                    pod_target.as_ref(),
+                    pod_before.as_ref(),
+                    pod_before.as_ref(),
+                ),
             )
         }
         Err(err) => {
@@ -1126,6 +1220,7 @@ fn storage_result_from_applied_outbox(
                 error_message: Some(message),
                 public_resource_changed: false,
                 applied_mutation: None,
+                pod_endpoint_effect: crate::datastore::PodEndpointEffect::Unchanged,
             })
         }
         Ok(_) => Ok(crate::datastore::raft::types::StorageCommandResult {
@@ -1133,6 +1228,7 @@ fn storage_result_from_applied_outbox(
             error_message: None,
             public_resource_changed: false,
             applied_mutation: None,
+            pod_endpoint_effect: crate::datastore::PodEndpointEffect::Unchanged,
         }),
         Err(err) => Err(other_error(format!(
             "failed to decode applied_outbox result: {err}"

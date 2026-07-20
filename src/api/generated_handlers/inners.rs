@@ -6,12 +6,13 @@ use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 use std::sync::Arc;
 
 use super::helpers::*;
+use crate::api::mutation::DryRunMode;
 use crate::api::mutation::write::{
     CreateStrategy, PatchStrategy, UpdateStrategy, WriteResult, create_with_strategy,
     patch_with_strategy, update_with_strategy,
 };
-use crate::api::mutation::{DryRunMode, MutationOperation};
 use crate::kubelet::pod_repository::PodApiWriter;
+use klights_reconcile_api::MutationOperation;
 
 pub use crate::api::finalizer_delete::DeleteCompletion;
 
@@ -140,7 +141,7 @@ async fn schedule_foreground_owner_finalization(
                                 worker_state.db.as_ref(),
                                 &worker_owner,
                                 worker_state.pod_repository.as_ref()
-                                    as &dyn crate::controllers::gc::GcPodDeleteSink,
+                                    as &dyn klights_reconcile_api::GcPodDeleteSink,
                             )
                             .await
                             {
@@ -194,7 +195,7 @@ async fn schedule_foreground_owner_finalization(
 
 async fn dispatch_generated_mutation_event(
     state: &Arc<AppState>,
-    operation: crate::api::mutation::MutationOperation,
+    operation: klights_reconcile_api::MutationOperation,
     resource: &Value,
     context: &'static str,
 ) {
@@ -329,7 +330,7 @@ async fn run_post_hard_delete_effects(
 
     dispatch_generated_mutation_event(
         state,
-        crate::api::mutation::MutationOperation::HardDelete,
+        klights_reconcile_api::MutationOperation::HardDelete,
         &resource.data,
         "generated_hard_delete",
     )
@@ -346,7 +347,7 @@ async fn run_post_hard_delete_effects(
         &resource.name,
         kind,
         namespace.map(str::to_string),
-        state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+        state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
     )
     .await
     {
@@ -1629,7 +1630,7 @@ async fn run_owner_cascade_sweeps(
             &owner_name,
             &owner_kind,
             namespace.clone(),
-            pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+            pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
         )
         .await
         {
@@ -1728,7 +1729,7 @@ pub async fn delete_inner(
                 );
                 dispatch_generated_mutation_event(
                     &state,
-                    crate::api::mutation::MutationOperation::DeleteMark,
+                    klights_reconcile_api::MutationOperation::DeleteMark,
                     &r.data,
                     "pod_delete_mark",
                 )
@@ -1822,7 +1823,7 @@ pub async fn delete_inner(
             &owner_name_gc,
             &owner_kind_gc,
             ns.map(str::to_string),
-            state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+            state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
         )
         .await
         {
@@ -1895,7 +1896,7 @@ pub async fn delete_inner(
     if kind != "ResourceQuota" && kind != "Endpoints" {
         dispatch_generated_mutation_event(
             &state,
-            crate::api::mutation::MutationOperation::DeleteMark,
+            klights_reconcile_api::MutationOperation::DeleteMark,
             &resource.data,
             "generated_delete_reconcile",
         )
@@ -2085,7 +2086,7 @@ pub async fn delete_collection_shared_inner(
                     &res_name,
                     kind,
                     namespace.map(str::to_string),
-                    state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+                    state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
                 )
                 .await
                 {
@@ -2121,7 +2122,7 @@ pub async fn delete_collection_shared_inner(
         });
         dispatch_generated_mutation_event(
             &state,
-            crate::api::mutation::MutationOperation::DeleteMark,
+            klights_reconcile_api::MutationOperation::DeleteMark,
             &stub,
             "generated_delete_collection",
         )

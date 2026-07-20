@@ -1360,7 +1360,7 @@ impl DatastoreBackend for ReplicatedDatastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::datastore::CommittedOutboxApply,
         crate::kubelet::outbox::OutboxApplyError,
     > {
         let payload_decoded = crate::kubelet::outbox::payload::OutboxPayload::decode_protobuf(
@@ -1373,9 +1373,10 @@ impl DatastoreBackend for ReplicatedDatastore {
                 .map_err(|err| {
                     crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(err.to_string())
                 })?;
-            return Ok((
+            return Ok(crate::datastore::CommittedOutboxApply::new(
                 crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 },
-                false,
+                crate::datastore::ResourceMutationEffect::Unchanged,
+                crate::datastore::PodEndpointEffect::NotApplicable,
             ));
         }
         let proposer = self
@@ -2656,7 +2657,7 @@ impl crate::datastore::AppliedOutboxStore for ReplicatedDatastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::datastore::CommittedOutboxApply,
         crate::kubelet::outbox::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark_effect(

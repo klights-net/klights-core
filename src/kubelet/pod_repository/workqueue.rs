@@ -10,6 +10,7 @@ use klights_pod_api::{
     UnscheduledPodDeletionError, UnscheduledPodDeletionFuture, UnscheduledPodDeletionOutcome,
     UnscheduledPodDeletionRequest,
 };
+use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Notify, watch};
 
@@ -76,8 +77,7 @@ pub(super) struct PodWorkqueue {
     wake: Arc<Notify>,
     lifecycle_router: std::sync::Mutex<Option<Arc<dyn PodLifecycleWakeup>>>,
     local_node_name: std::sync::Mutex<Option<String>>,
-    remote_pod_delete_resignal_sink:
-        std::sync::Mutex<Option<std::sync::Weak<dyn crate::controllers::gc::GcPodDeleteSink>>>,
+    remote_pod_delete_resignal_sink: std::sync::Mutex<Option<std::sync::Weak<dyn GcPodDeleteSink>>>,
     reconciler_started: AtomicBool,
     /// Set to true when `start()` is called. Enables Task 4.1 tests to
     /// verify that `build_parts` defers startup to `PodRepositoryBackground`.
@@ -163,16 +163,13 @@ impl PodWorkqueue {
 
     pub(super) fn set_remote_pod_delete_resignal_sink(
         &self,
-        sink: std::sync::Weak<dyn crate::controllers::gc::GcPodDeleteSink>,
+        sink: std::sync::Weak<dyn GcPodDeleteSink>,
     ) {
         *self.remote_pod_delete_resignal_sink.lock().unwrap() = Some(sink);
     }
 
     #[cfg(test)]
-    fn set_remote_pod_delete_resignal_sink_for_tests(
-        &self,
-        sink: Arc<dyn crate::controllers::gc::GcPodDeleteSink>,
-    ) {
+    fn set_remote_pod_delete_resignal_sink_for_tests(&self, sink: Arc<dyn GcPodDeleteSink>) {
         self.set_remote_pod_delete_resignal_sink(Arc::downgrade(&sink));
     }
 
@@ -700,7 +697,9 @@ impl PodWorkqueue {
             );
             return Ok(());
         };
-        sink.request_gc_pod_delete(ns, name, uid).await
+        sink.request_gc_pod_delete(GcPodDeleteRequest::new(PodIdentity::new(ns, name, uid)))
+            .await
+            .map_err(Into::into)
     }
 
     fn live_pod_belongs_to_local_node(&self, pod: &serde_json::Value) -> bool {
@@ -968,20 +967,19 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
-    impl crate::controllers::gc::GcPodDeleteSink for RecordingGcPodDeleteSink {
-        async fn request_gc_pod_delete(
+    impl GcPodDeleteSink for RecordingGcPodDeleteSink {
+        fn request_gc_pod_delete(
             &self,
-            namespace: &str,
-            name: &str,
-            uid: &str,
-        ) -> Result<()> {
-            self.calls.lock().await.push((
-                namespace.to_string(),
-                name.to_string(),
-                uid.to_string(),
-            ));
-            Ok(())
+            request: GcPodDeleteRequest,
+        ) -> klights_reconcile_api::GcPodDeleteFuture<'_> {
+            Box::pin(async move {
+                let identity = request.into_identity();
+                self.calls
+                    .lock()
+                    .await
+                    .push((identity.namespace, identity.name, identity.uid));
+                Ok(())
+            })
         }
     }
 
@@ -1811,8 +1809,11 @@ mod tests {
         )
         .await
         .unwrap();
+        // Exercise the enqueue primitive without starting its concurrent
+        // consumer; the public wrapper intentionally wakes that consumer, so
+        // directly claiming its rows would race the behavior under test.
         workqueue
-            .enqueue_actor_deletes_for_terminating_namespace("terminating-ns")
+            .enqueue_actor_deletes_for_terminating_namespace_pods("terminating-ns")
             .await
             .unwrap();
 

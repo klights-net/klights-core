@@ -1,7 +1,10 @@
 use crate::datastore::{DatastoreBackend, Resource, ResourcePreconditions};
 use anyhow::Result;
-use async_trait::async_trait;
 use futures::StreamExt as _;
+use klights_reconcile_api::{
+    GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink,
+};
+use klights_types::PodIdentity;
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 
@@ -54,30 +57,18 @@ fn clear_all_foreground_pod_delete_in_flight_for_owner(owner_uid: &str) {
     in_flight.retain(|(in_flight_owner_uid, _)| in_flight_owner_uid != owner_uid);
 }
 
-/// Focused GC-to-Pod deletion boundary.
-///
-/// The generic garbage collector must never remove a Pod datastore row
-/// directly. When GC decides a Pod should be deleted it must issue a
-/// UID-preconditioned Pod delete request through this sink, which marks
-/// the Pod terminating and wakes the Pod lifecycle actor. The actor-owned
-/// finalization path remains the only production path allowed to
-/// hard-delete a Pod datastore entry.
-#[async_trait]
-pub trait GcPodDeleteSink: Send + Sync {
-    async fn request_gc_pod_delete(&self, namespace: &str, name: &str, uid: &str) -> Result<()>;
-}
-
 /// No-op sink for use in tests and contexts where Pod children will not
-/// be encountered. Panics if called for a Pod delete — all tests that
-/// involve Pod children must use a recording sink instead.
+/// be encountered. Returns a typed unavailable error if called for a Pod
+/// delete; tests involving Pod children must use a recording sink instead.
 pub struct NoOpGcPodDeleteSink;
 
-#[async_trait]
 impl GcPodDeleteSink for NoOpGcPodDeleteSink {
-    async fn request_gc_pod_delete(&self, _namespace: &str, _name: &str, _uid: &str) -> Result<()> {
-        anyhow::bail!(
-            "no-op sink must not be called for Pod deletes — use a recording sink for Pod tests"
-        );
+    fn request_gc_pod_delete(&self, _request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
+        Box::pin(async {
+            Err(GcPodDeleteError::unavailable(
+                "no-op sink must not be called for Pod deletes — use a recording sink for Pod tests",
+            ))
+        })
     }
 }
 
@@ -877,30 +868,23 @@ async fn request_gc_pod_delete_for_gc(
         return Ok(GcDeleteOutcome::Gone);
     }
     match pod_delete_sink
-        .request_gc_pod_delete(namespace, name, uid)
+        .request_gc_pod_delete(GcPodDeleteRequest::new(PodIdentity::new(
+            namespace, name, uid,
+        )))
         .await
     {
         Ok(()) => {}
-        Err(e)
-            if e.to_string().contains("Resource not found")
-                || e.to_string().contains("Pod not found")
-                || e.to_string().contains("NotFound") =>
-        {
-            return Ok(GcDeleteOutcome::Gone);
-        }
-        Err(e)
-            if e.to_string().contains("UID precondition failed")
-                || e.to_string().contains("uid precondition") =>
-        {
+        Err(error) if error.is_gone_or_identity_changed() => {
             tracing::debug!(
                 namespace = %namespace,
                 pod = %name,
                 uid = %uid,
-                "GC Pod delete skipped: UID precondition mismatch (stale GC observation)"
+                error = %error,
+                "GC Pod delete skipped: Pod is gone or its UID changed"
             );
             return Ok(GcDeleteOutcome::Gone);
         }
-        Err(e) => return Err(e),
+        Err(e) => return Err(e.into()),
     }
     Ok(GcDeleteOutcome::MarkedTerminating)
 }
@@ -1693,7 +1677,11 @@ async fn finalize_foreground_owner_resource(
         if is_core_pod(owner) {
             let namespace = owner.namespace.as_deref().unwrap_or("default");
             pod_delete_sink
-                .request_gc_pod_delete(namespace, &owner.name, &owner.uid)
+                .request_gc_pod_delete(GcPodDeleteRequest::new(PodIdentity::new(
+                    namespace,
+                    &owner.name,
+                    &owner.uid,
+                )))
                 .await?;
         }
         return Ok(());

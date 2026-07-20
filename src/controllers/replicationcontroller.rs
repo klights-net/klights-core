@@ -63,7 +63,7 @@ pub async fn reconcile_replicationcontroller(
     db: &dyn DatastoreBackend,
     pod_reader: &dyn PodReader,
     pod_writer: &dyn PodObjectWriter,
-    pod_delete_sink: &dyn crate::controllers::gc::GcPodDeleteSink,
+    pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     rc: &Value,
     node_name: &str,
 ) -> Result<()> {

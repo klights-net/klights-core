@@ -22,114 +22,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use klights_reconcile_api::ReconcileKey;
 use tokio::sync::{Mutex, Notify};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ReconcileKey {
-    pub api_version: &'static str,
-    pub kind: &'static str,
-    pub namespace: Option<String>,
-    pub name: String,
-}
+pub(crate) type Key = ReconcileKey;
 
-impl ReconcileKey {
-    pub fn namespaced(
-        api_version: &'static str,
-        kind: &'static str,
-        namespace: &str,
-        name: &str,
-    ) -> Self {
-        Self {
-            api_version,
-            kind,
-            namespace: Some(namespace.to_string()),
-            name: name.to_string(),
-        }
-    }
-
-    pub fn cluster(api_version: &'static str, kind: &'static str, name: &str) -> Self {
-        Self {
-            api_version,
-            kind,
-            namespace: None,
-            name: name.to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct Key {
-    pub api_version: &'static str,
-    pub kind: &'static str,
-    pub namespace: Option<String>,
-    pub name: String,
-}
-
-impl Key {
-    #[cfg(test)]
-    pub fn new(api_version: &str, kind: &str, namespace: &str, name: &str) -> Self {
-        let (api_version, kind) = controller_kind_static(api_version, kind)
-            .unwrap_or_else(|| panic!("unsupported controller key {api_version}/{kind}"));
-        Self {
-            api_version,
-            kind,
-            namespace: if namespace.is_empty() {
-                None
-            } else {
-                Some(namespace.to_string())
-            },
-            name: name.to_string(),
-        }
-    }
-}
-
-impl From<ReconcileKey> for Key {
-    fn from(value: ReconcileKey) -> Self {
-        Self {
-            api_version: value.api_version,
-            kind: value.kind,
-            namespace: value.namespace,
-            name: value.name,
-        }
-    }
-}
-
-impl From<Key> for ReconcileKey {
-    fn from(value: Key) -> Self {
-        Self {
-            api_version: value.api_version,
-            kind: value.kind,
-            namespace: value.namespace,
-            name: value.name,
-        }
-    }
-}
-
-impl std::fmt::Display for Key {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(namespace) = &self.namespace {
-            write!(
-                f,
-                "{}/{} {}/{}",
-                self.api_version, self.kind, namespace, self.name
-            )
-        } else {
-            write!(f, "{}/{} {}", self.api_version, self.kind, self.name)
-        }
-    }
-}
-
-impl std::fmt::Display for ReconcileKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(namespace) = &self.namespace {
-            write!(
-                f,
-                "{}/{} {}/{}",
-                self.api_version, self.kind, namespace, self.name
-            )
-        } else {
-            write!(f, "{}/{} {}", self.api_version, self.kind, self.name)
-        }
+#[cfg(test)]
+pub(crate) fn key_for_test(api_version: &str, kind: &str, namespace: &str, name: &str) -> Key {
+    let (api_version, kind) = controller_kind_static(api_version, kind)
+        .unwrap_or_else(|| panic!("unsupported controller key {api_version}/{kind}"));
+    if namespace.is_empty() {
+        ReconcileKey::cluster(api_version, kind, name)
+    } else {
+        ReconcileKey::namespaced(api_version, kind, namespace, name)
     }
 }
 
@@ -231,6 +136,21 @@ impl WorkQueue {
         self.notify.notify_one();
     }
 
+    pub async fn add_batch(&self, keys: Vec<Key>) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut ready = self.ready.lock().await;
+        let mut gens = self.delayed_generations.lock().await;
+        for key in keys {
+            ready.insert(key.clone());
+            gens.insert(key, self.next_gen.fetch_add(1, Ordering::Relaxed));
+        }
+        drop(gens);
+        drop(ready);
+        self.notify.notify_one();
+    }
+
     /// Schedule `key` to become ready after `dur`. Used by the worker after a
     /// reconcile failure to honor exponential backoff.
     ///
@@ -295,26 +215,19 @@ impl WorkQueue {
     }
 
     pub async fn ready_keys_snapshot(&self) -> Vec<ReconcileKey> {
-        let mut keys: Vec<_> = self
-            .ready
-            .lock()
-            .await
-            .iter()
-            .cloned()
-            .map(ReconcileKey::from)
-            .collect();
+        let mut keys: Vec<_> = self.ready.lock().await.iter().cloned().collect();
         keys.sort_by(|a, b| {
             (
-                a.api_version,
-                a.kind,
-                a.namespace.as_deref().unwrap_or(""),
-                a.name.as_str(),
+                a.api_version(),
+                a.kind(),
+                a.namespace().unwrap_or(""),
+                a.name(),
             )
                 .cmp(&(
-                    b.api_version,
-                    b.kind,
-                    b.namespace.as_deref().unwrap_or(""),
-                    b.name.as_str(),
+                    b.api_version(),
+                    b.kind(),
+                    b.namespace().unwrap_or(""),
+                    b.name(),
                 ))
         });
         keys
@@ -336,7 +249,7 @@ mod tests {
     use tokio::time::{Duration as TDur, timeout};
 
     fn k(name: &str) -> Key {
-        Key::new("apps/v1", "Deployment", "default", name)
+        key_for_test("apps/v1", "Deployment", "default", name)
     }
 
     #[tokio::test]
@@ -433,11 +346,14 @@ mod tests {
     #[test]
     fn key_display_handles_namespaced_and_cluster_scope() {
         assert_eq!(
-            format!("{}", Key::new("apps/v1", "Deployment", "default", "nginx")),
+            format!(
+                "{}",
+                key_for_test("apps/v1", "Deployment", "default", "nginx")
+            ),
             "apps/v1/Deployment default/nginx"
         );
         assert_eq!(
-            format!("{}", Key::new("v1", "Service", "", "kubernetes")),
+            format!("{}", key_for_test("v1", "Service", "", "kubernetes")),
             "v1/Service kubernetes"
         );
     }
@@ -464,10 +380,10 @@ mod tests {
     fn reconcile_key_constructors_preserve_scope() {
         assert_eq!(
             ReconcileKey::namespaced("apps/v1", "DaemonSet", "default", "daemon"),
-            Key::new("apps/v1", "DaemonSet", "default", "daemon").into()
+            key_for_test("apps/v1", "DaemonSet", "default", "daemon")
         );
         assert_eq!(
-            ReconcileKey::cluster("v1", "Service", "kubernetes").namespace,
+            ReconcileKey::cluster("v1", "Service", "kubernetes").namespace(),
             None
         );
     }

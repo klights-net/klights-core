@@ -2297,7 +2297,7 @@ impl crate::datastore::AppliedOutboxStore for RedbDatastore {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::datastore::CommittedOutboxApply,
         crate::kubelet::outbox::OutboxApplyError,
     > {
         crate::datastore::DatastoreBackend::apply_outbox_transactionally_with_watermark_effect(

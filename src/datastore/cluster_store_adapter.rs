@@ -307,6 +307,16 @@ impl DatastoreCommittedRaftApply {
     fn new_for_test(db: DatastoreHandle) -> Self {
         Self { db }
     }
+
+    pub(crate) async fn apply_committed_raft_result(
+        &self,
+        request: CommittedRaftApplyRequest,
+    ) -> Result<crate::datastore::raft::types::StorageCommandResult, CommittedApplyError> {
+        self.db
+            .apply_raft_log_apply_commit(request.into_commit())
+            .await
+            .map_err(map_committed_apply_error)
+    }
 }
 
 impl PrivilegedCommittedRaftApply for DatastoreCommittedRaftApply {

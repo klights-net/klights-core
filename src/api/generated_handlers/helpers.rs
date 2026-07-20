@@ -183,15 +183,15 @@ pub async fn maybe_reconcile_service_after_controller_endpointslice_delete(
         return Ok(());
     }
 
-    state
-        .controller_dispatcher
-        .enqueue_reconcile_key(crate::controllers::workqueue::ReconcileKey::namespaced(
-            "v1",
-            "Service",
+    klights_reconcile_api::ServiceReconcileSink::enqueue_service_reconcile_batch(
+        state.controller_dispatcher.as_ref(),
+        vec![klights_reconcile_api::ServiceReconcileKey::new(
             namespace,
             service_name,
-        ))
-        .await;
+        )],
+    )
+    .await
+    .map_err(|err| crate::api::AppError::Internal(err.to_string()))?;
 
     Ok(())
 }
@@ -261,7 +261,7 @@ pub async fn reconcile_owner_refs_after_mutation(
     if let Err(e) = controllers::gc::reconcile_owner_references(
         state.db.as_ref(),
         resource.clone(),
-        state.pod_repository.as_ref() as &dyn crate::controllers::gc::GcPodDeleteSink,
+        state.pod_repository.as_ref() as &dyn klights_reconcile_api::GcPodDeleteSink,
     )
     .await
     {

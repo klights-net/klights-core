@@ -28,7 +28,6 @@ use crate::datastore::DatastoreBackend;
 use crate::datastore::node_local::SqliteNodeLocalDb;
 use crate::datastore::raft::snapshot::{RaftSnapshotData, SqliteRaftSnapshotBuilder};
 use crate::datastore::raft::types::{NodeId, StorageCommandResult, TypeConfig};
-use klights_cluster_store::PrivilegedCommittedRaftApply;
 
 const META_KEY_LAST_APPLIED: &str = "last_applied";
 const META_KEY_LAST_MEMBERSHIP: &str = "last_membership";
@@ -206,43 +205,12 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
                             self.backend.clone(),
                             super::authority::committed_apply(),
                         );
-                    let outcome = port
-                        .apply_committed_raft(
+                    let result = port
+                        .apply_committed_raft_result(
                             klights_cluster_store::CommittedRaftApplyRequest::new(commit),
                         )
                         .await
-                        .map_err(|e| apply_err(log_id, e))?
-                        .into_outcome();
-                    let result = match outcome {
-                        klights_cluster_core::CommittedApplyOutcome::Visible {
-                            resource_version,
-                            resource,
-                        } => StorageCommandResult {
-                            applied_rv: Some(resource_version),
-                            error_message: None,
-                            public_resource_changed: true,
-                            applied_mutation: resource
-                                .map(crate::datastore::raft::types::AppliedMutation::Resource),
-                        },
-                        klights_cluster_core::CommittedApplyOutcome::NoPublicChange {
-                            resource_version,
-                            ..
-                        } => StorageCommandResult {
-                            applied_rv: Some(resource_version),
-                            error_message: None,
-                            public_resource_changed: false,
-                            applied_mutation: None,
-                        },
-                        klights_cluster_core::CommittedApplyOutcome::Rejected(rejection) => {
-                            StorageCommandResult {
-                                applied_rv: None,
-                                error_message: Some(rejection.message().to_string()),
-                                public_resource_changed: false,
-                                applied_mutation: None,
-                            }
-                        }
-                        _ => return Err(apply_err(log_id, "unsupported committed apply outcome")),
-                    };
+                        .map_err(|e| apply_err(log_id, e))?;
                     out.push(result);
                 }
             }
@@ -1519,6 +1487,11 @@ mod tests {
         assert!(
             result[0].public_resource_changed,
             "a newly visible committed Pod status update must request downstream effects"
+        );
+        assert_eq!(
+            result[0].pod_endpoint_effect,
+            crate::datastore::PodEndpointEffect::Changed,
+            "real committed-Raft apply must carry the transaction-derived endpoint effect"
         );
         assert!(
             result[0].applied_mutation.is_none(),

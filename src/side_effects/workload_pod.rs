@@ -1,10 +1,11 @@
 //! Side effect to reconcile workload controllers after Pod metadata mutations.
 
 use super::{ControllerDispatcherSlot, SideEffect};
-use crate::controllers::workqueue::{ReconcileKey, controller_kind_static};
+use crate::controllers::workqueue::controller_kind_static;
 use crate::datastore::DatastoreBackend;
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -42,9 +43,11 @@ impl SideEffect for WorkloadPodReconcileEffect {
             return Ok(());
         };
 
-        for key in workload_reconcile_keys_for_pod(resource, db, namespace).await? {
-            dispatcher.enqueue_reconcile_key(key).await;
-        }
+        dispatcher
+            .enqueue_reconcile_batch(
+                workload_reconcile_keys_for_pod(resource, db, namespace).await?,
+            )
+            .await?;
 
         Ok(())
     }
@@ -63,7 +66,7 @@ pub async fn workload_reconcile_keys_for_pod(
     Ok(keys)
 }
 
-fn workload_owner_keys_for_pod(pod: &Value, namespace: &str) -> Vec<ReconcileKey> {
+pub(crate) fn workload_owner_keys_for_pod(pod: &Value, namespace: &str) -> Vec<ReconcileKey> {
     let Some(owner_refs) = pod
         .pointer("/metadata/ownerReferences")
         .and_then(|v| v.as_array())
@@ -240,14 +243,11 @@ fn pod_is_terminating(pod: &Value) -> bool {
 
 fn owner_ref_controller_kind(owner: &Value) -> Option<(&'static str, &'static str)> {
     let kind = owner.get("kind").and_then(|v| v.as_str())?;
-    let api_version = owner.get("apiVersion").and_then(|v| v.as_str());
-    match (api_version, kind) {
-        (Some("v1") | None, "ReplicationController") => Some(("v1", "ReplicationController")),
-        (Some("apps/v1"), "ReplicaSet") => Some(("apps/v1", "ReplicaSet")),
-        (Some("apps/v1"), "StatefulSet") => Some(("apps/v1", "StatefulSet")),
-        (Some("apps/v1"), "DaemonSet") => Some(("apps/v1", "DaemonSet")),
-        _ => None,
-    }
+    let api_version = owner
+        .get("apiVersion")
+        .and_then(|v| v.as_str())
+        .or_else(|| (kind == "ReplicationController").then_some("v1"))?;
+    controller_kind_static(api_version, kind)
 }
 
 pub fn workload_pod_reconcile(
@@ -256,4 +256,46 @@ pub fn workload_pod_reconcile(
     Arc::new(WorkloadPodReconcileEffect {
         controller_dispatcher,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workload_owner_keys_for_pod;
+    use serde_json::json;
+
+    #[test]
+    fn workload_owner_keys_preserve_every_supported_workload_controller() {
+        let cases = [
+            ("apps/v1", "Deployment"),
+            ("apps/v1", "ReplicaSet"),
+            ("apps/v1", "StatefulSet"),
+            ("apps/v1", "DaemonSet"),
+            ("batch/v1", "Job"),
+            ("v1", "ReplicationController"),
+        ];
+
+        for (api_version, kind) in cases {
+            let pod = json!({
+                "metadata": {
+                    "ownerReferences": [{
+                        "apiVersion": api_version,
+                        "kind": kind,
+                        "name": "owner",
+                        "controller": true
+                    }]
+                }
+            });
+            let keys = workload_owner_keys_for_pod(&pod, "default");
+            assert_eq!(keys.len(), 1, "missing owner key for {api_version}/{kind}");
+            assert_eq!(
+                keys.into_iter().next().unwrap().into_parts(),
+                (
+                    api_version,
+                    kind,
+                    Some("default".to_string()),
+                    "owner".to_string()
+                )
+            );
+        }
+    }
 }

@@ -103,6 +103,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
             result: OutboxApplyResult::Applied { applied_rv: 0 },
             resource: None,
             command: None,
+            pod_endpoint_effect: crate::datastore::PodEndpointEffect::NotApplicable,
         });
     }
     if watermark.is_none() {
@@ -112,7 +113,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
     let watermark_present = watermark.is_some();
     let uid_bound_pod_target = is_uid_bound_pod_command(&decoded.command);
     let mut resource_before = resource_before_apply(db, &decoded.command).await?;
-    let (result, resource_changed) = match db
+    let (result, resource_effect, pod_endpoint_effect) = match db
         .apply_outbox_transactionally_with_watermark_effect(
             idempotency_key,
             operation.as_str(),
@@ -122,7 +123,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
         )
         .await
     {
-        Ok(result) => result,
+        Ok(effect) => effect.into_parts(),
         Err(err) => {
             let classified = match err {
                 OutboxApplyError::Retryable(_) => {
@@ -142,6 +143,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
             return Err(classified);
         }
     };
+    let resource_changed = resource_effect == crate::datastore::ResourceMutationEffect::Changed;
 
     // T1: All apply results are now propagated (errors surface,
     // AlreadyApplied returns the stored resource). The log_apply
@@ -185,6 +187,7 @@ pub async fn propose_outbox_on_backend_with_watermark(
         result,
         resource,
         command,
+        pod_endpoint_effect,
     })
 }
 
@@ -231,9 +234,10 @@ fn is_uid_bound_pod_command(command: &StorageCommand) -> bool {
 }
 
 pub struct RaftOutboxApply {
-    pub result: OutboxApplyResult,
-    pub resource: Option<ForwardedResource>,
-    pub command: Option<StorageCommand>,
+    pub(crate) result: OutboxApplyResult,
+    pub(crate) resource: Option<ForwardedResource>,
+    pub(crate) command: Option<StorageCommand>,
+    pub(crate) pod_endpoint_effect: crate::datastore::PodEndpointEffect,
 }
 
 impl RaftOutboxApply {
@@ -477,8 +481,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pod_status_apply_reports_effective_endpoint_delta_from_pre_and_post_state() {
+        let db = crate::datastore::test_support::in_memory().await;
+        let pod = db
+            .create_resource(
+                "v1",
+                "Pod",
+                Some("default"),
+                "status-delta",
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Pod",
+                    "metadata": {
+                        "namespace": "default",
+                        "name": "status-delta",
+                        "uid": "status-delta-uid",
+                        "labels": {"app": "web"}
+                    },
+                    "spec": {"nodeName": "worker-a"},
+                    "status": {
+                        "phase": "Running",
+                        "podIP": "10.42.0.8",
+                        "conditions": [{"type": "Ready", "status": "True"}]
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let apply = |id: &'static str, status: serde_json::Value| {
+            propose_outbox_on_backend(
+                &db,
+                id,
+                OutboxOperation::PodStatus,
+                outbox_payload(StorageCommand::UpdateStatus {
+                    api_version: "v1".to_string(),
+                    kind: "Pod".to_string(),
+                    namespace: Some("default".to_string()),
+                    name: "status-delta".to_string(),
+                    status,
+                    expected_rv: None,
+                    preconditions: ResourcePreconditions {
+                        uid: Some(pod.uid.clone()),
+                        resource_version: None,
+                    },
+                    observed_status_stamp: None,
+                }),
+                "worker-a",
+            )
+        };
+
+        let unchanged = apply(
+            "same-endpoint-status",
+            json!({
+                "phase": "Running",
+                "podIP": "10.42.0.8",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unchanged.pod_endpoint_effect,
+            crate::datastore::PodEndpointEffect::Unchanged
+        );
+
+        let changed = apply(
+            "changed-endpoint-status",
+            json!({
+                "phase": "Running",
+                "podIP": "10.42.0.9",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            changed.pod_endpoint_effect,
+            crate::datastore::PodEndpointEffect::Changed
+        );
+    }
+
+    #[tokio::test]
     async fn watermarked_stale_uid_bound_pod_row_advances_stream_without_side_effect_command() {
         let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Namespace",
+            None,
+            "legacy-rv-seed",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "legacy-rv-seed"}
+            }),
+        )
+        .await
+        .unwrap();
+        let rv_before = db.get_current_resource_version().await.unwrap();
         let watermark = crate::log_apply::OutboxStreamWatermark {
             client_id: "worker-client".to_string(),
             stream_id: 11,
@@ -510,10 +609,18 @@ mod tests {
             panic!("stale UID-bound Pod status must return its durable typed terminal decision")
         };
 
-        assert!(matches!(error, OutboxApplyError::NotFound(_)));
+        assert!(
+            matches!(&error, OutboxApplyError::NotFound(_)),
+            "unexpected stale UID result: {error:?}"
+        );
         assert_eq!(
             db.list_outbox_stream_watermarks().await.unwrap(),
             vec![watermark]
+        );
+        assert_eq!(
+            db.get_current_resource_version().await.unwrap(),
+            rv_before,
+            "ledger-only stale status must not allocate a public resourceVersion"
         );
 
         propose_outbox_on_backend_with_watermark(
@@ -632,6 +739,11 @@ mod tests {
             "AlreadyApplied replay must not claim a new resource effect"
         );
         assert_eq!(
+            duplicate.pod_endpoint_effect,
+            crate::datastore::PodEndpointEffect::Unchanged,
+            "AlreadyApplied must preserve the atomic no-effect classification"
+        );
+        assert_eq!(
             db.get_current_resource_version().await.unwrap(),
             fresh_rv,
             "AlreadyApplied replay must remain resourceVersion-neutral"
@@ -658,6 +770,11 @@ mod tests {
             assert!(
                 no_change.resource.is_none(),
                 "{key} must not claim the still-live Pod as a resource effect"
+            );
+            assert_eq!(
+                no_change.pod_endpoint_effect,
+                crate::datastore::PodEndpointEffect::NotApplicable,
+                "{key} has no committed Pod mutation to classify"
             );
             assert_eq!(
                 db.get_current_resource_version().await.unwrap(),
@@ -696,6 +813,10 @@ mod tests {
             "newer status needs only its returned-resource read"
         );
         assert!(newer.command.is_some(), "newer status must emit effects");
+        assert_eq!(
+            newer.pod_endpoint_effect,
+            crate::datastore::PodEndpointEffect::Changed
+        );
         assert!(
             newer.resource.is_some(),
             "newer status must return its resource effect"

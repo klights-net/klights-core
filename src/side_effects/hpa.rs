@@ -1,10 +1,10 @@
 //! Side effect to enqueue HPAs after target or Pod mutations.
 
 use super::{ControllerDispatcherSlot, SideEffect};
-use crate::controllers::workqueue::ReconcileKey;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,9 +25,9 @@ impl SideEffect for HpaReconcileEffect {
             return Ok(());
         };
 
-        for key in hpa_reconcile_keys_for_resource(resource, db).await? {
-            dispatcher.enqueue_reconcile_key(key).await;
-        }
+        dispatcher
+            .enqueue_reconcile_batch(hpa_reconcile_keys_for_resource(resource, db).await?)
+            .await?;
         Ok(())
     }
 }

@@ -1,11 +1,12 @@
 //! Pod-status side-effect dispatch shared by every outbox apply path.
 //!
 //! Every successful UpdateStatus or DeleteResource apply for a `v1/Pod` must
-//! enqueue workload-owner, Job, and Service reconcile keys onto the leader's
-//! `ControllerDispatcher`. Without this the leader's controllers never see
-//! the change — Endpoints/EndpointSlices stay empty, Deployment / StatefulSet
-//! rollout never observes pod readiness, Job `.status.ready` stays stale, and
-//! StatefulSet ordinal recreate stalls after a Pod is finalized off the worker.
+//! enqueue workload-owner, Job, and Service reconcile keys through focused
+//! leader-side reconciliation sinks. Without this the leader's controllers
+//! never see the change — Endpoints/EndpointSlices stay empty, Deployment /
+//! StatefulSet rollout never observes pod readiness, Job `.status.ready` stays
+//! stale, and StatefulSet ordinal recreate stalls after a Pod is finalized off
+//! the worker.
 //!
 //! Two callers wire into this:
 //!
@@ -18,34 +19,47 @@
 //! side-effect dispatch logic is the same; sharing it here keeps the two paths
 //! from drifting.
 
-use std::sync::Arc;
-
-use crate::controller_dispatcher::ControllerDispatcher;
-use crate::controllers::workqueue::ReconcileKey;
 use crate::datastore::DatastoreBackend;
 use crate::datastore::command::StorageCommand;
 use crate::replication::protocol::ForwardedResource;
+use klights_reconcile_api::{
+    ControllerReconcileSink, GcPodDeleteSink, ReconcileKey, ServiceReconcileKey,
+    ServiceReconcileSink,
+};
 
 pub async fn handle_applied_pod_side_effects(
-    controller_dispatcher: Option<&Arc<ControllerDispatcher>>,
+    controller_sink: Option<&dyn ControllerReconcileSink>,
+    service_sink: Option<&dyn ServiceReconcileSink>,
+    gc_pod_delete_sink: Option<&dyn GcPodDeleteSink>,
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
+    pod_endpoint_effect: crate::datastore::PodEndpointEffect,
     db: &dyn DatastoreBackend,
 ) {
-    enqueue_pod_status_side_effects(controller_dispatcher, command, resource, db).await;
-    finalize_foreground_owners_after_pod_delete(controller_dispatcher, command, resource, db).await;
+    enqueue_pod_status_side_effects_with_endpoint_change(
+        controller_sink,
+        service_sink,
+        command,
+        resource,
+        pod_endpoint_effect,
+        db,
+    )
+    .await;
+    finalize_foreground_owners_after_pod_delete(gc_pod_delete_sink, command, resource, db).await;
     reconcile_namespace_after_pod_delete(command, resource, db).await;
 }
 
-pub async fn enqueue_pod_status_side_effects(
-    controller_dispatcher: Option<&Arc<ControllerDispatcher>>,
+async fn enqueue_pod_status_side_effects_with_endpoint_change(
+    controller_sink: Option<&dyn ControllerReconcileSink>,
+    service_sink: Option<&dyn ServiceReconcileSink>,
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
+    pod_endpoint_effect: crate::datastore::PodEndpointEffect,
     db: &dyn DatastoreBackend,
 ) {
-    let Some(controller_dispatcher) = controller_dispatcher else {
+    if controller_sink.is_none() && service_sink.is_none() {
         return;
-    };
+    }
     let is_endpoint_relevant_patch = matches!(
         command,
         StorageCommand::PatchResource {
@@ -62,6 +76,13 @@ pub async fn enqueue_pod_status_side_effects(
                     metadata.contains_key("labels")
                         || metadata.contains_key("deletionTimestamp")
                 })
+    );
+    let is_endpoint_relevant_status = matches!(
+        command,
+        StorageCommand::UpdateStatus { api_version, kind, .. }
+            if api_version == "v1"
+                && kind == "Pod"
+                && pod_endpoint_effect == crate::datastore::PodEndpointEffect::Changed
     );
     let is_pod_status_delete_or_endpoint_patch = is_endpoint_relevant_patch
         || matches!(
@@ -84,29 +105,39 @@ pub async fn enqueue_pod_status_side_effects(
     if namespace.is_empty() {
         return;
     }
-    let service_keys = match crate::side_effects::service_pod::service_reconcile_keys_for_pod(
-        &resource.data,
-        db,
-        namespace,
-    )
-    .await
+    let service_keys = if service_sink.is_some()
+        && (is_endpoint_relevant_patch
+            || is_endpoint_relevant_status
+            || matches!(command, StorageCommand::DeleteResource { .. }))
     {
-        Ok(keys) => keys,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                namespace,
-                "failed to derive Service keys for pod status side effects"
-            );
-            Vec::new()
+        match crate::side_effects::service_pod::service_reconcile_keys_for_pod(
+            &resource.data,
+            db,
+            namespace,
+        )
+        .await
+        {
+            Ok(keys) => keys,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    namespace,
+                    "failed to derive Service keys for pod status side effects"
+                );
+                Vec::new()
+            }
         }
+    } else {
+        Vec::new()
     };
     if is_endpoint_relevant_patch {
-        for key in service_keys {
-            controller_dispatcher.enqueue_reconcile_key(key).await;
-        }
+        enqueue_service_keys(service_sink, service_keys).await;
         return;
     }
+    let Some(controller_sink) = controller_sink else {
+        enqueue_service_keys(service_sink, service_keys).await;
+        return;
+    };
     let workload_keys = match crate::side_effects::workload_pod::workload_reconcile_keys_for_pod(
         &resource.data,
         db,
@@ -139,19 +170,32 @@ pub async fn enqueue_pod_status_side_effects(
             }
         };
     let pdb_keys = pdb_reconcile_keys_for_namespace(db, namespace).await;
-    for key in workload_keys {
-        controller_dispatcher.enqueue_reconcile_key(key).await;
+    let mut controller_keys = workload_keys;
+    controller_keys.extend(job_keys);
+    controller_keys.extend(pdb_keys);
+    if let Err(err) = controller_sink
+        .enqueue_reconcile_batch(controller_keys)
+        .await
+    {
+        tracing::warn!(error = %err, namespace, "failed to enqueue controller reconcile batch");
     }
-    for key in service_keys {
-        controller_dispatcher.enqueue_reconcile_key(key).await;
-    }
-    for key in job_keys.into_iter().chain(pdb_keys) {
-        controller_dispatcher.enqueue_reconcile_key(key).await;
+    enqueue_service_keys(service_sink, service_keys).await;
+}
+
+async fn enqueue_service_keys(
+    service_sink: Option<&dyn ServiceReconcileSink>,
+    keys: Vec<ServiceReconcileKey>,
+) {
+    let Some(service_sink) = service_sink else {
+        return;
+    };
+    if let Err(err) = service_sink.enqueue_service_reconcile_batch(keys).await {
+        tracing::warn!(error = %err, "failed to enqueue Service reconcile batch");
     }
 }
 
 async fn finalize_foreground_owners_after_pod_delete(
-    controller_dispatcher: Option<&Arc<ControllerDispatcher>>,
+    gc_pod_delete_sink: Option<&dyn GcPodDeleteSink>,
     command: &StorageCommand,
     resource: Option<&ForwardedResource>,
     db: &dyn DatastoreBackend,
@@ -167,10 +211,7 @@ async fn finalize_foreground_owners_after_pod_delete(
     let Some(resource) = resource else {
         return;
     };
-    let Some(controller_dispatcher) = controller_dispatcher else {
-        return;
-    };
-    let Some(pod_repository) = controller_dispatcher.current_pod_repository().await else {
+    let Some(gc_pod_delete_sink) = gc_pod_delete_sink else {
         return;
     };
 
@@ -178,7 +219,7 @@ async fn finalize_foreground_owners_after_pod_delete(
     if let Err(err) = crate::controllers::gc::finalize_foreground_owners_after_dependent_delete(
         db,
         &deleted_resource,
-        pod_repository.as_ref(),
+        gc_pod_delete_sink,
     )
     .await
     {
@@ -272,6 +313,9 @@ async fn pdb_reconcile_keys_for_namespace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::controller_dispatcher::ControllerDispatcher;
     use crate::datastore::ResourcePreconditions;
     use crate::datastore::command::StorageCommand;
     use crate::replication::protocol::ForwardedResource;
@@ -332,15 +376,23 @@ mod tests {
             }),
         };
 
-        enqueue_pod_status_side_effects(Some(&dispatcher), &command, Some(&resource), &db).await;
+        enqueue_pod_status_side_effects_with_endpoint_change(
+            Some(dispatcher.as_ref()),
+            Some(dispatcher.as_ref()),
+            &command,
+            Some(&resource),
+            crate::datastore::PodEndpointEffect::Unchanged,
+            &db,
+        )
+        .await;
 
         let keys = dispatcher.queued_reconcile_keys_for_test().await;
         assert!(
             keys.iter().any(|key| {
-                key.api_version == "policy/v1"
-                    && key.kind == "PodDisruptionBudget"
-                    && key.namespace.as_deref() == Some("default")
-                    && key.name == "pdb-ready"
+                key.api_version() == "policy/v1"
+                    && key.kind() == "PodDisruptionBudget"
+                    && key.namespace() == Some("default")
+                    && key.name() == "pdb-ready"
             }),
             "outbox Pod status applies must enqueue matching PDB reconciliation"
         );
@@ -392,15 +444,23 @@ mod tests {
             }),
         };
 
-        enqueue_pod_status_side_effects(Some(&dispatcher), &command, Some(&resource), &db).await;
+        enqueue_pod_status_side_effects_with_endpoint_change(
+            Some(dispatcher.as_ref()),
+            Some(dispatcher.as_ref()),
+            &command,
+            Some(&resource),
+            crate::datastore::PodEndpointEffect::Changed,
+            &db,
+        )
+        .await;
 
         let keys = dispatcher.queued_reconcile_keys_for_test().await;
         assert!(
             keys.iter().any(|key| {
-                key.api_version == "batch/v1"
-                    && key.kind == "Job"
-                    && key.namespace.as_deref() == Some("default")
-                    && key.name == "ready-job"
+                key.api_version() == "batch/v1"
+                    && key.kind() == "Job"
+                    && key.namespace() == Some("default")
+                    && key.name() == "ready-job"
             }),
             "outbox Pod status applies must enqueue owning Job reconciliation"
         );
@@ -510,7 +570,15 @@ mod tests {
             }),
         };
 
-        enqueue_pod_status_side_effects(Some(&dispatcher), &command, Some(&resource), &db).await;
+        enqueue_pod_status_side_effects_with_endpoint_change(
+            Some(dispatcher.as_ref()),
+            Some(dispatcher.as_ref()),
+            &command,
+            Some(&resource),
+            crate::datastore::PodEndpointEffect::Changed,
+            &db,
+        )
+        .await;
 
         let keys = dispatcher.queued_reconcile_keys_for_test().await;
         assert_eq!(
@@ -592,7 +660,15 @@ mod tests {
             }),
         };
 
-        enqueue_pod_status_side_effects(Some(&dispatcher), &command, Some(&resource), &db).await;
+        enqueue_pod_status_side_effects_with_endpoint_change(
+            Some(dispatcher.as_ref()),
+            Some(dispatcher.as_ref()),
+            &command,
+            Some(&resource),
+            crate::datastore::PodEndpointEffect::Changed,
+            &db,
+        )
+        .await;
 
         assert_eq!(
             dispatcher
@@ -670,16 +746,125 @@ mod tests {
             }),
         };
 
-        enqueue_pod_status_side_effects(Some(&dispatcher), &command, Some(&resource), &db).await;
+        enqueue_pod_status_side_effects_with_endpoint_change(
+            Some(dispatcher.as_ref()),
+            Some(dispatcher.as_ref()),
+            &command,
+            Some(&resource),
+            crate::datastore::PodEndpointEffect::NotApplicable,
+            &db,
+        )
+        .await;
         let keys = dispatcher.queued_reconcile_keys_for_test().await;
         assert!(
             keys.iter()
-                .any(|key| key.kind == "Service" && key.name == "matching")
+                .any(|key| key.kind() == "Service" && key.name() == "matching")
         );
         assert!(
             keys.iter()
-                .any(|key| key.kind == "Service" && key.name == "stale")
+                .any(|key| key.kind() == "Service" && key.name() == "stale")
         );
-        assert!(keys.iter().all(|key| key.kind == "Service"));
+        assert!(keys.iter().all(|key| key.kind() == "Service"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_pod_status_fields_do_not_enqueue_service_reconcile() {
+        let db = crate::datastore::test_support::in_memory().await;
+        db.create_resource(
+            "v1",
+            "Service",
+            Some("default"),
+            "web",
+            json!({
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {"namespace": "default", "name": "web"},
+                "spec": {"selector": {"app": "web"}}
+            }),
+        )
+        .await
+        .unwrap();
+        let dispatcher = Arc::new(ControllerDispatcher::default());
+        let command = StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web-pod".to_string(),
+            status: json!({"containerStatuses": [{
+                "name": "web",
+                "ready": true,
+                "restartCount": 1
+            }]}),
+            expected_rv: None,
+            preconditions: ResourcePreconditions {
+                uid: Some("pod-web-uid".to_string()),
+                resource_version: None,
+            },
+            observed_status_stamp: None,
+        };
+        let resource = ForwardedResource {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web-pod".to_string(),
+            resource_version: 2,
+            data: json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {
+                    "namespace": "default",
+                    "name": "web-pod",
+                    "uid": "pod-web-uid",
+                    "labels": {"app": "web"}
+                },
+                "status": {
+                    "phase": "Running",
+                    "podIP": "10.42.0.8",
+                    "conditions": [{"type": "Ready", "status": "True"}]
+                }
+            }),
+        };
+
+        enqueue_pod_status_side_effects_with_endpoint_change(
+            Some(dispatcher.as_ref()),
+            Some(dispatcher.as_ref()),
+            &command,
+            Some(&resource),
+            crate::datastore::PodEndpointEffect::Unchanged,
+            &db,
+        )
+        .await;
+
+        let repeated_full_status = StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web-pod".to_string(),
+            status: resource.data["status"].clone(),
+            expected_rv: None,
+            preconditions: ResourcePreconditions {
+                uid: Some("pod-web-uid".to_string()),
+                resource_version: None,
+            },
+            observed_status_stamp: None,
+        };
+        enqueue_pod_status_side_effects_with_endpoint_change(
+            Some(dispatcher.as_ref()),
+            Some(dispatcher.as_ref()),
+            &repeated_full_status,
+            Some(&resource),
+            crate::datastore::PodEndpointEffect::Unchanged,
+            &db,
+        )
+        .await;
+
+        assert!(
+            dispatcher
+                .queued_reconcile_keys_for_test()
+                .await
+                .iter()
+                .all(|key| key.kind() != "Service"),
+            "unrelated or repeated unchanged status is not endpoint-relevant Service work"
+        );
     }
 }

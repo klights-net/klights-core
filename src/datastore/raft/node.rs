@@ -737,7 +737,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
             watermark,
         )
         .await
-        .map(|(result, _resource_changed)| result)
+        .map(|effect| effect.into_parts().0)
     }
 
     async fn propose_outbox_command_effect(
@@ -748,7 +748,7 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
         authoring_node: &str,
         watermark: Option<crate::log_apply::OutboxStreamWatermark>,
     ) -> std::result::Result<
-        (crate::kubelet::outbox::OutboxApplyResult, bool),
+        crate::datastore::CommittedOutboxApply,
         crate::kubelet::outbox::OutboxApplyError,
     > {
         use crate::datastore::sqlite::BuildOutboxOutcome;
@@ -820,17 +820,19 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
             } => (commit, terminal_error),
             BuildOutboxOutcome::LeaseRenewShortcircuit => {
                 // Lease renews don't go through raft.
-                return Ok((
+                return Ok(crate::datastore::CommittedOutboxApply::new(
                     crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv: 0 },
-                    false,
+                    crate::datastore::ResourceMutationEffect::Unchanged,
+                    crate::datastore::PodEndpointEffect::NotApplicable,
                 ));
             }
             BuildOutboxOutcome::AlreadyApplied { applied_rv } => {
                 // The idempotency key already applied, avoid duplicate
                 // proposal and keep the existing RV.
-                return Ok((
+                return Ok(crate::datastore::CommittedOutboxApply::new(
                     crate::kubelet::outbox::OutboxApplyResult::AlreadyApplied { applied_rv },
-                    false,
+                    crate::datastore::ResourceMutationEffect::Unchanged,
+                    crate::datastore::PodEndpointEffect::Unchanged,
                 ));
             }
         };
@@ -850,7 +852,12 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
                 ));
             }
         };
-        let resource_changed = apply_result.public_resource_changed;
+        let resource_effect = if apply_result.public_resource_changed {
+            crate::datastore::ResourceMutationEffect::Changed
+        } else {
+            crate::datastore::ResourceMutationEffect::Unchanged
+        };
+        let pod_endpoint_effect = apply_result.pod_endpoint_effect;
         if let Some(message) = apply_result.error_message {
             return Err(crate::kubelet::outbox::OutboxApplyError::ConflictTerminal(
                 message,
@@ -860,9 +867,10 @@ impl crate::datastore::replicated::RaftProposer for RaftNode {
             return Err(error);
         }
         let applied_rv = apply_result.applied_rv.unwrap_or(0);
-        Ok((
+        Ok(crate::datastore::CommittedOutboxApply::new(
             crate::kubelet::outbox::OutboxApplyResult::Applied { applied_rv },
-            resource_changed,
+            resource_effect,
+            pod_endpoint_effect,
         ))
     }
 }

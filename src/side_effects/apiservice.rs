@@ -1,10 +1,10 @@
 //! Side effect to enqueue APIService availability reconciliation.
 
 use super::{ControllerDispatcherSlot, SideEffect};
-use crate::controllers::workqueue::ReconcileKey;
 use crate::datastore::{DatastoreBackend, ResourceListQuery};
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_reconcile_api::ReconcileKey;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -26,9 +26,9 @@ impl SideEffect for APIServiceReconcileEffect {
             return Ok(());
         };
 
-        for key in apiservice_reconcile_keys_for_resource(resource, db).await? {
-            dispatcher.enqueue_reconcile_key(key).await;
-        }
+        dispatcher
+            .enqueue_reconcile_batch(apiservice_reconcile_keys_for_resource(resource, db).await?)
+            .await?;
         Ok(())
     }
 }

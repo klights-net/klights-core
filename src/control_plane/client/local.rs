@@ -968,10 +968,33 @@ impl LeaderOutboxDelivery for LocalApiClient {
                 )
                 .await?;
             if let Some(command) = outcome.command.as_ref() {
+                let controller_dispatcher = self.controller_dispatcher.get();
+                let gc_pod_delete_sink = if matches!(
+                    command,
+                    StorageCommand::DeleteResource { api_version, kind, .. }
+                        if api_version == "v1" && kind == "Pod"
+                ) {
+                    match controller_dispatcher {
+                        Some(dispatcher) => dispatcher.current_pod_repository().await,
+                        None => None,
+                    }
+                } else {
+                    None
+                };
                 crate::control_plane::client::pod_status_side_effects::handle_applied_pod_side_effects(
-                    self.controller_dispatcher.get(),
+                    controller_dispatcher.map(|dispatcher| {
+                        dispatcher.as_ref()
+                            as &dyn klights_reconcile_api::ControllerReconcileSink
+                    }),
+                    controller_dispatcher.map(|dispatcher| {
+                        dispatcher.as_ref() as &dyn klights_reconcile_api::ServiceReconcileSink
+                    }),
+                    gc_pod_delete_sink.as_deref().map(|sink| {
+                        sink as &dyn klights_reconcile_api::GcPodDeleteSink
+                    }),
                     command,
                     outcome.resource.as_ref(),
+                    outcome.pod_endpoint_effect,
                     self.db.as_ref(),
                 )
                 .await;
@@ -1079,6 +1102,125 @@ mod inner_gate_tests {
         )
         .await
         .expect("create pod");
+    }
+
+    #[tokio::test]
+    async fn local_protobuf_pod_status_reconciles_json_endpoint_tables() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        let service = db
+            .create_resource(
+                "v1",
+                "Service",
+                Some("default"),
+                "web",
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Service",
+                    "metadata": {"namespace": "default", "name": "web", "uid": "service-uid"},
+                    "spec": {"selector": {"app": "web"}, "ports": [{"port": 80, "targetPort": 8080}]}
+                }),
+            )
+            .await
+            .unwrap();
+        db.create_resource(
+            "v1",
+            "Pod",
+            Some("default"),
+            "web",
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"namespace": "default", "name": "web", "uid": "uid-1", "labels": {"app": "web"}},
+                "spec": {"nodeName": "worker-1", "containers": [{"name": "app", "image": "nginx", "ports": [{"containerPort": 8080}]}]},
+                "status": {"phase": "Pending"}
+            }),
+        )
+        .await
+        .unwrap();
+        let client = LocalApiClient::new(
+            db.clone(),
+            "worker-1".to_string(),
+            crate::control_plane::client::local::always_leader_watch(),
+        );
+        let dispatcher = Arc::new(crate::controller_dispatcher::ControllerDispatcher::default());
+        client.set_controller_dispatcher(dispatcher.clone());
+        let command = StorageCommand::UpdateStatus {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            namespace: Some("default".to_string()),
+            name: "web".to_string(),
+            status: serde_json::json!({
+                "phase": "Running",
+                "podIP": "10.42.0.8",
+                "podIPs": [{"ip": "10.42.0.8"}],
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }),
+            expected_rv: None,
+            preconditions: ResourcePreconditions::uid("uid-1"),
+            observed_status_stamp: None,
+        };
+        let payload = bytes::Bytes::from(
+            OutboxPayload::from_command(command)
+                .encode_protobuf()
+                .expect("encode local Pod status protobuf"),
+        );
+        client
+            .deliver_test_outbox(
+                "local-pod-ready",
+                OutboxOperation::PodStatus,
+                payload,
+                "worker-1",
+                1,
+                1,
+            )
+            .await
+            .expect("apply local Pod status");
+
+        let keys = dispatcher.queued_reconcile_keys_for_test().await;
+        assert_eq!(
+            keys.iter()
+                .filter(|key| key.kind() == "Service" && key.name() == "web")
+                .count(),
+            1
+        );
+        let pod_store = crate::kubelet::pod_repository::store::PodStore::new(db.clone());
+        crate::controllers::endpoints::reconcile_service_endpoints_batch(
+            db.as_ref(),
+            &pod_store,
+            crate::controllers::endpoints::ServiceEndpointBatchReconcileRequest {
+                service_name: "web",
+                service_uid: &service.uid,
+                namespace: "default",
+                selector: service.data.pointer("/spec/selector"),
+                service_ports: service.data.pointer("/spec/ports"),
+                publish_not_ready: false,
+            },
+        )
+        .await
+        .unwrap();
+        let endpoints = db
+            .get_resource("v1", "Endpoints", Some("default"), "web")
+            .await
+            .unwrap()
+            .expect("JSON Endpoints row");
+        let slice = db
+            .get_resource(
+                "discovery.k8s.io/v1",
+                "EndpointSlice",
+                Some("default"),
+                "web-klights",
+            )
+            .await
+            .unwrap()
+            .expect("JSON EndpointSlice row");
+        assert_eq!(
+            endpoints.data.pointer("/subsets/0/addresses/0/ip"),
+            Some(&serde_json::json!("10.42.0.8"))
+        );
+        assert_eq!(
+            slice.data.pointer("/endpoints/0/conditions/ready"),
+            Some(&serde_json::json!(true))
+        );
     }
 
     /// Mutation gate: every `LeaderApiClient` mutation refuses when

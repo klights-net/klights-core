@@ -27,13 +27,15 @@ use crate::controllers::{
     service::{NodePortAllocator, ServiceIpam},
     service_controller::ServiceController,
     statefulset_controller::StatefulSetController,
-    workqueue::{
-        Key, MAX_RETRY_ATTEMPTS, ReconcileKey, WorkQueue, backoff_for, controller_kind_static,
-    },
+    workqueue::{Key, MAX_RETRY_ATTEMPTS, WorkQueue, backoff_for, controller_kind_static},
 };
 use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_repository::PodRepository;
 use anyhow::{Context as _, Result};
+use klights_reconcile_api::{
+    ControllerReconcileSink, ReconcileKey, ReconcileSinkFuture, ServiceReconcileKey,
+    ServiceReconcileSink,
+};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -259,52 +261,11 @@ impl ControllerDispatcher {
     /// fallback used by HTTP handler tests. Side effects use this path so they
     /// never run controller reconciliation inline with the mutating request.
     pub async fn enqueue_reconcile_key(&self, key: ReconcileKey) {
-        self.queue.add(key.into()).await;
+        self.queue.add(key).await;
     }
 
-    pub async fn enqueue_controller_owner_for_pod(&self, pod: &Value) {
-        let Some(owner_refs) = pod
-            .pointer("/metadata/ownerReferences")
-            .and_then(|value| value.as_array())
-        else {
-            return;
-        };
-        let namespace = pod
-            .pointer("/metadata/namespace")
-            .and_then(|value| value.as_str())
-            .unwrap_or("default");
-
-        for owner_ref in owner_refs {
-            if owner_ref
-                .get("controller")
-                .and_then(|value| value.as_bool())
-                != Some(true)
-            {
-                continue;
-            }
-            let api_version = owner_ref
-                .get("apiVersion")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let kind = owner_ref
-                .get("kind")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let owner_name = owner_ref
-                .get("name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let Some((static_api, static_kind)) = controller_kind_static(api_version, kind) else {
-                continue;
-            };
-            self.enqueue_reconcile_key(ReconcileKey::namespaced(
-                static_api,
-                static_kind,
-                namespace,
-                owner_name,
-            ))
-            .await;
-        }
+    pub async fn enqueue_reconcile_batch(&self, keys: Vec<ReconcileKey>) {
+        self.queue.add_batch(keys).await;
     }
 
     pub async fn pending_reconcile_keys(&self) -> Vec<ReconcileKey> {
@@ -318,7 +279,7 @@ impl ControllerDispatcher {
 
     #[cfg(test)]
     pub async fn take_reconcile_key_for_test(&self) -> ReconcileKey {
-        self.queue.take().await.into()
+        self.queue.take().await
     }
 
     /// Configure the synchronous-fallback context for [`enqueue`] when no
@@ -451,9 +412,14 @@ impl ControllerDispatcher {
         // Fetch the freshest version of the resource. If it's gone (deleted
         // between enqueue and dispatch), there is nothing to reconcile and we
         // also clear any retry counter for the key.
-        let namespace = key.namespace.clone();
+        let namespace = key.namespace().map(ToString::to_string);
         let resource = match db_handle
-            .get_resource(key.api_version, key.kind, namespace.as_deref(), &key.name)
+            .get_resource(
+                key.api_version(),
+                key.kind(),
+                namespace.as_deref(),
+                key.name(),
+            )
             .await
         {
             Ok(Some(r)) => r,
@@ -503,17 +469,12 @@ impl ControllerDispatcher {
         key: &Key,
         db_handle: &DatastoreHandle,
     ) -> Result<()> {
-        if key.api_version != "batch/v1" || key.kind != "Job" {
+        if key.api_version() != "batch/v1" || key.kind() != "Job" {
             return Ok(());
         }
 
         let Some(resource) = db_handle
-            .get_resource(
-                key.api_version,
-                key.kind,
-                key.namespace.as_deref(),
-                &key.name,
-            )
+            .get_resource(key.api_version(), key.kind(), key.namespace(), key.name())
             .await?
         else {
             return Ok(());
@@ -673,9 +634,9 @@ fn key_for_value(resource: &Value) -> Option<Key> {
         .and_then(|v| v.as_str());
     Some(match namespace {
         Some(namespace) if !namespace.is_empty() => {
-            ReconcileKey::namespaced(api_version, kind, namespace, name).into()
+            ReconcileKey::namespaced(api_version, kind, namespace, name)
         }
-        _ => ReconcileKey::cluster(api_version, kind, name).into(),
+        _ => ReconcileKey::cluster(api_version, kind, name),
     })
 }
 
@@ -693,6 +654,41 @@ impl Default for ControllerDispatcher {
     }
 }
 
+impl ControllerReconcileSink for ControllerDispatcher {
+    fn enqueue_reconcile_batch(&self, keys: Vec<ReconcileKey>) -> ReconcileSinkFuture<'_> {
+        Box::pin(async move {
+            if keys
+                .iter()
+                .any(|key| key.api_version() == "v1" && key.kind() == "Service")
+            {
+                return Err(klights_reconcile_api::ReconcileSinkError::unsupported_key(
+                    "Service reconcile keys must use ServiceReconcileSink",
+                ));
+            }
+            ControllerDispatcher::enqueue_reconcile_batch(self, keys).await;
+            Ok(())
+        })
+    }
+}
+
+impl ServiceReconcileSink for ControllerDispatcher {
+    fn enqueue_service_reconcile_batch(
+        &self,
+        keys: Vec<ServiceReconcileKey>,
+    ) -> ReconcileSinkFuture<'_> {
+        Box::pin(async move {
+            ControllerDispatcher::enqueue_reconcile_batch(
+                self,
+                keys.into_iter()
+                    .map(ServiceReconcileKey::into_reconcile_key)
+                    .collect(),
+            )
+            .await;
+            Ok(())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +696,68 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use tokio::sync::Notify;
+
+    fn reconcile_batch_fixture(count: usize) -> Vec<ReconcileKey> {
+        (0..count)
+            .map(|index| {
+                ReconcileKey::namespaced(
+                    "apps/v1",
+                    "Deployment",
+                    "default",
+                    &format!("batch-{index}"),
+                )
+            })
+            .collect()
+    }
+
+    async fn measured_sink_enqueue(
+        dispatcher: &ControllerDispatcher,
+        keys: Vec<ReconcileKey>,
+        one_key_per_call: bool,
+    ) -> (u64, std::time::Duration) {
+        let allocated =
+            tikv_jemalloc_ctl::thread::allocatedp::read().expect("read thread allocation counter");
+        let before = allocated.get();
+        let started = std::time::Instant::now();
+        if one_key_per_call {
+            for key in keys {
+                <ControllerDispatcher as ControllerReconcileSink>::enqueue_reconcile_batch(
+                    dispatcher,
+                    vec![key],
+                )
+                .await
+                .unwrap();
+            }
+        } else {
+            <ControllerDispatcher as ControllerReconcileSink>::enqueue_reconcile_batch(
+                dispatcher, keys,
+            )
+            .await
+            .unwrap();
+        }
+        (allocated.get() - before, started.elapsed())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_sink_batch_uses_fewer_allocated_bytes_than_per_key_futures() {
+        for count in [32, 4096] {
+            let scalar = ControllerDispatcher::default();
+            let batch = ControllerDispatcher::default();
+            let (scalar_bytes, scalar_elapsed) =
+                measured_sink_enqueue(&scalar, reconcile_batch_fixture(count), true).await;
+            let (batch_bytes, batch_elapsed) =
+                measured_sink_enqueue(&batch, reconcile_batch_fixture(count), false).await;
+            eprintln!(
+                "reconcile batch count={count}: scalar={scalar_bytes}B/{scalar_elapsed:?}, batch={batch_bytes}B/{batch_elapsed:?}"
+            );
+            assert_eq!(scalar.queued_reconcile_keys_for_test().await.len(), count);
+            assert_eq!(batch.queued_reconcile_keys_for_test().await.len(), count);
+            assert!(
+                batch_bytes < scalar_bytes,
+                "one sink future and one queue batch must allocate less than {count} per-key futures: batch={batch_bytes}, scalar={scalar_bytes}"
+            );
+        }
+    }
 
     fn handle_for(db: Datastore) -> DatastoreHandle {
         Arc::new(db)
@@ -1267,7 +1325,12 @@ mod tests {
         .await
         .unwrap();
 
-        let key = Key::new("batch/v1", "Job", "default", "ttl-delayed-job");
+        let key = crate::controllers::workqueue::key_for_test(
+            "batch/v1",
+            "Job",
+            "default",
+            "ttl-delayed-job",
+        );
         dispatcher.dispatch_key(&key, &db_handle, "test-node").await;
 
         assert!(
@@ -1289,10 +1352,10 @@ mod tests {
         )
         .await
         .expect("finished Job should be requeued when ttlSecondsAfterFinished expires");
-        assert_eq!(requeued.api_version, "batch/v1");
-        assert_eq!(requeued.kind, "Job");
-        assert_eq!(requeued.namespace.as_deref(), Some("default"));
-        assert_eq!(requeued.name, "ttl-delayed-job");
+        assert_eq!(requeued.api_version(), "batch/v1");
+        assert_eq!(requeued.kind(), "Job");
+        assert_eq!(requeued.namespace(), Some("default"));
+        assert_eq!(requeued.name(), "ttl-delayed-job");
     }
 
     #[tokio::test]
@@ -1351,7 +1414,12 @@ mod tests {
         .await
         .unwrap();
 
-        let key = Key::new("batch/v1", "Job", "default", "ttl-deleting-job");
+        let key = crate::controllers::workqueue::key_for_test(
+            "batch/v1",
+            "Job",
+            "default",
+            "ttl-deleting-job",
+        );
         dispatcher.dispatch_key(&key, &db_handle, "test-node").await;
 
         assert!(

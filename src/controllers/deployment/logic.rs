@@ -209,7 +209,7 @@ struct ZeroReplicaOldReplicaSetRedrive<'a> {
     db: &'a dyn DatastoreBackend,
     pod_reader: &'a dyn PodReader,
     pod_writer: &'a dyn PodObjectWriter,
-    pod_delete_sink: &'a dyn crate::controllers::gc::GcPodDeleteSink,
+    pod_delete_sink: &'a dyn klights_reconcile_api::GcPodDeleteSink,
     namespace: &'a str,
     deployment_uid: &'a str,
     current_template: &'a Value,
@@ -506,7 +506,7 @@ pub async fn reconcile_deployment(
     db: &dyn DatastoreBackend,
     pod_reader: &dyn PodReader,
     pod_writer: &dyn PodObjectWriter,
-    pod_delete_sink: &dyn crate::controllers::gc::GcPodDeleteSink,
+    pod_delete_sink: &dyn klights_reconcile_api::GcPodDeleteSink,
     deployment: &Value,
     node_name: &str,
 ) -> Result<()> {

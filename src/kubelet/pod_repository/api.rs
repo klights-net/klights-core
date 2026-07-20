@@ -31,6 +31,10 @@ use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::{DatastoreHandle, Resource, ResourcePreconditions};
 use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
 use crate::task_supervisor::TaskSupervisor;
+use klights_reconcile_api::{
+    GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink,
+};
+use klights_types::PodIdentity;
 
 use crate::api::DeleteOptions;
 
@@ -446,7 +450,7 @@ impl PodApiService {
         if let Err(e) = crate::controllers::gc::reconcile_owner_references(
             self.db.as_ref(),
             resource.clone(),
-            self as &dyn crate::controllers::gc::GcPodDeleteSink,
+            self as &dyn klights_reconcile_api::GcPodDeleteSink,
         )
         .await
         {
@@ -1177,7 +1181,7 @@ impl PodApiService {
                 name,
                 "Pod",
                 Some(ns.to_string()),
-                self as &dyn crate::controllers::gc::GcPodDeleteSink,
+                self as &dyn klights_reconcile_api::GcPodDeleteSink,
             )
             .await
         {
@@ -1246,7 +1250,7 @@ impl PodApiService {
                     &res_name,
                     "Pod",
                     Some(ns.to_string()),
-                    self as &dyn crate::controllers::gc::GcPodDeleteSink,
+                    self as &dyn klights_reconcile_api::GcPodDeleteSink,
                 )
                 .await
             {
@@ -2061,21 +2065,64 @@ fn patch_type_to_content_type(p: PodStatusPatchType) -> &'static str {
     }
 }
 
-#[async_trait::async_trait]
-impl crate::controllers::gc::GcPodDeleteSink for PodApiService {
-    async fn request_gc_pod_delete(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-    ) -> anyhow::Result<()> {
-        let options = crate::api::DeleteOptions::with_uid_precondition(uid);
-        match self
-            .api_delete_pod_for_gc(namespace, name, options, false)
-            .await
-        {
-            Ok(_outcome) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("{e:?}")),
-        }
+impl GcPodDeleteSink for PodApiService {
+    fn request_gc_pod_delete(&self, request: GcPodDeleteRequest) -> GcPodDeleteFuture<'_> {
+        Box::pin(async move {
+            let identity = request.into_identity();
+            let options = crate::api::DeleteOptions::with_uid_precondition(&identity.uid);
+            match self
+                .api_delete_pod_for_gc(&identity.namespace, &identity.name, options, false)
+                .await
+            {
+                Ok(_outcome) => Ok(()),
+                Err(error) => {
+                    Err(classify_gc_pod_delete_error(&self.store, &identity, error).await)
+                }
+            }
+        })
+    }
+}
+
+pub(super) async fn classify_gc_pod_delete_error(
+    store: &PodStore,
+    identity: &PodIdentity,
+    error: AppError,
+) -> GcPodDeleteError {
+    match error {
+        AppError::NotFound(message) => GcPodDeleteError::not_found(message),
+        AppError::Status {
+            reason: "NotFound",
+            message,
+            ..
+        } => GcPodDeleteError::not_found(message),
+        AppError::Conflict(message)
+        | AppError::Status {
+            reason: "Conflict",
+            message,
+            ..
+        } => match store.get(&identity.namespace, &identity.name).await {
+            Ok(None) => GcPodDeleteError::not_found(format!(
+                "Pod {}/{} disappeared after delete conflict: {message}",
+                identity.namespace, identity.name
+            )),
+            Ok(Some(current)) if current.uid.is_empty() || identity.uid.is_empty() => {
+                GcPodDeleteError::unavailable(format!(
+                    "could not establish Pod identity after delete conflict: {message}"
+                ))
+            }
+            Ok(Some(current)) if current.uid != identity.uid => {
+                GcPodDeleteError::identity_changed(format!(
+                    "Pod {}/{} identity changed from {} to {}: {message}",
+                    identity.namespace, identity.name, identity.uid, current.uid
+                ))
+            }
+            Ok(Some(_)) => GcPodDeleteError::unavailable(format!(
+                "Pod delete conflicted while the requested UID is still current: {message}"
+            )),
+            Err(read_error) => GcPodDeleteError::unavailable(format!(
+                "Pod delete conflicted and identity re-read failed ({read_error}): {message}"
+            )),
+        },
+        other => GcPodDeleteError::unavailable(format!("{other:?}")),
     }
 }

@@ -15,7 +15,7 @@ use async_trait::async_trait;
 
 async fn dispatch_pod_handler_mutation_event(
     state: &Arc<AppState>,
-    operation: crate::api::mutation::MutationOperation,
+    operation: klights_reconcile_api::MutationOperation,
     resource: &Value,
     context: &'static str,
 ) {
@@ -255,7 +255,7 @@ pub async fn create_pod(
         WriteResult::Persisted(resource) => {
             dispatch_pod_handler_mutation_event(
                 &state,
-                crate::api::mutation::MutationOperation::Create,
+                klights_reconcile_api::MutationOperation::Create,
                 &resource.data,
                 "pod_create",
             )
@@ -309,7 +309,7 @@ pub async fn update_pod(
 
     dispatch_pod_handler_mutation_event(
         &state,
-        crate::api::mutation::MutationOperation::Update,
+        klights_reconcile_api::MutationOperation::Update,
         &resource.data,
         "pod_update",
     )
@@ -349,7 +349,7 @@ pub async fn delete_pod(
         crate::kubelet::pod_repository::PodApiDeleteOutcome::GracefulSet(r) => {
             dispatch_pod_handler_mutation_event(
                 &state,
-                crate::api::mutation::MutationOperation::DeleteMark,
+                klights_reconcile_api::MutationOperation::DeleteMark,
                 &r.data,
                 "pod_delete_mark",
             )
@@ -406,7 +406,7 @@ pub async fn patch_pod(
 
     dispatch_pod_handler_mutation_event(
         &state,
-        crate::api::mutation::MutationOperation::Patch,
+        klights_reconcile_api::MutationOperation::Patch,
         &resource.data,
         "pod_patch",
     )
@@ -455,7 +455,7 @@ pub async fn delete_collection_pods(
         });
         dispatch_pod_handler_mutation_event(
             &state,
-            crate::api::mutation::MutationOperation::DeleteMark,
+            klights_reconcile_api::MutationOperation::DeleteMark,
             &stub,
             "pod_delete_collection",
         )

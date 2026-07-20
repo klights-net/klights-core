@@ -331,6 +331,7 @@ mod tests {
                     error_message: None,
                     public_resource_changed: false,
                     applied_mutation: None,
+                    pod_endpoint_effect: Default::default(),
                 })
             }
 

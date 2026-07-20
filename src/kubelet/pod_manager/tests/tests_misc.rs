@@ -2323,7 +2323,7 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
         .unwrap();
 
     dispatcher
-        .enqueue_reconcile_key(crate::controllers::workqueue::ReconcileKey::namespaced(
+        .enqueue_reconcile_key(klights_reconcile_api::ReconcileKey::namespaced(
             "apps/v1",
             "Deployment",
             "default",
@@ -2334,13 +2334,13 @@ async fn test_enqueue_job_reconcile_enqueues_job_key_via_dispatcher() {
 
     let keys = dispatcher.queued_reconcile_keys_for_test().await;
     assert!(
-        keys.contains(&crate::controllers::workqueue::ReconcileKey::namespaced(
+        keys.contains(&klights_reconcile_api::ReconcileKey::namespaced(
             "batch/v1", "Job", "default", "my-job"
         )),
         "terminal Job pod reconcile must enqueue the owning Job"
     );
     assert!(
-        keys.contains(&crate::controllers::workqueue::ReconcileKey::namespaced(
+        keys.contains(&klights_reconcile_api::ReconcileKey::namespaced(
             "apps/v1",
             "Deployment",
             "default",
@@ -2414,7 +2414,7 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
     });
 
     dispatcher
-        .enqueue_reconcile_key(crate::controllers::workqueue::ReconcileKey::namespaced(
+        .enqueue_reconcile_key(klights_reconcile_api::ReconcileKey::namespaced(
             "apps/v1",
             "Deployment",
             "default",
@@ -2426,7 +2426,7 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
 
     let keys = dispatcher.queued_reconcile_keys_for_test().await;
     assert!(
-        keys.contains(&crate::controllers::workqueue::ReconcileKey::namespaced(
+        keys.contains(&klights_reconcile_api::ReconcileKey::namespaced(
             "batch/v1",
             "Job",
             "default",
@@ -2435,7 +2435,7 @@ async fn test_terminal_watch_modified_pod_enqueues_job_reconcile() {
         "terminal Pod watch events must enqueue the owning indexed Job"
     );
     assert!(
-        keys.contains(&crate::controllers::workqueue::ReconcileKey::namespaced(
+        keys.contains(&klights_reconcile_api::ReconcileKey::namespaced(
             "apps/v1",
             "Deployment",
             "default",

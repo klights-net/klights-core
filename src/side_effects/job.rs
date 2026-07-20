@@ -41,10 +41,9 @@ impl SideEffect for JobReconcileEffect {
             return Ok(());
         };
 
-        let keys = job_reconcile_keys_for_pod(resource, db, namespace).await?;
-        for key in keys {
-            dispatcher.enqueue_reconcile_key(key).await;
-        }
+        dispatcher
+            .enqueue_reconcile_batch(job_reconcile_keys_for_pod(resource, db, namespace).await?)
+            .await?;
 
         Ok(())
     }
@@ -54,7 +53,7 @@ pub async fn job_reconcile_keys_for_pod(
     pod: &Value,
     db: &dyn DatastoreBackend,
     namespace: &str,
-) -> Result<Vec<crate::controllers::workqueue::ReconcileKey>> {
+) -> Result<Vec<klights_reconcile_api::ReconcileKey>> {
     let mut keys = Vec::new();
     if let Some(owner_refs) = pod
         .pointer("/metadata/ownerReferences")
@@ -71,7 +70,7 @@ pub async fn job_reconcile_keys_for_pod(
                     .map(|api_version| api_version == "batch/v1")
                     .unwrap_or(true);
             if is_job && let Some(name) = owner.get("name").and_then(|v| v.as_str()) {
-                keys.push(crate::controllers::workqueue::ReconcileKey::namespaced(
+                keys.push(klights_reconcile_api::ReconcileKey::namespaced(
                     "batch/v1", "Job", namespace, name,
                 ));
             }
@@ -97,7 +96,7 @@ pub async fn job_reconcile_keys_for_pod(
             .map(|selector| selector.matches_labels(pod_labels))
             .unwrap_or(false);
         if selector_matches {
-            keys.push(crate::controllers::workqueue::ReconcileKey::namespaced(
+            keys.push(klights_reconcile_api::ReconcileKey::namespaced(
                 "batch/v1", "Job", namespace, &job.name,
             ));
         }
