@@ -258,6 +258,18 @@ pub fn encode_watch_payload(
 /// in a WatchEvent — which used to cost a deep `Value::clone()` per
 /// event on the hot path.
 pub fn value_matches_field_selector(object: &Value, field_selector: Option<&str>) -> bool {
+    let identity = object
+        .get("apiVersion")
+        .and_then(Value::as_str)
+        .zip(object.get("kind").and_then(Value::as_str));
+    value_matches_field_selector_with_identity(object, field_selector, identity)
+}
+
+pub fn value_matches_field_selector_with_identity(
+    object: &Value,
+    field_selector: Option<&str>,
+    identity: Option<(&str, &str)>,
+) -> bool {
     let Some(selector) = field_selector else {
         return true;
     };
@@ -265,6 +277,10 @@ pub fn value_matches_field_selector(object: &Value, field_selector: Option<&str>
         return true;
     }
 
-    klights_types::FieldSelector::parse(selector)
-        .is_ok_and(|selector| selector.matches_resource(object))
+    klights_types::FieldSelector::parse(selector).is_ok_and(|selector| match identity {
+        Some((api_version, kind)) => {
+            selector.matches_resource_with_identity(api_version, kind, object)
+        }
+        None => selector.matches_resource(object),
+    })
 }

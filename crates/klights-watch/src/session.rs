@@ -174,15 +174,7 @@ impl PositionedWatchService {
                     .await
                     .map_err(map_allocator_error)?
                     .position();
-                match request.start_resource_version() {
-                    Some(resource_version) if resource_version > 0 => {
-                        WatchReplayPosition::from_resource_version_through_event_id(
-                            resource_version,
-                            anchor.event_id,
-                        )
-                    }
-                    _ => anchor,
-                }
+                replay_position_at_anchor(&request, anchor)
             }
         };
         let filter = ResourceFilter::for_watch(&request)?;
@@ -291,15 +283,7 @@ impl PositionedWatchService {
                     .await
                     .map_err(map_allocator_error)?
                     .position();
-                match request.start_resource_version() {
-                    Some(resource_version) if resource_version > 0 => {
-                        WatchReplayPosition::from_resource_version_through_event_id(
-                            resource_version,
-                            anchor.event_id,
-                        )
-                    }
-                    _ => anchor,
-                }
+                replay_position_at_anchor(&request, anchor)
             }
         };
         let filter = ResourceFilter::for_watch(&request)?;
@@ -418,7 +402,9 @@ fn validate_selector_baseline(
                 "positioned selector baseline contains duplicate resource identities",
             ));
         }
-        if resource.resource_version > requested.resource_version {
+        if requested.resource_version_filter_through_event_id == 0
+            && resource.resource_version > requested.resource_version
+        {
             return Err(LeaderWatchError::malformed_event(
                 "positioned selector baseline contains a body newer than its snapshot",
             ));
@@ -430,6 +416,20 @@ fn validate_selector_baseline(
         }
     }
     Ok(())
+}
+
+fn replay_position_at_anchor(
+    request: &WatchRequest,
+    anchor: WatchReplayPosition,
+) -> WatchReplayPosition {
+    request
+        .start_resource_version()
+        .map_or(anchor, |resource_version| {
+            WatchReplayPosition::from_resource_version_through_event_id(
+                resource_version,
+                anchor.event_id,
+            )
+        })
 }
 
 fn resource_matches_scope(resource: &Resource, scope: &DurableWatchScope) -> bool {

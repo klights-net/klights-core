@@ -30,10 +30,28 @@ impl FieldRequirement {
     }
 
     pub fn matches_resource(&self, object: &Value) -> bool {
-        let equal = resolve_field_value(object, &self.field)
+        self.matches_value(
+            resolve_field_value(object, &self.field)
+                .as_deref()
+                .unwrap_or(""),
+        )
+    }
+
+    pub fn matches_resource_with_identity(
+        &self,
+        api_version: &str,
+        kind: &str,
+        object: &Value,
+    ) -> bool {
+        let resolved = resolve_field_value(object, &self.field);
+        let value = resolved
             .as_deref()
-            .unwrap_or("")
-            == self.value;
+            .or_else(|| default_field_value(api_version, kind, &self.field));
+        self.matches_value(value.unwrap_or(""))
+    }
+
+    fn matches_value(&self, value: &str) -> bool {
+        let equal = value == self.value;
         match self.operator {
             FieldSelectorOperator::Equals => equal,
             FieldSelectorOperator::NotEquals => !equal,
@@ -87,6 +105,17 @@ impl FieldSelector {
             .iter()
             .all(|requirement| requirement.matches_resource(object))
     }
+
+    pub fn matches_resource_with_identity(
+        &self,
+        api_version: &str,
+        kind: &str,
+        object: &Value,
+    ) -> bool {
+        self.requirements.iter().all(|requirement| {
+            requirement.matches_resource_with_identity(api_version, kind, object)
+        })
+    }
 }
 
 fn parse_requirement(
@@ -99,8 +128,8 @@ fn parse_requirement(
             ("==", FieldSelectorOperator::Equals),
             ("=", FieldSelectorOperator::Equals),
         ] {
-            if remaining.starts_with(token) {
-                return Ok((&raw[..index], operator, &remaining[token.len()..]));
+            if let Some(value) = remaining.strip_prefix(token) {
+                return Ok((&raw[..index], operator, value));
             }
         }
     }
@@ -168,6 +197,19 @@ fn unescape_value(value: &str) -> Result<String, FieldSelectorParseError> {
 fn parse_error(message: impl Into<String>) -> FieldSelectorParseError {
     FieldSelectorParseError {
         message: message.into(),
+    }
+}
+
+/// Return the Kubernetes schema default for a selectable field omitted from
+/// the serialized object.
+///
+/// This is intentionally identity-aware: a missing arbitrary JSON field still
+/// has the generic field-selector value `""`. Only fields with one unambiguous
+/// Kubernetes API default belong in this map.
+pub fn default_field_value(api_version: &str, kind: &str, path: &str) -> Option<&'static str> {
+    match (api_version, kind, path) {
+        ("v1", "Node", "spec.unschedulable") => Some("false"),
+        _ => None,
     }
 }
 
@@ -281,6 +323,22 @@ mod tests {
         ] {
             assert!(FieldSelector::parse(selector).is_err(), "{selector}");
         }
+    }
+
+    #[test]
+    fn node_unschedulable_uses_its_api_default_only_with_node_identity() {
+        let omitted = json!({"spec": {}});
+        let selector = FieldSelector::parse("spec.unschedulable=false").unwrap();
+
+        assert!(selector.matches_resource_with_identity("v1", "Node", &omitted));
+        assert!(!selector.matches_resource_with_identity("v1", "Pod", &omitted));
+        assert!(!selector.matches_resource_with_identity("example.io/v1", "Node", &omitted));
+        assert!(
+            FieldSelector::parse("spec.unschedulable=")
+                .unwrap()
+                .matches_resource(&omitted)
+        );
+        assert!(!selector.matches_resource(&omitted));
     }
 
     #[test]

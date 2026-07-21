@@ -7565,12 +7565,24 @@ async fn test_cluster_custom_resource_watch_field_selector_preserves_cluster_sco
         .unwrap();
     assert_eq!(create_cr.status(), StatusCode::CREATED);
 
-    let first_chunk = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
+    let bookmark_chunk = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
         .await
         .expect("watch stream timed out")
         .expect("watch stream ended unexpectedly")
         .expect("watch stream chunk error");
-    let line = String::from_utf8(first_chunk.to_vec()).unwrap();
+    let bookmark_line = String::from_utf8(bookmark_chunk.to_vec()).unwrap();
+    let bookmark: serde_json::Value = serde_json::from_str(bookmark_line.trim()).unwrap();
+    assert_eq!(
+        bookmark["type"], "BOOKMARK",
+        "an eagerly established empty initial snapshot must close with a bookmark before later events"
+    );
+
+    let added_chunk = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
+        .await
+        .expect("watch stream timed out")
+        .expect("watch stream ended unexpectedly")
+        .expect("watch stream chunk error");
+    let line = String::from_utf8(added_chunk.to_vec()).unwrap();
     let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(event["type"], "ADDED");
     assert_eq!(event["object"]["metadata"]["name"], "cw1");

@@ -132,6 +132,30 @@ impl RemoteApiClient {
     /// Mark a cache scope as primed.
     #[cfg(test)]
     pub async fn cache_prime_scope(&self, scope: CacheReadinessRequest) {
+        let request = ListRequest {
+            api_version: scope.api_version().to_string(),
+            kind: scope.kind().to_string(),
+            namespace: scope.namespace().map(str::to_owned),
+            label_selector: scope.label_selector().map(str::to_owned),
+            field_selector: scope.field_selector().map(str::to_owned),
+            limit: None,
+            continue_token: None,
+        };
+        self.cache
+            .replace_scope(
+                &request,
+                ResourceList {
+                    items: Vec::new(),
+                    resource_version: 0,
+                    watch_replay_position: Some(
+                        crate::datastore::WatchReplayPosition::from_resource_version(0),
+                    ),
+                    continue_token: None,
+                    remaining_item_count: None,
+                },
+            )
+            .await
+            .expect("test cache scope baseline must be valid");
         self.cache
             .mark_primed(scope)
             .await

@@ -81,10 +81,7 @@ pub(super) fn indexed_field_default(
     kind: &str,
     path: &str,
 ) -> Option<&'static str> {
-    match (api_version, kind, path) {
-        ("v1", "Node", "spec.unschedulable") => Some("false"),
-        _ => None,
-    }
+    klights_types::default_field_value(api_version, kind, path)
 }
 
 /// Extract all label key-value pairs from `metadata.labels`.

@@ -483,7 +483,7 @@ mod cases {
             resume_position: Some(generated::WatchReplayPosition {
                 resource_version: 42,
                 event_id: 92,
-                resource_version_filter_through_event_id: 73,
+                resource_version_filter_through_event_id: 0,
             }),
         };
 

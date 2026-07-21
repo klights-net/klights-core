@@ -193,16 +193,23 @@ pub(crate) fn apply_membership_selectors(
         .filter(|selector| !selector.trim().is_empty())
         .map(LabelSelector::parse)
         .transpose()?;
+    let fields = field_selector
+        .filter(|selector| !selector.trim().is_empty())
+        .map(klights_types::FieldSelector::parse)
+        .transpose()?;
     Ok(items
         .into_iter()
         .filter(|resource| {
             labels
                 .as_ref()
                 .is_none_or(|selector| selector.matches_resource(&resource.data))
-                && crate::watch::value_matches_field_selector(
-                    &resource.data,
-                    field_selector.filter(|selector| !selector.trim().is_empty()),
-                )
+                && fields.as_ref().is_none_or(|selector| {
+                    selector.matches_resource_with_identity(
+                        &resource.api_version,
+                        &resource.kind,
+                        &resource.data,
+                    )
+                })
         })
         .collect())
 }

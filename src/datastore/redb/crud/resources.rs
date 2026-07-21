@@ -939,7 +939,11 @@ impl RedbResourceStore {
 
                             // Field selector filter
                             if let Some(ref selector) = parsed_field_selector
-                                && !selector.matches_resource(&data)
+                                && !selector.matches_resource_with_identity(
+                                    &av_owned,
+                                    &kind_owned,
+                                    &data,
+                                )
                             {
                                 continue;
                             }

@@ -916,7 +916,9 @@ where
     Ok((signal_rx, replay_start_position))
 }
 
-pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamRequest<'_>) -> Body {
+pub async fn build_label_selector_watch_stream(
+    request: LabelSelectorWatchStreamRequest<'_>,
+) -> Body {
     let LabelSelectorWatchStreamRequest {
         db,
         task_supervisor,
@@ -936,131 +938,123 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
     let api_version = api_version.to_string();
     let positioned_watch =
         crate::control_plane::client::local::datastore_positioned_watch_service(db.clone());
-    let stream = async_stream::stream! {
-        wait_until_datastore_fresh(
-            &db,
-            requested_rv,
-            WatchTopic::new(&api_version, &kind),
-            &task_supervisor,
-        )
-        .await;
+    wait_until_datastore_fresh(
+        &db,
+        requested_rv,
+        WatchTopic::new(&api_version, &kind),
+        &task_supervisor,
+    )
+    .await;
 
-        let has_selector = label_selector.as_deref().is_some_and(|value| !value.is_empty())
-            || field_selector.as_deref().is_some_and(|value| !value.is_empty());
-        let emit_baseline = send_initial_events
-            || requested_rv <= 0
-                && (has_selector || emit_initial_state_for_resource_version_zero);
-        let mut start_position = None;
-        let mut last_delivered_rv = requested_rv;
-        if emit_baseline {
-            let list = match db
-                .list_resources(
-                    &api_version,
-                    &kind,
-                    watch_namespace.as_deref(),
-                    crate::datastore::ResourceListQuery::new(
-                        label_selector.as_deref(),
-                        field_selector.as_deref(),
-                        None,
-                        None,
-                    ),
-                )
-                .await
-            {
-                Ok(list) => list,
-                Err(error) => {
-                    tracing::warn!(%error, "positioned watch baseline LIST failed");
-                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
-                        stream_format,
-                        500,
-                        "InternalError",
-                        "failed to establish watch baseline",
-                    ));
-                    return;
-                }
-            };
-            let Some(position) = list.watch_replay_position else {
-                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+    let has_selector = label_selector
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        || field_selector
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    let emit_baseline = send_initial_events
+        || requested_rv <= 0 && (has_selector || emit_initial_state_for_resource_version_zero);
+    let mut start_position = None;
+    let mut last_delivered_rv = requested_rv;
+    let mut initial_frames = Vec::new();
+    if emit_baseline {
+        let list = match db
+            .list_resources(
+                &api_version,
+                &kind,
+                watch_namespace.as_deref(),
+                crate::datastore::ResourceListQuery::new(
+                    label_selector.as_deref(),
+                    field_selector.as_deref(),
+                    None,
+                    None,
+                ),
+            )
+            .await
+        {
+            Ok(list) => list,
+            Err(error) => {
+                tracing::warn!(%error, "positioned watch baseline LIST failed");
+                return single_watch_frame_body(serialize_watch_status_for_stream(
                     stream_format,
                     500,
                     "InternalError",
-                    "watch baseline did not provide an atomic replay position",
+                    "failed to establish watch baseline",
                 ));
-                return;
-            };
-            start_position = Some(position);
-            last_delivered_rv = last_delivered_rv.max(list.resource_version);
-            for resource in list.items {
-                let event = CatchUpResource::added(resource).into_watch_event();
-                match try_serialize_watch_event_for_stream(
-                    event,
-                    &kind,
-                    table_format,
-                    stream_format,
-                ) {
-                    Ok(frame) => yield Ok::<_, std::convert::Infallible>(frame),
-                    Err(frame) => {
-                        yield Ok::<_, std::convert::Infallible>(frame);
-                        return;
-                    }
-                }
-            }
-            if send_initial_events {
-                let bookmark = WatchEvent::bookmark_initial_events_end(
-                    last_delivered_rv,
-                    &api_version,
-                    &kind,
-                );
-                match try_serialize_watch_event_for_stream(
-                    bookmark,
-                    &kind,
-                    table_format,
-                    stream_format,
-                ) {
-                    Ok(frame) => yield Ok::<_, std::convert::Infallible>(frame),
-                    Err(frame) => {
-                        yield Ok::<_, std::convert::Infallible>(frame);
-                        return;
-                    }
-                }
-            }
-        }
-
-        let watch_request = match klights_leader_api::WatchRequest::try_new(
-            api_version.clone(),
-            kind.clone(),
-            watch_namespace.clone(),
-            label_selector.clone(),
-            field_selector.clone(),
-            Some(requested_rv),
-            start_position,
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
-                    stream_format,
-                    400,
-                    "BadRequest",
-                    &error.to_string(),
-                ));
-                return;
             }
         };
-        let mut positioned_stream = match klights_leader_api::LeaderWatch::watch_resources(
-            &positioned_watch,
-            watch_request,
-        )
-        .await
+        let Some(position) = list.watch_replay_position else {
+            return single_watch_frame_body(serialize_watch_status_for_stream(
+                stream_format,
+                500,
+                "InternalError",
+                "watch baseline did not provide an atomic replay position",
+            ));
+        };
+        start_position = Some(position);
+        last_delivered_rv = last_delivered_rv.max(list.resource_version);
+        for resource in list.items {
+            let event = CatchUpResource::added(resource).into_watch_event();
+            match try_serialize_watch_event_for_stream(event, &kind, table_format, stream_format) {
+                Ok(frame) => initial_frames.push(frame),
+                Err(frame) => return single_watch_frame_body(frame),
+            }
+        }
+        if send_initial_events {
+            let bookmark =
+                WatchEvent::bookmark_initial_events_end(last_delivered_rv, &api_version, &kind);
+            match try_serialize_watch_event_for_stream(bookmark, &kind, table_format, stream_format)
+            {
+                Ok(frame) => initial_frames.push(frame),
+                Err(frame) => return single_watch_frame_body(frame),
+            }
+        }
+    }
+
+    let start_resource_version = if requested_rv == 0
+        && !emit_initial_state_for_resource_version_zero
+        && !send_initial_events
+    {
+        None
+    } else {
+        Some(requested_rv)
+    };
+    let watch_request = match klights_leader_api::WatchRequest::try_new(
+        api_version.clone(),
+        kind.clone(),
+        watch_namespace.clone(),
+        label_selector.clone(),
+        field_selector.clone(),
+        start_resource_version,
+        start_position,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return single_watch_frame_body(serialize_watch_status_for_stream(
+                stream_format,
+                400,
+                "BadRequest",
+                &error.to_string(),
+            ));
+        }
+    };
+    let mut positioned_stream =
+        match klights_leader_api::LeaderWatch::watch_resources(&positioned_watch, watch_request)
+            .await
         {
             Ok(stream) => stream,
             Err(error) => {
-                yield Ok::<_, std::convert::Infallible>(serialize_positioned_watch_error_for_stream(
+                return single_watch_frame_body(serialize_positioned_watch_error_for_stream(
                     &error,
                     stream_format,
                 ));
-                return;
             }
         };
+
+    let stream = async_stream::stream! {
+        for frame in initial_frames {
+            yield Ok::<_, std::convert::Infallible>(frame);
+        }
         let mut bookmark_ticks = maybe_spawn_bookmark_tick_stream(
             send_bookmarks,
             task_supervisor.clone(),
@@ -1133,6 +1127,12 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         }
     };
     Body::from_stream(stream)
+}
+
+fn single_watch_frame_body(frame: Vec<u8>) -> Body {
+    Body::from_stream(futures::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(frame)
+    }))
 }
 
 fn serialize_positioned_watch_error_for_stream(

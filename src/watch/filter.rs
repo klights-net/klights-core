@@ -50,7 +50,11 @@ impl WatchEventFilter {
             if api_version.is_some_and(|actual| actual != selector.api_version) {
                 continue;
             }
-            if !event.matches_field_selector(Some(selector.field_selector.as_str())) {
+            if !super::events::value_matches_field_selector_with_identity(
+                &event.object,
+                Some(selector.field_selector.as_str()),
+                Some((&selector.api_version, &selector.kind)),
+            ) {
                 return false;
             }
         }

@@ -11,7 +11,7 @@ use std::fmt;
 
 pub use field_selector::{
     FieldRequirement, FieldSelector, FieldSelectorOperator, FieldSelectorParseError,
-    resolve_field_value,
+    default_field_value, resolve_field_value,
 };
 pub use json_patch::apply_merge_patch;
 pub use label_selector::{

@@ -417,7 +417,11 @@ fn paginate_snapshot(
         Some(s) => Some(LabelSelector::parse(s)?),
         None => None,
     };
-    let field = query.field_selector.filter(|s| !s.trim().is_empty());
+    let parsed_field = query
+        .field_selector
+        .filter(|s| !s.trim().is_empty())
+        .map(klights_types::FieldSelector::parse)
+        .transpose()?;
 
     let mut filtered: Vec<Resource> = items
         .into_iter()
@@ -425,7 +429,9 @@ fn paginate_snapshot(
             parsed_label
                 .as_ref()
                 .is_none_or(|sel| sel.matches_resource(&r.data))
-                && crate::watch::value_matches_field_selector(&r.data, field)
+                && parsed_field.as_ref().is_none_or(|selector| {
+                    selector.matches_resource_with_identity(&r.api_version, &r.kind, &r.data)
+                })
         })
         .collect();
 

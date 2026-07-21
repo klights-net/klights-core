@@ -357,6 +357,48 @@ async fn watch_cache_coordinates_filtered_scope_readiness_and_event_application(
 }
 
 #[tokio::test]
+async fn watch_cache_matches_omitted_node_unschedulable_as_false() {
+    let cache = WatchCache::new();
+    let request = LeaderListRequest::try_new(
+        "v1",
+        "Node",
+        None,
+        None,
+        Some("spec.unschedulable=false".to_string()),
+        None,
+        None,
+        ResourceQueryConsistency::Cached,
+    )
+    .expect("cache request");
+    let node = Resource::try_from_data(Arc::new(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Node",
+        "metadata": {
+            "name": "node-a",
+            "uid": "uid-node-a",
+            "resourceVersion": "10"
+        },
+        "spec": {}
+    })))
+    .expect("valid Node");
+    cache
+        .replace_scope(&request, vec![node], position(10, 20))
+        .await
+        .expect("omitted unschedulable uses the Node default");
+    let readiness = CacheReadinessRequest::try_new(
+        "v1",
+        "Node",
+        None,
+        None,
+        Some("spec.unschedulable=false".to_string()),
+    )
+    .expect("readiness scope");
+    cache.mark_ready(readiness).await.expect("baseline ready");
+
+    assert_eq!(cache.list(&request).await.unwrap().items().len(), 1);
+}
+
+#[tokio::test]
 async fn cache_rejects_unready_reads() {
     let cache = WatchCache::new();
     let request = LeaderListRequest::try_new(

@@ -425,6 +425,20 @@ fn canonical_crd_positioned_watch_enabled() -> bool {
     true
 }
 
+fn crd_watch_frame_response(
+    stream_format: crate::api::watch_stream::WatchStreamFormat,
+    frame: Vec<u8>,
+) -> Response {
+    let body = Body::from_stream(futures::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(frame)
+    }));
+    Response::builder()
+        .header("Content-Type", stream_format.content_type())
+        .header("Transfer-Encoding", "chunked")
+        .body(body)
+        .expect("CRD watch response headers are valid")
+}
+
 struct CrdWatchProjection {
     db: crate::datastore::DatastoreHandle,
     conversion: Option<crate::api::crd_conversion::CrdConversionConfig>,
@@ -961,163 +975,179 @@ async fn list_cr_inner(
                 requested_api_version: av.clone(),
             });
             let baseline = Arc::new(CrdProjectedWatchBaseline { db: db.clone() });
-            let stream = async_stream::stream! {
-                crate::api::watch_stream::wait_until_datastore_fresh(
-                    &db,
-                    requested_rv,
-                    klights_watch::WatchTopic::new(&av, &kind),
-                    &task_supervisor,
-                )
-                .await;
-                let emit_baseline = send_initial_events
-                    || requested_rv <= 0
-                        && (has_selector || emit_initial_state_for_resource_version_zero);
-                let mut start_position = None;
-                let mut last_rv = requested_rv;
-                if emit_baseline {
-                    let list = match db
-                        .list_resources_for_watch_targets(
-                            &replay_targets,
-                            label_selector.as_deref(),
-                        )
-                        .await
-                    {
-                        Ok(list) => list,
-                        Err(error) => {
-                            tracing::warn!(%error, "canonical CRD watch baseline LIST failed");
-                            yield Ok::<_, std::convert::Infallible>(
-                                crate::api::watch_stream::serialize_watch_status_line(
-                                    500,
-                                    "InternalError",
-                                    "failed to establish custom-resource watch baseline",
-                                ),
-                            );
-                            return;
-                        }
-                    };
-                    let Some(position) = list.watch_replay_position else {
-                        yield Ok::<_, std::convert::Infallible>(
-                            crate::api::watch_stream::serialize_watch_status_line(
-                                500,
-                                "InternalError",
-                                "custom-resource baseline did not provide an atomic position",
-                            ),
-                        );
-                        return;
-                    };
-                    start_position = Some(position);
-                    last_rv = last_rv.max(list.resource_version);
-                    let projected = match klights_watch::WatchResourceProjection::project_resources(
-                        projection.as_ref(),
-                        list.items,
-                    )
-                    .await
-                    {
-                        Ok(resources) => resources,
-                        Err(error) => {
-                            yield Ok::<_, std::convert::Infallible>(
-                                crate::api::watch_stream::serialize_watch_status_line(
-                                    500,
-                                    "InternalError",
-                                    &error.to_string(),
-                                ),
-                            );
-                            return;
-                        }
-                    };
-                    let parsed_field_selector = field_selector
-                        .as_deref()
-                        .filter(|selector| !selector.is_empty())
-                        .map(klights_types::FieldSelector::parse)
-                        .transpose()
-                        .expect("CRD field selector was validated before watch establishment");
-                    for resource in projected.into_iter().filter(|resource| {
-                        parsed_label_selector.as_ref().is_none_or(|selector| {
-                            selector.matches_resource(&resource.data)
-                        }) && parsed_field_selector.as_ref().is_none_or(|selector| {
-                            selector.matches_resource(&resource.data)
-                        })
-                    }) {
-                        let event = CatchUpResource::added(resource).into_watch_event();
-                        yield Ok::<_, std::convert::Infallible>(
-                            crate::api::watch_stream::serialize_watch_event_line(
-                                event,
-                                &kind,
-                                false,
-                            ),
-                        );
-                    }
-                    if send_initial_events {
-                        yield Ok::<_, std::convert::Infallible>(
-                            crate::api::watch_stream::serialize_watch_event_line(
-                                WatchEvent::bookmark_initial_events_end(last_rv, &av, &kind),
-                                &kind,
-                                false,
-                            ),
-                        );
-                    }
-                }
-                let request = match klights_leader_api::WatchRequest::try_new(
-                    av.clone(),
-                    kind.clone(),
-                    watch_ns.clone(),
-                    label_selector.clone(),
-                    field_selector.clone(),
-                    Some(requested_rv),
-                    start_position,
-                ) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        yield Ok::<_, std::convert::Infallible>(
-                            crate::api::watch_stream::serialize_watch_status_line(
-                                400,
-                                "BadRequest",
-                                &error.to_string(),
-                            ),
-                        );
-                        return;
-                    }
-                };
-                let plan = match klights_watch::ProjectedWatchPlan::try_new(
-                    request,
-                    durable_targets.clone(),
-                    watch_topics.clone(),
-                    if is_cluster_scope {
-                        klights_watch::WatchResourceScope::Cluster
-                    } else {
-                        klights_watch::WatchResourceScope::Namespaced
-                    },
-                    baseline.clone(),
-                    projection.clone(),
-                ) {
-                    Ok(plan) => plan,
-                    Err(error) => {
-                        yield Ok::<_, std::convert::Infallible>(
-                            crate::api::watch_stream::serialize_watch_status_line(
-                                500,
-                                "InternalError",
-                                &error.to_string(),
-                            ),
-                        );
-                        return;
-                    }
-                };
-                let mut positioned_stream = match positioned_watch
-                    .watch_projected_resources(plan)
+            crate::api::watch_stream::wait_until_datastore_fresh(
+                &db,
+                requested_rv,
+                klights_watch::WatchTopic::new(&av, &kind),
+                &task_supervisor,
+            )
+            .await;
+            let emit_baseline = send_initial_events
+                || requested_rv <= 0
+                    && (has_selector || emit_initial_state_for_resource_version_zero);
+            let mut start_position = None;
+            let mut last_rv = requested_rv;
+            let mut initial_frames = Vec::new();
+            if emit_baseline {
+                let list = match db
+                    .list_resources_for_watch_targets(&replay_targets, label_selector.as_deref())
                     .await
                 {
-                    Ok(stream) => stream,
+                    Ok(list) => list,
                     Err(error) => {
-                        yield Ok::<_, std::convert::Infallible>(
+                        tracing::warn!(%error, "canonical CRD watch baseline LIST failed");
+                        return Ok(crd_watch_frame_response(
+                            stream_format,
                             crate::api::watch_stream::serialize_watch_status_line(
-                                if matches!(error, klights_leader_api::LeaderWatchError::ReplayExpired { .. }) { 410 } else { 500 },
-                                if matches!(error, klights_leader_api::LeaderWatchError::ReplayExpired { .. }) { "Expired" } else { "InternalError" },
-                                &error.to_string(),
+                                500,
+                                "InternalError",
+                                "failed to establish custom-resource watch baseline",
                             ),
-                        );
-                        return;
+                        ));
                     }
                 };
+                let Some(position) = list.watch_replay_position else {
+                    return Ok(crd_watch_frame_response(
+                        stream_format,
+                        crate::api::watch_stream::serialize_watch_status_line(
+                            500,
+                            "InternalError",
+                            "custom-resource baseline did not provide an atomic position",
+                        ),
+                    ));
+                };
+                start_position = Some(position);
+                last_rv = last_rv.max(list.resource_version);
+                let projected = match klights_watch::WatchResourceProjection::project_resources(
+                    projection.as_ref(),
+                    list.items,
+                )
+                .await
+                {
+                    Ok(resources) => resources,
+                    Err(error) => {
+                        return Ok(crd_watch_frame_response(
+                            stream_format,
+                            crate::api::watch_stream::serialize_watch_status_line(
+                                500,
+                                "InternalError",
+                                &error.to_string(),
+                            ),
+                        ));
+                    }
+                };
+                let parsed_field_selector = field_selector
+                    .as_deref()
+                    .filter(|selector| !selector.is_empty())
+                    .map(klights_types::FieldSelector::parse)
+                    .transpose()
+                    .expect("CRD field selector was validated before watch establishment");
+                for resource in projected.into_iter().filter(|resource| {
+                    parsed_label_selector
+                        .as_ref()
+                        .is_none_or(|selector| selector.matches_resource(&resource.data))
+                        && parsed_field_selector
+                            .as_ref()
+                            .is_none_or(|selector| selector.matches_resource(&resource.data))
+                }) {
+                    let event = CatchUpResource::added(resource).into_watch_event();
+                    initial_frames.push(crate::api::watch_stream::serialize_watch_event_line(
+                        event, &kind, false,
+                    ));
+                }
+                if send_initial_events {
+                    initial_frames.push(crate::api::watch_stream::serialize_watch_event_line(
+                        WatchEvent::bookmark_initial_events_end(last_rv, &av, &kind),
+                        &kind,
+                        false,
+                    ));
+                }
+            }
+            let start_resource_version = if requested_rv == 0
+                && !emit_initial_state_for_resource_version_zero
+                && !send_initial_events
+            {
+                None
+            } else {
+                Some(requested_rv)
+            };
+            let request = match klights_leader_api::WatchRequest::try_new(
+                av.clone(),
+                kind.clone(),
+                watch_ns.clone(),
+                label_selector.clone(),
+                field_selector.clone(),
+                start_resource_version,
+                start_position,
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    return Ok(crd_watch_frame_response(
+                        stream_format,
+                        crate::api::watch_stream::serialize_watch_status_line(
+                            400,
+                            "BadRequest",
+                            &error.to_string(),
+                        ),
+                    ));
+                }
+            };
+            let plan = match klights_watch::ProjectedWatchPlan::try_new(
+                request,
+                durable_targets,
+                watch_topics,
+                if is_cluster_scope {
+                    klights_watch::WatchResourceScope::Cluster
+                } else {
+                    klights_watch::WatchResourceScope::Namespaced
+                },
+                baseline,
+                projection,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return Ok(crd_watch_frame_response(
+                        stream_format,
+                        crate::api::watch_stream::serialize_watch_status_line(
+                            500,
+                            "InternalError",
+                            &error.to_string(),
+                        ),
+                    ));
+                }
+            };
+            let mut positioned_stream = match positioned_watch.watch_projected_resources(plan).await
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return Ok(crd_watch_frame_response(
+                        stream_format,
+                        crate::api::watch_stream::serialize_watch_status_line(
+                            if matches!(
+                                error,
+                                klights_leader_api::LeaderWatchError::ReplayExpired { .. }
+                            ) {
+                                410
+                            } else {
+                                500
+                            },
+                            if matches!(
+                                error,
+                                klights_leader_api::LeaderWatchError::ReplayExpired { .. }
+                            ) {
+                                "Expired"
+                            } else {
+                                "InternalError"
+                            },
+                            &error.to_string(),
+                        ),
+                    ));
+                }
+            };
+            let stream = async_stream::stream! {
+                for frame in initial_frames {
+                    yield Ok::<_, std::convert::Infallible>(frame);
+                }
                 let mut bookmark_ticks = maybe_spawn_bookmark_tick_stream(
                     send_bookmarks,
                     task_supervisor.clone(),

@@ -423,7 +423,8 @@ pub async fn list_inner(
             stream_format,
             timeout_seconds: query.timeout_seconds,
             emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
-        });
+        })
+        .await;
         return Ok(Response::builder()
             .header("Content-Type", stream_format.content_type())
             .header("Transfer-Encoding", "chunked")

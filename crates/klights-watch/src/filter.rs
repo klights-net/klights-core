@@ -68,10 +68,13 @@ impl ResourceFilter {
                 .label_selector
                 .as_ref()
                 .is_none_or(|selector| selector.matches_resource(&resource.data))
-            && self
-                .field_selector
-                .as_ref()
-                .is_none_or(|selector| selector.matches_resource(&resource.data))
+            && self.field_selector.as_ref().is_none_or(|selector| {
+                selector.matches_resource_with_identity(
+                    &resource.api_version,
+                    &resource.kind,
+                    &resource.data,
+                )
+            })
     }
 
     pub(crate) fn matches_identity(&self, resource: &Resource) -> bool {

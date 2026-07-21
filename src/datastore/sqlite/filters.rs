@@ -23,7 +23,9 @@ pub fn filter_by_field_selector(items: Vec<Resource>, selector: &str) -> Vec<Res
         .expect("API validation must reject malformed field selectors before datastore filtering");
     items
         .into_iter()
-        .filter(|item| selector.matches_resource(&item.data))
+        .filter(|item| {
+            selector.matches_resource_with_identity(&item.api_version, &item.kind, &item.data)
+        })
         .collect()
 }
 
@@ -69,12 +71,16 @@ pub(super) fn split_sql_pushdown_conditions(selector: &str) -> Result<SqlPushdow
 }
 
 pub(super) fn matches_field_selector_conditions(
-    data: &Value,
+    resource: &Resource,
     conditions: &[FieldSelectorCondition],
 ) -> bool {
-    conditions
-        .iter()
-        .all(|condition| condition.matches_resource(data))
+    conditions.iter().all(|condition| {
+        condition.matches_resource_with_identity(
+            &resource.api_version,
+            &resource.kind,
+            &resource.data,
+        )
+    })
 }
 
 #[cfg(test)]

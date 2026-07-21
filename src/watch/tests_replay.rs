@@ -352,6 +352,19 @@ fn test_matches_field_selector_inequality() {
 }
 
 #[test]
+fn test_matches_field_selector_uses_node_unschedulable_default() {
+    let event = WatchEvent::added(serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Node",
+        "metadata": {"name": "node-a"},
+        "spec": {}
+    }));
+
+    assert!(event.matches_field_selector(Some("spec.unschedulable=false")));
+    assert!(!event.matches_field_selector(Some("spec.unschedulable=true")));
+}
+
+#[test]
 fn test_matches_field_selector_event_source_alias() {
     let obj = serde_json::json!({
         "kind": "Event",

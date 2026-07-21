@@ -184,7 +184,13 @@ impl Datastore {
                 items.retain(|item| selector.matches_resource(&item.data));
             }
             if let Some(selector) = &parsed_field_selector {
-                items.retain(|item| selector.matches_resource(&item.data));
+                items.retain(|item| {
+                    selector.matches_resource_with_identity(
+                        &item.api_version,
+                        &item.kind,
+                        &item.data,
+                    )
+                });
             }
             let watch_replay_position = Self::current_watch_replay_position_in_tx(&tx)?;
             Ok(ResourceList {

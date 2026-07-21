@@ -589,16 +589,22 @@ async fn test_list_namespaces_field_selector_sql_injection_safe() {
         .await
         .unwrap();
 
-    // Attempt SQL injection via field selector — should return 0 results, not error or leak data
-    let result = db
+    let error = db
         .list_namespaces(None, Some("metadata.name=' OR '1'='1"))
         .await
-        .unwrap();
+        .expect_err("unescaped equals in a selector value must be rejected");
     assert_eq!(
-        result.items.len(),
-        0,
-        "SQL injection attempt should match nothing"
+        error.to_string(),
+        "Invalid field selector: invalid field selector: unescaped character in value: ="
     );
+
+    // The same payload is syntactically valid when its value is escaped. It
+    // remains a bound parameter and therefore matches no namespace.
+    let result = db
+        .list_namespaces(None, Some(r"metadata.name=' OR '1'\='1"))
+        .await
+        .unwrap();
+    assert!(result.items.is_empty());
 }
 
 #[tokio::test]

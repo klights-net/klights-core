@@ -63,7 +63,9 @@ pub fn filter_by_field_selector(items: Vec<Resource>, selector: &str) -> Vec<Res
         .expect("API validation must reject malformed field selectors before datastore filtering");
     items
         .into_iter()
-        .filter(|item| selector.matches_resource(&item.data))
+        .filter(|item| {
+            selector.matches_resource_with_identity(&item.api_version, &item.kind, &item.data)
+        })
         .collect()
 }
 
@@ -536,6 +538,25 @@ mod tests {
             data: Arc::new(json!({})),
         }];
         assert_eq!(filter_by_field_selector(items, "").len(), 1);
+    }
+
+    #[test]
+    fn filter_by_field_selector_applies_node_unschedulable_default() {
+        let items = vec![Resource {
+            id: 0,
+            api_version: "v1".into(),
+            kind: "Node".into(),
+            namespace: None,
+            name: "node-a".into(),
+            uid: String::new(),
+            resource_version: 1,
+            data: Arc::new(json!({"spec": {}})),
+        }];
+
+        assert_eq!(
+            filter_by_field_selector(items, "spec.unschedulable=false").len(),
+            1
+        );
     }
 
     #[test]

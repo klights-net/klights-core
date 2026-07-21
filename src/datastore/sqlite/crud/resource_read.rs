@@ -763,7 +763,7 @@ impl Datastore {
                                 }
                                 if !residual_fields.is_empty()
                                     && !matches_field_selector_conditions(
-                                        &item.data,
+                                        &item,
                                         residual_fields,
                                     )
                                 {
@@ -1016,7 +1016,7 @@ impl Datastore {
                                 }
                                 if !residual_fields.is_empty()
                                     && !matches_field_selector_conditions(
-                                        &item.data,
+                                        &item,
                                         residual_fields,
                                     )
                                 {
@@ -1262,7 +1262,7 @@ impl Datastore {
                         continue;
                     }
                     if !index_residual_fields.is_empty()
-                        && !matches_field_selector_conditions(&item.data, &index_residual_fields)
+                        && !matches_field_selector_conditions(&item, &index_residual_fields)
                     {
                         continue;
                     }
@@ -1341,7 +1341,7 @@ impl Datastore {
                         continue;
                     }
                     if !index_residual_fields.is_empty()
-                        && !matches_field_selector_conditions(&item.data, &index_residual_fields)
+                        && !matches_field_selector_conditions(&item, &index_residual_fields)
                     {
                         continue;
                     }
