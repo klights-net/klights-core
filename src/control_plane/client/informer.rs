@@ -1,179 +1,102 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-
 use anyhow::Result;
-use tokio::sync::{Notify, RwLock};
 
-use crate::control_plane::client::{CacheReadinessRequest, ListRequest, ResourceEvent};
-use crate::datastore::{Resource, ResourceList};
+use crate::control_plane::client::{
+    CacheReadinessRequest, ListRequest, ResourceEvent, ResourceQueryConsistency,
+    legacy_list_response,
+};
+use crate::datastore::{Resource, ResourceList, WatchReplayPosition};
 use klights_types::ResourceKey;
 
+/// Temporary legacy-client facade over the canonical watch-leaf cache.
 #[derive(Clone)]
 pub(super) struct InformerCache {
-    resources: Arc<RwLock<HashMap<String, Resource>>>,
-    primed_scopes: Arc<RwLock<HashSet<CacheReadinessRequest>>>,
-    ready: Arc<Notify>,
+    inner: klights_watch::WatchCache,
 }
 
 impl InformerCache {
     pub(super) fn new() -> Self {
         Self {
-            resources: Arc::new(RwLock::new(HashMap::new())),
-            primed_scopes: Arc::new(RwLock::new(HashSet::new())),
-            ready: Arc::new(Notify::new()),
+            inner: klights_watch::WatchCache::new(),
         }
     }
 
     pub(super) async fn get(&self, key: &ResourceKey) -> Option<Resource> {
-        let cache_key = resource_cache_key(
-            &key.api_version,
-            &key.kind,
-            key.namespace.as_deref(),
-            &key.name,
-        );
-        self.resources.read().await.get(&cache_key).cloned()
+        self.inner.get(key).await
     }
 
     pub(super) async fn insert(&self, resource: Resource) {
-        let key = resource_cache_key(
-            &resource.api_version,
-            &resource.kind,
-            resource.namespace.as_deref(),
-            &resource.name,
-        );
-        self.resources.write().await.insert(key, resource);
+        self.inner.insert(resource).await;
     }
 
-    pub(super) async fn list(&self, req: &ListRequest) -> ResourceList {
-        let guard = self.resources.read().await;
-        let items = guard
-            .values()
-            .filter(|resource| resource_matches_request(resource, req))
-            .cloned()
-            .collect();
-        ResourceList {
-            items,
-            resource_version: 0,
-            watch_replay_position: None,
-            continue_token: None,
-            remaining_item_count: None,
-        }
+    pub(super) async fn list(&self, request: &ListRequest) -> Result<ResourceList> {
+        let request = focused_list_request(request)?;
+        self.inner
+            .list(&request)
+            .await
+            .map(legacy_list_response)
+            .map_err(Into::into)
     }
 
-    pub(super) async fn replace_scope(&self, req: &ListRequest, list: ResourceList) {
-        let mut guard = self.resources.write().await;
-        guard.retain(|_, resource| !resource_matches_request(resource, req));
-        for resource in list.items {
-            let key = resource_cache_key(
-                &resource.api_version,
-                &resource.kind,
-                resource.namespace.as_deref(),
-                &resource.name,
-            );
-            guard.insert(key, resource);
-        }
+    pub(super) async fn replace_scope(
+        &self,
+        request: &ListRequest,
+        list: ResourceList,
+    ) -> Result<()> {
+        let request = focused_list_request(request)?;
+        let position = list
+            .watch_replay_position
+            .unwrap_or_else(|| WatchReplayPosition::from_resource_version(list.resource_version));
+        self.inner
+            .replace_scope(&request, list.items, position)
+            .await
+            .map_err(Into::into)
     }
 
     pub(super) async fn apply_event(&self, event: &ResourceEvent) -> Result<Option<Resource>> {
-        if event.event_type() == crate::control_plane::client::WatchEventType::Bookmark {
-            return Ok(None);
-        }
-        let resource = event.resource().clone();
-        let key = resource_cache_key(
-            &resource.api_version,
-            &resource.kind,
-            resource.namespace.as_deref(),
-            &resource.name,
-        );
-        let event_type = event.event_type();
-        {
-            let mut guard = self.resources.write().await;
-            let should_apply = guard
-                .get(&key)
-                .map(|current| current.resource_version <= resource.resource_version)
-                .unwrap_or(true);
-            if !should_apply {
-                return Ok(None);
-            }
-            match event_type {
-                crate::control_plane::client::WatchEventType::Deleted => {
-                    guard.remove(&key);
-                }
-                crate::control_plane::client::WatchEventType::Added
-                | crate::control_plane::client::WatchEventType::Modified => {
-                    guard.insert(key, resource.clone());
-                }
-                // ERROR is a wire-only watch frame; never broadcast internally.
-                crate::control_plane::client::WatchEventType::Bookmark
-                | crate::control_plane::client::WatchEventType::Error => {}
-            }
-        }
-        Ok(Some(resource))
+        Ok(self.inner.apply_event(event).await)
     }
 
-    pub(super) async fn mark_primed(&self, scope: CacheReadinessRequest) {
-        self.primed_scopes.write().await.insert(scope);
-        self.ready.notify_waiters();
+    pub(super) async fn mark_primed(&self, scope: CacheReadinessRequest) -> Result<()> {
+        self.inner.mark_ready(scope).await.map_err(Into::into)
     }
 
     #[cfg(test)]
     pub(super) async fn clear_scope_for_test(&self, scope: &CacheReadinessRequest) {
-        self.primed_scopes.write().await.remove(scope);
+        self.inner.clear_ready(scope).await;
     }
 
     pub(super) async fn wait_ready(&self, scope: CacheReadinessRequest) -> Result<()> {
-        loop {
-            if self.primed_scopes.read().await.contains(&scope) {
-                return Ok(());
-            }
-            self.ready.notified().await;
-        }
+        self.inner.wait_ready(scope).await;
+        Ok(())
     }
 
     pub(super) async fn is_ready(&self, scope: &CacheReadinessRequest) -> bool {
-        self.primed_scopes.read().await.contains(scope)
+        self.inner.is_ready(scope).await
     }
 }
 
-pub(super) fn scope_for_request(req: &ListRequest) -> CacheReadinessRequest {
+pub(super) fn scope_for_request(request: &ListRequest) -> CacheReadinessRequest {
     CacheReadinessRequest::try_new(
-        req.api_version.clone(),
-        req.kind.clone(),
-        req.namespace.clone(),
-        req.label_selector.clone(),
-        req.field_selector.clone(),
+        request.api_version.clone(),
+        request.kind.clone(),
+        request.namespace.clone(),
+        request.label_selector.clone(),
+        request.field_selector.clone(),
     )
     .expect("legacy LIST request identity was already validated")
 }
 
-fn resource_cache_key(
-    api_version: &str,
-    kind: &str,
-    namespace: Option<&str>,
-    name: &str,
-) -> String {
-    match namespace {
-        Some(ns) => format!("{api_version}/{kind}/{ns}/{name}"),
-        None => format!("{api_version}/{kind}/{name}"),
-    }
-}
-
-fn resource_matches_request(resource: &Resource, req: &ListRequest) -> bool {
-    resource.api_version == req.api_version
-        && resource.kind == req.kind
-        && req
-            .namespace
-            .as_deref()
-            .is_none_or(|expected| resource.namespace.as_deref() == Some(expected))
-        && label_selector_matches(resource, req.label_selector.as_deref())
-        && crate::watch::value_matches_field_selector(&resource.data, req.field_selector.as_deref())
-}
-
-fn label_selector_matches(resource: &Resource, selector: Option<&str>) -> bool {
-    let Some(selector) = selector.filter(|selector| !selector.trim().is_empty()) else {
-        return true;
-    };
-    klights_types::LabelSelector::parse(selector)
-        .map(|parsed| parsed.matches_resource(&resource.data))
-        .unwrap_or(false)
+fn focused_list_request(
+    request: &ListRequest,
+) -> Result<crate::control_plane::client::ResourceListRequest> {
+    Ok(crate::control_plane::client::ResourceListRequest::try_new(
+        request.api_version.clone(),
+        request.kind.clone(),
+        request.namespace.clone(),
+        request.label_selector.clone(),
+        request.field_selector.clone(),
+        request.limit,
+        request.continue_token.clone(),
+        ResourceQueryConsistency::Cached,
+    )?)
 }

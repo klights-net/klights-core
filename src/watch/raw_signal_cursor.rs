@@ -6,7 +6,9 @@ use crate::datastore::{
 };
 
 use super::signal_replay_cursor_core::{SignalReplayCursorCore, SignalReplayCursorSource};
-use super::{WatchCursorError, WatchDeliveryScope, WatchSignalReceiver, WatchTopic, WindowPolicy};
+use klights_watch::{WatchSignalReceiver, WatchTopic};
+
+use super::{WatchCursorError, WatchDeliveryScope, WindowPolicy};
 
 pub struct RawSignalWatchCursor {
     core: SignalReplayCursorCore<RawWatchEvent, RawWatchReplaySource>,

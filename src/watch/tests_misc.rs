@@ -7,6 +7,59 @@ fn test_task_supervisor() -> crate::task_supervisor::TaskSupervisor {
     )
 }
 
+struct PendingReplaySource {
+    started: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl WatchReplaySource for PendingReplaySource {
+    async fn replay_since(&self, _since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+        self.started.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn test_next_event_recovering_cancels_while_replay_read_is_pending() {
+    let cancel = CancellationToken::new();
+    let (tx, rx) = broadcast::channel(1);
+    let started = std::sync::Arc::new(tokio::sync::Notify::new());
+    let mut cursor = WatchCursor::new(
+        rx,
+        PendingReplaySource {
+            started: started.clone(),
+        },
+        1,
+    );
+    for resource_version in [2, 3] {
+        tx.send(WatchEvent::added(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": format!("lag-{resource_version}"),
+                "resourceVersion": resource_version.to_string()
+            }
+        })))
+        .expect("live receiver");
+    }
+
+    let started_wait = started.notified();
+    tokio::pin!(started_wait);
+    let supervisor = test_task_supervisor();
+    let next = cursor.next_event_recovering(&cancel, &supervisor);
+    tokio::pin!(next);
+    tokio::select! {
+        _ = &mut started_wait => {}
+        result = &mut next => panic!("pending replay returned before cancellation: {result:?}"),
+    }
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_millis(100), &mut next)
+        .await
+        .expect("cancellation must interrupt the pending replay read")
+        .expect("cursor result");
+    assert!(result.is_none());
+}
+
 #[tokio::test]
 async fn test_next_event_recovering_cancels_during_replay_backoff() {
     // Test that cancellation during replay backoff returns Ok(None) quickly

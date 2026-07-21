@@ -1,32 +1,41 @@
+#[cfg(test)]
 use crate::api::watch_session::{WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent};
 use crate::api::{AppError, watch_event_to_table};
+use crate::datastore::CatchUpResource;
+use crate::datastore::DatastoreHandle;
+#[cfg(test)]
+use crate::datastore::RawWatchEvent;
+#[cfg(test)]
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{CatchUpResource, RawWatchEvent};
+#[cfg(test)]
 use crate::datastore::{
-    DatastoreBackendWatchStore, DatastoreHandle, RawWatchReplayStore, SnapshotAtRv,
-    WatchReplayAnchorStore, WatchReplayPosition, WatchTarget,
+    DatastoreBackendWatchStore, RawWatchReplayStore, SnapshotAtRv, WatchReplayAnchorStore,
+    WatchReplayPosition, WatchTarget,
 };
-use crate::watch::{
-    EventType, RawSignalWatchCursor, WatchContentType, WatchCursorError, WatchDeliveryScope,
-    WatchEvent, WatchSignalReceiver, WatchTopic,
-};
+use crate::watch::{EventType, WatchContentType, WatchEvent};
+#[cfg(test)]
+use crate::watch::{RawSignalWatchCursor, WatchCursorError, WatchDeliveryScope};
 #[cfg(test)]
 use crate::watch::{event_key as watch_event_key, resource_key as resource_to_seen_key};
 use axum::body::Body;
 use axum::http::HeaderMap;
 use k8s_pb::apimachinery::pkg::apis::meta::v1::WatchEvent as PbWatchEvent;
 use k8s_pb::apimachinery::pkg::runtime::RawExtension;
+#[cfg(test)]
 use klights_types::LabelSelector;
+#[cfg(test)]
+use klights_watch::WatchSignalReceiver;
+use klights_watch::WatchTopic;
 use prost::Message;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WatchCatchUpMode {
     NamespacedScoped,
-    ClusterOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,14 +313,14 @@ pub async fn wait_until_datastore_fresh(
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
+                Err(klights_watch::WatchSignalReceiveError::Lagged(_)) => {
                     // A burst of writes overflowed our buffer; re-check the
                     // authoritative counter directly.
                     if db.get_current_resource_version().await.unwrap_or(0) >= target_rv {
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Closed) => return,
+                Err(klights_watch::WatchSignalReceiveError::Closed) => return,
             },
         }
     }
@@ -388,6 +397,7 @@ pub fn serialize_watch_event_frame(event: &WatchEvent, kind: &str) -> anyhow::Re
     Ok(encode_k8s_watch_event_frame(&pb_event))
 }
 
+#[cfg(test)]
 pub fn serialize_raw_watch_event_frame(event: &RawWatchEvent) -> anyhow::Result<Vec<u8>> {
     let raw = crate::protobuf::encode_protobuf_resource_from_json_bytes(
         &event.api_version,
@@ -450,6 +460,24 @@ pub fn try_serialize_watch_event_for_stream(
     }
 }
 
+/// Adapt one transport-neutral positioned event into the existing Kubernetes
+/// JSON/protobuf watch codecs. The durable resume position remains session
+/// state and is intentionally not added to either Kubernetes wire format.
+pub fn serialize_positioned_watch_event_for_stream(
+    event: klights_leader_api::ResourceEvent,
+    kind: &str,
+    table_format: bool,
+    stream_format: WatchStreamFormat,
+) -> Result<Vec<u8>, Vec<u8>> {
+    try_serialize_watch_event_for_stream(
+        crate::control_plane::client::legacy_watch_event(&event),
+        kind,
+        table_format,
+        stream_format,
+    )
+}
+
+#[cfg(test)]
 pub fn serialize_raw_watch_event_line(event: &RawWatchEvent) -> Vec<u8> {
     let event_type = event.event_type.as_ref();
     let mut line = Vec::with_capacity(event_type.len() + event.object_json.len() + 23);
@@ -471,6 +499,7 @@ pub fn serialize_raw_watch_event_for_stream(
     }
 }
 
+#[cfg(test)]
 pub fn try_serialize_raw_watch_event_for_stream(
     event: &RawWatchEvent,
     stream_format: WatchStreamFormat,
@@ -539,6 +568,7 @@ pub fn serialize_watch_status_for_stream(
 /// Convert any live cursor failure into the watch protocol's terminal frame.
 /// A closed signal channel ends cleanly; replay failures and expired history
 /// require the client to reconnect rather than parking with an undelivered row.
+#[cfg(test)]
 pub(crate) fn serialize_live_watch_cursor_error(error: &WatchCursorError) -> Option<Vec<u8>> {
     match error {
         WatchCursorError::Replay(_) => Some(serialize_watch_status_line(
@@ -555,6 +585,7 @@ pub(crate) fn serialize_live_watch_cursor_error(error: &WatchCursorError) -> Opt
     }
 }
 
+#[cfg(test)]
 pub(crate) fn serialize_live_watch_cursor_error_for_stream(
     error: &WatchCursorError,
     stream_format: WatchStreamFormat,
@@ -602,12 +633,16 @@ pub async fn spawn_bookmark_tick_stream(
                     if tick_tx.send(()).await.is_err() {
                         break;
                     }
-                    if task_supervisor_for_wait
-                        .sleep(sleep_name.clone(), Duration::from_secs(60))
-                        .await
-                        .is_err()
-                    {
-                        break;
+                    tokio::select! {
+                        _ = tick_tx.closed() => break,
+                        result = task_supervisor_for_wait.sleep(
+                            sleep_name.clone(),
+                            Duration::from_secs(60),
+                        ) => {
+                            if result.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             },
@@ -774,12 +809,16 @@ pub async fn maybe_spawn_watch_timeout_stream(
             crate::task_supervisor::TaskCategory::Timer,
             task_name.clone(),
             async move {
-                if task_supervisor_for_wait
-                    .sleep(sleep_name, Duration::from_secs(timeout_seconds))
-                    .await
-                    .is_ok()
-                {
-                    let _ = timeout_tx.send(()).await;
+                tokio::select! {
+                    _ = timeout_tx.closed() => {},
+                    result = task_supervisor_for_wait.sleep(
+                        sleep_name,
+                        Duration::from_secs(timeout_seconds),
+                    ) => {
+                        if result.is_ok() {
+                            let _ = timeout_tx.send(()).await;
+                        }
+                    }
                 }
             },
         )
@@ -798,6 +837,24 @@ pub async fn recv_watch_timeout(rx: &mut Option<mpsc::Receiver<()>>) -> Option<(
 }
 
 pub struct LabelSelectorWatchStreamRequest<'a> {
+    pub db: DatastoreHandle,
+    pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    pub api_version: &'a str,
+    pub kind: String,
+    pub watch_namespace: Option<String>,
+    pub requested_rv: i64,
+    pub send_initial_events: bool,
+    pub send_bookmarks: bool,
+    pub label_selector: Option<String>,
+    pub field_selector: Option<String>,
+    pub table_format: bool,
+    pub stream_format: WatchStreamFormat,
+    pub timeout_seconds: Option<u64>,
+    pub emit_initial_state_for_resource_version_zero: bool,
+}
+
+#[cfg(test)]
+pub struct LegacyLabelSelectorWatchStreamRequest<'a> {
     pub db: DatastoreHandle,
     pub watch_anchor: Arc<dyn WatchReplayAnchorStore>,
     pub signal_rx: WatchSignalReceiver,
@@ -821,16 +878,25 @@ pub struct LabelSelectorWatchStreamRequest<'a> {
 /// Capture the durable replay boundary before subscribing to signal wakeups.
 /// Writes in the narrow boundary-to-subscribe interval remain visible through
 /// positioned replay, so correctness never depends on observing their signal.
+#[cfg(test)]
 pub fn watch_replay_anchor_from_backend(db: &DatastoreHandle) -> Arc<dyn WatchReplayAnchorStore> {
     Arc::new(DatastoreBackendWatchStore::new(db.clone()))
 }
 
-pub async fn subscribe_watch_handoff(
+#[cfg(test)]
+pub async fn subscribe_watch_handoff<F>(
     watch_anchor: &dyn WatchReplayAnchorStore,
-    db: &DatastoreHandle,
-    topics: Vec<WatchTopic>,
+    subscribe: F,
     requested_rv: i64,
-) -> Result<(WatchSignalReceiver, WatchReplayPosition), AppError> {
+) -> Result<(WatchSignalReceiver, WatchReplayPosition), AppError>
+where
+    F: FnOnce() -> WatchSignalReceiver,
+{
+    // Install the wakeup edge before the first anchor await. Replay covers
+    // writes before the captured anchor; the installed receiver covers writes
+    // after it, so there is no boundary in which both mechanisms can miss a
+    // committed event.
+    let signal_rx = subscribe();
     let handoff_position = watch_anchor
         .current_watch_replay_position()
         .await
@@ -847,17 +913,249 @@ pub async fn subscribe_watch_handoff(
             handoff_position.event_id,
         )
     };
-    let signal_rx = WatchSignalReceiver::new(
-        topics
-            .into_iter()
-            .map(|topic| db.subscribe_watch_signals(topic))
-            .collect(),
-    );
     Ok((signal_rx, replay_start_position))
 }
 
 pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamRequest<'_>) -> Body {
     let LabelSelectorWatchStreamRequest {
+        db,
+        task_supervisor,
+        api_version,
+        kind,
+        watch_namespace,
+        requested_rv,
+        send_initial_events,
+        send_bookmarks,
+        label_selector,
+        field_selector,
+        table_format,
+        stream_format,
+        timeout_seconds,
+        emit_initial_state_for_resource_version_zero,
+    } = request;
+    let api_version = api_version.to_string();
+    let positioned_watch =
+        crate::control_plane::client::local::datastore_positioned_watch_service(db.clone());
+    let stream = async_stream::stream! {
+        wait_until_datastore_fresh(
+            &db,
+            requested_rv,
+            WatchTopic::new(&api_version, &kind),
+            &task_supervisor,
+        )
+        .await;
+
+        let has_selector = label_selector.as_deref().is_some_and(|value| !value.is_empty())
+            || field_selector.as_deref().is_some_and(|value| !value.is_empty());
+        let emit_baseline = send_initial_events
+            || requested_rv <= 0
+                && (has_selector || emit_initial_state_for_resource_version_zero);
+        let mut start_position = None;
+        let mut last_delivered_rv = requested_rv;
+        if emit_baseline {
+            let list = match db
+                .list_resources(
+                    &api_version,
+                    &kind,
+                    watch_namespace.as_deref(),
+                    crate::datastore::ResourceListQuery::new(
+                        label_selector.as_deref(),
+                        field_selector.as_deref(),
+                        None,
+                        None,
+                    ),
+                )
+                .await
+            {
+                Ok(list) => list,
+                Err(error) => {
+                    tracing::warn!(%error, "positioned watch baseline LIST failed");
+                    yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                        stream_format,
+                        500,
+                        "InternalError",
+                        "failed to establish watch baseline",
+                    ));
+                    return;
+                }
+            };
+            let Some(position) = list.watch_replay_position else {
+                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                    stream_format,
+                    500,
+                    "InternalError",
+                    "watch baseline did not provide an atomic replay position",
+                ));
+                return;
+            };
+            start_position = Some(position);
+            last_delivered_rv = last_delivered_rv.max(list.resource_version);
+            for resource in list.items {
+                let event = CatchUpResource::added(resource).into_watch_event();
+                match try_serialize_watch_event_for_stream(
+                    event,
+                    &kind,
+                    table_format,
+                    stream_format,
+                ) {
+                    Ok(frame) => yield Ok::<_, std::convert::Infallible>(frame),
+                    Err(frame) => {
+                        yield Ok::<_, std::convert::Infallible>(frame);
+                        return;
+                    }
+                }
+            }
+            if send_initial_events {
+                let bookmark = WatchEvent::bookmark_initial_events_end(
+                    last_delivered_rv,
+                    &api_version,
+                    &kind,
+                );
+                match try_serialize_watch_event_for_stream(
+                    bookmark,
+                    &kind,
+                    table_format,
+                    stream_format,
+                ) {
+                    Ok(frame) => yield Ok::<_, std::convert::Infallible>(frame),
+                    Err(frame) => {
+                        yield Ok::<_, std::convert::Infallible>(frame);
+                        return;
+                    }
+                }
+            }
+        }
+
+        let watch_request = match klights_leader_api::WatchRequest::try_new(
+            api_version.clone(),
+            kind.clone(),
+            watch_namespace.clone(),
+            label_selector.clone(),
+            field_selector.clone(),
+            Some(requested_rv),
+            start_position,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                yield Ok::<_, std::convert::Infallible>(serialize_watch_status_for_stream(
+                    stream_format,
+                    400,
+                    "BadRequest",
+                    &error.to_string(),
+                ));
+                return;
+            }
+        };
+        let mut positioned_stream = match klights_leader_api::LeaderWatch::watch_resources(
+            &positioned_watch,
+            watch_request,
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(error) => {
+                yield Ok::<_, std::convert::Infallible>(serialize_positioned_watch_error_for_stream(
+                    &error,
+                    stream_format,
+                ));
+                return;
+            }
+        };
+        let mut bookmark_ticks = maybe_spawn_bookmark_tick_stream(
+            send_bookmarks,
+            task_supervisor.clone(),
+            format!("watch_stream_bookmarks_{api_version}_{kind}"),
+        )
+        .await;
+        let mut timeout_tick = maybe_spawn_watch_timeout_stream(
+            timeout_seconds,
+            task_supervisor,
+            format!("watch_stream_timeout_{api_version}_{kind}"),
+        )
+        .await;
+        let has_scope_filter = watch_namespace.is_some() || has_selector;
+        loop {
+            tokio::select! {
+                Some(()) = recv_watch_timeout(&mut timeout_tick) => break,
+                next = futures::StreamExt::next(&mut positioned_stream) => {
+                    let Some(next) = next else { break; };
+                    let event = match next {
+                        Ok(event) => event,
+                        Err(error) => {
+                            yield Ok::<_, std::convert::Infallible>(
+                                serialize_positioned_watch_error_for_stream(&error, stream_format),
+                            );
+                            break;
+                        }
+                    };
+                    last_delivered_rv = last_delivered_rv.max(event.resource().resource_version);
+                    match serialize_positioned_watch_event_for_stream(
+                        event,
+                        &kind,
+                        table_format,
+                        stream_format,
+                    ) {
+                        Ok(frame) => yield Ok::<_, std::convert::Infallible>(frame),
+                        Err(frame) => {
+                            yield Ok::<_, std::convert::Infallible>(frame);
+                            break;
+                        }
+                    }
+                }
+                Some(()) = recv_bookmark_tick(&mut bookmark_ticks), if send_bookmarks => {
+                    let rv = resolve_periodic_bookmark_rv(PeriodicBookmarkContext {
+                        db: &db,
+                        api_version: &api_version,
+                        kind: &kind,
+                        watch_namespace: watch_namespace.as_deref(),
+                        label_selector: label_selector.as_deref(),
+                        field_selector: field_selector.as_deref(),
+                        requested_rv,
+                        has_scope_filter,
+                        cursor_high_water_rv: last_delivered_rv,
+                        last_delivered_scoped_rv: last_delivered_rv,
+                    }).await;
+                    let bookmark = WatchEvent::bookmark_typed(rv, &api_version, &kind);
+                    match try_serialize_watch_event_for_stream(
+                        bookmark,
+                        &kind,
+                        table_format,
+                        stream_format,
+                    ) {
+                        Ok(frame) => yield Ok::<_, std::convert::Infallible>(frame),
+                        Err(frame) => {
+                            yield Ok::<_, std::convert::Infallible>(frame);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    };
+    Body::from_stream(stream)
+}
+
+fn serialize_positioned_watch_error_for_stream(
+    error: &klights_leader_api::LeaderWatchError,
+    stream_format: WatchStreamFormat,
+) -> Vec<u8> {
+    let (code, reason) = match error {
+        klights_leader_api::LeaderWatchError::ReplayExpired { .. } => (410, "Expired"),
+        klights_leader_api::LeaderWatchError::InvalidRequest { .. }
+        | klights_leader_api::LeaderWatchError::MismatchedEvent { .. }
+        | klights_leader_api::LeaderWatchError::UnknownEventType { .. } => (400, "BadRequest"),
+        klights_leader_api::LeaderWatchError::Timeout
+        | klights_leader_api::LeaderWatchError::Cancelled => (504, "Timeout"),
+        _ => (500, "InternalError"),
+    };
+    serialize_watch_status_for_stream(stream_format, code, reason, &error.to_string())
+}
+
+#[cfg(test)]
+pub fn legacy_build_label_selector_watch_stream(
+    request: LegacyLabelSelectorWatchStreamRequest<'_>,
+) -> Body {
+    let LegacyLabelSelectorWatchStreamRequest {
         db,
         watch_anchor,
         signal_rx,
@@ -913,9 +1211,6 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
             }
             (WatchCatchUpMode::NamespacedScoped, None) => {
                 WatchTarget::namespaced(api_version.clone(), kind.clone())
-            }
-            (WatchCatchUpMode::ClusterOnly, _) => {
-                WatchTarget::cluster(api_version.clone(), kind.clone())
             }
         };
         let has_scope_filter = watch_namespace.is_some() || has_selector;
@@ -1126,7 +1421,6 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
         );
         let topic = WatchTopic::new(&api_version, &kind);
         let delivery_scope = match (catch_up_mode, watch_namespace.clone()) {
-            (WatchCatchUpMode::ClusterOnly, _) => WatchDeliveryScope::Cluster,
             (WatchCatchUpMode::NamespacedScoped, Some(ns)) => WatchDeliveryScope::Namespaced(ns),
             (WatchCatchUpMode::NamespacedScoped, None) => WatchDeliveryScope::NamespacedAll,
         };
@@ -1379,11 +1673,76 @@ pub fn build_label_selector_watch_stream(request: LabelSelectorWatchStreamReques
 mod tests {
     use super::*;
     use crate::task_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
-    use crate::watch::{SelectorMembership, WatchSignal};
+    use crate::watch::SelectorMembership;
+    use async_trait::async_trait;
     use bytes::Bytes;
     use futures::StreamExt;
+    use klights_watch::WatchSignal;
     use prost::Message;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct OrderedWatchAnchor {
+        subscribed: Arc<AtomicBool>,
+        position: WatchReplayPosition,
+    }
+
+    #[async_trait]
+    impl WatchReplayAnchorStore for OrderedWatchAnchor {
+        async fn current_watch_replay_position(&self) -> anyhow::Result<WatchReplayPosition> {
+            assert!(
+                self.subscribed.load(Ordering::Acquire),
+                "HTTP watch must install its signal subscriber before polling the anchor port"
+            );
+            Ok(self.position)
+        }
+
+        async fn snapshot_resources_at_position(
+            &self,
+            _targets: &[WatchTarget],
+            _label_selector: Option<&str>,
+            _field_selector: Option<&str>,
+            _position: WatchReplayPosition,
+        ) -> anyhow::Result<SnapshotAtRv> {
+            panic!("handoff ordering does not read a snapshot")
+        }
+    }
+
+    async fn assert_http_handoff_subscribes_first(topic: WatchTopic) {
+        let subscribed = Arc::new(AtomicBool::new(false));
+        let expected = WatchReplayPosition {
+            resource_version: 17,
+            event_id: 23,
+            resource_version_filter_through_event_id: 0,
+        };
+        let anchor = OrderedWatchAnchor {
+            subscribed: subscribed.clone(),
+            position: expected,
+        };
+        let (receiver, observed) = subscribe_watch_handoff(
+            &anchor,
+            || {
+                assert!(!topic.kind().is_empty());
+                subscribed.store(true, Ordering::Release);
+                WatchSignalReceiver::closed()
+            },
+            0,
+        )
+        .await
+        .expect("ordered handoff");
+        drop(receiver);
+        assert_eq!(observed, expected);
+    }
+
+    #[tokio::test]
+    async fn http_pod_watch_subscribes_before_the_first_anchor_await() {
+        assert_http_handoff_subscribes_first(WatchTopic::new("v1", "Pod")).await;
+    }
+
+    #[tokio::test]
+    async fn http_custom_resource_watch_subscribes_before_the_first_anchor_await() {
+        assert_http_handoff_subscribes_first(WatchTopic::new("example.com/v1", "Widget")).await;
+    }
 
     fn apply_selector_transition_event(
         event: WatchEvent,
@@ -2261,30 +2620,31 @@ mod tests {
             let signal_rx = WatchSignalReceiver::new(vec![db.subscribe_watch_signals(topic)]);
             db.close();
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
-                watch_anchor: watch_replay_anchor_from_backend(&db),
-                db,
-                signal_rx,
-                replay_start_position: WatchReplayPosition {
-                    resource_version: 0,
-                    event_id: 1,
-                    resource_version_filter_through_event_id: 0,
-                },
-                task_supervisor: supervisor,
-                api_version: "v1",
-                kind: "ConfigMap".to_string(),
-                watch_namespace: None,
-                requested_rv: 0,
-                send_initial_events: false,
-                send_bookmarks: false,
-                label_selector: None,
-                field_selector: None,
-                table_format,
-                stream_format: WatchStreamFormat::Json,
-                catch_up_mode: WatchCatchUpMode::NamespacedScoped,
-                timeout_seconds: None,
-                emit_initial_state_for_resource_version_zero: false,
-            });
+            let body =
+                legacy_build_label_selector_watch_stream(LegacyLabelSelectorWatchStreamRequest {
+                    watch_anchor: watch_replay_anchor_from_backend(&db),
+                    db,
+                    signal_rx,
+                    replay_start_position: WatchReplayPosition {
+                        resource_version: 0,
+                        event_id: 1,
+                        resource_version_filter_through_event_id: 0,
+                    },
+                    task_supervisor: supervisor,
+                    api_version: "v1",
+                    kind: "ConfigMap".to_string(),
+                    watch_namespace: None,
+                    requested_rv: 0,
+                    send_initial_events: false,
+                    send_bookmarks: false,
+                    label_selector: None,
+                    field_selector: None,
+                    table_format,
+                    stream_format: WatchStreamFormat::Json,
+                    catch_up_mode: WatchCatchUpMode::NamespacedScoped,
+                    timeout_seconds: None,
+                    emit_initial_state_for_resource_version_zero: false,
+                });
 
             let bytes = tokio::time::timeout(
                 Duration::from_secs(1),
@@ -2321,28 +2681,30 @@ mod tests {
             )
             .await
             .unwrap();
-            let (signal_tx, signal_rx) = broadcast::channel(4);
+            let signal_hub = klights_watch::WatchSignalHub::new(4);
+            let signal_rx = signal_hub.subscribe(WatchTopic::new("v1", "ConfigMap"));
             let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
-            let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
-                watch_anchor: watch_replay_anchor_from_backend(&db),
-                db: db.clone(),
-                signal_rx: signal_rx.into(),
-                replay_start_position: WatchReplayPosition::default(),
-                task_supervisor: supervisor,
-                api_version: "v1",
-                kind: "ConfigMap".to_string(),
-                watch_namespace: None,
-                requested_rv: 0,
-                send_initial_events: false,
-                send_bookmarks: false,
-                label_selector: None,
-                field_selector: None,
-                table_format,
-                stream_format: WatchStreamFormat::Json,
-                catch_up_mode: WatchCatchUpMode::NamespacedScoped,
-                timeout_seconds: None,
-                emit_initial_state_for_resource_version_zero: false,
-            });
+            let body =
+                legacy_build_label_selector_watch_stream(LegacyLabelSelectorWatchStreamRequest {
+                    watch_anchor: watch_replay_anchor_from_backend(&db),
+                    db: db.clone(),
+                    signal_rx,
+                    replay_start_position: WatchReplayPosition::default(),
+                    task_supervisor: supervisor,
+                    api_version: "v1",
+                    kind: "ConfigMap".to_string(),
+                    watch_namespace: None,
+                    requested_rv: 0,
+                    send_initial_events: false,
+                    send_bookmarks: false,
+                    label_selector: None,
+                    field_selector: None,
+                    table_format,
+                    stream_format: WatchStreamFormat::Json,
+                    catch_up_mode: WatchCatchUpMode::NamespacedScoped,
+                    timeout_seconds: None,
+                    emit_initial_state_for_resource_version_zero: false,
+                });
             let mut stream = body.into_data_stream();
 
             let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -2363,9 +2725,7 @@ mod tests {
                     "resourceVersion": "2"
                 }
             }));
-            signal_tx
-                .send(WatchSignal::from_event(&wake).unwrap())
-                .unwrap();
+            signal_hub.publish(WatchSignal::from_event(&wake).unwrap());
 
             let terminal = tokio::time::timeout(Duration::from_secs(1), stream.next())
                 .await
@@ -3015,6 +3375,49 @@ mod tests {
         );
     }
 
+    async fn wait_for_timer_task_exit(supervisor: &TaskSupervisor, task_name: &str) {
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if supervisor
+                    .active_tasks(Some(TaskCategory::Timer))
+                    .iter()
+                    .all(|task| !task.name.contains(task_name))
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping a watch timer receiver must promptly stop its task");
+    }
+
+    #[tokio::test]
+    async fn dropping_bookmark_receiver_promptly_cancels_timer_task() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let mut ticks =
+            spawn_bookmark_tick_stream(supervisor.clone(), "dropped_bookmark_timer").await;
+        ticks.recv().await.expect("initial bookmark tick");
+        drop(ticks);
+
+        wait_for_timer_task_exit(&supervisor, "dropped_bookmark_timer").await;
+    }
+
+    #[tokio::test]
+    async fn dropping_timeout_receiver_promptly_cancels_timer_task() {
+        let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+        let timeout = maybe_spawn_watch_timeout_stream(
+            Some(3_600),
+            supervisor.clone(),
+            "dropped_watch_timeout",
+        )
+        .await
+        .expect("timeout receiver");
+        drop(timeout);
+
+        wait_for_timer_task_exit(&supervisor, "dropped_watch_timeout").await;
+    }
+
     #[tokio::test]
     async fn recv_bookmark_tick_with_none_parks_indefinitely() {
         // When bookmarks are disabled, the watch select arm calls
@@ -3202,5 +3605,275 @@ mod tests {
             !can_reuse_encoded_watch_payload(&ctx),
             "bookmark events must never be reused"
         );
+    }
+
+    #[test]
+    fn production_positioned_watch_has_json_protobuf_and_grpc_parity() {
+        let position = WatchReplayPosition {
+            resource_version: 73,
+            event_id: 109,
+            resource_version_filter_through_event_id: 0,
+        };
+        let resource = klights_cluster_core::Resource::try_from_data(Arc::new(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "positioned",
+                "namespace": "default",
+                "uid": "uid-positioned",
+                "resourceVersion": "73"
+            },
+            "data": {"key": "value"}
+        })))
+        .expect("valid ConfigMap");
+        let event = klights_leader_api::ResourceEvent::try_new(
+            klights_leader_api::WatchEventType::Modified,
+            resource,
+            Some(position),
+        )
+        .expect("valid positioned event");
+
+        let json = serialize_positioned_watch_event_for_stream(
+            event.clone(),
+            "ConfigMap",
+            false,
+            WatchStreamFormat::Json,
+        )
+        .expect("JSON delivery");
+        let decoded_json: serde_json::Value =
+            serde_json::from_slice(&json).expect("JSON watch event");
+        assert_eq!(decoded_json["type"], "MODIFIED");
+        assert_eq!(decoded_json["object"]["metadata"]["name"], "positioned");
+        assert_eq!(decoded_json["object"]["metadata"]["resourceVersion"], "73");
+
+        let protobuf = serialize_positioned_watch_event_for_stream(
+            event.clone(),
+            "ConfigMap",
+            false,
+            WatchStreamFormat::Protobuf,
+        )
+        .expect("protobuf delivery");
+        let frames = decode_k8s_protobuf_watch_frames(&[protobuf]);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].event_type, "MODIFIED");
+        assert_eq!(frames[0].inner_api_version, "v1");
+        assert_eq!(frames[0].inner_kind, "ConfigMap");
+        let decoded = k8s_pb::api::core::v1::ConfigMap::decode(frames[0].inner_raw.as_slice())
+            .expect("ConfigMap payload");
+        let metadata = decoded.metadata.expect("metadata");
+        assert_eq!(metadata.name.as_deref(), Some("positioned"));
+        assert_eq!(metadata.resource_version.as_deref(), Some("73"));
+
+        let grpc = crate::replication::grpc::server::resource_to_proto(event.resource());
+        assert_eq!(grpc.api_version, "v1");
+        assert_eq!(grpc.kind, "ConfigMap");
+        assert_eq!(grpc.namespace.as_deref(), Some("default"));
+        assert_eq!(grpc.name, "positioned");
+        assert_eq!(grpc.resource_version, 73);
+        let grpc_object: serde_json::Value =
+            serde_json::from_slice(&grpc.data_json).expect("gRPC JSON resource");
+        assert_eq!(grpc_object, decoded_json["object"]);
+
+        assert_eq!(event.resume_position(), Some(position));
+    }
+
+    fn split_watch_bytes(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let widths = [1usize, 2, 5, 3, 8];
+        let mut chunks = Vec::new();
+        let mut offset = 0;
+        let mut width = 0;
+        while offset < bytes.len() {
+            let end = (offset + widths[width % widths.len()]).min(bytes.len());
+            chunks.push(bytes[offset..end].to_vec());
+            offset = end;
+            width += 1;
+        }
+        chunks
+    }
+
+    fn decode_split_json_watch_lines(chunks: &[Vec<u8>]) -> Vec<serde_json::Value> {
+        let mut pending = Vec::new();
+        let mut events = Vec::new();
+        for chunk in chunks {
+            pending.extend_from_slice(chunk);
+            while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                events.push(
+                    serde_json::from_slice(&pending[..end]).expect("fragmented JSON watch line"),
+                );
+                pending.drain(..=end);
+            }
+        }
+        assert!(
+            pending.is_empty(),
+            "every JSON watch event must end in a newline"
+        );
+        events
+    }
+
+    #[test]
+    fn positioned_sequence_and_terminal_errors_have_json_protobuf_parity_across_split_chunks() {
+        let cases = [
+            (
+                klights_leader_api::WatchEventType::Added,
+                "ADDED",
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": {"name": "added", "namespace": "default", "resourceVersion": "71"},
+                    "data": {"state": "added"}
+                }),
+            ),
+            (
+                klights_leader_api::WatchEventType::Modified,
+                "MODIFIED",
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": {"name": "modified", "namespace": "default", "resourceVersion": "72"},
+                    "data": {"state": "modified"}
+                }),
+            ),
+            (
+                klights_leader_api::WatchEventType::Deleted,
+                "DELETED",
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": {"name": "deleted", "namespace": "default", "resourceVersion": "73"},
+                    "data": {"state": "deleted"}
+                }),
+            ),
+            (
+                klights_leader_api::WatchEventType::Bookmark,
+                "BOOKMARK",
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": {"resourceVersion": "74"}
+                }),
+            ),
+            (
+                klights_leader_api::WatchEventType::Error,
+                "ERROR",
+                serde_json::json!({
+                    "apiVersion": "v1", "kind": "Status", "metadata": {},
+                    "status": "Failure", "code": 409, "reason": "Conflict", "message": "conflict"
+                }),
+            ),
+        ];
+        let mut json_wire = Vec::new();
+        let mut protobuf_wire = Vec::new();
+        let mut expected_positions = Vec::new();
+        for (index, (event_type, _, object)) in cases.iter().enumerate() {
+            let resource =
+                klights_cluster_core::Resource::from_data_lossy(Arc::new(object.clone()));
+            let position = WatchReplayPosition {
+                resource_version: resource.resource_version,
+                event_id: 200 + index as i64,
+                resource_version_filter_through_event_id: 0,
+            };
+            let event =
+                klights_leader_api::ResourceEvent::try_new(*event_type, resource, Some(position))
+                    .expect("valid positioned event");
+            expected_positions.push(event.resume_position());
+            json_wire.extend(
+                serialize_positioned_watch_event_for_stream(
+                    event.clone(),
+                    event.resource().kind.as_str(),
+                    false,
+                    WatchStreamFormat::Json,
+                )
+                .expect("JSON event"),
+            );
+            protobuf_wire.extend(
+                serialize_positioned_watch_event_for_stream(
+                    event.clone(),
+                    event.resource().kind.as_str(),
+                    false,
+                    WatchStreamFormat::Protobuf,
+                )
+                .expect("protobuf event"),
+            );
+            assert_eq!(event.resume_position(), Some(position));
+        }
+
+        let json_events = decode_split_json_watch_lines(&split_watch_bytes(&json_wire));
+        let protobuf_events = decode_k8s_protobuf_watch_frames(&split_watch_bytes(&protobuf_wire));
+        assert_eq!(json_events.len(), cases.len());
+        assert_eq!(protobuf_events.len(), cases.len());
+        for (index, (_, expected_type, _)) in cases.iter().enumerate() {
+            assert_eq!(json_events[index]["type"], *expected_type);
+            assert_eq!(protobuf_events[index].event_type, *expected_type);
+            let json_object = &json_events[index]["object"];
+            assert_eq!(
+                protobuf_events[index].inner_api_version,
+                json_object["apiVersion"].as_str().unwrap_or_default(),
+            );
+            assert_eq!(
+                protobuf_events[index].inner_kind,
+                json_object["kind"].as_str().unwrap_or_default(),
+            );
+            if protobuf_events[index].inner_kind == "Status" {
+                // Status is encoded through its dedicated meta/v1 protobuf
+                // codec and is intentionally absent from the generic resource
+                // registry. Decode the actual Kubernetes semantic type so the
+                // parity check does not discard every field after metadata.
+                let status = k8s_pb::apimachinery::pkg::apis::meta::v1::Status::decode(
+                    protobuf_events[index].inner_raw.as_slice(),
+                )
+                .expect("protobuf Status payload");
+                assert_eq!(status.status.as_deref(), json_object["status"].as_str());
+                assert_eq!(status.message.as_deref(), json_object["message"].as_str());
+                assert_eq!(status.reason.as_deref(), json_object["reason"].as_str());
+                assert_eq!(status.code.map(i64::from), json_object["code"].as_i64());
+            } else {
+                let envelope = crate::protobuf::wrap_protobuf_resource_envelope(
+                    &protobuf_events[index].inner_api_version,
+                    &protobuf_events[index].inner_kind,
+                    protobuf_events[index].inner_raw.clone(),
+                )
+                .expect("resource envelope");
+                let protobuf_object =
+                    crate::protobuf::decode_protobuf(&envelope).expect("decoded protobuf object");
+                assert_eq!(
+                    protobuf_object["metadata"]["resourceVersion"],
+                    json_object["metadata"]["resourceVersion"],
+                );
+                assert_eq!(
+                    protobuf_object["metadata"]["name"],
+                    json_object["metadata"]["name"],
+                );
+            }
+            assert!(json_events[index].get("resumePosition").is_none());
+        }
+        assert!(
+            expected_positions
+                .into_iter()
+                .all(|position| position.is_some())
+        );
+
+        for (error, expected_code, expected_reason) in [
+            (WatchCursorError::Expired, 410, "Expired"),
+            (
+                WatchCursorError::Replay(anyhow::anyhow!("history unavailable")),
+                500,
+                "InternalError",
+            ),
+        ] {
+            let json =
+                serialize_live_watch_cursor_error_for_stream(&error, WatchStreamFormat::Json)
+                    .expect("terminal JSON error");
+            let protobuf =
+                serialize_live_watch_cursor_error_for_stream(&error, WatchStreamFormat::Protobuf)
+                    .expect("terminal protobuf error");
+            let json = decode_split_json_watch_lines(&split_watch_bytes(&json));
+            let protobuf = decode_k8s_protobuf_watch_frames(&split_watch_bytes(&protobuf));
+            assert_eq!(json[0]["type"], "ERROR");
+            assert_eq!(json[0]["object"]["code"], expected_code);
+            assert_eq!(json[0]["object"]["reason"], expected_reason);
+            assert_eq!(protobuf[0].event_type, "ERROR");
+            let status = k8s_pb::apimachinery::pkg::apis::meta::v1::Status::decode(
+                protobuf[0].inner_raw.as_slice(),
+            )
+            .expect("protobuf Status");
+            assert_eq!(status.code, Some(expected_code));
+            assert_eq!(status.reason.as_deref(), Some(expected_reason));
+        }
     }
 }

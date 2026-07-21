@@ -35,6 +35,7 @@ pub trait ResourceProtoCodec: Send + Sync {
 
     /// Encode raw JSON object bytes into protobuf bytes without first
     /// materializing a generic serde_json::Value.
+    #[cfg(test)]
     fn encode_from_json_slice(
         &self,
         _api_version: &str,
@@ -110,6 +111,7 @@ impl OoCodecRegistry {
     }
 
     /// Encode raw JSON object bytes for a kind into protobuf bytes, or error.
+    #[cfg(test)]
     pub fn encode_json_slice(
         &self,
         api_version: &str,

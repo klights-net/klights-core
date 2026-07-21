@@ -351,8 +351,8 @@ pub struct RawWatchEvent {
 }
 
 impl RawWatchEvent {
-    pub fn topic(&self) -> crate::watch::WatchTopic {
-        crate::watch::WatchTopic::new(&self.api_version, &self.kind)
+    pub fn topic(&self) -> klights_watch::WatchTopic {
+        klights_watch::WatchTopic::new(&self.api_version, &self.kind)
     }
 
     pub fn key(&self) -> (Option<String>, String) {

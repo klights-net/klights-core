@@ -296,7 +296,7 @@ async fn test_crd_watch_catchup_emits_added_for_newly_created_crd() {
 #[tokio::test]
 async fn test_crd_watch_broadcast_delivers_added_event_to_subscriber() {
     let watch_bus = crate::watch::WatchBus::new(16);
-    let mut rx = watch_bus.subscribe(crate::watch::WatchTopic::new(
+    let mut rx = watch_bus.subscribe(klights_watch::WatchTopic::new(
         "apiextensions.k8s.io/v1",
         "CustomResourceDefinition",
     ));

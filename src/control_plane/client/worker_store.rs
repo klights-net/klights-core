@@ -30,8 +30,9 @@ use crate::datastore::{
 };
 use crate::kubelet::pod_lifecycle_core::message::{LifecycleMessage, PodLifecycleKey};
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
-use crate::watch::{EventType, WatchBus, WatchEvent, WatchSignal, WatchTopic};
+use crate::watch::{EventType, WatchBus, WatchEvent};
 use klights_types::ResourceKey;
+use klights_watch::{WatchSignal, WatchTopic};
 
 const WORKER_WATCH_EVENT_HISTORY_CAPACITY: usize = 32_768;
 
@@ -350,7 +351,7 @@ impl WorkerStoreAdapter {
         Ok(handles)
     }
 
-    pub fn watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+    pub fn watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         self.watch_bus.subscribe_signals(topic)
     }
 
@@ -470,6 +471,17 @@ impl WorkerStoreAdapter {
                                         immediate_expiry_relist_available = true;
                                         let delivered = event.clone();
                                         let event_rv = delivered.resource().resource_version;
+                                        let mut applied_cursor = WatchResumeCursor::try_new(
+                                            next_resource_version,
+                                            next_watch_replay_position,
+                                        )
+                                        .expect("worker mirror cursor remains valid");
+                                        if let Err(err) =
+                                            applied_cursor.advance_after_apply(&delivered)
+                                        {
+                                            tracing::warn!(error = %err, "worker mirror cursor rejected event before apply");
+                                            break;
+                                        }
                                         let legacy_event = legacy_watch_event(&event);
                                         let matches = super::watch_request_matches_event(
                                             &selector_req,
@@ -491,17 +503,8 @@ impl WorkerStoreAdapter {
                                             if event_rv > 0 {
                                                 self.observe_rv(event_rv);
                                             }
-                                            let mut cursor = WatchResumeCursor::try_new(
-                                                next_resource_version,
-                                                next_watch_replay_position,
-                                            )
-                                            .expect("worker mirror cursor remains valid");
-                                            if let Err(err) = cursor.advance_after_apply(&delivered) {
-                                                tracing::warn!(error = %err, "worker mirror cursor rejected event");
-                                                break;
-                                            }
-                                            next_resource_version = cursor.resource_version();
-                                            next_watch_replay_position = cursor.replay_position();
+                                            next_resource_version = applied_cursor.resource_version();
+                                            next_watch_replay_position = applied_cursor.replay_position();
                                             continue;
                                         };
                                         let transitioned = match self
@@ -524,17 +527,8 @@ impl WorkerStoreAdapter {
                                         if event_rv > 0 {
                                             self.observe_rv(event_rv);
                                         }
-                                        let mut cursor = WatchResumeCursor::try_new(
-                                            next_resource_version,
-                                            next_watch_replay_position,
-                                        )
-                                        .expect("worker mirror cursor remains valid");
-                                        if let Err(err) = cursor.advance_after_apply(&delivered) {
-                                            tracing::warn!(error = %err, "worker mirror cursor rejected applied event");
-                                            break;
-                                        }
-                                        next_resource_version = cursor.resource_version();
-                                        next_watch_replay_position = cursor.replay_position();
+                                        next_resource_version = applied_cursor.resource_version();
+                                        next_watch_replay_position = applied_cursor.replay_position();
                                     }
                                     Some(Err(err)) => {
                                         if is_watch_window_expired(&err) {
@@ -954,7 +948,7 @@ impl crate::datastore::CurrentResourceVersionStore for WorkerStoreAdapter {
 
 #[async_trait]
 impl WatchStore for WorkerStoreAdapter {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         self.watch_bus.subscribe_signals(topic)
     }
 
@@ -1025,7 +1019,7 @@ impl DatastoreBackend for WorkerStoreAdapter {
         self.node_local.close();
     }
 
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         self.watch_bus.subscribe_signals(topic)
     }
 
@@ -4436,7 +4430,7 @@ mod tests {
             "worker-a".to_string(),
         ));
         configure_successful_pod_router(&adapter);
-        let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Pod"));
+        let mut watch_rx = adapter.watch_topic(klights_watch::WatchTopic::new("v1", "Pod"));
         let cancel = tokio_util::sync::CancellationToken::new();
 
         let handles = adapter
@@ -4510,7 +4504,7 @@ mod tests {
             node_local,
             "worker-a".to_string(),
         ));
-        let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Namespace"));
+        let mut watch_rx = adapter.watch_topic(klights_watch::WatchTopic::new("v1", "Namespace"));
         let cancel = tokio_util::sync::CancellationToken::new();
 
         let handles = adapter
@@ -4572,7 +4566,7 @@ mod tests {
             "worker-a".to_string(),
         ));
         configure_successful_pod_router(&adapter);
-        let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Pod"));
+        let mut watch_rx = adapter.watch_topic(klights_watch::WatchTopic::new("v1", "Pod"));
         let cancel = tokio_util::sync::CancellationToken::new();
 
         let handles = adapter
@@ -5073,7 +5067,7 @@ mod tests {
             "worker-a".to_string(),
         ));
         configure_successful_pod_router(&adapter);
-        let mut watch_rx = adapter.watch_topic(crate::watch::WatchTopic::new("v1", "Pod"));
+        let mut watch_rx = adapter.watch_topic(klights_watch::WatchTopic::new("v1", "Pod"));
         let cancel = tokio_util::sync::CancellationToken::new();
 
         let handles = adapter

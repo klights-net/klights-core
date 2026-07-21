@@ -123,7 +123,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut watch_rx = db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Pod"));
+        let mut watch_rx = db.subscribe_watch(klights_watch::WatchTopic::new("v1", "Pod"));
         let raft = N1Raft::new(db);
 
         let applied = raft

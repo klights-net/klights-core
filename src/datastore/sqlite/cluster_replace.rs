@@ -3333,7 +3333,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut watch_rx = db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Pod"));
+        let mut watch_rx = db.subscribe_watch(klights_watch::WatchTopic::new("v1", "Pod"));
 
         let leader_watch_row = serde_json::json!({
             "apiVersion": "v1",
@@ -5079,7 +5079,7 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         enable_committed_apply_v1(&db).await;
         let mut watch =
-            db.subscribe_watch_signals(crate::watch::WatchTopic::new("v1", "ConfigMap"));
+            db.subscribe_watch_signals(klights_watch::WatchTopic::new("v1", "ConfigMap"));
         let key = "cancel-after-commit";
         let commit = committed_apply_v1(LogApplyCommit::new(
             0,
@@ -5141,7 +5141,7 @@ mod tests {
         let _serial = POST_COMMIT_PUBLISH_TEST_LOCK.lock().await;
         let db = crate::datastore::test_support::in_memory().await;
         let mut watch =
-            db.subscribe_watch_signals(crate::watch::WatchTopic::new("v1", "ConfigMap"));
+            db.subscribe_watch_signals(klights_watch::WatchTopic::new("v1", "ConfigMap"));
         let restored = serde_json::json!({
             "metadata": {
                 "name": "restored-after-cancel",

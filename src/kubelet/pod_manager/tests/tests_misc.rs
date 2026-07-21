@@ -51,7 +51,7 @@ fn pod_watcher_node_event_filter_matches_only_local_pods() {
 #[tokio::test]
 async fn pod_watcher_filtered_pod_event_does_not_advance_signal_cursor() {
     let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    let (tx, rx) = crate::watch::test_signal_channel(4, [WatchTopic::new("v1", "Pod")]);
     let mut cursor = SignalWatchCursor::new(
         rx,
         DatastoreWatchReplaySource::new(
@@ -86,15 +86,14 @@ async fn pod_watcher_filtered_pod_event_does_not_advance_signal_cursor() {
         .await
         .expect("current rv after remote pod create");
 
-    tx.send(crate::watch::WatchSignal {
+    tx.publish(klights_watch::WatchSignal {
         topic: WatchTopic::new("v1", "Pod"),
-        advances: vec![crate::watch::WatchAdvance {
+        advances: vec![klights_watch::WatchAdvance {
             namespace: Some("default".to_string()),
             low_rv: remote_rv,
             high_rv: remote_rv,
         }],
-    })
-    .expect("send remote pod signal");
+    });
     let result =
         tokio::time::timeout(std::time::Duration::from_millis(100), cursor.next_event()).await;
 

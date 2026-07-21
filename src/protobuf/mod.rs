@@ -5,13 +5,14 @@ mod oo;
 
 pub use decode_entrypoint::{TypeMeta, Unknown, decode_protobuf};
 pub use encode_core::encode_protobuf;
+#[cfg(test)]
+pub(crate) use encode_core::encode_protobuf_resource_from_json_bytes;
 pub(in crate::protobuf) use encode_core::{
     encode_message_to_vec, normalize_event_microtime_fields,
 };
 pub(crate) use encode_core::{
-    encode_protobuf_resource, encode_protobuf_resource_from_json_bytes, encode_status_protobuf,
-    supports_protobuf_resource, supports_raw_json_protobuf_resource,
-    wrap_protobuf_resource_envelope,
+    encode_protobuf_resource, encode_status_protobuf, supports_protobuf_resource,
+    supports_raw_json_protobuf_resource, wrap_protobuf_resource_envelope,
 };
 pub(in crate::protobuf) use oo::*;
 pub(in crate::protobuf) use serde::Deserialize;

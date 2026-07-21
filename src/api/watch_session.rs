@@ -1,8 +1,9 @@
 use crate::datastore::WatchReplayPosition;
 use crate::watch::{
     SelectorMembership, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
-    WatchReplaySource, WatchSignalReceiver, WatchTopic, WindowPolicy,
+    WatchReplaySource, WindowPolicy,
 };
+use klights_watch::{WatchSignalReceiver, WatchTopic};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WatchSessionConfig {
@@ -221,7 +222,6 @@ mod tests {
     use async_trait::async_trait;
     use std::num::NonZeroUsize;
     use std::sync::Arc;
-    use tokio::sync::broadcast;
 
     struct ReplaySource {
         events: Vec<WatchEvent>,
@@ -293,7 +293,7 @@ mod tests {
         bootstrap: WatchSessionBootstrap,
         source: ReplaySource,
     ) -> WatchSession<ReplaySource> {
-        let (_tx, rx) = broadcast::channel(4);
+        let (_tx, rx) = crate::watch::test_signal_channel(4, [WatchTopic::new("v1", "ConfigMap")]);
         bootstrap.establish_many(
             rx,
             source,

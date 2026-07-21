@@ -64,7 +64,7 @@ fn request_preserves_selectors_and_prefers_exact_event_id_intent() {
     let position = WatchReplayPosition {
         resource_version: 41,
         event_id: 91,
-        resource_version_filter_through_event_id: 73,
+        resource_version_filter_through_event_id: 173,
     };
     let request = WatchRequest::try_new(
         "apps/v1",
@@ -90,6 +90,51 @@ fn request_preserves_selectors_and_prefers_exact_event_id_intent() {
         .expect("legacy scalar request");
     assert_eq!(scalar_only.start_resource_version(), Some(17));
     assert_eq!(scalar_only.preferred_replay_position(), None);
+}
+
+#[test]
+fn request_rejects_a_completed_composite_filter_before_opening_history() {
+    for position in [
+        WatchReplayPosition {
+            resource_version: 41,
+            event_id: 91,
+            resource_version_filter_through_event_id: 91,
+        },
+        WatchReplayPosition {
+            resource_version: 41,
+            event_id: 92,
+            resource_version_filter_through_event_id: 91,
+        },
+    ] {
+        assert!(matches!(
+            WatchRequest::try_new("v1", "Pod", None, None, None, Some(41), Some(position),),
+            Err(LeaderWatchError::InvalidRequest {
+                field: "watch.start_watch_replay_position",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn request_rejects_malformed_field_selectors_at_the_internal_boundary() {
+    for selector in ["metadata.name", "metadata.name>pod", "metadata.name===pod"] {
+        assert!(matches!(
+            WatchRequest::try_new(
+                "v1",
+                "Pod",
+                None,
+                None,
+                Some(selector.to_string()),
+                None,
+                None,
+            ),
+            Err(LeaderWatchError::InvalidRequest {
+                field: "watch.field_selector",
+                ..
+            })
+        ));
+    }
 }
 
 #[test]
@@ -233,6 +278,82 @@ fn cursor_advances_only_after_explicit_apply_and_keeps_event_id_order() {
     cursor.advance_after_apply(&legacy).unwrap();
     assert_eq!(cursor.resource_version(), Some(43));
     assert_eq!(cursor.replay_position(), None);
+}
+
+#[test]
+fn resume_cursor_rejects_every_noncanonical_position_transition_atomically() {
+    struct Case {
+        name: &'static str,
+        current: WatchReplayPosition,
+        delivered: WatchReplayPosition,
+    }
+    let cases = [
+        Case {
+            name: "equal event id mutation",
+            current: WatchReplayPosition {
+                resource_version: 10,
+                event_id: 3,
+                resource_version_filter_through_event_id: 0,
+            },
+            delivered: WatchReplayPosition {
+                resource_version: 11,
+                event_id: 3,
+                resource_version_filter_through_event_id: 0,
+            },
+        },
+        Case {
+            name: "premature composite filter clearing",
+            current: WatchReplayPosition {
+                resource_version: 10,
+                event_id: 1,
+                resource_version_filter_through_event_id: 5,
+            },
+            delivered: WatchReplayPosition {
+                resource_version: 11,
+                event_id: 2,
+                resource_version_filter_through_event_id: 0,
+            },
+        },
+        Case {
+            name: "resource version changes before composite boundary",
+            current: WatchReplayPosition {
+                resource_version: 10,
+                event_id: 1,
+                resource_version_filter_through_event_id: 5,
+            },
+            delivered: WatchReplayPosition {
+                resource_version: 11,
+                event_id: 2,
+                resource_version_filter_through_event_id: 5,
+            },
+        },
+        Case {
+            name: "new composite filter appears",
+            current: WatchReplayPosition {
+                resource_version: 10,
+                event_id: 1,
+                resource_version_filter_through_event_id: 0,
+            },
+            delivered: WatchReplayPosition {
+                resource_version: 11,
+                event_id: 2,
+                resource_version_filter_through_event_id: 5,
+            },
+        },
+    ];
+
+    for case in cases {
+        let mut cursor = WatchResumeCursor::try_new(Some(10), Some(case.current)).unwrap();
+        let before = cursor;
+        let event = ResourceEvent::try_new(
+            WatchEventType::Modified,
+            resource("v1", "Pod", Some("default"), "web", 99),
+            Some(case.delivered),
+        )
+        .unwrap();
+        assert!(cursor.advance_after_apply(&event).is_err(), "{}", case.name,);
+        assert_eq!(cursor, before, "{} changed cursor on rejection", case.name);
+    }
 }
 
 #[test]

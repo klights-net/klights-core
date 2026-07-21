@@ -2,7 +2,6 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::borrow::Cow;
 use std::sync::Arc;
 
 use super::bookmark;
@@ -266,76 +265,6 @@ pub fn value_matches_field_selector(object: &Value, field_selector: Option<&str>
         return true;
     }
 
-    for part in selector.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-
-        let (path, expected, is_eq) = if let Some(idx) = part.find("!=") {
-            (&part[..idx], &part[idx + 2..], false)
-        } else if let Some(idx) = part.find('=') {
-            (&part[..idx], &part[idx + 1..], true)
-        } else {
-            // Ignore invalid fragments (same behavior as list filter parser).
-            continue;
-        };
-
-        let path = path.trim();
-        let expected = expected.trim();
-        let actual = resolve_field_path(object, path);
-        // Match DB field-selector semantics: absent boolean field defaults to false.
-        let effective = actual.as_deref().or(if expected == "false" {
-            Some("false")
-        } else {
-            None
-        });
-        let matches = effective == Some(expected);
-        if is_eq != matches {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn resolve_field_path<'a>(object: &'a Value, path: &str) -> Option<Cow<'a, str>> {
-    fn non_empty_str(value: Option<&Value>) -> Option<&str> {
-        value.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-    }
-
-    // Event selector compatibility:
-    // `source=<component>` matches core/v1 (`source.component`) and
-    // events.k8s.io/v1 (`deprecatedSource.component` / `reportingController`).
-    if path == "source" {
-        if let Some(component) =
-            non_empty_str(object.get("source").and_then(|s| s.get("component")))
-        {
-            return Some(Cow::Borrowed(component));
-        }
-        if let Some(component) = non_empty_str(
-            object
-                .get("deprecatedSource")
-                .and_then(|s| s.get("component")),
-        ) {
-            return Some(Cow::Borrowed(component));
-        }
-        if let Some(component) = non_empty_str(object.get("reportingController")) {
-            return Some(Cow::Borrowed(component));
-        }
-        if let Some(component) = non_empty_str(object.get("reportingComponent")) {
-            return Some(Cow::Borrowed(component));
-        }
-    }
-
-    let mut current: &Value = object;
-    for segment in path.split('.') {
-        current = current.get(segment)?;
-    }
-    match current {
-        Value::String(s) => Some(Cow::Borrowed(s.as_str())),
-        Value::Bool(b) => Some(Cow::Owned(b.to_string())),
-        Value::Number(n) => Some(Cow::Owned(n.to_string())),
-        _ => None,
-    }
+    klights_types::FieldSelector::parse(selector)
+        .is_ok_and(|selector| selector.matches_resource(object))
 }

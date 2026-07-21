@@ -17,6 +17,8 @@ pub fn validate_crd_field_selector(
     if selector.is_empty() {
         return Ok(());
     }
+    let parsed = klights_types::FieldSelector::parse(selector)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
 
     let mut supported_fields = std::collections::HashSet::new();
     supported_fields.insert("metadata.name".to_string());
@@ -27,23 +29,15 @@ pub fn validate_crd_field_selector(
         supported_fields.insert(field.clone());
     }
 
-    for part in selector.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let key = if let Some((key, _)) = part.split_once("!=") {
-            key.trim()
-        } else if let Some((key, _)) = part.split_once('=') {
-            key.trim()
-        } else {
-            continue;
-        };
-
-        if !supported_fields.contains(key) {
+    for requirement in parsed.requirements() {
+        if !supported_fields.contains(requirement.field()) {
             return Err(AppError::BadRequest(format!(
                 "Unable to find \"{}, Resource={}\" that match label selector \"{}\", field selector \"{}\": field label not supported: {}",
                 api_version,
                 plural,
                 label_selector.unwrap_or_default(),
                 selector,
-                key
+                requirement.field()
             )));
         }
     }
@@ -83,6 +77,8 @@ fn validate_field_selector(
     if selector.is_empty() {
         return Ok(());
     }
+    let parsed = klights_types::FieldSelector::parse(selector)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
 
     let mut supported_fields = std::collections::HashSet::new();
     supported_fields.insert("metadata.name");
@@ -93,23 +89,15 @@ fn validate_field_selector(
         supported_fields.insert(*field);
     }
 
-    for part in selector.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let key = if let Some((key, _)) = part.split_once("!=") {
-            key.trim()
-        } else if let Some((key, _)) = part.split_once('=') {
-            key.trim()
-        } else {
-            continue;
-        };
-
-        if !supported_fields.contains(key) {
+    for requirement in parsed.requirements() {
+        if !supported_fields.contains(requirement.field()) {
             return Err(AppError::BadRequest(format!(
                 "Unable to find \"{}, Resource={}\" that match label selector \"{}\", field selector \"{}\": field label not supported: {}",
                 api_version,
                 resource,
                 label_selector.unwrap_or_default(),
                 selector,
-                key
+                requirement.field()
             )));
         }
     }
@@ -145,6 +133,32 @@ fn builtin_selectable_fields(api_version: &str, kind: &str) -> &'static [&'stati
         ],
         ("certificates.k8s.io/v1", "CertificateSigningRequest") => &["spec.signerName"],
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod strict_field_selector_tests {
+    use super::*;
+
+    #[test]
+    fn builtin_and_crd_http_validation_reject_malformed_field_selector_syntax() {
+        for selector in ["metadata.name", "metadata.name>pod", "metadata.name===pod"] {
+            assert!(matches!(
+                validate_builtin_field_selector("v1", "Pod", None, Some(selector), true,),
+                Err(AppError::BadRequest(_))
+            ));
+            assert!(matches!(
+                validate_crd_field_selector(
+                    "example.com/v1",
+                    "widgets",
+                    None,
+                    Some(selector),
+                    true,
+                    &[],
+                ),
+                Err(AppError::BadRequest(_))
+            ));
+        }
     }
 }
 

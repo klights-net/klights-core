@@ -114,15 +114,15 @@ async fn run_leader_peer_endpoint_observer(
         );
     }
 
-    let mut signal_rx = db.subscribe_watch_signals(crate::watch::WatchTopic::new("v1", "Node"));
+    let mut signal_rx = db.subscribe_watch_signals(klights_watch::WatchTopic::new("v1", "Node"));
     loop {
         tokio::select! {
             _ = shutdown_token.cancelled() => return,
             signal = signal_rx.recv() => {
                 match signal {
                     Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(klights_watch::WatchSignalReceiveError::Lagged(_)) => {}
+                    Err(klights_watch::WatchSignalReceiveError::Closed) => return,
                 }
                 if ensure_published_if_local_has_external_ip(
                     db.as_ref(),

@@ -179,6 +179,8 @@ pub enum ResourceVersionMatch {
     Any,
     NotOlderThan(i64),
     Exact(i64),
+    /// Exact durable LIST-to-WATCH boundary, including same-RV apply order.
+    AtPosition(WatchReplayPosition),
 }
 
 /// Composite collection key used by keyset pagination. Namespace is required
@@ -213,14 +215,9 @@ pub struct ResourceListSnapshot {
 
 impl ResourceListSnapshot {
     pub fn try_new(position: WatchReplayPosition) -> Result<Self, ResourceReadError> {
-        if position.resource_version < 0
-            || position.event_id < 0
-            || position.resource_version_filter_through_event_id != 0
-        {
-            return Err(ResourceReadError::corrupt(format!(
-                "LIST snapshot must be an exact non-negative position: {position:?}"
-            )));
-        }
+        crate::durable_recovery::validate_replay_position(position, false).map_err(|message| {
+            ResourceReadError::corrupt(format!("invalid LIST snapshot position: {message}"))
+        })?;
         Ok(Self { position })
     }
     pub const fn position(self) -> WatchReplayPosition {
@@ -278,6 +275,7 @@ impl ResourceListQuery {
         let rv = match resource_version_match {
             ResourceVersionMatch::Any => None,
             ResourceVersionMatch::NotOlderThan(rv) | ResourceVersionMatch::Exact(rv) => Some(rv),
+            ResourceVersionMatch::AtPosition(position) => Some(position.resource_version),
         };
         if rv.is_some_and(|rv| rv < 0) {
             return Err(ResourceReadError::Conflict {
@@ -298,6 +296,19 @@ impl ResourceListQuery {
         {
             return Err(ResourceReadError::InvalidContinuation {
                 message: "continuation snapshot is older than requested resourceVersion"
+                    .to_string(),
+            });
+        }
+        if let ResourceVersionMatch::AtPosition(position) = resource_version_match {
+            crate::durable_recovery::validate_replay_position(position, false)
+                .map_err(|message| ResourceReadError::Conflict { message })?;
+        }
+        if let (Some(cursor), ResourceVersionMatch::AtPosition(position)) =
+            (&continuation, resource_version_match)
+            && cursor.snapshot.position() != position
+        {
+            return Err(ResourceReadError::InvalidContinuation {
+                message: "continuation snapshot does not match positioned LIST boundary"
                     .to_string(),
             });
         }

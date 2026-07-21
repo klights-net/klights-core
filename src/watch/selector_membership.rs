@@ -46,6 +46,7 @@ impl SelectorMembership {
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn record_event(&mut self, event: &WatchEvent) -> bool {
         let Some(key) = event_key(event) else {
             return false;
@@ -54,6 +55,7 @@ impl SelectorMembership {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn transition(
         &mut self,
         event: WatchEvent,

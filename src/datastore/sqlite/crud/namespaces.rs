@@ -133,7 +133,11 @@ impl Datastore {
             .map(LabelSelector::parse)
             .transpose()
             .map_err(|e| anyhow!("Invalid label selector: {e}"))?;
-        let field_selector_owned = field_selector.map(str::to_string);
+        let parsed_field_selector = field_selector
+            .filter(|selector| !selector.is_empty())
+            .map(klights_types::FieldSelector::parse)
+            .transpose()
+            .map_err(|error| anyhow!("Invalid field selector: {error}"))?;
 
         self.read_db_call("db_query", move |conn| {
             let tx = conn.transaction()?;
@@ -141,12 +145,16 @@ impl Datastore {
             let mut query = queries::NAMESPACES_LIST_HEAD.to_string();
             let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-            // Simple field selector support: metadata.name=foo
-            if let Some(ref selector) = field_selector_owned
-                && let Some(name_filter) = selector.strip_prefix("metadata.name=")
-            {
+            if let Some(name_filter) = parsed_field_selector.as_ref().and_then(|selector| {
+                selector.requirements().iter().find_map(|requirement| {
+                    (requirement.field() == "metadata.name"
+                        && requirement.operator() == klights_types::FieldSelectorOperator::Equals
+                        && !requirement.value().is_empty())
+                    .then(|| requirement.value().to_string())
+                })
+            }) {
                 query.push_str(" WHERE name = ?");
-                params.push(Box::new(name_filter.to_string()));
+                params.push(Box::new(name_filter));
             }
             query.push_str(" ORDER BY name ASC");
 
@@ -175,15 +183,8 @@ impl Datastore {
             if let Some(selector) = &parsed_label_selector {
                 items.retain(|item| selector.matches_resource(&item.data));
             }
-            if let Some(selector) = field_selector_owned
-                .as_deref()
-                .map(str::trim)
-                .filter(|selector| !selector.is_empty())
-            {
-                let conditions = parse_field_selector_conditions(selector);
-                if !conditions.is_empty() {
-                    items.retain(|item| matches_field_selector_conditions(&item.data, &conditions));
-                }
+            if let Some(selector) = &parsed_field_selector {
+                items.retain(|item| selector.matches_resource(&item.data));
             }
             let watch_replay_position = Self::current_watch_replay_position_in_tx(&tx)?;
             Ok(ResourceList {

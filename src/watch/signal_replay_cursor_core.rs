@@ -1,16 +1,13 @@
 use std::collections::{HashSet, VecDeque};
 
-use anyhow::Result;
-use tokio::sync::broadcast::error::RecvError;
+use anyhow::{Result, anyhow};
 
 use crate::datastore::{
     PositionedWatchEvent, PositionedWatchReplayRead, RawWatchEvent, WatchReplayPosition,
 };
+use klights_watch::{WatchSignal, WatchSignalReceiver, WatchTopic};
 
-use super::{
-    WatchCursorError, WatchDeliveryScope, WatchEvent, WatchReplaySource, WatchSignal,
-    WatchSignalReceiver, WatchTopic, WindowPolicy,
-};
+use super::{WatchCursorError, WatchDeliveryScope, WatchEvent, WatchReplaySource, WindowPolicy};
 
 pub trait ReplayCursorEvent: Clone + Send + Sync + 'static {
     fn resource_version(&self) -> Option<i64>;
@@ -132,10 +129,12 @@ where
                         self.replay_once().await?;
                     }
                 }
-                Err(RecvError::Lagged(_)) => {
+                Err(klights_watch::WatchSignalReceiveError::Lagged(_)) => {
                     self.replay_needed = true;
                 }
-                Err(RecvError::Closed) => return Err(WatchCursorError::Closed),
+                Err(klights_watch::WatchSignalReceiveError::Closed) => {
+                    return Err(WatchCursorError::Closed);
+                }
             }
         }
     }
@@ -149,6 +148,18 @@ where
             .map_err(WatchCursorError::Replay)?;
         match replay {
             PositionedWatchReplayRead::Events(replay) => {
+                let mut validated = self.replay_position;
+                for positioned in &replay.events {
+                    validated = validated
+                        .advance_through_event(positioned.position)
+                        .map_err(|message| WatchCursorError::Replay(anyhow!(message)))?;
+                }
+                if !validated.permits_successor(replay.next_position) {
+                    return Err(WatchCursorError::Replay(anyhow!(
+                        "replay page position {:?} is not a canonical continuation of {validated:?}",
+                        replay.next_position
+                    )));
+                }
                 let event_count = replay.events.len();
                 self.replay_position = replay.next_position;
                 // Keep draining durable history until a read is empty.  A
@@ -176,18 +187,10 @@ where
 
     fn pop_pending_event(&mut self) -> Option<E> {
         while let Some(positioned) = self.pending.pop_front() {
-            let mut processed = positioned.position;
-            if processed.event_id
-                < self
-                    .processed_position
-                    .resource_version_filter_through_event_id
-            {
-                processed.resource_version = self.processed_position.resource_version;
-                processed.resource_version_filter_through_event_id = self
-                    .processed_position
-                    .resource_version_filter_through_event_id;
-            }
-            self.processed_position = processed;
+            self.processed_position = self
+                .processed_position
+                .advance_through_event(positioned.position)
+                .expect("replay page was validated before it entered the pending queue");
             if self.pending.is_empty()
                 && let Some(covered) = self.covered_position_after_pending.take()
             {

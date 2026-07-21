@@ -1019,7 +1019,7 @@ mod cases {
         )
         .await
         .unwrap();
-        let mut watch = db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Pod"));
+        let mut watch = db.subscribe_watch(klights_watch::WatchTopic::new("v1", "Pod"));
 
         apply_command_to_backend(
             &db,

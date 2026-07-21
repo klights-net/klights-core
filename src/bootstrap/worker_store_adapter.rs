@@ -26,7 +26,7 @@ pub(crate) async fn start_worker_store_adapter(
             node_name,
         ),
     );
-    let discovery_rx = worker_store.watch_signals(crate::watch::WatchTopic::new("v1", "Node"));
+    let discovery_rx = worker_store.watch_signals(klights_watch::WatchTopic::new("v1", "Node"));
     worker_store
         .start_watch_mirrors(supervisor.clone(), shutdown_token.clone())
         .await
@@ -48,7 +48,7 @@ pub(crate) async fn start_worker_store_adapter(
                     loop {
                         match discovery_rx.recv().await {
                             Ok(_) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(klights_watch::WatchSignalReceiveError::Lagged(_)) => continue,
                             Err(_) => {
                                 if cancel.is_cancelled() {
                                     return;

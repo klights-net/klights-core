@@ -186,6 +186,14 @@ impl ResourceListRequest {
                 "must be non-negative",
             ));
         }
+        if let Some(selector) = field_selector
+            .as_deref()
+            .filter(|selector| !selector.trim().is_empty())
+        {
+            klights_types::FieldSelector::parse(selector).map_err(|error| {
+                ResourceQueryError::invalid("list.field_selector", error.to_string())
+            })?;
+        }
         Ok(Self {
             api_version,
             kind,
@@ -256,10 +264,7 @@ impl ResourceListResult {
             ));
         }
         if let Some(position) = watch_replay_position
-            && (position.resource_version < 0
-                || position.event_id < 0
-                || position.resource_version_filter_through_event_id < 0
-                || position.resource_version != resource_version)
+            && (position.validate().is_err() || position.resource_version != resource_version)
         {
             return Err(ResourceQueryError::corrupt_response(
                 "LIST replay position is invalid or does not match its public resourceVersion",
@@ -699,6 +704,10 @@ impl LeaderWatchError {
         }
     }
 
+    pub fn invalid_request(field: &'static str, message: impl Into<String>) -> Self {
+        Self::invalid(field, message)
+    }
+
     pub fn malformed_event(message: impl Into<String>) -> Self {
         Self::MalformedEvent {
             message: message.into(),
@@ -782,16 +791,9 @@ fn validate_watch_identity(
 }
 
 fn validate_replay_position(position: WatchReplayPosition) -> Result<(), LeaderWatchError> {
-    if position.resource_version < 0
-        || position.event_id < 0
-        || position.resource_version_filter_through_event_id < 0
-    {
-        return Err(LeaderWatchError::invalid(
-            "watch.start_watch_replay_position",
-            "all position values must be non-negative",
-        ));
-    }
-    Ok(())
+    position
+        .validate()
+        .map_err(|message| LeaderWatchError::invalid("watch.start_watch_replay_position", message))
 }
 
 /// Validated, transport-neutral positioned-watch request. Selector strings are
@@ -830,6 +832,14 @@ impl WatchRequest {
         }
         if let Some(position) = start_watch_replay_position {
             validate_replay_position(position)?;
+        }
+        if let Some(selector) = field_selector
+            .as_deref()
+            .filter(|selector| !selector.trim().is_empty())
+        {
+            klights_types::FieldSelector::parse(selector).map_err(|error| {
+                LeaderWatchError::invalid("watch.field_selector", error.to_string())
+            })?;
         }
         Ok(Self {
             api_version,
@@ -1043,7 +1053,7 @@ impl WatchResumeCursor {
 
     pub fn advance_after_apply(&mut self, event: &ResourceEvent) -> Result<(), LeaderWatchError> {
         if let (Some(current), Some(delivered)) = (self.replay_position, event.resume_position)
-            && delivered.event_id < current.event_id
+            && !current.permits_successor(delivered)
         {
             return Err(LeaderWatchError::OutOfOrderEvent {
                 current_event_id: current.event_id,
@@ -1051,13 +1061,14 @@ impl WatchResumeCursor {
             });
         }
         let delivered_resource_version = event.resource.resource_version;
-        if delivered_resource_version > 0 {
-            self.resource_version = Some(
+        let resource_version = (delivered_resource_version > 0)
+            .then(|| {
                 self.resource_version
                     .unwrap_or_default()
-                    .max(delivered_resource_version),
-            );
-        }
+                    .max(delivered_resource_version)
+            })
+            .or(self.resource_version);
+        self.resource_version = resource_version;
         self.replay_position = event.resume_position;
         Ok(())
     }

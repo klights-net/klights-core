@@ -24,11 +24,12 @@ use crate::kubelet::pod_watch_handlers::PersistentVolumeEventHandler;
 use crate::kubelet::pod_watch_source::PodWatchSource;
 use crate::watch::{
     EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
-    WatchEventFilter, WatchSignalReceiver, WatchTopic, WindowPolicy,
+    WatchEventFilter, WindowPolicy,
 };
 use anyhow::Result;
 #[cfg(test)]
 use event_handlers::{PodPhaseUpdateRequest, apply_pod_phase_update};
+use klights_watch::{WatchSignalReceiver, WatchTopic};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -149,11 +150,11 @@ mod watch_topic_tests {
     fn pod_watcher_live_topics_cover_secret_configmap_refresh_sources() {
         let topics = pod_watcher_watch_topics();
         assert!(
-            topics.contains(&crate::watch::WatchTopic::new("v1", "ConfigMap")),
+            topics.contains(&klights_watch::WatchTopic::new("v1", "ConfigMap")),
             "ConfigMap watch events must reach the pod watcher so mounted ConfigMap volumes refresh"
         );
         assert!(
-            topics.contains(&crate::watch::WatchTopic::new("v1", "Secret")),
+            topics.contains(&klights_watch::WatchTopic::new("v1", "Secret")),
             "Secret watch events must reach the pod watcher so mounted Secret volumes refresh"
         );
     }

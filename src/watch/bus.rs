@@ -20,46 +20,71 @@
 //! Datastore mutation paths publish through it after commit, and production
 //! consumers subscribe by topic instead of receiving the full cluster firehose.
 
+#[cfg(test)]
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Mutex;
 
+#[cfg(test)]
 use futures::future::select_all;
+#[cfg(test)]
 use tokio::sync::broadcast;
+#[cfg(test)]
 use tokio::sync::broadcast::error::RecvError;
 
 use super::events::WatchEvent;
+#[cfg(test)]
+use klights_watch::{DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, WatchAdvance, WatchSignalTryReceiveError};
+use klights_watch::{WatchSignal, WatchSignalReceiver, WatchTopic};
 
-/// The K8s watch scope a subscriber registers for: a `(apiVersion, kind)` pair.
-/// `Arc<str>` keeps clones cheap (topics are hashed and cloned per lookup).
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct WatchTopic {
-    api_version: Arc<str>,
-    kind: Arc<str>,
+impl klights_watch::WatchSignalEvent for WatchEvent {
+    fn watch_api_version(&self) -> Option<&str> {
+        self.object
+            .get("apiVersion")
+            .and_then(|value| value.as_str())
+    }
+
+    fn watch_kind(&self) -> Option<&str> {
+        self.object.get("kind").and_then(|value| value.as_str())
+    }
+
+    fn watch_namespace(&self) -> Option<&str> {
+        self.object
+            .pointer("/metadata/namespace")
+            .and_then(|value| value.as_str())
+    }
+
+    fn watch_resource_version(&self) -> Option<i64> {
+        self.resource_version()
+    }
 }
 
-impl WatchTopic {
-    pub fn new(api_version: impl AsRef<str>, kind: impl AsRef<str>) -> Self {
-        Self {
-            api_version: Arc::from(api_version.as_ref()),
-            kind: Arc::from(kind.as_ref()),
-        }
-    }
+/// Test-only construction seam for legacy cursor fixtures. Tokio broadcast
+/// channels remain private to the extracted watch leaf in every build.
+#[cfg(test)]
+pub(crate) fn test_signal_channel(
+    capacity: usize,
+    topics: impl IntoIterator<Item = WatchTopic>,
+) -> (
+    std::sync::Arc<klights_watch::WatchSignalHub>,
+    WatchSignalReceiver,
+) {
+    let hub = std::sync::Arc::new(klights_watch::WatchSignalHub::new(capacity));
+    let receiver = WatchSignalReceiver::new(
+        topics
+            .into_iter()
+            .map(|topic| hub.subscribe(topic))
+            .collect(),
+    );
+    (hub, receiver)
+}
 
-    pub fn api_version(&self) -> &str {
-        &self.api_version
-    }
-
-    pub fn kind(&self) -> &str {
-        &self.kind
-    }
-
-    /// The topic an event belongs to, read from its object's `apiVersion` and
-    /// `kind`. `None` when the event object carries neither (cannot be routed).
-    fn of_event(event: &WatchEvent) -> Option<Self> {
-        let api_version = event.object.get("apiVersion").and_then(|v| v.as_str())?;
-        let kind = event.object.get("kind").and_then(|v| v.as_str())?;
-        Some(Self::new(api_version, kind))
-    }
+#[cfg(test)]
+fn event_topic(event: &WatchEvent) -> Option<WatchTopic> {
+    Some(WatchTopic::new(
+        event.object.get("apiVersion")?.as_str()?,
+        event.object.get("kind")?.as_str()?,
+    ))
 }
 
 /// Per-topic broadcast fan-out. This is the only Kubernetes watch
@@ -67,96 +92,12 @@ impl WatchTopic {
 pub struct WatchBus {
     #[cfg(test)]
     topics: Mutex<HashMap<WatchTopic, broadcast::Sender<WatchEvent>>>,
-    signal_topics: Mutex<HashMap<WatchTopic, broadcast::Sender<WatchSignal>>>,
+    signal_hub: klights_watch::WatchSignalHub,
     /// Per-topic buffer capacity. Far smaller than the old global 8192/kind is
     /// viable because a topic only carries its own kind's events; the durable
     /// `watch_events` replay still backstops a lagging receiver.
+    #[cfg(test)]
     capacity: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WatchAdvance {
-    pub namespace: Option<String>,
-    pub low_rv: i64,
-    pub high_rv: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WatchSignal {
-    pub topic: WatchTopic,
-    pub advances: Vec<WatchAdvance>,
-}
-
-pub const DEFAULT_WATCH_ADVANCE_GROUP_LIMIT: usize = 3;
-
-impl WatchSignal {
-    pub fn from_event(event: &WatchEvent) -> Option<Self> {
-        Self::from_events(std::iter::once(event)).into_iter().next()
-    }
-
-    /// Build grouped watch signals from a batch of events.
-    ///
-    /// Events for the same `(apiVersion, kind)` topic and the same namespace
-    /// collapse into a single `WatchAdvance` carrying the low/high resource
-    /// version range for that namespace, so a post-commit batch publishes one
-    /// replay hint per (topic, namespace) rather than one per event. When a
-    /// topic's distinct namespaces exceed `DEFAULT_WATCH_ADVANCE_GROUP_LIMIT`,
-    /// the advances are chunked into multiple signals so no single signal
-    /// grows unbounded. This is the single source of truth for grouped signal
-    /// construction; single-event callers reuse it through `from_event`.
-    pub fn from_events<'a>(events: impl IntoIterator<Item = &'a WatchEvent>) -> Vec<Self> {
-        let mut grouped: HashMap<WatchTopic, HashMap<Option<String>, (i64, i64)>> = HashMap::new();
-
-        for event in events {
-            let Some(topic) = WatchTopic::of_event(event) else {
-                continue;
-            };
-            let Some(high_rv) = event.resource_version() else {
-                continue;
-            };
-            if high_rv <= 0 {
-                continue;
-            }
-            let namespace = event
-                .object
-                .get("metadata")
-                .and_then(|metadata| metadata.get("namespace"))
-                .and_then(|namespace| namespace.as_str())
-                .map(str::to_string);
-
-            let topic_advances = grouped.entry(topic).or_default();
-            let entry = topic_advances
-                .entry(namespace)
-                .or_insert((high_rv, high_rv));
-            entry.0 = entry.0.min(high_rv);
-            entry.1 = entry.1.max(high_rv);
-        }
-
-        let mut signals = Vec::new();
-        for (topic, namespace_rvs) in grouped {
-            let mut advances = namespace_rvs
-                .into_iter()
-                .map(|(namespace, (low_rv, high_rv))| WatchAdvance {
-                    namespace,
-                    low_rv,
-                    high_rv,
-                })
-                .collect::<Vec<_>>();
-            advances.sort_by(|left, right| left.namespace.cmp(&right.namespace));
-
-            for chunk in advances.chunks(DEFAULT_WATCH_ADVANCE_GROUP_LIMIT) {
-                signals.push(WatchSignal {
-                    topic: topic.clone(),
-                    advances: chunk.to_vec(),
-                });
-            }
-        }
-        signals.sort_by(|left, right| {
-            (left.topic.api_version(), left.topic.kind())
-                .cmp(&(right.topic.api_version(), right.topic.kind()))
-        });
-        signals
-    }
 }
 
 impl WatchBus {
@@ -164,7 +105,8 @@ impl WatchBus {
         Self {
             #[cfg(test)]
             topics: Mutex::new(HashMap::new()),
-            signal_topics: Mutex::new(HashMap::new()),
+            signal_hub: klights_watch::WatchSignalHub::new(capacity),
+            #[cfg(test)]
             capacity: capacity.max(1),
         }
     }
@@ -192,12 +134,8 @@ impl WatchBus {
         )
     }
 
-    pub fn subscribe_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
-        let mut topics = self.lock_signals();
-        topics
-            .entry(topic)
-            .or_insert_with(|| broadcast::channel(self.capacity).0)
-            .subscribe()
+    pub fn subscribe_signals(&self, topic: WatchTopic) -> WatchSignalReceiver {
+        self.signal_hub.subscribe(topic)
     }
 
     /// Route `event` to its own `(apiVersion, kind)` topic. A no-op when no
@@ -206,7 +144,7 @@ impl WatchBus {
     /// the topic is collected so memory tracks only active kinds.
     #[cfg(test)]
     pub fn publish(&self, event: WatchEvent) {
-        let Some(topic) = WatchTopic::of_event(&event) else {
+        let Some(topic) = event_topic(&event) else {
             return;
         };
         let mut topics = self.lock();
@@ -221,23 +159,13 @@ impl WatchBus {
     }
 
     pub fn publish_signal(&self, signal: WatchSignal) {
-        if signal.advances.is_empty() {
-            return;
-        }
-        let topic = signal.topic.clone();
-        let mut topics = self.lock_signals();
-        let Some(sender) = topics.get(&topic) else {
-            return;
-        };
-        if sender.send(signal).is_err() || sender.receiver_count() == 0 {
-            topics.remove(&topic);
-        }
+        self.signal_hub.publish(signal);
     }
 
     /// Test/observability seam: number of live topics currently held.
     #[cfg(test)]
     pub fn topic_count(&self) -> usize {
-        self.lock().len() + self.lock_signals().len()
+        self.lock().len()
     }
 
     #[cfg(test)]
@@ -247,48 +175,6 @@ impl WatchBus {
         self.topics
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn lock_signals(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<WatchTopic, broadcast::Sender<WatchSignal>>> {
-        self.signal_topics
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-pub struct WatchSignalReceiver {
-    receivers: Vec<broadcast::Receiver<WatchSignal>>,
-}
-
-impl WatchSignalReceiver {
-    pub fn new(receivers: Vec<broadcast::Receiver<WatchSignal>>) -> Self {
-        Self { receivers }
-    }
-
-    pub async fn recv(&mut self) -> Result<WatchSignal, RecvError> {
-        if self.receivers.is_empty() {
-            return Err(RecvError::Closed);
-        }
-        if self.receivers.len() == 1 {
-            return self.receivers[0].recv().await;
-        }
-
-        let futures = self
-            .receivers
-            .iter_mut()
-            .map(|receiver| Box::pin(receiver.recv()));
-        let (result, _index, _remaining) = select_all(futures).await;
-        result
-    }
-}
-
-impl From<broadcast::Receiver<WatchSignal>> for WatchSignalReceiver {
-    fn from(receiver: broadcast::Receiver<WatchSignal>) -> Self {
-        Self {
-            receivers: vec![receiver],
-        }
     }
 }
 
@@ -472,7 +358,7 @@ mod tests {
 
         assert!(matches!(
             cm_rx.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            Err(WatchSignalTryReceiveError::Empty)
         ));
     }
 

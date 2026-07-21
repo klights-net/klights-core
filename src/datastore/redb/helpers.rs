@@ -59,99 +59,18 @@ pub fn preserve_server_metadata_fields_from_existing(data: &mut Value, existing:
 
 /// Post-fetch field selector filtering (mirrors SQLite's `filter_by_field_selector`).
 pub fn filter_by_field_selector(items: Vec<Resource>, selector: &str) -> Vec<Resource> {
-    if selector.is_empty() {
-        return items;
-    }
-    let conditions: Vec<(&str, &str, bool)> = selector
-        .split(',')
-        .filter_map(|part| {
-            let part = part.trim();
-            if part.is_empty() {
-                return None;
-            }
-            if let Some(idx) = part.find("!=") {
-                let key = part[..idx].trim();
-                let value = part[idx + 2..].trim();
-                Some((key, value, false))
-            } else if let Some(idx) = part.find('=') {
-                let key = part[..idx].trim();
-                let value = part[idx + 1..].trim();
-                Some((key, value, true))
-            } else {
-                None
-            }
-        })
-        .collect();
-    if conditions.is_empty() {
-        return items;
-    }
+    let selector = klights_types::FieldSelector::parse(selector)
+        .expect("API validation must reject malformed field selectors before datastore filtering");
     items
         .into_iter()
-        .filter(|item| {
-            conditions.iter().all(|(path, expected, is_eq)| {
-                let actual = resolve_field_path(&item.data, path);
-                let effective = actual.as_deref().or(if *expected == "false" {
-                    Some("false")
-                } else {
-                    None
-                });
-                let matches = effective == Some(*expected);
-                if *is_eq { matches } else { !matches }
-            })
-        })
+        .filter(|item| selector.matches_resource(&item.data))
         .collect()
 }
 
 /// Resolve a dotted field path inside a JSON resource body.
+#[cfg(test)]
 pub fn resolve_field_path<'a>(data: &'a Value, path: &str) -> Option<std::borrow::Cow<'a, str>> {
-    fn non_empty_str(value: Option<&Value>) -> Option<&str> {
-        value.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-    }
-
-    if path == "source" {
-        if let Some(component) = non_empty_str(data.get("source").and_then(|s| s.get("component")))
-        {
-            return Some(std::borrow::Cow::Borrowed(component));
-        }
-        if let Some(component) = non_empty_str(
-            data.get("deprecatedSource")
-                .and_then(|s| s.get("component")),
-        ) {
-            return Some(std::borrow::Cow::Borrowed(component));
-        }
-        if let Some(component) = non_empty_str(data.get("reportingController")) {
-            return Some(std::borrow::Cow::Borrowed(component));
-        }
-        if let Some(component) = non_empty_str(data.get("reportingComponent")) {
-            return Some(std::borrow::Cow::Borrowed(component));
-        }
-    }
-
-    if let Some(suffix) = path.strip_prefix("involvedObject.") {
-        let mut current = data
-            .get("involvedObject")
-            .or_else(|| data.get("regarding"))?;
-        for segment in suffix.split('.') {
-            current = current.get(segment)?;
-        }
-        return match current {
-            Value::String(s) => Some(std::borrow::Cow::Borrowed(s.as_str())),
-            Value::Bool(b) => Some(std::borrow::Cow::Owned(b.to_string())),
-            Value::Number(n) => Some(std::borrow::Cow::Owned(n.to_string())),
-            _ => None,
-        };
-    }
-
-    let mut current = data;
-    for segment in path.split('.') {
-        current = current.get(segment)?;
-    }
-    match current {
-        Value::String(s) => Some(std::borrow::Cow::Borrowed(s.as_str())),
-        Value::Bool(b) => Some(std::borrow::Cow::Owned(b.to_string())),
-        Value::Number(n) => Some(std::borrow::Cow::Owned(n.to_string())),
-        _ => None,
-    }
+    klights_types::resolve_field_value(data, path)
 }
 
 /// Ensure a resource JSON has a non-empty `metadata.uid`.

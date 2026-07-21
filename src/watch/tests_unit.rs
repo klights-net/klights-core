@@ -1,4 +1,5 @@
 use super::*;
+use klights_watch::{WatchAdvance, WatchSignal, WatchSignalReceiver, WatchTopic};
 
 fn test_task_supervisor() -> crate::task_supervisor::TaskSupervisor {
     crate::task_supervisor::TaskSupervisor::new(
@@ -365,6 +366,28 @@ impl SignalCursorReplaySource {
 }
 
 #[derive(Clone)]
+struct MalformedPositionReplaySource {
+    replay: crate::datastore::PositionedWatchReplay<WatchEvent>,
+}
+
+#[async_trait::async_trait]
+impl WatchReplaySource for MalformedPositionReplaySource {
+    async fn replay_since(&self, _since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+        unreachable!("positioned cursor must use positioned replay")
+    }
+
+    async fn replay_after_checked(
+        &self,
+        _position: crate::datastore::WatchReplayPosition,
+        _limit: std::num::NonZeroUsize,
+    ) -> anyhow::Result<crate::datastore::PositionedWatchReplayRead<WatchEvent>> {
+        Ok(crate::datastore::PositionedWatchReplayRead::Events(
+            self.replay.clone(),
+        ))
+    }
+}
+
+#[derive(Clone)]
 struct MutableSignalCursorReplaySource {
     events: std::sync::Arc<std::sync::Mutex<Vec<WatchEvent>>>,
     calls: std::sync::Arc<std::sync::Mutex<Vec<(i64, usize)>>>,
@@ -557,6 +580,15 @@ fn signal_cursor_topic() -> WatchTopic {
     WatchTopic::new("v1", "Pod")
 }
 
+fn signal_cursor_channel(
+    capacity: usize,
+) -> (
+    std::sync::Arc<klights_watch::WatchSignalHub>,
+    WatchSignalReceiver,
+) {
+    crate::watch::test_signal_channel(capacity, [signal_cursor_topic()])
+}
+
 fn signal_cursor_pod(namespace: &str, name: &str, rv: i64) -> WatchEvent {
     WatchEvent::modified(serde_json::json!({
         "apiVersion": "v1",
@@ -595,7 +627,7 @@ fn signal_cursor_signal(namespace: Option<&str>, high_rv: i64) -> WatchSignal {
 
 #[tokio::test]
 async fn signal_cursor_default_window_three_delivers_single_event_without_waiting_for_three() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source = SignalCursorReplaySource::events(vec![signal_cursor_pod("default", "pod-11", 11)]);
     let mut cursor = SignalWatchCursor::new(
         rx,
@@ -606,7 +638,7 @@ async fn signal_cursor_default_window_three_delivers_single_event_without_waitin
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 11));
 
     let event = cursor.next_event().await.unwrap();
     assert_eq!(event.resource_version(), Some(11));
@@ -618,7 +650,7 @@ async fn signal_cursor_default_window_three_delivers_single_event_without_waitin
 
 #[tokio::test]
 async fn signal_cursor_default_window_three_delivers_two_events_without_waiting_for_three() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source = SignalCursorReplaySource::events(vec![
         signal_cursor_pod("default", "pod-11", 11),
         signal_cursor_pod("default", "pod-12", 12),
@@ -632,7 +664,7 @@ async fn signal_cursor_default_window_three_delivers_two_events_without_waiting_
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 12)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 12));
 
     let first = cursor.next_event().await.unwrap();
     assert_eq!(first.resource_version(), Some(11));
@@ -654,7 +686,7 @@ async fn signal_cursor_default_window_three_delivers_two_events_without_waiting_
 
 #[tokio::test]
 async fn signal_cursor_resume_position_retains_scalar_filter_until_anchor_is_crossed() {
-    let (_tx, rx) = broadcast::channel(4);
+    let (_tx, rx) = signal_cursor_channel(4);
     let source = SignalCursorReplaySource::events(vec![
         signal_cursor_pod("default", "pod-11", 11),
         signal_cursor_pod("default", "pod-12", 12),
@@ -687,9 +719,54 @@ async fn signal_cursor_resume_position_retains_scalar_filter_until_anchor_is_cro
 }
 
 #[tokio::test]
+async fn signal_cursor_rejects_non_strict_events_and_regressing_page_positions() {
+    let start = crate::datastore::WatchReplayPosition {
+        resource_version: 10,
+        event_id: 20,
+        resource_version_filter_through_event_id: 30,
+    };
+    let cases = [
+        crate::datastore::PositionedWatchReplay {
+            events: vec![crate::datastore::PositionedWatchEvent {
+                position: crate::datastore::WatchReplayPosition {
+                    resource_version: 11,
+                    event_id: 20,
+                    resource_version_filter_through_event_id: 0,
+                },
+                event: signal_cursor_pod("default", "equal-event", 11),
+            }],
+            next_position: start,
+        },
+        crate::datastore::PositionedWatchReplay {
+            events: Vec::new(),
+            next_position: crate::datastore::WatchReplayPosition {
+                resource_version: 11,
+                ..start
+            },
+        },
+    ];
+    for replay in cases {
+        let (_tx, rx) = signal_cursor_channel(4);
+        let mut cursor = SignalWatchCursor::new_many_at_position(
+            rx,
+            MalformedPositionReplaySource { replay },
+            vec![signal_cursor_topic()],
+            WatchDeliveryScope::Namespaced("default".to_string()),
+            10,
+            start,
+            WindowPolicy::default_watch_delivery(),
+        );
+        assert!(matches!(
+            cursor.prime_replay_or_expired().await,
+            Err(WatchCursorError::Replay(_))
+        ));
+    }
+}
+
+#[tokio::test]
 async fn signal_cursor_pages_every_same_revision_event_without_loss() {
     for count in [1_usize, 3, 4, 100] {
-        let (tx, rx) = broadcast::channel(4);
+        let (tx, rx) = signal_cursor_channel(4);
         let source = SignalCursorReplaySource::events(
             (0..count)
                 .map(|index| signal_cursor_pod("default", &format!("pod-{index}"), 11))
@@ -704,7 +781,7 @@ async fn signal_cursor_pages_every_same_revision_event_without_loss() {
             WindowPolicy::default_watch_delivery(),
         );
 
-        tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+        tx.publish(signal_cursor_signal(Some("default"), 11));
 
         let mut delivered = Vec::with_capacity(count);
         for _ in 0..count {
@@ -731,7 +808,7 @@ async fn signal_cursor_pages_every_same_revision_event_without_loss() {
 
 #[tokio::test]
 async fn signal_cursor_continues_after_short_nonempty_positioned_page() {
-    let (_tx, rx) = broadcast::channel(4);
+    let (_tx, rx) = signal_cursor_channel(4);
     let source = ShortPageReplaySource::new(
         vec![
             signal_cursor_pod("default", "pod-short-page", 11),
@@ -763,7 +840,7 @@ async fn signal_cursor_continues_after_short_nonempty_positioned_page() {
 
 #[tokio::test]
 async fn signal_cursor_identity_includes_topic_for_same_name_and_revision() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let pod = signal_cursor_pod("default", "shared", 11);
     let config_map = WatchEvent::modified(serde_json::json!({
         "apiVersion": "v1",
@@ -785,7 +862,7 @@ async fn signal_cursor_identity_includes_topic_for_same_name_and_revision() {
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 11));
     let first = cursor.next_event().await.unwrap();
     cursor.accept_event(11);
     let second = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
@@ -803,7 +880,7 @@ async fn signal_cursor_identity_includes_topic_for_same_name_and_revision() {
 
 #[tokio::test]
 async fn signal_cursor_identity_includes_event_type_for_same_name_and_revision() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let old = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Pod",
@@ -835,7 +912,7 @@ async fn signal_cursor_identity_includes_event_type_for_same_name_and_revision()
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 11));
     let deleted = cursor.next_event().await.unwrap();
     cursor.accept_event(11);
     let added = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
@@ -851,7 +928,7 @@ async fn signal_cursor_identity_includes_event_type_for_same_name_and_revision()
 
 #[tokio::test]
 async fn signal_cursor_lag_replays_late_lower_revision_without_its_signal() {
-    let (tx, rx) = broadcast::channel(2);
+    let (tx, rx) = signal_cursor_channel(2);
     let source =
         MutableSignalCursorReplaySource::new(vec![signal_cursor_pod("default", "first", 50)]);
     let mut cursor = SignalWatchCursor::new(
@@ -863,16 +940,16 @@ async fn signal_cursor_lag_replays_late_lower_revision_without_its_signal() {
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 50));
     let first = cursor.next_event().await.unwrap();
     cursor.accept_event(first.resource_version().unwrap());
 
     source.push(signal_cursor_pod("default", "late", 14));
     // The only signal that identifies RV 14 is overwritten before recv. A
     // lag recovery must use durable insertion position, not accepted RV.
-    tx.send(signal_cursor_signal(Some("default"), 14)).unwrap();
-    tx.send(signal_cursor_signal(Some("default"), 51)).unwrap();
-    tx.send(signal_cursor_signal(Some("default"), 52)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 14));
+    tx.publish(signal_cursor_signal(Some("default"), 51));
+    tx.publish(signal_cursor_signal(Some("default"), 52));
 
     let late = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
         .await
@@ -884,7 +961,7 @@ async fn signal_cursor_lag_replays_late_lower_revision_without_its_signal() {
 
 #[tokio::test]
 async fn signal_cursor_returned_event_does_not_advance_until_explicit_accept() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source = SignalCursorReplaySource::events(vec![signal_cursor_pod("default", "pod-11", 11)]);
     let mut cursor = SignalWatchCursor::new(
         rx,
@@ -895,7 +972,7 @@ async fn signal_cursor_returned_event_does_not_advance_until_explicit_accept() {
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 11));
 
     let event = cursor.next_event().await.unwrap();
     assert_eq!(event.resource_version(), Some(11));
@@ -912,7 +989,7 @@ async fn signal_cursor_returned_event_does_not_advance_until_explicit_accept() {
 
 #[tokio::test]
 async fn signal_cursor_skipped_out_of_scope_event_advances_replay_safe_frontier() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source = SignalCursorReplaySource::events(vec![
         signal_cursor_pod("other", "pod-11", 11),
         signal_cursor_pod("default", "pod-12", 12),
@@ -926,7 +1003,7 @@ async fn signal_cursor_skipped_out_of_scope_event_advances_replay_safe_frontier(
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 12)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 12));
 
     let event = cursor.next_event().await.unwrap();
     assert_eq!(event.resource_version(), Some(12));
@@ -943,7 +1020,7 @@ async fn signal_cursor_skipped_out_of_scope_event_advances_replay_safe_frontier(
 
 #[tokio::test]
 async fn signal_cursor_filtered_event_does_not_advance_past_late_lower_rv() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source =
         MutableSignalCursorReplaySource::new(vec![signal_cursor_pod("default", "unmatched", 50)]);
     let mut cursor = SignalWatchCursor::new(
@@ -955,7 +1032,7 @@ async fn signal_cursor_filtered_event_does_not_advance_past_late_lower_rv() {
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 50));
     let filtered = cursor.next_event().await.unwrap();
     assert_eq!(filtered.resource_version(), Some(50));
     assert_eq!(
@@ -965,7 +1042,7 @@ async fn signal_cursor_filtered_event_does_not_advance_past_late_lower_rv() {
     );
 
     source.push(signal_cursor_pod("default", "frontend", 14));
-    tx.send(signal_cursor_signal(Some("default"), 14)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 14));
     let delivered = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
         .await
         .expect("lower matching event must not be hidden by the filtered high-RV event")
@@ -977,7 +1054,7 @@ async fn signal_cursor_filtered_event_does_not_advance_past_late_lower_rv() {
 
 #[tokio::test]
 async fn signal_cursor_replays_late_lower_rv_signal_after_higher_match() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source = MutableSignalCursorReplaySource::new(vec![signal_cursor_pod_on_node(
         "default",
         "fast-local",
@@ -993,7 +1070,7 @@ async fn signal_cursor_replays_late_lower_rv_signal_after_higher_match() {
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 50));
     let first = cursor.next_event().await.unwrap();
     assert_eq!(first.resource_version(), Some(50));
     cursor.accept_event(50);
@@ -1004,7 +1081,7 @@ async fn signal_cursor_replays_late_lower_rv_signal_after_higher_match() {
         14,
         "node-a",
     ));
-    tx.send(signal_cursor_signal(Some("default"), 14)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 14));
     let delivered = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
         .await
         .expect("lower-RV signal must replay the newly visible event")
@@ -1016,7 +1093,7 @@ async fn signal_cursor_replays_late_lower_rv_signal_after_higher_match() {
 
 #[tokio::test]
 async fn signal_cursor_event_filter_does_not_accept_high_rv_pod_noise() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source = MutableSignalCursorReplaySource::new(vec![signal_cursor_pod_on_node(
         "default",
         "other-node",
@@ -1037,14 +1114,14 @@ async fn signal_cursor_event_filter_does_not_accept_high_rv_pod_noise() {
         "spec.nodeName=node-a",
     ));
 
-    tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 50));
     source.push(signal_cursor_pod_on_node(
         "default",
         "late-local",
         14,
         "node-a",
     ));
-    tx.send(signal_cursor_signal(Some("default"), 14)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 14));
 
     let delivered = tokio::time::timeout(Duration::from_secs(1), cursor.next_event())
         .await
@@ -1057,7 +1134,7 @@ async fn signal_cursor_event_filter_does_not_accept_high_rv_pod_noise() {
 
 #[tokio::test]
 async fn signal_cursor_filtered_same_rv_event_does_not_hide_matching_resource() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source = MutableSignalCursorReplaySource::new(vec![
         signal_cursor_pod("default", "unmatched", 50),
         signal_cursor_pod("default", "frontend", 50),
@@ -1071,7 +1148,7 @@ async fn signal_cursor_filtered_same_rv_event_does_not_hide_matching_resource() 
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 50)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 50));
     let filtered = cursor.next_event().await.unwrap();
     assert_eq!(filtered.resource_version(), Some(50));
     assert_eq!(filtered.object["metadata"]["name"], "unmatched");
@@ -1086,7 +1163,7 @@ async fn signal_cursor_filtered_same_rv_event_does_not_hide_matching_resource() 
 
 #[tokio::test]
 async fn signal_cursor_lost_signal_replays_all_missing_events_on_next_signal() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source = SignalCursorReplaySource::events(vec![
         signal_cursor_pod("default", "pod-11", 11),
         signal_cursor_pod("default", "pod-12", 12),
@@ -1101,7 +1178,7 @@ async fn signal_cursor_lost_signal_replays_all_missing_events_on_next_signal() {
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 13)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 13));
 
     let delivered = vec![
         cursor.next_event().await.unwrap().resource_version(),
@@ -1114,7 +1191,10 @@ async fn signal_cursor_lost_signal_replays_all_missing_events_on_next_signal() {
 
 #[tokio::test]
 async fn signal_cursor_replay_cancellation_keeps_second_page_obligation() {
-    let (tx, rx) = tokio::sync::broadcast::channel(1);
+    let (tx, rx) = crate::watch::test_signal_channel(
+        1,
+        [signal_cursor_topic(), WatchTopic::new("v1", "Service")],
+    );
     let source = CancellationReplaySource::new(
         vec![
             signal_cursor_pod("default", "pod-11", 11),
@@ -1134,19 +1214,19 @@ async fn signal_cursor_replay_cancellation_keeps_second_page_obligation() {
     );
 
     // Force a lagged receive so replay is the durable recovery path.
-    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
-    // Leave only a non-matching signal queued after the forced lag. If the
-    // replay obligation is lost on cancellation, next_event cannot recover by
-    // accidentally consuming another matching signal.
-    tx.send(WatchSignal {
+    tx.publish(signal_cursor_signal(Some("default"), 11));
+    tx.publish(signal_cursor_signal(Some("default"), 12));
+    // Leave a non-matching signal queued on the second subscription after the
+    // Pod subscription is forced to lag. If the replay obligation is lost on
+    // cancellation, next_event cannot recover by consuming this signal.
+    tx.publish(WatchSignal {
         topic: WatchTopic::new("v1", "Service"),
         advances: vec![WatchAdvance {
             namespace: Some("default".to_string()),
             low_rv: 14,
             high_rv: 14,
         }],
-    })
-    .unwrap();
+    });
     assert_eq!(
         cursor.next_event().await.unwrap().resource_version(),
         Some(11)
@@ -1178,7 +1258,7 @@ async fn signal_cursor_replay_cancellation_keeps_second_page_obligation() {
 
 #[tokio::test]
 async fn signal_cursor_matching_signal_cancellation_keeps_replay_obligation() {
-    let (tx, rx) = tokio::sync::broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source = CancellationReplaySource::new(vec![signal_cursor_pod("default", "pod-11", 11)], 1);
     let mut cursor = SignalWatchCursor::new(
         rx,
@@ -1189,7 +1269,7 @@ async fn signal_cursor_matching_signal_cancellation_keeps_replay_obligation() {
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 11));
     let mut cancelled = Box::pin(cursor.next_event());
     tokio::select! {
         _ = source.wait_for_page() => {}
@@ -1206,7 +1286,7 @@ async fn signal_cursor_matching_signal_cancellation_keeps_replay_obligation() {
 
 #[tokio::test]
 async fn signal_cursor_lagged_signal_receiver_uses_replay_instead_of_failing() {
-    let (tx, rx) = broadcast::channel(1);
+    let (tx, rx) = signal_cursor_channel(1);
     let source = SignalCursorReplaySource::events(vec![
         signal_cursor_pod("default", "pod-11", 11),
         signal_cursor_pod("default", "pod-12", 12),
@@ -1221,9 +1301,9 @@ async fn signal_cursor_lagged_signal_receiver_uses_replay_instead_of_failing() {
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
-    tx.send(signal_cursor_signal(Some("default"), 12)).unwrap();
-    tx.send(signal_cursor_signal(Some("default"), 13)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 11));
+    tx.publish(signal_cursor_signal(Some("default"), 12));
+    tx.publish(signal_cursor_signal(Some("default"), 13));
 
     let event = cursor.next_event().await.unwrap();
     assert_eq!(event.resource_version(), Some(11));
@@ -1232,7 +1312,7 @@ async fn signal_cursor_lagged_signal_receiver_uses_replay_instead_of_failing() {
 
 #[tokio::test]
 async fn signal_cursor_expired_replay_returns_expired() {
-    let (tx, rx) = broadcast::channel(4);
+    let (tx, rx) = signal_cursor_channel(4);
     let source = SignalCursorReplaySource::expired();
     let mut cursor = SignalWatchCursor::new(
         rx,
@@ -1243,7 +1323,7 @@ async fn signal_cursor_expired_replay_returns_expired() {
         WindowPolicy::default_watch_delivery(),
     );
 
-    tx.send(signal_cursor_signal(Some("default"), 11)).unwrap();
+    tx.publish(signal_cursor_signal(Some("default"), 11));
 
     match cursor.next_event().await {
         Err(WatchCursorError::Expired) => {}

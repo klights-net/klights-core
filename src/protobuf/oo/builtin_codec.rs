@@ -77,6 +77,7 @@ impl ResourceProtoCodec for BuiltinResourceCodec {
         (entry.encode)(api_version, value)
     }
 
+    #[cfg(test)]
     fn encode_from_json_slice(
         &self,
         api_version: &str,

@@ -4,7 +4,7 @@ use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{CurrentResourceVersionStore, WatchStore, WatchTarget};
 use crate::kubelet::pod_watch_source::{BoxedWatchReplaySource, PodWatchSource};
 use crate::node_heartbeat::NodeHeartbeatWatchSource;
-use crate::watch::{WatchSignal, WatchTopic};
+use klights_watch::WatchTopic;
 
 pub struct DatastorePodWatchSource {
     watch_store: Arc<dyn WatchStore>,
@@ -25,10 +25,7 @@ impl DatastorePodWatchSource {
 
 #[async_trait::async_trait]
 impl PodWatchSource for DatastorePodWatchSource {
-    fn subscribe_watch_signals(
-        &self,
-        topic: WatchTopic,
-    ) -> tokio::sync::broadcast::Receiver<WatchSignal> {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         self.watch_store.subscribe_watch_signals(topic)
     }
 
@@ -46,10 +43,7 @@ impl PodWatchSource for DatastorePodWatchSource {
 
 #[async_trait::async_trait]
 impl NodeHeartbeatWatchSource for DatastorePodWatchSource {
-    fn subscribe_watch_signals(
-        &self,
-        topic: WatchTopic,
-    ) -> tokio::sync::broadcast::Receiver<WatchSignal> {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         self.watch_store.subscribe_watch_signals(topic)
     }
 

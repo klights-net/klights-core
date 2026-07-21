@@ -680,6 +680,90 @@ parametrize_backends!(list_limit_zero_returns_all_items_without_continue, |db| {
     assert_eq!(list.remaining_item_count, None);
 });
 
+parametrize_backends!(
+    field_selector_upstream_semantics_match_across_backends,
+    |db| {
+        for name in ["comma,name", "equals=name", "ordinary"] {
+            db.create_resource(
+                "v1",
+                "ConfigMap",
+                Some("default"),
+                name,
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": name, "namespace": "default"}
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        for (selector, expected) in [
+            (r"metadata.name=comma\,name", vec!["comma,name"]),
+            (r"metadata.name=equals\=name", vec!["equals=name"]),
+            (
+                "status.phase=",
+                vec!["comma,name", "equals=name", "ordinary"],
+            ),
+            (
+                "status.phase!=Running",
+                vec!["comma,name", "equals=name", "ordinary"],
+            ),
+        ] {
+            let list = db
+                .list_resources(
+                    "v1",
+                    "ConfigMap",
+                    Some("default"),
+                    ResourceListQuery::new(None, Some(selector), None, None),
+                )
+                .await
+                .unwrap();
+            let mut names = list
+                .items
+                .iter()
+                .map(|resource| resource.name.as_str())
+                .collect::<Vec<_>>();
+            let mut expected = expected;
+            names.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(names, expected, "selector={selector}");
+        }
+
+        db.create_resource(
+            "events.k8s.io/v1",
+            "Event",
+            Some("default"),
+            "scheduled",
+            json!({
+                "apiVersion": "events.k8s.io/v1",
+                "kind": "Event",
+                "metadata": {"name": "scheduled", "namespace": "default"},
+                "regarding": {"apiVersion": "v1", "kind": "Pod", "name": "pod-a"}
+            }),
+        )
+        .await
+        .unwrap();
+        let events = db
+            .list_resources(
+                "events.k8s.io/v1",
+                "Event",
+                Some("default"),
+                ResourceListQuery::new(
+                    None,
+                    Some("involvedObject.kind=Pod,involvedObject.name=pod-a"),
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 1);
+        assert_eq!(events.items[0].name, "scheduled");
+    }
+);
+
 parametrize_backends!(list_carries_atomic_durable_watch_position, |db| {
     db.create_resource(
         "v1",

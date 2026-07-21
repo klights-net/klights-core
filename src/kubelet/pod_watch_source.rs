@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::datastore::WatchTarget;
-use crate::watch::{WatchReplaySource, WatchSignal, WatchTopic};
+use crate::watch::WatchReplaySource;
+use klights_watch::WatchTopic;
 
 pub struct BoxedWatchReplaySource {
     inner: Arc<dyn WatchReplaySource>,
@@ -42,10 +43,7 @@ impl WatchReplaySource for BoxedWatchReplaySource {
 
 #[async_trait::async_trait]
 pub trait PodWatchSource: Send + Sync {
-    fn subscribe_watch_signals(
-        &self,
-        topic: WatchTopic,
-    ) -> tokio::sync::broadcast::Receiver<WatchSignal>;
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
 
     fn replay_source(&self, targets: Vec<WatchTarget>) -> BoxedWatchReplaySource;
 

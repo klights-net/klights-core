@@ -64,19 +64,8 @@ pub async fn list_namespaces(
 
         let send_initial_events = query.send_initial_events.as_deref() == Some("true");
         let db = state.db.clone();
-        let watch_anchor = crate::api::watch_stream::watch_replay_anchor_from_backend(&db);
-        let (signal_rx, replay_start_position) = subscribe_watch_handoff(
-            watch_anchor.as_ref(),
-            &db,
-            vec![crate::watch::WatchTopic::new("v1", "Namespace")],
-            requested_rv,
-        )
-        .await?;
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
             db,
-            watch_anchor,
-            signal_rx,
-            replay_start_position,
             task_supervisor: state.task_supervisor.clone(),
             api_version: "v1",
             kind: "Namespace".to_string(),
@@ -88,7 +77,6 @@ pub async fn list_namespaces(
             field_selector,
             table_format: false,
             stream_format,
-            catch_up_mode: WatchCatchUpMode::ClusterOnly,
             timeout_seconds: query.timeout_seconds,
             emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
         });

@@ -396,14 +396,6 @@ pub async fn list_inner(
         let kind_owned = kind.to_string();
         let ns_owned = ns.map(str::to_string);
         let db = state.db.clone();
-        let watch_anchor = crate::api::watch_stream::watch_replay_anchor_from_backend(&db);
-        let (signal_rx, replay_start_position) = subscribe_watch_handoff(
-            watch_anchor.as_ref(),
-            &db,
-            vec![crate::watch::WatchTopic::new(api_version, kind)],
-            requested_rv,
-        )
-        .await?;
         let send_bookmarks = query.allow_watch_bookmarks == Some("true".to_string());
         let table_format = wants_table_format(&headers)?;
         let protobuf_supported = protobuf_watch_supported_for_request(
@@ -416,16 +408,8 @@ pub async fn list_inner(
         let stream_format = negotiate_watch_stream_format(&headers, protobuf_supported)?;
         let label_selector = query.label_selector.clone();
         let field_selector = query.field_selector.clone();
-        let mode = if ns_owned.is_some() {
-            WatchCatchUpMode::NamespacedScoped
-        } else {
-            WatchCatchUpMode::ClusterOnly
-        };
         let body = build_label_selector_watch_stream(LabelSelectorWatchStreamRequest {
             db,
-            watch_anchor,
-            signal_rx,
-            replay_start_position,
             task_supervisor: state.task_supervisor.clone(),
             api_version,
             kind: kind_owned,
@@ -437,7 +421,6 @@ pub async fn list_inner(
             field_selector,
             table_format,
             stream_format,
-            catch_up_mode: mode,
             timeout_seconds: query.timeout_seconds,
             emit_initial_state_for_resource_version_zero: explicit_resource_version_zero,
         });

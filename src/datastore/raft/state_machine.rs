@@ -677,7 +677,7 @@ mod tests {
         )
         .await
         .expect("seed Pod");
-        let mut watch = db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Pod"));
+        let mut watch = db.subscribe_watch(klights_watch::WatchTopic::new("v1", "Pod"));
 
         let deliver = |key: &'static str, stream_seq: i64, stamp: i64, phase: &'static str| {
             propose_outbox_on_backend_with_watermark(

@@ -33,7 +33,7 @@ pub(crate) fn is_namespaced(kind: &str) -> bool {
     )
 }
 
-pub(super) fn is_builtin_api_version(api_version: &str) -> bool {
+pub(crate) fn is_builtin_api_version(api_version: &str) -> bool {
     matches!(
         api_version,
         "v1" | "apps/v1"

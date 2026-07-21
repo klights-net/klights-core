@@ -1,10 +1,10 @@
 use crate::datastore::{DatastoreBackend, DatastoreHandle, WatchTarget};
 use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
-    WindowPolicy,
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
 };
 use anyhow::Result;
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
+use klights_watch::WatchTopic;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;

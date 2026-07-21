@@ -132,7 +132,10 @@ impl RemoteApiClient {
     /// Mark a cache scope as primed.
     #[cfg(test)]
     pub async fn cache_prime_scope(&self, scope: CacheReadinessRequest) {
-        self.cache.mark_primed(scope).await;
+        self.cache
+            .mark_primed(scope)
+            .await
+            .expect("test cache scope must have a baseline before readiness");
     }
 
     /// Clear a cache scope (simulates watch 410 Gone).
@@ -250,6 +253,15 @@ impl RemoteApiClient {
                             // before this event and reconnect, so catch-up replay
                             // re-delivers it — never advance past an event that
                             // was not applied (silent loss on reconnect).
+                            let mut applied_cursor = WatchResumeCursor::try_new(
+                                next_resource_version,
+                                next_watch_replay_position,
+                            )
+                            .expect("informer cursor remains valid");
+                            if let Err(err) = applied_cursor.advance_after_apply(&event) {
+                                tracing::warn!(error = %err, "remote informer cursor rejected event before apply");
+                                break;
+                            }
                             let legacy_event = legacy_watch_event(&event);
                             let matches =
                                 super::watch_request_matches_event(&selector_req, &legacy_event);
@@ -265,17 +277,8 @@ impl RemoteApiClient {
                                 if let Some(mutation) = membership_mutation {
                                     selector_membership.commit(mutation);
                                 }
-                                let mut cursor = WatchResumeCursor::try_new(
-                                    next_resource_version,
-                                    next_watch_replay_position,
-                                )
-                                .expect("informer cursor remains valid");
-                                if let Err(err) = cursor.advance_after_apply(&event) {
-                                    tracing::warn!(error = %err, "remote informer cursor rejected event");
-                                    break;
-                                }
-                                next_resource_version = cursor.resource_version();
-                                next_watch_replay_position = cursor.replay_position();
+                                next_resource_version = applied_cursor.resource_version();
+                                next_watch_replay_position = applied_cursor.replay_position();
                                 continue;
                             };
                             let event = match focused_watch_event(
@@ -300,17 +303,8 @@ impl RemoteApiClient {
                             if let Some(mutation) = membership_mutation {
                                 selector_membership.commit(mutation);
                             }
-                            let mut cursor = WatchResumeCursor::try_new(
-                                next_resource_version,
-                                next_watch_replay_position,
-                            )
-                            .expect("informer cursor remains valid");
-                            if let Err(err) = cursor.advance_after_apply(&event) {
-                                tracing::warn!(error = %err, "remote informer cursor rejected applied event");
-                                break;
-                            }
-                            next_resource_version = cursor.resource_version();
-                            next_watch_replay_position = cursor.replay_position();
+                            next_resource_version = applied_cursor.resource_version();
+                            next_watch_replay_position = applied_cursor.replay_position();
                         }
                         IdleNext::Item(Err(err)) => {
                             if watch_error_requires_relist(&err) {
@@ -380,8 +374,14 @@ impl RemoteApiClient {
             )
         })?;
         let list = grpc.list_resources_rpc(req.clone()).await?;
-        self.cache.replace_scope(&req, list.clone()).await;
-        self.cache.mark_primed(scope_for_request(&req)).await;
+        self.cache
+            .replace_scope(&req, list.clone())
+            .await
+            .map_err(query_error)?;
+        self.cache
+            .mark_primed(scope_for_request(&req))
+            .await
+            .map_err(query_error)?;
         Ok(list)
     }
 
@@ -497,13 +497,19 @@ impl LeaderResourceQuery for RemoteApiClient {
             } else {
                 let scope = scope_for_request(&legacy_request);
                 if self.cache.is_ready(&scope).await {
-                    self.cache.list(&legacy_request).await
+                    self.cache
+                        .list(&legacy_request)
+                        .await
+                        .map_err(query_error)?
                 } else if self.grpc.is_some() {
                     self.prime_list_scope(legacy_request)
                         .await
                         .map_err(query_error)?
                 } else {
-                    self.cache.list(&legacy_request).await
+                    self.cache
+                        .list(&legacy_request)
+                        .await
+                        .map_err(query_error)?
                 }
             };
             query_list_result(list)

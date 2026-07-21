@@ -328,7 +328,9 @@ impl<S: WatchReplaySource> WatchCursor<S> {
     /// `WatchReplaySource` default stay non-expiring.
     async fn replay_gap_detected(&self, since_rv: i64) -> bool {
         match self.replay_source.earliest_retained_rv().await {
-            Ok(Some(earliest)) => since_rv + 1 < earliest,
+            Ok(Some(earliest)) => since_rv
+                .checked_add(1)
+                .is_some_and(|next_resource_version| next_resource_version < earliest),
             Ok(None) => false,
             Err(_) => true,
         }
@@ -366,16 +368,20 @@ impl<S: WatchReplaySource> WatchCursor<S> {
         task_supervisor: &crate::task_supervisor::TaskSupervisor,
     ) -> Result<Option<WatchEvent>, WatchCursorError> {
         loop {
+            if cancel.is_cancelled() {
+                return Ok(None);
+            }
             if let Some(event) = self.pop_pending_event() {
                 return Ok(Some(event));
             }
 
             if self.replay_required {
-                match self
-                    .replay_source
-                    .replay_since(self.replay_since_rv())
-                    .await
-                {
+                let replay_since = self.replay_since_rv();
+                let replay = tokio::select! {
+                    _ = cancel.cancelled() => return Ok(None),
+                    replay = self.replay_source.replay_since(replay_since) => replay,
+                };
+                match replay {
                     Ok(replay) => {
                         self.replay_required = false;
                         self.replay_backoff = INITIAL_REPLAY_BACKOFF;
@@ -402,7 +408,11 @@ impl<S: WatchReplaySource> WatchCursor<S> {
                 }
             }
 
-            match self.rx.recv().await {
+            let received = tokio::select! {
+                _ = cancel.cancelled() => return Ok(None),
+                received = self.rx.recv() => received,
+            };
+            match received {
                 Ok(event) => {
                     if self.should_skip(&event) {
                         continue;
@@ -555,7 +565,7 @@ impl<S: WatchReplaySource> WatchCursor<S> {
         let Some(rv) = event.resource_version() else {
             return false;
         };
-        if rv <= self.floor_rv + 1 || self.seen_rvs.contains(&rv) {
+        if rv <= self.floor_rv.saturating_add(1) || self.seen_rvs.contains(&rv) {
             return false;
         }
         let Some(key) = event_key(event) else {
@@ -584,7 +594,10 @@ impl<S: WatchReplaySource> WatchCursor<S> {
         self.observe(event);
         if self.ordered_replay
             && let Some(rv) = event.resource_version()
-            && rv == self.floor_rv + 1
+            && self
+                .floor_rv
+                .checked_add(1)
+                .is_some_and(|next_resource_version| rv == next_resource_version)
         {
             self.floor_rv = rv;
         }
@@ -628,4 +641,47 @@ fn event_key(event: &WatchEvent) -> Option<(Option<String>, String)> {
         .and_then(|value| value.as_str())
         .map(ToString::to_string);
     Some((namespace, name))
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+
+    struct MaxFloorSource;
+
+    #[async_trait::async_trait]
+    impl WatchReplaySource for MaxFloorSource {
+        async fn replay_since(&self, _since_rv: i64) -> anyhow::Result<Vec<WatchEvent>> {
+            Ok(Vec::new())
+        }
+
+        async fn earliest_retained_rv(&self) -> anyhow::Result<Option<i64>> {
+            Ok(Some(i64::MAX))
+        }
+    }
+
+    fn max_rv_event() -> WatchEvent {
+        WatchEvent::modified(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "namespace": "default",
+                "name": "max-rv",
+                "resourceVersion": i64::MAX.to_string()
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn maximum_resource_version_never_overflows_cursor_arithmetic() {
+        let bus = crate::watch::WatchBus::new(1);
+        let receiver = bus.subscribe(klights_watch::WatchTopic::new("v1", "Pod"));
+        let mut cursor = WatchCursor::new(receiver, MaxFloorSource, i64::MAX);
+        cursor.ordered_replay = true;
+
+        assert!(!cursor.replay_gap_detected(i64::MAX).await);
+        assert!(!cursor.live_event_requires_ordered_replay(&max_rv_event()));
+        cursor.observe_live(&max_rv_event());
+        assert_eq!(cursor.floor_rv, i64::MAX);
+    }
 }

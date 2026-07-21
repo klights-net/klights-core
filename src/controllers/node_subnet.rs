@@ -23,9 +23,9 @@ use crate::kubelet::outbox::Outbox;
 use crate::networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
 use crate::networking::types::HostPortRange;
 use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
-    WindowPolicy,
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
 };
+use klights_watch::WatchTopic;
 
 #[cfg(test)]
 const PEER_SYNC_RETRY_BASE: Duration = Duration::from_millis(20);

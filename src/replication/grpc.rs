@@ -29,7 +29,7 @@ pub(crate) const WATCH_REPLAY_EXPIRED_REASON: &str = "watch-replay-expired";
 const LEGACY_WATCH_REPLAY_EXPIRED_PREFIX: &str = "WatchResources replay window expired: resume rv ";
 const LEGACY_WATCH_REPLAY_EXPIRED_SUFFIX: &str = " requires relist";
 
-pub(crate) fn watch_replay_expired_status(
+pub fn watch_replay_expired_status(
     accepted_resource_version: i64,
     message: impl Into<String>,
 ) -> tonic::Status {

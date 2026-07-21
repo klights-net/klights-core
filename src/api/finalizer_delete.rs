@@ -958,7 +958,7 @@ mod tests {
             .await
             .unwrap()
             .expect("deployment exists");
-        let mut watch = db.subscribe_watch(crate::watch::WatchTopic::new(
+        let mut watch = db.subscribe_watch(klights_watch::WatchTopic::new(
             owner.api_version.as_str(),
             owner.kind.as_str(),
         ));
@@ -1095,7 +1095,7 @@ mod tests {
             .await
             .unwrap()
             .expect("deployment exists");
-        let mut watch = db.subscribe_watch(crate::watch::WatchTopic::new(
+        let mut watch = db.subscribe_watch(klights_watch::WatchTopic::new(
             owner.api_version.as_str(),
             owner.kind.as_str(),
         ));

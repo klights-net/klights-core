@@ -114,7 +114,7 @@ use tokio::sync::broadcast;
 use crate::datastore::command::StorageCommand;
 #[cfg(test)]
 use crate::watch::{WatchEvent, WatchReceiver};
-use crate::watch::{WatchSignal, WatchTopic};
+use klights_watch::WatchTopic;
 
 #[cfg(test)]
 use super::command::CommandMeta;
@@ -204,7 +204,7 @@ pub trait DatastoreBackend: Send + Sync {
     ) {
     }
 
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal>;
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
 
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
@@ -1554,7 +1554,7 @@ pub trait RawWatchReplayStore: Send + Sync {
 /// Watch-event subscription, broadcast access, and replay queries.
 #[async_trait]
 pub trait WatchStore: Send + Sync {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal>;
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
     #[cfg(test)]
     fn subscribe_watch(&self, topic: WatchTopic) -> broadcast::Receiver<WatchEvent>;
     async fn list_watch_events_since(
@@ -1668,7 +1668,7 @@ impl RawWatchReplayStore for DatastoreBackendWatchStore {
 
 #[async_trait]
 impl WatchStore for DatastoreBackendWatchStore {
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         self.db.subscribe_watch_signals(topic)
     }
 

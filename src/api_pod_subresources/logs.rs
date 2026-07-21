@@ -1,10 +1,10 @@
 use super::*;
 use crate::datastore::{CurrentResourceVersionStore, WatchStore};
 use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
-    WindowPolicy,
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
 };
 use klights_node_api::{NodeLog, NodeLogOptions, NodeLogRequest, NodeLogTarget};
+use klights_watch::WatchTopic;
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 use std::sync::Arc;

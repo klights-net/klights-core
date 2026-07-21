@@ -6,7 +6,7 @@ use tokio::sync::broadcast;
 use super::hydrate_watch_event_data;
 #[cfg(test)]
 use crate::watch::{WatchContentType, WatchEvent, WatchReceiver, encode_watch_payload};
-use crate::watch::{WatchSignal, WatchTopic};
+use klights_watch::{WatchSignal, WatchTopic};
 
 use super::{
     CatchUpResource, Datastore, PendingWatchEvent, PodEndpointEvent, PodSlotAdmissionEvent,
@@ -81,7 +81,7 @@ where
         let mut advances = namespace_rvs
             .into_iter()
             .map(
-                |(namespace, (low_rv, high_rv))| crate::watch::WatchAdvance {
+                |(namespace, (low_rv, high_rv))| klights_watch::WatchAdvance {
                     namespace,
                     low_rv,
                     high_rv,
@@ -90,7 +90,7 @@ where
             .collect::<Vec<_>>();
         advances.sort_by(|left, right| left.namespace.cmp(&right.namespace));
 
-        for chunk in advances.chunks(crate::watch::DEFAULT_WATCH_ADVANCE_GROUP_LIMIT) {
+        for chunk in advances.chunks(klights_watch::DEFAULT_WATCH_ADVANCE_GROUP_LIMIT) {
             signals.push(WatchSignal {
                 topic: topic.clone(),
                 advances: chunk.to_vec(),
@@ -229,7 +229,7 @@ impl Datastore {
         self.watch_bus.subscribe_many(topics)
     }
 
-    pub fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+    pub fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         self.watch_bus.subscribe_signals(topic)
     }
 
@@ -583,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_pending_batch_sends_grouped_signal_for_same_topic() {
-        use crate::watch::WatchAdvance;
+        use klights_watch::WatchAdvance;
 
         let ds = crate::datastore::test_support::in_memory().await;
         let topic = WatchTopic::new("v1", "Pod");
@@ -638,7 +638,7 @@ mod tests {
 
     #[test]
     fn pending_watch_signals_are_grouped_from_pending_metadata() {
-        use crate::watch::WatchAdvance;
+        use klights_watch::WatchAdvance;
 
         let signals = pending_watch_signals(vec![
             PendingWatchEvent::from_signal_metadata("v1", "Pod", Some("default"), 10),

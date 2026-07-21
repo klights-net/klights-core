@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use futures::stream::BoxStream;
+use klights_leader_api::LeaderWatch as _;
 use klights_node_api::{
     ExecStreamChannel, ExecTerminalError, NodeExecFrame, NodeExecSyncResult, NodeLogEvent,
     NodeLogTerminalError, NodeMetricsContainerSample, NodeMetricsError, NodeMetricsNodeSample,
@@ -7,19 +8,28 @@ use klights_node_api::{
 };
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status, metadata::MetadataMap};
 
 use crate::controller_dispatcher::ControllerDispatcher;
+#[cfg(test)]
+use crate::datastore::WatchTarget;
+#[cfg(test)]
+use crate::datastore::backend::WatchReplayAnchorStore;
 use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
+#[cfg(test)]
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{ResourcePreconditions, WatchReplayPosition, WatchTarget};
+use crate::datastore::{ResourcePreconditions, WatchReplayPosition};
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
+#[cfg(test)]
+use crate::replication::grpc::watch_replay_expired_status;
 use crate::replication::grpc::{
     JOIN_TOKEN_METADATA_KEY, entry_to_proto, generated, resource_command_request_from_proto,
-    watch_replay_expired_status, watch_replay_position_from_proto, watch_replay_position_to_proto,
+    watch_replay_position_from_proto, watch_replay_position_to_proto,
 };
 use crate::replication::protocol::{
     FollowerControlMessage, JoinResponse, JoinRole, RoutedNodeExecFrame, RoutedNodeExecRequest,
@@ -30,11 +40,41 @@ use crate::replication::service::{
     FollowerCompletionContext, NodeOperationKind, ReplicationService,
 };
 use crate::replication::snapshot::SnapshotCommitSink;
+#[cfg(test)]
 use crate::watch::WatchEventSelection;
 
 use super::ca_files::ControlplaneCaFiles;
 
 const MAX_NODE_LEASE_RENEW_TIME_SKEW_SECONDS: i64 = 100;
+
+#[inline]
+fn canonical_positioned_watch_enabled() -> bool {
+    true
+}
+
+#[cfg(test)]
+async fn subscribe_grpc_watch_handoff<F>(
+    watch_anchor: &dyn WatchReplayAnchorStore,
+    subscribe: F,
+    requested_rv: i64,
+) -> std::result::Result<(klights_watch::WatchSignalReceiver, WatchReplayPosition), Status>
+where
+    F: FnOnce() -> klights_watch::WatchSignalReceiver,
+{
+    // Subscribe before polling the durable anchor. Replay covers the prefix
+    // through the anchor while the receiver covers every later commit.
+    let signal_rx = subscribe();
+    let anchor = watch_anchor
+        .current_watch_replay_position()
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
+    let replay_position = if requested_rv <= 0 {
+        anchor
+    } else {
+        WatchReplayPosition::from_resource_version_through_event_id(requested_rv, anchor.event_id)
+    };
+    Ok((signal_rx, replay_position))
+}
 
 pub fn validate_join_metadata(join: &generated::JoinRequest) -> Result<DataplanePeerMetadata> {
     validate_join_metadata_with_endpoint(join, None)
@@ -199,6 +239,7 @@ pub fn insert_tonic_tcp_connect_info<B>(
 pub struct GrpcReplicationServer {
     service: Arc<ReplicationService>,
     db: DatastoreHandle,
+    positioned_watch: klights_watch::PositionedWatchService,
     pod_store: Arc<PodStore>,
     controller_dispatcher: Option<Arc<ControllerDispatcher>>,
     node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
@@ -236,9 +277,12 @@ impl GrpcReplicationServer {
     ) -> Self {
         let controlplane_ca_files = ControlplaneCaFiles::new(service.task_supervisor());
         let pod_store = Arc::new(PodStore::new(db.clone()));
+        let positioned_watch =
+            crate::control_plane::client::local::datastore_positioned_watch_service(db.clone());
         Self {
             service,
             db,
+            positioned_watch,
             pod_store,
             controller_dispatcher,
             node_lease_tracker,
@@ -1366,7 +1410,7 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
         // the new leader instead of streaming from a deposed node.
         let leadership_rx = self.sample_raft_leadership()?;
         let req = request.into_inner();
-        klights_leader_api::WatchRequest::try_new(
+        let watch_request = klights_leader_api::WatchRequest::try_new(
             req.api_version.clone(),
             req.kind.clone(),
             req.namespace.clone(),
@@ -1378,110 +1422,155 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                 .map(watch_replay_position_from_proto),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let topic = crate::watch::WatchTopic::new(&req.api_version, &req.kind);
-        // For new peers, the exact position came from the same read snapshot as
-        // LIST. For legacy scalar-RV peers, capture a durable high-water mark
-        // before synchronously subscribing, then filter the pre-anchor prefix
-        // by RV. Rows applied after the anchor are replayed by event ID even if
-        // their RV is lower than an earlier row.
-        let requested_position = req
-            .start_watch_replay_position
-            .as_ref()
-            .map(watch_replay_position_from_proto);
-        let replay_position = if let Some(position) = requested_position {
-            position
-        } else {
-            let anchor = self
-                .db
-                .current_watch_replay_position()
+        if canonical_positioned_watch_enabled() {
+            let positioned_stream = self
+                .positioned_watch
+                .watch_resources(watch_request)
                 .await
-                .map_err(|err| Status::internal(err.to_string()))?;
-            WatchReplayPosition::from_resource_version_through_event_id(
-                req.start_resource_version,
-                anchor.event_id,
-            )
-        };
-        Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
-        // No await is permitted between the durable anchor above and this
-        // subscription. Replay closes the anchor->subscribe interval.
-        let signal_rx = self.db.subscribe_watch_signals(topic.clone());
-        let replay_source = DatastoreWatchReplaySource::new(
-            std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                self.db.clone(),
-            )),
-            vec![watch_target_for_request(&req)],
-        );
-        let scope: crate::watch::WatchDeliveryScope = watch_delivery_scope_for_request(&req);
-        let supervisor = self.service.task_supervisor();
-        let heartbeat_interval = self.watch_heartbeat_interval;
-        // Clone the leadership signal into the stream so the loop can race it
-        // against the broadcast recv and terminate promptly on a leadership
-        // change. Without this a deposed leader's broadcast goes silent and the
-        // worker waits up to its ~60s idle watchdog before reconnecting, reading
-        // stale informer-cached state in the window.
-        let mut leader_rx = leadership_rx;
-        let stream = async_stream::stream! {
-            let mut last_rv = req
-                .start_resource_version
-                .max(replay_position.resource_version);
-            let mut cursor = crate::watch::SignalWatchCursor::new_many_at_position(
-                signal_rx,
-                replay_source,
-                vec![topic],
-                scope,
-                last_rv,
-                replay_position,
-                crate::watch::WindowPolicy::default_watch_delivery(),
-            );
-            if let Err(err) = cursor.prime_replay_or_expired().await {
-                yield Err(watch_cursor_error_to_status(err, cursor.accepted_rv()));
-                return;
-            }
-            // bug-grpc B2: per-stream heartbeat. The previous code reset the
-            // heartbeat deadline on every loop iteration, so continuous
-            // *non-matching* broadcast traffic (the global firehose carries
-            // every kind) starved a quiet *matching* stream's BOOKMARK — the
-            // worker then idle-reconnected every window. Track when THIS stream
-            // last yielded (an event or a bookmark) and wait only the remaining
-            // time; a filtered-out event does NOT reset the clock, so the
-            // bookmark still fires on schedule under unrelated traffic.
-            let mut last_yield_at = Instant::now();
-            loop {
-                let elapsed = last_yield_at.elapsed();
-                if elapsed >= heartbeat_interval {
-                    yield Ok(watch_heartbeat_proto(
-                        &req.api_version,
-                        &req.kind,
-                        last_rv,
-                        cursor.processed_position(),
-                    ));
-                    last_yield_at = Instant::now();
-                    continue;
-                }
-                let wait = heartbeat_interval - elapsed;
-                // broadcast::Receiver::recv is cancel-safe, so dropping it on
-                // timeout loses no event. Race it against a leadership-loss
-                // signal (issue #4): if this node stops being the raft leader,
-                // end the stream so the worker reconnects to the new leader
-                // instead of idling on a deposed, silent broadcaster.
-                let recv = if let Some(leader_watch) = leader_rx.as_mut() {
-                    tokio::select! {
-                        biased;
-                        _ = watch_leadership_lost(leader_watch) => break,
-                        r = supervisor
-                            .timeout("grpc_watch_heartbeat", wait, cursor.next_event()) => r,
+                .map_err(leader_watch_error_to_status)?;
+            Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
+            let supervisor = self.service.task_supervisor();
+            let heartbeat_interval = self.watch_heartbeat_interval;
+            let mut leader_rx = leadership_rx;
+            let mut last_rv = req.start_resource_version;
+            let mut last_position = req
+                .start_watch_replay_position
+                .as_ref()
+                .map(watch_replay_position_from_proto)
+                .unwrap_or_else(|| WatchReplayPosition::from_resource_version(last_rv));
+            let stream = async_stream::stream! {
+                let mut positioned_stream = positioned_stream;
+                loop {
+                    let next = if let Some(leader_watch) = leader_rx.as_mut() {
+                        tokio::select! {
+                            biased;
+                            _ = watch_leadership_lost(leader_watch) => break,
+                            result = supervisor.timeout(
+                                "grpc_positioned_watch_heartbeat",
+                                heartbeat_interval,
+                                futures::StreamExt::next(&mut positioned_stream),
+                            ) => result,
+                        }
+                    } else {
+                        supervisor
+                            .timeout(
+                                "grpc_positioned_watch_heartbeat",
+                                heartbeat_interval,
+                                futures::StreamExt::next(&mut positioned_stream),
+                            )
+                            .await
+                    };
+                    let event = match next {
+                        Ok(Ok(Some(Ok(event)))) => event,
+                        Ok(Ok(Some(Err(error)))) => {
+                            yield Err(leader_watch_error_to_status(error));
+                            break;
+                        }
+                        Ok(Ok(None)) | Err(_) => break,
+                        Ok(Err(_elapsed)) => {
+                            yield Ok(watch_heartbeat_proto(
+                                &req.api_version,
+                                &req.kind,
+                                last_rv,
+                                last_position,
+                            ));
+                            continue;
+                        }
+                    };
+                    if let Some(position) = event.resume_position() {
+                        last_position = position;
                     }
-                } else {
-                    supervisor
-                        .timeout("grpc_watch_heartbeat", wait, cursor.next_event())
-                        .await
-                };
-                let event = match recv {
-                    Ok(Ok(event)) => event,
-                    // Idle past this stream's heartbeat window: emit a liveness
-                    // bookmark carrying the cursor so the client resumes
-                    // correctly, and reset the per-stream clock.
-                    Ok(Err(_elapsed)) => {
+                    last_rv = last_rv.max(event.resource().resource_version);
+                    yield Ok(generated::WatchEvent {
+                        event_type: event.event_type().as_str().to_string(),
+                        resource: Some(resource_to_proto(event.resource())),
+                        resume_position: event
+                            .resume_position()
+                            .map(watch_replay_position_to_proto),
+                    });
+                }
+            };
+            return Ok(Response::new(Box::pin(stream)));
+        }
+        #[cfg(test)]
+        {
+            let topic = klights_watch::WatchTopic::new(&req.api_version, &req.kind);
+            // For new peers, the exact position came from the same read snapshot as
+            // LIST. For legacy scalar-RV peers, capture a durable high-water mark
+            // before synchronously subscribing, then filter the pre-anchor prefix
+            // by RV. Rows applied after the anchor are replayed by event ID even if
+            // their RV is lower than an earlier row.
+            let requested_position = req
+                .start_watch_replay_position
+                .as_ref()
+                .map(watch_replay_position_from_proto);
+            let watch_anchor = crate::datastore::DatastoreBackendWatchStore::new(self.db.clone());
+            let (signal_rx, replay_position) = if let Some(position) = requested_position {
+                // Exact positioned continuations do not need to sample an anchor,
+                // but still install their wakeup edge before any later await.
+                (self.db.subscribe_watch_signals(topic.clone()), position)
+            } else {
+                subscribe_grpc_watch_handoff(
+                    &watch_anchor,
+                    || self.db.subscribe_watch_signals(topic.clone()),
+                    req.start_resource_version,
+                )
+                .await?
+            };
+            let resource_scope =
+                crate::control_plane::client::local::datastore_watch_resource_scope(
+                    self.db.as_ref(),
+                    &req.api_version,
+                    &req.kind,
+                )
+                .await
+                .map_err(leader_watch_error_to_status)?;
+            Self::require_raft_leadership_unchanged(leadership_rx.as_ref())?;
+            let replay_source = DatastoreWatchReplaySource::new(
+                std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
+                    self.db.clone(),
+                )),
+                vec![watch_target_for_request(&req, resource_scope)],
+            );
+            let scope: crate::watch::WatchDeliveryScope =
+                watch_delivery_scope_for_request(&req, resource_scope);
+            let supervisor = self.service.task_supervisor();
+            let heartbeat_interval = self.watch_heartbeat_interval;
+            // Clone the leadership signal into the stream so the loop can race it
+            // against the broadcast recv and terminate promptly on a leadership
+            // change. Without this a deposed leader's broadcast goes silent and the
+            // worker waits up to its ~60s idle watchdog before reconnecting, reading
+            // stale informer-cached state in the window.
+            let mut leader_rx = leadership_rx;
+            let stream = async_stream::stream! {
+                let mut last_rv = req
+                    .start_resource_version
+                    .max(replay_position.resource_version);
+                let mut cursor = crate::watch::SignalWatchCursor::new_many_at_position(
+                    signal_rx,
+                    replay_source,
+                    vec![topic],
+                    scope,
+                    last_rv,
+                    replay_position,
+                    crate::watch::WindowPolicy::default_watch_delivery(),
+                );
+                if let Err(err) = cursor.prime_replay_or_expired().await {
+                    yield Err(watch_cursor_error_to_status(err, cursor.accepted_rv()));
+                    return;
+                }
+                // bug-grpc B2: per-stream heartbeat. The previous code reset the
+                // heartbeat deadline on every loop iteration, so continuous
+                // *non-matching* broadcast traffic (the global firehose carries
+                // every kind) starved a quiet *matching* stream's BOOKMARK — the
+                // worker then idle-reconnected every window. Track when THIS stream
+                // last yielded (an event or a bookmark) and wait only the remaining
+                // time; a filtered-out event does NOT reset the clock, so the
+                // bookmark still fires on schedule under unrelated traffic.
+                let mut last_yield_at = Instant::now();
+                loop {
+                    let elapsed = last_yield_at.elapsed();
+                    if elapsed >= heartbeat_interval {
                         yield Ok(watch_heartbeat_proto(
                             &req.api_version,
                             &req.kind,
@@ -1491,36 +1580,72 @@ impl generated::replication_server::Replication for GrpcReplicationServer {
                         last_yield_at = Instant::now();
                         continue;
                     }
-                    // Supervisor declined the timer (root shutdown): end stream.
-                    Err(_shutdown) => break,
-                };
-                let event = match event {
-                    Ok(event) => event,
-                    Err(crate::watch::WatchCursorError::Closed) => break,
-                    Err(err) => {
-                        yield Err(watch_cursor_error_to_status(err, cursor.accepted_rv()));
-                        return;
+                    let wait = heartbeat_interval - elapsed;
+                    // broadcast::Receiver::recv is cancel-safe, so dropping it on
+                    // timeout loses no event. Race it against a leadership-loss
+                    // signal (issue #4): if this node stops being the raft leader,
+                    // end the stream so the worker reconnects to the new leader
+                    // instead of idling on a deposed, silent broadcaster.
+                    let recv = if let Some(leader_watch) = leader_rx.as_mut() {
+                        tokio::select! {
+                            biased;
+                            _ = watch_leadership_lost(leader_watch) => break,
+                            r = supervisor
+                                .timeout("grpc_watch_heartbeat", wait, cursor.next_event()) => r,
+                        }
+                    } else {
+                        supervisor
+                            .timeout("grpc_watch_heartbeat", wait, cursor.next_event())
+                            .await
+                    };
+                    let event = match recv {
+                        Ok(Ok(event)) => event,
+                        // Idle past this stream's heartbeat window: emit a liveness
+                        // bookmark carrying the cursor so the client resumes
+                        // correctly, and reset the per-stream clock.
+                        Ok(Err(_elapsed)) => {
+                            yield Ok(watch_heartbeat_proto(
+                                &req.api_version,
+                                &req.kind,
+                                last_rv,
+                                cursor.processed_position(),
+                            ));
+                            last_yield_at = Instant::now();
+                            continue;
+                        }
+                        // Supervisor declined the timer (root shutdown): end stream.
+                        Err(_shutdown) => break,
+                    };
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(crate::watch::WatchCursorError::Closed) => break,
+                        Err(err) => {
+                            yield Err(watch_cursor_error_to_status(err, cursor.accepted_rv()));
+                            return;
+                        }
+                    };
+                    if !watch_event_should_stream(&event, &req) {
+                        continue;
                     }
-                };
-                if !watch_event_should_stream(&event, &req) {
-                    continue;
+                    let resource = resource_from_event(&event);
+                    let rv = resource.resource_version;
+                    let event_type = watch_event_type(&event).to_string();
+                    yield Ok(generated::WatchEvent {
+                        event_type,
+                        resource: Some(resource_to_proto(&resource)),
+                        resume_position: Some(watch_replay_position_to_proto(cursor.processed_position())),
+                    });
+                    if rv > 0 {
+                        cursor.accept_event(rv);
+                        last_rv = last_rv.max(rv);
+                    }
+                    last_yield_at = Instant::now();
                 }
-                let resource = resource_from_event(&event);
-                let rv = resource.resource_version;
-                let event_type = watch_event_type(&event).to_string();
-                yield Ok(generated::WatchEvent {
-                    event_type,
-                    resource: Some(resource_to_proto(&resource)),
-                    resume_position: Some(watch_replay_position_to_proto(cursor.processed_position())),
-                });
-                if rv > 0 {
-                    cursor.accept_event(rv);
-                    last_rv = last_rv.max(rv);
-                }
-                last_yield_at = Instant::now();
-            }
-        };
-        Ok(Response::new(Box::pin(stream)))
+            };
+            return Ok(Response::new(Box::pin(stream)));
+        }
+        #[cfg(not(test))]
+        unreachable!("canonical positioned-watch adapter is always enabled")
     }
 
     async fn projected_service_account_token(
@@ -2417,7 +2542,9 @@ where
     call(router).await.map_err(|err| err.to_string())
 }
 
-fn resource_to_proto(resource: &crate::datastore::Resource) -> generated::ResourceObject {
+pub(crate) fn resource_to_proto(
+    resource: &crate::datastore::Resource,
+) -> generated::ResourceObject {
     let mut data = (*resource.data).clone();
     if let Some(root) = data.as_object_mut() {
         root.insert(
@@ -2651,6 +2778,7 @@ fn watch_heartbeat_proto(
     }
 }
 
+#[cfg(test)]
 fn watch_cursor_error_to_status(err: crate::watch::WatchCursorError, accepted_rv: i64) -> Status {
     match err {
         crate::watch::WatchCursorError::Expired => watch_replay_expired_status(
@@ -2666,6 +2794,7 @@ fn watch_cursor_error_to_status(err: crate::watch::WatchCursorError, accepted_rv
     }
 }
 
+#[cfg(test)]
 fn watch_event_should_stream(
     event: &crate::watch::WatchEvent,
     req: &generated::WatchResourcesRequest,
@@ -2684,6 +2813,7 @@ fn watch_event_should_stream(
     event.event_type == crate::watch::EventType::Modified && selector_may_change_membership(req)
 }
 
+#[cfg(test)]
 fn selector_may_change_membership(req: &generated::WatchResourcesRequest) -> bool {
     if req
         .label_selector
@@ -2728,7 +2858,11 @@ async fn watch_leadership_lost(leader_rx: &mut tokio::sync::watch::Receiver<bool
     let _ = leader_rx.changed().await;
 }
 
-fn watch_target_for_request(req: &generated::WatchResourcesRequest) -> WatchTarget {
+#[cfg(test)]
+fn watch_target_for_request(
+    req: &generated::WatchResourcesRequest,
+    resource_scope: klights_watch::WatchResourceScope,
+) -> WatchTarget {
     if let Some(namespace) = req.namespace.as_ref() {
         return WatchTarget::namespaced_in_namespace(
             req.api_version.clone(),
@@ -2736,28 +2870,47 @@ fn watch_target_for_request(req: &generated::WatchResourcesRequest) -> WatchTarg
             namespace.clone(),
         );
     }
-    // Share the canonical scope list with the datastore/API scope logic instead
-    // of maintaining a second list here, which drifted out of sync and
-    // misclassified cluster-scoped kinds such as CSIDriver, CSINode,
-    // VolumeAttachment, IngressClass, IPAddress, ServiceCIDR, and the
-    // validating admission policy types as namespaced on the watch replay path.
-    if crate::datastore::sqlite::scope::is_namespaced(&req.kind) {
-        WatchTarget::namespaced(req.api_version.clone(), req.kind.clone())
-    } else {
-        WatchTarget::cluster(req.api_version.clone(), req.kind.clone())
+    match resource_scope {
+        klights_watch::WatchResourceScope::Namespaced => {
+            WatchTarget::namespaced(req.api_version.clone(), req.kind.clone())
+        }
+        klights_watch::WatchResourceScope::Cluster => {
+            WatchTarget::cluster(req.api_version.clone(), req.kind.clone())
+        }
     }
 }
 
+#[cfg(test)]
 fn watch_delivery_scope_for_request(
     req: &generated::WatchResourcesRequest,
+    resource_scope: klights_watch::WatchResourceScope,
 ) -> crate::watch::WatchDeliveryScope {
     if let Some(namespace) = req.namespace.as_ref() {
         return crate::watch::WatchDeliveryScope::Namespaced(namespace.clone());
     }
-    if crate::datastore::sqlite::scope::is_namespaced(&req.kind) {
-        crate::watch::WatchDeliveryScope::NamespacedAll
-    } else {
-        crate::watch::WatchDeliveryScope::Cluster
+    match resource_scope {
+        klights_watch::WatchResourceScope::Namespaced => {
+            crate::watch::WatchDeliveryScope::NamespacedAll
+        }
+        klights_watch::WatchResourceScope::Cluster => crate::watch::WatchDeliveryScope::Cluster,
+    }
+}
+
+fn leader_watch_error_to_status(error: klights_leader_api::LeaderWatchError) -> Status {
+    match error {
+        error @ klights_leader_api::LeaderWatchError::ReplayExpired {
+            accepted_resource_version,
+        } => crate::replication::grpc::watch_replay_expired_status(
+            accepted_resource_version,
+            error.to_string(),
+        ),
+        klights_leader_api::LeaderWatchError::InvalidRequest { .. } => {
+            Status::invalid_argument(error.to_string())
+        }
+        klights_leader_api::LeaderWatchError::Unavailable { .. } => {
+            Status::unavailable(error.to_string())
+        }
+        _ => Status::internal(error.to_string()),
     }
 }
 
@@ -3129,7 +3282,10 @@ fn node_metrics_response_from_proto(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use crate::datastore::backend::{DatastoreBackend, DatastoreHandle};
     use crate::datastore::command::{
@@ -3148,11 +3304,80 @@ mod tests {
     use crate::replication::protocol::ReplicationEntry;
     use crate::replication::service::ReplicationService;
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use async_trait::async_trait;
     use tokio::sync::mpsc;
     use tonic_reflection::pb::v1::{
         ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
         server_reflection_request, server_reflection_response,
     };
+
+    #[test]
+    fn positioned_replay_expiry_keeps_the_typed_grpc_relist_marker() {
+        let status = super::leader_watch_error_to_status(
+            klights_leader_api::LeaderWatchError::ReplayExpired {
+                accepted_resource_version: 73,
+            },
+        );
+        assert!(crate::replication::grpc::is_watch_replay_expired_status(
+            &status
+        ));
+        assert_eq!(
+            crate::replication::grpc::watch_replay_expired_resource_version(&status),
+            Some(73)
+        );
+    }
+
+    struct OrderedGrpcWatchAnchor {
+        subscribed: Arc<AtomicBool>,
+        position: WatchReplayPosition,
+    }
+
+    #[async_trait]
+    impl crate::datastore::backend::WatchReplayAnchorStore for OrderedGrpcWatchAnchor {
+        async fn current_watch_replay_position(&self) -> anyhow::Result<WatchReplayPosition> {
+            assert!(
+                self.subscribed.load(Ordering::Acquire),
+                "gRPC watch must install its signal subscriber before polling the anchor port"
+            );
+            Ok(self.position)
+        }
+
+        async fn snapshot_resources_at_position(
+            &self,
+            _targets: &[crate::datastore::WatchTarget],
+            _label_selector: Option<&str>,
+            _field_selector: Option<&str>,
+            _position: WatchReplayPosition,
+        ) -> anyhow::Result<crate::datastore::SnapshotAtRv> {
+            panic!("handoff ordering does not read a snapshot")
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_watch_subscribes_before_the_first_anchor_await() {
+        let subscribed = Arc::new(AtomicBool::new(false));
+        let expected = WatchReplayPosition {
+            resource_version: 31,
+            event_id: 37,
+            resource_version_filter_through_event_id: 0,
+        };
+        let anchor = OrderedGrpcWatchAnchor {
+            subscribed: subscribed.clone(),
+            position: expected,
+        };
+        let (receiver, observed) = super::subscribe_grpc_watch_handoff(
+            &anchor,
+            || {
+                subscribed.store(true, Ordering::Release);
+                klights_watch::WatchSignalReceiver::closed()
+            },
+            0,
+        )
+        .await
+        .expect("ordered handoff");
+        drop(receiver);
+        assert_eq!(observed, expected);
+    }
 
     #[test]
     fn node_metrics_wire_conversions_preserve_correlation_and_sample_fields() {
@@ -3375,7 +3600,10 @@ mod tests {
             "ClusterRole",
             "PriorityLevelConfiguration",
         ] {
-            let target = super::watch_target_for_request(&watch_request_for_kind(kind, None));
+            let target = super::watch_target_for_request(
+                &watch_request_for_kind(kind, None),
+                klights_watch::WatchResourceScope::Cluster,
+            );
             assert_eq!(
                 target.scope,
                 WatchTargetScope::Cluster,
@@ -3388,13 +3616,16 @@ mod tests {
     fn watch_target_classifies_namespaced_kinds() {
         use crate::datastore::types::WatchTargetScope;
 
-        let target = super::watch_target_for_request(&watch_request_for_kind("ConfigMap", None));
+        let target = super::watch_target_for_request(
+            &watch_request_for_kind("ConfigMap", None),
+            klights_watch::WatchResourceScope::Namespaced,
+        );
         assert_eq!(target.scope, WatchTargetScope::Namespaced(None));
 
-        let scoped = super::watch_target_for_request(&watch_request_for_kind(
-            "ConfigMap",
-            Some("kube-system"),
-        ));
+        let scoped = super::watch_target_for_request(
+            &watch_request_for_kind("ConfigMap", Some("kube-system")),
+            klights_watch::WatchResourceScope::Namespaced,
+        );
         assert_eq!(
             scoped.scope,
             WatchTargetScope::Namespaced(Some("kube-system".to_string()))
@@ -4060,6 +4291,135 @@ mod tests {
             "test setup must start before the first ConfigMap event"
         );
         (db, resume_rv)
+    }
+
+    async fn register_grpc_watch_scope_crd(
+        db: &DatastoreHandle,
+        group: &str,
+        kind: &str,
+        plural: &str,
+        namespaced: bool,
+    ) {
+        db.create_resource(
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            &format!("{plural}.{group}"),
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": {"name": format!("{plural}.{group}")},
+                "spec": {
+                    "group": group,
+                    "scope": if namespaced { "Namespaced" } else { "Cluster" },
+                    "names": {"kind": kind, "plural": plural, "singular": plural},
+                    "versions": [{"name": "v1", "served": true, "storage": true}]
+                }
+            }),
+        )
+        .await
+        .expect("register CRD scope metadata");
+    }
+
+    fn custom_resource_watch_request(
+        api_version: &str,
+        kind: &str,
+    ) -> generated::WatchResourcesRequest {
+        generated::WatchResourcesRequest {
+            api_version: api_version.to_string(),
+            kind: kind.to_string(),
+            namespace: None,
+            field_selector: None,
+            start_resource_version: 0,
+            label_selector: None,
+            start_watch_replay_position: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_watch_resolves_namespaced_crd_for_all_namespaces_delivery() {
+        use futures::StreamExt;
+
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        register_grpc_watch_scope_crd(&db, "example.com", "Widget", "widgets", true).await;
+        let (grpc, _leader_tx) = grpc_leader_server_with_db(db.clone(), true).await;
+        let mut stream = grpc
+            .watch_resources(request_with_node_client_cert(
+                custom_resource_watch_request("example.com/v1", "Widget"),
+                "worker-1",
+            ))
+            .await
+            .expect("namespaced CRD watch opens")
+            .into_inner();
+
+        db.create_resource(
+            "example.com/v1",
+            "Widget",
+            Some("default"),
+            "namespaced",
+            serde_json::json!({
+                "apiVersion": "example.com/v1",
+                "kind": "Widget",
+                "metadata": {"namespace": "default", "name": "namespaced"}
+            }),
+        )
+        .await
+        .expect("create namespaced custom resource");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("all-namespaces CRD watch must receive namespaced events")
+            .expect("watch stream yields")
+            .expect("watch stream stays healthy");
+        assert_eq!(
+            event.resource.expect("event resource").namespace.as_deref(),
+            Some("default")
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_watch_resolves_cluster_scoped_crd_delivery() {
+        use futures::StreamExt;
+
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        register_grpc_watch_scope_crd(
+            &db,
+            "cluster.example.com",
+            "ClusterWidget",
+            "clusterwidgets",
+            false,
+        )
+        .await;
+        let (grpc, _leader_tx) = grpc_leader_server_with_db(db.clone(), true).await;
+        let mut stream = grpc
+            .watch_resources(request_with_node_client_cert(
+                custom_resource_watch_request("cluster.example.com/v1", "ClusterWidget"),
+                "worker-1",
+            ))
+            .await
+            .expect("cluster CRD watch opens")
+            .into_inner();
+
+        db.create_resource(
+            "cluster.example.com/v1",
+            "ClusterWidget",
+            None,
+            "clustered",
+            serde_json::json!({
+                "apiVersion": "cluster.example.com/v1",
+                "kind": "ClusterWidget",
+                "metadata": {"name": "clustered"}
+            }),
+        )
+        .await
+        .expect("create cluster custom resource");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("cluster CRD watch must receive cluster events")
+            .expect("watch stream yields")
+            .expect("watch stream stays healthy");
+        assert_eq!(event.resource.expect("event resource").namespace, None);
     }
 
     #[tokio::test]

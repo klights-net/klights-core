@@ -1,1 +1,20 @@
-//! Kubernetes watch support for klights.
+//! Active Kubernetes LIST-to-WATCH delivery for klights.
+//!
+//! Durable history remains behind `klights-cluster-store`, while the request,
+//! event, error, and stream values remain owned by `klights-leader-api`.
+
+mod cache;
+mod filter;
+mod session;
+mod signal;
+
+pub use cache::{WatchCache, WatchCacheError};
+pub use session::{
+    PositionedWatchService, ProjectedWatchBaselineRead, ProjectedWatchBaselineRequest,
+    ProjectedWatchPlan, WatchResourceProjection, WatchResourceScope, WatchScopeResolver,
+};
+pub use signal::{
+    DEFAULT_WATCH_ADVANCE_GROUP_LIMIT, WatchAdvance, WatchSignal, WatchSignalEvent,
+    WatchSignalFuture, WatchSignalHub, WatchSignalReceiveError, WatchSignalReceiver,
+    WatchSignalSubscribe, WatchSignalSubscription, WatchSignalTryReceiveError, WatchTopic,
+};

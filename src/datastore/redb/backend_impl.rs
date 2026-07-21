@@ -19,7 +19,9 @@ use crate::datastore::redb::helpers;
 use crate::datastore::redb::tables;
 use crate::datastore::types::*;
 use crate::networking::types::HostPortRange;
-use crate::watch::{WatchSignal, WatchTopic};
+#[cfg(test)]
+use klights_watch::WatchSignal;
+use klights_watch::WatchTopic;
 
 use super::RedbDatastore;
 
@@ -133,7 +135,7 @@ impl DatastoreBackend for RedbDatastore {
         self.accessor.close();
     }
 
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         self.watch_bus.subscribe_signals(topic)
     }
 

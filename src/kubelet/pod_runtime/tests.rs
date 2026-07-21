@@ -6141,7 +6141,7 @@ async fn reconcile_runtime_duplicate_status_does_not_emit_second_watch_event() {
         .unwrap();
     let mut watch_rx = harness
         .db_handle
-        .subscribe_watch(crate::watch::WatchTopic::new("v1", "Pod"));
+        .subscribe_watch(klights_watch::WatchTopic::new("v1", "Pod"));
     harness
         .store
         .record_sandbox(&key, "sandbox-dedup")

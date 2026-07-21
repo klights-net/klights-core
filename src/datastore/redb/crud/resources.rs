@@ -17,38 +17,6 @@ use crate::datastore::sqlite::{create_pending_watch_event, publish_pending};
 use crate::datastore::types::*;
 use crate::watch::WatchBus;
 
-/// Check whether a single JSON value matches a field selector string.
-/// Used inside the DB closure where we filter candidates row-by-row.
-fn value_matches_field_selector(data: &Value, selector: &str) -> bool {
-    if selector.is_empty() {
-        return true;
-    }
-    for part in selector.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (path, expected, is_eq) = if let Some(idx) = part.find("!=") {
-            (&part[..idx].trim(), &part[idx + 2..].trim(), false)
-        } else if let Some(idx) = part.find('=') {
-            (&part[..idx].trim(), &part[idx + 1..].trim(), true)
-        } else {
-            continue;
-        };
-        let actual = helpers::resolve_field_path(data, path);
-        let effective = actual.as_deref().or(if *expected == "false" {
-            Some("false")
-        } else {
-            None
-        });
-        let matches = effective == Some(expected);
-        if is_eq != matches {
-            return false;
-        }
-    }
-    true
-}
-
 pub struct RedbResourceStore {
     accessor: Arc<RedbAccessor>,
     watch_bus: Arc<WatchBus>,
@@ -905,6 +873,10 @@ impl RedbResourceStore {
         } else {
             None
         };
+        let parsed_field_selector = fs_owned
+            .as_deref()
+            .map(klights_types::FieldSelector::parse)
+            .transpose()?;
 
         let result = self
             .db_call("list_res", move |db| {
@@ -966,8 +938,8 @@ impl RedbResourceStore {
                             }
 
                             // Field selector filter
-                            if let Some(ref fs) = fs_owned
-                                && !value_matches_field_selector(&data, fs)
+                            if let Some(ref selector) = parsed_field_selector
+                                && !selector.matches_resource(&data)
                             {
                                 continue;
                             }
@@ -1672,7 +1644,7 @@ mod tests {
         let supervisor = Arc::new(TaskSupervisor::new(Default::default()));
         let accessor = Arc::new(RedbAccessor::new(Arc::new(db), supervisor));
         let watch_bus = Arc::new(WatchBus::new(256));
-        let mut watch_rx = watch_bus.subscribe(crate::watch::WatchTopic::new("v1", "Pod"));
+        let mut watch_rx = watch_bus.subscribe(klights_watch::WatchTopic::new("v1", "Pod"));
         let s = RedbResourceStore::new(accessor, watch_bus);
 
         let pod =

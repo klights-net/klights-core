@@ -62,10 +62,10 @@ pub fn should_wake_scheduler(event: &crate::watch::WatchEvent) -> bool {
 /// Disabled by default — call this only when config.enabled = true.
 pub async fn run_scheduler_watch(state: Arc<AppState>, cancel: CancellationToken) {
     let db = state.db.clone();
-    let mut signal_rx = crate::watch::WatchSignalReceiver::new(
+    let mut signal_rx = klights_watch::WatchSignalReceiver::new(
         [
-            crate::watch::WatchTopic::new("v1", "Pod"),
-            crate::watch::WatchTopic::new("v1", "Node"),
+            klights_watch::WatchTopic::new("v1", "Pod"),
+            klights_watch::WatchTopic::new("v1", "Node"),
         ]
         .into_iter()
         .map(|topic| db.subscribe_watch_signals(topic))
@@ -101,7 +101,7 @@ pub async fn run_scheduler_watch(state: Arc<AppState>, cancel: CancellationToken
                         tracing::warn!("scheduler reconcile failed: {e:#}");
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                Err(klights_watch::WatchSignalReceiveError::Lagged(n)) => {
                     tracing::warn!(
                         "scheduler watch signals lagged by {n}; running full unbound-pod sweep"
                     );
@@ -110,7 +110,7 @@ pub async fn run_scheduler_watch(state: Arc<AppState>, cancel: CancellationToken
                     }
                     last_seen_rv = db.get_current_resource_version().await.unwrap_or(last_seen_rv);
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(klights_watch::WatchSignalReceiveError::Closed) => break,
             }
         }
     }

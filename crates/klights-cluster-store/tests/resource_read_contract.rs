@@ -240,6 +240,15 @@ fn list_snapshot_rejects_inexact_or_negative_positions() {
 }
 
 #[test]
+fn list_snapshot_accepts_a_valid_scalar_rv_handoff_position() {
+    let position = WatchReplayPosition::from_resource_version_through_event_id(17, 29);
+    let snapshot = ResourceListSnapshot::try_new(position)
+        .expect("a scalar resourceVersion handoff is an exact composite LIST boundary");
+
+    assert_eq!(snapshot.position(), position);
+}
+
+#[test]
 fn resource_read_errors_preserve_kubernetes_semantics() {
     let errors = [
         ResourceReadError::InvalidSelector {

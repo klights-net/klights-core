@@ -1,9 +1,10 @@
 use super::signal_replay_cursor_core::SignalReplayCursorCore;
 use super::{
     WatchCursorError, WatchDeliveryScope, WatchEvent, WatchEventFilter, WatchReplaySource,
-    WatchSignalReceiver, WatchTopic, WindowPolicy,
+    WindowPolicy,
 };
 use crate::datastore::WatchReplayPosition;
+use klights_watch::{WatchSignalReceiver, WatchTopic};
 
 pub struct SignalWatchCursor<S>
 where

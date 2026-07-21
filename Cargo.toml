@@ -54,6 +54,7 @@ klights-types = { path = "crates/klights-types" }
 klights-cluster-core = { path = "crates/klights-cluster-core" }
 klights-cluster-store = { path = "crates/klights-cluster-store" }
 klights-leader-api = { path = "crates/klights-leader-api" }
+klights-watch = { path = "crates/klights-watch" }
 klights-node-store = { path = "crates/klights-node-store" }
 klights-node-api = { path = "crates/klights-node-api" }
 klights-pod-api = { path = "crates/klights-pod-api" }
@@ -190,6 +191,7 @@ klights-types = { workspace = true }
 klights-cluster-core = { workspace = true }
 klights-cluster-store = { workspace = true }
 klights-leader-api = { workspace = true }
+klights-watch = { workspace = true }
 klights-node-api = { workspace = true }
 klights-pod-api = { workspace = true }
 klights-reconcile-api = { workspace = true }

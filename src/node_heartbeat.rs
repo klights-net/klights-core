@@ -2,11 +2,11 @@ use crate::datastore::WatchTarget;
 use crate::kubelet::pod_watch_source::BoxedWatchReplaySource;
 use crate::utils::k8s_microtime_now;
 use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchSignal,
-    WatchTopic, WindowPolicy,
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_watch::WatchTopic;
 use std::time::Duration;
 
 fn is_node_heartbeat_event(event: &WatchEvent, node_name: &str) -> bool {
@@ -45,10 +45,7 @@ pub(crate) fn build_lease(node_name: &str) -> serde_json::Value {
 
 #[async_trait]
 pub trait NodeHeartbeatWatchSource: Send + Sync {
-    fn subscribe_watch_signals(
-        &self,
-        topic: WatchTopic,
-    ) -> tokio::sync::broadcast::Receiver<WatchSignal>;
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver;
 
     fn replay_source(&self, targets: Vec<WatchTarget>) -> BoxedWatchReplaySource;
 

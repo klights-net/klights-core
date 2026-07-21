@@ -416,7 +416,7 @@ impl PodStore {
     pub(super) fn subscribe_watch(&self) -> broadcast::Receiver<WatchEvent> {
         DatastoreBackend::subscribe_watch(
             self.db.as_ref(),
-            crate::watch::WatchTopic::new("v1", "Pod"),
+            klights_watch::WatchTopic::new("v1", "Pod"),
         )
     }
 }

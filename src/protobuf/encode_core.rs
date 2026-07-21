@@ -41,6 +41,7 @@ pub(crate) fn supports_raw_json_protobuf_resource(api_version: &str, kind: &str)
     global_oo_registry().handles_raw_json_encoding(api_version, kind)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_protobuf_resource_from_json_bytes(
     api_version: &str,
     kind: &str,

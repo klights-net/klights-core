@@ -602,12 +602,9 @@ impl Datastore {
             // and residual conditions.
             let field_pushdown = field_selector
                 .map(split_sql_pushdown_conditions)
+                .transpose()?
                 .unwrap_or_default();
-            let field_conditions_raw = if field_pushdown.residual_selector.is_empty() {
-                Vec::new()
-            } else {
-                parse_field_selector_conditions(&field_pushdown.residual_selector)
-            };
+            let field_conditions_raw = field_pushdown.residual_fields;
 
             let event_compat_selector = needs_event_v1_compat(api_version, kind);
 
@@ -1173,16 +1170,12 @@ impl Datastore {
         let no_limit_field_pushdown = if has_selectors {
             field_selector
                 .map(split_sql_pushdown_conditions)
+                .transpose()?
                 .unwrap_or_default()
         } else {
             Default::default()
         };
-        let no_limit_field_conditions =
-            if has_selectors && !no_limit_field_pushdown.residual_selector.is_empty() {
-                parse_field_selector_conditions(&no_limit_field_pushdown.residual_selector)
-            } else {
-                Vec::new()
-            };
+        let no_limit_field_conditions = no_limit_field_pushdown.residual_fields;
 
         let (items, watch_position, pending_reserved_rv) = if use_namespaced_table(
             api_version,

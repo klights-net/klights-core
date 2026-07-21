@@ -330,6 +330,29 @@ impl WatchHistoryPage {
         })
     }
 
+    pub fn validate_after(&self, requested: WatchReplayPosition) -> Result<(), WatchHistoryError> {
+        requested
+            .validate()
+            .map_err(|message| WatchHistoryError::CorruptData { message })?;
+        let mut cursor = requested;
+        for event in &self.events {
+            cursor = cursor
+                .advance_through_event(event.position)
+                .map_err(|message| WatchHistoryError::CorruptData {
+                    message: format!("invalid watch-history event continuation: {message}"),
+                })?;
+        }
+        if !cursor.permits_successor(self.next_position) {
+            return Err(WatchHistoryError::CorruptData {
+                message: format!(
+                    "watch-history page position {:?} is not a canonical continuation of {cursor:?}",
+                    self.next_position
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub fn events(&self) -> &[PositionedWatchEvent<DurableWatchEvent>] {
         &self.events
     }
@@ -537,26 +560,15 @@ fn validate_replay_target(target: &DurableReplayTarget) -> Result<(), WatchHisto
     Ok(())
 }
 
-fn validate_replay_position(position: WatchReplayPosition, exact: bool) -> Result<(), String> {
-    if position.resource_version < 0
-        || position.event_id < 0
-        || position.resource_version_filter_through_event_id < 0
-    {
-        return Err(format!(
-            "replay position must be non-negative: {position:?}"
-        ));
+pub(crate) fn validate_replay_position(
+    position: WatchReplayPosition,
+    exact: bool,
+) -> Result<(), String> {
+    if exact {
+        position.validate_exact()
+    } else {
+        position.validate()
     }
-    if position.resource_version_filter_through_event_id > position.event_id {
-        return Err(format!(
-            "replay position filter boundary exceeds event boundary: {position:?}"
-        ));
-    }
-    if exact && position.resource_version_filter_through_event_id != 0 {
-        return Err(format!(
-            "exact allocator position must not carry a composite filter: {position:?}"
-        ));
-    }
-    Ok(())
 }
 
 /// Heap-erased future used by the coarse durable-history boundary.

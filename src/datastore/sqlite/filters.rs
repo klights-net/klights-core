@@ -14,105 +14,20 @@ pub(super) fn resolve_field_path<'a>(
     data: &'a Value,
     path: &str,
 ) -> Option<std::borrow::Cow<'a, str>> {
-    fn non_empty_str(value: Option<&Value>) -> Option<&str> {
-        value.and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-    }
-
-    if path == "source" {
-        if let Some(component) = non_empty_str(data.get("source").and_then(|s| s.get("component")))
-        {
-            return Some(std::borrow::Cow::Borrowed(component));
-        }
-        if let Some(component) = non_empty_str(
-            data.get("deprecatedSource")
-                .and_then(|s| s.get("component")),
-        ) {
-            return Some(std::borrow::Cow::Borrowed(component));
-        }
-        if let Some(component) = non_empty_str(data.get("reportingController")) {
-            return Some(std::borrow::Cow::Borrowed(component));
-        }
-        if let Some(component) = non_empty_str(data.get("reportingComponent")) {
-            return Some(std::borrow::Cow::Borrowed(component));
-        }
-    }
-
-    if let Some(suffix) = path.strip_prefix("involvedObject.") {
-        let mut current = data
-            .get("involvedObject")
-            .or_else(|| data.get("regarding"))?;
-        for segment in suffix.split('.') {
-            current = current.get(segment)?;
-        }
-        return match current {
-            Value::String(s) => Some(std::borrow::Cow::Borrowed(s.as_str())),
-            Value::Bool(b) => Some(std::borrow::Cow::Owned(b.to_string())),
-            Value::Number(n) => Some(std::borrow::Cow::Owned(n.to_string())),
-            _ => None,
-        };
-    }
-
-    let mut current = data;
-    for segment in path.split('.') {
-        current = current.get(segment)?;
-    }
-    match current {
-        Value::String(s) => Some(std::borrow::Cow::Borrowed(s.as_str())),
-        Value::Bool(b) => Some(std::borrow::Cow::Owned(b.to_string())),
-        Value::Number(n) => Some(std::borrow::Cow::Owned(n.to_string())),
-        _ => None,
-    }
+    klights_types::resolve_field_value(data, path)
 }
 
 #[cfg(test)]
 pub fn filter_by_field_selector(items: Vec<Resource>, selector: &str) -> Vec<Resource> {
-    if selector.is_empty() {
-        return items;
-    }
-
-    let conditions: Vec<(&str, &str, bool)> = selector
-        .split(',')
-        .filter_map(|part| {
-            let part = part.trim();
-            if part.is_empty() {
-                return None;
-            }
-            if let Some(idx) = part.find("!=") {
-                let key = part[..idx].trim();
-                let value = part[idx + 2..].trim();
-                Some((key, value, false))
-            } else if let Some(idx) = part.find('=') {
-                let key = part[..idx].trim();
-                let value = part[idx + 1..].trim();
-                Some((key, value, true))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if conditions.is_empty() {
-        return items;
-    }
-
+    let selector = klights_types::FieldSelector::parse(selector)
+        .expect("API validation must reject malformed field selectors before datastore filtering");
     items
         .into_iter()
-        .filter(|item| {
-            conditions.iter().all(|(path, expected, is_eq)| {
-                let actual = resolve_field_path(&item.data, path);
-                let effective = actual.as_deref().or(if *expected == "false" {
-                    Some("false")
-                } else {
-                    None
-                });
-                let matches = effective == Some(*expected);
-                if *is_eq { matches } else { !matches }
-            })
-        })
+        .filter(|item| selector.matches_resource(&item.data))
         .collect()
 }
 
-pub(super) type FieldSelectorCondition = (String, String, bool);
+pub(super) type FieldSelectorCondition = klights_types::FieldRequirement;
 
 /// SQL-level pushdown plan for a field selector. The fields directly indexed
 /// in the namespaced/cluster tables (`name`, `namespace`) can become extra
@@ -122,85 +37,44 @@ pub(super) type FieldSelectorCondition = (String, String, bool);
 pub(super) struct SqlPushdownConditions {
     pub sql_name_eq: Option<String>,
     pub sql_namespace_eq: Option<String>,
-    pub residual_selector: String,
+    pub residual_fields: Vec<FieldSelectorCondition>,
 }
 
 /// Split a field selector string into SQL-pushdown-eligible equality conditions
 /// on `metadata.name` / `metadata.namespace` and the residual selector that
 /// must still be evaluated in Rust over the JSON body.
-pub(super) fn split_sql_pushdown_conditions(selector: &str) -> SqlPushdownConditions {
+pub(super) fn split_sql_pushdown_conditions(selector: &str) -> Result<SqlPushdownConditions> {
     let mut sql_name_eq: Option<String> = None;
     let mut sql_namespace_eq: Option<String> = None;
-    let mut residual: Vec<String> = Vec::new();
-
-    for part in selector.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        // Inequality (!=) is never pushed down — keep it residual.
-        if part.contains("!=") {
-            residual.push(part.to_string());
-            continue;
-        }
-        if let Some((key, value)) = part.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "metadata.name" if sql_name_eq.is_none() => {
-                    sql_name_eq = Some(value.to_string());
-                    continue;
-                }
-                "metadata.namespace" if sql_namespace_eq.is_none() => {
-                    sql_namespace_eq = Some(value.to_string());
-                    continue;
-                }
-                _ => {}
+    let mut residual_fields = Vec::new();
+    let parsed = klights_types::FieldSelector::parse(selector)?;
+    for requirement in parsed.requirements() {
+        let pushable = requirement.operator() == klights_types::FieldSelectorOperator::Equals
+            && !requirement.value().is_empty();
+        match requirement.field() {
+            "metadata.name" if pushable && sql_name_eq.is_none() => {
+                sql_name_eq = Some(requirement.value().to_string());
             }
+            "metadata.namespace" if pushable && sql_namespace_eq.is_none() => {
+                sql_namespace_eq = Some(requirement.value().to_string());
+            }
+            _ => residual_fields.push(requirement.clone()),
         }
-        residual.push(part.to_string());
     }
-
-    SqlPushdownConditions {
+    Ok(SqlPushdownConditions {
         sql_name_eq,
         sql_namespace_eq,
-        residual_selector: residual.join(","),
-    }
-}
-
-pub(super) fn parse_field_selector_conditions(selector: &str) -> Vec<FieldSelectorCondition> {
-    selector
-        .split(',')
-        .filter_map(|part| {
-            let part = part.trim();
-            if part.is_empty() {
-                return None;
-            }
-            if let Some(idx) = part.find("!=") {
-                let key = part[..idx].trim();
-                let value = part[idx + 2..].trim();
-                Some((key.to_string(), value.to_string(), false))
-            } else if let Some(idx) = part.find('=') {
-                let key = part[..idx].trim();
-                let value = part[idx + 1..].trim();
-                Some((key.to_string(), value.to_string(), true))
-            } else {
-                None
-            }
-        })
-        .collect()
+        residual_fields,
+    })
 }
 
 pub(super) fn matches_field_selector_conditions(
     data: &Value,
     conditions: &[FieldSelectorCondition],
 ) -> bool {
-    conditions.iter().all(|(path, expected, is_eq)| {
-        let actual = resolve_field_path(data, path);
-        let effective = actual.as_deref().or(if expected == "false" {
-            Some("false")
-        } else {
-            None
-        });
-        let matches = effective == Some(expected.as_str());
-        if *is_eq { matches } else { !matches }
-    })
+    conditions
+        .iter()
+        .all(|condition| condition.matches_resource(data))
 }
 
 #[cfg(test)]
@@ -218,40 +92,42 @@ mod sql_pushdown_tests {
 
     #[test]
     fn split_sql_pushdown_extracts_metadata_name_eq() {
-        let parsed = split_sql_pushdown_conditions("metadata.name=pod-9,status.phase=Running");
+        let parsed =
+            split_sql_pushdown_conditions("metadata.name=pod-9,status.phase=Running").unwrap();
         assert_eq!(parsed.sql_name_eq.as_deref(), Some("pod-9"));
         assert!(parsed.sql_namespace_eq.is_none());
-        assert_eq!(parsed.residual_selector, "status.phase=Running");
+        assert_eq!(parsed.residual_fields.len(), 1);
+        assert_eq!(parsed.residual_fields[0].field(), "status.phase");
     }
 
     #[test]
     fn split_sql_pushdown_extracts_metadata_namespace_eq() {
-        let parsed = split_sql_pushdown_conditions("metadata.namespace=kube-system");
+        let parsed = split_sql_pushdown_conditions("metadata.namespace=kube-system").unwrap();
         assert_eq!(parsed.sql_namespace_eq.as_deref(), Some("kube-system"));
         assert!(parsed.sql_name_eq.is_none());
-        assert!(parsed.residual_selector.is_empty());
+        assert!(parsed.residual_fields.is_empty());
     }
 
     #[test]
     fn split_sql_pushdown_keeps_inequality_residual() {
-        let parsed = split_sql_pushdown_conditions("metadata.name!=other");
+        let parsed = split_sql_pushdown_conditions("metadata.name!=other").unwrap();
         assert!(parsed.sql_name_eq.is_none());
-        assert_eq!(parsed.residual_selector, "metadata.name!=other");
+        assert_eq!(parsed.residual_fields.len(), 1);
     }
 
     #[test]
     fn split_sql_pushdown_keeps_unknown_keys_residual() {
-        let parsed = split_sql_pushdown_conditions("status.phase=Running");
+        let parsed = split_sql_pushdown_conditions("status.phase=Running").unwrap();
         assert!(parsed.sql_name_eq.is_none());
         assert!(parsed.sql_namespace_eq.is_none());
-        assert_eq!(parsed.residual_selector, "status.phase=Running");
+        assert_eq!(parsed.residual_fields.len(), 1);
     }
 
     #[test]
     fn split_sql_pushdown_handles_empty_selector() {
-        let parsed = split_sql_pushdown_conditions("");
+        let parsed = split_sql_pushdown_conditions("").unwrap();
         assert!(parsed.sql_name_eq.is_none());
         assert!(parsed.sql_namespace_eq.is_none());
-        assert!(parsed.residual_selector.is_empty());
+        assert!(parsed.residual_fields.is_empty());
     }
 }

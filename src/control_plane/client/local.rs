@@ -22,16 +22,15 @@ use crate::control_plane::client::{
     ProjectedServiceAccountTokenRequest, ResourceCommandError, ResourceCommandFuture,
     ResourceCommandRequest, ResourceCommandResult, ResourceGetRequest, ResourceListRequest,
     ResourceListResult, ResourceQueryFuture, WatchRequest, focused_dataplane, focused_node_subnet,
-    focused_watch_event, query_error, query_list_result,
+    query_error, query_list_result,
 };
 use crate::controller_dispatcher::ControllerDispatcher;
+use crate::datastore::cluster_store_adapter::{
+    DatastoreClusterResourceRead, DatastoreDurableAllocatorRead, DatastoreDurableWatchHistory,
+};
 use crate::datastore::command::StorageCommand;
 use crate::datastore::replicated::WriteRejection;
-use crate::datastore::sqlite::DatastoreWatchReplaySource;
-use crate::datastore::{
-    DatastoreBackendWatchStore, DatastoreHandle, PodCleanupIntent as StoredPodCleanupIntent,
-    Resource, SnapshotAtRv, WatchReplayAnchorStore, WatchTarget,
-};
+use crate::datastore::{DatastoreHandle, PodCleanupIntent as StoredPodCleanupIntent, Resource};
 use crate::kubelet::outbox::OutboxApplyError;
 use crate::kubelet::pod_repository::store::PodStore;
 
@@ -84,6 +83,7 @@ pub(crate) fn focused_pod_cleanup_intent(
 #[derive(Clone)]
 pub struct LocalApiClient {
     db: DatastoreHandle,
+    positioned_watch: klights_watch::PositionedWatchService,
     pod_store: Arc<PodStore>,
     raft: crate::datastore::raft::state_machine::N1Raft,
     authoring_node: String,
@@ -142,9 +142,11 @@ impl LocalApiClient {
         is_leader_rx: watch::Receiver<bool>,
     ) -> Self {
         let pod_store = Arc::new(PodStore::new(db.clone()));
+        let positioned_watch = datastore_positioned_watch_service(db.clone());
         Self {
             raft: crate::datastore::raft::state_machine::N1Raft::new(db.clone()),
             db,
+            positioned_watch,
             pod_store,
             authoring_node,
             containerd_namespace,
@@ -202,6 +204,119 @@ impl LocalApiClient {
     #[cfg(test)]
     pub async fn last_raft_commit_index_for_test(&self) -> i64 {
         self.raft.last_commit_index().await
+    }
+}
+
+pub(crate) fn datastore_positioned_watch_service(
+    db: DatastoreHandle,
+) -> klights_watch::PositionedWatchService {
+    klights_watch::PositionedWatchService::new(
+        Arc::new(DatastoreClusterResourceRead::new(db.clone())),
+        Arc::new(DatastoreDurableWatchHistory::new(db.clone())),
+        Arc::new(DatastoreDurableAllocatorRead::new(db.clone())),
+        Arc::new(DatastoreWatchSignals { db: db.clone() }),
+        Arc::new(DatastoreWatchScopes { db }),
+    )
+}
+
+struct DatastoreWatchSignals {
+    db: DatastoreHandle,
+}
+
+impl klights_watch::WatchSignalSubscribe for DatastoreWatchSignals {
+    fn subscribe(&self, topic: klights_watch::WatchTopic) -> klights_watch::WatchSignalReceiver {
+        self.db.subscribe_watch_signals(topic)
+    }
+}
+
+struct DatastoreWatchScopes {
+    db: DatastoreHandle,
+}
+
+pub(crate) async fn datastore_watch_resource_scope(
+    db: &dyn crate::datastore::DatastoreBackend,
+    api_version: &str,
+    kind: &str,
+) -> Result<klights_watch::WatchResourceScope, LeaderWatchError> {
+    if crate::datastore::sqlite::scope::is_builtin_api_version(api_version) {
+        return Ok(if crate::datastore::sqlite::scope::is_namespaced(kind) {
+            klights_watch::WatchResourceScope::Namespaced
+        } else {
+            klights_watch::WatchResourceScope::Cluster
+        });
+    }
+
+    let Some((group, version)) = api_version.rsplit_once('/') else {
+        return Err(LeaderWatchError::invalid_request(
+            "apiVersion",
+            format!("custom resource apiVersion {api_version:?} must contain group/version"),
+        ));
+    };
+    let crds = db
+        .list_resources(
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            crate::datastore::ResourceListQuery::all(),
+        )
+        .await
+        .map_err(|error| {
+            LeaderWatchError::unavailable(format!(
+                "failed to resolve custom resource watch scope: {error:#}"
+            ))
+        })?;
+    for crd in crds.items {
+        let spec = crd.data.get("spec").unwrap_or(&serde_json::Value::Null);
+        if spec.get("group").and_then(serde_json::Value::as_str) != Some(group)
+            || spec
+                .pointer("/names/kind")
+                .and_then(serde_json::Value::as_str)
+                != Some(kind)
+        {
+            continue;
+        }
+        let serves_version = spec
+            .get("versions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|versions| {
+                versions.iter().any(|candidate| {
+                    candidate.get("name").and_then(serde_json::Value::as_str) == Some(version)
+                        && candidate
+                            .get("served")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(true)
+                })
+            });
+        if !serves_version {
+            continue;
+        }
+        return match spec.get("scope").and_then(serde_json::Value::as_str) {
+            Some("Namespaced") => Ok(klights_watch::WatchResourceScope::Namespaced),
+            Some("Cluster") => Ok(klights_watch::WatchResourceScope::Cluster),
+            scope => Err(LeaderWatchError::invalid_request(
+                "kind",
+                format!("CRD for {api_version} {kind} has invalid scope {scope:?}"),
+            )),
+        };
+    }
+    Err(LeaderWatchError::invalid_request(
+        "kind",
+        format!("no served CRD defines {api_version} {kind}"),
+    ))
+}
+
+impl klights_watch::WatchScopeResolver for DatastoreWatchScopes {
+    fn resource_scope<'a>(
+        &'a self,
+        api_version: &'a str,
+        kind: &'a str,
+    ) -> futures::future::BoxFuture<'a, Result<klights_watch::WatchResourceScope, LeaderWatchError>>
+    {
+        Box::pin(datastore_watch_resource_scope(
+            self.db.as_ref(),
+            api_version,
+            kind,
+        ))
     }
 }
 
@@ -550,147 +665,8 @@ fn node_lifecycle_status_store_error(error: anyhow::Error) -> NodeLifecycleStatu
 }
 
 impl LeaderWatch for LocalApiClient {
-    fn watch_resources(&self, req: WatchRequest) -> LeaderWatchFuture<'_> {
-        Box::pin(async move {
-            let topic = crate::watch::WatchTopic::new(req.api_version(), req.kind());
-            let legacy_start_rv = req.start_resource_version().unwrap_or(0).max(0);
-            let requested_position = req.start_watch_replay_position();
-            let has_selector = super::watch_request_has_selector(&req);
-            let watch_anchor = DatastoreBackendWatchStore::new(self.db.clone());
-            // Capture the durable handoff before any selector baseline await. No
-            // await occurs between final establishment and signal subscription;
-            // replay closes every interval beginning at this early anchor.
-            let early_anchor = if requested_position.is_none() {
-                Some(
-                    watch_anchor
-                        .current_watch_replay_position()
-                        .await
-                        .map_err(|error| LeaderWatchError::transport(error.to_string()))?,
-                )
-            } else {
-                None
-            };
-            let mut selector_membership = crate::watch::SelectorMembership::default();
-            let mut current_baseline_position = None;
-            if has_selector {
-                let snapshot_position = requested_position.or_else(|| {
-                    (legacy_start_rv > 0).then(|| {
-                    crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(
-                        legacy_start_rv,
-                        early_anchor.unwrap_or_default().event_id,
-                    )
-                })
-                });
-                let query = || {
-                    crate::datastore::ResourceListQuery::new(
-                        req.label_selector(),
-                        req.field_selector(),
-                        None,
-                        None,
-                    )
-                };
-                let baseline = if let Some(snapshot_position) = snapshot_position {
-                    match watch_anchor
-                        .snapshot_resources_at_position(
-                            std::slice::from_ref(&watch_target_for_request(&req)),
-                            req.label_selector(),
-                            req.field_selector(),
-                            snapshot_position,
-                        )
-                        .await
-                        .map_err(|error| LeaderWatchError::transport(error.to_string()))?
-                    {
-                        SnapshotAtRv::List(list) => list,
-                        SnapshotAtRv::Current => self
-                            .db
-                            .list_resources(req.api_version(), req.kind(), req.namespace(), query())
-                            .await
-                            .map_err(|error| LeaderWatchError::transport(error.to_string()))?,
-                        SnapshotAtRv::Expired => {
-                            return Err(LeaderWatchError::ReplayExpired {
-                                accepted_resource_version: snapshot_position.resource_version,
-                            });
-                        }
-                    }
-                } else {
-                    self.db
-                        .list_resources(req.api_version(), req.kind(), req.namespace(), query())
-                        .await
-                        .map_err(|error| LeaderWatchError::transport(error.to_string()))?
-                };
-                selector_membership.replace_from_resources(&baseline.items);
-                current_baseline_position = baseline.watch_replay_position;
-            }
-            let replay_position = if let Some(position) = requested_position {
-                position
-            } else if legacy_start_rv > 0 {
-                crate::datastore::WatchReplayPosition::from_resource_version_through_event_id(
-                    legacy_start_rv,
-                    early_anchor.unwrap_or_default().event_id,
-                )
-            } else if let Some(position) = current_baseline_position {
-                position
-            } else {
-                early_anchor.unwrap_or_default()
-            };
-            let start_rv = legacy_start_rv.max(replay_position.resource_version);
-            let signal_rx = self.db.subscribe_watch_signals(topic.clone());
-            let replay_source = DatastoreWatchReplaySource::new(
-                std::sync::Arc::new(crate::datastore::DatastoreBackendWatchStore::new(
-                    self.db.clone(),
-                )),
-                vec![watch_target_for_request(&req)],
-            );
-            let scope = watch_delivery_scope_for_request(&req);
-            let stream = async_stream::stream! {
-                let mut cursor = crate::watch::SignalWatchCursor::new_many_at_position(
-                    signal_rx,
-                    replay_source,
-                    vec![topic],
-                    scope,
-                    start_rv,
-                    replay_position,
-                    crate::watch::WindowPolicy::default_watch_delivery(),
-                );
-                if let Err(err) = cursor.prime_replay_or_expired().await
-                {
-                    yield Err(local_watch_cursor_error(err, cursor.accepted_rv()));
-                    return;
-                }
-                loop {
-                    match cursor.next_event().await {
-                        Ok(event) => {
-                            let matches = super::watch_request_matches_event(&req, &event);
-                            let event = if has_selector {
-                                selector_membership.transition(event, matches)
-                            } else {
-                                matches.then_some(event)
-                            };
-                            if let Some(event) = event {
-                                yield focused_watch_event(
-                                    event,
-                                    Some(cursor.processed_position()),
-                                ).and_then(|event| {
-                                    event.validate_for(&req)?;
-                                    Ok(event)
-                                });
-                            }
-                        }
-                        Err(crate::watch::WatchCursorError::Closed) => {
-                            yield Err(LeaderWatchError::unavailable(
-                                "local watch signal channel closed",
-                            ));
-                            return;
-                        }
-                        Err(err) => {
-                            yield Err(local_watch_cursor_error(err, cursor.accepted_rv()));
-                            return;
-                        }
-                    }
-                }
-            };
-            Ok(Box::pin(stream) as crate::control_plane::client::WatchStream)
-        })
+    fn watch_resources(&self, request: WatchRequest) -> LeaderWatchFuture<'_> {
+        self.positioned_watch.watch_resources(request)
     }
 }
 
@@ -1001,45 +977,6 @@ impl LeaderOutboxDelivery for LocalApiClient {
             }
             Ok(outcome.result)
         })
-    }
-}
-
-fn watch_target_for_request(req: &WatchRequest) -> WatchTarget {
-    if let Some(namespace) = req.namespace() {
-        return WatchTarget::namespaced_in_namespace(req.api_version(), req.kind(), namespace);
-    }
-    if crate::datastore::sqlite::scope::is_namespaced(req.kind()) {
-        WatchTarget::namespaced(req.api_version(), req.kind())
-    } else {
-        WatchTarget::cluster(req.api_version(), req.kind())
-    }
-}
-
-fn watch_delivery_scope_for_request(req: &WatchRequest) -> crate::watch::WatchDeliveryScope {
-    if let Some(namespace) = req.namespace() {
-        return crate::watch::WatchDeliveryScope::Namespaced(namespace.to_string());
-    }
-    if crate::datastore::sqlite::scope::is_namespaced(req.kind()) {
-        crate::watch::WatchDeliveryScope::NamespacedAll
-    } else {
-        crate::watch::WatchDeliveryScope::Cluster
-    }
-}
-
-fn local_watch_cursor_error(
-    err: crate::watch::WatchCursorError,
-    accepted_rv: i64,
-) -> LeaderWatchError {
-    match err {
-        crate::watch::WatchCursorError::Expired => LeaderWatchError::ReplayExpired {
-            accepted_resource_version: accepted_rv,
-        },
-        crate::watch::WatchCursorError::Replay(err) => {
-            LeaderWatchError::transport(format!("local watch replay failed: {err}"))
-        }
-        crate::watch::WatchCursorError::Closed => {
-            LeaderWatchError::unavailable("local watch signal channel closed")
-        }
     }
 }
 
@@ -1683,6 +1620,121 @@ mod inner_gate_tests {
             .expect("event should decode");
         assert_eq!(event.event_type(), WatchEventType::Deleted);
         assert_eq!(event.resource().data["metadata"]["name"], "moving");
+    }
+
+    async fn register_watch_scope_crd(
+        db: &DatastoreHandle,
+        group: &str,
+        kind: &str,
+        plural: &str,
+        namespaced: bool,
+    ) {
+        db.create_resource(
+            "apiextensions.k8s.io/v1",
+            "CustomResourceDefinition",
+            None,
+            &format!("{plural}.{group}"),
+            serde_json::json!({
+                "apiVersion": "apiextensions.k8s.io/v1",
+                "kind": "CustomResourceDefinition",
+                "metadata": {"name": format!("{plural}.{group}")},
+                "spec": {
+                    "group": group,
+                    "scope": if namespaced { "Namespaced" } else { "Cluster" },
+                    "names": {"kind": kind, "plural": plural, "singular": plural},
+                    "versions": [{"name": "v1", "served": true, "storage": true}]
+                }
+            }),
+        )
+        .await
+        .expect("register CRD scope metadata");
+    }
+
+    #[tokio::test]
+    async fn local_positioned_watch_resolves_namespaced_crd_for_all_namespaces_delivery() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        register_watch_scope_crd(&db, "example.com", "Widget", "widgets", true).await;
+        let (_tx, rx) = watch::channel(true);
+        let client = LocalApiClient::new(db.clone(), "node-a".to_string(), rx);
+        let mut stream = client
+            .watch_resources(
+                WatchRequest::try_new("example.com/v1", "Widget", None, None, None, None, None)
+                    .expect("valid namespaced CRD watch"),
+            )
+            .await
+            .expect("namespaced CRD watch opens");
+
+        db.create_resource(
+            "example.com/v1",
+            "Widget",
+            Some("default"),
+            "namespaced",
+            serde_json::json!({
+                "apiVersion": "example.com/v1",
+                "kind": "Widget",
+                "metadata": {"namespace": "default", "name": "namespaced"}
+            }),
+        )
+        .await
+        .expect("create namespaced CR");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("all-namespaces CRD watch must receive namespaced events")
+            .expect("watch remains open")
+            .expect("event is valid");
+        assert_eq!(event.resource().namespace.as_deref(), Some("default"));
+    }
+
+    #[tokio::test]
+    async fn local_positioned_watch_resolves_cluster_scoped_crd_delivery() {
+        let db: DatastoreHandle = Arc::new(crate::datastore::test_support::in_memory().await);
+        register_watch_scope_crd(
+            &db,
+            "cluster.example.com",
+            "ClusterWidget",
+            "clusterwidgets",
+            false,
+        )
+        .await;
+        let (_tx, rx) = watch::channel(true);
+        let client = LocalApiClient::new(db.clone(), "node-a".to_string(), rx);
+        let mut stream = client
+            .watch_resources(
+                WatchRequest::try_new(
+                    "cluster.example.com/v1",
+                    "ClusterWidget",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("valid cluster CRD watch"),
+            )
+            .await
+            .expect("cluster CRD watch opens");
+
+        db.create_resource(
+            "cluster.example.com/v1",
+            "ClusterWidget",
+            None,
+            "clustered",
+            serde_json::json!({
+                "apiVersion": "cluster.example.com/v1",
+                "kind": "ClusterWidget",
+                "metadata": {"name": "clustered"}
+            }),
+        )
+        .await
+        .expect("create cluster CR");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("cluster CRD watch must receive cluster events")
+            .expect("watch remains open")
+            .expect("event is valid");
+        assert_eq!(event.resource().namespace, None);
     }
 
     #[tokio::test]

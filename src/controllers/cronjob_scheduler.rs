@@ -40,9 +40,9 @@ use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{DatastoreHandle, WatchTarget};
 use crate::task_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
-    WindowPolicy,
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
 };
+use klights_watch::WatchTopic;
 
 /// Maximum delay we ever pass to `spawn_delay` for a single arm. Long
 /// delays still work (Tokio's timer wheel handles years); this cap is a

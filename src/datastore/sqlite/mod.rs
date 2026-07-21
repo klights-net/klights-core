@@ -44,7 +44,8 @@ use tokio::sync::broadcast;
 use crate::datastore::WatchReplayRead;
 use crate::networking::{NodeName, PodSubnet};
 use crate::task_supervisor::TaskSupervisor;
-use crate::watch::{WatchBus, WatchSignal, WatchTopic};
+use crate::watch::WatchBus;
+use klights_watch::WatchTopic;
 
 impl std::fmt::Debug for Datastore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,8 +80,8 @@ use crate::datastore::pod_serviceaccount::{
 #[cfg(test)]
 use filters::filter_by_field_selector;
 use filters::{
-    matches_field_selector_conditions, matches_label_requirements, parse_field_selector_conditions,
-    parse_label_selector, split_sql_pushdown_conditions,
+    matches_field_selector_conditions, matches_label_requirements, parse_label_selector,
+    split_sql_pushdown_conditions,
 };
 #[cfg(test)]
 use filters::{resolve_field_path, split_selector};
@@ -3540,7 +3541,7 @@ impl DatastoreBackend for Datastore {
             .expect("seed namespace for test");
     }
 
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         Datastore::subscribe_watch_signals(self, topic)
     }
 

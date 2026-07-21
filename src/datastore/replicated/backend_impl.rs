@@ -12,7 +12,7 @@ use crate::datastore::command::CommandMeta;
 use crate::datastore::command::StorageCommand;
 use crate::datastore::errors::DatastoreError;
 use crate::datastore::types::*;
-use crate::watch::{WatchSignal, WatchTopic};
+use klights_watch::WatchTopic;
 
 use super::ReplicatedDatastore;
 #[cfg(test)]
@@ -66,11 +66,11 @@ impl DatastoreBackend for ReplicatedDatastore {
         self.set_raft_proposer(proposer);
     }
 
-    fn subscribe_watch_signals(&self, topic: WatchTopic) -> broadcast::Receiver<WatchSignal> {
+    fn subscribe_watch_signals(&self, topic: WatchTopic) -> klights_watch::WatchSignalReceiver {
         if true {
             self.inner.subscribe_watch_signals(topic)
         } else {
-            broadcast::channel(1).1
+            klights_watch::WatchSignalReceiver::closed()
         }
     }
 

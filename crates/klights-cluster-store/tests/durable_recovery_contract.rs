@@ -135,7 +135,7 @@ fn recovery_capabilities_are_distinct_and_object_safe() {
 fn watch_history_values_preserve_position_scope_and_floor_exactly() {
     let position = WatchReplayPosition {
         resource_version: 17,
-        event_id: 23,
+        event_id: 13,
         resource_version_filter_through_event_id: 19,
     };
     let targets = vec![
@@ -347,6 +347,14 @@ fn recovery_values_reject_inexact_or_internally_inconsistent_state() {
 #[test]
 fn watch_history_rejects_hostile_limits_and_invalid_positions_before_io() {
     let target = vec![DurableWatchTarget::namespaced("v1", "Pod")];
+    assert!(
+        WatchHistoryRequest::new(
+            target.clone(),
+            WatchReplayPosition::from_resource_version_through_event_id(1, 3),
+            1,
+        )
+        .is_ok()
+    );
     assert!(matches!(
         WatchHistoryRequest::new(
             target.clone(),
@@ -360,7 +368,7 @@ fn watch_history_rejects_hostile_limits_and_invalid_positions_before_io() {
             target,
             WatchReplayPosition {
                 resource_version: 1,
-                event_id: 2,
+                event_id: 3,
                 resource_version_filter_through_event_id: 3,
             },
             1

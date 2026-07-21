@@ -1,5 +1,6 @@
 //! Shared domain types for klights.
 
+pub mod field_selector;
 pub mod json_patch;
 pub mod label_selector;
 pub mod pod_status_merge;
@@ -8,6 +9,10 @@ pub mod resource_semantics;
 
 use std::fmt;
 
+pub use field_selector::{
+    FieldRequirement, FieldSelector, FieldSelectorOperator, FieldSelectorParseError,
+    resolve_field_value,
+};
 pub use json_patch::apply_merge_patch;
 pub use label_selector::{
     LabelRequirement, LabelSelector, LabelSelectorParseError, parse_label_selector, split_selector,

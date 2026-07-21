@@ -7130,7 +7130,7 @@ async fn from_executor_initializes_watch_and_fingerprint() {
     let ds = Datastore::new_in_memory_with_watch_and_executor(executor)
         .await
         .unwrap();
-    let mut watch_rx = ds.subscribe_watch(crate::watch::WatchTopic::new("v1", "ConfigMap"));
+    let mut watch_rx = ds.subscribe_watch(klights_watch::WatchTopic::new("v1", "ConfigMap"));
 
     // Verify watch subscription works
     ds.create_resource(
@@ -8294,8 +8294,8 @@ async fn apply_resource_batch_reserved_rv_not_observable_before_apply() {
 #[tokio::test]
 async fn apply_resource_batch_emits_watch_events_consistent_with_single_commit() {
     let db = Datastore::new_in_memory().await.unwrap();
-    let mut rx = db.subscribe_watch(crate::watch::WatchTopic::new("v1", "Endpoints"));
-    let mut rx_eps = db.subscribe_watch(crate::watch::WatchTopic::new(
+    let mut rx = db.subscribe_watch(klights_watch::WatchTopic::new("v1", "Endpoints"));
+    let mut rx_eps = db.subscribe_watch(klights_watch::WatchTopic::new(
         "discovery.k8s.io/v1",
         "EndpointSlice",
     ));

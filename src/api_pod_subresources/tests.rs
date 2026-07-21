@@ -1115,7 +1115,7 @@ async fn test_follow_log_file_exits_after_matching_pod_deleted_event() {
         },
         task_supervisor,
         PodLogFollowTermination::new_for_test(
-            watch_bus.subscribe(crate::watch::WatchTopic::new("v1", "Pod")),
+            watch_bus.subscribe(klights_watch::WatchTopic::new("v1", "Pod")),
             "default".to_string(),
             "done".to_string(),
             "uid-1".to_string(),

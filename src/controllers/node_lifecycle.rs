@@ -25,9 +25,9 @@ use crate::node_lease_tracker::{
 };
 use crate::utils::k8s_time_format;
 use crate::watch::{
-    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent,
-    WatchSignalReceiver, WatchTopic, WindowPolicy,
+    EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
 };
+use klights_watch::{WatchSignalReceiver, WatchTopic};
 
 #[cfg(test)]
 const DEFAULT_NODE_LEASE_DURATION_SECONDS: i64 =

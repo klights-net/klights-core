@@ -315,11 +315,13 @@ pub(super) fn build_selector_pushdown(
     }
 
     for cond in field_conditions {
-        let (path, expected, is_eq) = cond;
-        if indexed_fields.contains(&path.as_str()) {
+        let path = cond.field();
+        let expected = cond.value();
+        let is_eq = cond.operator() == klights_types::FieldSelectorOperator::Equals;
+        if !expected.is_empty() && indexed_fields.contains(&path) {
             let p1 = param_offset + sql_params.len() + 1;
             let p2 = p1 + 1;
-            if *is_eq {
+            if is_eq {
                 sql_clauses.push(format!(
                     "EXISTS (SELECT 1 FROM resource_fields rf WHERE rf.api_version = r.api_version AND rf.kind = r.kind AND {ns_join_rf} AND rf.name = r.name AND rf.field = ?{p1} AND rf.value = ?{p2})"
                 ));
@@ -328,8 +330,8 @@ pub(super) fn build_selector_pushdown(
                     "NOT EXISTS (SELECT 1 FROM resource_fields rf WHERE rf.api_version = r.api_version AND rf.kind = r.kind AND {ns_join_rf} AND rf.name = r.name AND rf.field = ?{p1} AND rf.value = ?{p2})"
                 ));
             }
-            sql_params.push(path.clone());
-            sql_params.push(expected.clone());
+            sql_params.push(path.to_string());
+            sql_params.push(expected.to_string());
         } else {
             residual_fields.push(cond.clone());
         }
@@ -550,7 +552,14 @@ mod tests {
 
     // --- build_selector_pushdown unit tests ---
 
-    use klights_types::LabelRequirement;
+    use klights_types::{FieldRequirement, FieldSelector, LabelRequirement};
+
+    fn fields(selector: &str) -> Vec<FieldRequirement> {
+        FieldSelector::parse(selector)
+            .expect("valid field selector")
+            .requirements()
+            .to_vec()
+    }
 
     #[test]
     fn pushdown_equality_generates_exists_with_two_params() {
@@ -672,14 +681,8 @@ mod tests {
 
     #[test]
     fn pushdown_field_equality_for_indexed_path() {
-        let pd = build_selector_pushdown(
-            &[],
-            &[("spec.nodeName".into(), "node-1".into(), true)],
-            "v1",
-            "Pod",
-            0,
-            false,
-        );
+        let pd =
+            build_selector_pushdown(&[], &fields("spec.nodeName=node-1"), "v1", "Pod", 0, false);
         assert_eq!(pd.sql_clauses.len(), 1);
         assert!(pd.sql_clauses[0].contains("resource_fields"));
         assert!(pd.sql_clauses[0].contains("EXISTS"));
@@ -689,14 +692,8 @@ mod tests {
 
     #[test]
     fn pushdown_field_inequality_for_indexed_path() {
-        let pd = build_selector_pushdown(
-            &[],
-            &[("spec.nodeName".into(), "node-1".into(), false)],
-            "v1",
-            "Pod",
-            0,
-            false,
-        );
+        let pd =
+            build_selector_pushdown(&[], &fields("spec.nodeName!=node-1"), "v1", "Pod", 0, false);
         assert_eq!(pd.sql_clauses.len(), 1);
         assert!(pd.sql_clauses[0].contains("NOT EXISTS"));
         assert_eq!(pd.sql_params, vec!["spec.nodeName", "node-1"]);
@@ -704,14 +701,8 @@ mod tests {
 
     #[test]
     fn pushdown_field_unindexed_is_residual() {
-        let pd = build_selector_pushdown(
-            &[],
-            &[("spec.someOtherField".into(), "x".into(), true)],
-            "v1",
-            "Pod",
-            0,
-            false,
-        );
+        let pd =
+            build_selector_pushdown(&[], &fields("spec.someOtherField=x"), "v1", "Pod", 0, false);
         assert!(pd.sql_clauses.is_empty());
         assert_eq!(pd.residual_fields.len(), 1);
     }
@@ -723,7 +714,7 @@ mod tests {
                 key: "app".into(),
                 value: "nginx".into(),
             }],
-            &[("spec.nodeName".into(), "node-1".into(), true)],
+            &fields("spec.nodeName=node-1"),
             "v1",
             "Pod",
             5,
@@ -752,7 +743,7 @@ mod tests {
                 key: "role".into(),
                 value: "control-plane".into(),
             }],
-            &[("spec.unschedulable".into(), "true".into(), true)],
+            &fields("spec.unschedulable=true"),
             "v1",
             "Node",
             0,

@@ -74,10 +74,14 @@ impl ClusterResourceRead for DatastoreClusterResourceRead {
                     .then(|| query.continuation().map(|cursor| cursor.after().name()))
                     .flatten(),
             );
-            let historical = query
+            let continuation_position = query
                 .continuation()
                 .map(|cursor| cursor.snapshot().position());
-            let read = if let Some(position) = historical {
+            let requested_position = match query.resource_version_match() {
+                ResourceVersionMatch::AtPosition(position) => Some(position),
+                _ => continuation_position,
+            };
+            let read = if let Some(position) = requested_position {
                 let target = match request.scope() {
                     ResourceCollectionScope::Cluster => crate::datastore::WatchTarget::cluster(
                         request.api_version(),
@@ -123,10 +127,11 @@ impl ClusterResourceRead for DatastoreClusterResourceRead {
 
             match read {
                 crate::datastore::SnapshotAtRv::Expired => {
-                    let requested = historical.map_or_else(
+                    let requested = requested_position.map_or_else(
                         || match query.resource_version_match() {
                             ResourceVersionMatch::Exact(rv)
                             | ResourceVersionMatch::NotOlderThan(rv) => rv,
+                            ResourceVersionMatch::AtPosition(position) => position.resource_version,
                             ResourceVersionMatch::Any => 0,
                         },
                         |position| position.resource_version,
@@ -154,6 +159,13 @@ impl ClusterResourceRead for DatastoreClusterResourceRead {
                     Ok(ResourceListRead::Historical(page))
                 }
                 crate::datastore::SnapshotAtRv::Current => {
+                    if requested_position.is_some() {
+                        return Err(ResourceReadError::CorruptData {
+                            message:
+                                "positioned datastore LIST returned an unpinned Current sentinel"
+                                    .to_string(),
+                        });
+                    }
                     let mut page = self
                         .db
                         .list_resources(

@@ -39,6 +39,7 @@ mod state;
 #[cfg(test)]
 pub mod test_support;
 mod validation;
+#[cfg(test)]
 mod watch_session;
 mod watch_stream;
 
@@ -149,13 +150,15 @@ pub use validation::{
     apply_schema_defaults_pub, validate_against_schema, validate_metadata_fields,
     validate_webhook_configuration,
 };
+#[cfg(test)]
 use watch_session::{WatchSessionBootstrap, WatchSessionConfig, WatchSessionEvent};
+#[cfg(test)]
+use watch_stream::subscribe_watch_handoff;
 use watch_stream::{
-    LabelSelectorWatchStreamRequest, WatchCatchUpMode, build_label_selector_watch_stream,
+    LabelSelectorWatchStreamRequest, build_label_selector_watch_stream,
     maybe_spawn_bookmark_tick_stream, maybe_spawn_watch_timeout_stream,
     negotiate_watch_stream_format, object_matches_field_selector,
     protobuf_watch_supported_for_request, recv_bookmark_tick, recv_watch_timeout,
-    subscribe_watch_handoff,
 };
 
 #[cfg(test)]
@@ -227,9 +230,12 @@ use crate::api_status::{
     update_volumeattachment_status,
 };
 use crate::controllers;
+#[cfg(test)]
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{CatchUpResource, DatastoreBackend, Resource, WatchTarget};
-use crate::watch::{WatchCursorError, WatchEvent};
+#[cfg(test)]
+use crate::watch::WatchCursorError;
+use crate::watch::WatchEvent;
 use klights_types::LabelSelector;
 
 // APIService proxy helpers moved to apiservice_proxy.rs

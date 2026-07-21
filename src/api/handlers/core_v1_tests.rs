@@ -10,7 +10,8 @@
 //! dispatcher queue and the coalesced service-route sync.
 
 use crate::networking::test_support::{MockNetworkProvider, MockServiceRouter};
-use crate::watch::{EventType, WatchTopic};
+use crate::watch::EventType;
+use klights_watch::WatchTopic;
 use serde_json::Value;
 use serde_json::json;
 use std::sync::Arc;
