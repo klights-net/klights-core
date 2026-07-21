@@ -11,8 +11,47 @@ use netlink_packet_route::{
     link::State as LinkOperState,
 };
 use std::net::{IpAddr, Ipv4Addr};
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
+
+type WireGuardPeerStepFuture<'a> =
+    Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+pub(super) async fn apply_wireguard_peer_route_with_rollback<
+    'a,
+    ApplyPeer,
+    ApplyRoute,
+    RemoveRoute,
+    RemovePeer,
+>(
+    apply_peer: ApplyPeer,
+    apply_route: ApplyRoute,
+    remove_route: RemoveRoute,
+    remove_peer: RemovePeer,
+) -> Result<()>
+where
+    ApplyPeer: FnOnce() -> WireGuardPeerStepFuture<'a>,
+    ApplyRoute: FnOnce() -> WireGuardPeerStepFuture<'a>,
+    RemoveRoute: FnOnce() -> WireGuardPeerStepFuture<'a>,
+    RemovePeer: FnOnce() -> WireGuardPeerStepFuture<'a>,
+{
+    apply_peer().await?;
+    let Err(apply_error) = apply_route().await else {
+        return Ok(());
+    };
+
+    let route_rollback_error = remove_route().await.err();
+    let peer_rollback_error = remove_peer().await.err();
+    let mut message = format!("{apply_error:#}");
+    if let Some(error) = route_rollback_error {
+        message.push_str(&format!("; route rollback failed: {error:#}"));
+    }
+    if let Some(error) = peer_rollback_error {
+        message.push_str(&format!("; peer rollback failed: {error:#}"));
+    }
+    Err(anyhow::anyhow!(message))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LinkIpv4Address {
@@ -577,8 +616,10 @@ impl NetworkPlane {
 
     async fn cni_add(
         &self,
-        request: crate::networking::provider::CniAddRequest,
-    ) -> Result<crate::networking::cni::PodNetwork> {
+        request: klights_network_api::CniAddRequest,
+    ) -> Result<klights_network_api::PodNetwork> {
+        let (sandbox_id, pod, netns_setns_path, netns_record_path, host_network) =
+            request.into_parts();
         let bridge_idx = self
             .link_index_cached(self.bridge.as_ref(), &self.bridge_idx)
             .await
@@ -586,19 +627,15 @@ impl NetworkPlane {
         crate::networking::cni::add(crate::networking::cni::CniAddArgs {
             store: self.node_local.as_ref(),
             handle: &self.rt,
-            sandbox_id: &request.sandbox_id,
-            pod: klights_types::PodIdentity::new(
-                &request.namespace,
-                &request.pod_name,
-                &request.pod_uid,
-            ),
+            sandbox_id: sandbox_id.as_str(),
+            pod,
             bridge_name: &self.bridge,
             bridge_idx,
-            netns_setns_path: &request.netns_setns_path,
-            netns_record_path: &request.netns_record_path,
+            netns_setns_path: netns_setns_path.as_str(),
+            netns_record_path: netns_record_path.as_str(),
             pod_subnet: &self.pod_subnet,
             pod_link_mtu: self.pod_link_mtu,
-            host_network: request.host_network,
+            host_network,
             host_ip: &self.host_ip.to_string(),
             _node_name: &self.my_node,
             task_supervisor: self.task_supervisor.clone(),
@@ -607,6 +644,19 @@ impl NetworkPlane {
     }
 
     async fn cni_del(&self, sandbox_id: &str) -> Result<()> {
+        if self
+            .node_local
+            .get_network_for_sandbox(sandbox_id)
+            .await
+            .context("failed to look up root pod network allocation")?
+            .is_none()
+        {
+            tracing::debug!(
+                "root cni::del {}: no pod_networks record (host-network or already deleted)",
+                sandbox_id
+            );
+            return Ok(());
+        }
         let bridge_idx = self
             .link_index_cached(self.bridge.as_ref(), &self.bridge_idx)
             .await
@@ -615,13 +665,9 @@ impl NetworkPlane {
             .await
     }
 
-    async fn apply_peer_endpoint(
-        &self,
-        peer: &crate::networking::types::NodeEndpoint,
-    ) -> Result<()> {
-        use crate::networking::types::NodeEndpoint;
+    async fn apply_peer_route(&self, peer: &klights_network_api::PeerRoute) -> Result<()> {
         match peer {
-            NodeEndpoint::WireGuard(plan) => {
+            klights_network_api::PeerRoute::WireGuard(route) => {
                 let controller = self
                     .wireguard
                     .get()
@@ -629,97 +675,128 @@ impl NetworkPlane {
                 let idx = self
                     .link_index_cached(&self.wireguard_device, &self.wireguard_idx)
                     .await?;
-                controller.apply_peer(plan).await?;
-                crate::networking::wireguard::apply_wireguard_pod_route(
-                    &self.rt,
-                    idx,
-                    plan,
-                    self.pod_subnet.bridge_ip(),
+                apply_wireguard_peer_route_with_rollback(
+                    || Box::pin(controller.apply_peer(route)),
+                    || {
+                        Box::pin(crate::networking::wireguard::apply_wireguard_pod_route(
+                            &self.rt,
+                            idx,
+                            route,
+                            self.pod_subnet.bridge_ip(),
+                        ))
+                    },
+                    || {
+                        Box::pin(crate::networking::wireguard::remove_wireguard_pod_route(
+                            &self.rt,
+                            idx,
+                            route,
+                            self.pod_subnet.bridge_ip(),
+                        ))
+                    },
+                    || Box::pin(controller.remove_peer(route)),
                 )
                 .await
             }
-            NodeEndpoint::UnencryptedDirect(plan) => {
-                crate::networking::wireguard::apply_unencrypted_direct_route(&self.rt, plan).await
+            klights_network_api::PeerRoute::Direct(route) => {
+                crate::networking::wireguard::apply_unencrypted_direct_route(&self.rt, route).await
             }
-            NodeEndpoint::Rootless { .. } => Ok(()),
         }
     }
 
-    async fn remove_peer_endpoint(
-        &self,
-        peer: &crate::networking::types::NodeEndpoint,
-    ) -> Result<()> {
-        use crate::networking::types::NodeEndpoint;
+    async fn remove_peer_route(&self, peer: &klights_network_api::PeerRoute) -> Result<()> {
         match peer {
-            NodeEndpoint::WireGuard(plan) => {
+            klights_network_api::PeerRoute::WireGuard(route) => {
                 let idx = self
                     .link_index_cached(&self.wireguard_device, &self.wireguard_idx)
                     .await?;
                 crate::networking::wireguard::remove_wireguard_pod_route(
                     &self.rt,
                     idx,
-                    plan,
+                    route,
                     self.pod_subnet.bridge_ip(),
                 )
                 .await?;
                 if let Some(controller) = self.wireguard.get() {
-                    controller.remove_peer(&plan.public_key).await?;
+                    controller.remove_peer(route).await?;
                 }
                 Ok(())
             }
-            NodeEndpoint::UnencryptedDirect(plan) => {
-                crate::networking::wireguard::remove_unencrypted_direct_route(&self.rt, plan).await
+            klights_network_api::PeerRoute::Direct(route) => {
+                crate::networking::wireguard::remove_unencrypted_direct_route(&self.rt, route).await
             }
-            NodeEndpoint::Rootless { .. } => Ok(()),
         }
     }
 
     async fn shutdown_impl(&self) -> Result<()> {
+        if let Some(controller) = self.wireguard.get() {
+            controller.shutdown().await?;
+        }
         self._rt_conn.abort();
         Ok(())
     }
 }
 
-#[async_trait::async_trait]
-impl crate::networking::datapath::Datapath for NetworkPlane {
-    async fn cni_add(
+impl klights_network_api::Datapath for NetworkPlane {
+    fn cni_add(
         &self,
-        request: crate::networking::provider::CniAddRequest,
-    ) -> Result<crate::networking::cni::PodNetwork> {
-        Self::cni_add(self, request).await
+        request: klights_network_api::CniAddRequest,
+    ) -> klights_network_api::DatapathFuture<'_, klights_network_api::PodNetwork> {
+        Box::pin(async move {
+            Self::cni_add(self, request)
+                .await
+                .map_err(|error| klights_network_api::DatapathError::setup(error.to_string()))
+        })
     }
 
-    async fn cni_del(&self, sandbox_id: &str) -> Result<()> {
-        Self::cni_del(self, sandbox_id).await
+    fn cni_del<'a>(
+        &'a self,
+        sandbox_id: &'a klights_network_api::SandboxId,
+    ) -> klights_network_api::DatapathFuture<'a, ()> {
+        Box::pin(async move {
+            Self::cni_del(self, sandbox_id.as_str())
+                .await
+                .map_err(|error| klights_network_api::DatapathError::teardown(error.to_string()))
+        })
     }
 
-    async fn host_ip(&self) -> Result<std::net::IpAddr> {
-        Ok(std::net::IpAddr::V4(self.host_ip))
+    fn host_ip(&self) -> klights_network_api::DatapathFuture<'_, std::net::IpAddr> {
+        Box::pin(async move { Ok(std::net::IpAddr::V4(self.host_ip)) })
     }
 
-    async fn pod_gateway_ip(&self) -> Result<std::net::IpAddr> {
-        Ok(std::net::IpAddr::V4(self.pod_subnet.bridge_ip()))
+    fn pod_gateway_ip(&self) -> klights_network_api::DatapathFuture<'_, std::net::IpAddr> {
+        Box::pin(async move { Ok(std::net::IpAddr::V4(self.pod_subnet.bridge_ip())) })
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        self.shutdown_impl().await
+    fn shutdown(&self) -> klights_network_api::DatapathFuture<'_, ()> {
+        Box::pin(async move {
+            self.shutdown_impl()
+                .await
+                .map_err(|error| klights_network_api::DatapathError::shutdown(error.to_string()))
+        })
     }
 }
 
-#[async_trait::async_trait]
-impl crate::networking::peer_router::PeerRouter for NetworkPlane {
-    async fn apply_peer_endpoint(
-        &self,
-        peer: &crate::networking::types::NodeEndpoint,
-    ) -> Result<()> {
-        Self::apply_peer_endpoint(self, peer).await
+impl klights_network_api::PeerRouter for NetworkPlane {
+    fn apply_peer_route<'a>(
+        &'a self,
+        route: &'a klights_network_api::PeerRoute,
+    ) -> klights_network_api::PeerRouterFuture<'a> {
+        Box::pin(async move {
+            Self::apply_peer_route(self, route)
+                .await
+                .map_err(|error| klights_network_api::PeerRouterError::apply(error.to_string()))
+        })
     }
 
-    async fn remove_peer_endpoint(
-        &self,
-        peer: &crate::networking::types::NodeEndpoint,
-    ) -> Result<()> {
-        Self::remove_peer_endpoint(self, peer).await
+    fn remove_peer_route<'a>(
+        &'a self,
+        route: &'a klights_network_api::PeerRoute,
+    ) -> klights_network_api::PeerRouterFuture<'a> {
+        Box::pin(async move {
+            Self::remove_peer_route(self, route)
+                .await
+                .map_err(|error| klights_network_api::PeerRouterError::remove(error.to_string()))
+        })
     }
 }
 
@@ -731,6 +808,112 @@ impl crate::networking::peer_router::PeerRouter for NetworkPlane {
 mod stale_route_tests {
     use super::*;
     use crate::networking::device_state::{LinkKind, LinkState};
+
+    #[tokio::test]
+    async fn root_cni_del_without_allocation_does_not_resolve_missing_bridge() {
+        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let node_local = crate::datastore::node_local::selector::open_node_local(
+            crate::datastore::backend_kind::BackendKind::Sqlite,
+            None,
+            supervisor.clone(),
+            None,
+            "sqlite:root-cni-del-test",
+        )
+        .await
+        .expect("open node-local test store");
+        let (connection, handle, _) = rtnetlink::new_connection().expect("open rtnetlink");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let connection_cancel = cancel.clone();
+        let connection = supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::Network,
+                "test_root_cni_del_rtnetlink_connection",
+                async move {
+                    tokio::select! {
+                        _ = connection => {}
+                        _ = connection_cancel.cancelled() => {}
+                    }
+                },
+            )
+            .await
+            .expect("spawn rtnetlink test connection");
+        let plane = NetworkPlane {
+            rt: handle,
+            _rt_conn: connection,
+            node_local,
+            bridge: BridgeName::parse("missing-cni0").unwrap(),
+            pod_subnet: PodSubnet::parse("10.42.1.0/24").unwrap(),
+            pod_link_mtu: 1500,
+            my_node: NodeName::parse("node-a").unwrap(),
+            host_ip: Ipv4Addr::new(192, 0, 2, 1),
+            wireguard_device: "missing-wg0".to_string(),
+            bridge_idx: OnceLock::new(),
+            wireguard_idx: OnceLock::new(),
+            wireguard: OnceLock::new(),
+            health: DataplaneHealth::new_healthy(),
+            task_supervisor: supervisor,
+        };
+
+        let result = NetworkPlane::cni_del(&plane, "already-gone").await;
+        cancel.cancel();
+        plane._rt_conn.abort();
+        assert!(
+            result.is_ok(),
+            "idempotent DEL without an allocation must not require the bridge: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wireguard_route_failure_rolls_back_route_and_peer_before_returning() {
+        use std::sync::Mutex;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let apply_peer_calls = calls.clone();
+        let apply_route_calls = calls.clone();
+        let remove_route_calls = calls.clone();
+        let remove_peer_calls = calls.clone();
+
+        let error = apply_wireguard_peer_route_with_rollback(
+            || {
+                Box::pin(async move {
+                    apply_peer_calls.lock().unwrap().push("apply-peer");
+                    Ok(())
+                })
+            },
+            || {
+                Box::pin(async move {
+                    apply_route_calls.lock().unwrap().push("apply-route");
+                    Err(anyhow::anyhow!("deterministic route add failure"))
+                })
+            },
+            || {
+                Box::pin(async move {
+                    remove_route_calls.lock().unwrap().push("remove-route");
+                    Ok(())
+                })
+            },
+            || {
+                Box::pin(async move {
+                    remove_peer_calls.lock().unwrap().push("remove-peer");
+                    Ok(())
+                })
+            },
+        )
+        .await
+        .expect_err("route failure must fail peer application");
+
+        assert!(
+            error
+                .to_string()
+                .contains("deterministic route add failure")
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["apply-peer", "apply-route", "remove-route", "remove-peer"]
+        );
+    }
 
     fn link_state(
         name: &str,

@@ -6,7 +6,7 @@ use tokio::process::Command;
 pub async fn cleanup_pod_sandboxes(
     cri: &mut crate::kubelet::CriClient,
     db: &dyn crate::datastore::DatastoreBackend,
-    network: &dyn crate::networking::Datapath,
+    network: &dyn klights_network_api::Datapath,
     containerd_ns: &str,
 ) -> Result<()> {
     let mut sandbox_ids = std::collections::HashSet::new();
@@ -57,17 +57,24 @@ pub async fn cleanup_pod_sandboxes(
 async fn cleanup_one_pod_sandbox(
     cri: &mut crate::kubelet::CriClient,
     db: &dyn crate::datastore::DatastoreBackend,
-    network: &dyn crate::networking::Datapath,
+    network: &dyn klights_network_api::Datapath,
     containerd_ns: &str,
     sandbox_id: &str,
     owner: Option<(&str, &str, &str)>,
 ) {
-    if let Err(e) = network.cni_del(sandbox_id).await {
-        tracing::warn!(
-            "Failed to clean pod network for sandbox {}: {}",
-            sandbox_id,
-            e
-        );
+    match klights_network_api::SandboxId::try_new(sandbox_id) {
+        Ok(sandbox_id) => {
+            if let Err(e) = network.cni_del(&sandbox_id).await {
+                tracing::warn!(
+                    "Failed to clean pod network for sandbox {}: {}",
+                    sandbox_id,
+                    e
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to validate sandbox network identity: {}", e);
+        }
     }
 
     if let Err(e) = cri.stop_pod_sandbox(sandbox_id).await {

@@ -30,14 +30,14 @@ pub trait PodNetworkRuntime: Send + Sync {
 
 /// Production network runtime adapter over Datapath + PodRepository.
 pub struct RealPodNetworkRuntime {
-    datapath: Arc<dyn crate::networking::Datapath>,
+    datapath: Arc<dyn klights_network_api::Datapath>,
     repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     store: Arc<dyn PodRuntimeStore>,
 }
 
 impl RealPodNetworkRuntime {
     pub fn new(
-        datapath: Arc<dyn crate::networking::Datapath>,
+        datapath: Arc<dyn klights_network_api::Datapath>,
         repository: Arc<crate::kubelet::pod_repository::PodRepository>,
         store: Arc<dyn PodRuntimeStore>,
     ) -> Self {
@@ -95,6 +95,8 @@ impl PodNetworkRuntime for RealPodNetworkRuntime {
                 );
             }
         }
-        self.datapath.cni_del(sandbox_id).await
+        let sandbox_id = klights_network_api::SandboxId::try_new(sandbox_id)?;
+        self.datapath.cni_del(&sandbox_id).await?;
+        Ok(())
     }
 }

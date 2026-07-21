@@ -2,9 +2,9 @@
 
 use super::SideEffect;
 use crate::datastore::DatastoreBackend;
-use crate::networking::ServiceRouter;
 use anyhow::Result;
 use async_trait::async_trait;
+use klights_network_api::ServiceRouter;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ impl SideEffect for EndpointSliceSyncEffect {
 
     async fn apply(&self, _resource: &Value, _db: &dyn DatastoreBackend) -> Result<()> {
         if let Some(services) = &self.services {
-            services.request_services_sync();
+            services.request_services_sync()?;
         }
         Ok(())
     }

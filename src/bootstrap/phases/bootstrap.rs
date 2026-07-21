@@ -61,7 +61,7 @@ pub struct BootstrapRunArgs<'a> {
     pub node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     pub node_lease_renewal_client: Arc<dyn crate::control_plane::client::LeaderNodeLeaseRenewal>,
     pub network: Arc<crate::networking::Network>,
-    pub services: Arc<dyn crate::networking::ServiceRouter>,
+    pub services: Arc<dyn klights_network_api::ServiceRouter>,
     pub local_api_client: Arc<crate::control_plane::client::local::LocalApiClient>,
     pub control_plane_lease_client:
         Option<Arc<crate::replication::grpc::client::ReplicationGrpcClient>>,
@@ -361,7 +361,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             containerd_ns: config.containerd_namespace.clone(),
             lifecycle_tx: pod_lifecycle_tx,
             probe_manager: None,
-            datapath: Some(network.datapath.clone()),
+            datapath: Some(network.datapath().clone()),
             service_router: Some(services.clone()),
             runtime_node_role,
             runtime_service: None,
@@ -838,12 +838,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             db,
             &config.service_cidr,
             config.tls_port,
-            network.datapath.as_ref(),
+            network.datapath().as_ref(),
         )
         .await
         .context("Failed to bootstrap kubernetes Service")?;
     }
-    services.request_services_sync();
+    services.request_services_sync()?;
 
     if leader_lease.is_some() {
         controllers::coredns::bootstrap_coredns(

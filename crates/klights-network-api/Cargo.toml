@@ -8,5 +8,16 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+conformance = []
+
+[dependencies]
+klights-types = { workspace = true }
+
 [lints]
 workspace = true
+
+[[test]]
+name = "conformance_contract"
+required-features = ["conformance"]

@@ -46,11 +46,31 @@ fn row_to_pod_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodEndpointR
         mode,
         pod_ip,
         node_ip,
-        host_port_tcp: host_port_tcp.map(|v| v as u16),
-        host_port_udp: host_port_udp.map(|v| v as u16),
+        host_port_tcp: checked_endpoint_port(host_port_tcp, 7)?,
+        host_port_udp: checked_endpoint_port(host_port_udp, 8)?,
         generation,
         updated_at,
     })
+}
+
+fn checked_endpoint_port(value: Option<i64>, index: usize) -> rusqlite::Result<Option<u16>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    u16::try_from(value)
+        .ok()
+        .filter(|port| *port != 0)
+        .map(Some)
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "pod endpoint port outside 1..=65535",
+                )),
+            )
+        })
 }
 
 #[derive(Debug)]

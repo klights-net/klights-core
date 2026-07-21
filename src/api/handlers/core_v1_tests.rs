@@ -72,14 +72,14 @@ async fn service_patch_enqueues_reconcile_without_route_sync_on_request_path() {
     // sync-fallback reconcile) is observable on our counter.
     let provider = Arc::new(MockNetworkProvider::new());
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
-    let services_dyn = services.clone() as Arc<dyn crate::networking::ServiceRouter>;
+    let services_dyn = services.clone() as Arc<dyn klights_network_api::ServiceRouter>;
     state.controller_dispatcher.set_services(services_dyn).await;
-    state.network = Arc::new(crate::networking::Network {
-        datapath: provider.clone(),
-        peering: provider,
-        services: services.clone() as Arc<dyn crate::networking::ServiceRouter>,
-        resolver: Arc::new(crate::networking::test_support::MockPodEndpointResolver),
-    });
+    state.network = Arc::new(crate::networking::Network::new(
+        provider.clone(),
+        provider,
+        services.clone() as Arc<dyn klights_network_api::ServiceRouter>,
+        Arc::new(crate::networking::test_support::MockPodEndpointResolver),
+    ));
     let app = crate::api::build_router(state);
 
     let db = crate::datastore::test_support::in_memory().await;
@@ -277,7 +277,7 @@ async fn service_create_enqueues_exactly_one_service_reconcile() {
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
     state
         .controller_dispatcher
-        .set_services(services.clone() as Arc<dyn crate::networking::ServiceRouter>)
+        .set_services(services.clone() as Arc<dyn klights_network_api::ServiceRouter>)
         .await;
     let app = crate::api::build_router(state);
 
@@ -314,7 +314,7 @@ async fn service_update_externalname_to_clusterip_enqueues_one_allocated_reconci
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
     state
         .controller_dispatcher
-        .set_services(services.clone() as Arc<dyn crate::networking::ServiceRouter>)
+        .set_services(services.clone() as Arc<dyn klights_network_api::ServiceRouter>)
         .await;
     let app = crate::api::build_router(state);
 
@@ -499,7 +499,7 @@ async fn create_service_does_not_enqueue_reconcile_after_allocation_failure() {
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
     state
         .controller_dispatcher
-        .set_services(services.clone() as Arc<dyn crate::networking::ServiceRouter>)
+        .set_services(services.clone() as Arc<dyn klights_network_api::ServiceRouter>)
         .await;
     let app = crate::api::build_router(state);
 
@@ -548,7 +548,7 @@ async fn create_service_success_response_contains_allocated_fields_and_enqueues_
     let services: Arc<MockServiceRouter> = Arc::new(MockServiceRouter::new());
     state
         .controller_dispatcher
-        .set_services(services.clone() as Arc<dyn crate::networking::ServiceRouter>)
+        .set_services(services.clone() as Arc<dyn klights_network_api::ServiceRouter>)
         .await;
     let app = crate::api::build_router(state);
 

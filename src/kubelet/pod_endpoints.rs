@@ -22,7 +22,7 @@ pub async fn reconcile_endpoints_for_pod(
     db: &dyn DatastoreBackend,
     pod_reader: &dyn PodReader,
     pod: &serde_json::Value,
-    service_router: Option<&dyn crate::networking::ServiceRouter>,
+    service_router: Option<&dyn klights_network_api::ServiceRouter>,
 ) -> Result<()> {
     // Extract pod metadata
     let metadata = pod
@@ -136,7 +136,7 @@ pub async fn reconcile_endpoints_for_pod(
     // Ensures NodePort and ClusterIP DNAT rules converge once endpoints
     // are available.
     if let Some(router) = service_router {
-        router.request_services_sync();
+        router.request_services_sync()?;
     }
     Ok(())
 }

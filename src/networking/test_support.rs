@@ -1,10 +1,7 @@
-use crate::networking::cni::PodNetwork;
-use crate::networking::pod_endpoint_resolver::{Endpoint, EndpointEvent, PodEndpointResolver};
-use crate::networking::types::NodeEndpoint;
-use async_trait::async_trait;
-use futures::stream::BoxStream;
 use std::net::{IpAddr, Ipv4Addr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 #[derive(Clone, Debug)]
 pub enum NetworkCall {
@@ -24,7 +21,7 @@ pub enum NetworkCall {
     },
     RemoveWireGuardPeerEndpoint {
         node_name: String,
-        public_key: String,
+        public_key: [u8; 32],
         allowed_pod_cidr: String,
     },
     ApplyUnencryptedPeerEndpoint {
@@ -37,17 +34,6 @@ pub enum NetworkCall {
         node_ip: String,
         allowed_pod_cidr: String,
     },
-    /// F2-04: rootless peer apply/remove. The mock records the underlay node IP
-    /// plus hostport range string so dispatch tests can assert the correct
-    /// endpoint variant was reached without inspecting opaque trait state.
-    ApplyRootlessPeerEndpoint {
-        node_ip: String,
-        hostport_range: String,
-    },
-    RemoveRootlessPeerEndpoint {
-        node_ip: String,
-        hostport_range: String,
-    },
     Shutdown,
 }
 
@@ -56,6 +42,10 @@ pub struct MockNetworkProvider {
     pod_ip: Arc<Mutex<Ipv4Addr>>,
     host_ip: Arc<Mutex<Ipv4Addr>>,
     pod_gateway_ip: Arc<Mutex<Ipv4Addr>>,
+    peer_apply_failures: Arc<std::sync::atomic::AtomicUsize>,
+    peer_apply_successes: Arc<std::sync::atomic::AtomicUsize>,
+    peer_apply_notify: Arc<tokio::sync::Notify>,
+    peer_remove_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockNetworkProvider {
@@ -69,6 +59,10 @@ impl MockNetworkProvider {
             pod_ip: Arc::new(Mutex::new(pod_ip)),
             host_ip: Arc::new(Mutex::new(Ipv4Addr::new(127, 0, 0, 1))),
             pod_gateway_ip: Arc::new(Mutex::new(Ipv4Addr::new(10, 43, 0, 1))),
+            peer_apply_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peer_apply_successes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peer_apply_notify: Arc::new(tokio::sync::Notify::new()),
+            peer_remove_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -101,141 +95,216 @@ impl MockNetworkProvider {
         *self.pod_ip.lock().expect("network calls mutex poisoned") = pod_ip;
     }
 
+    pub fn fail_next_peer_remove(&self) {
+        self.peer_remove_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn fail_next_peer_apply(&self) {
+        self.peer_apply_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn peer_apply_call_count(&self) -> usize {
+        self.calls()
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    NetworkCall::ApplyWireGuardPeerEndpoint { .. }
+                        | NetworkCall::ApplyUnencryptedPeerEndpoint { .. }
+                )
+            })
+            .count()
+    }
+
+    pub async fn wait_for_peer_apply_calls(&self, expected: usize) {
+        loop {
+            let notified = self.peer_apply_notify.notified();
+            if self.peer_apply_call_count() >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub async fn wait_for_peer_apply_successes(&self, expected: usize) {
+        loop {
+            let notified = self.peer_apply_notify.notified();
+            if self
+                .peer_apply_successes
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= expected
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     fn pod_network_ip(&self) -> std::sync::MutexGuard<'_, Ipv4Addr> {
         self.pod_ip.lock().expect("network calls mutex poisoned")
     }
 }
 
-#[async_trait]
-impl crate::networking::datapath::Datapath for MockNetworkProvider {
-    async fn cni_add(
+impl klights_network_api::Datapath for MockNetworkProvider {
+    fn cni_add(
         &self,
-        request: crate::networking::provider::CniAddRequest,
-    ) -> anyhow::Result<PodNetwork> {
-        self.calls
-            .lock()
-            .expect("network calls mutex poisoned")
-            .push(NetworkCall::CniAdd {
-                sandbox_id: request.sandbox_id,
-                namespace: request.namespace,
-                pod_name: request.pod_name,
-                pod_uid: request.pod_uid,
-            });
-        Ok(PodNetwork {
-            ip_addr: IpAddr::V4(*self.pod_network_ip()),
+        request: klights_network_api::CniAddRequest,
+    ) -> klights_network_api::DatapathFuture<'_, klights_network_api::PodNetwork> {
+        Box::pin(async move {
+            let (sandbox_id, pod, _, _, _) = request.into_parts();
+            self.calls
+                .lock()
+                .expect("network calls mutex poisoned")
+                .push(NetworkCall::CniAdd {
+                    sandbox_id: sandbox_id.to_string(),
+                    namespace: pod.namespace,
+                    pod_name: pod.name,
+                    pod_uid: pod.uid,
+                });
+            Ok(klights_network_api::PodNetwork::new(IpAddr::V4(
+                *self.pod_network_ip(),
+            )))
         })
     }
 
-    async fn cni_del(&self, sandbox_id: &str) -> anyhow::Result<()> {
-        self.calls
-            .lock()
-            .expect("network calls mutex poisoned")
-            .push(NetworkCall::CniDel {
-                sandbox_id: sandbox_id.to_string(),
-            });
-        Ok(())
-    }
-
-    async fn host_ip(&self) -> anyhow::Result<std::net::IpAddr> {
-        Ok(std::net::IpAddr::V4(
-            *self.host_ip.lock().expect("host_ip mutex poisoned"),
-        ))
-    }
-
-    async fn pod_gateway_ip(&self) -> anyhow::Result<std::net::IpAddr> {
-        Ok(std::net::IpAddr::V4(
-            *self
-                .pod_gateway_ip
+    fn cni_del<'a>(
+        &'a self,
+        sandbox_id: &'a klights_network_api::SandboxId,
+    ) -> klights_network_api::DatapathFuture<'a, ()> {
+        Box::pin(async move {
+            self.calls
                 .lock()
-                .expect("pod_gateway_ip mutex poisoned"),
-        ))
+                .expect("network calls mutex poisoned")
+                .push(NetworkCall::CniDel {
+                    sandbox_id: sandbox_id.to_string(),
+                });
+            Ok(())
+        })
     }
 
-    async fn shutdown(&self) -> anyhow::Result<()> {
-        self.calls
-            .lock()
-            .expect("network calls mutex poisoned")
-            .push(NetworkCall::Shutdown);
-        Ok(())
+    fn host_ip(&self) -> klights_network_api::DatapathFuture<'_, std::net::IpAddr> {
+        Box::pin(async move {
+            Ok(std::net::IpAddr::V4(
+                *self.host_ip.lock().expect("host_ip mutex poisoned"),
+            ))
+        })
+    }
+
+    fn pod_gateway_ip(&self) -> klights_network_api::DatapathFuture<'_, std::net::IpAddr> {
+        Box::pin(async move {
+            Ok(std::net::IpAddr::V4(
+                *self
+                    .pod_gateway_ip
+                    .lock()
+                    .expect("pod_gateway_ip mutex poisoned"),
+            ))
+        })
+    }
+
+    fn shutdown(&self) -> klights_network_api::DatapathFuture<'_, ()> {
+        Box::pin(async move {
+            self.calls
+                .lock()
+                .expect("network calls mutex poisoned")
+                .push(NetworkCall::Shutdown);
+            Ok(())
+        })
     }
 }
 
-#[async_trait]
-impl crate::networking::peer_router::PeerRouter for MockNetworkProvider {
-    async fn apply_peer_endpoint(&self, peer: &NodeEndpoint) -> anyhow::Result<()> {
-        match peer {
-            NodeEndpoint::WireGuard(plan) => {
-                self.calls
-                    .lock()
-                    .expect("network calls mutex poisoned")
-                    .push(NetworkCall::ApplyWireGuardPeerEndpoint {
-                        node_name: plan.node_name.clone(),
-                        endpoint: plan.endpoint.to_string(),
-                        allowed_pod_cidr: plan.allowed_pod_cidr.clone(),
-                    });
+impl klights_network_api::PeerRouter for MockNetworkProvider {
+    fn apply_peer_route<'a>(
+        &'a self,
+        route: &'a klights_network_api::PeerRoute,
+    ) -> klights_network_api::PeerRouterFuture<'a> {
+        Box::pin(async move {
+            match route {
+                klights_network_api::PeerRoute::WireGuard(route) => {
+                    self.calls
+                        .lock()
+                        .expect("network calls mutex poisoned")
+                        .push(NetworkCall::ApplyWireGuardPeerEndpoint {
+                            node_name: route.node_name().to_string(),
+                            endpoint: route.endpoint().to_string(),
+                            allowed_pod_cidr: route.allowed_pod_cidr().to_string(),
+                        });
+                }
+                klights_network_api::PeerRoute::Direct(route) => {
+                    self.calls
+                        .lock()
+                        .expect("network calls mutex poisoned")
+                        .push(NetworkCall::ApplyUnencryptedPeerEndpoint {
+                            node_name: route.node_name().to_string(),
+                            node_ip: route.gateway().to_string(),
+                            allowed_pod_cidr: route.allowed_pod_cidr().to_string(),
+                        });
+                }
             }
-            NodeEndpoint::UnencryptedDirect(plan) => {
-                self.calls
-                    .lock()
-                    .expect("network calls mutex poisoned")
-                    .push(NetworkCall::ApplyUnencryptedPeerEndpoint {
-                        node_name: plan.node_name.clone(),
-                        node_ip: plan.endpoint.to_string(),
-                        allowed_pod_cidr: plan.allowed_pod_cidr.clone(),
-                    });
+            if self
+                .peer_apply_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                self.peer_apply_notify.notify_waiters();
+                return Err(klights_network_api::PeerRouterError::apply(
+                    "injected peer apply failure",
+                ));
             }
-            NodeEndpoint::Rootless {
-                node_ip,
-                hostport_range,
-            } => {
-                self.calls
-                    .lock()
-                    .expect("network calls mutex poisoned")
-                    .push(NetworkCall::ApplyRootlessPeerEndpoint {
-                        node_ip: node_ip.to_string(),
-                        hostport_range: hostport_range.to_string(),
-                    });
-            }
-        }
-        Ok(())
+            self.peer_apply_successes
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            self.peer_apply_notify.notify_waiters();
+            Ok(())
+        })
     }
 
-    async fn remove_peer_endpoint(&self, peer: &NodeEndpoint) -> anyhow::Result<()> {
-        match peer {
-            NodeEndpoint::WireGuard(plan) => {
-                self.calls
-                    .lock()
-                    .expect("network calls mutex poisoned")
-                    .push(NetworkCall::RemoveWireGuardPeerEndpoint {
-                        node_name: plan.node_name.clone(),
-                        public_key: plan.public_key.to_string(),
-                        allowed_pod_cidr: plan.allowed_pod_cidr.clone(),
-                    });
+    fn remove_peer_route<'a>(
+        &'a self,
+        route: &'a klights_network_api::PeerRoute,
+    ) -> klights_network_api::PeerRouterFuture<'a> {
+        Box::pin(async move {
+            match route {
+                klights_network_api::PeerRoute::WireGuard(route) => {
+                    self.calls
+                        .lock()
+                        .expect("network calls mutex poisoned")
+                        .push(NetworkCall::RemoveWireGuardPeerEndpoint {
+                            node_name: route.node_name().to_string(),
+                            public_key: *route.public_key().as_bytes(),
+                            allowed_pod_cidr: route.allowed_pod_cidr().to_string(),
+                        });
+                }
+                klights_network_api::PeerRoute::Direct(route) => {
+                    self.calls
+                        .lock()
+                        .expect("network calls mutex poisoned")
+                        .push(NetworkCall::RemoveUnencryptedPeerEndpoint {
+                            node_name: route.node_name().to_string(),
+                            node_ip: route.gateway().to_string(),
+                            allowed_pod_cidr: route.allowed_pod_cidr().to_string(),
+                        });
+                }
             }
-            NodeEndpoint::UnencryptedDirect(plan) => {
-                self.calls
-                    .lock()
-                    .expect("network calls mutex poisoned")
-                    .push(NetworkCall::RemoveUnencryptedPeerEndpoint {
-                        node_name: plan.node_name.clone(),
-                        node_ip: plan.endpoint.to_string(),
-                        allowed_pod_cidr: plan.allowed_pod_cidr.clone(),
-                    });
+            if self
+                .peer_remove_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(klights_network_api::PeerRouterError::remove(
+                    "injected peer removal failure",
+                ));
             }
-            NodeEndpoint::Rootless {
-                node_ip,
-                hostport_range,
-            } => {
-                self.calls
-                    .lock()
-                    .expect("network calls mutex poisoned")
-                    .push(NetworkCall::RemoveRootlessPeerEndpoint {
-                        node_ip: node_ip.to_string(),
-                        hostport_range: hostport_range.to_string(),
-                    });
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -248,6 +317,10 @@ impl Default for MockNetworkProvider {
             // (e.g. kubernetes Endpoints bootstrap) want a usable value.
             host_ip: Arc::new(Mutex::new(Ipv4Addr::new(127, 0, 0, 1))),
             pod_gateway_ip: Arc::new(Mutex::new(Ipv4Addr::new(10, 43, 0, 1))),
+            peer_apply_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peer_apply_successes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peer_apply_notify: Arc::new(tokio::sync::Notify::new()),
+            peer_remove_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -264,14 +337,47 @@ pub struct MockServiceRouter {
 
 pub struct MockPodEndpointResolver;
 
-#[async_trait]
-impl PodEndpointResolver for MockPodEndpointResolver {
-    async fn resolve(&self, _pod_ip: Ipv4Addr) -> anyhow::Result<Option<Endpoint>> {
-        Ok(None)
+impl klights_network_api::PodEndpointResolver for MockPodEndpointResolver {
+    fn resolve(
+        &self,
+        _pod_ip: Ipv4Addr,
+    ) -> klights_network_api::PodEndpointFuture<'_, Option<klights_network_api::PodEndpoint>> {
+        Box::pin(async { Ok(None) })
     }
+}
 
-    fn watch(&self) -> BoxStream<'static, EndpointEvent> {
-        Box::pin(futures::stream::empty())
+impl klights_network_api::PodEndpointEventSource for MockPodEndpointResolver {
+    fn subscribe(
+        &self,
+    ) -> klights_network_api::PodEndpointFuture<'_, klights_network_api::PodEndpointEventStream>
+    {
+        Box::pin(async {
+            Ok(Box::pin(EmptyPodEndpointSubscription { initial: true })
+                as klights_network_api::PodEndpointEventStream)
+        })
+    }
+}
+
+struct EmptyPodEndpointSubscription {
+    initial: bool,
+}
+
+impl klights_network_api::PodEndpointEventSubscription for EmptyPodEndpointSubscription {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<
+        Option<
+            Result<klights_network_api::PodEndpointEvent, klights_network_api::PodEndpointError>,
+        >,
+    > {
+        if std::mem::take(&mut self.initial) {
+            Poll::Ready(Some(Ok(klights_network_api::PodEndpointEvent::Resync(
+                Vec::new(),
+            ))))
+        } else {
+            Poll::Ready(None)
+        }
     }
 }
 
@@ -321,68 +427,59 @@ pub fn mock_network(
     _db: crate::datastore::DatastoreHandle,
 ) -> std::sync::Arc<crate::networking::Network> {
     let provider = Arc::new(MockNetworkProvider::new());
-    std::sync::Arc::new(crate::networking::Network {
-        datapath: provider.clone(),
-        peering: provider,
-        services: Arc::new(MockServiceRouter::new()),
-        resolver: Arc::new(MockPodEndpointResolver),
-    })
+    std::sync::Arc::new(crate::networking::Network::new(
+        provider.clone(),
+        provider,
+        Arc::new(MockServiceRouter::new()),
+        Arc::new(MockPodEndpointResolver),
+    ))
 }
 
-#[async_trait]
-impl crate::networking::ServiceRouter for MockServiceRouter {
-    fn request_services_sync(&self) {
+impl klights_network_api::ServiceRouter for MockServiceRouter {
+    fn request_services_sync(&self) -> Result<(), klights_network_api::ServiceRouterError> {
         self.sync_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    async fn sync_services_now(&self) -> anyhow::Result<()> {
-        self.sync_now_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
-    async fn add_hostport_rules(
+    fn sync_services_now(&self) -> klights_network_api::ServiceRouterFuture<'_> {
+        Box::pin(async move {
+            self.sync_now_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+    }
+    fn add_hostport_rules(
         &self,
-        _pod: &serde_json::Value,
-        _pod_ip: Ipv4Addr,
-    ) -> anyhow::Result<()> {
-        self.add_hostport_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        _request: klights_network_api::HostPortRules,
+    ) -> klights_network_api::ServiceRouterFuture<'_> {
+        Box::pin(async move {
+            self.add_hostport_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
     }
-    async fn remove_hostport_rules(&self, _pod: &serde_json::Value) -> anyhow::Result<()> {
-        self.remove_hostport_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+    fn remove_hostport_rules(
+        &self,
+        _request: klights_network_api::HostPortRemoval,
+    ) -> klights_network_api::ServiceRouterFuture<'_> {
+        Box::pin(async move {
+            self.remove_hostport_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
     }
-    async fn cleanup(&self) -> anyhow::Result<()> {
-        self.cleanup_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+    fn cleanup(&self) -> klights_network_api::ServiceRouterFuture<'_> {
+        Box::pin(async move {
+            self.cleanup_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
     }
 }
 
 #[cfg(test)]
 mod peer_endpoint_tests {
     use super::*;
-
-    #[test]
-    fn test_node_endpoint_is_non_exhaustive() {
-        // Guards the `#[non_exhaustive]` shape: in-crate matches must
-        // cover every known variant; external matches need a wildcard.
-        let endpoint = NodeEndpoint::Rootless {
-            node_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
-            hostport_range: crate::networking::types::HostPortRange {
-                start: 31000,
-                end: 31999,
-            },
-        };
-        match &endpoint {
-            NodeEndpoint::WireGuard(_) | NodeEndpoint::UnencryptedDirect(_) => {
-                panic!("constructed Rootless, not direct endpoint")
-            }
-            NodeEndpoint::Rootless { .. } => {}
-        }
-    }
 
     // ---------- trait-split tests (Task 4) ----------
 
@@ -391,22 +488,22 @@ mod peer_endpoint_tests {
     /// the mock can't provide), this fails at build time.
     #[test]
     fn test_network_plane_implements_datapath() {
-        fn assert_impl<T: crate::networking::Datapath>() {}
+        fn assert_impl<T: klights_network_api::Datapath>() {}
         assert_impl::<MockNetworkProvider>();
         // NetworkPlane impls Datapath via the same trait surface — verify
         // by erasing through `dyn`.
         let _erase = |p: std::sync::Arc<crate::networking::plane::NetworkPlane>| {
-            let _: std::sync::Arc<dyn crate::networking::Datapath> = p;
+            let _: std::sync::Arc<dyn klights_network_api::Datapath> = p;
         };
     }
 
     /// Compile-time check: `MockNetworkProvider` satisfies `PeerRouter`.
     #[test]
     fn test_network_plane_implements_peer_router() {
-        fn assert_impl<T: crate::networking::PeerRouter>() {}
+        fn assert_impl<T: klights_network_api::PeerRouter>() {}
         assert_impl::<MockNetworkProvider>();
         let _erase = |p: std::sync::Arc<crate::networking::plane::NetworkPlane>| {
-            let _: std::sync::Arc<dyn crate::networking::PeerRouter> = p;
+            let _: std::sync::Arc<dyn klights_network_api::PeerRouter> = p;
         };
     }
 
@@ -415,7 +512,7 @@ mod peer_endpoint_tests {
     /// signature shape holds.
     #[test]
     fn test_kubelet_caller_takes_only_datapath() {
-        fn kubelet_call(_dp: &dyn crate::networking::Datapath) {}
+        fn kubelet_call(_dp: &dyn klights_network_api::Datapath) {}
         let mock = MockNetworkProvider::new();
         kubelet_call(&mock);
     }
@@ -424,7 +521,7 @@ mod peer_endpoint_tests {
     /// `&dyn PeerRouter`.
     #[test]
     fn test_node_subnet_caller_takes_only_peer_router() {
-        fn controller_call(_pr: &dyn crate::networking::PeerRouter) {}
+        fn controller_call(_pr: &dyn klights_network_api::PeerRouter) {}
         let mock = MockNetworkProvider::new();
         controller_call(&mock);
     }
@@ -436,7 +533,7 @@ mod peer_endpoint_tests {
     /// at boot from config / discovery.
     #[tokio::test]
     async fn test_datapath_host_ip_returns_configured_node_ip() {
-        use crate::networking::Datapath;
+        use klights_network_api::Datapath;
         let mock = MockNetworkProvider::new();
         mock.set_host_ip(std::net::Ipv4Addr::new(192, 168, 7, 42));
         let ip = Datapath::host_ip(&mock).await.unwrap();
@@ -450,7 +547,7 @@ mod peer_endpoint_tests {
     /// record any NetworkCall (no shell-out, no rtnetlink call).
     #[tokio::test]
     async fn test_datapath_host_ip_no_shell_command_invoked() {
-        use crate::networking::Datapath;
+        use klights_network_api::Datapath;
         let mock = MockNetworkProvider::new();
         mock.clear_calls();
         let _ = Datapath::host_ip(&mock).await.unwrap();

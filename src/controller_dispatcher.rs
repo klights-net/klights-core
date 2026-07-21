@@ -67,7 +67,7 @@ pub struct ControllerDispatcher {
     /// [`Context::services`]. Set by bootstrap before the worker starts;
     /// `None` in tests that exercise non-Service controllers without a
     /// live router.
-    services: Arc<Mutex<Option<Arc<dyn crate::networking::ServiceRouter>>>>,
+    services: Arc<Mutex<Option<Arc<dyn klights_network_api::ServiceRouter>>>>,
     /// Pod repository shared across all dispatched controllers via
     /// [`Context::pod_repository`]. Set by bootstrap before the worker
     /// starts; required by the Deployment and ReplicaSet controllers
@@ -197,11 +197,11 @@ impl ControllerDispatcher {
     /// Attach a live ServiceRouter so controllers (notably ServiceController)
     /// can request immediate nft sync via `Context::services`. Must be
     /// called by bootstrap before [`run_worker`] starts.
-    pub async fn set_services(&self, services: Arc<dyn crate::networking::ServiceRouter>) {
+    pub async fn set_services(&self, services: Arc<dyn klights_network_api::ServiceRouter>) {
         *self.services.lock().await = Some(services);
     }
 
-    async fn current_services(&self) -> Option<Arc<dyn crate::networking::ServiceRouter>> {
+    async fn current_services(&self) -> Option<Arc<dyn klights_network_api::ServiceRouter>> {
         self.services.lock().await.clone()
     }
 

@@ -584,7 +584,11 @@ async fn delete_service(
         tracing::error!(namespace = %namespace, name = %svc_name, error = %e, "service delete: cascade delete failed");
     }
 
-    state.network.services.request_services_sync();
+    state
+        .network
+        .services()
+        .request_services_sync()
+        .map_err(|error| AppError::Internal(error.to_string()))?;
 
     crate::api::mutation::dispatch_mutation_event(
         &state.side_effects,

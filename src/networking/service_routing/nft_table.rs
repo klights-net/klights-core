@@ -155,6 +155,12 @@ pub struct KlightsTable {
     /// (initial sync or after watch compaction / inventory corruption).
     service_route_inventory: std::sync::Mutex<Option<super::inventory::ServiceRouteInventory>>,
     network_policy_snapshot: std::sync::Mutex<Option<NetworkPolicyPlan>>,
+    #[cfg(test)]
+    hostport_flush_results: std::sync::Mutex<std::collections::VecDeque<Result<()>>>,
+    #[cfg(test)]
+    remote_flush_results: std::sync::Mutex<std::collections::VecDeque<Result<()>>>,
+    #[cfg(test)]
+    hostport_flush_attempts: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -491,6 +497,12 @@ impl KlightsTable {
             applied_service_specs: std::sync::Mutex::new(Vec::new()),
             service_route_inventory: std::sync::Mutex::new(None),
             network_policy_snapshot: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            hostport_flush_results: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            remote_flush_results: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            hostport_flush_attempts: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -507,19 +519,30 @@ impl KlightsTable {
             .collect()
     }
 
-    /// Insert/replace one pod's hostport specs. Returns true if the
-    /// stored entry actually changed (insert or differs from previous).
-    fn hostport_insert(&self, pod_ip: Ipv4Addr, specs: Vec<HostPortSpec>) -> bool {
+    /// Insert/replace one pod's hostport specs, retaining the exact prior
+    /// entry so a failed kernel flush can be rolled back without cloning it.
+    fn hostport_insert(
+        &self,
+        pod_ip: Ipv4Addr,
+        specs: Vec<HostPortSpec>,
+    ) -> Option<Option<Vec<HostPortSpec>>> {
         let mut reg = lock_recover(&self.hostport_registry);
-        let previous = reg.insert(pod_ip, specs.clone());
-        previous.as_ref() != Some(&specs)
+        if reg.get(&pod_ip) == Some(&specs) {
+            return None;
+        }
+        Some(reg.insert(pod_ip, specs))
     }
 
-    /// Remove one pod's hostport specs. Returns true if an entry was
-    /// actually removed.
-    fn hostport_remove(&self, pod_ip: Ipv4Addr) -> bool {
+    fn hostport_restore(&self, pod_ip: Ipv4Addr, prior: Option<Vec<HostPortSpec>>) {
         let mut reg = lock_recover(&self.hostport_registry);
-        reg.remove(&pod_ip).is_some()
+        match prior {
+            Some(specs) => {
+                reg.insert(pod_ip, specs);
+            }
+            None => {
+                reg.remove(&pod_ip);
+            }
+        }
     }
 
     fn remote_pod_snapshot(&self) -> Vec<RemotePodEndpointSpec> {
@@ -541,21 +564,90 @@ impl KlightsTable {
         snapshot
     }
 
-    fn remote_pod_replace_all(&self, specs: &[RemotePodEndpointSpec]) {
-        let mut reg = lock_recover(&self.remote_pod_registry);
-        reg.clear();
+    fn remote_pod_restore(
+        &self,
+        prior: std::collections::HashMap<Ipv4Addr, Vec<RemotePodEndpointSpec>>,
+    ) {
+        *lock_recover(&self.remote_pod_registry) = prior;
+    }
+
+    fn finish_remote_pod_flush<T>(
+        &self,
+        prior: std::collections::HashMap<Ipv4Addr, Vec<RemotePodEndpointSpec>>,
+        result: Result<T>,
+    ) -> Result<T> {
+        if result.is_err() {
+            self.remote_pod_restore(prior);
+        }
+        result
+    }
+
+    fn remote_pod_replace_all(
+        &self,
+        specs: &[RemotePodEndpointSpec],
+    ) -> std::collections::HashMap<Ipv4Addr, Vec<RemotePodEndpointSpec>> {
+        let mut replacement = std::collections::HashMap::new();
         for spec in specs {
-            reg.entry(spec.pod_ip).or_default().push(*spec);
+            replacement
+                .entry(spec.pod_ip)
+                .or_insert_with(Vec::new)
+                .push(*spec);
+        }
+        std::mem::replace(&mut *lock_recover(&self.remote_pod_registry), replacement)
+    }
+
+    fn remote_pod_upsert(
+        &self,
+        pod_ip: Ipv4Addr,
+        specs: Vec<RemotePodEndpointSpec>,
+    ) -> Option<Option<Vec<RemotePodEndpointSpec>>> {
+        let mut reg = lock_recover(&self.remote_pod_registry);
+        if specs.is_empty() {
+            return reg.remove(&pod_ip).map(Some);
+        }
+        if reg.get(&pod_ip) == Some(&specs) {
+            return None;
+        }
+        Some(reg.insert(pod_ip, specs))
+    }
+
+    fn remote_pod_restore_entry(
+        &self,
+        pod_ip: Ipv4Addr,
+        prior: Option<Vec<RemotePodEndpointSpec>>,
+    ) {
+        let mut reg = lock_recover(&self.remote_pod_registry);
+        match prior {
+            Some(specs) => {
+                reg.insert(pod_ip, specs);
+            }
+            None => {
+                reg.remove(&pod_ip);
+            }
         }
     }
 
-    fn remote_pod_upsert(&self, pod_ip: Ipv4Addr, specs: Vec<RemotePodEndpointSpec>) -> bool {
-        let mut reg = lock_recover(&self.remote_pod_registry);
-        if specs.is_empty() {
-            return reg.remove(&pod_ip).is_some();
-        }
-        let previous = reg.insert(pod_ip, specs.clone());
-        previous.as_ref() != Some(&specs)
+    #[cfg(test)]
+    fn test_queue_hostport_flush_result(&self, result: Result<()>) {
+        lock_recover(&self.hostport_flush_results).push_back(result);
+    }
+
+    #[cfg(test)]
+    fn test_hostport_flush_attempts(&self) -> usize {
+        self.hostport_flush_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn test_queue_remote_flush_result(&self, result: Result<()>) {
+        lock_recover(&self.remote_flush_results).push_back(result);
+    }
+
+    #[cfg(test)]
+    fn test_remote_entry_ptr(&self, pod_ip: Ipv4Addr) -> Option<usize> {
+        lock_recover(&self.remote_pod_registry)
+            .get(&pod_ip)
+            .map(|specs| specs.as_ptr() as usize)
     }
 
     /// Build the table with all foundation + service-routing chains.
@@ -1599,7 +1691,7 @@ impl KlightsTable {
     /// snapshot + send batch)` sequence so concurrent callers can't
     /// observe each other's intermediate state and emit chains based on
     /// stale snapshots. See [`hostport_lock_for`] for the race scenario.
-    pub async fn add_hostports_for_pod(
+    pub(crate) async fn add_hostports_for_pod(
         &self,
         pod_ip: Ipv4Addr,
         specs: Vec<HostPortSpec>,
@@ -1611,8 +1703,14 @@ impl KlightsTable {
         }
         let lock = self.hostport_lock.clone();
         let _guard = lock.lock().await;
-        self.hostport_insert(pod_ip, specs);
-        self.flush_hostports_chain().await
+        let Some(prior) = self.hostport_insert(pod_ip, specs) else {
+            return Ok(());
+        };
+        let result = self.flush_hostports_chain().await;
+        if result.is_err() {
+            self.hostport_restore(pod_ip, prior);
+        }
+        result
     }
 
     /// Remove all hostport rules for a pod and re-emit the chain.
@@ -1622,13 +1720,18 @@ impl KlightsTable {
     /// Holds the per-table hostport lock for the same reason
     /// [`add_hostports_for_pod`] does — the (mutate + snapshot + send)
     /// sequence is the critical section.
-    pub async fn remove_hostports_for_pod(&self, pod_ip: Ipv4Addr) -> Result<()> {
+    pub(crate) async fn remove_hostports_for_pod(&self, pod_ip: Ipv4Addr) -> Result<()> {
         let lock = self.hostport_lock.clone();
         let _guard = lock.lock().await;
-        if self.hostport_remove(pod_ip) {
-            self.flush_hostports_chain().await?;
+        let prior = lock_recover(&self.hostport_registry).remove(&pod_ip);
+        let Some(prior) = prior else {
+            return Ok(());
+        };
+        let result = self.flush_hostports_chain().await;
+        if result.is_err() {
+            self.hostport_restore(pod_ip, Some(prior));
         }
-        Ok(())
+        result
     }
 
     /// Re-emit the hostports chain from the current registry contents
@@ -1637,6 +1740,14 @@ impl KlightsTable {
     /// flush + new rules in one batch) so observers never see a partial
     /// chain.
     async fn flush_hostports_chain(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.hostport_flush_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(result) = lock_recover(&self.hostport_flush_results).pop_front() {
+                return result;
+            }
+        }
         let table = self.table();
         let chain = Chain::new(HOSTPORTS_CHAIN, &table);
 
@@ -1705,57 +1816,43 @@ impl KlightsTable {
 
     // ---- Remote rootless pod endpoint helpers -------------------------
 
-    pub async fn sync_remote_pod_endpoints_from_db(
-        &self,
-        db: &dyn DatastoreBackend,
-        local_node_name: &str,
-    ) -> Result<usize> {
-        let rows = db
-            .pod_endpoint_list_all()
-            .await
-            .context("list pod_endpoints for remote pod DNAT")?;
-        let specs = remote_pod_endpoint_specs_from_rows(local_node_name, rows);
-        let count = specs.len();
-        self.replace_remote_pod_endpoints(&specs).await?;
-        Ok(count)
-    }
-
-    pub async fn sync_remote_pod_endpoints_from_node_local(
-        &self,
-        node_local: &dyn NodeLocalBackend,
-        local_node_name: &str,
-    ) -> Result<usize> {
-        let rows = node_local
-            .list_endpoints_all()
-            .await
-            .context("list node-local pod_endpoints for remote pod DNAT")?;
-        let specs = remote_pod_endpoint_specs_from_rows(local_node_name, rows);
-        let count = specs.len();
-        self.replace_remote_pod_endpoints(&specs).await?;
-        Ok(count)
-    }
-
     pub async fn replace_remote_pod_endpoints(
         &self,
         specs: &[RemotePodEndpointSpec],
     ) -> Result<()> {
         let lock = self.remote_pod_lock.clone();
         let _guard = lock.lock().await;
-        self.remote_pod_replace_all(specs);
-        self.flush_remote_pod_endpoints_chain().await
+        let prior = self.remote_pod_replace_all(specs);
+        let result = self.flush_remote_pod_endpoints_chain().await;
+        self.finish_remote_pod_flush(prior, result)
     }
 
-    pub async fn upsert_remote_pod_endpoint_row(
+    pub async fn sync_remote_pod_endpoints_from_topology(
         &self,
         local_node_name: &str,
-        row: crate::datastore::PodEndpointRow,
+        endpoints: &[klights_network_api::PodEndpointTopology],
+    ) -> Result<usize> {
+        let specs = remote_pod_endpoint_specs_from_topology(local_node_name, endpoints);
+        let count = specs.len();
+        self.replace_remote_pod_endpoints(&specs).await?;
+        Ok(count)
+    }
+
+    pub async fn upsert_remote_pod_endpoint(
+        &self,
+        local_node_name: &str,
+        endpoint: klights_network_api::PodEndpointTopology,
     ) -> Result<()> {
-        let pod_ip = row.pod_ip;
-        let specs = remote_pod_endpoint_specs_from_rows(local_node_name, vec![row]);
+        let pod_ip = endpoint.pod_ip();
+        let specs = remote_pod_endpoint_specs_from_topology(local_node_name, &[endpoint]);
         let lock = self.remote_pod_lock.clone();
         let _guard = lock.lock().await;
-        if self.remote_pod_upsert(pod_ip, specs) {
-            self.flush_remote_pod_endpoints_chain().await?;
+        if let Some(prior) = self.remote_pod_upsert(pod_ip, specs) {
+            let result = self.flush_remote_pod_endpoints_chain().await;
+            if result.is_err() {
+                self.remote_pod_restore_entry(pod_ip, prior);
+            }
+            result?;
         }
         Ok(())
     }
@@ -1763,13 +1860,21 @@ impl KlightsTable {
     pub async fn remove_remote_pod_endpoint(&self, pod_ip: Ipv4Addr) -> Result<()> {
         let lock = self.remote_pod_lock.clone();
         let _guard = lock.lock().await;
-        if self.remote_pod_upsert(pod_ip, Vec::new()) {
-            self.flush_remote_pod_endpoints_chain().await?;
+        if let Some(prior) = self.remote_pod_upsert(pod_ip, Vec::new()) {
+            let result = self.flush_remote_pod_endpoints_chain().await;
+            if result.is_err() {
+                self.remote_pod_restore_entry(pod_ip, prior);
+            }
+            result?;
         }
         Ok(())
     }
 
     async fn flush_remote_pod_endpoints_chain(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(result) = lock_recover(&self.remote_flush_results).pop_front() {
+            return result;
+        }
         let table = self.table();
         let chain = Chain::new(REMOTE_POD_ENDPOINTS_CHAIN, &table);
         let snapshot = self.remote_pod_snapshot();
@@ -2039,6 +2144,172 @@ fn validate_linux_ifname(ifname: &CStr) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod remote_endpoint_failure_tests {
+    use super::*;
+
+    fn table() -> KlightsTable {
+        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        KlightsTable::with_name(
+            Netfilter::new(supervisor).unwrap(),
+            "klights-remote-rollback-test",
+            PodSubnet::parse("10.42.0.0/24").unwrap(),
+            ClusterCidr::parse("10.42.0.0/16").unwrap(),
+            ClusterCidr::parse("10.43.0.0/16").unwrap(),
+            ServiceRoutingMode::default_root_for_test(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn failed_remote_endpoint_flush_restores_prior_registry() {
+        let table = table();
+        let prior_spec = RemotePodEndpointSpec {
+            pod_ip: Ipv4Addr::new(10, 42, 1, 10),
+            node_ip: Ipv4Addr::new(192, 0, 2, 10),
+            host_port: 31_010,
+            protocol: Protocol::Tcp,
+        };
+        let failed_spec = RemotePodEndpointSpec {
+            pod_ip: Ipv4Addr::new(10, 42, 2, 10),
+            node_ip: Ipv4Addr::new(192, 0, 2, 20),
+            host_port: 31_020,
+            protocol: Protocol::Udp,
+        };
+        table.remote_pod_replace_all(&[prior_spec]);
+        let prior = table.remote_pod_replace_all(&[failed_spec]);
+
+        table
+            .finish_remote_pod_flush::<()>(prior, Err(anyhow::anyhow!("nft flush failed")))
+            .expect_err("deterministic nft failure must remain visible to the worker");
+
+        assert_eq!(table.remote_pod_snapshot(), vec![prior_spec]);
+    }
+
+    #[tokio::test]
+    async fn failed_hostport_delete_restores_registry_for_identical_retry() {
+        let table = table();
+        let pod_ip = Ipv4Addr::new(10, 42, 1, 10);
+        let spec = HostPortSpec {
+            host_ip: None,
+            host_port: 30_080,
+            container_port: 80,
+            protocol: Protocol::Tcp,
+        };
+        assert!(table.hostport_insert(pod_ip, vec![spec.clone()]).is_some());
+        table
+            .test_queue_hostport_flush_result(Err(anyhow::anyhow!("injected first flush failure")));
+        table.test_queue_hostport_flush_result(Ok(()));
+
+        table
+            .remove_hostports_for_pod(pod_ip)
+            .await
+            .expect_err("first delete must expose the nft flush failure");
+        assert_eq!(table.hostport_snapshot(), vec![(pod_ip, vec![spec])]);
+
+        table
+            .remove_hostports_for_pod(pod_ip)
+            .await
+            .expect("identical retry must flush and commit the delete");
+        assert!(table.hostport_snapshot().is_empty());
+        assert_eq!(table.test_hostport_flush_attempts(), 2);
+    }
+
+    #[tokio::test]
+    async fn incremental_remote_mutations_rollback_only_the_affected_key() {
+        let table = table();
+        let unrelated = RemotePodEndpointSpec {
+            pod_ip: Ipv4Addr::new(10, 42, 1, 10),
+            node_ip: Ipv4Addr::new(192, 0, 2, 10),
+            host_port: 31_010,
+            protocol: Protocol::Tcp,
+        };
+        let prior = RemotePodEndpointSpec {
+            pod_ip: Ipv4Addr::new(10, 42, 2, 10),
+            node_ip: Ipv4Addr::new(192, 0, 2, 20),
+            host_port: 31_020,
+            protocol: Protocol::Udp,
+        };
+        let replacement = RemotePodEndpointSpec {
+            host_port: 31_021,
+            ..prior
+        };
+        table.remote_pod_replace_all(&[unrelated, prior]);
+        let unrelated_ptr = table.test_remote_entry_ptr(unrelated.pod_ip);
+
+        for result in [
+            Err(anyhow::anyhow!("injected upsert failure")),
+            Ok(()),
+            Err(anyhow::anyhow!("injected removal failure")),
+            Ok(()),
+        ] {
+            table.test_queue_remote_flush_result(result);
+        }
+
+        table
+            .upsert_remote_pod_endpoint(
+                "local",
+                klights_network_api::PodEndpointTopology::HostPort(
+                    klights_network_api::HostPortPodEndpoint::try_new(
+                        replacement.pod_ip,
+                        "remote",
+                        replacement.node_ip,
+                        None,
+                        Some(replacement.host_port),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await
+            .expect_err("first incremental upsert must expose flush failure");
+        assert_eq!(table.remote_pod_snapshot(), vec![unrelated, prior]);
+        assert_eq!(
+            table.test_remote_entry_ptr(unrelated.pod_ip),
+            unrelated_ptr,
+            "rollback must not clone or replace an unrelated registry vector"
+        );
+
+        table
+            .upsert_remote_pod_endpoint(
+                "local",
+                klights_network_api::PodEndpointTopology::HostPort(
+                    klights_network_api::HostPortPodEndpoint::try_new(
+                        replacement.pod_ip,
+                        "remote",
+                        replacement.node_ip,
+                        None,
+                        Some(replacement.host_port),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await
+            .expect("identical upsert retry must commit");
+        assert_eq!(table.test_remote_entry_ptr(unrelated.pod_ip), unrelated_ptr);
+
+        table
+            .remove_remote_pod_endpoint(replacement.pod_ip)
+            .await
+            .expect_err("first incremental removal must expose flush failure");
+        assert!(
+            table
+                .remote_pod_snapshot()
+                .iter()
+                .any(|spec| *spec == replacement)
+        );
+        assert_eq!(table.test_remote_entry_ptr(unrelated.pod_ip), unrelated_ptr);
+
+        table
+            .remove_remote_pod_endpoint(replacement.pod_ip)
+            .await
+            .expect("identical removal retry must commit");
+        assert_eq!(table.remote_pod_snapshot(), vec![unrelated]);
+        assert_eq!(table.test_remote_entry_ptr(unrelated.pod_ip), unrelated_ptr);
+    }
 }
 
 /// The verdict applied at the end of a rule.

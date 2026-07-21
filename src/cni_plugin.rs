@@ -500,16 +500,14 @@ async fn handle_request(
             let pod_name_for_log = pod_name.clone();
             let network = state
                 .network
-                .datapath
-                .cni_add(crate::networking::provider::CniAddRequest {
-                    sandbox_id: req.container_id.clone(),
-                    namespace: pod_namespace,
-                    pod_name,
-                    pod_uid,
+                .datapath()
+                .cni_add(klights_network_api::CniAddRequest::try_new(
+                    req.container_id.clone(),
+                    klights_types::PodIdentity::new(&pod_namespace, &pod_name, &pod_uid),
                     netns_setns_path,
-                    netns_record_path: netns_record_path.clone(),
-                    host_network: false,
-                })
+                    netns_record_path.clone(),
+                    false,
+                )?)
                 .await
                 .with_context(|| {
                     format!(
@@ -517,14 +515,15 @@ async fn handle_request(
                         pod_namespace_for_log, pod_name_for_log, req.container_id
                     )
                 })?;
-            let result = build_cni_result(&req.config, &netns_record_path, network.ip_addr)?;
+            let result = build_cni_result(&req.config, &netns_record_path, network.ip_addr())?;
             Ok(Some(result))
         }
         "DEL" => {
+            let sandbox_id = klights_network_api::SandboxId::try_new(req.container_id.clone())?;
             state
                 .network
-                .datapath
-                .cni_del(&req.container_id)
+                .datapath()
+                .cni_del(&sandbox_id)
                 .await
                 .with_context(|| format!("failed in-process CNI DEL for {}", req.container_id))?;
             Ok(None)

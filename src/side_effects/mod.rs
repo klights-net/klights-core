@@ -251,7 +251,7 @@ pub async fn run_named_hook_logged(
 /// passes the same `Arc<SideEffectMetrics>` that lives on `AppState`.
 pub fn default_registry(
     metrics: std::sync::Arc<SideEffectMetrics>,
-    services: Option<std::sync::Arc<dyn crate::networking::ServiceRouter>>,
+    services: Option<std::sync::Arc<dyn klights_network_api::ServiceRouter>>,
     task_supervisor: Option<std::sync::Arc<crate::task_supervisor::TaskSupervisor>>,
     db: Option<crate::datastore::DatastoreHandle>,
 ) -> SideEffectRegistry {

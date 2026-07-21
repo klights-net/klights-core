@@ -13,7 +13,7 @@ use crate::task_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 
 pub struct NetworkPhase {
     pub network: Arc<networking::Network>,
-    pub services: Arc<dyn networking::ServiceRouter>,
+    pub services: Arc<dyn klights_network_api::ServiceRouter>,
     pub _local_pod_subnet: String,
     pub cni_rpc_token: CancellationToken,
     pub cni_rpc_handle: SupervisedJoinHandle<()>,
@@ -95,7 +95,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         }
     };
 
-    let boot_peering: Arc<dyn networking::PeerRouter> = match &network_boot {
+    let boot_peering: Arc<dyn klights_network_api::PeerRouter> = match &network_boot {
         networking::NetworkBoot::Root(p) => p.clone(),
         networking::NetworkBoot::Rootless(p) => p.clone(),
     };
@@ -119,13 +119,28 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
     let service_cidr = networking::ClusterCidr::parse(&config.service_cidr)
         .map_err(|e| anyhow::anyhow!("bad service_cidr '{}': {}", config.service_cidr, e))?;
 
+    let endpoint_adapter = Arc::new(networking::SqlitePodEndpointResolver::new(
+        node_local.clone(),
+        cluster_api.clone(),
+    ));
+    let endpoint_source: Arc<dyn klights_network_api::PodEndpointEventSource> =
+        endpoint_adapter.clone();
+    let resolver: Arc<dyn klights_network_api::PodEndpointResolver> = endpoint_adapter;
+
+    if let networking::NetworkBoot::Rootless(plane) = &network_boot {
+        plane
+            .prepare_service_routing_bridge()
+            .await
+            .context("prepare rootless bridge before service-router sysctls")?;
+    }
+
     let srm = networking::service_routing::ServiceRoutingMode::new(node_mode.clone());
-    let services: Arc<dyn networking::ServiceRouter> =
+    let services: Arc<dyn klights_network_api::ServiceRouter> =
         networking::service_routing::NftServiceRouter::boot_with_defaults(
             networking::service_routing::NftServiceRouterDefaultBoot::new(
                 networking::service_routing::NftServiceRouterStores::new(
                     cluster_api.clone(),
-                    node_local.clone(),
+                    endpoint_source,
                 ),
                 networking::service_routing::NftServiceRouterTableConfig::new(
                     &config.node_name,
@@ -145,24 +160,20 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         .await
         .context("klights service routing requires br_netfilter")?;
 
-    let resolver: Arc<dyn networking::PodEndpointResolver> = Arc::new(
-        networking::SqlitePodEndpointResolver::new(node_local.clone(), cluster_api),
-    );
-
     let (datapath, peering): (
-        Arc<dyn networking::Datapath>,
-        Arc<dyn networking::PeerRouter>,
+        Arc<dyn klights_network_api::Datapath>,
+        Arc<dyn klights_network_api::PeerRouter>,
     ) = match (&network_boot, node_mode) {
         (networking::NetworkBoot::Root(p), _) => (p.clone(), p.clone()),
         (networking::NetworkBoot::Rootless(p), _) => (p.clone(), p.clone()),
     };
 
-    let network = Arc::new(networking::Network {
+    let network = Arc::new(networking::Network::new(
         datapath,
         peering,
-        services: services.clone(),
+        services.clone(),
         resolver,
-    });
+    ));
 
     // CNI RPC
     let cni_rpc_token = CancellationToken::new();

@@ -1013,7 +1013,7 @@ mod integration_tests {
     #[tokio::test]
     #[ignore = "requires root/netfilter access"]
     async fn test_worker_exits_within_100ms_on_cancel() {
-        use crate::networking::service_router::ServiceRouter;
+        use klights_network_api::ServiceRouter;
         let cancel = CancellationToken::new();
         let db = crate::datastore::sqlite::Datastore::new_in_memory()
             .await
@@ -1036,8 +1036,13 @@ mod integration_tests {
         )
         .await
         .expect("open node-local test db");
+        let endpoint_source: std::sync::Arc<dyn klights_network_api::PodEndpointEventSource> =
+            std::sync::Arc::new(crate::networking::SqlitePodEndpointResolver::new(
+                node_local,
+                cluster_api.clone(),
+            ));
         let rt = NftServiceRouter::boot(NftServiceRouterBoot::new(
-            NftServiceRouterStores::new(cluster_api, node_local),
+            NftServiceRouterStores::new(cluster_api, endpoint_source),
             NftServiceRouterTableConfig::new("node-a", "klights-test-shutdown", "klights-test"),
             NftServiceRouterNetworkConfig::new(
                 PodSubnet::parse("10.42.0.0/24").unwrap(),

@@ -484,7 +484,14 @@ mod tests {
             .await;
         let _ = fixture
             .hostports
-            .add_host_ports(&key, &serde_json::json!({}))
+            .add_host_ports(
+                &klights_network_api::PodHostPorts::try_new(
+                    klights_types::PodIdentity::new(&key.namespace, &key.name, &key.uid),
+                    None,
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
             .await;
         let _ = fixture
             .events

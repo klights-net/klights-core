@@ -2028,6 +2028,7 @@ dependencies = [
  "klights-cluster-store",
  "klights-internal-protobuf",
  "klights-leader-api",
+ "klights-network-api",
  "klights-node-api",
  "klights-pod-api",
  "klights-reconcile-api",
@@ -2164,6 +2165,9 @@ dependencies = [
 [[package]]
 name = "klights-network-api"
 version = "0.0.0"
+dependencies = [
+ "klights-types",
+]
 
 [[package]]
 name = "klights-networking"

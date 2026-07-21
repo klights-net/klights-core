@@ -55,7 +55,7 @@ pub async fn bootstrap_kubernetes_service(
     db: &dyn DatastoreBackend,
     service_cidr: &str,
     tls_port: u16,
-    datapath: &dyn crate::networking::Datapath,
+    datapath: &dyn klights_network_api::Datapath,
 ) -> Result<()> {
     let kubernetes_service_ip = derive_kubernetes_service_ip(service_cidr);
 

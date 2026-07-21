@@ -21,6 +21,9 @@ const POD_SLOT_ADMISSION_CHANNEL_BOUND: usize = 4_096;
 pub struct SqliteNodeLocalDb {
     executor: DbExecutor,
     pod_endpoint_tx: broadcast::Sender<PodEndpointEvent>,
+    pod_endpoint_handoff: std::sync::Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    pod_endpoint_snapshot_failures: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pod_slot_admission_tx: broadcast::Sender<PodSlotAdmissionEvent>,
 }
 
@@ -178,6 +181,11 @@ impl SqliteNodeLocalDb {
         Ok(Self {
             executor,
             pod_endpoint_tx,
+            pod_endpoint_handoff: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            pod_endpoint_snapshot_failures: std::sync::Arc::new(
+                std::sync::atomic::AtomicUsize::new(0),
+            ),
             pod_slot_admission_tx,
         })
     }
@@ -188,6 +196,38 @@ impl SqliteNodeLocalDb {
         F: FnOnce(&mut rusqlite::Connection) -> tokio_rusqlite::Result<T> + Send + 'static,
     {
         self.executor.call_raw(query_name, f).await
+    }
+
+    pub async fn subscribe_pod_endpoints_with_snapshot(
+        &self,
+    ) -> Result<(Vec<PodEndpointRow>, broadcast::Receiver<PodEndpointEvent>)> {
+        let _handoff = self.pod_endpoint_handoff.lock().await;
+        let receiver = self.pod_endpoint_tx.subscribe();
+        #[cfg(test)]
+        if self
+            .pod_endpoint_snapshot_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(anyhow!("injected pod endpoint snapshot failure"));
+        }
+        let snapshot = self.list_endpoints_all().await?;
+        Ok((snapshot, receiver))
+    }
+
+    #[cfg(test)]
+    pub fn fail_next_pod_endpoint_snapshot(&self) {
+        self.pod_endpoint_snapshot_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub async fn lock_pod_endpoint_handoff_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.pod_endpoint_handoff.clone().lock_owned().await
     }
 
     pub fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
@@ -1737,6 +1777,7 @@ impl SqliteNodeLocalDb {
     }
 
     pub async fn upsert_endpoint(&self, row: PodEndpointRow) -> Result<()> {
+        let _handoff = self.pod_endpoint_handoff.lock().await;
         let tx = self.pod_endpoint_tx.clone();
         let event_row = row.clone();
         self.db_call("node_local:upsert_endpoint", move |conn| {
@@ -1785,6 +1826,7 @@ impl SqliteNodeLocalDb {
     }
 
     pub async fn delete_endpoint_for_uid(&self, pod_uid: &str) -> Result<()> {
+        let _handoff = self.pod_endpoint_handoff.lock().await;
         let pod_uid = pod_uid.to_string();
         let event_pod_uid = pod_uid.clone();
         let tx = self.pod_endpoint_tx.clone();
@@ -2108,11 +2150,31 @@ fn row_to_pod_endpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodEndpointR
                     Box::new(e),
                 )
             })?,
-        host_port_tcp: row.get::<_, Option<i64>>(7)?.map(|p| p as u16),
-        host_port_udp: row.get::<_, Option<i64>>(8)?.map(|p| p as u16),
+        host_port_tcp: endpoint_port(row, 7)?,
+        host_port_udp: endpoint_port(row, 8)?,
         generation: row.get(9)?,
         updated_at: row.get(10)?,
     })
+}
+
+fn endpoint_port(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<u16>> {
+    let Some(value) = row.get::<_, Option<i64>>(index)? else {
+        return Ok(None);
+    };
+    u16::try_from(value)
+        .ok()
+        .filter(|port| *port != 0)
+        .map(Some)
+        .ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Integer,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "pod endpoint port outside 1..=65535",
+                )),
+            )
+        })
 }
 
 fn row_to_pod_status_checkpoint(row: &rusqlite::Row<'_>) -> rusqlite::Result<PodStatusCheckpoint> {

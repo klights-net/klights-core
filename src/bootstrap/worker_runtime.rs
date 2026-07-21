@@ -342,7 +342,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         let dbh = db.clone();
         let node_name = config.node_name.clone();
         let cluster_cidr = config.cluster_cidr.clone();
-        let peering = network.peering.clone();
+        let peering = network.peering().clone();
         let supervisor_for_task = task_supervisor.clone();
         let health_for_peer_watch = dataplane_health.clone();
         let query_for_peer_watch: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery> =
@@ -424,7 +424,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             containerd_ns: config.containerd_namespace.clone(),
             lifecycle_tx: pod_lifecycle_tx,
             probe_manager: None,
-            datapath: Some(network.datapath.clone()),
+            datapath: Some(network.datapath().clone()),
             service_router: Some(services.clone()),
             runtime_node_role: worker_pod_runtime_node_role(),
             runtime_service: None,
@@ -464,7 +464,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     worker_store.set_pod_lifecycle_router(plr.clone());
     side_effects.set_pod_repository(pod_repository.clone());
 
-    services.request_services_sync();
+    services.request_services_sync()?;
 
     let kctx = std::sync::Arc::new(crate::kubelet::context::KubeletContext {
         cluster_api,

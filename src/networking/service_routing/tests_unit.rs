@@ -433,66 +433,37 @@ fn test_hostportspec_from_pod_rejects_out_of_range_port_silently() {
 
 // ---- Hybrid remote pod endpoint planning --------------------------
 
-fn pod_endpoint_row(
-    uid: &str,
-    node_name: &str,
-    mode: crate::datastore::PodEndpointMode,
-    pod_ip: Ipv4Addr,
-    node_ip: Ipv4Addr,
-    tcp: Option<u16>,
-    udp: Option<u16>,
-) -> crate::datastore::PodEndpointRow {
-    crate::datastore::PodEndpointRow {
-        pod_uid: uid.to_string(),
-        namespace: "default".to_string(),
-        pod_name: format!("pod-{uid}"),
-        node_name: node_name.to_string(),
-        mode,
-        pod_ip,
-        node_ip,
-        host_port_tcp: tcp,
-        host_port_udp: udp,
-        generation: 1,
-        updated_at: 1,
-    }
-}
-
 #[test]
-fn test_remote_pod_endpoint_specs_keep_only_remote_hostport_rows() {
-    let rows = vec![
-        pod_endpoint_row(
-            "local",
-            "node-a",
-            crate::datastore::PodEndpointMode::Hostport,
-            Ipv4Addr::new(10, 42, 0, 10),
-            Ipv4Addr::new(192, 0, 2, 10),
-            Some(31010),
-            None,
+fn test_remote_pod_endpoint_topology_keeps_both_remote_l4_mappings() {
+    let endpoints = vec![
+        klights_network_api::PodEndpointTopology::Direct(
+            klights_network_api::DirectPodEndpoint::try_new(Ipv4Addr::new(10, 42, 1, 10), "node-b")
+                .unwrap(),
         ),
-        pod_endpoint_row(
-            "direct",
-            "node-b",
-            crate::datastore::PodEndpointMode::EncryptedDirect,
-            Ipv4Addr::new(10, 42, 1, 10),
-            Ipv4Addr::new(192, 0, 2, 11),
-            None,
-            None,
+        klights_network_api::PodEndpointTopology::HostPort(
+            klights_network_api::HostPortPodEndpoint::try_new(
+                Ipv4Addr::new(10, 42, 0, 10),
+                "node-a",
+                Ipv4Addr::new(192, 0, 2, 10),
+                Some(31010),
+                None,
+            )
+            .unwrap(),
         ),
-        pod_endpoint_row(
-            "remote",
-            "rootless-c",
-            crate::datastore::PodEndpointMode::Hostport,
-            Ipv4Addr::new(10, 42, 2, 10),
-            Ipv4Addr::new(192, 0, 2, 12),
-            Some(31234),
-            Some(31235),
+        klights_network_api::PodEndpointTopology::HostPort(
+            klights_network_api::HostPortPodEndpoint::try_new(
+                Ipv4Addr::new(10, 42, 2, 10),
+                "rootless-c",
+                Ipv4Addr::new(192, 0, 2, 12),
+                Some(31234),
+                Some(31235),
+            )
+            .unwrap(),
         ),
     ];
 
-    let specs = remote_pod_endpoint_specs_from_rows("node-a", rows);
-
     assert_eq!(
-        specs,
+        remote_pod_endpoint_specs_from_topology("node-a", &endpoints),
         vec![
             RemotePodEndpointSpec {
                 pod_ip: Ipv4Addr::new(10, 42, 2, 10),
@@ -506,8 +477,7 @@ fn test_remote_pod_endpoint_specs_keep_only_remote_hostport_rows() {
                 host_port: 31235,
                 protocol: Protocol::Udp,
             },
-        ],
-        "root-side DNAT should be derived only from remote hostport pod_endpoints rows"
+        ]
     );
 }
 

@@ -1368,11 +1368,8 @@ impl MockHostPortRuntime {
 
 #[async_trait::async_trait]
 impl crate::kubelet::pod_runtime::hostports::HostPortRuntime for MockHostPortRuntime {
-    async fn add_host_ports(
-        &self,
-        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
-        _pod: &serde_json::Value,
-    ) -> anyhow::Result<()> {
+    async fn add_host_ports(&self, pod: &klights_network_api::PodHostPorts) -> anyhow::Result<()> {
+        let key = pod.pod();
         self.calls.lock().unwrap().push(MockHostPortOp::Add {
             namespace: key.namespace.clone(),
             name: key.name.clone(),
@@ -1390,9 +1387,9 @@ impl crate::kubelet::pod_runtime::hostports::HostPortRuntime for MockHostPortRun
 
     async fn remove_host_ports(
         &self,
-        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
-        _pod: &serde_json::Value,
+        pod: &klights_network_api::PodHostPorts,
     ) -> anyhow::Result<()> {
+        let key = pod.pod();
         self.calls.lock().unwrap().push(MockHostPortOp::Remove {
             namespace: key.namespace.clone(),
             name: key.name.clone(),
@@ -1403,9 +1400,9 @@ impl crate::kubelet::pod_runtime::hostports::HostPortRuntime for MockHostPortRun
 
     async fn check_host_port_admission(
         &self,
-        key: &crate::kubelet::pod_runtime::service::PodRuntimeKey,
-        _pod: &serde_json::Value,
+        pod: &klights_network_api::PodHostPorts,
     ) -> anyhow::Result<()> {
+        let key = pod.pod();
         self.calls.lock().unwrap().push(MockHostPortOp::Check {
             namespace: key.namespace.clone(),
             name: key.name.clone(),

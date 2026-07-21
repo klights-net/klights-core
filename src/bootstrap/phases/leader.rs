@@ -31,7 +31,7 @@ pub struct LeaderStart<'a> {
     pub pod_repository: &'a Arc<crate::kubelet::pod_repository::PodRepository>,
     pub scheduler_state: &'a Arc<crate::api::AppState>,
     pub cri_for_shutdown: &'a Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
-    pub datapath: &'a Arc<dyn crate::networking::Datapath>,
+    pub datapath: &'a Arc<dyn klights_network_api::Datapath>,
     pub is_leader_rx: tokio::sync::watch::Receiver<bool>,
     pub shutdown_token: CancellationToken,
 }
@@ -46,7 +46,7 @@ struct LeaderScopedTaskContext {
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     scheduler_state: Arc<crate::api::AppState>,
     cri_for_shutdown: Option<Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
-    datapath: Arc<dyn crate::networking::Datapath>,
+    datapath: Arc<dyn klights_network_api::Datapath>,
 }
 
 pub async fn start(args: LeaderStart<'_>) -> Result<()> {
@@ -304,7 +304,7 @@ async fn start_leader_scoped_tasks(
 async fn reconcile_kubernetes_service_for_leader(
     config: &KlightsConfig,
     db_handle: &DatastoreHandle,
-    datapath: &dyn crate::networking::Datapath,
+    datapath: &dyn klights_network_api::Datapath,
 ) -> Result<()> {
     crate::controllers::kube_service::bootstrap_default_service_cidr(
         db_handle.as_ref(),

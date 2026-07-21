@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::AppState;
@@ -19,13 +20,72 @@ use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{DatastoreBackend, DatastoreHandle, NodeSubnet, WatchTarget};
 #[cfg(test)]
 use crate::kubelet::outbox::Outbox;
-use crate::networking::NodeEndpoint;
 use crate::networking::dataplane_health::{DataplaneHealth, DataplaneHealthStatus};
 use crate::networking::types::HostPortRange;
 use crate::watch::{
     EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WatchTopic,
     WindowPolicy,
 };
+
+#[cfg(test)]
+const PEER_SYNC_RETRY_BASE: Duration = Duration::from_millis(20);
+#[cfg(not(test))]
+const PEER_SYNC_RETRY_BASE: Duration = Duration::from_millis(250);
+const PEER_SYNC_RETRY_MAX_SHIFT: u32 = 5;
+
+#[derive(Default)]
+struct PeerSyncRetryState {
+    attempt: u32,
+    generation: u64,
+    scheduled: bool,
+}
+
+impl PeerSyncRetryState {
+    async fn schedule(
+        &mut self,
+        supervisor: &crate::task_supervisor::TaskSupervisor,
+        sender: &tokio::sync::mpsc::Sender<u64>,
+    ) -> Result<()> {
+        if self.scheduled {
+            return Ok(());
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let shift = self.attempt.min(PEER_SYNC_RETRY_MAX_SHIFT);
+        self.attempt = self.attempt.saturating_add(1);
+        self.scheduled = true;
+        let delay = PEER_SYNC_RETRY_BASE * (1u32 << shift);
+        let sender = sender.clone();
+        if let Err(error) = supervisor
+            .spawn_delay(
+                format!("node_peer_sync_retry:{generation}"),
+                delay,
+                async move {
+                    let _ = sender.send(generation).await;
+                },
+            )
+            .await
+        {
+            self.scheduled = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn take(&mut self, generation: u64) -> bool {
+        if !self.scheduled || self.generation != generation {
+            return false;
+        }
+        self.scheduled = false;
+        true
+    }
+
+    fn succeeded(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.attempt = 0;
+        self.scheduled = false;
+    }
+}
 
 /// Result of one [`sync_peer_routes`] pass, used to gate the local node's
 /// readiness. A node is only Ready when every *Ready* peer has a dataplane
@@ -62,7 +122,7 @@ pub fn apply_peer_sync_outcome(health: &DataplaneHealth, outcome: &PeerSyncOutco
 async fn endpoint_for_peer(
     db: &dyn DatastoreBackend,
     peer: &NodeSubnet,
-) -> Result<Option<NodeEndpoint>> {
+) -> Result<Option<klights_network_api::PeerRoute>> {
     let Some(metadata) = db.get_node_dataplane(peer.node_name.as_ref()).await? else {
         tracing::warn!(
             node = %peer.node_name,
@@ -71,33 +131,20 @@ async fn endpoint_for_peer(
         return Ok(None);
     };
 
-    match metadata.encryption {
-        crate::networking::wireguard::DataplaneEncryption::Enabled => {
-            let plan = crate::networking::wireguard::WireGuardPeerPlan::try_new(
-                metadata,
-                &peer.subnet.to_string(),
-            )?;
-            Ok(Some(NodeEndpoint::WireGuard(plan)))
-        }
-        crate::networking::wireguard::DataplaneEncryption::Disabled => {
-            let plan = crate::networking::wireguard::UnencryptedPeerPlan::try_new(
-                metadata,
-                &peer.subnet.to_string(),
-            )?;
-            Ok(Some(NodeEndpoint::UnencryptedDirect(plan)))
-        }
-    }
+    Ok(Some(
+        crate::networking::wireguard::peer_route_from_metadata(metadata, &peer.subnet.to_string())?,
+    ))
 }
 
 /// Tracks every peer the controller has actually installed against the network
 /// `PeerRouter`, keyed by node name. Stores both the projected `NodeSubnet`
-/// (for change detection) and the exact `NodeEndpoint` variant we applied so
+/// (for change detection) and the exact `PeerRoute` variant we applied so
 /// removal hits the same shape — root removal must not be issued against a
 /// rootless endpoint or vice versa.
 #[derive(Clone)]
 pub struct AppliedPeer {
     pub subnet: NodeSubnet,
-    pub endpoint: NodeEndpoint,
+    pub endpoint: klights_network_api::PeerRoute,
 }
 
 /// Allocate (or retrieve) the local node's /24 subnet.
@@ -148,7 +195,7 @@ pub async fn run_peer_watch(
         state.db.clone(),
         state.config.node_name.clone(),
         state.config.cluster_cidr.clone(),
-        state.network.peering.clone(),
+        state.network.peering().clone(),
         state.task_supervisor.clone(),
         state.is_raft_leader_rx.clone(),
         Some(dataplane_health),
@@ -164,7 +211,7 @@ pub async fn run_peer_watch_with_components(
     db: DatastoreHandle,
     my_node_name: String,
     cluster_cidr: String,
-    peering: std::sync::Arc<dyn crate::networking::PeerRouter>,
+    peering: std::sync::Arc<dyn klights_network_api::PeerRouter>,
     task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
     dataplane_health: Option<DataplaneHealth>,
     query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
@@ -187,12 +234,36 @@ pub async fn run_peer_watch_with_components(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn sync_peer_routes_and_publish_readiness(
+    db: &dyn DatastoreBackend,
+    my_node_name: &str,
+    peering: &dyn klights_network_api::PeerRouter,
+    applied: &mut HashMap<String, AppliedPeer>,
+    query: &dyn klights_leader_api::LeaderResourceQuery,
+    node_status: &dyn klights_leader_api::LeaderNodeSelfStatus,
+    dataplane_health: Option<&DataplaneHealth>,
+    last_readiness: &mut Option<DataplaneHealthStatus>,
+) -> Result<()> {
+    let outcome = sync_peer_routes(db, my_node_name, peering, applied).await?;
+    reconcile_local_readiness_with_publisher(
+        query,
+        node_status,
+        my_node_name,
+        dataplane_health,
+        &outcome,
+        last_readiness,
+    )
+    .await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_peer_watch_with_components_inner(
     db: DatastoreHandle,
     my_node_name: String,
     cluster_cidr: String,
-    peering: std::sync::Arc<dyn crate::networking::PeerRouter>,
-    _task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    peering: std::sync::Arc<dyn klights_network_api::PeerRouter>,
+    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
     raft_leader_proxy: Option<std::sync::Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
     dataplane_health: Option<DataplaneHealth>,
     query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
@@ -223,25 +294,35 @@ async fn run_peer_watch_with_components_inner(
     // persisted-state verification on watcher startup; unchanged conditions are
     // memoed after that, while a missing Node is not.
     let mut last_readiness: Option<DataplaneHealthStatus> = None;
+    let (retry_tx, mut retry_rx) = tokio::sync::mpsc::channel(1);
+    let mut retry = PeerSyncRetryState::default();
 
     // Run an initial sync against an empty applied map so every peer known
     // in the datastore gets applied to the dataplane on watcher start.
     // This covers peers that bootstrap may have partially failed to apply
     // (e.g. transient WireGuard or FDB setup errors) — the watcher starts
     // from truth-in-store, not from bootstrap's local success/failure state.
-    match sync_peer_routes(db.as_ref(), &my_node_name, peering.as_ref(), &mut applied).await {
-        Ok(outcome) => {
-            reconcile_local_readiness_with_publisher(
-                query.as_ref(),
-                node_status.as_ref(),
-                &my_node_name,
-                dataplane_health.as_ref(),
-                &outcome,
-                &mut last_readiness,
-            )
-            .await;
+    match sync_peer_routes_and_publish_readiness(
+        db.as_ref(),
+        &my_node_name,
+        peering.as_ref(),
+        &mut applied,
+        query.as_ref(),
+        node_status.as_ref(),
+        dataplane_health.as_ref(),
+        &mut last_readiness,
+    )
+    .await
+    {
+        Ok(()) => retry.succeeded(),
+        Err(error) => {
+            tracing::warn!("node_subnet: initial peer route sync failed: {error:#}");
+            if let Err(schedule_error) = retry.schedule(task_supervisor.as_ref(), &retry_tx).await {
+                tracing::warn!(
+                    "node_subnet: failed to schedule peer sync retry: {schedule_error:#}"
+                );
+            }
         }
-        Err(e) => tracing::warn!("node_subnet: initial peer route sync failed: {:#}", e),
     }
 
     loop {
@@ -249,6 +330,29 @@ async fn run_peer_watch_with_components_inner(
             _ = cancel.cancelled() => {
                 tracing::info!("node_subnet: peer watch cancelled");
                 break;
+            }
+            Some(generation) = retry_rx.recv() => {
+                if !retry.take(generation) {
+                    continue;
+                }
+                match sync_peer_routes_and_publish_readiness(
+                    db.as_ref(),
+                    &my_node_name,
+                    peering.as_ref(),
+                    &mut applied,
+                    query.as_ref(),
+                    node_status.as_ref(),
+                    dataplane_health.as_ref(),
+                    &mut last_readiness,
+                ).await {
+                    Ok(()) => retry.succeeded(),
+                    Err(error) => {
+                        tracing::warn!("node_subnet: peer route retry failed: {error:#}");
+                        if let Err(schedule_error) = retry.schedule(task_supervisor.as_ref(), &retry_tx).await {
+                            tracing::warn!("node_subnet: failed to reschedule peer sync: {schedule_error:#}");
+                        }
+                    }
+                }
             }
             result = cursor.next_event() => match result {
             Ok(event) => {
@@ -279,26 +383,25 @@ async fn run_peer_watch_with_components_inner(
                             e
                         );
                     }
-                    match sync_peer_routes(
+                    match sync_peer_routes_and_publish_readiness(
                         db.as_ref(),
                         &my_node_name,
                         peering.as_ref(),
                         &mut applied,
+                        query.as_ref(),
+                        node_status.as_ref(),
+                        dataplane_health.as_ref(),
+                        &mut last_readiness,
                     )
                     .await
                     {
-                        Ok(outcome) => {
-                            reconcile_local_readiness_with_publisher(
-                                query.as_ref(),
-                                node_status.as_ref(),
-                                &my_node_name,
-                                dataplane_health.as_ref(),
-                                &outcome,
-                                &mut last_readiness,
-                            )
-                            .await;
+                        Ok(()) => retry.succeeded(),
+                        Err(error) => {
+                            tracing::warn!("node_subnet: peer sync failed: {error:#}");
+                            if let Err(schedule_error) = retry.schedule(task_supervisor.as_ref(), &retry_tx).await {
+                                tracing::warn!("node_subnet: failed to schedule peer sync retry: {schedule_error:#}");
+                            }
                         }
-                        Err(e) => tracing::warn!("node_subnet: peer sync failed: {}", e),
                     }
                 }
             }
@@ -387,7 +490,7 @@ async fn reconcile_peer_node_event_cluster_state(
                     _ => {
                         // F2-04: project mode + hostport-range annotations
                         // onto the peer row so sync_peer_routes can pick the
-                        // right NodeEndpoint variant for each peer.
+                        // right topology metadata for each peer.
                         let (mode, hostport_range) = project_node_peer_attributes(&live_node.data);
                         if let Err(e) = db
                             .update_node_peer_attributes(peer_name, mode, hostport_range)
@@ -412,7 +515,7 @@ async fn reconcile_peer_node_event_cluster_state(
 pub async fn sync_peer_routes(
     db: &dyn DatastoreBackend,
     my_node_name: &str,
-    network: &dyn crate::networking::PeerRouter,
+    network: &dyn klights_network_api::PeerRouter,
     applied: &mut HashMap<String, AppliedPeer>,
 ) -> Result<PeerSyncOutcome> {
     let desired_list = db
@@ -442,10 +545,13 @@ pub async fn sync_peer_routes(
             outcome.ready_peers += 1;
         }
         let Some(endpoint) = endpoint_for_peer(db, peer).await? else {
-            // Skipped peers must not appear in `applied` — otherwise a later
-            // reconcile would treat them as stale and emit a phantom remove
-            // against an endpoint we never applied.
-            applied.remove(name);
+            if let Some(old) = applied.get(name) {
+                network
+                    .remove_peer_route(&old.endpoint)
+                    .await
+                    .with_context(|| format!("remove peer {} with missing metadata", name))?;
+                applied.remove(name);
+            }
             if peer_ready {
                 outcome.unreachable_ready_peers += 1;
             }
@@ -466,14 +572,15 @@ pub async fn sync_peer_routes(
         if !needs_apply {
             continue;
         }
-        if let Some(old) = applied.remove(name) {
+        if let Some(old) = applied.get(name) {
             network
-                .remove_peer_endpoint(&old.endpoint)
+                .remove_peer_route(&old.endpoint)
                 .await
                 .with_context(|| format!("replace peer {}", name))?;
+            applied.remove(name);
         }
         network
-            .apply_peer_endpoint(&endpoint)
+            .apply_peer_route(&endpoint)
             .await
             .with_context(|| format!("apply peer {}", name))?;
         applied.insert(
@@ -494,14 +601,15 @@ pub async fn sync_peer_routes(
         if stale_name == my_node_name {
             continue;
         }
-        if let Some(applied_peer) = applied.remove(&stale_name) {
+        if let Some(applied_peer) = applied.get(&stale_name) {
             // Remove using the EXACT endpoint variant we applied. Root removal
             // against a rootless endpoint (or vice versa) is undefined under
             // the current PeerRouter contract.
             network
-                .remove_peer_endpoint(&applied_peer.endpoint)
+                .remove_peer_route(&applied_peer.endpoint)
                 .await
                 .with_context(|| format!("remove peer {}", stale_name))?;
+            applied.remove(&stale_name);
         }
     }
 
@@ -697,6 +805,218 @@ mod tests {
     use crate::networking::test_support::{MockNetworkProvider, NetworkCall};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    struct NoopLeaderPorts;
+
+    impl klights_leader_api::LeaderResourceQuery for NoopLeaderPorts {
+        fn get_resource(
+            &self,
+            _request: klights_leader_api::ResourceGetRequest,
+        ) -> klights_leader_api::ResourceQueryFuture<'_, Option<crate::datastore::Resource>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn list_resources(
+            &self,
+            _request: klights_leader_api::ResourceListRequest,
+        ) -> klights_leader_api::ResourceQueryFuture<'_, klights_leader_api::ResourceListResult>
+        {
+            Box::pin(async {
+                klights_leader_api::ResourceListResult::try_new(Vec::new(), 0, None, None, None)
+            })
+        }
+    }
+
+    impl klights_leader_api::LeaderNodeSelfStatus for NoopLeaderPorts {
+        fn submit_node_self_status(
+            &self,
+            _request: klights_leader_api::NodeSelfStatusRequest,
+        ) -> klights_leader_api::NodeSelfStatusFuture<'_, klights_leader_api::NodeSelfStatusResult>
+        {
+            Box::pin(async { Ok(klights_leader_api::NodeSelfStatusResult::Enqueued) })
+        }
+    }
+
+    async fn seed_peer(
+        db: &crate::datastore::DatastoreHandle,
+        peer_name: &str,
+        node_ip: &str,
+        key_byte: u8,
+    ) {
+        db.allocate_node_subnet(peer_name, "10.42.0.0/16", node_ip)
+            .await
+            .unwrap();
+        db.update_node_dataplane(
+            crate::networking::wireguard::DataplanePeerMetadata::try_new(
+                peer_name.to_string(),
+                crate::networking::wireguard::DataplaneMode::Root,
+                crate::networking::wireguard::DataplaneEncryption::Enabled,
+                Some(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    [key_byte; 32],
+                )),
+                Some(node_ip.to_string()),
+                Some(51_820),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        db.create_resource(
+            "v1",
+            "Node",
+            None,
+            peer_name,
+            json!({
+                "apiVersion": "v1",
+                "kind": "Node",
+                "metadata": {"name": peer_name},
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]}
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn spawn_peer_watch(
+        db: crate::datastore::DatastoreHandle,
+        router: Arc<MockNetworkProvider>,
+        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        cancel: CancellationToken,
+    ) -> crate::task_supervisor::SupervisedJoinHandle<()> {
+        let task_supervisor = supervisor.clone();
+        supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::Network,
+                "node_subnet_peer_retry_test",
+                async move {
+                    super::run_peer_watch_with_components(
+                        db,
+                        "node-a".to_string(),
+                        "10.42.0.0/16".to_string(),
+                        router,
+                        task_supervisor,
+                        None,
+                        Arc::new(NoopLeaderPorts),
+                        Arc::new(NoopLeaderPorts),
+                        cancel,
+                    )
+                    .await;
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn stop_peer_watch(
+        cancel: CancellationToken,
+        handle: crate::task_supervisor::SupervisedJoinHandle<()>,
+        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    ) {
+        cancel.cancel();
+        handle.join().await.unwrap();
+        let report = supervisor.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(report.remaining_active, 0);
+    }
+
+    #[tokio::test]
+    async fn initial_peer_sync_failure_retries_without_a_watch_event() {
+        let db: crate::datastore::DatastoreHandle =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        seed_peer(&db, "node-b", "192.0.2.20", 7).await;
+        let router = Arc::new(MockNetworkProvider::new());
+        router.fail_next_peer_apply();
+        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let cancel = CancellationToken::new();
+        let handle = spawn_peer_watch(db, router.clone(), supervisor.clone(), cancel.clone()).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            router.wait_for_peer_apply_successes(1),
+        )
+        .await
+        .expect("initial failure must converge through one-shot retry");
+        assert_eq!(router.peer_apply_call_count(), 2);
+
+        stop_peer_watch(cancel, handle, supervisor).await;
+    }
+
+    #[tokio::test]
+    async fn event_peer_sync_failure_retries_serially_without_a_second_event() {
+        let db: crate::datastore::DatastoreHandle =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        seed_peer(&db, "node-b", "192.0.2.20", 7).await;
+        let router = Arc::new(MockNetworkProvider::new());
+        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let cancel = CancellationToken::new();
+        let handle = spawn_peer_watch(
+            db.clone(),
+            router.clone(),
+            supervisor.clone(),
+            cancel.clone(),
+        )
+        .await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            router.wait_for_peer_apply_successes(1),
+        )
+        .await
+        .expect("initial peer must establish watcher startup");
+
+        router.fail_next_peer_apply();
+        seed_peer(&db, "node-c", "192.0.2.30", 8).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            router.wait_for_peer_apply_successes(2),
+        )
+        .await
+        .expect("event failure must converge without a second Node event");
+        assert_eq!(
+            router.peer_apply_call_count(),
+            3,
+            "one initial apply plus one failed and one successful event apply"
+        );
+        tokio::time::sleep(super::PEER_SYNC_RETRY_BASE * 3).await;
+        assert_eq!(
+            router.peer_apply_call_count(),
+            3,
+            "successful retry must not leave a stale timer that re-applies state"
+        );
+
+        stop_peer_watch(cancel, handle, supervisor).await;
+    }
+
+    #[tokio::test]
+    async fn peer_sync_retry_cancellation_does_not_spin_or_apply_after_exit() {
+        let db: crate::datastore::DatastoreHandle =
+            Arc::new(crate::datastore::test_support::in_memory().await);
+        seed_peer(&db, "node-b", "192.0.2.20", 7).await;
+        let router = Arc::new(MockNetworkProvider::new());
+        router.fail_next_peer_apply();
+        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let cancel = CancellationToken::new();
+        let handle = spawn_peer_watch(db, router.clone(), supervisor.clone(), cancel.clone()).await;
+        tokio::time::timeout(Duration::from_secs(2), router.wait_for_peer_apply_calls(1))
+            .await
+            .expect("initial failed attempt must be observable");
+
+        cancel.cancel();
+        handle.join().await.unwrap();
+        tokio::time::sleep(super::PEER_SYNC_RETRY_BASE * 3).await;
+        assert_eq!(router.peer_apply_call_count(), 1);
+        let report = supervisor.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(report.remaining_active, 0);
+    }
 
     #[tokio::test]
     async fn test_allocate_node_subnet_first_node_gets_first_24() {
@@ -1041,8 +1361,8 @@ mod tests {
 
     /// F2-02: rootless boot must allocate the local subnet without ever
     /// reaching the peer router. Before the split, `ensure_node_subnet`
-    /// always called `apply_peer_endpoint`, which crashed boot under the
-    /// rootless `Bypass4NetnsPeerRouter` stub.
+    /// always called peer-route apply, which crashed boot under the
+    /// rootless network-plane peer router.
     #[tokio::test]
     async fn bootstrap_rootless_allocates_local_subnet_without_peer_router() {
         let db = crate::datastore::test_support::in_memory().await;
@@ -1061,7 +1381,7 @@ mod tests {
         assert_eq!(row.node_ip.to_string(), "10.0.0.7");
 
         // Construct a peer router and prove it has zero recorded calls — the
-        // local-only path must never reach apply_peer_endpoint.
+        // local-only path must never reach peer-route apply.
         let mock_peer = MockNetworkProvider::new();
         // Sanity: the mock starts with no calls.
         assert!(
@@ -1222,17 +1542,17 @@ mod tests {
             .expect("AppliedPeer must record the rootless apply");
         assert!(matches!(
             entry.endpoint,
-            crate::networking::NodeEndpoint::WireGuard(_)
+            klights_network_api::PeerRoute::WireGuard(_)
         ));
     }
 
     /// Phase 2C: a root peer with enabled encryption dispatches to WireGuard.
     #[tokio::test]
     async fn sync_peer_routes_dispatches_wireguard_for_root_peer() {
-        use crate::networking::NodeEndpoint;
         use crate::networking::wireguard::{
             DataplaneEncryption, DataplaneMode, DataplanePeerMetadata,
         };
+        use klights_network_api::PeerRoute;
         let db = crate::datastore::test_support::in_memory().await;
         super::ensure_local_node_subnet(&db, "node-a", "10.42.0.0/16", "10.0.0.1")
             .await
@@ -1260,8 +1580,8 @@ mod tests {
             .unwrap();
         let entry = applied.get("node-b").expect("root peer must be applied");
         assert!(
-            matches!(entry.endpoint, NodeEndpoint::WireGuard(_)),
-            "root peer must use NodeEndpoint::WireGuard, got {:?}",
+            matches!(entry.endpoint, PeerRoute::WireGuard(_)),
+            "root peer must use PeerRoute::WireGuard, got {:?}",
             entry.endpoint
         );
     }
@@ -1311,6 +1631,116 @@ mod tests {
         assert!(
             !applied.contains_key("node-b"),
             "applied map must drop the removed peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_peer_routes_removes_exact_applied_route_when_metadata_disappears() {
+        let db = crate::datastore::test_support::in_memory().await;
+        super::ensure_local_node_subnet(&db, "node-a", "10.42.0.0/16", "10.0.0.1")
+            .await
+            .unwrap();
+        db.allocate_node_subnet("node-b", "10.42.0.0/16", "10.0.0.2")
+            .await
+            .unwrap();
+        db.update_node_dataplane(
+            crate::networking::wireguard::DataplanePeerMetadata::try_new(
+                "node-b".to_string(),
+                crate::networking::wireguard::DataplaneMode::Root,
+                crate::networking::wireguard::DataplaneEncryption::Enabled,
+                Some("BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=".to_string()),
+                Some("10.0.0.2".to_string()),
+                Some(51_820),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let network = MockNetworkProvider::new();
+        let mut applied = HashMap::new();
+        super::sync_peer_routes(&db, "node-a", &network, &mut applied)
+            .await
+            .unwrap();
+        network.clear_calls();
+        db.db_call("test_delete_node_dataplane", |conn| {
+            conn.execute(
+                "DELETE FROM node_dataplane WHERE node_name = ?1",
+                ["node-b"],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        super::sync_peer_routes(&db, "node-a", &network, &mut applied)
+            .await
+            .unwrap();
+        assert!(matches!(
+            network.calls().as_slice(),
+            [NetworkCall::RemoveWireGuardPeerEndpoint { node_name, .. }] if node_name == "node-b"
+        ));
+        assert!(!applied.contains_key("node-b"));
+    }
+
+    #[tokio::test]
+    async fn sync_peer_routes_retries_failed_missing_metadata_removal() {
+        let db = crate::datastore::test_support::in_memory().await;
+        super::ensure_local_node_subnet(&db, "node-a", "10.42.0.0/16", "10.0.0.1")
+            .await
+            .unwrap();
+        db.allocate_node_subnet("node-b", "10.42.0.0/16", "10.0.0.2")
+            .await
+            .unwrap();
+        db.update_node_dataplane(
+            crate::networking::wireguard::DataplanePeerMetadata::try_new(
+                "node-b".to_string(),
+                crate::networking::wireguard::DataplaneMode::Root,
+                crate::networking::wireguard::DataplaneEncryption::Enabled,
+                Some("BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=".to_string()),
+                Some("10.0.0.2".to_string()),
+                Some(51_820),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let network = MockNetworkProvider::new();
+        let mut applied = HashMap::new();
+        super::sync_peer_routes(&db, "node-a", &network, &mut applied)
+            .await
+            .unwrap();
+        network.clear_calls();
+        db.db_call("test_delete_node_dataplane_retry", |conn| {
+            conn.execute(
+                "DELETE FROM node_dataplane WHERE node_name = ?1",
+                ["node-b"],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        network.fail_next_peer_remove();
+
+        assert!(
+            super::sync_peer_routes(&db, "node-a", &network, &mut applied)
+                .await
+                .is_err()
+        );
+        assert!(
+            applied.contains_key("node-b"),
+            "failed kernel removal must retain retry bookkeeping"
+        );
+        super::sync_peer_routes(&db, "node-a", &network, &mut applied)
+            .await
+            .expect("second reconcile retries removal");
+        assert!(!applied.contains_key("node-b"));
+        assert_eq!(
+            network
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, NetworkCall::RemoveWireGuardPeerEndpoint { .. }))
+                .count(),
+            2
         );
     }
 

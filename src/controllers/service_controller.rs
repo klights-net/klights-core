@@ -39,7 +39,7 @@ impl Controller for ServiceController {
         )
         .await?;
         if let Some(services) = ctx.services() {
-            services.request_services_sync();
+            services.request_services_sync()?;
         }
         Ok(())
     }

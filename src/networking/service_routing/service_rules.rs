@@ -62,32 +62,33 @@ pub struct RemotePodEndpointSpec {
     pub protocol: Protocol,
 }
 
-/// Build the remote-pod DNAT inventory for this node from `pod_endpoints`.
-/// Local rows and direct encrypted rows are ignored; only remote hostport rows
-/// belong in the root-side hybrid chain.
-pub fn remote_pod_endpoint_specs_from_rows(
+/// Build remote-pod DNAT inventory from the transport-neutral endpoint-event
+/// topology. Direct rows and local-node hostPort rows intentionally produce no
+/// rules; both published L4 mappings are retained for remote rootless pods.
+pub fn remote_pod_endpoint_specs_from_topology(
     local_node_name: &str,
-    rows: Vec<crate::datastore::PodEndpointRow>,
+    endpoints: &[klights_network_api::PodEndpointTopology],
 ) -> Vec<RemotePodEndpointSpec> {
     let mut specs = Vec::new();
-    for row in rows {
-        if row.node_name == local_node_name
-            || row.mode != crate::datastore::PodEndpointMode::Hostport
-        {
+    for endpoint in endpoints {
+        let klights_network_api::PodEndpointTopology::HostPort(endpoint) = endpoint else {
+            continue;
+        };
+        if endpoint.node_name() == local_node_name {
             continue;
         }
-        if let Some(host_port) = row.host_port_tcp {
+        if let Some(host_port) = endpoint.host_port_tcp() {
             specs.push(RemotePodEndpointSpec {
-                pod_ip: row.pod_ip,
-                node_ip: row.node_ip,
+                pod_ip: endpoint.pod_ip(),
+                node_ip: endpoint.node_ip(),
                 host_port,
                 protocol: Protocol::Tcp,
             });
         }
-        if let Some(host_port) = row.host_port_udp {
+        if let Some(host_port) = endpoint.host_port_udp() {
             specs.push(RemotePodEndpointSpec {
-                pod_ip: row.pod_ip,
-                node_ip: row.node_ip,
+                pod_ip: endpoint.pod_ip(),
+                node_ip: endpoint.node_ip(),
                 host_port,
                 protocol: Protocol::Udp,
             });
@@ -466,7 +467,7 @@ impl ServiceSpec {
 }
 
 /// Parse `spec.sessionAffinity` from a Service JSON spec.
-pub(super) fn parse_session_affinity(spec: &serde_json::Value) -> SessionAffinity {
+pub(crate) fn parse_session_affinity(spec: &serde_json::Value) -> SessionAffinity {
     match spec.get("sessionAffinity").and_then(|v| v.as_str()) {
         Some("ClientIP") => SessionAffinity::ClientIp,
         _ => SessionAffinity::None,
@@ -480,7 +481,7 @@ pub(super) fn parse_session_affinity(spec: &serde_json::Value) -> SessionAffinit
 /// silently produce wrong rules for K8s objects with malformed port
 /// fields. K8s spec says ports are 1-65535; anything else is invalid
 /// data and should not become a DNAT rule.
-pub(super) fn parse_port(v: Option<&serde_json::Value>) -> Option<u16> {
+pub(crate) fn parse_port(v: Option<&serde_json::Value>) -> Option<u16> {
     let n = v?.as_u64()?;
     if n == 0 {
         return None;
@@ -614,7 +615,7 @@ fn service_target_port_number(service_port: &serde_json::Value) -> Option<u16> {
 /// distribution kube-proxy achieves with iptables `-m statistic --mode
 /// random --probability X`), expressed in nft's `meta random < threshold`
 /// form.
-pub(super) fn probability_for_ladder_step(endpoints_remaining: usize) -> u32 {
+pub(crate) fn probability_for_ladder_step(endpoints_remaining: usize) -> u32 {
     debug_assert!(
         endpoints_remaining >= 2,
         "ladder is only used for >= 2 remaining"
@@ -624,6 +625,6 @@ pub(super) fn probability_for_ladder_step(endpoints_remaining: usize) -> u32 {
 
 // ---- CIDR helpers -------------------------------------------------------
 
-pub(super) fn prefix_len_from_mask(mask: Ipv4Addr) -> u8 {
+pub(crate) fn prefix_len_from_mask(mask: Ipv4Addr) -> u8 {
     u32::from(mask).count_ones() as u8
 }

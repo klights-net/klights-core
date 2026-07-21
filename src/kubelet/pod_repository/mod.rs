@@ -8,7 +8,8 @@
 //! Internal services depend on `Arc<PodStore>` rather than
 //! `DatastoreHandle`, which localizes the pod-shaped DB boundary to a
 //! single file. Network-runtime tables (`pod_network`, `sandbox`) and
-//! `NetworkProvider::cni_*` calls remain with their existing owners and
+//! [`klights_network_api::Datapath::cni_add`] /
+//! [`klights_network_api::Datapath::cni_del`] calls remain with their existing owners and
 //! are not policed by this boundary.
 
 use std::sync::Arc;

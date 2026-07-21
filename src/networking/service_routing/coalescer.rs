@@ -63,8 +63,9 @@
 
 use super::prelude::*;
 use super::*;
-use crate::networking::service_router::ServiceRouter;
-use async_trait::async_trait;
+use klights_network_api::{
+    HostPortRemoval, HostPortRules, ServiceRouter, ServiceRouterError, ServiceRouterFuture,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Default coalescing window for the services-sync worker. Matches
@@ -88,17 +89,17 @@ const MAX_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60
 
 pub struct NftServiceRouterStores {
     pub cluster_api: std::sync::Arc<dyn LeaderApiClient>,
-    pub node_local: NodeLocalHandle,
+    pub endpoint_source: std::sync::Arc<dyn klights_network_api::PodEndpointEventSource>,
 }
 
 impl NftServiceRouterStores {
     pub fn new(
         cluster_api: std::sync::Arc<dyn LeaderApiClient>,
-        node_local: NodeLocalHandle,
+        endpoint_source: std::sync::Arc<dyn klights_network_api::PodEndpointEventSource>,
     ) -> Self {
         Self {
             cluster_api,
-            node_local,
+            endpoint_source,
         }
     }
 }
@@ -282,7 +283,7 @@ impl NftServiceRouter {
         } = request;
         let NftServiceRouterStores {
             cluster_api,
-            node_local,
+            endpoint_source,
         } = stores;
         let NftServiceRouterTableConfig {
             local_node_name,
@@ -316,11 +317,6 @@ impl NftServiceRouter {
             .context("construct KlightsTable")?,
         );
         table.init().await.context("init klights table chains")?;
-        table
-            .sync_remote_pod_endpoints_from_node_local(node_local.as_ref(), local_node_name)
-            .await
-            .context("initial remote pod endpoint DNAT sync")?;
-
         let notify = std::sync::Arc::new(tokio::sync::Notify::new());
         let force_full_sync = std::sync::Arc::new(AtomicBool::new(true));
         let worker_table = table.clone();
@@ -413,9 +409,10 @@ impl NftServiceRouter {
             .context("failed to spawn service routing coalescer worker")?;
 
         let remote_table = table.clone();
-        let remote_node_local = node_local.clone();
+        let remote_endpoint_source = endpoint_source.clone();
         let remote_cancel = cancel.clone();
         let remote_local_node = local_node_name.to_string();
+        let remote_task_supervisor = task_supervisor.clone();
         let service_watch_notify = notify.clone();
         let service_watch_cancel = cancel.clone();
         let service_watch_cluster_api: std::sync::Arc<
@@ -449,9 +446,10 @@ impl NftServiceRouter {
                 async move {
                     run_remote_pod_endpoint_worker(
                         remote_table,
-                        remote_node_local,
+                        remote_endpoint_source,
                         remote_local_node,
                         remote_cancel,
+                        remote_task_supervisor,
                     )
                     .await;
                 },
@@ -493,85 +491,94 @@ impl NftServiceRouter {
     }
 }
 
-#[async_trait]
 impl ServiceRouter for NftServiceRouter {
-    fn request_services_sync(&self) {
+    fn request_services_sync(&self) -> Result<(), ServiceRouterError> {
         self.force_full_sync.store(true, Ordering::Release);
         self.notify.notify_one();
-    }
-
-    async fn sync_services_now(&self) -> Result<()> {
-        sync_routing_from_api(self.table.as_ref(), self.cluster_api.as_ref())
-            .await
-            .context("sync_services_now: rebuild routing chains")?;
         Ok(())
     }
 
-    async fn add_hostport_rules(&self, pod: &serde_json::Value, pod_ip: Ipv4Addr) -> Result<()> {
-        let specs = HostPortSpec::from_pod(pod);
-        if specs.is_empty() {
-            return Ok(());
-        }
-        self.table.add_hostports_for_pod(pod_ip, specs).await
+    fn sync_services_now(&self) -> ServiceRouterFuture<'_> {
+        Box::pin(async move {
+            sync_routing_from_api(self.table.as_ref(), self.cluster_api.as_ref())
+                .await
+                .context("sync_services_now: rebuild routing chains")
+                .map_err(|error| ServiceRouterError::sync(error.to_string()))?;
+            Ok(())
+        })
     }
 
-    async fn remove_hostport_rules(&self, pod: &serde_json::Value) -> Result<()> {
-        let specs = HostPortSpec::from_pod(pod);
-        if specs.is_empty() {
-            return Ok(());
-        }
-        let pod_ip = match pod.pointer("/status/podIP").and_then(|v| v.as_str()) {
-            Some(ip) if !ip.is_empty() => ip,
-            _ => return Ok(()),
-        };
-        let pod_ip = Ipv4Addr::from_str(pod_ip).context("parse pod IP")?;
-        self.table.remove_hostports_for_pod(pod_ip).await
+    fn add_hostport_rules(&self, request: HostPortRules) -> ServiceRouterFuture<'_> {
+        Box::pin(async move {
+            let (pod_ip, bindings) = request.into_parts();
+            let specs = bindings.into_iter().map(Into::into).collect();
+            self.table
+                .add_hostports_for_pod(pod_ip, specs)
+                .await
+                .map_err(|error| ServiceRouterError::hostport(error.to_string()))
+        })
     }
 
-    async fn cleanup(&self) -> Result<()> {
-        // 1. Stop the coalescer worker so it isn't mid-batch when the
-        //    table is dropped.
-        self.cancel.cancel();
-        let handle = self.worker.lock().await.take();
-        if let Some(h) = handle
-            && let Err(e) = h.join().await
-        {
-            tracing::warn!("coalescer worker join failed: {e}");
-        }
-        let service_watch_handle = self.service_watch_worker.lock().await.take();
-        if let Some(h) = service_watch_handle
-            && let Err(e) = h.join().await
-        {
-            tracing::warn!("service routing watch worker join failed: {e}");
-        }
-        let remote_handle = self.remote_endpoint_worker.lock().await.take();
-        if let Some(h) = remote_handle
-            && let Err(e) = h.join().await
-        {
-            tracing::warn!("remote pod endpoint worker join failed: {e}");
-        }
+    fn remove_hostport_rules(&self, request: HostPortRemoval) -> ServiceRouterFuture<'_> {
+        Box::pin(async move {
+            self.table
+                .remove_hostports_for_pod(request.pod_ip())
+                .await
+                .map_err(|error| ServiceRouterError::hostport(error.to_string()))
+        })
+    }
 
-        // 2. Drop the `inet <table>` table on a fresh netlink socket.
-        //    Best-effort — missing tables are tolerated.
-        let nf = Netfilter::new(self.task_supervisor.clone())
-            .context("open netlink socket for cleanup")?;
-        let placeholder_pod = PodSubnet::parse("0.0.0.0/30").expect("static placeholder");
-        let placeholder_cluster = ClusterCidr::parse("0.0.0.0/0").expect("static placeholder");
-        let placeholder_service = ClusterCidr::parse("0.0.0.0/0").expect("static placeholder");
-        // Cleanup only deletes the table; the mode field never drives kernel
-        // calls on the cleanup path, so a default placeholder is safe here.
-        let placeholder_mode = ServiceRoutingMode::new(crate::bootstrap::NodeMode::Root);
-        let table = KlightsTable::with_name_and_bridge(
-            nf,
-            &self.table_name_str,
-            &self.table_name_str,
-            placeholder_pod,
-            placeholder_cluster,
-            placeholder_service,
-            placeholder_mode,
-        )
-        .context("construct KlightsTable for cleanup")?;
-        table.cleanup().await
+    fn cleanup(&self) -> ServiceRouterFuture<'_> {
+        Box::pin(async move {
+            // 1. Stop the coalescer worker so it isn't mid-batch when the
+            //    table is dropped.
+            self.cancel.cancel();
+            let handle = self.worker.lock().await.take();
+            if let Some(h) = handle
+                && let Err(e) = h.join().await
+            {
+                tracing::warn!("coalescer worker join failed: {e}");
+            }
+            let service_watch_handle = self.service_watch_worker.lock().await.take();
+            if let Some(h) = service_watch_handle
+                && let Err(e) = h.join().await
+            {
+                tracing::warn!("service routing watch worker join failed: {e}");
+            }
+            let remote_handle = self.remote_endpoint_worker.lock().await.take();
+            if let Some(h) = remote_handle
+                && let Err(e) = h.join().await
+            {
+                tracing::warn!("remote pod endpoint worker join failed: {e}");
+            }
+
+            // 2. Drop the `inet <table>` table on a fresh netlink socket.
+            //    Best-effort — missing tables are tolerated.
+            let nf = Netfilter::new(self.task_supervisor.clone())
+                .context("open netlink socket for cleanup")
+                .map_err(|error| ServiceRouterError::cleanup(error.to_string()))?;
+            let placeholder_pod = PodSubnet::parse("0.0.0.0/30").expect("static placeholder");
+            let placeholder_cluster = ClusterCidr::parse("0.0.0.0/0").expect("static placeholder");
+            let placeholder_service = ClusterCidr::parse("0.0.0.0/0").expect("static placeholder");
+            // Cleanup only deletes the table; the mode field never drives kernel
+            // calls on the cleanup path, so a default placeholder is safe here.
+            let placeholder_mode = ServiceRoutingMode::new(crate::bootstrap::NodeMode::Root);
+            let table = KlightsTable::with_name_and_bridge(
+                nf,
+                &self.table_name_str,
+                &self.table_name_str,
+                placeholder_pod,
+                placeholder_cluster,
+                placeholder_service,
+                placeholder_mode,
+            )
+            .context("construct KlightsTable for cleanup")
+            .map_err(|error| ServiceRouterError::cleanup(error.to_string()))?;
+            table
+                .cleanup()
+                .await
+                .map_err(|error| ServiceRouterError::cleanup(error.to_string()))
+        })
     }
 }
 
@@ -997,51 +1004,108 @@ async fn sync_routing_from_api(
     Ok(service_count)
 }
 
+type RemotePodEndpointRuleFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
+trait RemotePodEndpointRuleSync: Send + Sync {
+    fn apply_event<'a>(
+        &'a self,
+        local_node_name: &'a str,
+        event: klights_network_api::PodEndpointEvent,
+    ) -> RemotePodEndpointRuleFuture<'a>;
+}
+
+impl RemotePodEndpointRuleSync for KlightsTable {
+    fn apply_event<'a>(
+        &'a self,
+        local_node_name: &'a str,
+        event: klights_network_api::PodEndpointEvent,
+    ) -> RemotePodEndpointRuleFuture<'a> {
+        Box::pin(async move {
+            match event {
+                klights_network_api::PodEndpointEvent::Upsert(endpoint) => {
+                    self.upsert_remote_pod_endpoint(local_node_name, endpoint)
+                        .await
+                }
+                klights_network_api::PodEndpointEvent::Delete(pod_ip) => {
+                    self.remove_remote_pod_endpoint(pod_ip).await
+                }
+                klights_network_api::PodEndpointEvent::Resync(snapshot) => self
+                    .sync_remote_pod_endpoints_from_topology(local_node_name, &snapshot)
+                    .await
+                    .map(|_| ()),
+            }
+        })
+    }
+}
+
 async fn run_remote_pod_endpoint_worker(
-    table: std::sync::Arc<KlightsTable>,
-    node_local: NodeLocalHandle,
+    endpoint_rules: std::sync::Arc<dyn RemotePodEndpointRuleSync>,
+    endpoint_source: std::sync::Arc<dyn klights_network_api::PodEndpointEventSource>,
     local_node_name: String,
     cancel: CancellationToken,
+    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
 ) {
     tracing::info!("nft remote pod endpoint worker started");
-    let mut rx = node_local.subscribe_pod_endpoints();
-    loop {
-        tokio::select! {
+    let mut retry_backoff = INITIAL_RETRY_BACKOFF;
+    'subscribe: loop {
+        let subscription = tokio::select! {
             _ = cancel.cancelled() => break,
-            event = rx.recv() => {
-                match event {
-                    Ok(crate::datastore::PodEndpointEvent::Upsert(row)) => {
-                        if let Err(e) = table
-                            .upsert_remote_pod_endpoint_row(&local_node_name, row)
+            subscription = endpoint_source.subscribe() => subscription,
+        };
+        let mut events = match subscription {
+            Ok(events) => {
+                retry_backoff = INITIAL_RETRY_BACKOFF;
+                events
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "remote pod endpoint subscription failed");
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = task_supervisor.sleep(
+                        "service_routing_endpoint_subscription_retry",
+                        retry_backoff,
+                    ) => {}
+                }
+                retry_backoff = std::cmp::min(retry_backoff.saturating_mul(2), MAX_RETRY_BACKOFF);
+                continue;
+            }
+        };
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break 'subscribe,
+                event = std::future::poll_fn(|context| events.as_mut().poll_next(context)) => {
+                    match event {
+                    Some(Ok(event)) => {
+                        if let Err(error) = endpoint_rules
+                            .apply_event(&local_node_name, event)
                             .await
                         {
-                            tracing::warn!("remote pod endpoint upsert sync failed: {e:#}");
+                            tracing::warn!(
+                                error = %error,
+                                "remote pod endpoint nft apply lost authority; resubscribing for authoritative resync"
+                            );
+                            break;
                         }
+                        retry_backoff = INITIAL_RETRY_BACKOFF;
                     }
-                    Ok(crate::datastore::PodEndpointEvent::Delete { pod_ip, .. }) => {
-                        if let Err(e) = table.remove_remote_pod_endpoint(pod_ip).await {
-                            tracing::warn!("remote pod endpoint delete sync failed: {e:#}");
-                        }
+                    Some(Err(error)) => {
+                        tracing::warn!(error = %error, "remote pod endpoint subscription lost authority; retrying");
+                        break;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            skipped,
-                            "remote pod endpoint worker lagged; rebuilding from datastore"
-                        );
-                        if let Err(e) = table
-                            .sync_remote_pod_endpoints_from_node_local(
-                                node_local.as_ref(),
-                                &local_node_name,
-                            )
-                            .await
-                        {
-                            tracing::warn!("remote pod endpoint lag rebuild failed: {e:#}");
-                        }
+                    None => break,
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = task_supervisor.sleep(
+                "service_routing_endpoint_stream_retry",
+                retry_backoff,
+            ) => {}
+        }
+        retry_backoff = std::cmp::min(retry_backoff.saturating_mul(2), MAX_RETRY_BACKOFF);
     }
     tracing::info!("nft remote pod endpoint worker exited");
 }
@@ -1204,6 +1268,113 @@ mod tests {
         watches_opened: AtomicUsize,
         opened_notify: Notify,
         closed_endpoints_once: std::sync::atomic::AtomicBool,
+    }
+
+    #[derive(Default)]
+    struct ReopeningEndpointSource {
+        subscriptions: AtomicUsize,
+    }
+
+    struct OneResyncSubscription {
+        delivered: bool,
+    }
+
+    impl klights_network_api::PodEndpointEventSubscription for OneResyncSubscription {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<
+            Option<
+                std::result::Result<
+                    klights_network_api::PodEndpointEvent,
+                    klights_network_api::PodEndpointError,
+                >,
+            >,
+        > {
+            if self.delivered {
+                std::task::Poll::Ready(None)
+            } else {
+                self.delivered = true;
+                std::task::Poll::Ready(Some(Ok(klights_network_api::PodEndpointEvent::Resync(
+                    Vec::new(),
+                ))))
+            }
+        }
+    }
+
+    impl klights_network_api::PodEndpointEventSource for ReopeningEndpointSource {
+        fn subscribe(
+            &self,
+        ) -> klights_network_api::PodEndpointFuture<'_, klights_network_api::PodEndpointEventStream>
+        {
+            self.subscriptions.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(Box::pin(OneResyncSubscription { delivered: false })
+                    as klights_network_api::PodEndpointEventStream)
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FailOnceRemoteEndpointSync {
+        attempts: AtomicUsize,
+        attempted: Notify,
+    }
+
+    impl RemotePodEndpointRuleSync for FailOnceRemoteEndpointSync {
+        fn apply_event<'a>(
+            &'a self,
+            _local_node_name: &'a str,
+            _event: klights_network_api::PodEndpointEvent,
+        ) -> RemotePodEndpointRuleFuture<'a> {
+            Box::pin(async move {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                self.attempted.notify_waiters();
+                if attempt == 0 {
+                    Err(anyhow::anyhow!("deterministic nft apply failure"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_endpoint_nft_failure_resubscribes_for_authoritative_resync() {
+        let source = Arc::new(ReopeningEndpointSource::default());
+        let sink = Arc::new(FailOnceRemoteEndpointSync::default());
+        let cancel = CancellationToken::new();
+        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
+            crate::task_supervisor::TaskCategoryConfig::default(),
+        ));
+        let worker = supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::Network,
+                "test_remote_endpoint_apply_retry",
+                run_remote_pod_endpoint_worker(
+                    sink.clone(),
+                    source.clone(),
+                    "node-a".to_string(),
+                    cancel.clone(),
+                    supervisor.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if sink.attempts.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                sink.attempted.notified().await;
+            }
+        })
+        .await
+        .expect("failed nft apply must be followed by a supervised resubscribe/resync retry");
+        cancel.cancel();
+        worker.join().await.unwrap();
+        assert!(source.subscriptions.load(Ordering::SeqCst) >= 2);
     }
 
     macro_rules! impl_unexpected_resource_query {
@@ -1446,7 +1617,7 @@ mod tests {
             table_name_str: "klights-test-watch".to_string(),
         };
 
-        router.request_services_sync();
+        router.request_services_sync().unwrap();
 
         assert!(
             force_full_sync.load(Ordering::SeqCst),

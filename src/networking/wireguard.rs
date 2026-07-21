@@ -217,75 +217,44 @@ impl DataplanePeerMetadata {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WireGuardPeerPlan {
-    pub node_name: String,
-    pub mode: DataplaneMode,
-    pub public_key: WireGuardPublicKey,
-    pub endpoint: SocketAddr,
-    pub allowed_pod_cidr: String,
-}
-
-impl WireGuardPeerPlan {
-    pub fn try_new(metadata: DataplanePeerMetadata, peer_pod_cidr: &str) -> Result<Self> {
-        if metadata.encryption != DataplaneEncryption::Enabled {
-            return Err(anyhow!(
-                "WireGuard peer plan requires dataplane encryption enabled for {}",
-                metadata.node_name
-            ));
-        }
-        let public_key = metadata.public_key.ok_or_else(|| {
-            anyhow!(
-                "WireGuard peer plan requires a public key for {}",
-                metadata.node_name
+/// Project cluster topology metadata into the canonical runtime peer-route
+/// contract. Topology mode and base64 representation remain outside the port.
+pub(crate) fn peer_route_from_metadata(
+    metadata: DataplanePeerMetadata,
+    peer_pod_cidr: &str,
+) -> Result<klights_network_api::PeerRoute> {
+    match metadata.encryption {
+        DataplaneEncryption::Enabled => {
+            let public_key = metadata.public_key.ok_or_else(|| {
+                anyhow!(
+                    "WireGuard peer route requires a public key for {}",
+                    metadata.node_name
+                )
+            })?;
+            let port = metadata.port.ok_or_else(|| {
+                anyhow!(
+                    "WireGuard peer route requires a listen port for {}",
+                    metadata.node_name
+                )
+            })?;
+            let route = klights_network_api::WireGuardPeerRoute::try_new(
+                metadata.node_name,
+                klights_network_api::WireGuardPeerKey::new(public_key.to_bytes()?),
+                SocketAddr::new(metadata.endpoint, port),
+                peer_pod_cidr,
             )
-        })?;
-        let port = metadata.port.ok_or_else(|| {
-            anyhow!(
-                "WireGuard peer plan requires a listen port for {}",
-                metadata.node_name
-            )
-        })?;
-        let allowed_pod_cidr = crate::networking::PodSubnet::parse(peer_pod_cidr)
-            .map_err(|err| anyhow!("invalid WireGuard peer pod CIDR '{peer_pod_cidr}': {err}"))?
-            .to_string();
-
-        Ok(Self {
-            node_name: metadata.node_name,
-            mode: metadata.mode,
-            public_key,
-            endpoint: SocketAddr::new(metadata.endpoint, port),
-            allowed_pod_cidr,
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnencryptedPeerPlan {
-    pub node_name: String,
-    pub mode: DataplaneMode,
-    pub endpoint: IpAddr,
-    pub allowed_pod_cidr: String,
-}
-
-impl UnencryptedPeerPlan {
-    pub fn try_new(metadata: DataplanePeerMetadata, peer_pod_cidr: &str) -> Result<Self> {
-        if metadata.encryption != DataplaneEncryption::Disabled {
-            return Err(anyhow!(
-                "unencrypted peer plan requires dataplane encryption disabled for {}",
-                metadata.node_name
-            ));
+            .map_err(|error| anyhow!(error))?;
+            Ok(klights_network_api::PeerRoute::WireGuard(route))
         }
-        let allowed_pod_cidr = crate::networking::PodSubnet::parse(peer_pod_cidr)
-            .map_err(|err| anyhow!("invalid unencrypted peer pod CIDR '{peer_pod_cidr}': {err}"))?
-            .to_string();
-
-        Ok(Self {
-            node_name: metadata.node_name,
-            mode: metadata.mode,
-            endpoint: metadata.endpoint,
-            allowed_pod_cidr,
-        })
+        DataplaneEncryption::Disabled => {
+            let route = klights_network_api::DirectPeerRoute::try_new(
+                metadata.node_name,
+                metadata.endpoint,
+                peer_pod_cidr,
+            )
+            .map_err(|error| anyhow!(error))?;
+            Ok(klights_network_api::PeerRoute::Direct(route))
+        }
     }
 }
 
@@ -364,7 +333,8 @@ pub fn parse_wireguard_device_name(raw: &str) -> Result<String> {
 pub struct WireGuardController {
     device: String,
     handle: AsyncMutex<genetlink::GenetlinkHandle>,
-    _conn: SupervisedJoinHandle<()>,
+    _conn: AsyncMutex<Option<SupervisedJoinHandle<()>>>,
+    connection_cancel: CancellationToken,
 }
 
 impl WireGuardController {
@@ -375,6 +345,8 @@ impl WireGuardController {
     ) -> Result<Self> {
         let (conn, handle, _) =
             genetlink::new_connection().context("failed to open WireGuard generic netlink")?;
+        let connection_cancel = CancellationToken::new();
+        let owned_connection_cancel = connection_cancel.clone();
         let conn = supervisor
             .spawn_async(
                 TaskCategory::Network,
@@ -383,6 +355,7 @@ impl WireGuardController {
                     tokio::select! {
                         _ = conn => {}
                         _ = cancel.cancelled() => {}
+                        _ = owned_connection_cancel.cancelled() => {}
                     }
                 },
             )
@@ -391,27 +364,51 @@ impl WireGuardController {
         let controller = Self {
             device: config.device.clone(),
             handle: AsyncMutex::new(handle),
-            _conn: conn,
+            _conn: AsyncMutex::new(Some(conn)),
+            connection_cancel,
         };
-        controller
+        let configure_result = controller
             .set_device_with_retry(&config, supervisor)
             .await
-            .with_context(|| format!("configure WireGuard device {}", config.device))?;
-        Ok(controller)
+            .with_context(|| format!("configure WireGuard device {}", config.device));
+        controller.finish_open(configure_result).await
     }
 
-    pub async fn apply_peer(&self, plan: &WireGuardPeerPlan) -> Result<()> {
-        let message = build_set_peer_message(&self.device, plan)?;
+    pub async fn apply_peer(&self, route: &klights_network_api::WireGuardPeerRoute) -> Result<()> {
+        let message = build_set_peer_message(&self.device, route)?;
         self.send(message)
             .await
-            .with_context(|| format!("apply WireGuard peer {}", plan.node_name))
+            .with_context(|| format!("apply WireGuard peer {}", route.node_name()))
     }
 
-    pub async fn remove_peer(&self, public_key: &WireGuardPublicKey) -> Result<()> {
-        let message = build_remove_peer_message(&self.device, public_key)?;
+    pub async fn remove_peer(&self, route: &klights_network_api::WireGuardPeerRoute) -> Result<()> {
+        let message = build_remove_peer_message(&self.device, route.public_key())?;
         self.send(message)
             .await
-            .with_context(|| format!("remove WireGuard peer {}", public_key))
+            .with_context(|| format!("remove WireGuard peer {}", route.node_name()))
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        self.connection_cancel.cancel();
+        if let Some(connection) = self._conn.lock().await.take() {
+            connection
+                .join()
+                .await
+                .context("WireGuard generic netlink connection task join failed")?;
+        }
+        Ok(())
+    }
+
+    async fn finish_open(self, configure_result: Result<()>) -> Result<Self> {
+        match configure_result {
+            Ok(()) => Ok(self),
+            Err(configure_error) => match self.shutdown().await {
+                Ok(()) => Err(configure_error),
+                Err(shutdown_error) => Err(anyhow!(
+                    "{configure_error:#}; generic-netlink cleanup after configuration failure also failed: {shutdown_error:#}"
+                )),
+            },
+        }
     }
 
     async fn set_device(&self, config: &WireGuardDeviceConfig) -> Result<()> {
@@ -476,24 +473,19 @@ pub fn build_set_device_message(config: &WireGuardDeviceConfig) -> WireGuardNetl
 
 pub fn build_set_peer_message(
     device: &str,
-    plan: &WireGuardPeerPlan,
+    route: &klights_network_api::WireGuardPeerRoute,
 ) -> Result<WireGuardNetlinkMessage> {
-    let subnet = crate::networking::PodSubnet::parse(&plan.allowed_pod_cidr).map_err(|err| {
-        anyhow!(
-            "invalid WireGuard peer pod CIDR '{}': {err}",
-            plan.allowed_pod_cidr
-        )
-    })?;
+    let subnet = route.allowed_pod_cidr();
     Ok(wireguard_request(vec![
         WireguardAttribute::IfName(parse_wireguard_device_name(device)?),
         WireguardAttribute::Peers(vec![WireguardPeer(vec![
-            WireguardPeerAttribute::PublicKey(plan.public_key.to_bytes()?),
-            WireguardPeerAttribute::Endpoint(plan.endpoint),
+            WireguardPeerAttribute::PublicKey(*route.public_key().as_bytes()),
+            WireguardPeerAttribute::Endpoint(route.endpoint()),
             WireguardPeerAttribute::PersistentKeepalive(WIREGUARD_PERSISTENT_KEEPALIVE_SECS),
             WireguardPeerAttribute::Flags(WGPEER_F_REPLACE_ALLOWEDIPS),
             WireguardPeerAttribute::AllowedIps(vec![WireguardAllowedIp(vec![
                 WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv4),
-                WireguardAllowedIpAttr::IpAddr(IpAddr::V4(subnet.base_ip())),
+                WireguardAllowedIpAttr::IpAddr(IpAddr::V4(subnet.network())),
                 WireguardAllowedIpAttr::Cidr(subnet.prefix()),
             ])]),
         ])]),
@@ -502,12 +494,12 @@ pub fn build_set_peer_message(
 
 pub fn build_remove_peer_message(
     device: &str,
-    public_key: &WireGuardPublicKey,
+    public_key: &klights_network_api::WireGuardPeerKey,
 ) -> Result<WireGuardNetlinkMessage> {
     Ok(wireguard_request(vec![
         WireguardAttribute::IfName(parse_wireguard_device_name(device)?),
         WireguardAttribute::Peers(vec![WireguardPeer(vec![
-            WireguardPeerAttribute::PublicKey(public_key.to_bytes()?),
+            WireguardPeerAttribute::PublicKey(*public_key.as_bytes()),
             WireguardPeerAttribute::Flags(WGPEER_F_REMOVE_ME),
         ])]),
     ]))
@@ -516,15 +508,15 @@ pub fn build_remove_peer_message(
 pub async fn apply_wireguard_pod_route(
     handle: &rtnetlink::Handle,
     wireguard_idx: u32,
-    plan: &WireGuardPeerPlan,
+    route: &klights_network_api::WireGuardPeerRoute,
     preferred_source: Ipv4Addr,
 ) -> Result<()> {
-    let subnet = parse_plan_subnet(&plan.allowed_pod_cidr)?;
+    let subnet = route.allowed_pod_cidr();
     handle
         .route()
         .add()
         .v4()
-        .destination_prefix(subnet.base_ip(), subnet.prefix())
+        .destination_prefix(subnet.network(), subnet.prefix())
         .output_interface(wireguard_idx)
         .pref_source(preferred_source)
         .replace()
@@ -533,7 +525,8 @@ pub async fn apply_wireguard_pod_route(
         .with_context(|| {
             format!(
                 "failed to install WireGuard route for peer {} subnet {}",
-                plan.node_name, plan.allowed_pod_cidr
+                route.node_name(),
+                subnet
             )
         })
 }
@@ -541,39 +534,32 @@ pub async fn apply_wireguard_pod_route(
 pub async fn remove_wireguard_pod_route(
     handle: &rtnetlink::Handle,
     wireguard_idx: u32,
-    plan: &WireGuardPeerPlan,
+    route: &klights_network_api::WireGuardPeerRoute,
     preferred_source: Ipv4Addr,
 ) -> Result<()> {
-    let subnet = parse_plan_subnet(&plan.allowed_pod_cidr)?;
+    let subnet = route.allowed_pod_cidr();
     let message = wireguard_route_message(wireguard_idx, subnet, preferred_source);
-    if let Err(err) = handle.route().del(message).execute().await {
-        tracing::warn!(
-            peer = %plan.node_name,
-            subnet = %plan.allowed_pod_cidr,
-            error = %err,
-            "failed to remove WireGuard pod route"
-        );
-    }
-    Ok(())
+    route_delete_result(
+        handle.route().del(message).execute().await,
+        format!(
+            "failed to remove WireGuard route for peer {} subnet {}",
+            route.node_name(),
+            subnet
+        ),
+    )
 }
 
 pub async fn apply_unencrypted_direct_route(
     handle: &rtnetlink::Handle,
-    plan: &UnencryptedPeerPlan,
+    route: &klights_network_api::DirectPeerRoute,
 ) -> Result<()> {
-    let subnet = parse_plan_subnet(&plan.allowed_pod_cidr)?;
-    let IpAddr::V4(gateway) = plan.endpoint else {
-        bail!(
-            "unencrypted direct route for {} requires IPv4 endpoint, got {}",
-            plan.node_name,
-            plan.endpoint
-        );
-    };
+    let subnet = route.allowed_pod_cidr();
+    let gateway = route.gateway();
     handle
         .route()
         .add()
         .v4()
-        .destination_prefix(subnet.base_ip(), subnet.prefix())
+        .destination_prefix(subnet.network(), subnet.prefix())
         .gateway(gateway)
         .replace()
         .execute()
@@ -581,40 +567,55 @@ pub async fn apply_unencrypted_direct_route(
         .with_context(|| {
             format!(
                 "failed to install unencrypted direct route for peer {} subnet {} via {}",
-                plan.node_name, plan.allowed_pod_cidr, gateway
+                route.node_name(),
+                subnet,
+                gateway
             )
         })
 }
 
 pub async fn remove_unencrypted_direct_route(
     handle: &rtnetlink::Handle,
-    plan: &UnencryptedPeerPlan,
+    route: &klights_network_api::DirectPeerRoute,
 ) -> Result<()> {
-    let subnet = parse_plan_subnet(&plan.allowed_pod_cidr)?;
-    let IpAddr::V4(gateway) = plan.endpoint else {
-        return Ok(());
-    };
+    let subnet = route.allowed_pod_cidr();
+    let gateway = route.gateway();
     let message = unencrypted_direct_route_message(subnet, gateway);
-    if let Err(err) = handle.route().del(message).execute().await {
-        tracing::warn!(
-            peer = %plan.node_name,
-            subnet = %plan.allowed_pod_cidr,
-            gateway = %gateway,
-            error = %err,
-            "failed to remove unencrypted direct pod route"
-        );
-    }
-    Ok(())
+    route_delete_result(
+        handle.route().del(message).execute().await,
+        format!(
+            "failed to remove unencrypted direct route for peer {} subnet {} via {}",
+            route.node_name(),
+            subnet,
+            gateway
+        ),
+    )
 }
 
-fn parse_plan_subnet(cidr: &str) -> Result<crate::networking::PodSubnet> {
-    crate::networking::PodSubnet::parse(cidr)
-        .map_err(|err| anyhow!("invalid peer pod CIDR '{cidr}': {err}"))
+fn route_delete_result(
+    result: std::result::Result<(), rtnetlink::Error>,
+    context: impl fmt::Display,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if route_delete_reports_absent(&error) => Ok(()),
+        Err(error) => Err(error).with_context(|| context.to_string()),
+    }
+}
+
+fn route_delete_reports_absent(error: &rtnetlink::Error) -> bool {
+    matches!(
+        error,
+        rtnetlink::Error::NetlinkError(message)
+            if message.code.is_some_and(|code| {
+                matches!(code.get().abs(), libc::ENOENT | libc::ESRCH)
+            })
+    )
 }
 
 fn wireguard_route_message(
     wireguard_idx: u32,
-    subnet: crate::networking::PodSubnet,
+    subnet: klights_network_api::PeerPodCidr,
     preferred_source: Ipv4Addr,
 ) -> netlink_packet_route::route::RouteMessage {
     use netlink_packet_route::route::{
@@ -630,7 +631,7 @@ fn wireguard_route_message(
     route_msg
         .attributes
         .push(RouteAttribute::Destination(RouteAddress::Inet(
-            subnet.base_ip(),
+            subnet.network(),
         )));
     route_msg
         .attributes
@@ -644,7 +645,7 @@ fn wireguard_route_message(
 }
 
 fn unencrypted_direct_route_message(
-    subnet: crate::networking::PodSubnet,
+    subnet: klights_network_api::PeerPodCidr,
     gateway: std::net::Ipv4Addr,
 ) -> netlink_packet_route::route::RouteMessage {
     use netlink_packet_route::route::{
@@ -660,7 +661,7 @@ fn unencrypted_direct_route_message(
     route_msg
         .attributes
         .push(RouteAttribute::Destination(RouteAddress::Inet(
-            subnet.base_ip(),
+            subnet.network(),
         )));
     route_msg
         .attributes
@@ -765,16 +766,18 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::{
-        WGPEER_F_REMOVE_ME, WGPEER_F_REPLACE_ALLOWEDIPS, WireGuardDeviceConfig,
-        WireGuardPrivateKey, build_remove_peer_message, build_set_device_message,
-        build_set_peer_message, unencrypted_direct_route_message,
-        wireguard_device_config_retry_delays, wireguard_message_attrs, wireguard_route_message,
+        WGPEER_F_REMOVE_ME, WGPEER_F_REPLACE_ALLOWEDIPS, WireGuardController,
+        WireGuardDeviceConfig, WireGuardPrivateKey, build_remove_peer_message,
+        build_set_device_message, build_set_peer_message, route_delete_result,
+        unencrypted_direct_route_message, wireguard_device_config_retry_delays,
+        wireguard_message_attrs, wireguard_route_message,
     };
     use crate::networking::wireguard::{
         DataplaneEncryption, DataplaneMode, DataplanePeerMetadata, WireGuardIdentity,
-        WireGuardPeerPlan, WireGuardPublicKey,
+        WireGuardPublicKey, peer_route_from_metadata,
     };
     use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use tokio::sync::Mutex as AsyncMutex;
 
     #[test]
     fn wireguard_mtu_is_safe_for_public_internet_overlay() {
@@ -923,8 +926,79 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn wireguard_controller_shutdown_cancels_and_joins_generic_netlink_task() {
+        let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+        let (connection, handle, _) = genetlink::new_connection().unwrap();
+        let owned_cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = owned_cancel.clone();
+        let connection_task = supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::Network,
+                "test_wireguard_owned_generic_netlink_connection",
+                async move {
+                    tokio::select! {
+                        _ = connection => {}
+                        _ = task_cancel.cancelled() => {}
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let controller = WireGuardController {
+            device: "test.wg".to_string(),
+            handle: AsyncMutex::new(handle),
+            _conn: AsyncMutex::new(Some(connection_task)),
+            connection_cancel: owned_cancel,
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), controller.shutdown())
+            .await
+            .expect("explicit shutdown must not leave the generic-netlink task alive")
+            .expect("generic-netlink task shutdown must succeed");
+    }
+
+    #[tokio::test]
+    async fn wireguard_open_failure_cancels_and_joins_generic_netlink_task() {
+        let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
+        let (connection, handle, _) = genetlink::new_connection().unwrap();
+        let owned_cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = owned_cancel.clone();
+        let connection_task = supervisor
+            .spawn_async(
+                crate::task_supervisor::TaskCategory::Network,
+                "test_wireguard_failed_open_generic_netlink_connection",
+                async move {
+                    tokio::select! {
+                        _ = connection => {}
+                        _ = task_cancel.cancelled() => {}
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let controller = WireGuardController {
+            device: "test.wg".to_string(),
+            handle: AsyncMutex::new(handle),
+            _conn: AsyncMutex::new(Some(connection_task)),
+            connection_cancel: owned_cancel,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            controller.finish_open(Err(anyhow::anyhow!("configuration failed"))),
+        )
+        .await
+        .expect("failed open must cancel and join its owned generic-netlink task");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("the original configuration failure must remain visible"),
+        };
+        assert!(error.to_string().contains("configuration failed"));
+    }
+
     #[test]
-    fn wireguard_peer_plan_requires_enabled_encryption_and_uses_peer_pod_cidr() {
+    fn topology_projects_to_wireguard_route_with_peer_pod_cidr() {
         let metadata = DataplanePeerMetadata::try_new(
             "worker-1".to_string(),
             DataplaneMode::Rootless,
@@ -935,16 +1009,18 @@ mod tests {
         )
         .unwrap();
 
-        let plan = WireGuardPeerPlan::try_new(metadata, "10.42.7.0/24").unwrap();
+        let route = peer_route_from_metadata(metadata, "10.42.7.0/24").unwrap();
+        let klights_network_api::PeerRoute::WireGuard(route) = route else {
+            panic!("enabled topology must project to WireGuard");
+        };
 
-        assert_eq!(plan.node_name, "worker-1");
-        assert_eq!(plan.allowed_pod_cidr, "10.42.7.0/24");
-        assert_eq!(plan.endpoint.to_string(), "192.0.2.10:51820");
-        assert_eq!(plan.mode, DataplaneMode::Rootless);
+        assert_eq!(route.node_name(), "worker-1");
+        assert_eq!(route.allowed_pod_cidr().to_string(), "10.42.7.0/24");
+        assert_eq!(route.endpoint().to_string(), "192.0.2.10:51820");
     }
 
     #[test]
-    fn wireguard_peer_plan_rejects_disabled_encryption_and_malformed_cidr() {
+    fn topology_projects_disabled_encryption_to_direct_and_rejects_malformed_cidr() {
         let disabled = DataplanePeerMetadata::try_new(
             "worker-1".to_string(),
             DataplaneMode::Root,
@@ -954,7 +1030,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(WireGuardPeerPlan::try_new(disabled, "10.42.7.0/24").is_err());
+        assert!(matches!(
+            peer_route_from_metadata(disabled, "10.42.7.0/24").unwrap(),
+            klights_network_api::PeerRoute::Direct(_)
+        ));
 
         let enabled = DataplanePeerMetadata::try_new(
             "worker-2".to_string(),
@@ -965,7 +1044,7 @@ mod tests {
             Some(51_820),
         )
         .unwrap();
-        assert!(WireGuardPeerPlan::try_new(enabled, "not-a-cidr").is_err());
+        assert!(peer_route_from_metadata(enabled, "not-a-cidr").is_err());
     }
 
     #[test]
@@ -1032,8 +1111,11 @@ mod tests {
             Some(51_821),
         )
         .unwrap();
-        let plan = WireGuardPeerPlan::try_new(metadata, "10.42.7.0/24").unwrap();
-        let message = build_set_peer_message("klights.wg", &plan).unwrap();
+        let route = peer_route_from_metadata(metadata, "10.42.7.0/24").unwrap();
+        let klights_network_api::PeerRoute::WireGuard(route) = route else {
+            panic!("enabled topology must project to WireGuard");
+        };
+        let message = build_set_peer_message("klights.wg", &route).unwrap();
         let attrs = wireguard_message_attrs(&message);
         let peer_attrs = attrs
             .iter()
@@ -1088,8 +1170,7 @@ mod tests {
     fn wireguard_remove_peer_marks_peer_for_kernel_removal() {
         use netlink_packet_wireguard::{WireguardAttribute, WireguardPeerAttribute};
 
-        let public_key =
-            WireGuardPublicKey::parse("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").unwrap();
+        let public_key = klights_network_api::WireGuardPeerKey::new([1; 32]);
         let message = build_remove_peer_message("klights.wg", &public_key).unwrap();
         let attrs = wireguard_message_attrs(&message);
         let peer_attrs = attrs
@@ -1113,7 +1194,7 @@ mod tests {
 
         use netlink_packet_route::route::{RouteAddress, RouteAttribute};
 
-        let subnet = crate::networking::PodSubnet::parse("10.42.7.0/24").unwrap();
+        let subnet = klights_network_api::PeerPodCidr::try_new("10.42.7.0/24").unwrap();
         let message = wireguard_route_message(77, subnet, Ipv4Addr::new(10, 42, 0, 1));
 
         assert_eq!(message.header.destination_prefix_length, 24);
@@ -1143,12 +1224,31 @@ mod tests {
     }
 
     #[test]
+    fn route_delete_propagates_non_absent_netlink_failures() {
+        let error = route_delete_result(Err(rtnetlink::Error::RequestFailed), "remove peer route")
+            .expect_err("non-absence netlink failures must remain retryable errors");
+        assert!(error.to_string().contains("remove peer route"));
+        route_delete_result(Ok(()), "remove peer route").expect("successful delete stays ok");
+    }
+
+    #[test]
+    fn route_delete_treats_kernel_not_found_as_idempotent_absence() {
+        let mut message = netlink_packet_core::ErrorMessage::default();
+        message.code = std::num::NonZeroI32::new(-libc::ESRCH);
+        route_delete_result(
+            Err(rtnetlink::Error::NetlinkError(message)),
+            "remove already absent peer route",
+        )
+        .expect("kernel ESRCH proves the route is already absent");
+    }
+
+    #[test]
     fn unencrypted_route_message_is_explicit_plaintext_gateway_route() {
         use std::net::Ipv4Addr;
 
         use netlink_packet_route::route::{RouteAddress, RouteAttribute};
 
-        let subnet = crate::networking::PodSubnet::parse("10.42.8.0/24").unwrap();
+        let subnet = klights_network_api::PeerPodCidr::try_new("10.42.8.0/24").unwrap();
         let message = unencrypted_direct_route_message(subnet, Ipv4Addr::new(192, 0, 2, 44));
 
         assert_eq!(message.header.destination_prefix_length, 24);

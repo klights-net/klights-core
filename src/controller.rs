@@ -29,7 +29,7 @@ pub struct Context {
     /// Service router for controllers that need to trigger nft sync
     /// (Service controller). Optional because the unit-test workqueue
     /// wiring constructs a Context without a live router.
-    pub services: Option<Arc<dyn crate::networking::ServiceRouter>>,
+    pub services: Option<Arc<dyn klights_network_api::ServiceRouter>>,
     /// Single-instance pod persistence boundary. Workload controllers
     /// (Deployment, ReplicaSet) use this to read/write Pod objects
     /// instead of going through the raw datastore. Optional so test
@@ -58,7 +58,7 @@ impl Context {
     pub fn with_services(
         db_handle: DatastoreHandle,
         node_name: String,
-        services: Arc<dyn crate::networking::ServiceRouter>,
+        services: Arc<dyn klights_network_api::ServiceRouter>,
     ) -> Self {
         Self {
             db_handle,
@@ -95,7 +95,7 @@ impl Context {
     }
 
     /// Borrow the service router if one is attached.
-    pub fn services(&self) -> Option<&Arc<dyn crate::networking::ServiceRouter>> {
+    pub fn services(&self) -> Option<&Arc<dyn klights_network_api::ServiceRouter>> {
         self.services.as_ref()
     }
 

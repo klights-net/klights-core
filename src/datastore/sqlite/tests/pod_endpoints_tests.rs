@@ -36,6 +36,33 @@ async fn test_pod_endpoints_create_round_trip() {
 }
 
 #[tokio::test]
+async fn test_pod_endpoints_reject_malformed_persisted_port_without_wrapping() {
+    let db = Datastore::new_in_memory().await.unwrap();
+    db.node_db_call("test_insert_malformed_endpoint_port", |conn| {
+        conn.execute(
+            "INSERT INTO pod_endpoints
+             (pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip,
+              host_port_tcp, host_port_udp, generation, updated_ms)
+             VALUES ('bad-port', 'default', 'bad-port', 'node-a', 'hostport',
+                     '10.42.0.10', '192.0.2.10', 65536, NULL, 1, 1)",
+            [],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let error = db
+        .pod_endpoint_get_by_pod_ip("10.42.0.10".parse().unwrap())
+        .await
+        .expect_err("invalid persisted port must fail decoding");
+    assert!(
+        format!("{error:#}").contains("pod endpoint port outside 1..=65535"),
+        "unexpected decode error: {error:#}"
+    );
+}
+
+#[tokio::test]
 async fn test_pod_endpoints_unique_pod_uid_violation() {
     // Two distinct pods inserted, then a raw INSERT (no REPLACE) of a third
     // row reusing the first pod's uid must violate the PRIMARY KEY constraint.

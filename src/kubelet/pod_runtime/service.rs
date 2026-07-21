@@ -915,7 +915,12 @@ impl PodRuntimeService for RealPodRuntimeService {
         }
 
         // HostPort admission check.
-        if let Err(e) = self.hostports.check_host_port_admission(&key, &pod).await {
+        let admission_host_ports = super::hostports::pod_host_ports_from_resource(&key, &pod)?;
+        if let Err(e) = self
+            .hostports
+            .check_host_port_admission(&admission_host_ports)
+            .await
+        {
             let failure_message = format!("hostPort admission failed: {:#}", e);
             // Emit admission failure event.
             let _ = self
@@ -1151,6 +1156,7 @@ impl PodRuntimeService for RealPodRuntimeService {
             assignment.pod_ip.as_str(),
             assignment.host_ip.as_str(),
         );
+        let pod_host_ports = super::hostports::pod_host_ports_from_resource(&key, &pod)?;
 
         // --- Cancellation check: after sandbox + store + network, before hostports/containers ---
         if cancel.is_cancelled() {
@@ -1165,7 +1171,7 @@ impl PodRuntimeService for RealPodRuntimeService {
             .timeout(
                 "pod_start_add_hostports",
                 POST_SANDBOX_HOSTPORT_SETUP_TIMEOUT,
-                self.hostports.add_host_ports(&key, &pod),
+                self.hostports.add_host_ports(&pod_host_ports),
             )
             .await?;
         match hostport_result {
@@ -1260,7 +1266,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                     uid = key.uid,
                     "{message}"
                 );
-                let _ = self.hostports.remove_host_ports(&key, &pod).await;
+                let _ = self.hostports.remove_host_ports(&pod_host_ports).await;
                 self.rollback_partial_pod_start(&key, &sandbox_id, "volume processing failed")
                     .await;
                 let _ = self
@@ -1287,7 +1293,7 @@ impl PodRuntimeService for RealPodRuntimeService {
                     uid = key.uid,
                     "{message}"
                 );
-                let _ = self.hostports.remove_host_ports(&key, &pod).await;
+                let _ = self.hostports.remove_host_ports(&pod_host_ports).await;
                 self.rollback_partial_pod_start(&key, &sandbox_id, "volume processing timed out")
                     .await;
                 let _ = self
@@ -2030,7 +2036,8 @@ impl PodRuntimeService for RealPodRuntimeService {
         }
 
         // Remove hostPort rules.
-        let _ = self.hostports.remove_host_ports(&key, &pod).await;
+        let pod_host_ports = super::hostports::pod_host_ports_from_resource(&key, &pod)?;
+        let _ = self.hostports.remove_host_ports(&pod_host_ports).await;
 
         self.cleanup_pod_local_artifacts(&key).await;
 

@@ -211,6 +211,16 @@ impl RootlessNetworkPlane {
         Ok(idx)
     }
 
+    pub(crate) async fn prepare_service_routing_bridge(&self) -> Result<()> {
+        self.ensure_bridge_once().await.with_context(|| {
+            format!(
+                "rootless bridge {} not ready for service routing",
+                self.bridge
+            )
+        })?;
+        Ok(())
+    }
+
     async fn link_index(&self, name: &str) -> Result<u32> {
         use futures::stream::TryStreamExt;
 
@@ -317,134 +327,189 @@ impl RootlessNetworkPlane {
     }
 }
 
-#[async_trait::async_trait]
-impl crate::networking::datapath::Datapath for RootlessNetworkPlane {
-    async fn cni_add(
+impl klights_network_api::Datapath for RootlessNetworkPlane {
+    fn cni_add(
         &self,
-        request: crate::networking::provider::CniAddRequest,
-    ) -> Result<crate::networking::cni::PodNetwork> {
-        if request.host_network {
-            return Ok(crate::networking::cni::PodNetwork {
-                ip_addr: IpAddr::V4(self.host_ip),
-            });
-        }
+        request: klights_network_api::CniAddRequest,
+    ) -> klights_network_api::DatapathFuture<'_, klights_network_api::PodNetwork> {
+        Box::pin(async move {
+            let (sandbox_id, pod, netns_setns_path, netns_record_path, host_network) =
+                request.into_parts();
+            if host_network {
+                return Ok(klights_network_api::PodNetwork::new(IpAddr::V4(
+                    self.host_ip,
+                )));
+            }
 
-        let bridge_idx = self
-            .ensure_bridge_once()
+            let bridge_idx = self
+                .ensure_bridge_once()
+                .await
+                .with_context(|| format!("rootless bridge {} not ready", self.bridge))
+                .map_err(|error| klights_network_api::DatapathError::setup(error.to_string()))?;
+            crate::networking::cni::add(crate::networking::cni::CniAddArgs {
+                store: self.node_local.as_ref(),
+                handle: &self.rt,
+                sandbox_id: sandbox_id.as_str(),
+                pod,
+                bridge_name: &self.bridge,
+                bridge_idx,
+                netns_setns_path: netns_setns_path.as_str(),
+                netns_record_path: netns_record_path.as_str(),
+                pod_subnet: &self.local_subnet.subnet,
+                pod_link_mtu: self.pod_link_mtu,
+                host_network,
+                host_ip: &self.host_ip.to_string(),
+                _node_name: &self.my_node,
+                task_supervisor: self.task_supervisor.clone(),
+            })
             .await
-            .with_context(|| format!("rootless bridge {} not ready", self.bridge))?;
-        crate::networking::cni::add(crate::networking::cni::CniAddArgs {
-            store: self.node_local.as_ref(),
-            handle: &self.rt,
-            sandbox_id: &request.sandbox_id,
-            pod: klights_types::PodIdentity::new(
-                &request.namespace,
-                &request.pod_name,
-                &request.pod_uid,
-            ),
-            bridge_name: &self.bridge,
-            bridge_idx,
-            netns_setns_path: &request.netns_setns_path,
-            netns_record_path: &request.netns_record_path,
-            pod_subnet: &self.local_subnet.subnet,
-            pod_link_mtu: self.pod_link_mtu,
-            host_network: request.host_network,
-            host_ip: &self.host_ip.to_string(),
-            _node_name: &self.my_node,
-            task_supervisor: self.task_supervisor.clone(),
+            .map_err(|error| klights_network_api::DatapathError::setup(error.to_string()))
         })
-        .await
     }
 
-    async fn cni_del(&self, sandbox_id: &str) -> Result<()> {
-        if self
-            .node_local
-            .get_network_for_sandbox(sandbox_id)
+    fn cni_del<'a>(
+        &'a self,
+        sandbox_id: &'a klights_network_api::SandboxId,
+    ) -> klights_network_api::DatapathFuture<'a, ()> {
+        Box::pin(async move {
+            if self
+                .node_local
+                .get_network_for_sandbox(sandbox_id.as_str())
+                .await
+                .context("failed to look up rootless pod network allocation")
+                .map_err(|error| klights_network_api::DatapathError::teardown(error.to_string()))?
+                .is_none()
+            {
+                tracing::debug!(
+                    "rootless cni::del {}: no pod_networks record (host-network or already deleted)",
+                    sandbox_id
+                );
+                return Ok(());
+            }
+
+            let bridge_idx = self
+                .ensure_bridge_once()
+                .await
+                .with_context(|| format!("rootless bridge {} not ready", self.bridge))
+                .map_err(|error| klights_network_api::DatapathError::teardown(error.to_string()))?;
+            crate::networking::cni::del(
+                self.node_local.as_ref(),
+                &self.rt,
+                sandbox_id.as_str(),
+                bridge_idx,
+            )
             .await
-            .context("failed to look up rootless pod network allocation")?
-            .is_none()
-        {
-            tracing::debug!(
-                "rootless cni::del {}: no pod_networks record (host-network or already deleted)",
-                sandbox_id
-            );
-            return Ok(());
-        }
-
-        let bridge_idx = self
-            .ensure_bridge_once()
-            .await
-            .with_context(|| format!("rootless bridge {} not ready", self.bridge))?;
-        crate::networking::cni::del(self.node_local.as_ref(), &self.rt, sandbox_id, bridge_idx)
-            .await
+            .map_err(|error| klights_network_api::DatapathError::teardown(error.to_string()))
+        })
     }
 
-    async fn host_ip(&self) -> Result<std::net::IpAddr> {
-        Ok(IpAddr::V4(self.host_ip))
+    fn host_ip(&self) -> klights_network_api::DatapathFuture<'_, std::net::IpAddr> {
+        Box::pin(async move { Ok(IpAddr::V4(self.host_ip)) })
     }
 
-    async fn pod_gateway_ip(&self) -> Result<std::net::IpAddr> {
-        Ok(IpAddr::V4(self.local_subnet.subnet.bridge_ip()))
+    fn pod_gateway_ip(&self) -> klights_network_api::DatapathFuture<'_, std::net::IpAddr> {
+        Box::pin(async move { Ok(IpAddr::V4(self.local_subnet.subnet.bridge_ip())) })
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        self._rt_conn.abort();
-        Ok(())
+    fn shutdown(&self) -> klights_network_api::DatapathFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(controller) = self.wireguard.get() {
+                controller.shutdown().await.map_err(|error| {
+                    klights_network_api::DatapathError::shutdown(error.to_string())
+                })?;
+            }
+            self._rt_conn.abort();
+            Ok(())
+        })
     }
 }
 
-#[async_trait::async_trait]
-impl crate::networking::peer_router::PeerRouter for RootlessNetworkPlane {
-    async fn apply_peer_endpoint(&self, peer: &crate::networking::NodeEndpoint) -> Result<()> {
-        match peer {
-            crate::networking::NodeEndpoint::WireGuard(plan) => {
-                let controller = self
-                    .wireguard
-                    .get()
-                    .context("rootless WireGuard dataplane is not initialized")?;
-                let idx = self
-                    .link_index_cached(&self.wireguard_device, &self.wireguard_idx)
-                    .await?;
-                self.ensure_bridge_once().await?;
-                controller.apply_peer(plan).await?;
-                crate::networking::wireguard::apply_wireguard_pod_route(
-                    &self.rt,
-                    idx,
-                    plan,
-                    self.local_subnet.subnet.bridge_ip(),
-                )
-                .await
+impl klights_network_api::PeerRouter for RootlessNetworkPlane {
+    fn apply_peer_route<'a>(
+        &'a self,
+        route: &'a klights_network_api::PeerRoute,
+    ) -> klights_network_api::PeerRouterFuture<'a> {
+        Box::pin(async move {
+            let result: anyhow::Result<()> = async {
+                match route {
+                    klights_network_api::PeerRoute::WireGuard(route) => {
+                        let controller = self
+                            .wireguard
+                            .get()
+                            .context("rootless WireGuard dataplane is not initialized")?;
+                        let idx = self
+                            .link_index_cached(&self.wireguard_device, &self.wireguard_idx)
+                            .await?;
+                        self.ensure_bridge_once().await?;
+                        super::plane::apply_wireguard_peer_route_with_rollback(
+                            || Box::pin(controller.apply_peer(route)),
+                            || {
+                                Box::pin(crate::networking::wireguard::apply_wireguard_pod_route(
+                                    &self.rt,
+                                    idx,
+                                    route,
+                                    self.local_subnet.subnet.bridge_ip(),
+                                ))
+                            },
+                            || {
+                                Box::pin(crate::networking::wireguard::remove_wireguard_pod_route(
+                                    &self.rt,
+                                    idx,
+                                    route,
+                                    self.local_subnet.subnet.bridge_ip(),
+                                ))
+                            },
+                            || Box::pin(controller.remove_peer(route)),
+                        )
+                        .await
+                    }
+                    klights_network_api::PeerRoute::Direct(route) => {
+                        crate::networking::wireguard::apply_unencrypted_direct_route(
+                            &self.rt, route,
+                        )
+                        .await
+                    }
+                }
             }
-            crate::networking::NodeEndpoint::UnencryptedDirect(plan) => {
-                crate::networking::wireguard::apply_unencrypted_direct_route(&self.rt, plan).await
-            }
-            crate::networking::NodeEndpoint::Rootless { .. } => Ok(()),
-        }
+            .await;
+            result.map_err(|error| klights_network_api::PeerRouterError::apply(error.to_string()))
+        })
     }
 
-    async fn remove_peer_endpoint(&self, peer: &crate::networking::NodeEndpoint) -> Result<()> {
-        match peer {
-            crate::networking::NodeEndpoint::WireGuard(plan) => {
-                let idx = self
-                    .link_index_cached(&self.wireguard_device, &self.wireguard_idx)
-                    .await?;
-                crate::networking::wireguard::remove_wireguard_pod_route(
-                    &self.rt,
-                    idx,
-                    plan,
-                    self.local_subnet.subnet.bridge_ip(),
-                )
-                .await?;
-                if let Some(controller) = self.wireguard.get() {
-                    controller.remove_peer(&plan.public_key).await?;
+    fn remove_peer_route<'a>(
+        &'a self,
+        route: &'a klights_network_api::PeerRoute,
+    ) -> klights_network_api::PeerRouterFuture<'a> {
+        Box::pin(async move {
+            let result: anyhow::Result<()> = async {
+                match route {
+                    klights_network_api::PeerRoute::WireGuard(route) => {
+                        let idx = self
+                            .link_index_cached(&self.wireguard_device, &self.wireguard_idx)
+                            .await?;
+                        crate::networking::wireguard::remove_wireguard_pod_route(
+                            &self.rt,
+                            idx,
+                            route,
+                            self.local_subnet.subnet.bridge_ip(),
+                        )
+                        .await?;
+                        if let Some(controller) = self.wireguard.get() {
+                            controller.remove_peer(route).await?;
+                        }
+                        Ok(())
+                    }
+                    klights_network_api::PeerRoute::Direct(route) => {
+                        crate::networking::wireguard::remove_unencrypted_direct_route(
+                            &self.rt, route,
+                        )
+                        .await
+                    }
                 }
-                Ok(())
             }
-            crate::networking::NodeEndpoint::UnencryptedDirect(plan) => {
-                crate::networking::wireguard::remove_unencrypted_direct_route(&self.rt, plan).await
-            }
-            crate::networking::NodeEndpoint::Rootless { .. } => Ok(()),
-        }
+            .await;
+            result.map_err(|error| klights_network_api::PeerRouterError::remove(error.to_string()))
+        })
     }
 }
 
@@ -579,7 +644,7 @@ mod tests {
 
     #[tokio::test]
     async fn rootless_datapath_host_network_returns_detected_host_ip() {
-        use crate::networking::datapath::Datapath;
+        use klights_network_api::Datapath;
 
         let db = crate::datastore::test_support::in_memory().await;
         let cfg = rootless_test_config("rootless-hostnet-node");
@@ -604,31 +669,37 @@ mod tests {
         .expect("rootless boot must succeed");
 
         let network = plane
-            .cni_add(crate::networking::provider::CniAddRequest {
-                sandbox_id: "hostnet-sandbox".into(),
-                namespace: "default".into(),
-                pod_name: "hostnet-pod".into(),
-                pod_uid: "hostnet-uid".into(),
-                netns_setns_path: "/proc/self/ns/net".into(),
-                netns_record_path: "/proc/self/ns/net".into(),
-                host_network: true,
-            })
+            .cni_add(
+                klights_network_api::CniAddRequest::try_new(
+                    "hostnet-sandbox",
+                    klights_types::PodIdentity::new("default", "hostnet-pod", "hostnet-uid"),
+                    "/proc/self/ns/net",
+                    "/proc/self/ns/net",
+                    true,
+                )
+                .expect("valid host-network CNI request"),
+            )
             .await
             .expect("host-network CNI add should not use the Phase-2 stub");
 
         assert_eq!(
-            network.ip_addr,
+            network.ip_addr(),
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 77, 9))
         );
         assert_eq!(
             plane.host_ip().await.expect("host_ip must be available"),
-            network.ip_addr
+            network.ip_addr()
         );
     }
 
     // Rootless datapath invariants (Datapath impl, cni::add/del,
     // ensure_bridge_once) are enforced by the base-repo source guard run by
     // `./build.sh`.
+
+    #[test]
+    fn rootless_plane_has_explicit_service_router_bridge_preparation_step() {
+        let _ordered_step = RootlessNetworkPlane::prepare_service_routing_bridge;
+    }
 
     #[tokio::test]
     async fn rootless_plane_exposes_dataplane_health_after_boot() {

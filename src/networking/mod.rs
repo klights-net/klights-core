@@ -1,24 +1,47 @@
 pub mod boot;
 pub mod cleanup;
 pub mod cni;
-pub mod datapath;
 pub mod dataplane_health;
 pub mod device_state;
+pub(crate) mod hostport_resource;
 pub mod netfilter;
 pub mod netns_sync;
-pub mod peer_router;
 pub mod plane;
 pub mod pod_endpoint_resolver;
 pub mod pod_network_events;
-pub mod provider;
 pub mod rootless;
 pub mod rootless_plane;
-pub mod service_router;
+/// Concrete service-routing internals do not own a second public hostPort DTO;
+/// callers use `klights_network_api::HostPortBinding`.
+///
+/// ```compile_fail,E0432
+/// use klights::networking::service_routing::HostPortSpec;
+/// ```
 pub mod service_routing;
 pub(crate) mod subnet_allocator;
 #[cfg(test)]
 pub mod test_support;
 pub mod types;
+
+#[cfg(test)]
+mod contract_conformance_tests {
+    fn assert_datapath<T: klights_network_api::Datapath>() {}
+    fn assert_peer_router<T: klights_network_api::PeerRouter>() {}
+    fn assert_service_router<T: klights_network_api::ServiceRouter>() {}
+    fn assert_endpoint_resolver<T: klights_network_api::PodEndpointResolver>() {}
+    fn assert_endpoint_source<T: klights_network_api::PodEndpointEventSource>() {}
+
+    #[test]
+    fn concrete_network_adapters_implement_focused_ports() {
+        assert_datapath::<super::NetworkPlane>();
+        assert_peer_router::<super::NetworkPlane>();
+        assert_datapath::<super::RootlessNetworkPlane>();
+        assert_peer_router::<super::RootlessNetworkPlane>();
+        assert_service_router::<super::service_routing::NftServiceRouter>();
+        assert_endpoint_resolver::<super::SqlitePodEndpointResolver>();
+        assert_endpoint_source::<super::SqlitePodEndpointResolver>();
+    }
+}
 pub mod wireguard;
 
 use anyhow::Context;
@@ -26,13 +49,10 @@ use std::sync::{Arc, OnceLock};
 
 pub use boot::NetworkBoot;
 pub use cleanup::NetworkCleanup;
-pub use datapath::Datapath;
-pub use peer_router::PeerRouter;
 pub use plane::NetworkPlane;
-pub use pod_endpoint_resolver::{PodEndpointResolver, SqlitePodEndpointResolver};
+pub use pod_endpoint_resolver::SqlitePodEndpointResolver;
 pub use rootless_plane::RootlessNetworkPlane;
-pub use service_router::ServiceRouter;
-pub use types::{BridgeName, ClusterCidr, NodeEndpoint, NodeName, PodSubnet};
+pub use types::{BridgeName, ClusterCidr, NodeName, PodSubnet};
 
 /// Historical pod-link MTU used when encryption is disabled.
 pub const POD_OVERLAY_MTU: u32 = 1450;
@@ -56,22 +76,65 @@ pub fn global_pod_network_events() -> pod_network_events::PodNetworkEvents {
 ///
 /// This is the gate Tasks 4–6 of the refactor build toward: AppState
 /// holds a single `Arc<Network>` rather than four separate Arcs, and
-/// every consumer reaches the surface they need via the matching field
-/// (`state.network.datapath`, `state.network.peering`,
-/// `state.network.services`, `state.network.resolver`).
+/// every consumer reaches the surface it needs via the matching capability
+/// accessor.
 ///
 /// `shutdown` sequences cleanup so the coalescer drains before the
 /// netlink connection driver dies.
+///
+/// Facade capabilities are intentionally not fields that downstream crates can
+/// reach or replace directly:
+///
+/// ```compile_fail,E0616
+/// fn direct_field_access_is_forbidden(network: &klights::networking::Network) {
+///     let _ = (
+///         &network.datapath,
+///         &network.peering,
+///         &network.services,
+///         &network.resolver,
+///     );
+/// }
+/// ```
 pub struct Network {
-    pub datapath: Arc<dyn Datapath>,
-    pub peering: Arc<dyn PeerRouter>,
-    pub services: Arc<dyn ServiceRouter>,
+    datapath: Arc<dyn klights_network_api::Datapath>,
+    peering: Arc<dyn klights_network_api::PeerRouter>,
+    services: Arc<dyn klights_network_api::ServiceRouter>,
     /// `PodEndpointResolver` for cross-mode pod reachability. Service routing
     /// uses the same `pod_endpoints` stream for hybrid DNAT reconciliation.
-    pub resolver: Arc<dyn PodEndpointResolver>,
+    resolver: Arc<dyn klights_network_api::PodEndpointResolver>,
 }
 
 impl Network {
+    pub(crate) fn new(
+        datapath: Arc<dyn klights_network_api::Datapath>,
+        peering: Arc<dyn klights_network_api::PeerRouter>,
+        services: Arc<dyn klights_network_api::ServiceRouter>,
+        resolver: Arc<dyn klights_network_api::PodEndpointResolver>,
+    ) -> Self {
+        Self {
+            datapath,
+            peering,
+            services,
+            resolver,
+        }
+    }
+
+    pub fn datapath(&self) -> &Arc<dyn klights_network_api::Datapath> {
+        &self.datapath
+    }
+
+    pub fn peering(&self) -> &Arc<dyn klights_network_api::PeerRouter> {
+        &self.peering
+    }
+
+    pub fn services(&self) -> &Arc<dyn klights_network_api::ServiceRouter> {
+        &self.services
+    }
+
+    pub fn resolver(&self) -> &Arc<dyn klights_network_api::PodEndpointResolver> {
+        &self.resolver
+    }
+
     /// Sequenced shutdown: services first (drains coalescer + drops
     /// the nft table), then datapath (kills the rtnetlink connection
     /// driver). PeerRouter has no shutdown hook today.
@@ -140,19 +203,26 @@ mod network_facade_tests {
         );
     }
 
-    /// Compile-time check: the Network struct exposes one Arc per narrow
-    /// sub-trait. If a future refactor flattens or renames these fields,
-    /// the destructure here fails.
     #[test]
-    fn test_network_struct_holds_all_four_subtraits() {
-        fn _assert_fields(n: &Network) {
-            let Network {
-                datapath: _,
-                peering: _,
-                services: _,
-                resolver: _,
-            } = n;
-        }
+    fn test_network_accessors_preserve_composed_capability_identity() {
+        let provider = Arc::new(crate::networking::test_support::MockNetworkProvider::new());
+        let datapath: Arc<dyn klights_network_api::Datapath> = provider.clone();
+        let peering: Arc<dyn klights_network_api::PeerRouter> = provider;
+        let services: Arc<dyn klights_network_api::ServiceRouter> =
+            Arc::new(crate::networking::test_support::MockServiceRouter::new());
+        let resolver: Arc<dyn klights_network_api::PodEndpointResolver> =
+            Arc::new(crate::networking::test_support::MockPodEndpointResolver);
+        let network = Network::new(
+            datapath.clone(),
+            peering.clone(),
+            services.clone(),
+            resolver.clone(),
+        );
+
+        assert!(Arc::ptr_eq(network.datapath(), &datapath));
+        assert!(Arc::ptr_eq(network.peering(), &peering));
+        assert!(Arc::ptr_eq(network.services(), &services));
+        assert!(Arc::ptr_eq(network.resolver(), &resolver));
     }
 
     /// Build a Network of mocks and observe shutdown order: services
@@ -161,14 +231,14 @@ mod network_facade_tests {
     async fn test_network_shutdown_calls_each_subtrait_shutdown_in_order() {
         let provider = Arc::new(crate::networking::test_support::MockNetworkProvider::new());
         let services = Arc::new(crate::networking::test_support::MockServiceRouter::new());
-        let resolver: Arc<dyn PodEndpointResolver> =
+        let resolver: Arc<dyn klights_network_api::PodEndpointResolver> =
             Arc::new(crate::networking::test_support::MockPodEndpointResolver);
-        let net = Network {
-            datapath: provider.clone(),
-            peering: provider.clone(),
-            services: services.clone(),
+        let net = Network::new(
+            provider.clone(),
+            provider.clone(),
+            services.clone(),
             resolver,
-        };
+        );
 
         net.shutdown().await.expect("shutdown must succeed");
         assert_eq!(

@@ -791,10 +791,12 @@ async fn mock_hostport_runtime_records_add_and_remove() {
     let hp = MockHostPortRuntime::new();
     let key = PodRuntimeKey::new("ns", "pod", "uid-1");
     let pod = serde_json::json!({});
+    let host_ports =
+        crate::kubelet::pod_runtime::hostports::pod_host_ports_from_resource(&key, &pod).unwrap();
 
-    hp.add_host_ports(&key, &pod).await.unwrap();
-    hp.remove_host_ports(&key, &pod).await.unwrap();
-    hp.check_host_port_admission(&key, &pod).await.unwrap();
+    hp.add_host_ports(&host_ports).await.unwrap();
+    hp.remove_host_ports(&host_ports).await.unwrap();
+    hp.check_host_port_admission(&host_ports).await.unwrap();
 
     let calls = hp.recorded_calls();
     assert_eq!(calls.len(), 3);
@@ -4609,10 +4611,12 @@ async fn mock_dependency_matrix_hostport() {
     let mock = MockHostPortRuntime::new();
     let key = PodRuntimeKey::new("ns", "hp-pod", "uid-hp");
     let pod = serde_json::json!({"spec": {"containers": [{"ports": [{"hostPort": 8080}]}]}});
+    let host_ports =
+        crate::kubelet::pod_runtime::hostports::pod_host_ports_from_resource(&key, &pod).unwrap();
 
-    mock.check_host_port_admission(&key, &pod).await.unwrap();
-    mock.add_host_ports(&key, &pod).await.unwrap();
-    mock.remove_host_ports(&key, &pod).await.unwrap();
+    mock.check_host_port_admission(&host_ports).await.unwrap();
+    mock.add_host_ports(&host_ports).await.unwrap();
+    mock.remove_host_ports(&host_ports).await.unwrap();
 
     let calls = mock.recorded_calls();
     assert_eq!(calls.len(), 3);

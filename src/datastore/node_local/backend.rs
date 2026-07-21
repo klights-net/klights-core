@@ -20,6 +20,9 @@ pub trait NodeLocalBackend: Send + Sync {
     fn backend_name(&self) -> &'static str;
 
     fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent>;
+    async fn subscribe_pod_endpoints_with_snapshot(
+        &self,
+    ) -> Result<(Vec<PodEndpointRow>, broadcast::Receiver<PodEndpointEvent>)>;
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent>;
 
     async fn ensure_node_identity(&self, cluster_id: &str, node_uid: &str) -> Result<()>;
@@ -188,6 +191,12 @@ impl NodeLocalBackend for SqliteNodeLocalDb {
 
     fn subscribe_pod_endpoints(&self) -> broadcast::Receiver<PodEndpointEvent> {
         SqliteNodeLocalDb::subscribe_pod_endpoints(self)
+    }
+
+    async fn subscribe_pod_endpoints_with_snapshot(
+        &self,
+    ) -> Result<(Vec<PodEndpointRow>, broadcast::Receiver<PodEndpointEvent>)> {
+        SqliteNodeLocalDb::subscribe_pod_endpoints_with_snapshot(self).await
     }
 
     fn subscribe_pod_slot_admissions(&self) -> broadcast::Receiver<PodSlotAdmissionEvent> {

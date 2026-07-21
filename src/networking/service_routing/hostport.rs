@@ -1,5 +1,6 @@
 use super::prelude::*;
 use super::service_rules::Protocol;
+use klights_network_api::{HostPortBinding, HostPortProtocol};
 
 // ============ HostPortSpec ===============================================
 // Per-pod hostport mapping. Typed data extracted from a Pod's container
@@ -7,16 +8,16 @@ use super::service_rules::Protocol;
 
 /// One hostPort declared on a container port.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostPortSpec {
+pub(crate) struct HostPortSpec {
     /// `containerPort.hostIP` — `None` means "any host destination IP"
     /// (i.e. omit the `ip daddr` match in the rule).
-    pub host_ip: Option<Ipv4Addr>,
+    pub(crate) host_ip: Option<Ipv4Addr>,
     /// `containerPort.hostPort` — the port the host listens on.
-    pub host_port: u16,
+    pub(crate) host_port: u16,
     /// `containerPort.containerPort` — the pod-side port the rule
     /// DNATs to.
-    pub container_port: u16,
-    pub protocol: Protocol,
+    pub(crate) container_port: u16,
+    pub(crate) protocol: Protocol,
 }
 
 impl HostPortSpec {
@@ -24,49 +25,40 @@ impl HostPortSpec {
     /// with a non-zero `hostPort` declaration. hostPort=0 (or missing)
     /// is skipped; protocol defaults to TCP; `0.0.0.0`/empty hostIP is
     /// treated as "any IP".
-    pub fn from_pod(pod: &serde_json::Value) -> Vec<HostPortSpec> {
-        let mut specs = Vec::new();
-        let containers = match pod.pointer("/spec/containers").and_then(|c| c.as_array()) {
-            Some(c) => c,
-            None => return specs,
+    #[cfg(test)]
+    pub(crate) fn from_pod(pod: &serde_json::Value) -> Vec<HostPortSpec> {
+        crate::networking::hostport_resource::bindings_from_pod(pod)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl From<HostPortSpec> for HostPortBinding {
+    fn from(spec: HostPortSpec) -> Self {
+        let protocol = match spec.protocol {
+            Protocol::Tcp => HostPortProtocol::Tcp,
+            Protocol::Udp => HostPortProtocol::Udp,
+            Protocol::Sctp => HostPortProtocol::Sctp,
         };
-        for container in containers {
-            let ports = match container.get("ports").and_then(|p| p.as_array()) {
-                Some(p) => p,
-                None => continue,
-            };
-            for port_obj in ports {
-                // Strict parse: parse_port rejects 0, negatives, and
-                // out-of-range values rather than silently truncating
-                // (the previous `as u16` cast would have produced
-                // incorrect rules for malformed input).
-                let host_port = match super::service_rules::parse_port(port_obj.get("hostPort")) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                let container_port =
-                    match super::service_rules::parse_port(port_obj.get("containerPort")) {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                let protocol =
-                    match Protocol::parse(port_obj.get("protocol").and_then(|p| p.as_str())) {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                let host_ip = port_obj
-                    .get("hostIP")
-                    .and_then(|ip| ip.as_str())
-                    .filter(|s| !s.is_empty() && *s != "0.0.0.0")
-                    .and_then(|s| s.parse::<Ipv4Addr>().ok());
-                specs.push(HostPortSpec {
-                    host_ip,
-                    host_port,
-                    container_port,
-                    protocol,
-                });
-            }
+        HostPortBinding::try_new(spec.host_ip, spec.host_port, spec.container_port, protocol)
+            .expect("HostPortSpec only contains validated non-zero ports")
+    }
+}
+
+impl From<HostPortBinding> for HostPortSpec {
+    fn from(binding: HostPortBinding) -> Self {
+        let protocol = match binding.protocol() {
+            HostPortProtocol::Tcp => Protocol::Tcp,
+            HostPortProtocol::Udp => Protocol::Udp,
+            HostPortProtocol::Sctp => Protocol::Sctp,
+        };
+        Self {
+            host_ip: binding.host_ip(),
+            host_port: binding.host_port(),
+            container_port: binding.container_port(),
+            protocol,
         }
-        specs
     }
 }

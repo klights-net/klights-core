@@ -407,21 +407,22 @@ async fn test_configmap_put_integration_full_stack() {
 #[tokio::test]
 async fn test_api_build_state_uses_mock_network_provider() {
     let state = build_test_app_state().await;
-    let datapath = state.network.datapath.clone();
+    let datapath = state.network.datapath().clone();
     let result = datapath
-        .cni_add(crate::networking::provider::CniAddRequest {
-            sandbox_id: "sid-1".to_string(),
-            namespace: "default".to_string(),
-            pod_name: "test-pod".to_string(),
-            pod_uid: "uid".to_string(),
-            netns_setns_path: "/proc/self/ns/net".to_string(),
-            netns_record_path: "/proc/self/ns/net".to_string(),
-            host_network: false,
-        })
+        .cni_add(
+            klights_network_api::CniAddRequest::try_new(
+                "sid-1",
+                klights_types::PodIdentity::new("default", "test-pod", "uid"),
+                "/proc/self/ns/net",
+                "/proc/self/ns/net",
+                false,
+            )
+            .expect("valid mock CNI request"),
+        )
         .await
         .expect("mock network cni_add should succeed");
     assert_eq!(
-        result.ip_addr,
+        result.ip_addr(),
         std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
     );
 }

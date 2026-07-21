@@ -855,6 +855,77 @@ fn node_local_backend_has_no_cluster_resource_crud() {
     // R4: invariant now enforced by check_supervisor_spawn.sh
 }
 
+#[tokio::test]
+async fn endpoint_handoff_queues_mutation_after_authoritative_snapshot() {
+    let db = open_node_local_in_memory().await;
+    let handoff_guard = db.lock_pod_endpoint_handoff_for_test().await;
+    let mut subscribe = Box::pin(db.subscribe_pod_endpoints_with_snapshot());
+    assert!(matches!(
+        futures::poll!(subscribe.as_mut()),
+        std::task::Poll::Pending
+    ));
+
+    let row = crate::datastore::PodEndpointRow {
+        pod_uid: "handoff-uid".into(),
+        namespace: "default".into(),
+        pod_name: "handoff-pod".into(),
+        node_name: "node-a".into(),
+        mode: crate::datastore::PodEndpointMode::EncryptedDirect,
+        pod_ip: "10.42.0.9".parse().unwrap(),
+        node_ip: "192.0.2.9".parse().unwrap(),
+        host_port_tcp: None,
+        host_port_udp: None,
+        generation: 1,
+        updated_at: 1,
+    };
+    let mut upsert = Box::pin(db.upsert_endpoint(row.clone()));
+    assert!(matches!(
+        futures::poll!(upsert.as_mut()),
+        std::task::Poll::Pending
+    ));
+
+    drop(handoff_guard);
+    let (snapshot, mut events) = subscribe.await.expect("atomic endpoint handoff");
+    assert!(
+        snapshot.is_empty(),
+        "queued upsert must be after the snapshot"
+    );
+    upsert.await.expect("queued endpoint upsert");
+    assert_eq!(
+        events.recv().await.expect("post-snapshot event"),
+        crate::datastore::PodEndpointEvent::Upsert(row)
+    );
+}
+
+#[tokio::test]
+async fn malformed_endpoint_ports_fail_instead_of_wrapping_to_u16() {
+    let db = open_node_local_in_memory().await;
+    for (tcp, udp) in [(Some(65_536i64), None), (None, Some(-1i64))] {
+        db.db_call("test_insert_malformed_endpoint_port", move |conn| {
+            conn.execute("DELETE FROM pod_endpoints", [])?;
+            conn.execute(
+                "INSERT INTO pod_endpoints
+                 (pod_uid, namespace, pod_name, node_name, mode, pod_ip, node_ip,
+                  host_port_tcp, host_port_udp, generation, updated_ms)
+                 VALUES ('bad-port', 'default', 'bad-port', 'node-a', 'hostport',
+                         '10.42.0.10', '192.0.2.10', ?1, ?2, 1, 1)",
+                rusqlite::params![tcp, udp],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let error = db
+            .get_endpoint_by_pod_ip("10.42.0.10".parse().unwrap())
+            .await
+            .expect_err("invalid persisted port must fail decoding");
+        assert!(
+            format!("{error:#}").contains("pod endpoint port outside 1..=65535"),
+            "unexpected decode error: {error:#}"
+        );
+    }
+}
+
 // ── Task 9: RuntimeObservationCheckpoint tests ────────────────────
 
 #[tokio::test]

@@ -24,17 +24,14 @@ use std::os::fd::AsFd;
 use std::os::unix::io::AsRawFd;
 use std::str::FromStr;
 
+use klights_network_api::PodNetwork;
+
 use super::types::{BridgeName, NodeName, PodSubnet};
 use crate::datastore::node_local::NodeLocalBackend;
 use crate::datastore::{
     DatastoreBackend, PodNetworkAllocationLink, PodNetworkAllocationPod,
     PodNetworkAllocationRequest, PodNetworkAllocationSubnet, PodNetworkEndpoint,
 };
-
-/// Result of a successful [`add`] call.
-pub struct PodNetwork {
-    pub ip_addr: std::net::IpAddr,
-}
 
 #[async_trait]
 pub trait CniStore: Send + Sync {
@@ -239,11 +236,9 @@ pub async fn add<S: CniStore + ?Sized>(args: CniAddArgs<'_, S>) -> Result<PodNet
     let pod_name = pod.name.as_str();
     let pod_uid = pod.uid.as_str();
     if host_network {
-        return Ok(PodNetwork {
-            ip_addr: std::net::IpAddr::V4(
-                Ipv4Addr::from_str(host_ip).unwrap_or(Ipv4Addr::UNSPECIFIED),
-            ),
-        });
+        return Ok(PodNetwork::new(std::net::IpAddr::V4(
+            Ipv4Addr::from_str(host_ip).unwrap_or(Ipv4Addr::UNSPECIFIED),
+        )));
     }
 
     let bridge_name = bridge_name.as_str();
@@ -285,9 +280,7 @@ pub async fn add<S: CniStore + ?Sized>(args: CniAddArgs<'_, S>) -> Result<PodNet
                     endpoint.veth_host
                 );
                 publish_pod_network_assignment(sandbox_id, namespace, pod_name, pod_uid).await;
-                return Ok(PodNetwork {
-                    ip_addr: std::net::IpAddr::V4(ip),
-                });
+                return Ok(PodNetwork::new(std::net::IpAddr::V4(ip)));
             }
             ExistingAllocation::Stale { reason } => {
                 tracing::warn!(
@@ -443,9 +436,7 @@ pub async fn add<S: CniStore + ?Sized>(args: CniAddArgs<'_, S>) -> Result<PodNet
         veth_host
     );
 
-    Ok(PodNetwork {
-        ip_addr: std::net::IpAddr::V4(pod_ip),
-    })
+    Ok(PodNetwork::new(std::net::IpAddr::V4(pod_ip)))
 }
 
 /// Tear down the pod network allocation for a sandbox.

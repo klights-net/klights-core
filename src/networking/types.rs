@@ -8,31 +8,6 @@ use std::net::Ipv4Addr;
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 
-/// Identifier for a peer node from the perspective of `PeerRouter` /
-/// `NetworkProvider::apply_peer_endpoint`.
-///
-/// Marked `#[non_exhaustive]` so adding the rootless variant doesn't
-/// force every match arm in the codebase to add a wildcard.
-#[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NodeEndpoint {
-    /// Peer reachable through the klights-managed WireGuard overlay.
-    /// This is the default cross-node pod dataplane when encryption is
-    /// enabled.
-    WireGuard(crate::networking::wireguard::WireGuardPeerPlan),
-    /// Peer reachable through an explicitly disabled-encryption direct route.
-    /// This is operator-selected plaintext, never an implicit fallback.
-    UnencryptedDirect(crate::networking::wireguard::UnencryptedPeerPlan),
-    /// Peer reachable via host-port grafting on (node_ip, hostport_range).
-    /// Used by hybrid clusters where one or more nodes run rootless.
-    /// Root/rootless pod reachability is reconciled from `pod_endpoints`;
-    /// this endpoint carries node-level metadata for the shared peer watch.
-    Rootless {
-        node_ip: std::net::IpAddr,
-        hostport_range: HostPortRange,
-    },
-}
-
 /// Inclusive range of host ports a rootless node uses to expose pods.
 /// Phase 2 reconcilers allocate ports from this window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

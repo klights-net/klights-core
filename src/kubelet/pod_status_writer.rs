@@ -81,7 +81,7 @@ pub async fn update_pod_status(
     pod_name: &str,
     namespace: &str,
     status: PodStatusUpdate,
-    services: Option<&dyn crate::networking::ServiceRouter>,
+    services: Option<&dyn klights_network_api::ServiceRouter>,
 ) -> Result<()> {
     let PodStatusUpdate {
         phase,
