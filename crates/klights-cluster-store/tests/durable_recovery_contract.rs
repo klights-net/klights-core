@@ -407,6 +407,10 @@ fn watch_history_rejects_empty_malformed_and_reserved_targets_before_io() {
         DurableWatchTarget::namespaced_in_namespace("v1", "Pod", "#cluster"),
         DurableWatchTarget::cluster("v1/", "Pod"),
         DurableWatchTarget::cluster("v1", "Pod/List"),
+        DurableWatchTarget::cluster("v1", "-Pod"),
+        DurableWatchTarget::cluster("v1", "Pod-"),
+        DurableWatchTarget::cluster("v1", "Pod_Name"),
+        DurableWatchTarget::cluster("v1", "../Pod"),
         DurableWatchTarget::namespaced_in_namespace("v1", "Pod", "bad/name"),
     ];
 
@@ -415,6 +419,24 @@ fn watch_history_rejects_empty_malformed_and_reserved_targets_before_io() {
             WatchHistoryRequest::new(vec![target], WatchReplayPosition::default(), 1),
             Err(WatchHistoryError::InvalidTarget { .. })
         ));
+    }
+}
+
+#[test]
+fn watch_history_accepts_kubernetes_crd_kind_dns1035_shape_with_mixed_case() {
+    for kind in [
+        "e2e-test-crd-selectable-fields-2445-5527-crd",
+        "Mixed-Case-CRD",
+        "a-1",
+    ] {
+        WatchHistoryRequest::new(
+            vec![DurableWatchTarget::cluster("stable.example.com/v2", kind)],
+            WatchReplayPosition::default(),
+            1,
+        )
+        .unwrap_or_else(|error| {
+            panic!("Kubernetes-compatible CRD Kind {kind:?} rejected: {error}")
+        });
     }
 }
 

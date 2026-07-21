@@ -227,13 +227,14 @@ fn valid_api_version(value: &str) -> bool {
 }
 
 fn valid_kind(value: &str) -> bool {
+    // Kubernetes applies DNS-1035 validation to a lower-cased CRD Kind, so
+    // mixed case and interior hyphens are valid while path punctuation is not.
     !reserved_identity(value)
-        && value.len() <= 63
         && value
             .as_bytes()
             .first()
             .is_some_and(u8::is_ascii_alphabetic)
-        && value.as_bytes().iter().all(u8::is_ascii_alphanumeric)
+        && valid_dns_label(value)
 }
 
 fn valid_namespace(value: &str) -> bool {

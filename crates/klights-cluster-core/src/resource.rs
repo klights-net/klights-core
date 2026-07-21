@@ -135,6 +135,7 @@ impl Resource {
             namespace: data
                 .pointer("/metadata/namespace")
                 .and_then(Value::as_str)
+                .filter(|namespace| !namespace.is_empty())
                 .map(str::to_string),
             name,
             uid: Self::uid_from_data(&data),
@@ -321,6 +322,24 @@ mod tests {
             .to_string(),
             "resource missing apiVersion"
         );
+    }
+
+    #[test]
+    fn empty_metadata_namespace_is_absent_from_identity_but_preserved_in_data() {
+        let data = Arc::new(json!({
+            "apiVersion": "example.com/v1",
+            "kind": "ClusterThing",
+            "metadata": {
+                "name": "cluster-thing",
+                "namespace": "",
+                "resourceVersion": "42"
+            }
+        }));
+        let resource = Resource::try_from_data(data.clone()).unwrap();
+
+        assert_eq!(resource.namespace, None);
+        assert_eq!(resource.data["metadata"]["namespace"], "");
+        assert!(Arc::ptr_eq(&resource.data, &data));
     }
 
     #[test]

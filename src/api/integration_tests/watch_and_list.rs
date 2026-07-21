@@ -3249,26 +3249,39 @@ async fn test_list_pagination_metadata_for_selector_free_and_label_selector_requ
     );
 }
 
-#[tokio::test]
-async fn test_cluster_custom_resource_watch_from_create_rv_sees_deleted_before_modified() {
+async fn register_cluster_multiversion_watch_crd(
+    app: &axum::Router,
+    group: &str,
+    plural: &str,
+    kind: &str,
+) {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use futures::StreamExt;
     use serde_json::json;
     use tower::ServiceExt;
-
-    let state = build_test_app_state().await;
-    let app = crate::api::build_router(state);
 
     let crd = json!({
         "apiVersion": "apiextensions.k8s.io/v1",
         "kind": "CustomResourceDefinition",
-        "metadata": {"name": "clusterwatchprimed.example.com"},
+        "metadata": {"name": format!("{plural}.{group}")},
         "spec": {
-            "group": "example.com",
+            "group": group,
             "scope": "Cluster",
-            "names": {"plural": "clusterwatchprimed", "singular": "clusterwatchprimed", "kind": "ClusterWatchPrimed"},
-            "versions": [{"name": "v1", "served": true, "storage": true, "schema": {"openAPIV3Schema": {"type": "object"}}}]
+            "names": {"plural": plural, "singular": plural, "kind": kind},
+            "versions": [
+                {
+                    "name": "v1beta1",
+                    "served": true,
+                    "storage": false,
+                    "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}
+                },
+                {
+                    "name": "v1",
+                    "served": true,
+                    "storage": true,
+                    "schema": {"openAPIV3Schema": {"type": "object", "x-kubernetes-preserve-unknown-fields": true}}
+                }
+            ]
         }
     });
     let create_crd = app
@@ -3284,16 +3297,40 @@ async fn test_cluster_custom_resource_watch_from_create_rv_sees_deleted_before_m
         .await
         .unwrap();
     assert_eq!(create_crd.status(), StatusCode::CREATED);
+}
 
+async fn create_then_delete_cluster_custom_resource(
+    app: &axum::Router,
+    group: &str,
+    plural: &str,
+    kind: &str,
+    name: &str,
+    namespace: Option<&str>,
+) -> String {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    let metadata = namespace.map_or_else(
+        || json!({"name": name}),
+        |namespace| json!({"name": name, "namespace": namespace}),
+    );
     let create_cr = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/apis/example.com/v1/clusterwatchprimed")
+                .uri(format!("/apis/{group}/v1beta1/{plural}"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"apiVersion":"example.com/v1","kind":"ClusterWatchPrimed","metadata":{"name":"setup-instance"},"spec":{"x":"y"}}"#,
+                    serde_json::to_vec(&json!({
+                        "apiVersion": format!("{group}/v1beta1"),
+                        "kind": kind,
+                        "metadata": metadata,
+                        "spec": {"x": "y"}
+                    }))
+                    .unwrap(),
                 ))
                 .unwrap(),
         )
@@ -3316,17 +3353,31 @@ async fn test_cluster_custom_resource_watch_from_create_rv_sees_deleted_before_m
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri("/apis/example.com/v1/clusterwatchprimed/setup-instance")
+                .uri(format!("/apis/{group}/v1beta1/{plural}/{name}"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(delete_cr.status(), StatusCode::OK);
+    create_rv
+}
+
+async fn first_cluster_custom_resource_watch_event(
+    app: &axum::Router,
+    group: &str,
+    version: &str,
+    plural: &str,
+    create_rv: &str,
+    selector_suffix: &str,
+) -> serde_json::Value {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use futures::StreamExt;
+    use tower::ServiceExt;
 
     let watch_uri = format!(
-        "/apis/example.com/v1/clusterwatchprimed?watch=true&resourceVersion={}&fieldSelector=metadata.name%3Dsetup-instance",
-        create_rv
+        "/apis/{group}/{version}/{plural}?watch=true&resourceVersion={create_rv}{selector_suffix}"
     );
     let watch_resp = app
         .clone()
@@ -3343,7 +3394,7 @@ async fn test_cluster_custom_resource_watch_from_create_rv_sees_deleted_before_m
     let mut stream = watch_resp.into_body().into_data_stream();
     let chunk = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
         .await
-        .expect("watch stream timed out")
+        .unwrap_or_else(|_| panic!("{version} watch stream timed out"))
         .expect("watch stream ended unexpectedly")
         .expect("watch stream chunk error");
     let chunk_text = String::from_utf8(chunk.to_vec()).unwrap();
@@ -3351,12 +3402,79 @@ async fn test_cluster_custom_resource_watch_from_create_rv_sees_deleted_before_m
         .lines()
         .find(|line| !line.trim().is_empty())
         .expect("watch response chunk should contain at least one JSON event line");
-    let event: serde_json::Value = serde_json::from_str(first_line).unwrap();
-    assert_eq!(
-        event["type"], "DELETED",
-        "watch from create resourceVersion must observe DELETED first for immediate delete, got: {}",
-        event
-    );
+    serde_json::from_str(first_line).unwrap()
+}
+
+#[tokio::test]
+async fn test_cluster_custom_resource_watch_accepts_hyphenated_kind() {
+    let app = crate::api::build_router(build_test_app_state().await);
+    let group = "hyphen-watch.example.com";
+    let plural = "cluster-watch-primed";
+    let kind = "Cluster-Watch-Primed";
+    register_cluster_multiversion_watch_crd(&app, group, plural, kind).await;
+
+    for (name, selector_suffix) in [
+        ("setup-instance-unfiltered", ""),
+        (
+            "setup-instance-filtered",
+            "&fieldSelector=metadata.name%3Dsetup-instance-filtered",
+        ),
+    ] {
+        let create_rv =
+            create_then_delete_cluster_custom_resource(&app, group, plural, kind, name, None).await;
+        let event = first_cluster_custom_resource_watch_event(
+            &app,
+            group,
+            "v1beta1",
+            plural,
+            &create_rv,
+            selector_suffix,
+        )
+        .await;
+        assert_eq!(
+            event["type"], "DELETED",
+            "{name} watch from create resourceVersion must observe DELETED first for immediate delete, got: {event}"
+        );
+        assert_eq!(event["object"]["metadata"]["name"], name);
+    }
+}
+
+#[tokio::test]
+async fn test_cluster_custom_resource_watch_treats_empty_namespace_as_cluster_scope() {
+    let app = crate::api::build_router(build_test_app_state().await);
+    let group = "mygroup.example.com";
+    let plural = "watchprimeds";
+    let kind = "watchprimed";
+    let name = "setup-instance";
+    register_cluster_multiversion_watch_crd(&app, group, plural, kind).await;
+    let create_rv =
+        create_then_delete_cluster_custom_resource(&app, group, plural, kind, name, Some("")).await;
+
+    for (version, selector_suffix) in [
+        ("v1beta1", ""),
+        ("v1", ""),
+        ("v1beta1", "&fieldSelector=metadata.name%3Dsetup-instance"),
+        ("v1", "&fieldSelector=metadata.name%3Dsetup-instance"),
+    ] {
+        let event = first_cluster_custom_resource_watch_event(
+            &app,
+            group,
+            version,
+            plural,
+            &create_rv,
+            selector_suffix,
+        )
+        .await;
+        assert_eq!(
+            event["type"], "DELETED",
+            "{version} watch from create resourceVersion must observe the immediate delete, got: {event}"
+        );
+        assert_eq!(event["object"]["metadata"]["name"], name);
+        assert_eq!(
+            event["object"]["metadata"]["namespace"], "",
+            "cluster-scoped event body must preserve the explicitly empty namespace"
+        );
+    }
 }
 
 /// P0-E2E-20260424b-07: DELETE /apis/storage.k8s.io/v1/csinodes (collection)
