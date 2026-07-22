@@ -246,7 +246,12 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
             // the cluster CA on disk. Authentication is still mTLS-only;
             // bootstrap tokens are limited to CSR signing.
             let ca_path = crate::paths::ca_cert_path(&config.containerd_namespace);
-            let (ca_cert_path, skip_ca) = if ca_path.exists() {
+            let file_process =
+                klights_supervisor::FileProcessExecutor::from_supervisor(supervisor.as_ref());
+            let ca_exists = crate::utils::path_exists_async(&file_process, &ca_path)
+                .await
+                .context("Failed to inspect control-plane CA certificate path")?;
+            let (ca_cert_path, skip_ca) = if ca_exists {
                 (Some(ca_path), false)
             } else {
                 (None, true)
