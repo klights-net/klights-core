@@ -8,7 +8,7 @@ use serde_json::Value;
 use crate::datastore::{DatastoreBackend, DatastoreHandle};
 use crate::kubelet::pod_repository::{PodObjectWriter, PodReader};
 use crate::side_effects::{PodRepositorySlot, SideEffect};
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 const NODE_NOT_READY_TAINT_KEY: &str = "node.kubernetes.io/not-ready";
 const NODE_NOT_READY_TAINT_EFFECT: &str = "NoExecute";
@@ -515,8 +515,8 @@ mod tests {
     ) {
         let db = crate::datastore::test_support::in_memory().await;
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let metrics = crate::side_effects::SideEffectMetrics::new();
         let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 use crate::kubelet::volume_sources::VolumeSourceReader;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 use tokio_util::sync::CancellationToken;
 
 /// Pod volume runtime port for processing and cleaning up volumes.
@@ -31,6 +31,7 @@ pub struct RealPodVolumeRuntime {
     sources: Arc<dyn VolumeSourceReader>,
     containerd_namespace: String,
     supervisor: Arc<TaskSupervisor>,
+    file_process: klights_supervisor::FileProcessExecutor,
     projected_sa_refresh_cancellations: Arc<Mutex<HashMap<PodRuntimeKey, CancellationToken>>>,
 }
 
@@ -43,6 +44,7 @@ impl RealPodVolumeRuntime {
         Self {
             sources,
             containerd_namespace,
+            file_process: klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
             supervisor,
             projected_sa_refresh_cancellations: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -82,6 +84,7 @@ impl RealPodVolumeRuntime {
             .into_owned();
         crate::kubelet::projected_sa_token_refresh::schedule_projected_service_account_token_refresh(
             crate::kubelet::projected_sa_token_refresh::ProjectedSaTokenRefreshRequest {
+                file_process: self.file_process.clone(),
                 sources: self.sources.clone(),
                 volumes_root,
                 key: key.clone(),
@@ -103,6 +106,7 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
     ) -> anyhow::Result<HashMap<String, String>> {
         let pod_dir_id = key.volume_dir_id();
         let manager = crate::kubelet::pod_volume_manager::PodVolumeManager::new(
+            &self.file_process,
             self.sources.as_ref(),
             &self.containerd_namespace,
         );
@@ -121,8 +125,9 @@ impl PodVolumeRuntime for RealPodVolumeRuntime {
             .join(&pod_dir_id)
             .join("volumes");
         let pod_volumes_path = pod_volumes_dir.to_string_lossy().into_owned();
-        crate::kubelet::volumes::unmount_volume_mounts_under(&pod_volumes_path).await?;
-        crate::utils::remove_dir_all_if_exists_async(&pod_volumes_dir)
+        crate::kubelet::volumes::unmount_volume_mounts_under(&self.file_process, &pod_volumes_path)
+            .await?;
+        crate::utils::remove_dir_all_if_exists_async(&self.file_process, &pod_volumes_dir)
             .await
             .map(|_| ())
             .map_err(|e| {
@@ -156,8 +161,8 @@ mod tests {
         let runtime = RealPodVolumeRuntime::new(
             crate::kubelet::volume_sources::empty_volume_source_reader_for_tests(),
             containerd_ns.to_string(),
-            Arc::new(crate::task_supervisor::TaskSupervisor::new(
-                crate::task_supervisor::TaskCategoryConfig::default(),
+            Arc::new(klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
             )),
         );
         let key = PodRuntimeKey {
@@ -201,8 +206,8 @@ mod tests {
         let runtime = RealPodVolumeRuntime::new(
             crate::kubelet::volume_sources::empty_volume_source_reader_for_tests(),
             containerd_ns.to_string(),
-            Arc::new(crate::task_supervisor::TaskSupervisor::new(
-                crate::task_supervisor::TaskCategoryConfig::default(),
+            Arc::new(klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
             )),
         );
         let pod = serde_json::json!({

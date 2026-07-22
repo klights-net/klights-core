@@ -17,11 +17,20 @@ pub trait PersistentVolumeEventHandler: Send + Sync {
 pub struct DatastorePersistentVolumeEventHandler {
     db: DatastoreHandle,
     is_leader_rx: tokio::sync::watch::Receiver<bool>,
+    file_process: klights_supervisor::FileProcessExecutor,
 }
 
 impl DatastorePersistentVolumeEventHandler {
-    pub fn new(db: DatastoreHandle, is_leader_rx: tokio::sync::watch::Receiver<bool>) -> Self {
-        Self { db, is_leader_rx }
+    pub fn new(
+        db: DatastoreHandle,
+        is_leader_rx: tokio::sync::watch::Receiver<bool>,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
+        Self {
+            db,
+            is_leader_rx,
+            file_process,
+        }
     }
 }
 
@@ -37,7 +46,7 @@ impl PersistentVolumeEventHandler for DatastorePersistentVolumeEventHandler {
             );
             return;
         }
-        handle_pvc_event(self.db.as_ref(), event, event_name).await;
+        handle_pvc_event(&self.file_process, self.db.as_ref(), event, event_name).await;
     }
 
     async fn handle_pv_event(&self, event: &WatchEvent, event_name: &str) {
@@ -50,7 +59,7 @@ impl PersistentVolumeEventHandler for DatastorePersistentVolumeEventHandler {
             );
             return;
         }
-        handle_pv_event(self.db.as_ref(), event, event_name).await;
+        handle_pv_event(&self.file_process, self.db.as_ref(), event, event_name).await;
     }
 }
 
@@ -79,7 +88,12 @@ impl PersistentVolumeEventHandler for NoopPersistentVolumeEventHandler {
 }
 
 /// Handle PersistentVolumeClaim ADDED/MODIFIED events
-pub async fn handle_pvc_event(db: &dyn DatastoreBackend, event: &WatchEvent, event_name: &str) {
+pub async fn handle_pvc_event(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    db: &dyn DatastoreBackend,
+    event: &WatchEvent,
+    event_name: &str,
+) {
     if event.event_type != EventType::Added && event.event_type != EventType::Modified {
         return;
     }
@@ -117,7 +131,7 @@ pub async fn handle_pvc_event(db: &dyn DatastoreBackend, event: &WatchEvent, eve
         }
 
         // Reconcile PVC - bind to matching PV if available
-        match crate::controllers::pvc::reconcile_pvc(db, &pvc_with_rv).await {
+        match crate::controllers::pvc::reconcile_pvc(file_process, db, &pvc_with_rv).await {
             Ok(updated_pvc) => {
                 if let Some(phase) = updated_pvc
                     .pointer("/status/phase")
@@ -142,7 +156,12 @@ pub async fn handle_pvc_event(db: &dyn DatastoreBackend, event: &WatchEvent, eve
 }
 
 /// Handle PersistentVolume ADDED events
-pub async fn handle_pv_event(db: &dyn DatastoreBackend, event: &WatchEvent, event_name: &str) {
+pub async fn handle_pv_event(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    db: &dyn DatastoreBackend,
+    event: &WatchEvent,
+    event_name: &str,
+) {
     if event.event_type != EventType::Added {
         return;
     }
@@ -186,7 +205,9 @@ pub async fn handle_pv_event(db: &dyn DatastoreBackend, event: &WatchEvent, even
                         );
                     }
 
-                    if let Err(e) = crate::controllers::pvc::reconcile_pvc(db, &pvc_with_rv).await {
+                    if let Err(e) =
+                        crate::controllers::pvc::reconcile_pvc(file_process, db, &pvc_with_rv).await
+                    {
                         let pvc_name = pvc_resource.name.as_str();
                         tracing::warn!(
                             "Failed to reconcile PVC {} after PV creation: {:#}",
@@ -259,7 +280,11 @@ mod tests {
     async fn follower_pvc_event_does_not_reconcile_until_leadership_gained() {
         let (db, _pv, pvc) = seed_matching_pv_and_pvc().await;
         let (leader_tx, leader_rx) = tokio::sync::watch::channel(false);
-        let handler = DatastorePersistentVolumeEventHandler::new(db.clone(), leader_rx);
+        let handler = DatastorePersistentVolumeEventHandler::new(
+            db.clone(),
+            leader_rx,
+            crate::kubelet::file_blocking::test_file_process_executor(),
+        );
 
         // While not leader, a PVC event must not originate a binding write.
         handler
@@ -301,7 +326,11 @@ mod tests {
     async fn leader_pv_event_binds_pending_pvc_with_claimref_agreement() {
         let (db, pv, _pvc) = seed_matching_pv_and_pvc().await;
         let (_leader_tx, leader_rx) = tokio::sync::watch::channel(true);
-        let handler = DatastorePersistentVolumeEventHandler::new(db.clone(), leader_rx);
+        let handler = DatastorePersistentVolumeEventHandler::new(
+            db.clone(),
+            leader_rx,
+            crate::kubelet::file_blocking::test_file_process_executor(),
+        );
 
         handler
             .handle_pv_event(&WatchEvent::added((*pv.data).clone()), "test-pv")
@@ -391,7 +420,11 @@ mod tests {
         .unwrap();
 
         let (_leader_tx, leader_rx) = tokio::sync::watch::channel(true);
-        let handler = DatastorePersistentVolumeEventHandler::new(db.clone(), leader_rx);
+        let handler = DatastorePersistentVolumeEventHandler::new(
+            db.clone(),
+            leader_rx,
+            crate::kubelet::file_blocking::test_file_process_executor(),
+        );
         handler
             .handle_pv_event(&WatchEvent::added((*small_pv.data).clone()), "small-pv")
             .await;

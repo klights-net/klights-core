@@ -8,8 +8,8 @@ use serde_json::json;
 fn fixture_pod_repository(
     db_handle: &crate::datastore::DatastoreHandle,
 ) -> std::sync::Arc<crate::kubelet::pod_repository::PodRepository> {
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
     let metrics = crate::side_effects::SideEffectMetrics::new();

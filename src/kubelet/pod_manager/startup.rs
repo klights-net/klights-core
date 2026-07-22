@@ -81,8 +81,8 @@ mod tests {
     #[tokio::test]
     async fn boot_recovery_routes_existing_pods_through_actor_startpod() {
         let (_db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
             crate::kubelet::pod_repository::PodRepositoryBuildConfig {

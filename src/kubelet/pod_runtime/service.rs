@@ -150,7 +150,7 @@ use crate::kubelet::pod_status_builders::{
     build_initial_pending_status, build_pod_initializing_app_statuses,
 };
 use crate::kubelet::pod_termination::{find_pod_container_spec, get_termination_message_path};
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 const INIT_CONTAINER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const INIT_CONTAINER_FAST_EXIT_RECHECK_DELAY: std::time::Duration =

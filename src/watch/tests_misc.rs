@@ -1,10 +1,8 @@
 use super::tests_replay::FailingReplaySource;
 use super::*;
 
-fn test_task_supervisor() -> crate::task_supervisor::TaskSupervisor {
-    crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
-    )
+fn test_task_supervisor() -> klights_supervisor::TaskSupervisor {
+    klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default())
 }
 
 struct PendingReplaySource {

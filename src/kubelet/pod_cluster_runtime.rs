@@ -257,8 +257,8 @@ mod tests {
 
     async fn build_repo() -> PodRepository {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let metrics = crate::side_effects::SideEffectMetrics::new();
         let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());

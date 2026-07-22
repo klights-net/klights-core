@@ -19,7 +19,7 @@ async fn close_websocket_gracefully<S>(
         tokio_tungstenite::tungstenite::Message,
     >,
     ws_receiver: &mut futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     peer_already_closed: bool,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -63,7 +63,7 @@ async fn close_websocket_gracefully<S>(
 
 pub struct ExecWebSocketRequest {
     pub cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub target: ExecTarget,
     pub subprotocol: String,
     pub stream_options: ExecStreamOptions,
@@ -72,7 +72,7 @@ pub struct ExecWebSocketRequest {
 
 pub struct RemoteExecWebSocketRequest {
     pub session: Box<dyn NodeExecSession>,
-    pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub target: ExecTarget,
     pub subprotocol: String,
     pub stream_options: ExecStreamOptions,
@@ -84,7 +84,7 @@ pub struct RemoteExecWebSocketSyncRequest {
     pub target: ExecTarget,
     pub subprotocol: String,
     pub node_name: String,
-    pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 pub async fn handle_exec_websocket_tungstenite<S>(

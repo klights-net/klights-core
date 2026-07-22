@@ -292,8 +292,8 @@ async fn list_resources_response_rv_does_not_advance_past_concurrent_delete_snap
     let dir = tempfile::tempdir().expect("tempdir");
     let db_root = dir.path().join("state");
     let cluster_db_path = db_root.join("sqlite").join("cluster.db");
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let db = Datastore::new_persistent(&db_root, supervisor.clone(), None)
         .await
@@ -391,8 +391,8 @@ async fn list_resources_response_rv_does_not_advance_past_concurrent_delete_snap
 async fn list_resources_watch_position_is_atomic_with_row_snapshot() {
     let _pause_guard = list_resources_snapshot_pause_test_guard().await;
     let dir = tempfile::tempdir().expect("tempdir");
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let db_root = dir.path().join("state");
     let db = Datastore::new_persistent(&db_root, supervisor, None)
@@ -507,8 +507,8 @@ async fn list_resources_watch_position_is_atomic_with_row_snapshot() {
 async fn multi_target_watch_list_uses_one_snapshot_across_target_scans() {
     let _pause_guard = list_resources_snapshot_pause_test_guard().await;
     let dir = tempfile::tempdir().expect("tempdir");
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let db = Datastore::new_persistent(&dir.path().join("state"), supervisor, None)
         .await
@@ -618,8 +618,8 @@ async fn list_resources_response_rv_stays_at_snapshot_despite_retained_delete_hi
     let dir = tempfile::tempdir().expect("tempdir");
     let db_root = dir.path().join("state");
     let cluster_db_path = db_root.join("sqlite").join("cluster.db");
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let db = Datastore::new_persistent(&db_root, supervisor.clone(), None)
         .await

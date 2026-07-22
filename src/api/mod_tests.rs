@@ -5605,18 +5605,47 @@ async fn test_task_supervisor_category_and_task_endpoints() {
         .unwrap();
     assert_eq!(tasks_resp.status(), StatusCode::OK);
 
-    let file_tasks_resp = app
+    for category in &names {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/klights/v1/task-supervisor/categories/{category}/tasks"
+                    ))
+                    .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "category {category}");
+    }
+
+    let invalid_response = app
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/klights/v1/task-supervisor/categories/file/tasks")
+                .uri("/klights/v1/task-supervisor/categories/FILE/tasks")
                 .extension(crate::auth::AuthenticatedIdentity::admin("klights-admin"))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(file_tasks_resp.status(), StatusCode::OK);
+    assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+    let invalid_body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(invalid_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(invalid_body["reason"], "BadRequest");
+    assert_eq!(
+        invalid_body["message"],
+        "unknown task supervisor category: FILE"
+    );
 }
 
 #[tokio::test]
@@ -6040,7 +6069,7 @@ async fn test_task_supervisor_active_background_and_others_tasks_are_queryable()
 
     let bg_handle = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Background,
+            klights_supervisor::TaskCategory::Background,
             "test_background_queryable_task",
             async move {
                 let _ = bg_rx.await;
@@ -6050,7 +6079,7 @@ async fn test_task_supervisor_active_background_and_others_tasks_are_queryable()
         .expect("spawn background task");
     let other_handle = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Others,
+            klights_supervisor::TaskCategory::Others,
             "test_others_queryable_task",
             async move {
                 let _ = other_rx.await;

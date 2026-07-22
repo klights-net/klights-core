@@ -36,7 +36,7 @@ use super::protocol::{
 use crate::datastore::backend::DatastoreBackend;
 use crate::networking::wireguard::DataplanePeerMetadata;
 use crate::replication::grpc::fanout::FanoutPool;
-use crate::task_supervisor::{TaskCategory, TaskSupervisor};
+use klights_supervisor::{TaskCategory, TaskSupervisor};
 
 const STREAM_FOLLOWER_QUEUE_CAPACITY: usize = 1024;
 const FOLLOWER_CONTROL_QUEUE_CAPACITY: usize = 64;
@@ -1382,8 +1382,8 @@ mod tests {
     use crate::datastore::command::{
         COMMAND_CODEC_VERSION, CommandId, CommandMeta, StorageCommand,
     };
-    use crate::task_supervisor::TaskCategoryConfig;
     use klights_node_api::ExecStreamChannel;
+    use klights_supervisor::TaskCategoryConfig;
     use serde_json::json;
 
     async fn test_service() -> ReplicationService {

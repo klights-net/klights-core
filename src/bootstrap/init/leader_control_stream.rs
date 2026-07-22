@@ -7,13 +7,13 @@
 
 pub async fn start_worker_leader_control_stream(
     client: std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>,
-    supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     cancel: tokio_util::sync::CancellationToken,
-) -> anyhow::Result<crate::task_supervisor::SupervisedJoinHandle<()>> {
+) -> anyhow::Result<klights_supervisor::SupervisedJoinHandle<()>> {
     let supervisor_for_task = supervisor.clone();
     supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Network,
+            klights_supervisor::TaskCategory::Network,
             "worker_leader_control_stream",
             async move {
                 run_worker_leader_control_stream(client, supervisor_for_task, cancel).await;
@@ -25,7 +25,7 @@ pub async fn start_worker_leader_control_stream(
 
 async fn run_worker_leader_control_stream(
     client: std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>,
-    supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     let mut observed_rv = 0_i64;

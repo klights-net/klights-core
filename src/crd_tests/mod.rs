@@ -49,8 +49,8 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
     let controller_dispatcher = std::sync::Arc::new(
         crate::controller_dispatcher::ControllerDispatcher::new(service_ipam.clone()),
     );
-    let task_supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let task_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());
@@ -143,6 +143,7 @@ pub async fn build_test_app_state(db: Datastore, registry: CrdRegistry) -> crate
         apiservice_proxy_cache: std::sync::Arc::new(
             crate::api::apiservice_proxy::ApiServiceProxyCache::default(),
         ),
+        file_process: klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
         task_supervisor,
         pod_repository,
         outbox: std::sync::Arc::new(crate::kubelet::outbox::Outbox::test_outbox().await),

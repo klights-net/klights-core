@@ -273,7 +273,7 @@ pub async fn create_namespace(
         );
     }
     let ca_cert_path = crate::paths::ca_cert_path(&state.config.containerd_namespace);
-    match crate::utils::read_utf8_file_async(&ca_cert_path).await {
+    match crate::utils::read_utf8_file_async(&state.file_process, &ca_cert_path).await {
         Ok(ca_cert_pem) => {
             if let Err(e) = crate::controllers::namespace::create_kube_root_ca_configmap(
                 state.db.as_ref(),

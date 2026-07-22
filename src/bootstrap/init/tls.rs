@@ -3,7 +3,7 @@
 use anyhow::Context;
 
 pub async fn load_tls_pem_files(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
@@ -27,7 +27,7 @@ pub async fn load_tls_pem_files(
 }
 
 async fn load_client_cert_verifier(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     containerd_namespace: &str,
 ) -> anyhow::Result<std::sync::Arc<dyn rustls::server::danger::ClientCertVerifier>> {
     let ca_cert_path = crate::paths::ca_cert_path(containerd_namespace);
@@ -69,7 +69,7 @@ async fn load_client_cert_verifier(
 pub(crate) async fn serve_https_connection(
     acceptor: tokio_rustls::TlsAcceptor,
     app: axum::Router,
-    supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     remote_addr: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
     handshake_timeout: std::time::Duration,
@@ -136,7 +136,7 @@ pub async fn serve_https<F>(
     app: axum::Router,
     addr: &str,
     containerd_namespace: &str,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     transport_policy: crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
     shutdown_signal: F,
 ) -> anyhow::Result<()>
@@ -200,7 +200,7 @@ where
 
                 if let Err(e) = task_supervisor
                     .spawn_async(
-                        crate::task_supervisor::TaskCategory::Network,
+                        klights_supervisor::TaskCategory::Network,
                         "https_connection_worker",
                         serve_https_connection(
                             acceptor, app, sup, remote_addr, stream,
@@ -434,8 +434,8 @@ mod tests {
         // Use a very short timeout to make the test fast
         let short_timeout = std::time::Duration::from_millis(50);
 
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
 
         // Start a TCP listener and connect a client that sends no TLS bytes
@@ -448,11 +448,11 @@ mod tests {
         tokio::spawn(async move {
             let (stream, remote_addr) = listener.accept().await.unwrap();
             let before = sup
-                .active_tasks(Some(crate::task_supervisor::TaskCategory::Network))
+                .active_tasks(Some(klights_supervisor::TaskCategory::Network))
                 .len();
 
             sup.spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "https_connection_worker",
                 super::serve_https_connection(
                     acceptor,
@@ -470,7 +470,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
             let after = sup
-                .active_tasks(Some(crate::task_supervisor::TaskCategory::Network))
+                .active_tasks(Some(klights_supervisor::TaskCategory::Network))
                 .len();
             // Task count should return to baseline (worker exited after timeout)
             assert!(
@@ -498,8 +498,8 @@ mod tests {
         let app = axum::Router::new();
 
         // Only 1 concurrent network task allowed
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig {
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig {
                 network: 1,
                 ..Default::default()
             },
@@ -520,7 +520,7 @@ mod tests {
                 let (stream, remote_addr) = listener.accept().await.unwrap();
                 if sup
                     .spawn_async(
-                        crate::task_supervisor::TaskCategory::Network,
+                        klights_supervisor::TaskCategory::Network,
                         "https_connection_worker",
                         super::serve_https_connection(
                             acceptor1.clone(),
@@ -546,7 +546,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Only 1 worker should be active due to network:1 limit
-        let active = supervisor.active_tasks(Some(crate::task_supervisor::TaskCategory::Network));
+        let active = supervisor.active_tasks(Some(klights_supervisor::TaskCategory::Network));
         // At most 1 active network task (the second is queued or rejected)
         let network_active = active.len();
         assert!(
@@ -565,8 +565,8 @@ mod tests {
         let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
         let app = axum::Router::new();
 
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -579,7 +579,7 @@ mod tests {
             let _ = ready_tx.send(());
             let sup2 = sup.clone();
             sup.spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "https_connection_worker",
                 super::serve_https_connection(
                     acceptor,
@@ -633,8 +633,8 @@ mod tests {
         let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
         let app = axum::Router::new();
 
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -647,7 +647,7 @@ mod tests {
             let (stream, remote_addr) = listener.accept().await.unwrap();
             let _ = accepted_tx.send(());
             sup.spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "https_connection_worker",
                 super::serve_https_connection(
                     acceptor,
@@ -673,7 +673,7 @@ mod tests {
         let _report = supervisor.shutdown(std::time::Duration::from_secs(2)).await;
 
         // The worker should have exited (cancelled)
-        let active = supervisor.active_tasks(Some(crate::task_supervisor::TaskCategory::Network));
+        let active = supervisor.active_tasks(Some(klights_supervisor::TaskCategory::Network));
         assert!(
             active.is_empty(),
             "pending HTTPS handshake worker should exit on shutdown: {active:?}"

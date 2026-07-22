@@ -665,6 +665,7 @@ async fn test_downward_api_refresh_uses_keyed_blocking_boundary() {
         "uid-pod-refresh",
     );
     create_downward_api_volume_at_with_db_name(DownwardApiVolumeWithDbNameRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -683,9 +684,13 @@ async fn test_downward_api_refresh_uses_keyed_blocking_boundary() {
         .unwrap()
         .unwrap();
     let before = blocking_fs_keyed_call_count();
-    refresh_downward_api_volumes(&pod_for_refresh.data, root)
-        .await
-        .unwrap();
+    refresh_downward_api_volumes(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &pod_for_refresh.data,
+        root,
+    )
+    .await
+    .unwrap();
     assert!(
         blocking_fs_keyed_call_count() > before,
         "downwardAPI refresh must run through keyed blocking filesystem boundary"

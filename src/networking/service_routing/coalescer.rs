@@ -146,14 +146,14 @@ impl NftServiceRouterNetworkConfig {
 pub struct NftServiceRouterRuntime {
     pub min_sync_period: std::time::Duration,
     pub cancel: CancellationToken,
-    pub task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl NftServiceRouterRuntime {
     pub fn new(
         min_sync_period: std::time::Duration,
         cancel: CancellationToken,
-        task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+        task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self {
             min_sync_period,
@@ -164,7 +164,7 @@ impl NftServiceRouterRuntime {
 
     pub fn default_window(
         cancel: CancellationToken,
-        task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+        task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self::new(DEFAULT_MIN_SYNC_PERIOD, cancel, task_supervisor)
     }
@@ -198,7 +198,7 @@ pub struct NftServiceRouterDefaultBoot<'a> {
     pub table: NftServiceRouterTableConfig<'a>,
     pub network: NftServiceRouterNetworkConfig,
     pub cancel: CancellationToken,
-    pub task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl<'a> NftServiceRouterDefaultBoot<'a> {
@@ -207,7 +207,7 @@ impl<'a> NftServiceRouterDefaultBoot<'a> {
         table: NftServiceRouterTableConfig<'a>,
         network: NftServiceRouterNetworkConfig,
         cancel: CancellationToken,
-        task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+        task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self {
             stores,
@@ -257,15 +257,14 @@ pub struct NftServiceRouter {
     /// JoinHandle for the spawned coalescer worker. `Mutex<Option<_>>`
     /// so `cleanup` can `take()` ownership and `.await` the handle
     /// without holding `&mut self`.
-    worker: tokio::sync::Mutex<Option<crate::task_supervisor::SupervisedJoinHandle<()>>>,
-    service_watch_worker:
-        tokio::sync::Mutex<Option<crate::task_supervisor::SupervisedJoinHandle<()>>>,
+    worker: tokio::sync::Mutex<Option<klights_supervisor::SupervisedJoinHandle<()>>>,
+    service_watch_worker: tokio::sync::Mutex<Option<klights_supervisor::SupervisedJoinHandle<()>>>,
     remote_endpoint_worker:
-        tokio::sync::Mutex<Option<crate::task_supervisor::SupervisedJoinHandle<()>>>,
+        tokio::sync::Mutex<Option<klights_supervisor::SupervisedJoinHandle<()>>>,
     /// Used by `cleanup` to construct a fresh netlink socket when the
     /// runtime is being torn down. Stored on the struct so callers
     /// don't have to re-thread the supervisor.
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     table_name_str: String,
 }
 
@@ -327,7 +326,7 @@ impl NftServiceRouter {
         let worker_force_full_sync = force_full_sync.clone();
         let worker = task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "service_routing_coalescer_worker",
                 async move {
                     tracing::info!(
@@ -423,7 +422,7 @@ impl NftServiceRouter {
         let service_watch_force_full_sync = force_full_sync.clone();
         let service_watch_worker = task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "service_routing_watch_worker",
                 async move {
                     run_service_routing_watch_worker(
@@ -441,7 +440,7 @@ impl NftServiceRouter {
             .context("failed to spawn service routing watch worker")?;
         let remote_endpoint_worker = task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "service_routing_remote_pod_endpoint_worker",
                 async move {
                     run_remote_pod_endpoint_worker(
@@ -703,7 +702,7 @@ async fn open_service_routing_watch_set(
 }
 
 async fn service_routing_watch_reconnect_delay(
-    task_supervisor: &std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: &std::sync::Arc<klights_supervisor::TaskSupervisor>,
     cancel: &CancellationToken,
     attempt: u32,
 ) -> bool {
@@ -812,7 +811,7 @@ async fn run_service_routing_watch_worker(
     table: std::sync::Arc<KlightsTable>,
     notify: std::sync::Arc<tokio::sync::Notify>,
     cancel: CancellationToken,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     force_full_sync: std::sync::Arc<AtomicBool>,
 ) {
     use futures::StreamExt;
@@ -1044,7 +1043,7 @@ async fn run_remote_pod_endpoint_worker(
     endpoint_source: std::sync::Arc<dyn klights_network_api::PodEndpointEventSource>,
     local_node_name: String,
     cancel: CancellationToken,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) {
     tracing::info!("nft remote pod endpoint worker started");
     let mut retry_backoff = INITIAL_RETRY_BACKOFF;
@@ -1110,8 +1109,12 @@ async fn run_remote_pod_endpoint_worker(
     tracing::info!("nft remote pod endpoint worker exited");
 }
 
-async fn write_proc_sysctl(path: &str, value: &str) -> Result<()> {
-    crate::utils::write_file_async(path, value)
+async fn write_proc_sysctl(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    path: &str,
+    value: &str,
+) -> Result<()> {
+    crate::utils::write_file_async(file_process, path, value)
         .await
         .with_context(|| format!("write sysctl {path}={}", value.trim_end()))
 }
@@ -1150,9 +1153,10 @@ fn required_service_routing_sysctl_entries(bridge_ifname: &str) -> Vec<(String, 
 }
 
 async fn ensure_service_routing_sysctls(
-    task_supervisor: &std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: &std::sync::Arc<klights_supervisor::TaskSupervisor>,
     bridge_ifname: &str,
 ) -> Result<()> {
+    let file_process = klights_supervisor::FileProcessExecutor::new(task_supervisor.clone());
     let modprobe = task_supervisor
         .run_blocking_file("service_routing_modprobe_br_netfilter", || {
             std::process::Command::new("modprobe")
@@ -1176,14 +1180,18 @@ async fn ensure_service_routing_sysctls(
     }
 
     for (path, value) in required_service_routing_sysctl_entries(bridge_ifname) {
-        ensure_sysctl_value(&path, value).await?;
+        ensure_sysctl_value(&file_process, &path, value).await?;
     }
     Ok(())
 }
 
-async fn ensure_sysctl_value(path: &str, expected: &str) -> Result<()> {
-    write_proc_sysctl(path, expected).await?;
-    let actual = crate::utils::read_utf8_file_async(path)
+async fn ensure_sysctl_value(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    path: &str,
+    expected: &str,
+) -> Result<()> {
+    write_proc_sysctl(file_process, path, expected).await?;
+    let actual = crate::utils::read_utf8_file_async(file_process, path)
         .await
         .with_context(|| format!("read sysctl {path}"))?;
     if actual != expected {
@@ -1241,7 +1249,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn test_service_table(
-        task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Arc<KlightsTable> {
         let nf = Netfilter::new(task_supervisor).expect("Netfilter::new");
         Arc::new(
@@ -1344,12 +1352,12 @@ mod tests {
         let source = Arc::new(ReopeningEndpointSource::default());
         let sink = Arc::new(FailOnceRemoteEndpointSync::default());
         let cancel = CancellationToken::new();
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let worker = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "test_remote_endpoint_apply_retry",
                 run_remote_pod_endpoint_worker(
                     sink.clone(),
@@ -1429,8 +1437,8 @@ mod tests {
 
     #[test]
     fn policy_only_watch_targets_trigger_sync_without_service_inventory_identity() {
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let table = test_service_table(supervisor);
         let cases = [
@@ -1548,15 +1556,15 @@ mod tests {
         let client = Arc::new(WatchOnlyLeaderApiClient::default());
         let notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let table = test_service_table(supervisor.clone());
         let force_full_sync = Arc::new(AtomicBool::new(false));
 
         let worker = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "test_service_routing_watch_worker",
                 run_service_routing_watch_worker(
                     client.clone(),
@@ -1600,8 +1608,8 @@ mod tests {
 
     #[test]
     fn request_services_sync_marks_next_coalesced_pass_as_full_sync() {
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let force_full_sync = Arc::new(AtomicBool::new(false));
         let router = NftServiceRouter {
@@ -1677,15 +1685,15 @@ mod tests {
         let client = Arc::new(ReopeningLeaderApiClient::default());
         let notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let table = test_service_table(supervisor.clone());
         let force_full_sync = Arc::new(AtomicBool::new(false));
 
         let worker = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "test_service_routing_watch_worker_reopen",
                 run_service_routing_watch_worker(
                     client.clone(),
@@ -1788,15 +1796,15 @@ mod tests {
         let client = Arc::new(ErroringLeaderApiClient::default());
         let notify = Arc::new(Notify::new());
         let cancel = CancellationToken::new();
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let table = test_service_table(supervisor.clone());
         let force_full_sync = Arc::new(AtomicBool::new(false));
 
         let worker = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "test_service_routing_watch_worker_bounds_errors",
                 run_service_routing_watch_worker(
                     client.clone(),

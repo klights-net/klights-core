@@ -8,8 +8,12 @@ async fn process_volumes(
     containerd_namespace: &str,
     pod: &serde_json::Value,
 ) -> anyhow::Result<std::collections::HashMap<String, String>> {
-    let manager =
-        crate::kubelet::pod_volume_manager::PodVolumeManager::new(sources, containerd_namespace);
+    let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+    let manager = crate::kubelet::pod_volume_manager::PodVolumeManager::new(
+        &file_process,
+        sources,
+        containerd_namespace,
+    );
     manager
         .process_volumes(pod_dir_id, pod_name, namespace, pod)
         .await
@@ -319,9 +323,13 @@ async fn test_pvc_added_event_triggers_reconciliation() {
     }
 
     // Call reconcile_pvc (what handle_watch_event will do)
-    crate::controllers::pvc::reconcile_pvc(&db, &pvc_with_rv)
-        .await
-        .unwrap();
+    crate::controllers::pvc::reconcile_pvc(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &db,
+        &pvc_with_rv,
+    )
+    .await
+    .unwrap();
 
     // Verify PVC is now Bound
     let updated_pvc = db
@@ -400,9 +408,13 @@ async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
         );
     }
 
-    crate::controllers::pvc::reconcile_pvc(&db, &pvc_with_rv)
-        .await
-        .unwrap();
+    crate::controllers::pvc::reconcile_pvc(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &db,
+        &pvc_with_rv,
+    )
+    .await
+    .unwrap();
 
     // Verify PVC is Pending
     let pending_pvc = db
@@ -470,9 +482,13 @@ async fn test_pv_added_event_triggers_pending_pvc_reconciliation() {
                     json!(pvc_resource.resource_version.to_string()),
                 );
             }
-            crate::controllers::pvc::reconcile_pvc(&db, &pvc_with_rv)
-                .await
-                .unwrap();
+            crate::controllers::pvc::reconcile_pvc(
+                &crate::kubelet::file_blocking::test_file_process_executor(),
+                &db,
+                &pvc_with_rv,
+            )
+            .await
+            .unwrap();
         }
     }
 

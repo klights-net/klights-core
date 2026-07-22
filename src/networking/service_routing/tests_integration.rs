@@ -48,9 +48,9 @@ mod integration_tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    fn test_task_supervisor() -> std::sync::Arc<crate::task_supervisor::TaskSupervisor> {
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+    fn test_task_supervisor() -> std::sync::Arc<klights_supervisor::TaskSupervisor> {
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ))
     }
 
@@ -1018,8 +1018,8 @@ mod integration_tests {
         let db = crate::datastore::sqlite::Datastore::new_in_memory()
             .await
             .expect("in-mem datastore");
-        let task_supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let cluster_api: std::sync::Arc<dyn crate::control_plane::client::LeaderApiClient> =
             std::sync::Arc::new(crate::control_plane::client::local::LocalApiClient::new(

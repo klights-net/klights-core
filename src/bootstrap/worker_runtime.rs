@@ -33,7 +33,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     phases::env::init_tracing(&cli);
     phases::env::init_process(&cli)?;
     let cfg = phases::config::load(&cli).await?;
-    resolve_token_file_if_present(&mut cli).await?;
+    resolve_token_file_if_present(&mut cli, &cfg.file_process).await?;
     phases::env::validate_role(&cli.role, &cfg.node_mode)?;
     let recovery = phases::recovery::run(&cfg).await?;
     let identity = phases::identity::setup_worker(&cfg, &recovery.node_ip).await?;
@@ -41,6 +41,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let config = cfg.config;
     let node_mode = cfg.node_mode;
     let task_supervisor = cfg.supervisor;
+    let file_process = cfg.file_process;
     let grpc_transport_policy = cfg.grpc_transport_policy;
     let network_cleanup = cfg.network_cleanup;
     let shutdown_token = cfg.shutdown_token;
@@ -287,6 +288,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
     let registration_addresses =
         kubelet::node::NodeRegistrationAddresses::new(node_ip.clone(), None);
     let registration = kubelet::node::NodeRegistrationSnapshot::capture_local(
+        &file_process,
         &config.node_name,
         &node_mode,
         &cli.role,
@@ -357,7 +359,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         let cancel = shutdown_token.clone();
         task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "worker_node_subnet_peer_watch",
                 async move {
                     controllers::node_subnet::run_peer_watch_with_components(
@@ -471,6 +473,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         node_local: node_local.clone(),
         outbox: outbox.clone(),
         task_supervisor: task_supervisor.clone(),
+        file_process: file_process.clone(),
         config: config.clone(),
         node_mode: node_mode.clone(),
         role: cli.role.clone(),
@@ -501,7 +504,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
         Some(
             task_supervisor
                 .spawn_async(
-                    crate::task_supervisor::TaskCategory::Background,
+                    klights_supervisor::TaskCategory::Background,
                     "worker_pod_watcher",
                     async move {
                         kubelet::pod_manager::run_pod_watcher_with_context(
@@ -531,7 +534,7 @@ pub(crate) async fn run_worker(mut cli: CliFlags) -> anyhow::Result<()> {
             remote_api_client.clone();
         task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "worker_node_heartbeat",
                 async move {
                     kubelet::node::run_heartbeat_with_lease_client(

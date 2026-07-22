@@ -19,7 +19,7 @@ fn conflict_backoff_ms(attempt: usize) -> u64 {
 /// it observes the latest `resourceVersion`) before merging and writing.
 async fn run_ephemeral_update_with_conflict_retry<P, F>(
     mut persist: P,
-    supervisor: &crate::task_supervisor::TaskSupervisor,
+    supervisor: &klights_supervisor::TaskSupervisor,
     max_attempts: usize,
 ) -> Result<crate::datastore::Resource, AppError>
 where
@@ -374,10 +374,8 @@ mod tests {
         }
     }
 
-    fn test_supervisor() -> crate::task_supervisor::TaskSupervisor {
-        crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
-        )
+    fn test_supervisor() -> klights_supervisor::TaskSupervisor {
+        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default())
     }
 
     /// P0 e2e `Ephemeral Containers should update ...`: a concurrent kubelet

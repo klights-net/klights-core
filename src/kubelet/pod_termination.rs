@@ -120,14 +120,18 @@ pub fn read_termination_message_from_logs(log_path: &str) -> String {
     utf8_tail(&lines.join("\n"), MAX_LOG_BYTES)
 }
 
-pub async fn read_termination_message_async(host_path: &str) -> String {
+pub async fn read_termination_message_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    host_path: &str,
+) -> String {
     let host_path_owned = host_path.to_string();
-    match crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "pod_termination_read_message",
-        host_path_owned.clone(),
-        move || std::fs::read(&host_path_owned).map_err(anyhow::Error::from),
-    )
-    .await
+    match file_process
+        .run_blocking_file_keyed(
+            "pod_termination_read_message",
+            host_path_owned.clone(),
+            move || std::fs::read(&host_path_owned).map_err(anyhow::Error::from),
+        )
+        .await
     {
         Ok(bytes) => {
             let truncated = if bytes.len() > 4096 {
@@ -141,17 +145,21 @@ pub async fn read_termination_message_async(host_path: &str) -> String {
     }
 }
 
-async fn read_termination_message_from_logs_async(log_path: &str) -> String {
+async fn read_termination_message_from_logs_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    log_path: &str,
+) -> String {
     const MAX_LOG_BYTES: usize = 2048;
     const MAX_LOG_LINES: usize = 80;
 
     let log_path_owned = log_path.to_string();
-    let content = match crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "pod_termination_read_logs",
-        log_path_owned.clone(),
-        move || std::fs::read_to_string(&log_path_owned).map_err(anyhow::Error::from),
-    )
-    .await
+    let content = match file_process
+        .run_blocking_file_keyed(
+            "pod_termination_read_logs",
+            log_path_owned.clone(),
+            move || std::fs::read_to_string(&log_path_owned).map_err(anyhow::Error::from),
+        )
+        .await
     {
         Ok(content) => content,
         Err(_) => return String::new(),
@@ -166,12 +174,13 @@ async fn read_termination_message_from_logs_async(log_path: &str) -> String {
 }
 
 pub async fn read_termination_message_with_fallback_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
     termination_path: &str,
     log_path: &str,
     policy: &str,
     exit_code: i32,
 ) -> String {
-    let message = read_termination_message_async(termination_path).await;
+    let message = read_termination_message_async(file_process, termination_path).await;
     if !message.is_empty() {
         return message;
     }
@@ -180,7 +189,7 @@ pub async fn read_termination_message_with_fallback_async(
         return String::new();
     }
 
-    read_termination_message_from_logs_async(log_path).await
+    read_termination_message_from_logs_async(file_process, log_path).await
 }
 
 #[cfg(test)]
@@ -203,13 +212,18 @@ pub fn read_termination_message_with_fallback(
 }
 
 pub async fn ensure_termination_log_host_file(
+    file_process: &klights_supervisor::FileProcessExecutor,
     containerd_ns: &str,
     namespace: &str,
     pod_name: &str,
     container_name: &str,
 ) -> String {
     let path = termination_log_host_path(containerd_ns, namespace, pod_name, container_name);
-    crate::kubelet::pod_fs::PodFs::ensure_termination_log(std::path::PathBuf::from(&path)).await
+    crate::kubelet::pod_fs::PodFs::ensure_termination_log(
+        file_process,
+        std::path::PathBuf::from(&path),
+    )
+    .await
 }
 
 #[cfg(test)]

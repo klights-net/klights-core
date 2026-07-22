@@ -91,7 +91,7 @@ pub fn build_oidc_authenticator(config: Option<OidcConfig>) -> Option<Arc<dyn Oi
 
 pub async fn build_oidc_authenticator_from_config(
     config: &crate::KlightsConfig,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<Option<Arc<dyn OidcValidator>>> {
     let Some(issuer) = config.oidc_issuer_url.as_ref() else {
         return Ok(None);

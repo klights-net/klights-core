@@ -15,11 +15,11 @@ pub trait BootstrapCredentialStore: Send + Sync {
 
 #[derive(Clone)]
 pub struct SupervisedBootstrapCredentialStore {
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl SupervisedBootstrapCredentialStore {
-    pub fn new(supervisor: Arc<crate::task_supervisor::TaskSupervisor>) -> Self {
+    pub fn new(supervisor: Arc<klights_supervisor::TaskSupervisor>) -> Self {
         Self { supervisor }
     }
 }
@@ -183,8 +183,8 @@ mod tests {
     async fn supervised_store_installs_ca_key_atomically_with_restrictive_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ca.key");
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let store = SupervisedBootstrapCredentialStore::new(supervisor);
 

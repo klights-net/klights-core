@@ -4,7 +4,7 @@ pub(crate) async fn start_worker_store_adapter(
     remote_api_client: std::sync::Arc<crate::control_plane::client::remote::RemoteApiClient>,
     node_local: crate::datastore::node_local::NodeLocalHandle,
     node_name: String,
-    supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     shutdown_token: tokio_util::sync::CancellationToken,
     discovery_client: Option<
         std::sync::Arc<crate::replication::grpc::client::ReplicationGrpcClient>,
@@ -42,7 +42,7 @@ pub(crate) async fn start_worker_store_adapter(
         let cancel = shutdown_token.clone();
         supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "controlplane_endpoint_discovery",
                 async move {
                     loop {

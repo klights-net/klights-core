@@ -23,6 +23,7 @@ async fn test_projected_volume_with_service_account_token() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -62,6 +63,7 @@ async fn test_projected_volume_create_uses_keyed_blocking_boundary() {
 
     let before = blocking_fs_keyed_call_count();
     let _ = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -113,6 +115,7 @@ async fn test_projected_volume_with_configmap_source() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -155,6 +158,7 @@ async fn test_projected_volume_with_downward_api_source() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -208,6 +212,7 @@ async fn test_projected_volume_combines_multiple_sources() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -258,6 +263,7 @@ async fn test_projected_volume_respects_default_mode() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -474,6 +480,7 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         "uid-test-pod",
     );
     create_downward_api_volume_at_with_db_name(DownwardApiVolumeWithDbNameRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root,
         sources: &db,
         namespace: "default",
@@ -535,9 +542,13 @@ async fn test_refresh_downward_api_updates_annotation_file() {
         .unwrap()
         .unwrap();
 
-    refresh_downward_api_volumes(&pod_for_refresh.data, volumes_root)
-        .await
-        .unwrap();
+    refresh_downward_api_volumes(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &pod_for_refresh.data,
+        volumes_root,
+    )
+    .await
+    .unwrap();
 
     // Verify file content updated
     let updated_content = crate::utils::read_utf8_file(&annotations_path).unwrap();
@@ -604,9 +615,13 @@ async fn test_refresh_downward_api_skips_projected_volumes() {
         .unwrap();
 
     // Call refresh — should NOT create any files for the projected volume
-    refresh_downward_api_volumes(&pod_resource.data, volumes_root)
-        .await
-        .unwrap();
+    refresh_downward_api_volumes(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &pod_resource.data,
+        volumes_root,
+    )
+    .await
+    .unwrap();
 
     // The volumes/downward-api/ directory must NOT exist
     let pod_dir_id =
@@ -709,9 +724,13 @@ async fn test_refresh_projected_downward_api_updates_labels_file() {
     .unwrap();
 
     // Refresh volumes
-    refresh_downward_api_volumes(&updated_pod, volumes_root)
-        .await
-        .unwrap();
+    refresh_downward_api_volumes(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
+        &updated_pod,
+        volumes_root,
+    )
+    .await
+    .unwrap();
 
     // Verify labels file updated at the correct projected path
     let updated_content = crate::utils::read_utf8_file(format!("{}/labels", vol_dir)).unwrap();
@@ -775,6 +794,7 @@ async fn test_projected_volume_configmap_writes_files() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -837,6 +857,7 @@ async fn test_projected_volume_configmap_with_items() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",

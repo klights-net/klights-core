@@ -22,7 +22,7 @@ use crate::kubelet::pod_runtime::service::{
     PodRuntimeService, RealPodRuntimeService, RealPodRuntimeServiceDependencies,
 };
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 /// Wiring inputs for PodSubsystem construction.
 pub struct PodSubsystemConfig {
@@ -323,7 +323,7 @@ mod tests {
 
     fn fixture_supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+            klights_supervisor::TaskCategoryConfig::default(),
         ))
     }
 

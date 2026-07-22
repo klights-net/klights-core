@@ -311,7 +311,7 @@ pub fn build_webhook_auth(config: Option<WebhookAuthConfig>) -> Result<Option<Ar
 
 pub async fn build_webhook_auth_from_config(
     config: &crate::KlightsConfig,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<Option<Arc<WebhookAuth>>> {
     let Some(url) = config.webhook_auth_url.as_ref() else {
         return Ok(None);
@@ -356,7 +356,7 @@ pub async fn build_webhook_auth_from_config(
 }
 
 async fn read_optional_pem_file(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     label: &'static str,
     description: &'static str,
     path: Option<&String>,

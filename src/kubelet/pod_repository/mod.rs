@@ -30,10 +30,10 @@ use crate::datastore::{DatastoreHandle, Resource, ResourceList};
 use crate::kubelet::pod_runtime::deletion_finalizer::PodDeletionFinalizer;
 use crate::kubelet::pod_runtime::service::PodDeletionFinalizeResult;
 use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
-use crate::task_supervisor::TaskSupervisor;
 #[cfg(test)]
 use crate::watch::WatchEvent;
 use klights_reconcile_api::{GcPodDeleteRequest, GcPodDeleteSink};
+use klights_supervisor::TaskSupervisor;
 use klights_types::ResourceKey;
 
 pub mod api;
@@ -872,7 +872,7 @@ impl PodRepository {
         let _ = self
             .supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 format!("post_write_maintenance/{ns}"),
                 async move {
                     if let Err(err) = crate::api::reconcile_namespace_termination(

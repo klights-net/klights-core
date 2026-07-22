@@ -13,7 +13,7 @@ use crate::kubelet::outbox::{
     DispatchOutcome, Outbox, OutboxApplyError, OutboxApplyResult, OutboxCommand, OutboxDispatcher,
     OutboxSubject,
 };
-use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn supervisor() -> Arc<TaskSupervisor> {
     Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))

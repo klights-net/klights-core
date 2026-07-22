@@ -148,7 +148,7 @@ pub(crate) struct RealPodDeletionFinalizer {
     bound_pod_finalization: Arc<dyn BoundPodFinalization>,
     side_effects: Arc<crate::side_effects::SideEffectRegistry>,
     metrics: Arc<crate::side_effects::SideEffectMetrics>,
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 struct RealPodDeletionFinalizerDependencies {
@@ -158,7 +158,7 @@ struct RealPodDeletionFinalizerDependencies {
     outbox: Option<Arc<Outbox>>,
     side_effects: Arc<crate::side_effects::SideEffectRegistry>,
     metrics: Arc<crate::side_effects::SideEffectMetrics>,
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl RealPodDeletionFinalizer {
@@ -195,7 +195,7 @@ impl RealPodDeletionFinalizer {
         outbox: Option<Arc<Outbox>>,
         side_effects: Arc<crate::side_effects::SideEffectRegistry>,
         metrics: Arc<crate::side_effects::SideEffectMetrics>,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         let bound_pod_finalization: Arc<dyn BoundPodFinalization> = Arc::new(
             RootBoundPodFinalization::new(store.clone(), cluster_api.is_some(), outbox.clone()),
@@ -260,7 +260,7 @@ impl RealPodDeletionFinalizer {
         let metrics = self.metrics.clone();
         let ns = namespace.to_string();
         drop(self.supervisor.spawn_async(
-            crate::task_supervisor::TaskCategory::Background,
+            klights_supervisor::TaskCategory::Background,
             format!("post_write_maintenance/{ns}"),
             async move {
                 crate::controllers::pdb::reconcile_pdbs_for_namespace(
@@ -304,7 +304,7 @@ pub(crate) fn compose_real_pod_deletion_finalizer(
     outbox: Option<Arc<Outbox>>,
     side_effects: Arc<crate::side_effects::SideEffectRegistry>,
     metrics: Arc<crate::side_effects::SideEffectMetrics>,
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) -> Arc<dyn PodDeletionFinalizer> {
     let bound_pod_finalization: Arc<dyn BoundPodFinalization> = Arc::new(
         RootBoundPodFinalization::new(store.clone(), cluster_api.is_some(), outbox.clone()),

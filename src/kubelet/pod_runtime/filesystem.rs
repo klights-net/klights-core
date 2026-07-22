@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Context;
 
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 /// Pod filesystem port for hosts files, logs, cgroups, fsGroup, and cleanup.
 #[async_trait::async_trait]
@@ -51,7 +51,7 @@ pub trait PodFilesystem: Send + Sync {
 
 /// Production filesystem adapter delegating to PodFs helpers.
 pub struct RealPodFilesystem {
-    _supervisor: Arc<TaskSupervisor>,
+    file_process: klights_supervisor::FileProcessExecutor,
     containerd_ns: String,
     _node_name: String,
 }
@@ -59,7 +59,7 @@ pub struct RealPodFilesystem {
 impl RealPodFilesystem {
     pub fn new(supervisor: Arc<TaskSupervisor>, containerd_ns: String, node_name: String) -> Self {
         Self {
-            _supervisor: supervisor,
+            file_process: klights_supervisor::FileProcessExecutor::new(supervisor),
             containerd_ns,
             _node_name: node_name,
         }
@@ -101,7 +101,12 @@ impl PodFilesystem for RealPodFilesystem {
         );
         let hosts_dir =
             crate::paths::containerd_hosts_dir_path(&self.containerd_ns, &key.namespace, &key.name);
-        crate::kubelet::pod_fs::PodFs::write_hosts_file(hosts_dir, hosts_content).await?;
+        crate::kubelet::pod_fs::PodFs::write_hosts_file(
+            &self.file_process,
+            hosts_dir,
+            hosts_content,
+        )
+        .await?;
         Ok(())
     }
 
@@ -112,7 +117,7 @@ impl PodFilesystem for RealPodFilesystem {
             &key.name,
             &key.uid,
         );
-        crate::kubelet::pod_fs::PodFs::create_log_dir(log_dir).await?;
+        crate::kubelet::pod_fs::PodFs::create_log_dir(&self.file_process, log_dir).await?;
         Ok(())
     }
 
@@ -122,6 +127,7 @@ impl PodFilesystem for RealPodFilesystem {
         container_name: &str,
     ) -> String {
         crate::kubelet::pod_termination::ensure_termination_log_host_file(
+            &self.file_process,
             &self.containerd_ns,
             &key.namespace,
             &key.name,
@@ -151,6 +157,7 @@ impl PodFilesystem for RealPodFilesystem {
             container_name,
         );
         crate::kubelet::pod_termination::read_termination_message_with_fallback_async(
+            &self.file_process,
             &termination_path,
             &log_path,
             policy,
@@ -160,7 +167,12 @@ impl PodFilesystem for RealPodFilesystem {
     }
 
     async fn cleanup_cgroup(&self, key: &PodRuntimeKey) -> anyhow::Result<()> {
-        crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup(&self.containerd_ns, &key.uid).await?;
+        crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup(
+            &self.file_process,
+            &self.containerd_ns,
+            &key.uid,
+        )
+        .await?;
         Ok(())
     }
 
@@ -181,6 +193,7 @@ impl PodFilesystem for RealPodFilesystem {
             .join(pod_dir_id)
             .join("volumes");
         crate::kubelet::pod_fs::PodFs::apply_fs_group(
+            &self.file_process,
             vec![volume_root.to_string_lossy().into_owned()],
             gid,
         )
@@ -197,12 +210,12 @@ impl PodFilesystem for RealPodFilesystem {
             &key.name,
             &key.uid,
         );
-        crate::utils::remove_dir_all_if_exists_async(&pod_root)
+        crate::utils::remove_dir_all_if_exists_async(&self.file_process, &pod_root)
             .await
             .with_context(|| {
                 format!("failed to remove pod filesystem dir {}", pod_root.display())
             })?;
-        crate::utils::remove_dir_all_if_exists_async(&pod_log_dir)
+        crate::utils::remove_dir_all_if_exists_async(&self.file_process, &pod_log_dir)
             .await
             .with_context(|| format!("failed to remove pod log dir {}", pod_log_dir.display()))?;
         Ok(())

@@ -2,7 +2,7 @@ use std::{io, path::PathBuf, sync::Arc};
 
 use tonic::Status;
 
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 #[derive(Clone)]
 pub(super) struct ControlplaneCaFiles {
@@ -118,7 +118,7 @@ mod tests {
     use tonic::Code;
 
     use super::ControlplaneCaFiles;
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     fn supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))

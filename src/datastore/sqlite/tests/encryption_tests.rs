@@ -25,9 +25,9 @@ mod encrypted {
         path
     }
 
-    fn supervisor() -> std::sync::Arc<crate::task_supervisor::TaskSupervisor> {
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+    fn supervisor() -> std::sync::Arc<klights_supervisor::TaskSupervisor> {
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ))
     }
 

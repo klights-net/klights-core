@@ -161,7 +161,7 @@ pub async fn patch_status_subresource(
         if let Err(err) = state
             .task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Others,
+                klights_supervisor::TaskCategory::Others,
                 "resourcequota_post_status_reconcile",
                 async move {
                     if let Err(e) =

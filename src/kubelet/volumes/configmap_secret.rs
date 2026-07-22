@@ -15,6 +15,7 @@ struct ProjectionFileWrite {
 }
 
 pub struct ConfigMapVolumeAtRequest<'a> {
+    pub file_process: &'a klights_supervisor::FileProcessExecutor,
     pub volumes_root: &'a str,
     pub sources: &'a dyn VolumeSourceReader,
     pub namespace: &'a str,
@@ -26,6 +27,7 @@ pub struct ConfigMapVolumeAtRequest<'a> {
 }
 
 struct ConfigMapRenderRequest<'a> {
+    file_process: &'a klights_supervisor::FileProcessExecutor,
     volumes_root: &'a str,
     cm_resource: &'a serde_json::Value,
     namespace: &'a str,
@@ -37,6 +39,7 @@ struct ConfigMapRenderRequest<'a> {
 }
 
 pub struct SecretVolumeAtRequest<'a> {
+    pub file_process: &'a klights_supervisor::FileProcessExecutor,
     pub volumes_root: &'a str,
     pub sources: &'a dyn VolumeSourceReader,
     pub namespace: &'a str,
@@ -48,6 +51,7 @@ pub struct SecretVolumeAtRequest<'a> {
 }
 
 struct SecretRenderRequest<'a> {
+    file_process: &'a klights_supervisor::FileProcessExecutor,
     volumes_root: &'a str,
     secret_resource: &'a serde_json::Value,
     namespace: &'a str,
@@ -73,6 +77,7 @@ fn render_projection_volume_blocking(
 }
 
 async fn render_projection_volume_keyed(
+    file_process: &klights_supervisor::FileProcessExecutor,
     task_label: &'static str,
     volume_path: &str,
     files: Vec<ProjectionFileWrite>,
@@ -80,14 +85,16 @@ async fn render_projection_volume_keyed(
 ) -> Result<()> {
     let key = volume_path.to_string();
     let volume_path = volume_path.to_string();
-    run_blocking_fs_keyed(task_label, &key, move || {
+    run_blocking_fs_keyed(file_process, task_label, &key, move || {
         render_projection_volume_blocking(volume_path, files, desired_paths)
     })
     .await
 }
 
 /// Creates a ConfigMap volume by rendering ConfigMap data as files
+#[allow(clippy::too_many_arguments)]
 pub async fn create_config_map_volume(
+    file_process: &klights_supervisor::FileProcessExecutor,
     sources: &dyn VolumeSourceReader,
     namespace: &str,
     cm_name: &str,
@@ -98,6 +105,7 @@ pub async fn create_config_map_volume(
 ) -> Result<String> {
     let volumes_root = volumes_root();
     create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process,
         volumes_root: &volumes_root,
         sources,
         namespace,
@@ -124,6 +132,7 @@ pub async fn create_config_map_volume_at(request: ConfigMapVolumeAtRequest<'_>) 
         })?;
 
     render_config_map_resource_to_volume_at(ConfigMapRenderRequest {
+        file_process: request.file_process,
         volumes_root: request.volumes_root,
         cm_resource: cm_resource.data.as_ref(),
         namespace: request.namespace,
@@ -140,6 +149,7 @@ async fn render_config_map_resource_to_volume_at(
     request: ConfigMapRenderRequest<'_>,
 ) -> Result<String> {
     let ConfigMapRenderRequest {
+        file_process,
         volumes_root,
         cm_resource,
         namespace,
@@ -210,6 +220,7 @@ async fn render_config_map_resource_to_volume_at(
     }
 
     render_projection_volume_keyed(
+        file_process,
         "create_config_map_volume_render",
         &volume_path,
         writes,
@@ -221,7 +232,9 @@ async fn render_config_map_resource_to_volume_at(
 }
 
 /// Creates a Secret volume by rendering Secret data as files
+#[allow(clippy::too_many_arguments)]
 pub async fn create_secret_volume(
+    file_process: &klights_supervisor::FileProcessExecutor,
     sources: &dyn VolumeSourceReader,
     namespace: &str,
     secret_name: &str,
@@ -232,6 +245,7 @@ pub async fn create_secret_volume(
 ) -> Result<String> {
     let volumes_root = volumes_root();
     create_secret_volume_at(SecretVolumeAtRequest {
+        file_process,
         volumes_root: &volumes_root,
         sources,
         namespace,
@@ -258,6 +272,7 @@ pub async fn create_secret_volume_at(request: SecretVolumeAtRequest<'_>) -> Resu
         })?;
 
     render_secret_resource_to_volume_at(SecretRenderRequest {
+        file_process: request.file_process,
         volumes_root: request.volumes_root,
         secret_resource: secret_resource.data.as_ref(),
         namespace: request.namespace,
@@ -272,6 +287,7 @@ pub async fn create_secret_volume_at(request: SecretVolumeAtRequest<'_>) -> Resu
 
 async fn render_secret_resource_to_volume_at(request: SecretRenderRequest<'_>) -> Result<String> {
     let SecretRenderRequest {
+        file_process,
         volumes_root,
         secret_resource,
         namespace,
@@ -313,6 +329,7 @@ async fn render_secret_resource_to_volume_at(request: SecretRenderRequest<'_>) -
     }
 
     render_projection_volume_keyed(
+        file_process,
         "create_secret_volume_render",
         &volume_path,
         writes,
@@ -333,6 +350,7 @@ enum RefreshResourceSource<'a> {
 }
 
 pub async fn refresh_secret_configmap_volumes_from_event(
+    file_process: &klights_supervisor::FileProcessExecutor,
     kind: &str,
     namespace: &str,
     name: &str,
@@ -341,6 +359,7 @@ pub async fn refresh_secret_configmap_volumes_from_event(
     pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
 ) -> Result<()> {
     refresh_secret_configmap_volumes_inner(
+        file_process,
         kind,
         namespace,
         name,
@@ -352,6 +371,7 @@ pub async fn refresh_secret_configmap_volumes_from_event(
 }
 
 pub async fn refresh_secret_configmap_volumes_after_delete(
+    file_process: &klights_supervisor::FileProcessExecutor,
     kind: &str,
     namespace: &str,
     name: &str,
@@ -359,6 +379,7 @@ pub async fn refresh_secret_configmap_volumes_after_delete(
     pod_reader: &dyn crate::kubelet::pod_repository::PodReader,
 ) -> Result<()> {
     refresh_secret_configmap_volumes_inner(
+        file_process,
         kind,
         namespace,
         name,
@@ -370,6 +391,7 @@ pub async fn refresh_secret_configmap_volumes_after_delete(
 }
 
 async fn refresh_secret_configmap_volumes_inner(
+    file_process: &klights_supervisor::FileProcessExecutor,
     kind: &str,
     namespace: &str,
     name: &str,
@@ -493,6 +515,7 @@ async fn refresh_secret_configmap_volumes_inner(
                         let vp = volume_path.clone();
                         let key = vp.clone();
                         run_blocking_fs_keyed(
+                            file_process,
                             "refresh_clear_volume_dir_contents",
                             &key,
                             move || clear_volume_dir_contents_blocking(&vp),
@@ -517,6 +540,7 @@ async fn refresh_secret_configmap_volumes_inner(
                         .map(|m| m as u32);
                     if let Some(resource) = latest_resource {
                         match render_secret_resource_to_volume_at(SecretRenderRequest {
+                            file_process,
                             volumes_root,
                             secret_resource: resource,
                             namespace,
@@ -557,6 +581,7 @@ async fn refresh_secret_configmap_volumes_inner(
                         .map(|m| m as u32);
                     if let Some(resource) = latest_resource {
                         match render_config_map_resource_to_volume_at(ConfigMapRenderRequest {
+                            file_process,
                             volumes_root,
                             cm_resource: resource,
                             namespace,
@@ -645,6 +670,7 @@ async fn refresh_secret_configmap_volumes_inner(
                                     let name = file_name.clone();
                                     let key = pv.clone();
                                     if let Err(e) = run_blocking_fs_keyed(
+                                        file_process,
                                         "refresh_remove_projection_path",
                                         &key,
                                         move || remove_projection_path_blocking(&pv, &name),
@@ -663,6 +689,7 @@ async fn refresh_secret_configmap_volumes_inner(
                                     let pvp = projected_vol_path.clone();
                                     let key = pvp.clone();
                                     run_blocking_fs_keyed(
+                                        file_process,
                                         "refresh_clear_projected_dir_contents",
                                         &key,
                                         move || clear_volume_dir_contents_blocking(&pvp),
@@ -719,6 +746,7 @@ async fn refresh_secret_configmap_volumes_inner(
                                         let name = file_name.clone();
                                         let key = pvp.clone();
                                         if let Err(e) = run_blocking_fs_keyed(
+                                            file_process,
                                             "refresh_projected_source_write_file",
                                             &key,
                                             move || {

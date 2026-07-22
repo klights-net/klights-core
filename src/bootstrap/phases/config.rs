@@ -11,12 +11,13 @@ use crate::KlightsConfig;
 use crate::bootstrap::{CliFlags, NodeMode};
 use crate::networking::NetworkCleanup;
 use crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 pub struct ConfigPhase {
     pub config: Arc<KlightsConfig>,
     pub node_mode: NodeMode,
     pub supervisor: Arc<TaskSupervisor>,
+    pub file_process: klights_supervisor::FileProcessExecutor,
     pub grpc_transport_policy: SharedGrpcTransportPolicy,
     pub network_cleanup: NetworkCleanup,
     pub shutdown_token: CancellationToken,
@@ -38,12 +39,13 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
 
     super::super::init::predicates::validate_worker_dataplane_ingress(&cli.role, &config)?;
 
-    let network_cleanup = NetworkCleanup::from_config(&node_mode, &config);
     let shutdown_token = CancellationToken::new();
 
-    let task_config = crate::task_supervisor::TaskCategoryConfig::from_env()
+    let task_config = klights_supervisor::TaskCategoryConfig::from_env()
         .context("invalid task supervisor category limits")?;
     let supervisor = Arc::new(TaskSupervisor::new(task_config));
+    let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
+    let network_cleanup = NetworkCleanup::from_config(&node_mode, &config, file_process.clone());
     let grpc_transport_policy =
         crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default();
     let task_limits = supervisor.config();
@@ -57,14 +59,6 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
         task_limits.pod_delete_workqueue,
         task_limits.others
     );
-
-    crate::kubelet::file_blocking::init_file_blocking_supervisor(supervisor.clone()).map_err(
-        |_| {
-            anyhow::anyhow!(
-                "file_blocking supervisor was already initialized — bootstrap must run exactly once"
-            )
-        },
-    )?;
 
     use crate::paths;
     let etc_dir = paths::etc_dir_path(&config.containerd_namespace)
@@ -81,6 +75,7 @@ pub async fn load(cli: &CliFlags) -> Result<ConfigPhase> {
         config,
         node_mode,
         supervisor,
+        file_process,
         grpc_transport_policy,
         network_cleanup,
         shutdown_token,

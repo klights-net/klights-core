@@ -3,7 +3,7 @@ use super::task::{
     ActiveTask, ActiveTaskStatus, DbQueryLoggingStatus, ShutdownReport, TaskAdmissionError,
     TaskCategoryStatus, TaskJoinError, TaskOutcome, TaskOutcomeStatus,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::process::{ExitStatus, Output};
@@ -174,6 +174,67 @@ impl SupervisedChild {
 #[derive(Clone)]
 pub struct TaskSupervisor {
     inner: Arc<TaskSupervisorInner>,
+}
+
+/// Narrow, explicitly injected access to supervised filesystem and process
+/// execution.
+#[derive(Clone)]
+pub struct FileProcessExecutor {
+    supervisor: Arc<TaskSupervisor>,
+}
+
+impl FileProcessExecutor {
+    pub fn new(supervisor: Arc<TaskSupervisor>) -> Self {
+        Self { supervisor }
+    }
+
+    pub fn from_supervisor(supervisor: &TaskSupervisor) -> Self {
+        Self::new(Arc::new(supervisor.clone()))
+    }
+
+    pub async fn run_blocking_file<T>(
+        &self,
+        name: impl Into<String>,
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+    {
+        let name = name.into();
+        let label = name.clone();
+        self.supervisor
+            .run_blocking_file(name, f)
+            .await
+            .with_context(|| format!("file_blocking::run_blocking_file({label})"))?
+    }
+
+    pub async fn run_blocking_file_keyed<T>(
+        &self,
+        name: impl Into<String>,
+        key: impl Into<String>,
+        f: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+    {
+        let name = name.into();
+        let label = name.clone();
+        self.supervisor
+            .run_blocking_file_keyed(name, key, f)
+            .await
+            .with_context(|| format!("file_blocking::run_blocking_file_keyed({label})"))?
+    }
+
+    pub async fn run_process_output(
+        &self,
+        category: TaskCategory,
+        name: impl Into<String>,
+        command: std::process::Command,
+    ) -> std::result::Result<Output, ProcessError> {
+        self.supervisor
+            .run_process_output(category, name, command)
+            .await
+    }
 }
 
 struct TaskSupervisorInner {

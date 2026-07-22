@@ -50,10 +50,13 @@ pub struct NodeRegistrationHostFacts {
 }
 
 impl NodeRegistrationHostFacts {
-    pub async fn capture_local(node_mode: &crate::bootstrap::NodeMode) -> Self {
+    pub async fn capture_local(
+        file_process: &klights_supervisor::FileProcessExecutor,
+        node_mode: &crate::bootstrap::NodeMode,
+    ) -> Self {
         let (host_info, memory_info) = tokio::join!(
-            host_node_info(),
-            crate::utils::read_utf8_file_async("/proc/meminfo")
+            host_node_info(file_process),
+            crate::utils::read_utf8_file_async(file_process, "/proc/meminfo")
         );
         let memory_ki = memory_info
             .ok()
@@ -171,6 +174,7 @@ pub struct NodeRegistrationSnapshot {
 
 impl NodeRegistrationSnapshot {
     pub async fn capture_local(
+        file_process: &klights_supervisor::FileProcessExecutor,
         node_name: &str,
         node_mode: &crate::bootstrap::NodeMode,
         node_role: &crate::bootstrap::NodeRole,
@@ -191,7 +195,7 @@ impl NodeRegistrationSnapshot {
             addresses,
             raft_shape: raft_shape.cloned(),
             grpc_port,
-            host: NodeRegistrationHostFacts::capture_local(node_mode).await,
+            host: NodeRegistrationHostFacts::capture_local(file_process, node_mode).await,
         }
     }
 
@@ -257,18 +261,19 @@ struct HostNodeInfo {
     kernel_version: String,
 }
 
-async fn host_node_info() -> HostNodeInfo {
-    let os_image = crate::utils::read_utf8_file_async("/etc/os-release")
+async fn host_node_info(file_process: &klights_supervisor::FileProcessExecutor) -> HostNodeInfo {
+    let os_image = crate::utils::read_utf8_file_async(file_process, "/etc/os-release")
         .await
         .ok()
         .and_then(|content| os_release_pretty_name(&content))
         .unwrap_or_else(|| "Linux".to_string());
-    let kernel_version = crate::utils::read_utf8_file_async("/proc/sys/kernel/osrelease")
-        .await
-        .ok()
-        .map(|content| content.trim().to_string())
-        .filter(|content| !content.is_empty())
-        .unwrap_or_else(|| "<unknown>".to_string());
+    let kernel_version =
+        crate::utils::read_utf8_file_async(file_process, "/proc/sys/kernel/osrelease")
+            .await
+            .ok()
+            .map(|content| content.trim().to_string())
+            .filter(|content| !content.is_empty())
+            .unwrap_or_else(|| "<unknown>".to_string());
 
     HostNodeInfo {
         os_image,
@@ -321,6 +326,7 @@ fn unquote_os_release_value(value: &str) -> String {
 /// (root + rootless + hybrid) can discover each other's mode through Node
 /// metadata.
 pub async fn register_node(
+    file_process: &klights_supervisor::FileProcessExecutor,
     db: &dyn DatastoreBackend,
     node_name: &str,
     node_mode: &crate::bootstrap::NodeMode,
@@ -329,6 +335,7 @@ pub async fn register_node(
     dataplane_external_ip: Option<&str>,
 ) -> Result<()> {
     let snapshot = capture_node_registration_snapshot(
+        file_process,
         node_name,
         node_mode,
         node_role,
@@ -339,7 +346,9 @@ pub async fn register_node(
     register_node_snapshot(db, None, None, dataplane_health, &snapshot).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn register_node_with_outbox(
+    file_process: &klights_supervisor::FileProcessExecutor,
     db: &dyn DatastoreBackend,
     outbox: &Outbox,
     node_name: &str,
@@ -349,6 +358,7 @@ pub async fn register_node_with_outbox(
     dataplane_external_ip: Option<&str>,
 ) -> Result<()> {
     let snapshot = capture_node_registration_snapshot(
+        file_process,
         node_name,
         node_mode,
         node_role,
@@ -360,6 +370,7 @@ pub async fn register_node_with_outbox(
 }
 
 pub async fn register_node_at_addresses(
+    file_process: &klights_supervisor::FileProcessExecutor,
     db: &dyn DatastoreBackend,
     node_name: &str,
     node_mode: &crate::bootstrap::NodeMode,
@@ -368,6 +379,7 @@ pub async fn register_node_at_addresses(
     addresses: &NodeRegistrationAddresses,
 ) -> Result<()> {
     let snapshot = NodeRegistrationSnapshot::capture_local(
+        file_process,
         node_name,
         node_mode,
         node_role,
@@ -379,7 +391,9 @@ pub async fn register_node_at_addresses(
     register_node_snapshot(db, None, None, dataplane_health, &snapshot).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn register_node_with_outbox_at_addresses(
+    file_process: &klights_supervisor::FileProcessExecutor,
     db: &dyn DatastoreBackend,
     outbox: &Outbox,
     node_name: &str,
@@ -389,6 +403,7 @@ pub async fn register_node_with_outbox_at_addresses(
     addresses: &NodeRegistrationAddresses,
 ) -> Result<()> {
     let snapshot = NodeRegistrationSnapshot::capture_local(
+        file_process,
         node_name,
         node_mode,
         node_role,
@@ -401,6 +416,7 @@ pub async fn register_node_with_outbox_at_addresses(
 }
 
 async fn capture_node_registration_snapshot(
+    file_process: &klights_supervisor::FileProcessExecutor,
     node_name: &str,
     node_mode: &crate::bootstrap::NodeMode,
     node_role: &crate::bootstrap::NodeRole,
@@ -409,6 +425,7 @@ async fn capture_node_registration_snapshot(
 ) -> NodeRegistrationSnapshot {
     let node_ip = crate::kubelet::node_ip::resolve_node_ip(node_name).await;
     NodeRegistrationSnapshot::capture_local(
+        file_process,
         node_name,
         node_mode,
         node_role,

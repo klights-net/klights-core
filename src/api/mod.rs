@@ -36,6 +36,7 @@ mod response_tests;
 mod routes;
 pub mod server_side_apply;
 mod state;
+mod task_supervisor;
 #[cfg(test)]
 pub mod test_support;
 mod validation;

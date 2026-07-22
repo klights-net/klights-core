@@ -51,19 +51,22 @@ fn leader_endpoints_for_role(role: &NodeRole) -> Vec<String> {
     }
 }
 
-pub(crate) async fn resolve_token_file_if_present(cli: &mut CliFlags) -> anyhow::Result<()> {
+pub(crate) async fn resolve_token_file_if_present(
+    cli: &mut CliFlags,
+    file_process: &klights_supervisor::FileProcessExecutor,
+) -> anyhow::Result<()> {
     let Some(path) = cli.token_file.take() else {
         return Ok(());
     };
 
-    let supervisor = crate::kubelet::file_blocking::run_blocking_file_keyed;
     let key = path.to_string_lossy().to_string();
     let path_for_task = path.clone();
-    let token = supervisor("join_token_file_read", key, move || {
-        std::fs::read_to_string(path_for_task).context("read join token file")
-    })
-    .await
-    .with_context(|| format!("failed to read --token-file {}", path.display()))?;
+    let token = file_process
+        .run_blocking_file_keyed("join_token_file_read", key, move || {
+            std::fs::read_to_string(path_for_task).context("read join token file")
+        })
+        .await
+        .with_context(|| format!("failed to read --token-file {}", path.display()))?;
     let token = token.trim().to_string();
     if token.is_empty() {
         anyhow::bail!("--token-file {} is empty", path.display());
@@ -86,9 +89,9 @@ async fn start_controlplane_leader_control_stream_if_needed(
     cri_for_api: Option<&std::sync::Arc<tokio::sync::Mutex<crate::kubelet::CriClient>>>,
     config: &std::sync::Arc<crate::KlightsConfig>,
     pod_event_db: crate::datastore::DatastoreHandle,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     shutdown_token: tokio_util::sync::CancellationToken,
-) -> anyhow::Result<Option<crate::task_supervisor::SupervisedJoinHandle<()>>> {
+) -> anyhow::Result<Option<klights_supervisor::SupervisedJoinHandle<()>>> {
     if !should_start_controlplane_leader_control_stream(role, client.is_some()) {
         return Ok(None);
     }
@@ -141,7 +144,7 @@ pub(crate) async fn run_with_flags(mut cli: CliFlags) -> anyhow::Result<()> {
     log_role(&cli);
     phases::env::init_process(&cli)?;
     let cfg = phases::config::load(&cli).await?;
-    resolve_token_file_if_present(&mut cli).await?;
+    resolve_token_file_if_present(&mut cli, &cfg.file_process).await?;
     phases::env::validate_role(&cli.role, &cfg.node_mode)?;
     let recovery = phases::recovery::run(&cfg).await?;
     let identity = phases::identity::setup_leader(&cfg, &recovery.node_ip, &cli.role).await?;
@@ -420,8 +423,8 @@ mod tests {
 
     #[tokio::test]
     async fn tls_pem_loader_reads_existing_files() {
-        let task_supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
         let dir = tempfile::tempdir().expect("tempdir");
         let cert_path = dir.path().join("server.crt");
@@ -487,8 +490,8 @@ mod tests {
 
     #[tokio::test]
     async fn tls_pem_loader_missing_cert_returns_error() {
-        let task_supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
         let dir = tempfile::tempdir().expect("tempdir");
         let cert_path = dir.path().join("missing.crt");
@@ -592,9 +595,12 @@ mod tests {
             },
         };
 
-        super::resolve_token_file_if_present(&mut flags)
-            .await
-            .unwrap();
+        super::resolve_token_file_if_present(
+            &mut flags,
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(flags.token_file, None);
         assert_eq!(flags.role.token(), Some("file-token"));
@@ -694,8 +700,8 @@ mod tests {
         config.node_name = "leader-a".to_string();
         config.external_endpoint = Some("192.0.2.10".to_string());
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
 
         let published = super::publish_local_dataplane_metadata_self_heal(
@@ -727,8 +733,8 @@ mod tests {
 
     #[tokio::test]
     async fn worker_dataplane_metadata_is_enqueued_to_outbox() {
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_db = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,

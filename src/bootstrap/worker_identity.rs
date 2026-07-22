@@ -216,14 +216,14 @@ impl WorkerCredentialStore for FilesystemWorkerCredentialStore {
 pub struct SupervisedFilesystemWorkerCredentialStore {
     dir: PathBuf,
     node_name: String,
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl SupervisedFilesystemWorkerCredentialStore {
     pub fn new(
         dir: PathBuf,
         node_name: &str,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self {
             dir,
@@ -235,7 +235,7 @@ impl SupervisedFilesystemWorkerCredentialStore {
     pub fn for_namespace(
         namespace: &str,
         node_name: &str,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self::new(crate::paths::etc_dir_path(namespace), node_name, supervisor)
     }
@@ -502,7 +502,7 @@ impl HttpCsrBootstrapClient {
         token: String,
         ca_cert_path: Option<PathBuf>,
         skip_ca: bool,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Result<Self> {
         let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
         match LeaderTlsVerificationPolicy::new(ca_cert_path, skip_ca).verification() {
@@ -1204,8 +1204,8 @@ mod tests {
     async fn http_csr_client_prefers_known_ca_path_over_skip_ca() {
         let dir = tempfile::tempdir().unwrap();
         let missing_ca = dir.path().join("missing-leader-ca.crt");
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
 
         let result = HttpCsrBootstrapClient::new(
@@ -1400,8 +1400,8 @@ mod tests {
     #[tokio::test]
     async fn test_supervised_filesystem_store_save_load_delete_returns_credential() {
         let dir = tempfile::tempdir().unwrap();
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let store = SupervisedFilesystemWorkerCredentialStore::new(
             dir.path().join("etc"),

@@ -26,9 +26,9 @@ use super::store::{PodStore, UnscheduledPodDeleteOutcome};
 use super::{PodReader, PodRepository, PodRepositoryBuildConfig};
 use klights_types::PodIdentity;
 
-fn fixture_supervisor() -> Arc<crate::task_supervisor::TaskSupervisor> {
-    Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+fn fixture_supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
+    Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ))
 }
 

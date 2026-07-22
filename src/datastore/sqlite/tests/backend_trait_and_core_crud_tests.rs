@@ -7121,8 +7121,8 @@ async fn cluster_same_kind_name_can_exist_in_different_api_versions() {
 async fn from_executor_initializes_watch_and_fingerprint() {
     use crate::datastore::sqlite::DbExecutor;
 
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let executor = DbExecutor::open_in_memory(supervisor, "dsb03:fp-test")
         .await
@@ -7158,8 +7158,8 @@ async fn new_persistent_creates_cluster_and_node_db_files() {
     )
     .expect("set perms");
 
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let ds = Datastore::new_persistent(db_dir, supervisor, None)
         .await
@@ -7205,8 +7205,8 @@ async fn new_persistent_rejects_when_parent_perms_too_open() {
         .create(&sqlite_dir)
         .expect("create loose sqlite dir");
 
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let result = Datastore::new_persistent(&parent, supervisor, None).await;
 
@@ -7222,8 +7222,8 @@ async fn new_persistent_rejects_when_parent_perms_too_open() {
 #[tokio::test]
 async fn new_persistent_failure_propagates_no_fallback() {
     // Use a non-existent path that can't be created (root-only)
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let bad_dir = std::path::Path::new("/proc/klights-test-noexist");
     let result = Datastore::new_persistent(bad_dir, supervisor, None).await;
@@ -7870,8 +7870,8 @@ async fn restart_preserves_pods_with_uids_and_rv() {
     )
     .expect("set perms");
 
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let resource_uid;
     let resource_rv;
@@ -7947,8 +7947,8 @@ async fn restart_preserves_configmaps_secrets_crds_services() {
     )
     .expect("set perms");
 
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
 
     let names = ["cm-restart", "secret-restart", "svc-restart"];
@@ -8002,8 +8002,8 @@ async fn restart_resumes_watch_within_retention_window() {
     )
     .expect("set perms");
 
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
 
     // Session 1: create resources to generate watch events
@@ -8066,8 +8066,8 @@ async fn restart_returns_410_gone_when_rv_pre_dates_retention() {
     )
     .expect("set perms");
 
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
 
     // Session 1: create many events, then GC aggressively
@@ -8123,8 +8123,8 @@ async fn retention_bounds_db_file_size_after_churn() {
     )
     .expect("set perms");
 
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
 
     {

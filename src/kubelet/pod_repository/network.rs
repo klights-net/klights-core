@@ -16,7 +16,7 @@ use crate::datastore::DatastoreHandle;
 use crate::kubelet::pod_manager::get_cached_host_ip;
 use crate::kubelet::pod_startup_error::PodStartupErrorKind;
 use crate::networking::pod_network_events::{PodNetworkEvents, PodNetworkKey};
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 use super::types::PodNetworkAssignment;
 

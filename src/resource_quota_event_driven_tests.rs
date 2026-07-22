@@ -22,8 +22,8 @@ async fn make_registry_and_repo() -> (
     Arc<SideEffectRegistry>,
 ) {
     let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let metrics = SideEffectMetrics::new();
     let registry = Arc::new(default_registry(

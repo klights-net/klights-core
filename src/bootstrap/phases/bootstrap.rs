@@ -13,7 +13,7 @@ use crate::datastore::DatastoreHandle;
 use crate::kubelet::CriClient;
 use crate::kubelet::cri::SharedCriClient;
 use crate::kubelet::pod_cluster_runtime::RuntimeNodeRole;
-use crate::task_supervisor::{SupervisedJoinHandle, TaskSupervisor};
+use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 
 pub struct BootstrapPhase {
     pub _watcher_state: Arc<crate::api::AppState>,
@@ -209,9 +209,12 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
 
     // Initialize default namespaces (only on the seed leader).
     if leader_lease.is_some() {
-        controllers::namespace::init_default_namespaces(db)
-            .await
-            .context("Failed to initialize default namespaces")?;
+        controllers::namespace::init_default_namespaces(
+            &klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
+            db,
+        )
+        .await
+        .context("Failed to initialize default namespaces")?;
     }
 
     // Seed and reconcile default RBAC objects (only on leader).
@@ -523,6 +526,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         apiservice_proxy_identity_cache: Arc::new(tokio::sync::OnceCell::new()),
         apiservice_proxy_cache: Arc::new(api::apiservice_proxy::ApiServiceProxyCache::default()),
         task_supervisor: supervisor.clone(),
+        file_process: klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
         pod_repository: api_pod_repository.clone(),
         outbox: outbox_runtime.clone(),
         node_lease_tracker: node_lease_tracker.clone(),
@@ -557,6 +561,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         node_local: _node_local.clone(),
         outbox: outbox_runtime.clone(),
         task_supervisor: supervisor.clone(),
+        file_process: klights_supervisor::FileProcessExecutor::new(supervisor.clone()),
         config: Arc::clone(config),
         node_mode: node_mode.clone(),
         role: cli.role.clone(),
@@ -604,6 +609,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             config.external_endpoint.clone(),
         );
         let registration = kubelet::node::NodeRegistrationSnapshot::capture_local(
+            &kubelet_context.file_process,
             &config.node_name,
             node_mode,
             &cli.role,
@@ -675,6 +681,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let external_endpoint_task = config.external_endpoint.clone();
         let node_mode_task = node_mode.clone();
         let role_task = cli.role.clone();
+        let file_process_task = kubelet_context.file_process.clone();
         let is_leader_tx_task = is_leader_tx.clone();
         let leader_addr_tx_task = leader_addr_tx.clone();
         let grpc_port_task = if cli.role.runs_full_stack() {
@@ -687,7 +694,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let mut last_shape = initial_raft_shape.clone();
         supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "raft_shape_role_label_watcher",
                 async move {
                     // Deduped server-metrics: fires only on real
@@ -777,6 +784,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
                                 external_endpoint_task.clone(),
                             );
                         let registration = crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
+                            &file_process_task,
                             &node_name,
                             &node_mode_task,
                             &role_task,
@@ -881,7 +889,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let cancel = shutdown_token.clone();
         supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "runtime_crd_registry_watch",
                 async move {
                     controllers::crd::run_crd_registry_watch_with_components(
@@ -909,13 +917,14 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
             crate::kubelet::pod_watch_handlers::DatastorePersistentVolumeEventHandler::new(
                 kubelet_db_handle.clone(),
                 is_leader_rx.clone(),
+                ctx.file_process.clone(),
             ),
         );
         let cancel = shutdown_token.clone();
         Some(
             supervisor
                 .spawn_async(
-                    crate::task_supervisor::TaskCategory::Background,
+                    klights_supervisor::TaskCategory::Background,
                     "runtime_pod_watcher",
                     async move {
                         kubelet::pod_manager::run_pod_watcher_with_context(
@@ -948,7 +957,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let lease_client = node_lease_renewal_client.clone();
         supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "runtime_node_heartbeat",
                 async move {
                     kubelet::node::run_heartbeat_with_lease_client(
@@ -972,7 +981,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         let health = dataplane_health.clone();
         supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "runtime_node_subnet_peer_watch",
                 async move {
                     controllers::node_subnet::run_peer_watch(state, health, cancel).await;
@@ -997,7 +1006,7 @@ pub async fn run(args: BootstrapRunArgs<'_>) -> Result<BootstrapPhase> {
         Some(
             supervisor
                 .spawn_async(
-                    crate::task_supervisor::TaskCategory::Background,
+                    klights_supervisor::TaskCategory::Background,
                     "runtime_node_lifecycle_controller",
                     async move {
                         controllers::node_lifecycle::run_node_lifecycle_controller(
@@ -1120,7 +1129,7 @@ mod tests {
     };
     use crate::replication::grpc::transport_policy::GrpcTransportPolicy;
     use crate::replication::protocol::JoinRole;
-    use crate::task_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
 
     fn remote_client_for_informer_start_test(
         supervisor: Arc<TaskSupervisor>,

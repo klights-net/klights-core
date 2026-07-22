@@ -733,10 +733,12 @@ async fn create_serviceaccount_token(
         }
     }
 
-    let signing_key_pem =
-        crate::auth::read_service_account_signing_key_async(&state.config.containerd_namespace)
-            .await
-            .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
+    let signing_key_pem = crate::auth::read_service_account_signing_key_async(
+        &state.file_process,
+        &state.config.containerd_namespace,
+    )
+    .await
+    .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
 
     let sa_uid = sa
         .data

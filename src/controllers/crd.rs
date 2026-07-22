@@ -187,7 +187,7 @@ pub async fn sync_registry_from_datastore(
 pub async fn run_crd_registry_watch_with_components(
     db: DatastoreHandle,
     registry: CrdRegistry,
-    _task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    _task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     cancel: CancellationToken,
 ) {
     let start_rv = db.get_current_resource_version().await.unwrap_or(0);
@@ -609,8 +609,8 @@ mod tests {
             .unwrap();
         let db_handle: crate::datastore::DatastoreHandle = Arc::new(db.clone());
         let registry = CrdRegistry::new();
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let cancel = CancellationToken::new();
 

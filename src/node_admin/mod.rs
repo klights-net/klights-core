@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::datastore::node_local::{DeadLetterRow, NodeLocalHandle};
-use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
+use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 #[derive(Clone)]
 struct AdminState {
@@ -149,7 +149,7 @@ mod tests {
     use crate::datastore::backend_kind::BackendKind;
     use crate::datastore::node_local::sqlite::DeadLetterTestInsert;
     use crate::datastore::node_local::{NodeLocalHandle, OutboxInsert, selector};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     fn supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))

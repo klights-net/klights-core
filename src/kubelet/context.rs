@@ -9,7 +9,7 @@ use crate::kubelet::pod_creation_state::PodStartRetryTracker;
 use crate::kubelet::pod_lifecycle_router::PodLifecycleRouter;
 use crate::kubelet::pod_repository::PodRepository;
 use crate::networking::Network;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 /// Runtime context for kubelet-owned components.
 ///
@@ -22,6 +22,7 @@ pub struct KubeletContext {
     pub node_local: NodeLocalHandle,
     pub outbox: Arc<Outbox>,
     pub task_supervisor: Arc<TaskSupervisor>,
+    pub file_process: klights_supervisor::FileProcessExecutor,
     pub config: Arc<KlightsConfig>,
     pub node_mode: NodeMode,
     pub role: NodeRole,

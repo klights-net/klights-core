@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use crate::datastore::redb::{self, RedbOpenOpts};
-use crate::task_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
 use ::redb::{ReadableDatabase, TableHandle};
+use klights_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
 
 fn temp_db_dir() -> (TempDir, PathBuf) {
     let dir = TempDir::new().expect("tempdir");

@@ -243,25 +243,30 @@ pub fn orphaned_pod_dir_ids(
 /// before the recursive root removal, so it never deletes over a live mount.
 /// Returns the number of orphan dirs removed.
 pub async fn sweep_orphan_pod_artifacts(
+    file_process: &klights_supervisor::FileProcessExecutor,
     containerd_ns: &str,
     live_owners: &HashSet<(String, String, String)>,
 ) -> anyhow::Result<usize> {
     let pods_root = crate::paths::volumes_root_path(containerd_ns);
-    let dir_ids = crate::kubelet::pod_fs::PodFs::list_subdir_names(pods_root.clone()).await?;
+    let dir_ids =
+        crate::kubelet::pod_fs::PodFs::list_subdir_names(file_process, pods_root.clone()).await?;
 
     let orphans = orphaned_pod_dir_ids(&dir_ids, live_owners);
     let mut removed = 0usize;
     for dir_id in &orphans {
         let pod_root = pods_root.join(dir_id);
         let volumes_dir = pod_root.join("volumes");
-        if let Err(e) =
-            crate::kubelet::volumes::unmount_volume_mounts_under(&volumes_dir.to_string_lossy())
-                .await
+        if let Err(e) = crate::kubelet::volumes::unmount_volume_mounts_under(
+            file_process,
+            &volumes_dir.to_string_lossy(),
+        )
+        .await
         {
             tracing::warn!(dir = %dir_id, "orphan pod artifact sweep: unmount failed, skipping: {e:#}");
             continue;
         }
-        if let Err(e) = crate::utils::remove_dir_all_if_exists_async(&pod_root).await {
+        if let Err(e) = crate::utils::remove_dir_all_if_exists_async(file_process, &pod_root).await
+        {
             tracing::warn!(dir = %dir_id, "orphan pod artifact sweep: remove failed, skipping: {e:#}");
             continue;
         }
@@ -477,8 +482,8 @@ pub mod tests {
         use crate::kubelet::pod_lifecycle_router::executor::{PodWorkExecutor, RecordingExecutor};
 
         let recorder = RecordingExecutor::new();
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let holder = std::sync::Arc::new(std::sync::Mutex::new(
             recorder.clone() as std::sync::Arc<dyn PodWorkExecutor>

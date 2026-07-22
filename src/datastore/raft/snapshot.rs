@@ -250,9 +250,12 @@ mod tests {
     #[tokio::test]
     async fn streaming_snapshot_round_trips_and_is_zstd_framed() {
         let db = test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
         db.create_resource(
             "v1",
             "ConfigMap",

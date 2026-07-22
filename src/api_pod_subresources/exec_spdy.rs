@@ -25,14 +25,14 @@ pub struct SpdyExecStreamRequest {
 
 pub struct LocalExecSpdyRequest {
     pub cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub target: ExecTarget,
     pub stream_request: SpdyExecStreamRequest,
 }
 
 pub struct RemoteExecSpdyRequest {
     pub node_exec: Arc<dyn NodeExec>,
-    pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub node_name: String,
     pub target: ExecTarget,
     pub stream_request: SpdyExecStreamRequest,
@@ -134,7 +134,7 @@ pub async fn collect_spdy_client_streams<S>(
     client_spdy: &mut SpdyExec,
     client_stream: &mut S,
     request: SpdyExecStreamRequest,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<SpdyClientStreams>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -262,7 +262,7 @@ where
 
 struct LocalSpdyExecTarget<'a> {
     cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     container_id: &'a str,
     command: &'a [String],
     request: SpdyExecStreamRequest,

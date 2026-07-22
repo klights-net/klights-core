@@ -85,14 +85,14 @@ pub trait LeaderElection: Send + Sync {
 pub struct RaftLeaderLease {
     raft_node: Arc<crate::datastore::raft::node::RaftNode>,
     root_cancel: CancellationToken,
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl RaftLeaderLease {
     pub fn new(
         raft_node: Arc<crate::datastore::raft::node::RaftNode>,
         root_cancel: CancellationToken,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self {
             raft_node,
@@ -118,7 +118,7 @@ impl LeaderElection for RaftLeaderLease {
         // token when this node loses Raft leadership.
         let _ = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "raft_leader_lease_watcher",
                 async move {
                     // Deduped server-metrics: only wakes on real
@@ -165,7 +165,7 @@ mod tests {
     use crate::datastore::node_local::SqliteNodeLocalDb;
     use crate::datastore::raft::node::RaftNode;
     use crate::datastore::sqlite::{DbExecutor, opener};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     async fn fresh_raft_node(id: u64) -> RaftNode {
         let supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));

@@ -196,7 +196,7 @@ impl PodLifecycleRouter {
 
     /// Create a router from env-selected mode (for bootstrap).
     pub fn from_env(
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
         config: PodLifecycleConcurrencyConfig,
     ) -> Self {
         Self::from_env_impl(supervisor, config, |key| std::env::var(key))
@@ -204,7 +204,7 @@ impl PodLifecycleRouter {
 
     /// Construct with injectable env reader (for testing).
     fn from_env_impl(
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
         config: PodLifecycleConcurrencyConfig,
         get_env: impl Fn(&str) -> Result<String, std::env::VarError>,
     ) -> Self {
@@ -297,7 +297,7 @@ impl PodLifecycleRouter {
 mod tests {
     use super::*;
     use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::collections::HashMap;
 
     fn test_supervisor() -> Arc<TaskSupervisor> {

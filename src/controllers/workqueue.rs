@@ -95,20 +95,18 @@ pub struct WorkQueue {
     delayed_generations: Arc<Mutex<HashMap<Key, u64>>>,
     notify: Arc<Notify>,
     next_gen: Arc<AtomicU64>,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl WorkQueue {
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_task_supervisor(Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        Self::with_task_supervisor(Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )))
     }
 
-    pub fn with_task_supervisor(
-        task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
-    ) -> Self {
+    pub fn with_task_supervisor(task_supervisor: Arc<klights_supervisor::TaskSupervisor>) -> Self {
         Self {
             ready: Arc::new(Mutex::new(HashSet::new())),
             delayed_generations: Arc::new(Mutex::new(HashMap::new())),
@@ -237,8 +235,8 @@ impl WorkQueue {
 #[cfg(test)]
 impl Default for WorkQueue {
     fn default() -> Self {
-        Self::with_task_supervisor(Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        Self::with_task_supervisor(Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )))
     }
 }

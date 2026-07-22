@@ -285,9 +285,12 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_kubernetes_service_creates_service_and_endpoints() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_kubernetes_service(
             &db,
@@ -356,9 +359,12 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _endpoint = EnvGuard::set("KLIGHTS_EXTERNAL_ENDPOINT", "198.51.100.74");
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
         let network = crate::networking::test_support::MockNetworkProvider::new();
         network.set_host_ip(std::net::Ipv4Addr::new(10, 206, 0, 10));
         network.set_pod_gateway_ip(std::net::Ipv4Addr::new(10, 43, 0, 1));
@@ -392,9 +398,12 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_kubernetes_service_idempotent() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_kubernetes_service(
             &db,
@@ -437,9 +446,12 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_kubernetes_service_reconciles_existing_tls_port() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
         let network = crate::networking::test_support::MockNetworkProvider::new();
 
         bootstrap_kubernetes_service(&db, "10.43.128.0/17", 7443, &network)

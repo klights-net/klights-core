@@ -24,7 +24,7 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 /// Check whether the WireGuard UDP port is bound and pasta is exposing it
 /// at the host edge. Uses the task supervisor to read `/proc/net/udp`

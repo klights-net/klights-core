@@ -2,8 +2,8 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 #[cfg(test)]
-use crate::task_supervisor::TaskCategoryConfig;
-use crate::task_supervisor::{TaskCategory, TaskSupervisor};
+use klights_supervisor::TaskCategoryConfig;
+use klights_supervisor::{TaskCategory, TaskSupervisor};
 use thiserror::Error;
 use tokio_rusqlite::Connection;
 
@@ -299,7 +299,7 @@ impl DbExecutor {
 #[cfg(test)]
 mod tests {
     use super::{DbError, DbExecutor, OpenOpts};
-    use crate::task_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;

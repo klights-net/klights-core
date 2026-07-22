@@ -7,7 +7,7 @@ use crate::datastore::node_local::{DeadLetterTestInsert, NodeLocalHandle, Outbox
 use crate::datastore::node_local::{SqliteNodeLocalDb, selector};
 use crate::datastore::sqlite::{DbExecutor, opener};
 use crate::kubelet::outbox::payload::OutboxPayload;
-use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn supervisor() -> Arc<TaskSupervisor> {
     Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))

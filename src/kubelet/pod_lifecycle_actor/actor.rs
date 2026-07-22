@@ -15,8 +15,8 @@ use crate::kubelet::pod_lifecycle_core::trace::{LifecycleTraceEntry, LifecycleTr
 use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor;
 #[cfg(test)]
-use crate::task_supervisor::TaskCategoryConfig;
-use crate::task_supervisor::{SupervisedJoinHandle, TaskSupervisor};
+use klights_supervisor::TaskCategoryConfig;
+use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 use super::registry::{
     ActorInstanceToken, PodLifecycleActorRemovalHandle, PodLifecycleActorStateEntry,
@@ -40,6 +40,60 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
+}
+
+fn task_category_for_action(action: &PodAction) -> TaskCategory {
+    match action {
+        PodAction::StartPod { .. }
+        | PodAction::CheckSlotAdmission { .. }
+        | PodAction::StopPod { .. }
+        | PodAction::FinalizePodDeletion { .. }
+        | PodAction::FinalizeStartup { .. }
+        | PodAction::ReconcileRuntime { .. }
+        | PodAction::ReconcileCriLeftovers { .. }
+        | PodAction::HandleCommand { .. }
+        | PodAction::ReconcileEphemeral { .. } => TaskCategory::PodLifecycleWork,
+        PodAction::ScheduleRetry { .. } | PodAction::ScheduleStartPodRetry { .. } => {
+            TaskCategory::Timer
+        }
+        PodAction::Noop => TaskCategory::Background,
+    }
+}
+
+#[cfg(test)]
+mod task_category_tests {
+    use super::*;
+    use crate::kubelet::pod_lifecycle_core::message::PodLifecycleKey;
+
+    fn test_key() -> PodLifecycleKey {
+        PodLifecycleKey::new("default", "test-pod", "uid-1")
+    }
+
+    #[test]
+    fn actor_selects_supervisor_category_for_each_action_class() {
+        let actions = [
+            (
+                PodAction::FinalizePodDeletion {
+                    key: test_key(),
+                    operation_id: 1,
+                    permit: None,
+                },
+                TaskCategory::PodLifecycleWork,
+            ),
+            (
+                PodAction::ScheduleRetry {
+                    key: test_key(),
+                    delay: std::time::Duration::from_secs(1),
+                },
+                TaskCategory::Timer,
+            ),
+            (PodAction::Noop, TaskCategory::Background),
+        ];
+
+        for (action, expected) in actions {
+            assert_eq!(task_category_for_action(&action), expected);
+        }
+    }
 }
 
 pub type PodLifecycleActorStateMap = Arc<Mutex<HashMap<PodSlotKey, PodLifecycleActorStateEntry>>>;
@@ -600,7 +654,7 @@ impl PodLifecycleActor {
             .unwrap_or_else(CancellationToken::new);
         let synth = action.failure_synthesizer();
         let synth_for_task = synth.clone();
-        let category = action.task_category();
+        let category = task_category_for_action(&action);
         let task_name = action.task_name();
         let executor = self.executor_holder.lock().unwrap().clone();
         let reply = LifecycleReplyHandle::direct(completion_tx.clone());

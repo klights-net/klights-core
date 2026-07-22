@@ -4,16 +4,19 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 pub struct PodVolumeManager<'a> {
+    file_process: &'a klights_supervisor::FileProcessExecutor,
     sources: &'a dyn crate::kubelet::volume_sources::VolumeSourceReader,
     containerd_namespace: &'a str,
 }
 
 impl<'a> PodVolumeManager<'a> {
     pub fn new(
+        file_process: &'a klights_supervisor::FileProcessExecutor,
         sources: &'a dyn crate::kubelet::volume_sources::VolumeSourceReader,
         containerd_namespace: &'a str,
     ) -> Self {
         Self {
+            file_process,
             sources,
             containerd_namespace,
         }
@@ -28,6 +31,7 @@ impl<'a> PodVolumeManager<'a> {
     ) -> Result<HashMap<String, String>> {
         let registry = crate::kubelet::volume_registry::VolumeRegistry::with_defaults();
         let ctx = crate::kubelet::volume_registry::VolumeContext {
+            file_process: self.file_process,
             sources: self.sources,
             namespace,
             pod_name,

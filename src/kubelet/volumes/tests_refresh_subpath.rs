@@ -4,7 +4,7 @@ fn make_pod_reader(
     db: &crate::datastore::sqlite::Datastore,
 ) -> std::sync::Arc<dyn crate::kubelet::pod_repository::PodReader> {
     use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     let supervisor = std::sync::Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
     let metrics = SideEffectMetrics::new();
     let side_effects = std::sync::Arc::new(SideEffectRegistry::new());
@@ -69,6 +69,7 @@ async fn test_projected_volume_configmap_uses_default_mode() {
 
     // defaultMode 0o400
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -121,6 +122,7 @@ async fn test_projected_volume_downward_api_per_file_mode() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "ns1",
@@ -283,6 +285,7 @@ async fn test_secret_volume_refresh_on_update() {
         .unwrap();
     let before = blocking_fs_keyed_call_count();
     refresh_secret_configmap_volumes_from_event(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
         "Secret",
         "default",
         "my-secret",
@@ -372,6 +375,7 @@ async fn test_projected_secret_refresh_uses_event_payload_for_new_keys() {
     });
 
     refresh_secret_configmap_volumes_from_event(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
         "Secret",
         "default",
         "projected-secret",
@@ -446,6 +450,7 @@ async fn test_projected_secret_delete_event_clears_volume_with_stale_db_secret()
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
 
     refresh_secret_configmap_volumes_after_delete(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
         "Secret",
         "default",
         "deleted-secret",
@@ -518,6 +523,7 @@ async fn test_projected_configmap_delete_event_clears_existing_volume_with_missi
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
 
     refresh_secret_configmap_volumes_after_delete(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
         "ConfigMap",
         "default",
         "deleted-config",
@@ -591,6 +597,7 @@ async fn test_secret_delete_event_clears_direct_volume_with_stale_db_secret() {
     fs::write(format!("{}/data-1", vol_path), "value-1").unwrap();
 
     refresh_secret_configmap_volumes_after_delete(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
         "Secret",
         "default",
         "deleted-secret",
@@ -672,6 +679,7 @@ async fn test_configmap_volume_refresh_uses_event_payload_for_new_keys() {
     });
 
     refresh_secret_configmap_volumes_from_event(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
         "ConfigMap",
         "default",
         "direct-config",
@@ -776,6 +784,7 @@ async fn test_configmap_volume_refresh_on_update() {
         .unwrap();
     let before = blocking_fs_keyed_call_count();
     refresh_secret_configmap_volumes_from_event(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
         "ConfigMap",
         "default",
         "my-config",
@@ -877,6 +886,7 @@ async fn test_configmap_volume_refresh_prunes_removed_keys() {
         .unwrap()
         .unwrap();
     refresh_secret_configmap_volumes_from_event(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
         "ConfigMap",
         "default",
         "my-config",
@@ -957,6 +967,7 @@ async fn test_configmap_volume_refresh_clears_files_on_source_delete() {
         .unwrap();
 
     refresh_secret_configmap_volumes_after_delete(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
         "ConfigMap",
         "default",
         "my-config",
@@ -1040,6 +1051,7 @@ async fn test_secret_volume_refreshes_existing_terminal_pod_mounts() {
         .unwrap()
         .unwrap();
     refresh_secret_configmap_volumes_from_event(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
         "Secret",
         "default",
         "skip-secret",

@@ -47,7 +47,7 @@ struct RemotePodLogRequest<'a> {
 
 struct RemotePodLogWebSocketRequest {
     node_log: Arc<dyn NodeLog>,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     namespace: String,
     name: String,
     pod_uid: String,
@@ -235,7 +235,7 @@ pub async fn get_pod_log(
         if let Err(err) = state
             .task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Others,
+                klights_supervisor::TaskCategory::Others,
                 "pod_log_ws_upgrade",
                 async move {
                     match on_upgrade.await {
@@ -450,7 +450,7 @@ fn build_pod_log_websocket_response(
 
 pub async fn handle_pod_log_websocket_tungstenite<S>(
     mut socket: tokio_tungstenite::WebSocketStream<S>,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     log_path: String,
     params: LogQuery,
 ) where
@@ -519,7 +519,7 @@ pub async fn handle_pod_log_websocket_tungstenite<S>(
 pub async fn build_log_output(
     log_path: &str,
     params: &LogQuery,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<String, AppError> {
     let bytes = build_log_output_bytes(log_path, params, task_supervisor).await?;
     Ok(String::from_utf8_lossy(bytes.as_ref()).into_owned())
@@ -528,7 +528,7 @@ pub async fn build_log_output(
 pub async fn build_log_output_bytes(
     log_path: &str,
     params: &LogQuery,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<Bytes, AppError> {
     const ATTEMPTS: usize = 50;
     const RETRY_DELAY_MS: u64 = 100;
@@ -573,7 +573,7 @@ pub async fn build_log_output_bytes(
 async fn build_log_output_once_bytes(
     log_path: &str,
     params: &LogQuery,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> io::Result<Bytes> {
     let path = PathBuf::from(log_path);
     let key = log_path.to_string();
@@ -753,7 +753,7 @@ fn is_log_line_after_cutoff_bytes(
 pub fn follow_log_file_with_initial_query(
     log_path: String,
     params: LogQuery,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
     follow_log_file_inner(log_path, params, task_supervisor, None)
 }
@@ -844,7 +844,7 @@ impl PodLogEventSource {
 pub fn follow_log_file_with_termination_watch(
     log_path: String,
     params: LogQuery,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     termination: PodLogFollowTermination,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
     follow_log_file_inner(log_path, params, task_supervisor, Some(termination))
@@ -853,7 +853,7 @@ pub fn follow_log_file_with_termination_watch(
 fn follow_log_file_inner(
     log_path: String,
     initial_params: LogQuery,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     mut termination: Option<PodLogFollowTermination>,
 ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
     async_stream::stream! {
@@ -1294,7 +1294,7 @@ fn split_cri_log_line_bytes(line: &[u8]) -> Option<(&[u8], &[u8])> {
 
 async fn open_log_file_supervised(
     log_path: &str,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> io::Result<blocking_fs::File> {
     let path = PathBuf::from(log_path);
     let key = log_path.to_string();
@@ -1309,7 +1309,7 @@ async fn open_log_file_supervised(
 
 async fn open_log_file_for_follow(
     log_path: &str,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     mut termination: Option<&mut PodLogFollowTermination>,
 ) -> io::Result<Option<blocking_fs::File>> {
     loop {
@@ -1345,7 +1345,7 @@ async fn open_log_file_for_follow(
 
 async fn watch_nearest_log_path_parent(
     log_path: &str,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> io::Result<tokio::io::unix::AsyncFd<inotify::Inotify>> {
     use inotify::{Inotify, WatchMask};
 
@@ -1365,7 +1365,7 @@ async fn watch_nearest_log_path_parent(
 
 async fn nearest_existing_log_watch_dir(
     log_path: &str,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> io::Result<PathBuf> {
     let path = PathBuf::from(log_path);
     let key = log_path.to_string();
@@ -1481,7 +1481,7 @@ async fn wait_for_log_path_activity(
 async fn read_log_chunk_supervised(
     log_path: &str,
     file: blocking_fs::File,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> io::Result<(blocking_fs::File, Bytes)> {
     let key = log_path.to_string();
     let read = move || {
@@ -1502,7 +1502,7 @@ async fn seek_log_file_supervised(
     log_path: &str,
     file: blocking_fs::File,
     offset: u64,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> io::Result<blocking_fs::File> {
     let key = log_path.to_string();
     let seek = move || {
@@ -1520,7 +1520,7 @@ async fn seek_log_file_supervised(
 async fn read_initial_follow_snapshot(
     log_path: &str,
     params: &LogQuery,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> io::Result<(u64, Bytes)> {
     let path = PathBuf::from(log_path);
     let key = log_path.to_string();
@@ -1935,7 +1935,7 @@ async fn get_remote_pod_log_websocket(
 
     if let Err(err) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Others,
+            klights_supervisor::TaskCategory::Others,
             "pod_log_remote_ws_upgrade",
             async move {
                 match on_upgrade.await {

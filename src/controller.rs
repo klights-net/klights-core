@@ -39,26 +39,60 @@ pub struct Context {
     /// Request-scoped metrics provider used by HPA. Optional so unit tests
     /// that exercise unrelated controllers do not need metrics wiring.
     pub metrics_provider: Option<Arc<dyn crate::metrics::MetricsProvider>>,
+    /// Explicit access to supervised filesystem and process work.
+    file_process: klights_supervisor::FileProcessExecutor,
 }
 
 impl Context {
     /// Create a new controller context from a [`DatastoreHandle`].
-    pub fn new(db_handle: DatastoreHandle, node_name: String) -> Self {
+    #[cfg(not(test))]
+    pub fn new(
+        db_handle: DatastoreHandle,
+        node_name: String,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
         Self {
             db_handle,
             node_name,
             services: None,
             pod_repository: None,
             metrics_provider: None,
+            file_process,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(db_handle: DatastoreHandle, node_name: String) -> Self {
+        Self::new_with_file_process(
+            db_handle,
+            node_name,
+            crate::kubelet::file_blocking::test_file_process_executor(),
+        )
+    }
+
+    pub fn new_with_file_process(
+        db_handle: DatastoreHandle,
+        node_name: String,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
+        Self {
+            db_handle,
+            node_name,
+            services: None,
+            pod_repository: None,
+            metrics_provider: None,
+            file_process,
         }
     }
 
     /// Construct a Context with a live service router attached. Used by
     /// the production controller dispatcher; tests use `Context::new`.
+    #[cfg(not(test))]
     pub fn with_services(
         db_handle: DatastoreHandle,
         node_name: String,
         services: Arc<dyn klights_network_api::ServiceRouter>,
+        file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         Self {
             db_handle,
@@ -66,6 +100,37 @@ impl Context {
             services: Some(services),
             pod_repository: None,
             metrics_provider: None,
+            file_process,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_services(
+        db_handle: DatastoreHandle,
+        node_name: String,
+        services: Arc<dyn klights_network_api::ServiceRouter>,
+    ) -> Self {
+        Self::with_services_and_file_process(
+            db_handle,
+            node_name,
+            services,
+            crate::kubelet::file_blocking::test_file_process_executor(),
+        )
+    }
+
+    pub fn with_services_and_file_process(
+        db_handle: DatastoreHandle,
+        node_name: String,
+        services: Arc<dyn klights_network_api::ServiceRouter>,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
+        Self {
+            db_handle,
+            node_name,
+            services: Some(services),
+            pod_repository: None,
+            metrics_provider: None,
+            file_process,
         }
     }
 
@@ -106,6 +171,10 @@ impl Context {
 
     pub fn metrics_provider(&self) -> Option<&Arc<dyn crate::metrics::MetricsProvider>> {
         self.metrics_provider.as_ref()
+    }
+
+    pub fn file_process(&self) -> &klights_supervisor::FileProcessExecutor {
+        &self.file_process
     }
 }
 
@@ -318,6 +387,25 @@ macro_rules! controller_wrapper {
                 ctx: $crate::controller::Context,
             ) -> ::anyhow::Result<()> {
                 $core_fn(ctx.db_handle().as_ref(), &resource)
+                    .await
+                    .map(|_| ())
+            }
+        }
+    };
+    ($struct_name:ident, $name:literal, $core_fn:path, no_node, discard, with_file_process) => {
+        pub struct $struct_name;
+
+        #[::async_trait::async_trait]
+        impl $crate::controller::Controller for $struct_name {
+            fn name(&self) -> &'static str {
+                $name
+            }
+            async fn reconcile(
+                &self,
+                resource: ::serde_json::Value,
+                ctx: $crate::controller::Context,
+            ) -> ::anyhow::Result<()> {
+                $core_fn(ctx.file_process(), ctx.db_handle().as_ref(), &resource)
                     .await
                     .map(|_| ())
             }

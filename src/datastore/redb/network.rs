@@ -698,7 +698,7 @@ mod tests {
     use crate::datastore::redb::helpers;
     use crate::datastore::redb::open_boundary;
     use crate::datastore::redb::sandbox::RedbSandboxStore;
-    use crate::task_supervisor::TaskSupervisor;
+    use klights_supervisor::TaskSupervisor;
 
     use super::*;
 

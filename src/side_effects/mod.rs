@@ -252,7 +252,7 @@ pub async fn run_named_hook_logged(
 pub fn default_registry(
     metrics: std::sync::Arc<SideEffectMetrics>,
     services: Option<std::sync::Arc<dyn klights_network_api::ServiceRouter>>,
-    task_supervisor: Option<std::sync::Arc<crate::task_supervisor::TaskSupervisor>>,
+    task_supervisor: Option<std::sync::Arc<klights_supervisor::TaskSupervisor>>,
     db: Option<crate::datastore::DatastoreHandle>,
 ) -> SideEffectRegistry {
     let mut registry = SideEffectRegistry::new();

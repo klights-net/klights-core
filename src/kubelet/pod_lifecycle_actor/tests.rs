@@ -4710,7 +4710,7 @@ fn lifecycle_message_carries_pod_identity() {
     assert_eq!(message.key().uid, "uid-a");
 }
 
-use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 use super::config::PodLifecycleConcurrencyConfig;
 use super::registry::PodLifecycleRegistry;

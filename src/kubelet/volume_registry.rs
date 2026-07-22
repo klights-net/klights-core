@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct VolumeContext<'a> {
+    pub file_process: &'a klights_supervisor::FileProcessExecutor,
     pub sources: &'a dyn crate::kubelet::volume_sources::VolumeSourceReader,
     pub namespace: &'a str,
     pub pod_name: &'a str,
@@ -76,6 +77,7 @@ impl VolumeRegistry {
 }
 
 async fn ensure_optional_placeholder_volume_path(
+    file_process: &klights_supervisor::FileProcessExecutor,
     volume_type_dir: &str,
     pod_dir_id: &str,
     volume_name: &str,
@@ -90,6 +92,7 @@ async fn ensure_optional_placeholder_volume_path(
     let volume_key = volume_path.clone();
     let volume_path_for_blocking = volume_path.clone();
     volumes::run_blocking_fs_keyed(
+        file_process,
         "ensure_optional_placeholder_volume_path",
         &volume_key,
         move || ensure_optional_placeholder_volume_path_blocking(&volume_path_for_blocking),
@@ -146,16 +149,17 @@ impl VolumeHandler for EmptyDirHandler {
             &pod_dir_id,
             &volume_name,
         );
-        let path = volumes::run_blocking_fs_keyed("create_empty_dir", &key, move || {
-            volumes::create_empty_dir_for_namespace(
-                &containerd_namespace,
-                &pod_dir_id,
-                &volume_name,
-                medium.as_deref(),
-                size_limit.as_deref(),
-            )
-        })
-        .await?;
+        let path =
+            volumes::run_blocking_fs_keyed(ctx.file_process, "create_empty_dir", &key, move || {
+                volumes::create_empty_dir_for_namespace(
+                    &containerd_namespace,
+                    &pod_dir_id,
+                    &volume_name,
+                    medium.as_deref(),
+                    size_limit.as_deref(),
+                )
+            })
+            .await?;
         Ok(Some(path))
     }
 }
@@ -170,7 +174,7 @@ impl VolumeHandler for HostPathHandler {
         &self,
         volume: &Value,
         _volume_name: &str,
-        _ctx: &VolumeContext<'_>,
+        ctx: &VolumeContext<'_>,
     ) -> Result<Option<String>> {
         let host_path = volume
             .get("hostPath")
@@ -184,8 +188,9 @@ impl VolumeHandler for HostPathHandler {
             .get("type")
             .and_then(|t| t.as_str())
             .map(str::to_string);
-        let resolved =
-            crate::kubelet::file_blocking::run_blocking_file("resolve_host_path", move || {
+        let resolved = ctx
+            .file_process
+            .run_blocking_file("resolve_host_path", move || {
                 volumes::resolve_host_path(&path, host_type.as_deref())
             })
             .await?;
@@ -223,6 +228,7 @@ impl VolumeHandler for ConfigMapHandler {
         let items = config_map.get("items");
 
         match volumes::create_config_map_volume(
+            ctx.file_process,
             ctx.sources,
             ctx.namespace,
             cm_name,
@@ -240,9 +246,14 @@ impl VolumeHandler for ConfigMapHandler {
                     volume_name,
                     cm_name
                 );
-                ensure_optional_placeholder_volume_path("config-map", ctx.pod_dir_id, volume_name)
-                    .await
-                    .map(Some)
+                ensure_optional_placeholder_volume_path(
+                    ctx.file_process,
+                    "config-map",
+                    ctx.pod_dir_id,
+                    volume_name,
+                )
+                .await
+                .map(Some)
             }
             Err(e) => Err(e),
         }
@@ -279,6 +290,7 @@ impl VolumeHandler for SecretHandler {
         let items = secret.get("items");
 
         match volumes::create_secret_volume(
+            ctx.file_process,
             ctx.sources,
             ctx.namespace,
             secret_name,
@@ -296,9 +308,14 @@ impl VolumeHandler for SecretHandler {
                     volume_name,
                     secret_name
                 );
-                ensure_optional_placeholder_volume_path("secret", ctx.pod_dir_id, volume_name)
-                    .await
-                    .map(Some)
+                ensure_optional_placeholder_volume_path(
+                    ctx.file_process,
+                    "secret",
+                    ctx.pod_dir_id,
+                    volume_name,
+                )
+                .await
+                .map(Some)
             }
             Err(e) => Err(e),
         }
@@ -329,6 +346,7 @@ impl VolumeHandler for DownwardApiHandler {
             .ok_or_else(|| anyhow::anyhow!("downwardAPI missing items"))?;
 
         let path = volumes::create_downward_api_volume_ns(volumes::DownwardApiVolumeNsRequest {
+            file_process: ctx.file_process,
             sources: ctx.sources,
             namespace: ctx.namespace,
             pod_dir_id: ctx.pod_dir_id,
@@ -375,6 +393,7 @@ impl VolumeHandler for ProjectedHandler {
             .await?;
 
         let path = volumes::create_projected_volume_ns(volumes::ProjectedVolumeNsRequest {
+            file_process: ctx.file_process,
             source_reader: ctx.sources,
             namespace: ctx.namespace,
             pod_dir_id: ctx.pod_dir_id,
@@ -452,11 +471,12 @@ impl VolumeHandler for PersistentVolumeClaimHandler {
             .ok_or_else(|| anyhow::anyhow!("PV {} has no hostPath.path", pv_name))?;
 
         let pv_host_path = pv_host_path.to_string();
-        let resolved = crate::kubelet::file_blocking::run_blocking_file(
-            "resolve_persistent_volume_host_path",
-            move || volumes::resolve_host_path(&pv_host_path, None),
-        )
-        .await?;
+        let resolved = ctx
+            .file_process
+            .run_blocking_file("resolve_persistent_volume_host_path", move || {
+                volumes::resolve_host_path(&pv_host_path, None)
+            })
+            .await?;
         Ok(Some(resolved))
     }
 }
@@ -692,7 +712,9 @@ mod tests {
             "leader-issued-token",
         );
 
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let ctx = VolumeContext {
+            file_process: &file_process,
             sources: &sources,
             namespace: "default",
             pod_name: "sa-pod",
@@ -790,7 +812,9 @@ mod tests {
         );
 
         let volume = pod["spec"]["volumes"][0].clone();
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let ctx = VolumeContext {
+            file_process: &file_process,
             sources: &sources,
             namespace: "default",
             pod_name,
@@ -877,7 +901,9 @@ mod tests {
         );
 
         let volume = pod["spec"]["volumes"][0].clone();
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let ctx = VolumeContext {
+            file_process: &file_process,
             sources: &sources,
             namespace: "default",
             pod_name,
@@ -939,7 +965,9 @@ mod tests {
             "name": volume_name,
             "configMap": {"name": "missing-cm", "optional": true}
         });
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let ctx = VolumeContext {
+            file_process: &file_process,
             sources: &db,
             namespace: "default",
             pod_name: "optional-cm",
@@ -983,7 +1011,9 @@ mod tests {
             }
         });
         let volume = json!({"name": "work", "emptyDir": {}});
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let ctx = VolumeContext {
+            file_process: &file_process,
             sources: &db,
             namespace: "default",
             pod_name: "emptydir-pod",
@@ -1066,7 +1096,9 @@ mod tests {
                 ]
             }
         });
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let ctx = VolumeContext {
+            file_process: &file_process,
             sources: &sources,
             namespace: "default",
             pod_name,
@@ -1140,7 +1172,9 @@ mod tests {
                 ]
             }
         });
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let ctx = VolumeContext {
+            file_process: &file_process,
             sources: &sources,
             namespace: "default",
             pod_name,
@@ -1211,7 +1245,9 @@ mod tests {
                 ]
             }
         });
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let ctx = VolumeContext {
+            file_process: &file_process,
             sources: &sources,
             namespace: "default",
             pod_name,
@@ -1279,7 +1315,9 @@ mod tests {
                 ]
             }
         });
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
         let ctx = VolumeContext {
+            file_process: &file_process,
             sources: &sources,
             namespace: "default",
             pod_name,

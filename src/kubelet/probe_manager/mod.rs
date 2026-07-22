@@ -70,22 +70,22 @@ fn parse_probe_params(probe_spec: &Value) -> ProbeParams {
 /// Manages health probe timers for all pods
 pub struct ProbeManager {
     /// Map of probe task key (namespace/name/uid) to probe task handles.
-    tasks: Arc<RwLock<HashMap<String, Vec<crate::task_supervisor::SupervisedJoinHandle<()>>>>>,
+    tasks: Arc<RwLock<HashMap<String, Vec<klights_supervisor::SupervisedJoinHandle<()>>>>>,
     /// Tracks readiness/liveness gating once startup probe has passed.
     /// Key format: namespace/name/uid/container when UID is known.
     startup_completed: Arc<RwLock<HashSet<String>>>,
     pod_reader: Arc<dyn crate::kubelet::pod_repository::PodReader>,
     cri: Option<Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>>,
     lifecycle_tx: mpsc::Sender<LifecycleCommand>,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl ProbeManager {
     #[cfg(test)]
     pub fn new(db_handle: DatastoreHandle, _containerd_namespace: String) -> Self {
         let (lifecycle_tx, _rx) = mpsc::channel(1);
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let metrics = crate::side_effects::SideEffectMetrics::new();
         let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
@@ -107,7 +107,7 @@ impl ProbeManager {
     }
 
     pub fn new_with_lifecycle(
-        task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         pod_reader: Arc<dyn crate::kubelet::pod_repository::PodReader>,
         cri: Option<Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>>,
         lifecycle_tx: mpsc::Sender<LifecycleCommand>,
@@ -335,7 +335,7 @@ impl ProbeManager {
     async fn spawn_probe_task_with_params(
         &self,
         spec: scheduler::ProbeTaskSpec,
-    ) -> Result<crate::task_supervisor::SupervisedJoinHandle<()>> {
+    ) -> Result<klights_supervisor::SupervisedJoinHandle<()>> {
         scheduler::spawn_probe_task_with_params(
             scheduler::ProbeTaskRuntime {
                 task_supervisor: self.task_supervisor.clone(),
@@ -388,8 +388,8 @@ pub async fn update_pod_condition(
         container_name,
         probe_type,
         success,
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
     )
     .await
@@ -405,8 +405,8 @@ pub async fn update_pod_condition_for_uid(
         db_handle,
         pod_repo,
         update,
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
     )
     .await
@@ -420,7 +420,7 @@ pub async fn update_pod_condition_with_supervisor(
     container_name: &str,
     probe_type: ProbeType,
     success: bool,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<()> {
     let parts: Vec<&str> = pod_key.split('/').collect();
     if parts.len() != 2 {
@@ -455,7 +455,7 @@ pub async fn update_pod_condition_for_uid_with_supervisor(
     _db_handle: &DatastoreHandle,
     pod_repo: &Arc<PodRepository>,
     update: PodConditionProbeUpdate<'_>,
-    _task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    _task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<()> {
     let PodConditionProbeUpdate {
         namespace,

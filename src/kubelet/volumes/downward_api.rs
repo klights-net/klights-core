@@ -13,6 +13,7 @@ struct DownwardFileWrite {
 }
 
 pub struct DownwardApiVolumeNsRequest<'a> {
+    pub file_process: &'a klights_supervisor::FileProcessExecutor,
     pub sources: &'a dyn VolumeSourceReader,
     pub namespace: &'a str,
     pub pod_dir_id: &'a str,
@@ -23,6 +24,7 @@ pub struct DownwardApiVolumeNsRequest<'a> {
 }
 
 pub struct DownwardApiVolumeWithDbNameRequest<'a> {
+    pub file_process: &'a klights_supervisor::FileProcessExecutor,
     pub volumes_root: &'a str,
     pub sources: &'a dyn VolumeSourceReader,
     pub namespace: &'a str,
@@ -96,13 +98,14 @@ fn build_downward_api_writes(
 }
 
 async fn render_downward_api_volume_keyed(
+    file_process: &klights_supervisor::FileProcessExecutor,
     task_label: &'static str,
     volume_path: &str,
     writes: Vec<DownwardFileWrite>,
 ) -> Result<()> {
     let key = volume_path.to_string();
     let volume_path = volume_path.to_string();
-    run_blocking_fs_keyed(task_label, &key, move || {
+    run_blocking_fs_keyed(file_process, task_label, &key, move || {
         render_downward_api_volume_blocking(volume_path, writes)
     })
     .await
@@ -111,6 +114,7 @@ async fn render_downward_api_volume_keyed(
 /// Refreshes downwardAPI and projected volumes when pod metadata changes.
 /// Re-renders volume files on disk to reflect updated labels/annotations.
 pub async fn refresh_downward_api_volumes(
+    file_process: &klights_supervisor::FileProcessExecutor,
     pod: &serde_json::Value,
     volumes_root: &str,
 ) -> Result<()> {
@@ -164,6 +168,7 @@ pub async fn refresh_downward_api_volumes(
             );
             let writes = build_downward_api_writes(pod, default_mode, items)?;
             render_downward_api_volume_keyed(
+                file_process,
                 "refresh_downward_api_volume_render",
                 &volume_path,
                 writes,
@@ -229,6 +234,7 @@ pub async fn refresh_downward_api_volumes(
             }
             if !writes.is_empty() {
                 render_downward_api_volume_keyed(
+                    file_process,
                     "refresh_projected_downward_api_files",
                     &volume_path,
                     writes,
@@ -248,6 +254,7 @@ pub async fn create_downward_api_volume_ns(
 ) -> Result<String> {
     let volumes_root = volumes_root();
     create_downward_api_volume_at_with_db_name(DownwardApiVolumeWithDbNameRequest {
+        file_process: request.file_process,
         volumes_root: &volumes_root,
         sources: request.sources,
         namespace: request.namespace,
@@ -270,6 +277,7 @@ pub async fn create_downward_api_volume_at(
     default_mode: Option<u32>,
     items: &serde_json::Value,
 ) -> Result<String> {
+    let file_process = crate::kubelet::file_blocking::test_file_process_executor();
     let pod_resource = sources
         .pod(namespace, pod_name)
         .await?
@@ -280,8 +288,13 @@ pub async fn create_downward_api_volume_at(
         volumes_root, pod_name, volume_name
     );
     let writes = build_downward_api_writes(&pod_resource.data, default_mode, items)?;
-    render_downward_api_volume_keyed("create_downward_api_volume_render", &volume_path, writes)
-        .await?;
+    render_downward_api_volume_keyed(
+        &file_process,
+        "create_downward_api_volume_render",
+        &volume_path,
+        writes,
+    )
+    .await?;
     Ok(volume_path)
 }
 
@@ -309,6 +322,7 @@ pub async fn create_downward_api_volume_at_with_db_name(
     let writes =
         build_downward_api_writes(&pod_resource.data, request.default_mode, request.items)?;
     render_downward_api_volume_keyed(
+        request.file_process,
         "create_downward_api_volume_with_db_name_render",
         &volume_path,
         writes,

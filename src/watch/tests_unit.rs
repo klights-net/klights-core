@@ -1,10 +1,8 @@
 use super::*;
 use klights_watch::{WatchAdvance, WatchSignal, WatchSignalReceiver, WatchTopic};
 
-fn test_task_supervisor() -> crate::task_supervisor::TaskSupervisor {
-    crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
-    )
+fn test_task_supervisor() -> klights_supervisor::TaskSupervisor {
+    klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default())
 }
 
 #[test]

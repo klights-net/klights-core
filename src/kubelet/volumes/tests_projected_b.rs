@@ -19,6 +19,7 @@ async fn test_projected_volume_missing_configmap_logs_error() {
     ]);
 
     let result = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -60,6 +61,7 @@ async fn test_projected_volume_optional_missing_configmap_creates_empty_volume()
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -110,6 +112,7 @@ async fn test_projected_volume_configmap_missing_key_errors() {
     ]);
 
     let result = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -160,6 +163,7 @@ async fn test_projected_volume_optional_configmap_missing_key_is_skipped() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -198,6 +202,7 @@ async fn test_projected_volume_optional_missing_secret_creates_empty_volume() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -249,6 +254,7 @@ async fn test_projected_volume_optional_secret_missing_key_is_skipped() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -304,6 +310,7 @@ async fn test_projected_volume_secret_writes_files() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -364,6 +371,7 @@ async fn test_projected_volume_configmap_without_items_writes_all_keys() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -429,6 +437,7 @@ async fn test_projected_volume_configmap_items_per_file_mode() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -505,6 +514,7 @@ async fn test_projected_volume_secret_without_items_writes_all_keys() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -568,6 +578,7 @@ async fn test_projected_volume_secret_items_per_file_mode() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -628,6 +639,7 @@ async fn test_projected_volume_downward_api_resource_field_ref() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -705,6 +717,7 @@ async fn test_projected_volume_combines_configmap_secret_downward_api() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -761,6 +774,7 @@ async fn test_projected_volume_missing_secret_returns_error() {
     ]);
 
     let result = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -806,6 +820,7 @@ async fn test_projected_volume_missing_sa_token_returns_error() {
     ]);
 
     let result = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -852,6 +867,7 @@ async fn test_projected_volume_sources_not_array_returns_error() {
     let sources = json!({"configMap": {"name": "test"}});
 
     let result = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -906,6 +922,7 @@ async fn test_projected_volume_configmap_no_data_field_returns_error() {
     ]);
 
     let result = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",
@@ -951,6 +968,7 @@ async fn test_projected_volume_sa_token_default_path_is_token() {
     ]);
 
     let path = create_projected_volume_at(ProjectedVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         source_reader: &db,
         namespace: "default",

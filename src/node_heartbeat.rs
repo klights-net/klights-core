@@ -68,7 +68,7 @@ pub async fn run_heartbeat_with_lease_client(
     lease_client: std::sync::Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     node_name: String,
     cancel_token: tokio_util::sync::CancellationToken,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) {
     run_heartbeat_with_interval(
         watch_source,
@@ -86,7 +86,7 @@ pub(crate) async fn run_heartbeat_with_interval(
     lease_client: std::sync::Arc<dyn klights_leader_api::LeaderNodeLeaseRenewal>,
     node_name: String,
     cancel_token: tokio_util::sync::CancellationToken,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     heartbeat_interval: Duration,
 ) {
     tracing::info!("Starting node heartbeat for {}", node_name);

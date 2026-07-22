@@ -348,8 +348,8 @@ async fn real_hook_runtime_exec_hook_uses_cri_runtime_port() {
     use crate::kubelet::pod_runtime::hooks::PodHookRuntime;
 
     let cri = Arc::new(MockCriRuntime::new());
-    let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let hooks =
         crate::kubelet::pod_runtime::hooks::RealPodHookRuntime::new(cri.clone(), supervisor);
@@ -484,8 +484,8 @@ async fn mock_network_records_assignment_and_release() {
 #[tokio::test]
 async fn real_network_runtime_rejects_release_when_uid_sandbox_row_does_not_match() {
     let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
-    let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {
@@ -575,8 +575,8 @@ async fn real_filesystem_handles_termination_log_with_parity() {
     let runtime_namespace = "klights-term-real-fs-test";
     let _ = std::fs::remove_dir_all(crate::paths::data_root_path(runtime_namespace));
     let fs = crate::kubelet::pod_runtime::filesystem::RealPodFilesystem::new(
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
         runtime_namespace.to_string(),
         "test-node".to_string(),
@@ -602,8 +602,8 @@ async fn real_filesystem_cleanup_removes_entire_pod_root() {
     let data_root = crate::paths::data_root_path(runtime_namespace);
     let _ = std::fs::remove_dir_all(&data_root);
     let fs = crate::kubelet::pod_runtime::filesystem::RealPodFilesystem::new(
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
         runtime_namespace.to_string(),
         "test-node".to_string(),
@@ -697,8 +697,8 @@ async fn fs_group_volume_ownership_with_parity() {
     );
 
     let fs = crate::kubelet::pod_runtime::filesystem::RealPodFilesystem::new(
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
         containerd_ns.clone(),
         "test-node".to_string(),
@@ -1064,8 +1064,8 @@ async fn fixture_pod_repository() -> std::sync::Arc<crate::kubelet::pod_reposito
     // namespace must exist), so seed them as a live cluster would have them.
     crate::kubelet::pod_runtime::test_support::seed_runtime_test_namespaces(&handle).await;
     std::mem::forget(ds);
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
     let metrics = crate::side_effects::SideEffectMetrics::new();
@@ -1114,8 +1114,8 @@ async fn real_pod_runtime_service_constructor_requires_all_object_ports() {
     let finalizer = std::sync::Arc::new(
         crate::kubelet::pod_runtime::test_support::MockPodDeletionFinalizer::new(),
     );
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let config = RuntimeConfig {
         node_name: "node-1".into(),
@@ -3845,8 +3845,8 @@ async fn fixture_runtime_with_node(
     let finalizer = std::sync::Arc::new(
         crate::kubelet::pod_runtime::test_support::MockPodDeletionFinalizer::new(),
     );
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let config = RuntimeConfig {
         node_name: node_name.to_string(),
@@ -4039,8 +4039,8 @@ async fn fixture_runtime_with_cluster(
     let finalizer = std::sync::Arc::new(
         crate::kubelet::pod_runtime::test_support::MockPodDeletionFinalizer::new(),
     );
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let config = RuntimeConfig {
         node_name: node_name.to_string(),
@@ -4495,8 +4495,8 @@ async fn mock_dependency_matrix_replication() {
 /// Timer: TaskSupervisor spawn_delay fires once per scheduled deadline.
 #[tokio::test]
 async fn mock_dependency_matrix_timer() {
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let fired_clone = fired.clone();
@@ -10268,8 +10268,8 @@ async fn production_runtime_stop_unstarted_terminating_pod_allows_actor_finaliza
     let (ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
     db.seed_namespace_for_test("sonobuoy").await;
     std::mem::forget(ds);
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let parts = crate::kubelet::pod_repository::PodRepository::build_parts(
         crate::kubelet::pod_repository::PodRepositoryBuildConfig {

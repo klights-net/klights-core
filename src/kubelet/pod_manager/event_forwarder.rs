@@ -10,7 +10,7 @@ fn now_ms() -> i64 {
 pub(super) async fn spawn_cri_event_forwarder(
     cri: std::sync::Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
     cancel_token: tokio_util::sync::CancellationToken,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     lifecycle_tx: Option<
         tokio::sync::mpsc::Sender<crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
     >,
@@ -21,7 +21,7 @@ pub(super) async fn spawn_cri_event_forwarder(
     let (tx, rx) = mpsc::channel(1024);
     let task_supervisor_for_worker = task_supervisor.clone();
     if let Err(err) = task_supervisor.spawn_async(
-        crate::task_supervisor::TaskCategory::Background,
+        klights_supervisor::TaskCategory::Background,
         "cri_event_forwarder",
         async move {
         let mut reconnect_attempt = 0u32;
@@ -264,9 +264,9 @@ mod tests {
         }
     }
 
-    fn supervisor() -> Arc<crate::task_supervisor::TaskSupervisor> {
-        Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+    fn supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
+        Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ))
     }
 

@@ -12,7 +12,8 @@ pub async fn run_startup_resource_recovery(
     node_mode: &NodeMode,
     network_cleanup: &networking::NetworkCleanup,
     containerd_state_dir: &str,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+    file_process: &klights_supervisor::FileProcessExecutor,
     grpc_transport_policy: &crate::replication::grpc::transport_policy::GrpcTransportPolicy,
 ) -> anyhow::Result<()> {
     if config.containerd_socket.is_some() {
@@ -25,6 +26,7 @@ pub async fn run_startup_resource_recovery(
     let namespace = &config.containerd_namespace;
     let rootless = matches!(node_mode, NodeMode::Rootless { .. });
     match kubelet::ContainerdManager::namespace_containerd_is_reusable(
+        file_process,
         namespace,
         rootless,
         grpc_transport_policy,
@@ -53,27 +55,36 @@ pub async fn run_startup_resource_recovery(
         }
     }
 
-    stop_namespace_containerd_after_cleanup(namespace, task_supervisor).await;
+    stop_namespace_containerd_after_cleanup(namespace, task_supervisor, file_process).await;
     network_cleanup.cleanup_startup_network_best_effort().await;
 
-    if let Err(e) = shutdown::cleanup_shm_mounts(containerd_state_dir).await {
+    if let Err(e) = shutdown::cleanup_shm_mounts(file_process, containerd_state_dir).await {
         tracing::warn!("Failed to cleanup stale startup shm mounts: {}", e);
     }
 
     let containerd_base = paths::containerd_root_dir_path(namespace)
         .to_string_lossy()
         .into_owned();
-    if let Err(e) = shutdown::cleanup_overlay_rootfs_mounts(&containerd_base).await {
+    if let Err(e) = shutdown::cleanup_overlay_rootfs_mounts(file_process, &containerd_base).await {
         tracing::warn!("Failed to cleanup stale startup overlay mounts: {}", e);
     }
 
-    if let Err(e) =
-        shutdown::cleanup_containerd_sandbox_mounts(containerd_state_dir, &containerd_base).await
+    if let Err(e) = shutdown::cleanup_containerd_sandbox_mounts(
+        file_process,
+        containerd_state_dir,
+        &containerd_base,
+    )
+    .await
     {
         tracing::warn!("Failed to cleanup stale startup sandbox mounts: {}", e);
     }
 
-    match kubelet::cgroup_cleanup::kill_namespace_cgroup_processes(namespace, task_supervisor).await
+    match kubelet::cgroup_cleanup::kill_namespace_cgroup_processes(
+        namespace,
+        task_supervisor,
+        file_process,
+    )
+    .await
     {
         Ok(killed) if killed > 0 => {
             tracing::info!(namespace = %namespace, killed, "Stopped stale startup cgroup processes");
@@ -81,7 +92,7 @@ pub async fn run_startup_resource_recovery(
         Ok(_) => {}
         Err(e) => tracing::warn!("Failed to stop stale startup cgroup processes: {}", e),
     }
-    match kubelet::cgroup_cleanup::cleanup_namespace_cgroup_tree(namespace).await {
+    match kubelet::cgroup_cleanup::cleanup_namespace_cgroup_tree(file_process, namespace).await {
         Ok(removed) if removed > 0 => {
             tracing::info!(namespace = %namespace, removed, "Removed stale startup cgroups");
         }
@@ -89,13 +100,13 @@ pub async fn run_startup_resource_recovery(
         Err(e) => tracing::warn!("Failed to cleanup stale startup cgroups: {}", e),
     }
 
-    shutdown::cleanup_containerd_root_dir(namespace)
+    shutdown::cleanup_containerd_root_dir(file_process, namespace)
         .await
         .with_context(|| {
             format!("failed to remove unreclaimable embedded containerd root for {namespace}")
         })?;
 
-    if let Err(e) = shutdown::cleanup_cni_config_dir(namespace).await {
+    if let Err(e) = shutdown::cleanup_cni_config_dir(file_process, namespace).await {
         tracing::warn!("Failed to cleanup stale startup CNI config: {}", e);
     }
 

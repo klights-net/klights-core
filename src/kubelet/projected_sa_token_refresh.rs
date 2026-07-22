@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
 use crate::kubelet::volume_sources::VolumeSourceReader;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 const DEFAULT_SERVICE_ACCOUNT_AUDIENCE: &str = "https://kubernetes.default.svc.cluster.local";
 const MAX_PROJECTED_TOKEN_REFRESH_DELAY: std::time::Duration =
@@ -24,6 +24,7 @@ struct ProjectedServiceAccountTokenRef {
 
 #[derive(Clone)]
 pub(crate) struct ProjectedSaTokenRefreshRequest {
+    pub file_process: klights_supervisor::FileProcessExecutor,
     pub sources: Arc<dyn VolumeSourceReader>,
     pub volumes_root: String,
     pub key: PodRuntimeKey,
@@ -223,15 +224,17 @@ async fn mint_projected_service_account_token(
 }
 
 async fn write_projected_service_account_token_file(
+    file_process: &klights_supervisor::FileProcessExecutor,
     volume_path: String,
     token_ref: ProjectedServiceAccountTokenRef,
     token: String,
 ) -> Result<()> {
-    if !crate::utils::path_exists_async(&volume_path).await? {
+    if !crate::utils::path_exists_async(file_process, &volume_path).await? {
         anyhow::bail!("projected volume path {} no longer exists", volume_path);
     }
     let key = volume_path.clone();
     crate::kubelet::volumes::run_blocking_fs_keyed(
+        file_process,
         "refresh_projected_sa_token_file",
         &key,
         move || {
@@ -285,6 +288,7 @@ async fn recreate_projected_service_account_token_volume(
     let pod_dir_id = request.key.volume_dir_id();
     crate::kubelet::volumes::create_projected_volume_under_root(
         crate::kubelet::volumes::ProjectedVolumeRootRequest {
+            file_process: &request.file_process,
             volumes_root: &request.volumes_root,
             source_reader: request.sources.as_ref(),
             namespace: &request.key.namespace,
@@ -331,7 +335,7 @@ pub(crate) async fn refresh_projected_service_account_tokens_once(
         if recreated_volumes.contains(&token_ref.volume_name) {
             continue;
         }
-        if !crate::utils::path_exists_async(&volume_path).await? {
+        if !crate::utils::path_exists_async(&request.file_process, &volume_path).await? {
             recreate_projected_service_account_token_volume(&request, pod, &token_ref.volume_name)
                 .await?;
             recreated_volumes.insert(token_ref.volume_name);
@@ -339,7 +343,13 @@ pub(crate) async fn refresh_projected_service_account_tokens_once(
         }
         let token =
             mint_projected_service_account_token(request.sources.as_ref(), pod, &token_ref).await?;
-        write_projected_service_account_token_file(volume_path, token_ref, token).await?;
+        write_projected_service_account_token_file(
+            &request.file_process,
+            volume_path,
+            token_ref,
+            token,
+        )
+        .await?;
     }
 
     let next_delay = refs
@@ -651,6 +661,7 @@ mod tests {
 
         let outcome = super::refresh_projected_service_account_tokens_once(
             super::ProjectedSaTokenRefreshRequest {
+                file_process: crate::kubelet::file_blocking::test_file_process_executor(),
                 sources: sources.clone(),
                 volumes_root: volumes_root.to_string_lossy().into_owned(),
                 key,
@@ -758,6 +769,7 @@ mod tests {
 
         let outcome = super::refresh_projected_service_account_tokens_once(
             super::ProjectedSaTokenRefreshRequest {
+                file_process: crate::kubelet::file_blocking::test_file_process_executor(),
                 sources: sources.clone(),
                 volumes_root: volumes_root.to_string_lossy().into_owned(),
                 key,

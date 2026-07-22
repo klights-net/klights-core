@@ -43,8 +43,8 @@ use tokio::sync::broadcast;
 
 use crate::datastore::WatchReplayRead;
 use crate::networking::{NodeName, PodSubnet};
-use crate::task_supervisor::TaskSupervisor;
 use crate::watch::WatchBus;
+use klights_supervisor::TaskSupervisor;
 use klights_watch::WatchTopic;
 
 impl std::fmt::Debug for Datastore {
@@ -3378,7 +3378,7 @@ impl Datastore {
     #[cfg(test)]
     pub async fn new_in_memory() -> Result<Self> {
         let supervisor = std::sync::Arc::new(TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let executor =
             DbExecutor::open_in_memory(supervisor.clone(), "sqlite:memory:cluster").await?;

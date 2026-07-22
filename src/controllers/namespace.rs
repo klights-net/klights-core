@@ -5,12 +5,17 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
 const DEFAULT_NAMESPACES: [&str; 4] = ["default", "kube-system", "kube-public", "kube-node-lease"];
 
-pub async fn init_default_namespaces(db: &dyn DatastoreBackend) -> Result<()> {
+pub async fn init_default_namespaces(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    db: &dyn DatastoreBackend,
+) -> Result<()> {
     // Read CA cert once (will be used for all namespaces)
     let containerd_ns =
         std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or("klights".to_string());
     let ca_cert_path = crate::paths::ca_cert_path(&containerd_ns);
-    let ca_cert_pem = crate::utils::read_utf8_file_async(&ca_cert_path).await.ok();
+    let ca_cert_pem = crate::utils::read_utf8_file_async(file_process, &ca_cert_path)
+        .await
+        .ok();
 
     for ns_name in DEFAULT_NAMESPACES {
         // Check if namespace already exists (use new get_namespace method)
@@ -173,7 +178,11 @@ async fn namespace_absent_or_terminating(
 /// Reconcile `kube-root-ca.crt` in a namespace: read the CA from the
 /// bootstrap file and create the ConfigMap if it does not exist.
 /// Skips if the namespace is terminating.
-pub async fn reconcile_kube_root_ca(db: &dyn DatastoreBackend, namespace: &str) -> Result<()> {
+pub async fn reconcile_kube_root_ca(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    db: &dyn DatastoreBackend,
+    namespace: &str,
+) -> Result<()> {
     if namespace_absent_or_terminating(db, namespace).await? {
         return Ok(());
     }
@@ -191,7 +200,7 @@ pub async fn reconcile_kube_root_ca(db: &dyn DatastoreBackend, namespace: &str) 
     let containerd_ns =
         std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or("klights".to_string());
     let ca_cert_path = crate::paths::ca_cert_path(&containerd_ns);
-    let ca_pem = match crate::utils::read_utf8_file_async(&ca_cert_path).await {
+    let ca_pem = match crate::utils::read_utf8_file_async(file_process, &ca_cert_path).await {
         Ok(pem) => pem,
         Err(e) => {
             tracing::warn!("Cannot read CA cert from {}: {e}", ca_cert_path.display());
@@ -206,7 +215,11 @@ pub async fn reconcile_kube_root_ca(db: &dyn DatastoreBackend, namespace: &str) 
 /// the bootstrap file and update the existing ConfigMap's `ca.crt` key.
 /// Used when the data is cleared or modified by a user.
 /// Skips if the namespace is terminating.
-pub async fn reconcile_kube_root_ca_data(db: &dyn DatastoreBackend, namespace: &str) -> Result<()> {
+pub async fn reconcile_kube_root_ca_data(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    db: &dyn DatastoreBackend,
+    namespace: &str,
+) -> Result<()> {
     if namespace_absent_or_terminating(db, namespace).await? {
         return Ok(());
     }
@@ -215,7 +228,7 @@ pub async fn reconcile_kube_root_ca_data(db: &dyn DatastoreBackend, namespace: &
     let containerd_ns =
         std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or("klights".to_string());
     let ca_cert_path = crate::paths::ca_cert_path(&containerd_ns);
-    let ca_pem = match crate::utils::read_utf8_file_async(&ca_cert_path).await {
+    let ca_pem = match crate::utils::read_utf8_file_async(file_process, &ca_cert_path).await {
         Ok(pem) => pem,
         Err(e) => {
             tracing::warn!("Cannot read CA cert from {}: {e}", ca_cert_path.display());
@@ -373,6 +386,16 @@ pub async fn reconcile_namespace_for_test(
 mod tests {
     use super::*;
     use tokio::sync::{Mutex, MutexGuard};
+
+    async fn init_default_namespaces(db: &dyn DatastoreBackend) -> Result<()> {
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        super::init_default_namespaces(&file_process, db).await
+    }
+
+    async fn reconcile_kube_root_ca(db: &dyn DatastoreBackend, namespace: &str) -> Result<()> {
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        super::reconcile_kube_root_ca(&file_process, db, namespace).await
+    }
 
     static CONTAINERD_NAMESPACE_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 

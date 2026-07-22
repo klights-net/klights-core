@@ -42,7 +42,7 @@ impl GcScheduler {
     /// compete for CPU/IO at the same instant.
     pub async fn run(
         self,
-        task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         cancel: tokio_util::sync::CancellationToken,
     ) {
         let (tick_tx, mut tick_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -143,8 +143,8 @@ mod tests {
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_for_run = cancel.clone();
-        let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let handle =
             tokio::spawn(async move { scheduler.run(task_supervisor, cancel_for_run).await });
@@ -245,8 +245,8 @@ mod tests {
 
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_for_run = cancel.clone();
-        let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let handle =
             tokio::spawn(async move { scheduler.run(task_supervisor, cancel_for_run).await });
@@ -266,8 +266,8 @@ mod tests {
         let scheduler = GcScheduler::new(Duration::from_secs(60));
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_for_run = cancel.clone();
-        let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let handle =
             tokio::spawn(async move { scheduler.run(task_supervisor, cancel_for_run).await });

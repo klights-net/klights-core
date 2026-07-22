@@ -25,7 +25,8 @@ pub(super) struct WatchEventHandlerContext<'a> {
     pub pod_lifecycle_state: &'a PodLifecycleStateTracker,
     pub pod_lifecycle_router:
         std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
-    pub task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
+    pub file_process: klights_supervisor::FileProcessExecutor,
 }
 
 pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, event: WatchEvent) {
@@ -40,6 +41,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         pod_lifecycle_state,
         pod_lifecycle_router,
         task_supervisor,
+        file_process,
     } = context;
     // Check event kind and dispatch to appropriate handler
     let event_kind = event
@@ -85,6 +87,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
             .into_owned();
         let refresh_result = if event.event_type == EventType::Deleted {
             crate::kubelet::volumes::refresh_secret_configmap_volumes_after_delete(
+                &file_process,
                 event_kind,
                 event_ns,
                 event_name,
@@ -94,6 +97,7 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
             .await
         } else {
             crate::kubelet::volumes::refresh_secret_configmap_volumes_from_event(
+                &file_process,
                 event_kind,
                 event_ns,
                 event_name,
@@ -213,9 +217,12 @@ pub(super) async fn handle_watch_event(context: WatchEventHandlerContext<'_>, ev
         let volumes_root = crate::paths::volumes_root_path(containerd_namespace)
             .to_string_lossy()
             .into_owned();
-        if let Err(e) =
-            crate::kubelet::volumes::refresh_downward_api_volumes(&event.object, &volumes_root)
-                .await
+        if let Err(e) = crate::kubelet::volumes::refresh_downward_api_volumes(
+            &file_process,
+            &event.object,
+            &volumes_root,
+        )
+        .await
         {
             tracing::warn!(
                 "Failed to refresh downwardAPI volumes after pod modification: {}",
@@ -690,15 +697,15 @@ mod tests {
         }
     }
 
-    fn fixture_supervisor() -> Arc<crate::task_supervisor::TaskSupervisor> {
-        Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+    fn fixture_supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
+        Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ))
     }
 
     fn fixture_pod_repo(
         db_handle: crate::datastore::DatastoreHandle,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Arc<crate::kubelet::pod_repository::PodRepository> {
         let pod_repo = Arc::new(crate::kubelet::pod_repository::PodRepository::new(
             db_handle,
@@ -913,6 +920,7 @@ mod tests {
             Arc::new(NoopPersistentVolumeEventHandler::new());
         handle_watch_event(
             WatchEventHandlerContext {
+                file_process: crate::kubelet::file_blocking::test_file_process_executor(),
                 persistent_volume_event_handler: &persistent_volume_event_handler,
                 cluster_api: &cluster_api,
                 node_name: "worker-a",

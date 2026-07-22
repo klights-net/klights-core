@@ -57,7 +57,7 @@ pub(super) fn parse_deadline_timer_delay_secs(
 
 pub(super) async fn schedule_active_deadline_timer_for_modified_pod(
     pod: &serde_json::Value,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     pod_lifecycle_router: std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
 ) {
     let Some((namespace, pod_name, delay_secs, schedule_key)) =

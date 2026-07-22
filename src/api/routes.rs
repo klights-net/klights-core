@@ -417,7 +417,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .nest(
             "/klights/v1/task-supervisor",
-            crate::task_supervisor::api::routes(),
+            crate::api::task_supervisor::routes(),
         )
         .route("/klights/v1/status", get(klights_status_handler))
         // Unmatched paths and unsupported methods must return a metav1.Status
@@ -564,10 +564,12 @@ async fn openid_jwks(State(state): State<Arc<AppState>>) -> Result<Json<Value>, 
     use rsa::{RsaPrivateKey, pkcs8::DecodePrivateKey, traits::PublicKeyParts};
     use sha2::Digest;
 
-    let signing_key_pem =
-        crate::auth::read_service_account_signing_key_async(&state.config.containerd_namespace)
-            .await
-            .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
+    let signing_key_pem = crate::auth::read_service_account_signing_key_async(
+        &state.file_process,
+        &state.config.containerd_namespace,
+    )
+    .await
+    .map_err(|e| AppError::InternalError(format!("Failed to read signing key: {}", e)))?;
 
     if let Ok(private_key) = RsaPrivateKey::from_pkcs8_pem(&signing_key_pem) {
         let n_bytes = private_key.n().to_bytes_be();
@@ -973,8 +975,8 @@ mod status_tests {
         crate::bootstrap::cluster_meta::ensure_cluster_metadata(state.db.as_ref())
             .await
             .unwrap();
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let replication = std::sync::Arc::new(crate::replication::ReplicationService::new(
             state.db.clone(),

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 
 use crate::datastore::errors::OpenError;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 use super::{fingerprint, queries, schema};
 
@@ -468,7 +468,7 @@ pub fn init_schema_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task_supervisor::TaskCategoryConfig;
+    use klights_supervisor::TaskCategoryConfig;
     use rusqlite::OptionalExtension;
     use std::sync::Arc;
 

@@ -169,7 +169,7 @@ impl<S: WatchReplaySource> WatchCursor<S> {
 
     pub async fn next_event(
         &mut self,
-        task_supervisor: &crate::task_supervisor::TaskSupervisor,
+        task_supervisor: &klights_supervisor::TaskSupervisor,
     ) -> std::result::Result<WatchEvent, WatchCursorError> {
         loop {
             if let Some(event) = self.pop_pending_event() {
@@ -365,7 +365,7 @@ impl<S: WatchReplaySource> WatchCursor<S> {
     pub async fn next_event_recovering(
         &mut self,
         cancel: &CancellationToken,
-        task_supervisor: &crate::task_supervisor::TaskSupervisor,
+        task_supervisor: &klights_supervisor::TaskSupervisor,
     ) -> Result<Option<WatchEvent>, WatchCursorError> {
         loop {
             if cancel.is_cancelled() {

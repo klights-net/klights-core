@@ -14,20 +14,6 @@ use std::path::{Path, PathBuf};
 
 use crate::bootstrap::NodeMode;
 
-async fn run_network_command(
-    name: &'static str,
-    program: &str,
-    args: &[&str],
-) -> Result<std::process::Output> {
-    run_network_command_with(
-        &crate::kubelet::file_blocking::SupervisedProcessOutputRunner,
-        name,
-        program,
-        args,
-    )
-    .await
-}
-
 async fn run_network_command_with(
     runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
     name: &'static str,
@@ -36,7 +22,7 @@ async fn run_network_command_with(
 ) -> Result<std::process::Output> {
     runner
         .run(
-            crate::task_supervisor::TaskCategory::Network,
+            klights_supervisor::TaskCategory::Network,
             name,
             program,
             args,
@@ -95,21 +81,38 @@ struct CniCleanupScope {
 /// a successful `NetworkPlane::boot()`. It only captures mode + static config,
 /// which lets cleanup run even after partial network boot failure while still
 /// keeping direct network operations inside `src/networking/`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NetworkCleanup {
     mode: NetworkCleanupMode,
     cni_scope: CniCleanupScope,
+    file_process: klights_supervisor::FileProcessExecutor,
+}
+
+impl std::fmt::Debug for NetworkCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NetworkCleanup")
+            .field("mode", &self.mode)
+            .field("cni_scope", &self.cni_scope)
+            .field("file_process", &"<FileProcessExecutor>")
+            .finish()
+    }
 }
 
 impl NetworkCleanup {
     /// Build cleanup from immutable startup mode/config. Must be called before
     /// network boot so failure paths still have a networking-owned fallback.
-    pub fn from_config(mode: &NodeMode, cfg: &crate::KlightsConfig) -> Self {
+    pub fn from_config(
+        mode: &NodeMode,
+        cfg: &crate::KlightsConfig,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
         match mode {
             NodeMode::Root => Self::root_with_runtime(
                 cfg.bridge_name.clone(),
                 cfg.wireguard_device.clone(),
                 cfg.containerd_namespace.clone(),
+                file_process,
             ),
             NodeMode::Rootless {
                 rootlesskit_pid, ..
@@ -118,6 +121,7 @@ impl NetworkCleanup {
                 cfg.wireguard_device.clone(),
                 cfg.containerd_namespace.clone(),
                 *rootlesskit_pid != 0,
+                file_process,
             ),
         }
     }
@@ -126,10 +130,14 @@ impl NetworkCleanup {
     #[cfg(test)]
     pub fn root(bridge_name: impl Into<String>) -> Self {
         let bridge_name = bridge_name.into();
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
+        ));
         Self::root_with_runtime(
             bridge_name.clone(),
             crate::networking::wireguard::DEFAULT_WIREGUARD_DEVICE.to_string(),
             bridge_name,
+            klights_supervisor::FileProcessExecutor::new(supervisor),
         )
     }
 
@@ -137,6 +145,7 @@ impl NetworkCleanup {
         bridge_name: impl Into<String>,
         wireguard_device: impl Into<String>,
         nft_table_name: impl Into<String>,
+        file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         let bridge_name = bridge_name.into();
         Self {
@@ -146,6 +155,7 @@ impl NetworkCleanup {
                 nft_table_name: nft_table_name.into(),
             },
             cni_scope: CniCleanupScope::new(bridge_name),
+            file_process,
         }
     }
 
@@ -154,6 +164,7 @@ impl NetworkCleanup {
         wireguard_device: impl Into<String>,
         nft_table_name: impl Into<String>,
         inside_rootlesskit: bool,
+        file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         let network_name = network_name.into();
         Self {
@@ -164,7 +175,17 @@ impl NetworkCleanup {
                 inside_rootlesskit,
             },
             cni_scope: CniCleanupScope::new(network_name),
+            file_process,
         }
+    }
+
+    async fn run_network_command(
+        &self,
+        name: &'static str,
+        program: &str,
+        args: &[&str],
+    ) -> Result<std::process::Output> {
+        run_network_command_with(&self.file_process, name, program, args).await
     }
 
     /// Best-effort runtime networking cleanup: remove veths first while the
@@ -279,12 +300,13 @@ impl NetworkCleanup {
     }
 
     async fn cleanup_recorded_veth(&self, sandbox_id: &str, iface: &str) {
-        let check = match run_network_command(
-            "network_cleanup_recorded_veth_inspect",
-            "ip",
-            &["link", "show", iface],
-        )
-        .await
+        let check = match self
+            .run_network_command(
+                "network_cleanup_recorded_veth_inspect",
+                "ip",
+                &["link", "show", iface],
+            )
+            .await
         {
             Ok(out) => out,
             Err(e) => {
@@ -301,12 +323,13 @@ impl NetworkCleanup {
             return;
         }
 
-        match run_network_command(
-            "network_cleanup_recorded_veth_delete",
-            "ip",
-            &link_delete_args(iface),
-        )
-        .await
+        match self
+            .run_network_command(
+                "network_cleanup_recorded_veth_delete",
+                "ip",
+                &link_delete_args(iface),
+            )
+            .await
         {
             Ok(out) if out.status.success() => {
                 tracing::info!(
@@ -338,10 +361,7 @@ impl NetworkCleanup {
     /// Clean up the owned bridge interface in the current network namespace.
     /// Rootless cleanup is active only inside rootlesskit, never from the host.
     pub async fn cleanup_bridge(&self) -> Result<()> {
-        self.cleanup_bridge_with_runner(
-            &crate::kubelet::file_blocking::SupervisedProcessOutputRunner,
-        )
-        .await?;
+        self.cleanup_bridge_with_runner(&self.file_process).await?;
         Ok(())
     }
 
@@ -388,13 +408,14 @@ impl NetworkCleanup {
             return Ok(());
         };
 
-        let output = run_network_command(
-            "network_cleanup_orphaned_veth_list",
-            "ip",
-            &orphaned_veth_list_args(bridge_name),
-        )
-        .await
-        .context("Failed to list network interfaces")?;
+        let output = self
+            .run_network_command(
+                "network_cleanup_orphaned_veth_list",
+                "ip",
+                &orphaned_veth_list_args(bridge_name),
+            )
+            .await
+            .context("Failed to list network interfaces")?;
         if !output.status.success() {
             return Err(command_failure(
                 "ip",
@@ -408,12 +429,13 @@ impl NetworkCleanup {
 
         let mut count = 0u32;
         for iface in veths {
-            let delete = run_network_command(
-                "network_cleanup_orphaned_veth_delete",
-                "ip",
-                &link_delete_args(&iface),
-            )
-            .await;
+            let delete = self
+                .run_network_command(
+                    "network_cleanup_orphaned_veth_delete",
+                    "ip",
+                    &link_delete_args(&iface),
+                )
+                .await;
 
             match delete {
                 Ok(out) if out.status.success() => {
@@ -455,12 +477,13 @@ impl NetworkCleanup {
             return Ok(());
         };
 
-        let check = run_network_command(
-            "network_cleanup_wireguard_inspect",
-            "ip",
-            &wireguard_show_args(wireguard_device),
-        )
-        .await?;
+        let check = self
+            .run_network_command(
+                "network_cleanup_wireguard_inspect",
+                "ip",
+                &wireguard_show_args(wireguard_device),
+            )
+            .await?;
 
         if !check.status.success() {
             if inspection_reports_not_found(&check) {
@@ -473,13 +496,14 @@ impl NetworkCleanup {
             ));
         }
 
-        let delete = run_network_command(
-            "network_cleanup_wireguard_delete",
-            "ip",
-            &wireguard_delete_args(wireguard_device),
-        )
-        .await
-        .context("Failed to delete WireGuard interface")?;
+        let delete = self
+            .run_network_command(
+                "network_cleanup_wireguard_delete",
+                "ip",
+                &wireguard_delete_args(wireguard_device),
+            )
+            .await
+            .context("Failed to delete WireGuard interface")?;
         if delete.status.success() {
             tracing::info!("Deleted WireGuard interface: {}", wireguard_device);
         } else {
@@ -499,12 +523,13 @@ impl NetworkCleanup {
             return Ok(());
         };
 
-        let check = run_network_command(
-            "network_cleanup_nft_table_inspect",
-            "nft",
-            &nft_list_table_args(nft_table_name),
-        )
-        .await?;
+        let check = self
+            .run_network_command(
+                "network_cleanup_nft_table_inspect",
+                "nft",
+                &nft_list_table_args(nft_table_name),
+            )
+            .await?;
 
         if !check.status.success() {
             if inspection_reports_not_found(&check) {
@@ -517,13 +542,14 @@ impl NetworkCleanup {
             ));
         }
 
-        let delete = run_network_command(
-            "network_cleanup_nft_table_delete",
-            "nft",
-            &nft_delete_table_args(nft_table_name),
-        )
-        .await
-        .context("Failed to delete nftables table")?;
+        let delete = self
+            .run_network_command(
+                "network_cleanup_nft_table_delete",
+                "nft",
+                &nft_delete_table_args(nft_table_name),
+            )
+            .await
+            .context("Failed to delete nftables table")?;
         if delete.status.success() {
             tracing::info!("Deleted nftables table inet {}", nft_table_name);
         } else {
@@ -540,12 +566,12 @@ impl NetworkCleanup {
     pub async fn cleanup_cni_artifacts(&self) -> Result<()> {
         let scope = self.cni_scope.clone();
         let key = scope.results_dir.to_string_lossy().into_owned();
-        let artifacts = crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "cleanup_cni_cache_files",
-            key,
-            move || cleanup_cni_cache_files(scope),
-        )
-        .await?;
+        let artifacts = self
+            .file_process
+            .run_blocking_file_keyed("cleanup_cni_cache_files", key, move || {
+                cleanup_cni_cache_files(scope)
+            })
+            .await?;
 
         let mut seen = HashSet::new();
         for artifact in artifacts {
@@ -561,16 +587,20 @@ impl NetworkCleanup {
 
     async fn cleanup_cni_netns(&self, netns_name: &str) {
         let netns_path = netns_runtime_path(netns_name);
-        if !matches!(crate::utils::path_exists_async(&netns_path).await, Ok(true)) {
+        if !matches!(
+            crate::utils::path_exists_async(&self.file_process, &netns_path).await,
+            Ok(true)
+        ) {
             return;
         }
 
-        match run_network_command(
-            "network_cleanup_cni_netns_delete",
-            "ip",
-            &netns_delete_args(netns_name),
-        )
-        .await
+        match self
+            .run_network_command(
+                "network_cleanup_cni_netns_delete",
+                "ip",
+                &netns_delete_args(netns_name),
+            )
+            .await
         {
             Ok(out) if out.status.success() => {
                 tracing::info!("Deleted CNI netns: {}", netns_name);
@@ -949,6 +979,16 @@ mod tests {
     use super::*;
     use crate::kubelet::file_blocking::process_test_support::{FakeProcessOutputRunner, output};
 
+    #[test]
+    fn network_cleanup_remains_publicly_debuggable_without_exposing_executor_state() {
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_debug::<NetworkCleanup>();
+
+        let rendered = format!("{:?}", NetworkCleanup::root("klights"));
+        assert!(rendered.contains("file_process: \"<FileProcessExecutor>\""));
+        assert!(!rendered.contains("TaskSupervisorInner"));
+    }
+
     #[tokio::test]
     async fn bridge_cleanup_obeys_spawn_status_not_found_and_mutation_results() {
         struct Case {
@@ -1054,7 +1094,11 @@ mod tests {
         cfg.containerd_namespace = "klights".to_string();
         cfg.wireguard_device = "klights.wg".to_string();
 
-        let cleanup = NetworkCleanup::from_config(&NodeMode::Root, &cfg);
+        let cleanup = NetworkCleanup::from_config(
+            &NodeMode::Root,
+            &cfg,
+            crate::kubelet::file_blocking::test_file_process_executor(),
+        );
 
         assert_eq!(cleanup.bridge_name_for_test(), Some("klights"));
         assert_eq!(
@@ -1212,6 +1256,7 @@ mod tests {
                 user_netns: std::path::PathBuf::from("/proc/42/ns/net"),
             },
             &cfg,
+            crate::kubelet::file_blocking::test_file_process_executor(),
         );
 
         assert_eq!(

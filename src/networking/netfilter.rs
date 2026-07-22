@@ -33,7 +33,7 @@ pub struct Netfilter {
 
 struct NetfilterInner {
     socket: Mutex<NetfilterSocket>,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 struct NetfilterSocket {
@@ -59,7 +59,7 @@ impl NetfilterSocket {
 impl Netfilter {
     /// Open a netlink socket to the kernel `nf_tables` subsystem.
     /// Requires `CAP_NET_ADMIN` (i.e. root for klights).
-    pub fn new(task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>) -> Result<Self> {
+    pub fn new(task_supervisor: Arc<klights_supervisor::TaskSupervisor>) -> Result<Self> {
         let socket = NetfilterSocket::open()?;
         Ok(Self {
             inner: Arc::new(NetfilterInner {
@@ -160,7 +160,7 @@ impl Netfilter {
         self.inner
             .task_supervisor
             .run_blocking(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "netfilter_send_batch",
                 move || inner.send_blocking(batch),
             )
@@ -171,11 +171,9 @@ impl Netfilter {
     pub async fn nft_output(&self, name: impl Into<String>, args: Vec<String>) -> Result<Output> {
         self.inner
             .task_supervisor
-            .run_blocking(
-                crate::task_supervisor::TaskCategory::Network,
-                name,
-                move || std::process::Command::new("nft").args(args).output(),
-            )
+            .run_blocking(klights_supervisor::TaskCategory::Network, name, move || {
+                std::process::Command::new("nft").args(args).output()
+            })
             .await
             .context("nft command task failed")?
             .context("run nft command")
@@ -510,9 +508,9 @@ mod integration_tests {
             .unwrap_or(false)
     }
 
-    fn test_task_supervisor() -> Arc<crate::task_supervisor::TaskSupervisor> {
-        Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+    fn test_task_supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
+        Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ))
     }
 

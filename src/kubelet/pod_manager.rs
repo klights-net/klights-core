@@ -75,7 +75,8 @@ struct PodWatcherRuntimeContext {
     cluster_api: Arc<dyn crate::control_plane::client::LeaderApiClient>,
     node_local: Option<crate::datastore::node_local::NodeLocalHandle>,
     config: Arc<crate::KlightsConfig>,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    file_process: klights_supervisor::FileProcessExecutor,
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
     pod_lifecycle_router: Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
     persistent_volume_event_handler: Arc<dyn PersistentVolumeEventHandler>,
@@ -99,6 +100,7 @@ impl PodWatcherRuntimeContext {
             node_local: Some(context.node_local.clone()),
             config: context.config.clone(),
             task_supervisor: context.task_supervisor.clone(),
+            file_process: context.file_process.clone(),
             pod_repository: context.pod_repository.clone(),
             pod_lifecycle_router: context.pod_lifecycle_router.clone(),
             persistent_volume_event_handler,
@@ -169,7 +171,7 @@ struct PodRecovery<'a> {
 async fn spawn_cri_event_forwarder(
     cri: Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>,
     cancel_token: tokio_util::sync::CancellationToken,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     lifecycle_tx: Option<
         tokio::sync::mpsc::Sender<crate::kubelet::reconciler::cri_reconnect::CriStreamLifecycle>,
     >,
@@ -197,12 +199,20 @@ pub struct PodWatcherConfig {
     pub containerd_namespace: String,
 }
 
-async fn rotate_all_pod_logs(containerd_ns: &str) {
+async fn rotate_all_pod_logs(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    containerd_ns: &str,
+) {
     use crate::kubelet::log_rotation::{get_max_log_files, get_max_log_size};
 
     let log_root = crate::paths::pod_logs_root_path(containerd_ns);
-    crate::kubelet::pod_fs::PodFs::rotate_logs(log_root, get_max_log_size(), get_max_log_files())
-        .await;
+    crate::kubelet::pod_fs::PodFs::rotate_logs(
+        file_process,
+        log_root,
+        get_max_log_size(),
+        get_max_log_files(),
+    )
+    .await;
 }
 
 pub async fn run_pod_watcher_with_context(
@@ -296,6 +306,7 @@ async fn run_pod_watcher_with_runtime(
             node_local.clone(),
             cri_runtime.clone(),
             pod_lifecycle_router.clone(),
+            state.file_process.clone(),
         );
         if let Err(err) = reconciler.run_once().await {
             tracing::warn!("startup reconciler failed: {err:#}");
@@ -316,7 +327,7 @@ async fn run_pod_watcher_with_runtime(
         if let Err(err) = state
             .task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "cri_reconnect_reconciler",
                 async move {
                     reconnect.run_lifecycle_loop(rx, reconnect_cancel).await;
@@ -455,6 +466,7 @@ async fn run_pod_watcher_with_runtime(
                         pod_lifecycle_state: &pod_lifecycle_state,
                         pod_lifecycle_router: pod_lifecycle_router.clone(),
                         task_supervisor: state.task_supervisor.clone(),
+                        file_process: state.file_process.clone(),
                     },
                     event,
                 ).await;
@@ -494,7 +506,7 @@ async fn run_pod_watcher_with_runtime(
 
             // Handle log rotation timer tick
             Some(()) = log_rotation_tick_rx.recv() => {
-                rotate_all_pod_logs(&containerd_namespace).await;
+                rotate_all_pod_logs(&state.file_process, &containerd_namespace).await;
             }
         }
     }
@@ -636,7 +648,7 @@ fn parse_deadline_timer_delay_secs(
 }
 async fn schedule_active_deadline_timer_for_modified_pod(
     pod: &serde_json::Value,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     pod_lifecycle_router: std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
 ) {
     deadline_timers::schedule_active_deadline_timer_for_modified_pod(

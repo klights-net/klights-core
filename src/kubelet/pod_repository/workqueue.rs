@@ -16,7 +16,7 @@ use tokio::sync::{Notify, watch};
 
 use crate::datastore::{DatastoreHandle, PodWorkqueueEntry, PodWorkqueueKind};
 use crate::side_effects::SideEffectMetrics;
-use crate::task_supervisor::{TaskCategory, TaskSupervisor};
+use klights_supervisor::{TaskCategory, TaskSupervisor};
 use klights_types::PodIdentity;
 
 use super::delete_coordinator::PodDeleteCoordinator;
@@ -1019,8 +1019,8 @@ mod tests {
     async fn test_workqueue() -> (Arc<PodWorkqueue>, DatastoreHandle) {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let metrics = SideEffectMetrics::new();
         let workqueue = PodWorkqueue::new_leader(
@@ -1037,8 +1037,8 @@ mod tests {
     async fn test_non_leader_workqueue() -> (Arc<PodWorkqueue>, DatastoreHandle) {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let metrics = SideEffectMetrics::new();
         let workqueue = PodWorkqueue::new(store, db.clone(), supervisor, metrics);
@@ -1050,8 +1050,8 @@ mod tests {
     async fn leadership_gain_discovers_terminating_unbound_pod_without_local_queue_row() {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let (leader_tx, leader_rx) = tokio::sync::watch::channel(false);
         let workqueue = PodWorkqueue::new_leader(
@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     fn test_router(
-        supervisor: &Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: &Arc<klights_supervisor::TaskSupervisor>,
         executor: Arc<dyn PodWorkExecutor>,
     ) -> Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter> {
         let registry = Arc::new(
@@ -1303,8 +1303,8 @@ mod tests {
         .await
         .unwrap();
 
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let executor = Arc::new(WakeRecordingExecutor {
             stop_seen: tokio::sync::Notify::new(),
@@ -1344,8 +1344,8 @@ mod tests {
         .await
         .unwrap();
 
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let executor = Arc::new(WakeRecordingExecutor {
             stop_seen: tokio::sync::Notify::new(),
@@ -1439,8 +1439,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let executor = Arc::new(WakeRecordingExecutor {
             stop_seen: tokio::sync::Notify::new(),
@@ -1782,8 +1782,8 @@ mod tests {
         // for ALL terminating pods, including those on remote nodes. Remote
         // entries are actor-owned reminders, not leader hard-deletes.
         let (workqueue, db) = test_workqueue().await;
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let executor = Arc::new(WakeRecordingExecutor {
             stop_seen: tokio::sync::Notify::new(),
@@ -1934,8 +1934,8 @@ mod tests {
         .await
         .unwrap();
 
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let executor = Arc::new(WakeRecordingExecutor {
             stop_seen: tokio::sync::Notify::new(),
@@ -1995,8 +1995,8 @@ mod tests {
         .await
         .unwrap();
 
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let executor = Arc::new(WakeRecordingExecutor {
             stop_seen: tokio::sync::Notify::new(),
@@ -2189,8 +2189,8 @@ mod tests {
         .await
         .unwrap();
 
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let executor = Arc::new(WakeRecordingExecutor {
             stop_seen: tokio::sync::Notify::new(),
@@ -2247,8 +2247,8 @@ mod tests {
     async fn reconciler_exits_on_root_cancellation() {
         let (_ds, db) = crate::datastore::test_support::in_memory_with_handle().await;
         let store = Arc::new(PodStore::new(db.clone()));
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let cancel = supervisor.root_cancellation_token();
         let metrics = SideEffectMetrics::new();

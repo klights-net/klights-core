@@ -38,10 +38,10 @@ use tokio_util::sync::CancellationToken;
 use crate::controller_dispatcher::ControllerDispatcher;
 use crate::datastore::sqlite::DatastoreWatchReplaySource;
 use crate::datastore::{DatastoreHandle, WatchTarget};
-use crate::task_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 use crate::watch::{
     EventType, SignalWatchCursor, WatchCursorError, WatchDeliveryScope, WatchEvent, WindowPolicy,
 };
+use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 use klights_watch::WatchTopic;
 
 /// Maximum delay we ever pass to `spawn_delay` for a single arm. Long

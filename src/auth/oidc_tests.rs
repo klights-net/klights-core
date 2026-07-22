@@ -352,9 +352,8 @@ async fn test_build_oidc_authenticator_from_config_reads_ca_bundle_path() {
     let ca_path = temp_dir.path().join("oidc-ca.pem");
     let cert = rcgen::generate_simple_self_signed(vec!["oidc.example.com".to_string()]).unwrap();
     std::fs::write(&ca_path, cert.cert.pem()).unwrap();
-    let supervisor = crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
-    );
+    let supervisor =
+        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
     let config = crate::KlightsConfig {
         oidc_issuer_url: Some("https://oidc.example.com".to_string()),
         oidc_client_id: Some("klights".to_string()),
@@ -371,9 +370,8 @@ async fn test_build_oidc_authenticator_from_config_reads_ca_bundle_path() {
 
 #[tokio::test]
 async fn test_build_oidc_authenticator_from_config_errors_for_missing_client_id() {
-    let supervisor = crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
-    );
+    let supervisor =
+        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
     let config = crate::KlightsConfig {
         oidc_issuer_url: Some("https://oidc.example.com".to_string()),
         oidc_client_id: None,

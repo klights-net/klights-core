@@ -15,7 +15,7 @@ use crate::datastore::node_local::sqlite::{PodStatusCheckpoint, RuntimeObservati
 use crate::datastore::node_local::{
     NodeLocalHandle, OutboxFailureDisposition, OutboxInsert, OutboxRow,
 };
-use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
+use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 use self::payload::{OutboxOperation, OutboxPayload};
 
@@ -220,8 +220,8 @@ impl Outbox {
     /// For test use only.
     #[cfg(test)]
     pub async fn test_outbox() -> Self {
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let (handle, _) = crate::datastore::node_local::selector::open_node_local_with_sqlite(
             crate::datastore::backend_kind::BackendKind::Sqlite,
@@ -1412,7 +1412,7 @@ mod tests {
     use crate::datastore::command::StorageCommand;
     use crate::datastore::node_local::{NodeLocalHandle, selector};
     use crate::kubelet::outbox::payload::{OutboxOperation, OutboxPayload};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     use super::{
         DispatchOutcome, Outbox, OutboxApplyError, OutboxApplyResult, OutboxCommand,
@@ -3232,6 +3232,7 @@ mod tests {
             .expect("seed existing node");
 
         crate::kubelet::node::register_node_with_outbox(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
             db.as_ref(),
             &outbox,
             "node-a",

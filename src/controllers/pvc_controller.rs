@@ -8,7 +8,8 @@ controller_wrapper!(
     "pvc",
     pvc_core::reconcile_pvc,
     no_node,
-    discard
+    discard,
+    with_file_process
 );
 
 #[cfg(test)]

@@ -327,9 +327,9 @@ impl WorkerStoreAdapter {
 
     pub async fn start_watch_mirrors(
         self: &Arc<Self>,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<Vec<crate::task_supervisor::SupervisedJoinHandle<()>>> {
+    ) -> Result<Vec<klights_supervisor::SupervisedJoinHandle<()>>> {
         let mut handles = Vec::new();
         for req in self.worker_watch_requests() {
             let this = self.clone();
@@ -339,7 +339,7 @@ impl WorkerStoreAdapter {
             handles.push(
                 spawn_supervisor
                     .spawn_async(
-                        crate::task_supervisor::TaskCategory::Network,
+                        klights_supervisor::TaskCategory::Network,
                         "worker_store_watch_mirror",
                         async move {
                             this.run_watch_mirror(req, mirror_supervisor, cancel).await;
@@ -401,7 +401,7 @@ impl WorkerStoreAdapter {
     async fn run_watch_mirror(
         self: Arc<Self>,
         req: WatchRequest,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
         cancel: tokio_util::sync::CancellationToken,
     ) {
         let mut next_resource_version = req.start_resource_version();
@@ -833,7 +833,7 @@ impl WorkerStoreAdapter {
 }
 
 async fn sleep_before_watch_mirror_reconnect(
-    supervisor: &crate::task_supervisor::TaskSupervisor,
+    supervisor: &klights_supervisor::TaskSupervisor,
     cancel: &tokio_util::sync::CancellationToken,
     attempt: u32,
 ) -> bool {
@@ -2729,7 +2729,7 @@ mod tests {
         PodLifecycleDiagnostics, PodLifecycleRouteBackend, PodLifecycleRouteError,
         PodLifecycleRouteMode,
     };
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::sync::atomic::AtomicUsize;
 
     fn worker_pod_watch_request() -> WatchRequest {
@@ -3515,7 +3515,7 @@ mod tests {
         let driver_cancel = cancel.clone();
         let handle = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "worker_store_route_replay_position_test",
                 async move {
                     driver_adapter
@@ -4643,7 +4643,7 @@ mod tests {
         let driver_cancel = cancel.clone();
         let handle = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "worker_store_watch_unmarked_out_of_range_test",
                 async move {
                     driver_adapter
@@ -4699,7 +4699,7 @@ mod tests {
         let driver_cancel = cancel.clone();
         let handle = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "worker_store_watch_repeated_expiry_test",
                 async move {
                     driver_adapter

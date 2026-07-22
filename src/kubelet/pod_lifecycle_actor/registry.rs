@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::kubelet::outbox::Outbox;
 use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use crate::kubelet::pod_lifecycle_router::executor::PodWorkExecutor;
-use crate::task_supervisor::{TaskCategory, TaskSupervisor};
+use klights_supervisor::{TaskCategory, TaskSupervisor};
 
 use super::actor::{PodLifecycleActor, PodLifecycleActorRuntime, pod_actor_idle_grace_duration};
 use super::config::PodLifecycleConcurrencyConfig;

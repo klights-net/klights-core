@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use crate::datastore::raft::grpc_network::{
     GrpcRaftClientFactory, GrpcRaftRpcClient, GrpcRaftRpcError, RaftPeerTransportError,
 };
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 /// Per-peer client wrapping a `ReplicationGrpcClient`. Translates the
 /// envelope-bytes return of the three Raft RPCs into the typed

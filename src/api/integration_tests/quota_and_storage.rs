@@ -1887,12 +1887,20 @@ async fn test_pvc_binding_result_is_same_for_json_and_protobuf_creation() {
     )
     .await;
 
-    let _ = crate::controllers::pvc::reconcile_pvc(db.as_ref(), &json_pvc_snapshot)
-        .await
-        .unwrap();
-    let _ = crate::controllers::pvc::reconcile_pvc(db.as_ref(), &proto_pvc_snapshot)
-        .await
-        .unwrap();
+    let _ = crate::controllers::pvc::reconcile_pvc(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
+        db.as_ref(),
+        &json_pvc_snapshot,
+    )
+    .await
+    .unwrap();
+    let _ = crate::controllers::pvc::reconcile_pvc(
+        &crate::kubelet::file_blocking::test_file_process_executor(),
+        db.as_ref(),
+        &proto_pvc_snapshot,
+    )
+    .await
+    .unwrap();
 
     let json_pvc_bound = fetch_resource_with_rv(
         &db,

@@ -56,7 +56,7 @@ impl NetworkBoot {
         stores: NetworkBootStores<'_, S>,
         node_ip: &str,
         cancel: tokio_util::sync::CancellationToken,
-        task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Result<Self>
     where
         S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
@@ -167,7 +167,7 @@ mod tests {
     }
 
     async fn node_local_for_test(
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> crate::datastore::node_local::NodeLocalHandle {
         crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
@@ -209,8 +209,8 @@ mod tests {
     async fn network_boot_dispatches_rootless_mode_to_rootless_plane() {
         let db = crate::datastore::test_support::in_memory().await;
         let cfg = rootless_test_config("rootless-dispatch-node");
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = node_local_for_test(supervisor.clone()).await;
         let cancel = tokio_util::sync::CancellationToken::new();

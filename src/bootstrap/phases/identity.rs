@@ -267,7 +267,7 @@ async fn controlplane_rpc_client_identity_for_token(
     token: &str,
     namespace: &str,
     node_name: &str,
-    supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<(Option<String>, Option<String>)> {
     if !token.is_empty() {
         return Ok((None, None));
@@ -501,16 +501,22 @@ mod tests {
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
         let config = std::sync::Arc::new(config);
         let node_mode = crate::bootstrap::NodeMode::Root;
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
+        let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
         let cfg = crate::bootstrap::phases::config::ConfigPhase {
             config: config.clone(),
             node_mode: node_mode.clone(),
             supervisor: supervisor.clone(),
+            file_process: file_process.clone(),
             grpc_transport_policy:
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(&node_mode, &config),
+            network_cleanup: crate::networking::NetworkCleanup::from_config(
+                &node_mode,
+                &config,
+                file_process,
+            ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             etc_dir: crate::paths::etc_dir_path(&namespace)
                 .to_string_lossy()
@@ -552,16 +558,22 @@ mod tests {
         config.node_name = "mn-controlplane1".to_string();
         let config = std::sync::Arc::new(config);
         let node_mode = crate::bootstrap::NodeMode::Root;
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
+        let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
         let cfg = crate::bootstrap::phases::config::ConfigPhase {
             config: config.clone(),
             node_mode: node_mode.clone(),
             supervisor: supervisor.clone(),
+            file_process: file_process.clone(),
             grpc_transport_policy:
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(&node_mode, &config),
+            network_cleanup: crate::networking::NetworkCleanup::from_config(
+                &node_mode,
+                &config,
+                file_process,
+            ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             etc_dir: crate::paths::etc_dir_path(&namespace)
                 .to_string_lossy()
@@ -634,8 +646,8 @@ mod tests {
         )
         .unwrap();
 
-        let leader_supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let leader_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let service = std::sync::Arc::new(crate::replication::service::ReplicationService::new(
             db.clone(),
@@ -670,16 +682,22 @@ mod tests {
         config.external_endpoint = Some("10.99.0.14".to_string());
         let config = std::sync::Arc::new(config);
         let node_mode = crate::bootstrap::NodeMode::Root;
-        let joiner_supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let joiner_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
+        let file_process = klights_supervisor::FileProcessExecutor::new(joiner_supervisor.clone());
         let cfg = crate::bootstrap::phases::config::ConfigPhase {
             config: config.clone(),
             node_mode: node_mode.clone(),
             supervisor: joiner_supervisor.clone(),
+            file_process: file_process.clone(),
             grpc_transport_policy:
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(&node_mode, &config),
+            network_cleanup: crate::networking::NetworkCleanup::from_config(
+                &node_mode,
+                &config,
+                file_process,
+            ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             etc_dir: crate::paths::etc_dir_path(&joiner_namespace)
                 .to_string_lossy()
@@ -748,16 +766,22 @@ mod tests {
         config.external_endpoint = Some("10.99.0.14".to_string());
         let config = std::sync::Arc::new(config);
         let node_mode = crate::bootstrap::NodeMode::Root;
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
+        let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
         let cfg = crate::bootstrap::phases::config::ConfigPhase {
             config: config.clone(),
             node_mode: node_mode.clone(),
             supervisor: supervisor.clone(),
+            file_process: file_process.clone(),
             grpc_transport_policy:
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(&node_mode, &config),
+            network_cleanup: crate::networking::NetworkCleanup::from_config(
+                &node_mode,
+                &config,
+                file_process,
+            ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             etc_dir: crate::paths::etc_dir_path(&namespace)
                 .to_string_lossy()
@@ -816,16 +840,22 @@ mod tests {
         config.external_endpoint = Some("10.99.0.10".to_string());
         let config = std::sync::Arc::new(config);
         let node_mode = crate::bootstrap::NodeMode::Root;
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
+        let file_process = klights_supervisor::FileProcessExecutor::new(supervisor.clone());
         let cfg = crate::bootstrap::phases::config::ConfigPhase {
             config: config.clone(),
             node_mode: node_mode.clone(),
             supervisor: supervisor.clone(),
+            file_process: file_process.clone(),
             grpc_transport_policy:
                 crate::replication::grpc::transport_policy::GrpcTransportPolicy::shared_default(),
-            network_cleanup: crate::networking::NetworkCleanup::from_config(&node_mode, &config),
+            network_cleanup: crate::networking::NetworkCleanup::from_config(
+                &node_mode,
+                &config,
+                file_process,
+            ),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             etc_dir: crate::paths::etc_dir_path(&namespace)
                 .to_string_lossy()

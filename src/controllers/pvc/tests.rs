@@ -2,6 +2,11 @@ use super::*;
 
 use serde_json::json;
 
+async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Value> {
+    let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+    super::reconcile_pvc(&file_process, db, pvc).await
+}
+
 /// Helper to fetch latest PVC from DB with resourceVersion injected
 async fn get_pvc(db: &dyn DatastoreBackend, namespace: &str, name: &str) -> Value {
     let resource = db

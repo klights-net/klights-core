@@ -12,7 +12,7 @@ use crate::kubelet::outbox::payload::OutboxOperation;
 use crate::kubelet::outbox::payload::OutboxPayload;
 use crate::kubelet::outbox::{Outbox, OutboxCommand, OutboxSendPlanner, OutboxSubject};
 #[cfg(test)]
-use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
 fn non_persisted_event(reason: &str, message: &str, event_type: &str) -> Value {
     serde_json::json!({

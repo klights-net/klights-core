@@ -39,6 +39,7 @@ pub struct SandboxGc {
     /// Shared counter: incremented by PodStore on create/update/delete.
     /// Zero when the cluster has been quiescent — no sweep needed.
     dirty: Arc<AtomicUsize>,
+    file_process: klights_supervisor::FileProcessExecutor,
 }
 
 impl SandboxGc {
@@ -48,6 +49,7 @@ impl SandboxGc {
         pod_reader: Arc<dyn PodReader>,
         containerd_ns: impl Into<String>,
         dirty: Arc<AtomicUsize>,
+        file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         Self {
             db,
@@ -55,6 +57,7 @@ impl SandboxGc {
             pod_reader,
             containerd_ns: containerd_ns.into(),
             dirty,
+            file_process,
         }
     }
 
@@ -151,6 +154,7 @@ impl SandboxGc {
                 continue;
             }
             if !cleanup_pod_cgroup_for_gc(
+                &self.file_process,
                 &self.containerd_ns,
                 &meta.uid,
                 &sandbox.id,
@@ -197,6 +201,7 @@ impl SandboxGc {
                 for sb in rows {
                     if !live_sandbox_ids.contains(&sb.sandbox_id) {
                         if !cleanup_pod_cgroup_for_gc(
+                            &self.file_process,
                             &self.containerd_ns,
                             &sb.pod_uid,
                             &sb.sandbox_id,
@@ -276,6 +281,7 @@ impl SandboxGc {
 }
 
 async fn cleanup_pod_cgroup_for_gc(
+    file_process: &klights_supervisor::FileProcessExecutor,
     containerd_ns: &str,
     pod_uid: &str,
     sandbox_id: &str,
@@ -290,7 +296,7 @@ async fn cleanup_pod_cgroup_for_gc(
         return true;
     }
 
-    match cleanup_pod_cgroup(containerd_ns, pod_uid).await {
+    match cleanup_pod_cgroup(file_process, containerd_ns, pod_uid).await {
         Ok(0) => {
             tracing::debug!(
                 sandbox_id = %sandbox_id,

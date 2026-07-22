@@ -598,9 +598,12 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
 
         // Init default namespace
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         // Create some resources
         db.create_resource(
@@ -633,9 +636,12 @@ mod tests {
     async fn snapshot_after_current_rv_still_contains_authoritative_state() {
         let db = crate::datastore::test_support::in_memory().await;
 
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         db.create_resource(
             "v1",
@@ -668,9 +674,12 @@ mod tests {
     async fn snapshot_replays_resource_deletes_since_rv() {
         let db = crate::datastore::test_support::in_memory().await;
 
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         let created = db
             .create_resource(
@@ -712,9 +721,12 @@ mod tests {
     #[tokio::test]
     async fn snapshot_restore_preserves_durable_watch_history() {
         let leader = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&leader)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &leader,
+        )
+        .await
+        .unwrap();
 
         let current = leader
             .create_resource(
@@ -1033,9 +1045,12 @@ mod tests {
     #[tokio::test]
     async fn snapshot_restore_preserves_rv_counter_for_next_raft_apply() {
         let leader = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&leader)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &leader,
+        )
+        .await
+        .unwrap();
         leader
             .create_resource(
                 "v1",
@@ -1266,9 +1281,12 @@ mod tests {
     #[tokio::test]
     async fn snapshot_after_rv_is_still_authoritative_for_destructive_restore() {
         let leader = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&leader)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &leader,
+        )
+        .await
+        .unwrap();
 
         let baseline = leader
             .create_resource(
@@ -1520,9 +1538,12 @@ mod tests {
     async fn staging_restore_successful() {
         let db = crate::datastore::test_support::in_memory().await;
 
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         // Create a resource (simulating leader state)
         db.create_resource(
@@ -1606,9 +1627,12 @@ mod tests {
     #[tokio::test]
     async fn snapshot_emits_complete_watch_history_across_page_boundaries() {
         let leader = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&leader)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &leader,
+        )
+        .await
+        .unwrap();
 
         // Insert strictly more watch_events than SNAPSHOT_EMIT_PAGE_SIZE so the
         // emitter's paged loop crosses at least one boundary.
@@ -1678,9 +1702,12 @@ mod tests {
             ("mixed", 5, 7),
         ] {
             let leader = crate::datastore::test_support::in_memory().await;
-            crate::controllers::namespace::init_default_namespaces(&leader)
-                .await
-                .unwrap();
+            crate::controllers::namespace::init_default_namespaces(
+                &crate::kubelet::file_blocking::test_file_process_executor(),
+                &leader,
+            )
+            .await
+            .unwrap();
             for i in 0..n_resources {
                 leader
                     .create_resource(

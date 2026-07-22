@@ -245,7 +245,7 @@ pub async fn pod_exec(
         if let Err(err) = state
             .task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Others,
+                klights_supervisor::TaskCategory::Others,
                 "pod_exec_ws_upgrade",
                 async move {
                     match on_upgrade.await {
@@ -346,7 +346,7 @@ async fn pod_exec_local_spdy_stream(
 
     if let Err(err) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Others,
+            klights_supervisor::TaskCategory::Others,
             "pod_exec_spdy_upgrade",
             async move {
                 match on_upgrade.await {
@@ -432,7 +432,7 @@ async fn pod_exec_remote_websocket_stream(
     if let Err(err) = state
         .task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Others,
+            klights_supervisor::TaskCategory::Others,
             format!(
                 "pod_{}_remote_websocket_stream_upgrade",
                 if attach { "attach" } else { "exec" }
@@ -540,7 +540,7 @@ async fn pod_exec_remote_spdy_stream(
     let on_upgrade = hyper::upgrade::on(req);
     if let Err(err) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Others,
+            klights_supervisor::TaskCategory::Others,
             "pod_exec_remote_spdy_upgrade",
             async move {
                 match on_upgrade.await {
@@ -602,7 +602,7 @@ async fn pod_exec_remote_websocket_sync(
     if let Err(err) = state
         .task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Others,
+            klights_supervisor::TaskCategory::Others,
             "pod_exec_remote_ws_sync_upgrade",
             async move {
                 match on_upgrade.await {
@@ -793,7 +793,7 @@ pub async fn pod_attach(
         if let Err(err) = state
             .task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Others,
+                klights_supervisor::TaskCategory::Others,
                 "pod_attach_ws_upgrade",
                 async move {
                     match on_upgrade.await {
@@ -1044,7 +1044,7 @@ pub fn extract_container_id(
 
 pub async fn exec_sync_with_created_state_retry(
     cri_client: &mut crate::kubelet::cri::CriClient,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     container_id: &str,
     command: &[String],
     timeout_seconds: i64,
@@ -1094,7 +1094,7 @@ pub async fn exec_sync_with_created_state_retry(
 
 pub async fn exec_with_created_state_retry(
     cri_client: &mut crate::kubelet::cri::CriClient,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     request: ExecRequest<'_>,
 ) -> anyhow::Result<k8s_cri::v1::ExecResponse> {
     use std::time::Duration;
@@ -1162,7 +1162,7 @@ pub async fn exec_with_created_state_retry(
 
 pub async fn attach_with_created_state_retry(
     cri_client: &mut crate::kubelet::cri::CriClient,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     request: AttachRequest<'_>,
 ) -> anyhow::Result<k8s_cri::v1::AttachResponse> {
     use std::time::Duration;
@@ -1234,7 +1234,7 @@ pub async fn attach_with_created_state_retry(
 pub async fn handle_exec_websocket(
     socket: WebSocket,
     cri: Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     container_id: String,
     command: Vec<String>,
     namespace: String,

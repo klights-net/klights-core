@@ -30,10 +30,10 @@ use crate::api::{
 use crate::control_plane::client::LeaderApiClient;
 use crate::datastore::{DatastoreHandle, Resource, ResourcePreconditions};
 use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
-use crate::task_supervisor::TaskSupervisor;
 use klights_reconcile_api::{
     GcPodDeleteError, GcPodDeleteFuture, GcPodDeleteRequest, GcPodDeleteSink,
 };
+use klights_supervisor::TaskSupervisor;
 use klights_types::PodIdentity;
 
 use crate::api::DeleteOptions;
@@ -514,7 +514,7 @@ impl PodApiService {
                 let handle = self
                     .supervisor
                     .spawn_async(
-                        crate::task_supervisor::TaskCategory::Background,
+                        klights_supervisor::TaskCategory::Background,
                         format!("scheduler_bind/{namespace}/{name}"),
                         async move {
                             api.schedule_pending_pod_with_decision(&namespace, &name, decision)

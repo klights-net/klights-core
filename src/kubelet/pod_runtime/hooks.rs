@@ -39,13 +39,13 @@ pub trait PodHookRuntime: Send + Sync {
 /// exposing it through a mockable runtime port.
 pub struct RealPodHookRuntime {
     cri: Arc<dyn CriRuntime>,
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl RealPodHookRuntime {
     pub fn new(
         cri: Arc<dyn CriRuntime>,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self { cri, supervisor }
     }
@@ -99,7 +99,7 @@ pub async fn execute_lifecycle_hook(
     hook: &Value,
     hook_type: &str,
     container_spec: &Value,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<()> {
     let hook_timeout_secs = hook
         .get("timeoutSeconds")

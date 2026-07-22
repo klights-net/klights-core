@@ -423,8 +423,8 @@ mod tests {
 
         let db_handle: std::sync::Arc<dyn crate::datastore::backend::DatastoreBackend> =
             std::sync::Arc::new(db);
-        let ts = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let ts = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let metrics = crate::side_effects::SideEffectMetrics::new();
         let side_effects = std::sync::Arc::new(crate::side_effects::default_registry(

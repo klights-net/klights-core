@@ -372,7 +372,7 @@ pub async fn resolve_service_proxy_target(
 
 pub async fn load_apiservice_proxy_identity(
     namespace: &str,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     cache: &tokio::sync::OnceCell<reqwest::Identity>,
 ) -> Option<reqwest::Identity> {
     let etc = crate::paths::etc_dir_path(namespace);
@@ -381,7 +381,7 @@ pub async fn load_apiservice_proxy_identity(
 
 async fn load_apiservice_proxy_identity_from_etc(
     etc: &Path,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     cache: &tokio::sync::OnceCell<reqwest::Identity>,
 ) -> Option<reqwest::Identity> {
     match cache
@@ -400,7 +400,7 @@ async fn load_apiservice_proxy_identity_from_etc(
 
 async fn load_apiservice_proxy_identity_uncached(
     etc: &Path,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<reqwest::Identity> {
     let cert_path = etc.join("apiservice-proxy.crt");
     let key_path = etc.join("apiservice-proxy.key");
@@ -422,7 +422,7 @@ async fn load_apiservice_proxy_identity_uncached(
 }
 
 async fn read_apiservice_proxy_identity_file(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     path: &Path,
     label: &'static str,
 ) -> anyhow::Result<Vec<u8>> {
@@ -549,8 +549,8 @@ mod tests {
         let etc = data_root.path().join("etc");
         super::blocking_fs::create_dir_all(&etc).unwrap();
 
-        let task_supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
         let cache = tokio::sync::OnceCell::new();
         let cert =
@@ -591,8 +591,8 @@ mod tests {
         let etc = data_root.path().join("etc");
         super::blocking_fs::create_dir_all(&etc).unwrap();
 
-        let task_supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
         let cache = tokio::sync::OnceCell::new();
         let cert =

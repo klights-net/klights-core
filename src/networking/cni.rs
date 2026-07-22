@@ -155,7 +155,7 @@ enum ExistingAllocation {
 trait NetnsInspector: Send + Sync {
     async fn inspect(
         &self,
-        task_supervisor: &crate::task_supervisor::TaskSupervisor,
+        task_supervisor: &klights_supervisor::TaskSupervisor,
         netns_setns_path: &str,
         pod_ip: Ipv4Addr,
         prefix: u8,
@@ -169,7 +169,7 @@ struct RealNetnsInspector;
 impl NetnsInspector for RealNetnsInspector {
     async fn inspect(
         &self,
-        task_supervisor: &crate::task_supervisor::TaskSupervisor,
+        task_supervisor: &klights_supervisor::TaskSupervisor,
         netns_setns_path: &str,
         pod_ip: Ipv4Addr,
         prefix: u8,
@@ -178,7 +178,7 @@ impl NetnsInspector for RealNetnsInspector {
         let netns_path = netns_setns_path.to_string();
         task_supervisor
             .run_blocking(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "cni_validate_pod_netns_state",
                 move || validate_pod_netns_state(&netns_path, pod_ip, prefix, gateway),
             )
@@ -212,7 +212,7 @@ pub struct CniAddArgs<'a, S: CniStore + ?Sized + 'a> {
     pub host_network: bool,
     pub host_ip: &'a str,
     pub _node_name: &'a NodeName,
-    pub task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 }
 
 pub async fn add<S: CniStore + ?Sized>(args: CniAddArgs<'_, S>) -> Result<PodNetwork> {
@@ -232,6 +232,7 @@ pub async fn add<S: CniStore + ?Sized>(args: CniAddArgs<'_, S>) -> Result<PodNet
         _node_name,
         task_supervisor,
     } = args;
+    let file_process = klights_supervisor::FileProcessExecutor::new(task_supervisor.clone());
     let namespace = pod.namespace.as_str();
     let pod_name = pod.name.as_str();
     let pod_uid = pod.uid.as_str();
@@ -267,6 +268,7 @@ pub async fn add<S: CniStore + ?Sized>(args: CniAddArgs<'_, S>) -> Result<PodNet
             netns_setns_path,
             inspector: &RealNetnsInspector,
             task_supervisor: task_supervisor.as_ref(),
+            file_process: &file_process,
         })
         .await
         .with_context(|| format!("Failed to validate existing allocation for {}", sandbox_id))?;
@@ -314,13 +316,12 @@ pub async fn add<S: CniStore + ?Sized>(args: CniAddArgs<'_, S>) -> Result<PodNet
     // netns (RTM_NEWLINK + IFLA_NET_NS_FD on the peer) works reliably.
     let netns_open_key = netns_setns_path.to_string();
     let netns_path_for_open = netns_setns_path.to_string();
-    let netns_file = crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "cni_open_sandbox_netns",
-        netns_open_key,
-        move || open_netns_file_blocking(netns_path_for_open),
-    )
-    .await
-    .with_context(|| format!("Failed to open sandbox netns {}", netns_setns_path))?;
+    let netns_file = file_process
+        .run_blocking_file_keyed("cni_open_sandbox_netns", netns_open_key, move || {
+            open_netns_file_blocking(netns_path_for_open)
+        })
+        .await
+        .with_context(|| format!("Failed to open sandbox netns {}", netns_setns_path))?;
     let netns_fd_raw = netns_file.as_raw_fd();
 
     // Create veth pair with peer directly in the target netns.
@@ -377,7 +378,7 @@ pub async fn add<S: CniStore + ?Sized>(args: CniAddArgs<'_, S>) -> Result<PodNet
         // works. Without this the bridge drops frames that DNAT sends back out
         // the same port they arrived on (hairpin forwarding).
         let hairpin_path = format!("/sys/class/net/{}/brport/hairpin_mode", veth_host);
-        if let Err(e) = crate::utils::write_file_async(&hairpin_path, b"1").await {
+        if let Err(e) = crate::utils::write_file_async(&file_process, &hairpin_path, b"1").await {
             tracing::warn!(
                 "Failed to set hairpin_mode on {}: {} (continuing anyway)",
                 veth_host,
@@ -398,7 +399,7 @@ pub async fn add<S: CniStore + ?Sized>(args: CniAddArgs<'_, S>) -> Result<PodNet
         let veth_pod_temp_owned = veth_pod_temp.clone();
         task_supervisor
             .run_blocking(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "cni_configure_pod_netns",
                 move || {
                     configure_pod_netns(
@@ -779,7 +780,8 @@ struct ValidateExistingAllocationArgs<'a> {
     gateway: Ipv4Addr,
     netns_setns_path: &'a str,
     inspector: &'a dyn NetnsInspector,
-    task_supervisor: &'a crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &'a klights_supervisor::TaskSupervisor,
+    file_process: &'a klights_supervisor::FileProcessExecutor,
 }
 
 async fn validate_existing_allocation(
@@ -797,6 +799,7 @@ async fn validate_existing_allocation(
         netns_setns_path,
         inspector,
         task_supervisor,
+        file_process,
     } = args;
     if recorded_netns_path.starts_with("/proc/self/fd/") {
         return Ok(ExistingAllocation::Stale {
@@ -872,6 +875,7 @@ async fn validate_existing_allocation(
     validate_existing_allocation_netns(
         inspector,
         task_supervisor,
+        file_process,
         netns_setns_path,
         pod_ip,
         prefix,
@@ -882,19 +886,21 @@ async fn validate_existing_allocation(
 
 async fn validate_existing_allocation_netns(
     inspector: &dyn NetnsInspector,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+    file_process: &klights_supervisor::FileProcessExecutor,
     netns_setns_path: &str,
     pod_ip: Ipv4Addr,
     prefix: u8,
     gateway: Ipv4Addr,
 ) -> Result<ExistingAllocation> {
     let path = netns_setns_path.to_string();
-    let netns_usable = crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "cni_check_netns_path_usable",
-        netns_setns_path.to_string(),
-        move || Ok(netns_path_usable_blocking(path)),
-    )
-    .await?;
+    let netns_usable = file_process
+        .run_blocking_file_keyed(
+            "cni_check_netns_path_usable",
+            netns_setns_path.to_string(),
+            move || Ok(netns_path_usable_blocking(path)),
+        )
+        .await?;
     if !netns_usable {
         tracing::debug!(
             "cni::add: netns path {} unavailable, validating only host-side state for duplicate ADD",
@@ -1015,7 +1021,7 @@ mod tests {
     impl NetnsInspector for FakeNetnsInspector {
         async fn inspect(
             &self,
-            _task_supervisor: &crate::task_supervisor::TaskSupervisor,
+            _task_supervisor: &klights_supervisor::TaskSupervisor,
             _netns_setns_path: &str,
             _pod_ip: Ipv4Addr,
             _prefix: u8,
@@ -1028,10 +1034,8 @@ mod tests {
         }
     }
 
-    fn test_task_supervisor() -> crate::task_supervisor::TaskSupervisor {
-        crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
-        )
+    fn test_task_supervisor() -> klights_supervisor::TaskSupervisor {
+        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default())
     }
 
     #[test]
@@ -1081,6 +1085,7 @@ mod tests {
         let res = validate_existing_allocation_netns(
             &inspector,
             &test_task_supervisor(),
+            &crate::kubelet::file_blocking::test_file_process_executor(),
             "/definitely/missing/netns/path",
             Ipv4Addr::new(10, 43, 0, 10),
             24,
@@ -1101,6 +1106,7 @@ mod tests {
         let res = validate_existing_allocation_netns(
             &inspector,
             &test_task_supervisor(),
+            &crate::kubelet::file_blocking::test_file_process_executor(),
             "/proc/self/ns/net",
             Ipv4Addr::new(10, 43, 0, 11),
             24,
@@ -1123,6 +1129,7 @@ mod tests {
         let res = validate_existing_allocation_netns(
             &inspector,
             &test_task_supervisor(),
+            &crate::kubelet::file_blocking::test_file_process_executor(),
             "/proc/self/ns/net",
             Ipv4Addr::new(10, 43, 0, 12),
             24,

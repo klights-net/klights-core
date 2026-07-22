@@ -117,7 +117,7 @@ fn is_nl_absent_error(err: &rtnetlink::Error) -> bool {
 /// Concrete root-mode networking implementation used by klights runtime.
 pub struct NetworkPlane {
     rt: rtnetlink::Handle,
-    _rt_conn: crate::task_supervisor::SupervisedJoinHandle<()>,
+    _rt_conn: klights_supervisor::SupervisedJoinHandle<()>,
     node_local: NodeLocalHandle,
     bridge: BridgeName,
     pod_subnet: PodSubnet,
@@ -129,7 +129,7 @@ pub struct NetworkPlane {
     wireguard_idx: OnceLock<u32>,
     wireguard: OnceLock<Arc<crate::networking::wireguard::WireGuardController>>,
     health: DataplaneHealth,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl NetworkPlane {
@@ -142,7 +142,7 @@ impl NetworkPlane {
         stores: crate::networking::boot::NetworkBootStores<'_, S>,
         node_ip: &str,
         cancel: tokio_util::sync::CancellationToken,
-        task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Result<Arc<Self>>
     where
         S: crate::networking::subnet_allocator::NodeSubnetAllocationStore + ?Sized,
@@ -184,7 +184,7 @@ impl NetworkPlane {
         let rt_cancel = cancel.clone();
         let rt_conn = task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "network_plane_rtnetlink_connection",
                 async move {
                     tokio::select! {
@@ -811,8 +811,8 @@ mod stale_route_tests {
 
     #[tokio::test]
     async fn root_cni_del_without_allocation_does_not_resolve_missing_bridge() {
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let node_local = crate::datastore::node_local::selector::open_node_local(
             crate::datastore::backend_kind::BackendKind::Sqlite,
@@ -828,7 +828,7 @@ mod stale_route_tests {
         let connection_cancel = cancel.clone();
         let connection = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "test_root_cni_del_rtnetlink_connection",
                 async move {
                     tokio::select! {

@@ -283,7 +283,7 @@ impl RaftStateMachine<TypeConfig> for SqliteRaftStateMachine {
 mod tests {
     use super::*;
     use crate::datastore::sqlite::{DbExecutor, opener};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use openraft::storage::RaftSnapshotBuilder;
     use openraft::{Entry, EntryPayload, LeaderId, Membership};
     use std::collections::BTreeSet;

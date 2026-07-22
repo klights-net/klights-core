@@ -2187,7 +2187,7 @@ pub struct PodRuntimeHarness {
     pub hooks: std::sync::Arc<MockPodHookRuntime>,
     pub env_source: std::sync::Arc<MockEnvSourceReader>,
     pub finalizer: std::sync::Arc<MockPodDeletionFinalizer>,
-    pub supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    pub supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     pub node_view: std::sync::Arc<FakeNode>,
     pub runtime: std::sync::Arc<crate::kubelet::pod_runtime::service::RealPodRuntimeService>,
 }
@@ -2213,8 +2213,8 @@ impl PodRuntimeHarness {
         seed_runtime_test_namespaces(&handle).await;
         // Keep ds alive so the handle stays valid.
         std::mem::forget(ds);
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let side_effects = std::sync::Arc::new(crate::side_effects::SideEffectRegistry::new());
         let metrics: std::sync::Arc<crate::side_effects::SideEffectMetrics> =

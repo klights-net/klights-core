@@ -87,7 +87,7 @@ pub async fn pod_portforward(
         let relay_supervisor = task_supervisor.clone();
         if let Err(err) = task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Others,
+                klights_supervisor::TaskCategory::Others,
                 "pod_portforward_ws_upgrade",
                 async move {
                     match on_upgrade.await {
@@ -153,7 +153,7 @@ async fn handle_portforward_websocket<IO>(
     ws_stream: tokio_tungstenite::WebSocketStream<IO>,
     node_port_forward: Arc<dyn NodePortForward>,
     request: NodePortForwardRequest,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -167,7 +167,7 @@ async fn handle_portforward_websocket<IO>(
     let (mut ws_input_tx, mut ws_input_rx) = futures::channel::mpsc::channel(64);
     if let Err(error) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Others,
+            klights_supervisor::TaskCategory::Others,
             "pod_portforward_ws_reader",
             async move {
                 loop {
@@ -430,8 +430,8 @@ mod cancellation_tests {
         let server =
             tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None);
         let (mut client, server) = tokio::join!(client, server);
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let cancelled = Arc::new(tokio::sync::Notify::new());
         let request = NodePortForwardRequest::try_new(
@@ -441,7 +441,7 @@ mod cancellation_tests {
         .unwrap();
         supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Others,
+                klights_supervisor::TaskCategory::Others,
                 "test_portforward_ws_relay",
                 handle_portforward_websocket(
                     server,
@@ -483,8 +483,8 @@ mod cancellation_tests {
         let server =
             tokio_tungstenite::WebSocketStream::from_raw_socket(server_io, Role::Server, None);
         let (mut client, server) = tokio::join!(client, server);
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let started = Arc::new(tokio::sync::Notify::new());
         let dropped = Arc::new(tokio::sync::Notify::new());
@@ -495,7 +495,7 @@ mod cancellation_tests {
         .unwrap();
         supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Others,
+                klights_supervisor::TaskCategory::Others,
                 "test_portforward_ws_slow_open",
                 handle_portforward_websocket(
                     server,

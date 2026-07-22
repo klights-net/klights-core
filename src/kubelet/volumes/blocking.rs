@@ -23,6 +23,7 @@ fn keyed_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
 }
 
 pub async fn run_blocking_fs<T>(
+    file_process: &klights_supervisor::FileProcessExecutor,
     label: &'static str,
     f: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T>
@@ -31,12 +32,14 @@ where
 {
     #[cfg(test)]
     FILE_BLOCKING_CALLS.fetch_add(1, Ordering::SeqCst);
-    crate::kubelet::file_blocking::run_blocking_file(label, f)
+    file_process
+        .run_blocking_file(label, f)
         .await
         .with_context(|| format!("blocking fs task '{}' failed", label))
 }
 
 pub async fn run_blocking_fs_keyed<T>(
+    file_process: &klights_supervisor::FileProcessExecutor,
     label: &'static str,
     key: &str,
     f: impl FnOnce() -> Result<T> + Send + 'static,
@@ -56,7 +59,7 @@ where
     }
     let lock = keyed_lock(key);
     let _guard = lock.lock().await;
-    run_blocking_fs(label, f).await
+    run_blocking_fs(file_process, label, f).await
 }
 
 #[cfg(test)]
@@ -91,20 +94,25 @@ mod tests {
         let run_one = |barrier: Arc<Barrier>,
                        active: Arc<AtomicUsize>,
                        max_active: Arc<AtomicUsize>| async move {
-            run_blocking_fs_keyed("keyed-fs-test", "volume/same", move || {
-                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                let mut prev = max_active.load(Ordering::SeqCst);
-                while now > prev
-                    && max_active
-                        .compare_exchange(prev, now, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_err()
-                {
-                    prev = max_active.load(Ordering::SeqCst);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                active.fetch_sub(1, Ordering::SeqCst);
-                Ok::<(), anyhow::Error>(())
-            })
+            run_blocking_fs_keyed(
+                &crate::kubelet::file_blocking::test_file_process_executor(),
+                "keyed-fs-test",
+                "volume/same",
+                move || {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    let mut prev = max_active.load(Ordering::SeqCst);
+                    while now > prev
+                        && max_active
+                            .compare_exchange(prev, now, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_err()
+                    {
+                        prev = max_active.load(Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<(), anyhow::Error>(())
+                },
+            )
             .await
             .unwrap();
             barrier.wait().await;

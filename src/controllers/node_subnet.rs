@@ -43,7 +43,7 @@ struct PeerSyncRetryState {
 impl PeerSyncRetryState {
     async fn schedule(
         &mut self,
-        supervisor: &crate::task_supervisor::TaskSupervisor,
+        supervisor: &klights_supervisor::TaskSupervisor,
         sender: &tokio::sync::mpsc::Sender<u64>,
     ) -> Result<()> {
         if self.scheduled {
@@ -212,7 +212,7 @@ pub async fn run_peer_watch_with_components(
     my_node_name: String,
     cluster_cidr: String,
     peering: std::sync::Arc<dyn klights_network_api::PeerRouter>,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     dataplane_health: Option<DataplaneHealth>,
     query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
     node_status: std::sync::Arc<dyn klights_leader_api::LeaderNodeSelfStatus>,
@@ -263,7 +263,7 @@ async fn run_peer_watch_with_components_inner(
     my_node_name: String,
     cluster_cidr: String,
     peering: std::sync::Arc<dyn klights_network_api::PeerRouter>,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
     raft_leader_proxy: Option<std::sync::Arc<crate::api::raft_proxy::RaftLeaderProxy>>,
     dataplane_health: Option<DataplaneHealth>,
     query: std::sync::Arc<dyn klights_leader_api::LeaderResourceQuery>,
@@ -885,13 +885,13 @@ mod tests {
     async fn spawn_peer_watch(
         db: crate::datastore::DatastoreHandle,
         router: Arc<MockNetworkProvider>,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
         cancel: CancellationToken,
-    ) -> crate::task_supervisor::SupervisedJoinHandle<()> {
+    ) -> klights_supervisor::SupervisedJoinHandle<()> {
         let task_supervisor = supervisor.clone();
         supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "node_subnet_peer_retry_test",
                 async move {
                     super::run_peer_watch_with_components(
@@ -914,8 +914,8 @@ mod tests {
 
     async fn stop_peer_watch(
         cancel: CancellationToken,
-        handle: crate::task_supervisor::SupervisedJoinHandle<()>,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        handle: klights_supervisor::SupervisedJoinHandle<()>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) {
         cancel.cancel();
         handle.join().await.unwrap();
@@ -930,8 +930,8 @@ mod tests {
         seed_peer(&db, "node-b", "192.0.2.20", 7).await;
         let router = Arc::new(MockNetworkProvider::new());
         router.fail_next_peer_apply();
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let cancel = CancellationToken::new();
         let handle = spawn_peer_watch(db, router.clone(), supervisor.clone(), cancel.clone()).await;
@@ -953,8 +953,8 @@ mod tests {
             Arc::new(crate::datastore::test_support::in_memory().await);
         seed_peer(&db, "node-b", "192.0.2.20", 7).await;
         let router = Arc::new(MockNetworkProvider::new());
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let cancel = CancellationToken::new();
         let handle = spawn_peer_watch(
@@ -1001,8 +1001,8 @@ mod tests {
         seed_peer(&db, "node-b", "192.0.2.20", 7).await;
         let router = Arc::new(MockNetworkProvider::new());
         router.fail_next_peer_apply();
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let cancel = CancellationToken::new();
         let handle = spawn_peer_watch(db, router.clone(), supervisor.clone(), cancel.clone()).await;

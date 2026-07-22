@@ -5,7 +5,7 @@ pub async fn check_tcp_probe(
     pod_ip: &str,
     probe: &TcpProbe,
     timeout: Duration,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> bool {
     run_tcp_probe(pod_ip, probe, timeout, task_supervisor)
         .await

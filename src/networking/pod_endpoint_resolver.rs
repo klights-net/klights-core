@@ -211,7 +211,7 @@ mod tests {
     use crate::datastore::PodEndpointRow;
     use crate::datastore::node_local::{NodeLocalHandle, selector};
     use crate::datastore::sqlite::Datastore;
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::sync::Arc;
     use tokio::time::Duration;
 

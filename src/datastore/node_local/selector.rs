@@ -6,7 +6,7 @@ use anyhow::Result;
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::node_local::{NodeLocalHandle, SqliteNodeLocalDb};
 use crate::datastore::sqlite::{DbExecutor, opener};
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 pub async fn open_node_local(
     kind: BackendKind,

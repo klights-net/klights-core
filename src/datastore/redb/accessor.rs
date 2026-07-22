@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use ::redb::Database;
 use anyhow::{Result, anyhow};
 
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 /// Shared synchronous-redb access through the TaskSupervisor DB pool.
 ///

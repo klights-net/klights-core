@@ -5,7 +5,7 @@ use crate::kubelet::pod_lifecycle_router::LifecycleReplyHandle;
 use crate::kubelet::pod_runtime::events::PodEventSink;
 use crate::kubelet::pod_runtime::repository::PodRuntimeRepository;
 use crate::kubelet::pod_runtime::service::PodRuntimeKey;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 fn lifecycle_key_from_runtime_key(key: &PodRuntimeKey) -> PodLifecycleKey {
     PodLifecycleKey::new(&key.namespace, &key.name, &key.uid)

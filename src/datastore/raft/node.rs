@@ -1311,7 +1311,7 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
     use super::*;
     use crate::datastore::sqlite::{DbExecutor, opener};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     struct FeatureProbe {
         replies: std::collections::BTreeMap<NodeId, Result<u64>>,

@@ -25,6 +25,7 @@ pub struct StartupReconciler {
     node_local: NodeLocalHandle,
     cri: Arc<dyn CriRuntime>,
     router: Arc<PodLifecycleRouter>,
+    file_process: klights_supervisor::FileProcessExecutor,
 }
 
 impl StartupReconciler {
@@ -35,6 +36,7 @@ impl StartupReconciler {
         node_local: NodeLocalHandle,
         cri: Arc<dyn CriRuntime>,
         router: Arc<PodLifecycleRouter>,
+        file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         let cache_readiness: Arc<dyn LeaderCacheReadiness> = cluster_api.clone();
         Self {
@@ -45,6 +47,7 @@ impl StartupReconciler {
             node_local,
             cri,
             router,
+            file_process,
         }
     }
 
@@ -108,6 +111,7 @@ impl StartupReconciler {
             ))
             .collect();
         match crate::kubelet::reconciler::cri_inventory::sweep_orphan_pod_artifacts(
+            &self.file_process,
             &self.containerd_ns,
             &live_owners,
         )

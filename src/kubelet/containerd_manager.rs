@@ -165,7 +165,8 @@ pub struct ContainerdManager {
     _config_path: String,
     _data_dir: String,
     _state_dir: String,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
+    file_process: klights_supervisor::FileProcessExecutor,
 }
 
 pub struct ContainerdStartConfig<'a> {
@@ -176,13 +177,13 @@ pub struct ContainerdStartConfig<'a> {
     pub data_dir: &'a str,
     pub state_dir: &'a str,
     pub rootless: bool,
-    pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub grpc_transport_policy:
         crate::replication::grpc::transport_policy::SharedGrpcTransportPolicy,
 }
 
 enum ContainerdProcess {
-    Spawned(crate::task_supervisor::SupervisedChild),
+    Spawned(klights_supervisor::SupervisedChild),
     Reused,
 }
 
@@ -207,7 +208,10 @@ impl ContainerdManager {
         )
     }
 
-    async fn write_rootless_runc_wrapper(data_dir: &str) -> Result<()> {
+    async fn write_rootless_runc_wrapper(
+        file_process: &klights_supervisor::FileProcessExecutor,
+        data_dir: &str,
+    ) -> Result<()> {
         let current_exe =
             std::env::current_exe().context("Failed to resolve current executable")?;
         let current_exe = current_exe.to_string_lossy().into_owned();
@@ -218,10 +222,8 @@ impl ContainerdManager {
             .to_path_buf();
         let script = Self::rootless_runc_wrapper_script(&current_exe);
         let key = wrapper_path.display().to_string();
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "containerd_write_rootless_runc_wrapper",
-            key,
-            move || {
+        file_process
+            .run_blocking_file_keyed("containerd_write_rootless_runc_wrapper", key, move || {
                 use std::os::unix::fs::PermissionsExt;
 
                 std::fs::create_dir_all(&wrapper_parent).with_context(|| {
@@ -252,9 +254,8 @@ impl ContainerdManager {
                     )
                 })?;
                 Ok(())
-            },
-        )
-        .await
+            })
+            .await
     }
 
     /// Write the klights Rust CNI config.
@@ -262,6 +263,7 @@ impl ContainerdManager {
     /// containerd CRI requires an IP-bearing CNI result before RunPodSandbox
     /// returns, so the plugin receives the node-local subnet selected by klights.
     async fn write_cni_config(
+        file_process: &klights_supervisor::FileProcessExecutor,
         cni_conf_dir: &str,
         namespace: &str,
         bridge_name: &str,
@@ -269,15 +271,16 @@ impl ContainerdManager {
         pod_link_mtu: u32,
     ) -> Result<()> {
         let cni_conf_dir_owned = cni_conf_dir.to_string();
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "containerd_write_cni_create_dir",
-            cni_conf_dir_owned.clone(),
-            move || {
-                std::fs::create_dir_all(&cni_conf_dir_owned)
-                    .context("Failed to create CNI config directory")
-            },
-        )
-        .await?;
+        file_process
+            .run_blocking_file_keyed(
+                "containerd_write_cni_create_dir",
+                cni_conf_dir_owned.clone(),
+                move || {
+                    std::fs::create_dir_all(&cni_conf_dir_owned)
+                        .context("Failed to create CNI config directory")
+                },
+            )
+            .await?;
 
         let cni_config = serde_json::json!({
             "cniVersion": "1.0.0",
@@ -294,48 +297,50 @@ impl ContainerdManager {
 
         let subdir_path = format!("{}/10-{}.conf", cni_conf_dir, bridge_name);
         let subdir_path_key = subdir_path.clone();
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "containerd_write_cni_config",
-            subdir_path_key,
-            move || {
+        file_process
+            .run_blocking_file_keyed("containerd_write_cni_config", subdir_path_key, move || {
                 std::fs::write(&subdir_path, &config_json)
                     .context("Failed to write CNI config file to namespace subdir")
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         Ok(())
     }
 
-    async fn install_klights_cni_binary(cni_bin_dir: &str) -> Result<()> {
+    async fn install_klights_cni_binary(
+        file_process: &klights_supervisor::FileProcessExecutor,
+        cni_bin_dir: &str,
+    ) -> Result<()> {
         let current_exe =
             std::env::current_exe().context("Failed to resolve current executable")?;
         let plugin_dir = std::path::Path::new(cni_bin_dir);
         let plugin_dir_path = plugin_dir.to_path_buf();
         let plugin_dir_key = plugin_dir.display().to_string();
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "containerd_install_cni_create_dir",
-            plugin_dir_key,
-            move || {
-                std::fs::create_dir_all(&plugin_dir_path)
-                    .with_context(|| format!("Failed to create {}", plugin_dir_path.display()))
-            },
-        )
-        .await?;
+        file_process
+            .run_blocking_file_keyed(
+                "containerd_install_cni_create_dir",
+                plugin_dir_key,
+                move || {
+                    std::fs::create_dir_all(&plugin_dir_path)
+                        .with_context(|| format!("Failed to create {}", plugin_dir_path.display()))
+                },
+            )
+            .await?;
         let plugin_path = plugin_dir.join("klights-cni");
         let current_exe_for_link = current_exe.clone();
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "containerd_install_cni_symlink",
-            plugin_path.display().to_string(),
-            move || -> Result<()> {
-                let _ = std::fs::remove_file(&plugin_path);
-                std::os::unix::fs::symlink(&current_exe_for_link, &plugin_path)
-                    .with_context(|| format!("Failed to symlink {}", plugin_path.display()))?;
-                Ok(())
-            },
-        )
-        .await
-        .context("Failed to install klights CNI plugin")?;
+        file_process
+            .run_blocking_file_keyed(
+                "containerd_install_cni_symlink",
+                plugin_path.display().to_string(),
+                move || -> Result<()> {
+                    let _ = std::fs::remove_file(&plugin_path);
+                    std::os::unix::fs::symlink(&current_exe_for_link, &plugin_path)
+                        .with_context(|| format!("Failed to symlink {}", plugin_path.display()))?;
+                    Ok(())
+                },
+            )
+            .await
+            .context("Failed to install klights CNI plugin")?;
         Ok(())
     }
 
@@ -448,18 +453,17 @@ state = "{state_dir}"
             task_supervisor,
             grpc_transport_policy,
         } = config;
+        let file_process = klights_supervisor::FileProcessExecutor::new(task_supervisor.clone());
         // Ensure inotify limits are sufficient before starting containerd
-        crate::kubelet::file_blocking::run_blocking_file(
-            "containerd_ensure_inotify_limits",
-            ensure_inotify_limits,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                "Failed to increase inotify limits: {}. Continuing anyway.",
-                e
-            );
-        });
+        file_process
+            .run_blocking_file("containerd_ensure_inotify_limits", ensure_inotify_limits)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    "Failed to increase inotify limits: {}. Continuing anyway.",
+                    e
+                );
+            });
 
         // Derive all paths from namespace for isolation
         let socket_path = crate::paths::containerd_socket_path(namespace)
@@ -477,29 +481,28 @@ state = "{state_dir}"
 
         // Create directories
         let state_dir_clone = state_dir.clone();
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "containerd_create_state_dir",
-            state_dir.clone(),
-            move || {
-                std::fs::create_dir_all(&state_dir_clone)
-                    .context("Failed to create state directory")
-            },
-        )
-        .await?;
+        file_process
+            .run_blocking_file_keyed(
+                "containerd_create_state_dir",
+                state_dir.clone(),
+                move || {
+                    std::fs::create_dir_all(&state_dir_clone)
+                        .context("Failed to create state directory")
+                },
+            )
+            .await?;
         let data_dir_clone = data_dir.clone();
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "containerd_create_data_dir",
-            data_dir.clone(),
-            move || {
+        file_process
+            .run_blocking_file_keyed("containerd_create_data_dir", data_dir.clone(), move || {
                 std::fs::create_dir_all(&data_dir_clone).context("Failed to create data directory")
-            },
-        )
-        .await?;
+            })
+            .await?;
         if rootless {
-            Self::write_rootless_runc_wrapper(&data_dir).await?;
+            Self::write_rootless_runc_wrapper(&file_process, &data_dir).await?;
         }
-        Self::install_klights_cni_binary(&cni_bin_dir).await?;
+        Self::install_klights_cni_binary(&file_process, &cni_bin_dir).await?;
         Self::write_cni_config(
+            &file_process,
             &cni_conf_dir,
             namespace,
             bridge_name,
@@ -520,17 +523,15 @@ state = "{state_dir}"
         );
         let config_key = config_path.clone();
         let config_path_for_write = config_path.clone();
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "containerd_write_config",
-            config_key,
-            move || {
+        file_process
+            .run_blocking_file_keyed("containerd_write_config", config_key, move || {
                 std::fs::write(&config_path_for_write, config_content)
                     .context("Failed to write containerd config")
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         if Self::try_reuse_existing(
+            &file_process,
             &socket_path,
             namespace,
             rootless,
@@ -550,6 +551,7 @@ state = "{state_dir}"
                 _data_dir: data_dir,
                 _state_dir: state_dir,
                 task_supervisor,
+                file_process,
             });
         }
 
@@ -560,12 +562,12 @@ state = "{state_dir}"
         apply_private_mount_namespace(&mut cmd);
         let child = task_supervisor
             .spawn_process(
-                crate::task_supervisor::TaskCategory::Others,
+                klights_supervisor::TaskCategory::Others,
                 "containerd_process_spawn",
                 cmd,
                 // A soft klights shutdown deliberately leaves containerd and
                 // its workloads running for the next process to reuse.
-                crate::task_supervisor::ProcessShutdownPolicy::Preserve,
+                klights_supervisor::ProcessShutdownPolicy::Preserve,
             )
             .await
             .context("Failed to spawn containerd process")?;
@@ -576,15 +578,12 @@ state = "{state_dir}"
             .context("Socket path has no parent directory")?;
         let socket_dir_path = socket_dir.to_path_buf();
         let socket_dir_key = socket_dir.display().to_string();
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "containerd_create_socket_dir",
-            socket_dir_key,
-            move || {
+        file_process
+            .run_blocking_file_keyed("containerd_create_socket_dir", socket_dir_key, move || {
                 std::fs::create_dir_all(&socket_dir_path)
                     .context("Failed to create containerd socket directory")
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         // Check if socket already exists (fast path)
         if !Path::new(&socket_path).exists() {
@@ -654,21 +653,29 @@ state = "{state_dir}"
             _data_dir: data_dir,
             _state_dir: state_dir,
             task_supervisor,
+            file_process,
         })
     }
 
     async fn try_reuse_existing(
+        file_process: &klights_supervisor::FileProcessExecutor,
         socket_path: &str,
         namespace: &str,
         rootless: bool,
         grpc_transport_policy: &crate::replication::grpc::transport_policy::GrpcTransportPolicy,
     ) -> Result<bool> {
-        if !crate::utils::path_exists_async(socket_path).await? {
+        if !crate::utils::path_exists_async(file_process, socket_path).await? {
             return Ok(false);
         }
 
-        match Self::socket_is_reusable(socket_path, namespace, rootless, grpc_transport_policy)
-            .await
+        match Self::socket_is_reusable(
+            file_process,
+            socket_path,
+            namespace,
+            rootless,
+            grpc_transport_policy,
+        )
+        .await
         {
             Ok(true) => Ok(true),
             Ok(false) => Ok(false),
@@ -679,24 +686,26 @@ state = "{state_dir}"
                     "Existing containerd socket is not ready; removing stale socket before spawn"
                 );
                 let socket_path_for_remove = socket_path.to_string();
-                crate::kubelet::file_blocking::run_blocking_file_keyed(
-                    "containerd_remove_stale_socket",
-                    socket_path.to_string(),
-                    move || match std::fs::remove_file(&socket_path_for_remove) {
-                        Ok(()) => Ok(()),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        Err(e) => Err(e).with_context(|| {
-                            format!("Failed to remove stale socket {socket_path_for_remove}")
-                        }),
-                    },
-                )
-                .await?;
+                file_process
+                    .run_blocking_file_keyed(
+                        "containerd_remove_stale_socket",
+                        socket_path.to_string(),
+                        move || match std::fs::remove_file(&socket_path_for_remove) {
+                            Ok(()) => Ok(()),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                            Err(e) => Err(e).with_context(|| {
+                                format!("Failed to remove stale socket {socket_path_for_remove}")
+                            }),
+                        },
+                    )
+                    .await?;
                 Ok(false)
             }
         }
     }
 
     pub async fn namespace_containerd_is_reusable(
+        file_process: &klights_supervisor::FileProcessExecutor,
         namespace: &str,
         rootless: bool,
         grpc_transport_policy: &crate::replication::grpc::transport_policy::GrpcTransportPolicy,
@@ -704,13 +713,21 @@ state = "{state_dir}"
         let socket_path = crate::paths::containerd_socket_path(namespace)
             .to_string_lossy()
             .into_owned();
-        if !crate::utils::path_exists_async(&socket_path).await? {
+        if !crate::utils::path_exists_async(file_process, &socket_path).await? {
             return Ok(false);
         }
-        Self::socket_is_reusable(&socket_path, namespace, rootless, grpc_transport_policy).await
+        Self::socket_is_reusable(
+            file_process,
+            &socket_path,
+            namespace,
+            rootless,
+            grpc_transport_policy,
+        )
+        .await
     }
 
     async fn socket_is_reusable(
+        file_process: &klights_supervisor::FileProcessExecutor,
         socket_path: &str,
         namespace: &str,
         rootless: bool,
@@ -723,7 +740,9 @@ state = "{state_dir}"
         )
         .await
         {
-            Ok(_) if rootless => rootless_namespace_containerd_is_current(namespace).await,
+            Ok(_) if rootless => {
+                rootless_namespace_containerd_is_current(file_process, namespace).await
+            }
             Ok(_) => Ok(true),
             Err(e) => Err(e)
                 .with_context(|| format!("containerd socket {socket_path} is not ready for reuse")),
@@ -790,16 +809,18 @@ state = "{state_dir}"
         // Clean up socket file (best-effort — containerd may have already removed it)
         if Path::new(&self.socket_path).exists() {
             let socket_path = self.socket_path.clone();
-            if let Err(e) = crate::kubelet::file_blocking::run_blocking_file_keyed(
-                "containerd_remove_socket_file",
-                socket_path.clone(),
-                move || {
-                    std::fs::remove_file(&socket_path)
-                        .with_context(|| format!("Failed to remove socket {}", socket_path))?;
-                    Ok(())
-                },
-            )
-            .await
+            if let Err(e) = self
+                .file_process
+                .run_blocking_file_keyed(
+                    "containerd_remove_socket_file",
+                    socket_path.clone(),
+                    move || {
+                        std::fs::remove_file(&socket_path)
+                            .with_context(|| format!("Failed to remove socket {}", socket_path))?;
+                        Ok(())
+                    },
+                )
+                .await
             {
                 tracing::warn!("Failed to remove socket {}: {}", self.socket_path, e);
             }
@@ -810,15 +831,17 @@ state = "{state_dir}"
 
     pub async fn stop_namespace_containerd(
         namespace: &str,
-        task_supervisor: &crate::task_supervisor::TaskSupervisor,
+        task_supervisor: &klights_supervisor::TaskSupervisor,
+        file_process: &klights_supervisor::FileProcessExecutor,
     ) -> Result<usize> {
         let config_path = crate::paths::containerd_data_dir_path(namespace).join("config.toml");
         let socket_path = crate::paths::containerd_socket_path(namespace);
-        let mut pids: BTreeSet<libc::pid_t> = find_containerd_pids_for_config(&config_path)
-            .await?
-            .into_iter()
-            .collect();
-        pids.extend(find_containerd_shim_pids_for_socket(&socket_path).await?);
+        let mut pids: BTreeSet<libc::pid_t> =
+            find_containerd_pids_for_config(file_process, &config_path)
+                .await?
+                .into_iter()
+                .collect();
+        pids.extend(find_containerd_shim_pids_for_socket(file_process, &socket_path).await?);
         let pids: Vec<libc::pid_t> = pids.into_iter().collect();
 
         if pids.is_empty() {
@@ -867,7 +890,7 @@ pub fn send_signal(pid: libc::pid_t, signal: libc::c_int) {
 pub async fn wait_for_pids_to_exit(
     pids: &[libc::pid_t],
     timeout_duration: Duration,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) {
     let mut pidfds = Vec::new();
     for pid in pids {
@@ -921,9 +944,12 @@ pub fn process_exists(pid: libc::pid_t) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
-async fn rootless_namespace_containerd_is_current(namespace: &str) -> Result<bool> {
+async fn rootless_namespace_containerd_is_current(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    namespace: &str,
+) -> Result<bool> {
     let config_path = crate::paths::containerd_data_dir_path(namespace).join("config.toml");
-    let pids = find_containerd_pids_for_config(&config_path).await?;
+    let pids = find_containerd_pids_for_config(file_process, &config_path).await?;
     rootless_containerd_pids_in_current_netns(Path::new("/proc"), &pids)
 }
 
@@ -965,24 +991,32 @@ fn rootless_containerd_pids_in_current_netns(
     Ok(true)
 }
 
-async fn find_containerd_pids_for_config(config_path: &Path) -> Result<Vec<libc::pid_t>> {
+async fn find_containerd_pids_for_config(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    config_path: &Path,
+) -> Result<Vec<libc::pid_t>> {
     let config_path = config_path.to_path_buf();
-    crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "containerd_find_namespace_processes",
-        config_path.display().to_string(),
-        move || find_containerd_pids_for_config_sync(&config_path),
-    )
-    .await
+    file_process
+        .run_blocking_file_keyed(
+            "containerd_find_namespace_processes",
+            config_path.display().to_string(),
+            move || find_containerd_pids_for_config_sync(&config_path),
+        )
+        .await
 }
 
-async fn find_containerd_shim_pids_for_socket(socket_path: &Path) -> Result<Vec<libc::pid_t>> {
+async fn find_containerd_shim_pids_for_socket(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    socket_path: &Path,
+) -> Result<Vec<libc::pid_t>> {
     let socket_path = socket_path.to_path_buf();
-    crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "containerd_find_namespace_shims",
-        socket_path.display().to_string(),
-        move || find_containerd_shim_pids_for_socket_sync(&socket_path),
-    )
-    .await
+    file_process
+        .run_blocking_file_keyed(
+            "containerd_find_namespace_shims",
+            socket_path.display().to_string(),
+            move || find_containerd_shim_pids_for_socket_sync(&socket_path),
+        )
+        .await
 }
 
 fn find_containerd_pids_for_config_sync(config_path: &Path) -> Result<Vec<libc::pid_t>> {
@@ -1160,15 +1194,15 @@ mod tests {
     }
 
     async fn test_containerd_manager_with_fixture(ignore_sigterm: bool) -> ContainerdManager {
-        let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let child = task_supervisor
             .spawn_process(
-                crate::task_supervisor::TaskCategory::Others,
+                klights_supervisor::TaskCategory::Others,
                 "containerd_stop_fixture",
                 containerd_stop_fixture_command(ignore_sigterm),
-                crate::task_supervisor::ProcessShutdownPolicy::Preserve,
+                klights_supervisor::ProcessShutdownPolicy::Preserve,
             )
             .await
             .expect("spawn containerd stop fixture");
@@ -1178,6 +1212,7 @@ mod tests {
             _config_path: String::new(),
             _data_dir: String::new(),
             _state_dir: String::new(),
+            file_process: klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
             task_supervisor,
         }
     }
@@ -1194,7 +1229,7 @@ mod tests {
         assert!(
             manager
                 .task_supervisor
-                .active_tasks(Some(crate::task_supervisor::TaskCategory::Others))
+                .active_tasks(Some(klights_supervisor::TaskCategory::Others))
                 .is_empty()
         );
     }
@@ -1211,7 +1246,7 @@ mod tests {
         assert!(
             manager
                 .task_supervisor
-                .active_tasks(Some(crate::task_supervisor::TaskCategory::Others))
+                .active_tasks(Some(klights_supervisor::TaskCategory::Others))
                 .is_empty()
         );
     }
@@ -1817,6 +1852,7 @@ mod tests {
         let cni_dir = dir.path().to_string_lossy().into_owned();
 
         ContainerdManager::write_cni_config(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
             &cni_dir,
             "klights-test",
             "klights-test",

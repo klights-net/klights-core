@@ -430,6 +430,48 @@ mod tests {
     use std::sync::{Arc as StdArc, Mutex};
     use std::time::Duration;
 
+    async fn register_node(
+        db: &dyn DatastoreBackend,
+        node_name: &str,
+        node_mode: &crate::bootstrap::NodeMode,
+        node_role: &crate::bootstrap::NodeRole,
+        dataplane_health: Option<&DataplaneHealth>,
+        dataplane_external_ip: Option<&str>,
+    ) -> Result<()> {
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        crate::kubelet::node_registration::register_node(
+            &file_process,
+            db,
+            node_name,
+            node_mode,
+            node_role,
+            dataplane_health,
+            dataplane_external_ip,
+        )
+        .await
+    }
+
+    async fn register_node_at_addresses(
+        db: &dyn DatastoreBackend,
+        node_name: &str,
+        node_mode: &crate::bootstrap::NodeMode,
+        node_role: &crate::bootstrap::NodeRole,
+        dataplane_health: Option<&DataplaneHealth>,
+        addresses: &NodeRegistrationAddresses,
+    ) -> Result<()> {
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        crate::kubelet::node_registration::register_node_at_addresses(
+            &file_process,
+            db,
+            node_name,
+            node_mode,
+            node_role,
+            dataplane_health,
+            addresses,
+        )
+        .await
+    }
+
     fn node_condition_status<'a>(node: &'a serde_json::Value, cond_type: &str) -> Option<&'a str> {
         node.pointer("/status/conditions")
             .and_then(|v| v.as_array())
@@ -1858,8 +1900,8 @@ mod tests {
             client.clone(),
             "test-node".to_string(),
             cancel.clone(),
-            std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-                crate::task_supervisor::TaskCategoryConfig::default(),
+            std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
             )),
             Duration::from_millis(25),
         ));
@@ -1884,7 +1926,7 @@ mod tests {
     async fn node_effect_self_status_uses_fresh_identity_and_only_durable_enqueue() {
         use crate::datastore::backend_kind::BackendKind;
         use crate::datastore::node_local::selector;
-        use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+        use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
         let cluster: crate::datastore::DatastoreHandle =
             std::sync::Arc::new(crate::datastore::test_support::in_memory().await);
@@ -1967,7 +2009,7 @@ mod tests {
     async fn node_effect_self_status_rejects_cross_node_before_enqueue() {
         use crate::datastore::backend_kind::BackendKind;
         use crate::datastore::node_local::selector;
-        use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+        use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
         let cluster: crate::datastore::DatastoreHandle =
             std::sync::Arc::new(crate::datastore::test_support::in_memory().await);

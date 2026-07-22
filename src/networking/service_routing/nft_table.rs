@@ -2151,8 +2151,8 @@ mod remote_endpoint_failure_tests {
     use super::*;
 
     fn table() -> KlightsTable {
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         KlightsTable::with_name(
             Netfilter::new(supervisor).unwrap(),
@@ -2354,9 +2354,9 @@ mod kernel_compat_tests {
         format!("{prefix}_{}_{}", std::process::id(), nanos)
     }
 
-    fn test_task_supervisor() -> Arc<crate::task_supervisor::TaskSupervisor> {
-        Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+    fn test_task_supervisor() -> Arc<klights_supervisor::TaskSupervisor> {
+        Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ))
     }
 

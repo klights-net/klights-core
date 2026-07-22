@@ -222,7 +222,7 @@ mod tests {
     use crate::datastore::node_local::SqliteNodeLocalDb;
     use crate::datastore::raft::types::{NodeId, StorageCommandPayload};
     use crate::datastore::sqlite::{DbExecutor, opener};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use openraft::{Entry, EntryPayload, LeaderId};
 
     fn entry_for(index: u64, term: u64, leader_node: NodeId, payload: &[u8]) -> Entry<TypeConfig> {

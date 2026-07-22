@@ -442,19 +442,23 @@ fn collect_mount_targets_under(mountinfo: &str, root: &str) -> Vec<String> {
     collect_mount_targets_under_roots(mountinfo, &roots)
 }
 
-pub async fn unmount_volume_mounts_under(root: &str) -> Result<()> {
-    let mountinfo = match crate::utils::read_utf8_file_async("/proc/self/mountinfo").await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                "Failed reading /proc/self/mountinfo while cleaning {}: {}",
-                root,
-                e
-            );
-            return Ok(());
-        }
-    };
-    let canonical_root = crate::utils::canonicalize_async(root)
+pub async fn unmount_volume_mounts_under(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    root: &str,
+) -> Result<()> {
+    let mountinfo =
+        match crate::utils::read_utf8_file_async(file_process, "/proc/self/mountinfo").await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed reading /proc/self/mountinfo while cleaning {}: {}",
+                    root,
+                    e
+                );
+                return Ok(());
+            }
+        };
+    let canonical_root = crate::utils::canonicalize_async(file_process, root)
         .await
         .ok()
         .map(|path| path.to_string_lossy().to_string());
@@ -462,10 +466,8 @@ pub async fn unmount_volume_mounts_under(root: &str) -> Result<()> {
     let targets = collect_mount_targets_under_roots(&mountinfo, &roots);
     for target in targets {
         let target_for_cmd = target.clone();
-        let result = crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "kubelet_unmount_volume_target",
-            target.clone(),
-            move || {
+        let result = file_process
+            .run_blocking_file_keyed("kubelet_unmount_volume_target", target.clone(), move || {
                 // INVARIANT (D4): the `-l` (lazy) flag is load-bearing for the
                 // unmount-before-remove safety in pod cleanup. Even if a mount is
                 // EBUSY, lazy detach removes it from the namespace immediately, so
@@ -489,9 +491,8 @@ pub async fn unmount_volume_mounts_under(root: &str) -> Result<()> {
                     }
                 }
                 Ok(())
-            },
-        )
-        .await;
+            })
+            .await;
 
         if let Err(e) = result {
             tracing::warn!("Unmount failed for {}: {}", target, e);
@@ -642,12 +643,13 @@ pub fn resolve_host_path(host_path: &str, host_type: Option<&str>) -> Result<Str
 /// block the tokio runtime (HR2: the event loop must never block).
 #[cfg(test)]
 pub async fn cleanup_volumes(pod_name: &str) -> Result<()> {
+    let file_process = crate::kubelet::file_blocking::test_file_process_executor();
     let volumes_root = volumes_root();
     let pod_volumes_path = format!("{}/{}/volumes", volumes_root, pod_name);
     // Best-effort unmount first to prevent recursive tmpfs stacking leaks
     // and remove_dir_all failures when mount points are still attached.
-    unmount_volume_mounts_under(&pod_volumes_path).await?;
-    crate::utils::remove_dir_all_if_exists_async(&pod_volumes_path)
+    unmount_volume_mounts_under(&file_process, &pod_volumes_path).await?;
+    crate::utils::remove_dir_all_if_exists_async(&file_process, &pod_volumes_path)
         .await
         .with_context(|| format!("Failed to remove volumes at {}", pod_volumes_path))?;
     Ok(())

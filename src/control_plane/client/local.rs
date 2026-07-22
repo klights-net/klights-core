@@ -88,6 +88,7 @@ pub struct LocalApiClient {
     raft: crate::datastore::raft::state_machine::N1Raft,
     authoring_node: String,
     containerd_namespace: String,
+    file_process: klights_supervisor::FileProcessExecutor,
     node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
     /// Set once the leader's `ControllerDispatcher` is constructed (later in
     /// bootstrap than `LocalApiClient`). When present, every successful
@@ -105,41 +106,130 @@ pub struct LocalApiClient {
 }
 
 impl LocalApiClient {
+    #[cfg(not(test))]
     pub fn new(
         db: DatastoreHandle,
         authoring_node: String,
         is_leader_rx: watch::Receiver<bool>,
+        file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
-        Self::new_with_node_lease_tracker_and_containerd_namespace(
+        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
             db,
             authoring_node,
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
             Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
             is_leader_rx,
+            file_process,
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn new(
+        db: DatastoreHandle,
+        authoring_node: String,
+        is_leader_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self::new_with_file_process(
+            db,
+            authoring_node,
+            is_leader_rx,
+            crate::kubelet::file_blocking::test_file_process_executor(),
+        )
+    }
+
+    pub fn new_with_file_process(
+        db: DatastoreHandle,
+        authoring_node: String,
+        is_leader_rx: watch::Receiver<bool>,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
+        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+            db,
+            authoring_node,
+            std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
+            Arc::new(crate::node_lease_tracker::NodeLeaseTracker::new()),
+            is_leader_rx,
+            file_process,
+        )
+    }
+
+    #[cfg(not(test))]
     pub fn new_with_node_lease_tracker(
         db: DatastoreHandle,
         authoring_node: String,
         node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
         is_leader_rx: watch::Receiver<bool>,
+        file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
-        Self::new_with_node_lease_tracker_and_containerd_namespace(
+        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
             db,
             authoring_node,
             std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
             node_lease_tracker,
             is_leader_rx,
+            file_process,
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_node_lease_tracker(
+        db: DatastoreHandle,
+        authoring_node: String,
+        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        is_leader_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self::new_with_node_lease_tracker_and_file_process(
+            db,
+            authoring_node,
+            node_lease_tracker,
+            is_leader_rx,
+            crate::kubelet::file_blocking::test_file_process_executor(),
+        )
+    }
+
+    pub fn new_with_node_lease_tracker_and_file_process(
+        db: DatastoreHandle,
+        authoring_node: String,
+        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        is_leader_rx: watch::Receiver<bool>,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
+        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+            db,
+            authoring_node,
+            std::env::var("KLIGHTS_CONTAINERD_NAMESPACE").unwrap_or_else(|_| "klights".to_string()),
+            node_lease_tracker,
+            is_leader_rx,
+            file_process,
+        )
+    }
+
+    #[cfg(not(test))]
     pub fn new_with_node_lease_tracker_and_containerd_namespace(
         db: DatastoreHandle,
         authoring_node: String,
         containerd_namespace: String,
         node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
         is_leader_rx: watch::Receiver<bool>,
+        file_process: klights_supervisor::FileProcessExecutor,
+    ) -> Self {
+        Self::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+            db,
+            authoring_node,
+            containerd_namespace,
+            node_lease_tracker,
+            is_leader_rx,
+            file_process,
+        )
+    }
+
+    pub fn new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
+        db: DatastoreHandle,
+        authoring_node: String,
+        containerd_namespace: String,
+        node_lease_tracker: Arc<crate::node_lease_tracker::NodeLeaseTracker>,
+        is_leader_rx: watch::Receiver<bool>,
+        file_process: klights_supervisor::FileProcessExecutor,
     ) -> Self {
         let pod_store = Arc::new(PodStore::new(db.clone()));
         let positioned_watch = datastore_positioned_watch_service(db.clone());
@@ -150,6 +240,7 @@ impl LocalApiClient {
             pod_store,
             authoring_node,
             containerd_namespace,
+            file_process,
             node_lease_tracker,
             controller_dispatcher: Arc::new(OnceCell::new()),
             is_leader_rx,
@@ -688,15 +779,17 @@ impl LeaderProjectedServiceAccountToken for LocalApiClient {
             if request.bound_node_name() != self.authoring_node {
                 return Err(ProjectedServiceAccountTokenError::Unauthorized);
             }
-            let signing_key_pem =
-                crate::auth::read_service_account_signing_key_async(&self.containerd_namespace)
-                    .await
-                    .map_err(|error| {
-                        ProjectedServiceAccountTokenError::signing_failed(format!(
-                            "ServiceAccount signing key for {} is unavailable: {error}",
-                            self.containerd_namespace
-                        ))
-                    })?;
+            let signing_key_pem = crate::auth::read_service_account_signing_key_async(
+                &self.file_process,
+                &self.containerd_namespace,
+            )
+            .await
+            .map_err(|error| {
+                ProjectedServiceAccountTokenError::signing_failed(format!(
+                    "ServiceAccount signing key for {} is unavailable: {error}",
+                    self.containerd_namespace
+                ))
+            })?;
             crate::control_plane::service_account_tokens::issue_projected_service_account_token(
                 self.db.as_ref(),
                 self.pod_store.as_ref(),

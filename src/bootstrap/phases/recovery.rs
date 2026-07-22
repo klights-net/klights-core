@@ -18,6 +18,7 @@ pub async fn run(cfg: &ConfigPhase) -> Result<RecoveryPhase> {
         &cfg.network_cleanup,
         &cfg.containerd_state_dir,
         cfg.supervisor.as_ref(),
+        &cfg.file_process,
         cfg.grpc_transport_policy.as_ref(),
     )
     .await

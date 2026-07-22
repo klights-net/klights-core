@@ -19,7 +19,6 @@ mod cases {
     use crate::replication::grpc::generated::{self, follower_message, leader_message};
     use crate::replication::protocol::{JoinRole, ReplicationEntry, StreamItem};
     use crate::replication::service::ReplicationService;
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use futures::StreamExt as _;
     use klights_leader_api::{OutboxDeliveryOperation, OutboxDeliveryRequest};
     use klights_node_api::{
@@ -30,6 +29,7 @@ mod cases {
         NodeMetricsNodeSample, NodeMetricsPodSample, NodeMetricsRequest, NodeMetricsResult,
         NodeMetricsRuntime, NodeMetricsTarget,
     };
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio_util::sync::CancellationToken;
 
     use crate::leader_tls_policy::LeaderTlsVerification;
@@ -2111,6 +2111,7 @@ mod cases {
         );
         let controlplane_registration =
             crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
+                &crate::kubelet::file_blocking::test_file_process_executor(),
                 "cp2",
                 &crate::bootstrap::NodeMode::Root,
                 &crate::bootstrap::NodeRole::Controlplane {

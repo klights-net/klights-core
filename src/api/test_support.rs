@@ -12,12 +12,15 @@ pub async fn build_test_app_state() -> crate::api::AppState {
     // F6-02: Create NodePortAllocator and mark as ready for tests
     let nodeport_alloc = Arc::new(crate::controllers::service::NodePortAllocator::new());
     nodeport_alloc.set_ready();
-    let controller_dispatcher = Arc::new(crate::controller_dispatcher::ControllerDispatcher::new(
-        service_ipam.clone(),
+    let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
-    let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
-    ));
+    let controller_dispatcher = Arc::new(
+        crate::controller_dispatcher::ControllerDispatcher::with_task_supervisor(
+            service_ipam.clone(),
+            task_supervisor.clone(),
+        ),
+    );
 
     // Unit tests do not run the async workqueue worker; wire sync fallback
     // so enqueue() still drives side-effect assertions in handler tests.
@@ -79,6 +82,7 @@ pub async fn build_test_app_state() -> crate::api::AppState {
         apiservice_proxy_cache: Arc::new(
             crate::api::apiservice_proxy::ApiServiceProxyCache::default(),
         ),
+        file_process: klights_supervisor::FileProcessExecutor::new(task_supervisor.clone()),
         task_supervisor,
         pod_repository,
         outbox: std::sync::Arc::new(crate::kubelet::outbox::Outbox::test_outbox().await),

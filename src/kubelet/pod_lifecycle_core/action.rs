@@ -13,7 +13,6 @@ use super::message::{
     LifecycleMessage, PodLifecycleKey, PodLifecycleWorkFailure, PodLifecycleWorkKind,
 };
 use crate::kubelet::lifecycle::LifecycleCommand;
-use crate::task_supervisor::TaskCategory;
 
 /// Synthesizes a `PodWorkFailed` message from an executor dispatch error.
 /// Shared by actor backend, multiplex adapter, and `PodDemuxEngine::spawn_work`.
@@ -171,23 +170,6 @@ impl PodAction {
         }
     }
 
-    /// Supervisor task category for this action.
-    pub fn task_category(&self) -> TaskCategory {
-        match self {
-            Self::StartPod { .. }
-            | Self::CheckSlotAdmission { .. }
-            | Self::StopPod { .. }
-            | Self::FinalizePodDeletion { .. }
-            | Self::FinalizeStartup { .. }
-            | Self::ReconcileRuntime { .. }
-            | Self::ReconcileCriLeftovers { .. }
-            | Self::HandleCommand { .. }
-            | Self::ReconcileEphemeral { .. } => TaskCategory::PodLifecycleWork,
-            Self::ScheduleRetry { .. } | Self::ScheduleStartPodRetry { .. } => TaskCategory::Timer,
-            Self::Noop => TaskCategory::Background,
-        }
-    }
-
     /// Stable static name for tracing / supervisor diagnostics.
     pub fn task_name(&self) -> &'static str {
         match self {
@@ -256,7 +238,6 @@ mod tests {
             action.expected_completion(),
             Some(PodLifecycleWorkKind::StartPod)
         );
-        assert_eq!(action.task_category(), TaskCategory::PodLifecycleWork);
         assert_eq!(action.task_name(), "executor_start_pod");
         assert!(action.failure_synthesizer().is_some());
     }
@@ -275,7 +256,6 @@ mod tests {
             action.expected_completion(),
             Some(PodLifecycleWorkKind::StopPod)
         );
-        assert_eq!(action.task_category(), TaskCategory::PodLifecycleWork);
         assert_eq!(action.task_name(), "executor_stop_pod");
         assert!(action.failure_synthesizer().is_some());
     }
@@ -292,7 +272,6 @@ mod tests {
             action.expected_completion(),
             Some(PodLifecycleWorkKind::FinalizePodDeletion)
         );
-        assert_eq!(action.task_category(), TaskCategory::PodLifecycleWork);
         assert_eq!(action.task_name(), "executor_finalize_pod_deletion");
         assert!(action.failure_synthesizer().is_some());
     }
@@ -311,7 +290,6 @@ mod tests {
             action.expected_completion(),
             Some(PodLifecycleWorkKind::FinalizeStartup)
         );
-        assert_eq!(action.task_category(), TaskCategory::PodLifecycleWork);
         assert!(action.failure_synthesizer().is_some());
     }
 
@@ -328,7 +306,6 @@ mod tests {
             action.expected_completion(),
             Some(PodLifecycleWorkKind::ReconcileRuntime)
         );
-        assert_eq!(action.task_category(), TaskCategory::PodLifecycleWork);
         assert_eq!(action.task_name(), "executor_reconcile_runtime");
         assert!(action.failure_synthesizer().is_some());
     }
@@ -345,7 +322,6 @@ mod tests {
             action.expected_completion(),
             Some(PodLifecycleWorkKind::ReconcileCriLeftovers)
         );
-        assert_eq!(action.task_category(), TaskCategory::PodLifecycleWork);
         assert_eq!(action.task_name(), "executor_reconcile_cri_leftovers");
         assert!(action.failure_synthesizer().is_some());
     }
@@ -369,7 +345,6 @@ mod tests {
             action.expected_completion(),
             Some(PodLifecycleWorkKind::HandleCommand)
         );
-        assert_eq!(action.task_category(), TaskCategory::PodLifecycleWork);
         assert!(action.failure_synthesizer().is_some());
     }
 
@@ -386,7 +361,6 @@ mod tests {
             action.expected_completion(),
             Some(PodLifecycleWorkKind::ReconcileEphemeral)
         );
-        assert_eq!(action.task_category(), TaskCategory::PodLifecycleWork);
         assert!(action.failure_synthesizer().is_some());
     }
 
@@ -399,7 +373,6 @@ mod tests {
         assert!(action.key().is_some());
         assert_eq!(action.operation_id(), None);
         assert_eq!(action.expected_completion(), None);
-        assert_eq!(action.task_category(), TaskCategory::Timer);
         assert_eq!(action.task_name(), "executor_schedule_retry");
         assert!(action.failure_synthesizer().is_none());
     }
@@ -415,7 +388,6 @@ mod tests {
         assert_eq!(action.key().map(|k| &k.uid), Some(&"uid-1".to_string()));
         assert_eq!(action.operation_id(), None);
         assert_eq!(action.expected_completion(), None);
-        assert_eq!(action.task_category(), TaskCategory::Timer);
         assert_eq!(action.task_name(), "executor_schedule_start_pod_retry");
         assert!(action.failure_synthesizer().is_none());
         match action {
@@ -439,7 +411,6 @@ mod tests {
         assert_eq!(action.key(), None);
         assert_eq!(action.operation_id(), None);
         assert_eq!(action.expected_completion(), None);
-        assert_eq!(action.task_category(), TaskCategory::Background);
         assert_eq!(action.task_name(), "executor_noop");
         assert!(action.failure_synthesizer().is_none());
     }

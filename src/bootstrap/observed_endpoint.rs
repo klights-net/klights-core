@@ -12,7 +12,7 @@ use crate::replication::grpc::client::{
     GrpcClientConfig, JoinDataplaneMetadata, ReplicationGrpcClient,
 };
 use crate::replication::protocol::JoinRole;
-use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
+use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PeerEndpoint {
@@ -430,7 +430,7 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
-        let supervisor = TaskSupervisor::new(crate::task_supervisor::TaskCategoryConfig::default());
+        let supervisor = TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
 
         db.create_resource(
             "v1",
@@ -473,7 +473,7 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
-        let supervisor = TaskSupervisor::new(crate::task_supervisor::TaskCategoryConfig::default());
+        let supervisor = TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
 
         db.create_resource(
             "v1",

@@ -91,7 +91,7 @@ pub struct InitCertificateRequest<'a> {
 /// the additional IP claim.
 pub async fn init_certificates(
     request: InitCertificateRequest<'_>,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<CertInitResult> {
     let InitCertificateRequest {
         tls_port,
@@ -365,7 +365,7 @@ pub async fn init_certificates(
 }
 
 async fn path_exists_keyed(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     path: &Path,
     label: &'static str,
 ) -> Result<bool> {
@@ -377,7 +377,7 @@ async fn path_exists_keyed(
 }
 
 async fn read_utf8_file_keyed(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     path: &Path,
     label: &'static str,
 ) -> Result<String> {
@@ -389,7 +389,7 @@ async fn read_utf8_file_keyed(
 }
 
 async fn write_file_keyed(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     path: &Path,
     contents: String,
     label: &'static str,
@@ -410,7 +410,7 @@ async fn write_file_keyed(
 }
 
 async fn ensure_service_account_signing_key(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     path: &Path,
     allow_local_generation: bool,
 ) -> Result<()> {
@@ -469,7 +469,7 @@ fn generate_service_account_signing_key_pem() -> Result<String> {
 }
 
 async fn set_key_permissions_keyed(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     path: &Path,
     label: &'static str,
 ) -> Result<()> {
@@ -665,7 +665,7 @@ pub fn generate_apiservice_proxy_cert(
 }
 
 pub async fn ensure_api_proxy_certificate_from_pem(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     etc_dir: &Path,
     ca_cert_pem: &str,
     ca_key_pem: &str,
@@ -712,7 +712,7 @@ pub async fn ensure_api_proxy_certificate_from_pem(
 }
 
 pub async fn ensure_apiservice_proxy_certificate_from_pem(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     etc_dir: &Path,
     ca_cert_pem: &str,
     ca_key_pem: &str,
@@ -1155,7 +1155,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path().join("etc");
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(Default::default());
+        let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
         init_certificates(
             InitCertificateRequest {
                 tls_port: 7679,
@@ -1207,7 +1207,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path().join("etc");
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(Default::default());
+        let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
         init_certificates(
             InitCertificateRequest {
                 tls_port: 7679,
@@ -1268,7 +1268,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path().join("etc");
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(Default::default());
+        let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
         init_certificates(
             InitCertificateRequest {
                 tls_port: 7679,
@@ -1310,7 +1310,7 @@ mod tests {
         std::fs::write(etc_dir.join("ca.crt"), ca_cert_pem).unwrap();
         std::fs::write(etc_dir.join("ca.key"), ca_key_pem).unwrap();
 
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(Default::default());
+        let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
         init_certificates(
             InitCertificateRequest {
                 tls_port: 7679,
@@ -1345,7 +1345,7 @@ mod tests {
         let signer_path = etc_dir.join("service-account-signing.key");
         std::fs::write(&signer_path, "not a private key").unwrap();
 
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(Default::default());
+        let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
         let err = init_certificates(
             InitCertificateRequest {
                 tls_port: 7679,
@@ -1385,7 +1385,7 @@ mod tests {
         std::fs::write(etc_dir.join("ca.key"), ca_key_pem).unwrap();
         let signer_path = etc_dir.join("service-account-signing.key");
 
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(Default::default());
+        let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
         let err = init_certificates(
             InitCertificateRequest {
                 tls_port: 7679,
@@ -1418,7 +1418,7 @@ mod tests {
     async fn init_certificates_regenerates_mismatched_api_proxy_key_pair() {
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path().join("etc");
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(Default::default());
+        let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
         let request = || InitCertificateRequest {
             tls_port: 7679,
             context_name: "klights-proxy-key-test",
@@ -1474,7 +1474,7 @@ mod tests {
         std::fs::write(etc_dir.join("server.crt"), old_server_cert_pem).unwrap();
         std::fs::write(etc_dir.join("server.key"), old_server_key_pem).unwrap();
 
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(Default::default());
+        let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
         let result = init_certificates(
             InitCertificateRequest {
                 tls_port: 7679,
@@ -1507,7 +1507,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let etc_dir = dir.path().join("etc");
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(Default::default());
+        let supervisor = klights_supervisor::TaskSupervisor::new(Default::default());
         init_certificates(
             InitCertificateRequest {
                 tls_port: 7679,

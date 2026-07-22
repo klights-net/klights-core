@@ -11,8 +11,8 @@ use std::sync::Arc;
 use crate::KlightsConfig;
 use crate::datastore::DatastoreHandle;
 use crate::leader_election::{LeaderElection, LeaderScope};
-use crate::task_supervisor::TaskSupervisor;
 use anyhow::{Context as _, Result};
+use klights_supervisor::TaskSupervisor;
 use tokio_util::sync::CancellationToken;
 
 const CONTROLLER_WORKQUEUE_WORKERS: usize = 8;
@@ -84,7 +84,7 @@ pub async fn start(args: LeaderStart<'_>) -> Result<()> {
 
     task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Background,
+            klights_supervisor::TaskCategory::Background,
             "runtime_leader_controller_lease_loop",
             async move {
                 crate::leader_election::run_under_lease(
@@ -134,9 +134,12 @@ mod tests {
     #[tokio::test]
     async fn leader_kubernetes_service_reconcile_moves_endpoint_to_current_gateway() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .expect("default namespaces");
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .expect("default namespaces");
         let db_handle: DatastoreHandle = Arc::new(db);
         let mut config = KlightsConfig::test_default();
         config.service_cidr = "10.51.0.0/24".to_string();
@@ -212,7 +215,7 @@ async fn start_leader_scoped_tasks(
     let wlc = lease_cancel.child_token();
     if let Err(err) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Background,
+            klights_supervisor::TaskCategory::Background,
             "runtime_cronjob_scheduler_watch",
             async move {
                 wls.run_watch_loop(wlc).await;
@@ -229,7 +232,7 @@ async fn start_leader_scoped_tasks(
     let c = lease_cancel.child_token();
     if let Err(e) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Background,
+            klights_supervisor::TaskCategory::Background,
             "runtime_controller_workqueue_worker",
             async move {
                 d.run_worker_pool(CONTROLLER_WORKQUEUE_WORKERS, dhw, nn, c)
@@ -249,7 +252,7 @@ async fn start_leader_scoped_tasks(
     let scheduler_cancel = lease_cancel.child_token();
     if let Err(e) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Background,
+            klights_supervisor::TaskCategory::Background,
             "runtime_scheduler_controller",
             async move {
                 crate::controllers::scheduler::run_scheduler_watch(
@@ -277,6 +280,7 @@ async fn start_leader_scoped_tasks(
             pod_repository.clone(),
             config.containerd_namespace.clone(),
             pod_repository.sandbox_gc_dirty_counter(),
+            klights_supervisor::FileProcessExecutor::from_supervisor(task_supervisor.as_ref()),
         )));
     }
     sched.register(Arc::new(gc::watch_events_gc::WatchEventsGc::new(
@@ -287,7 +291,7 @@ async fn start_leader_scoped_tasks(
     let ts = task_supervisor.clone();
     if let Err(e) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Background,
+            klights_supervisor::TaskCategory::Background,
             "runtime_gc_scheduler",
             async move {
                 sched.run(ts, cancel).await;

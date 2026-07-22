@@ -2,17 +2,12 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 
 async fn run_shutdown_command(
+    file_process: &klights_supervisor::FileProcessExecutor,
     name: &'static str,
     program: &str,
     args: &[&str],
 ) -> Result<std::process::Output> {
-    run_shutdown_command_with(
-        &crate::kubelet::file_blocking::SupervisedProcessOutputRunner,
-        name,
-        program,
-        args,
-    )
-    .await
+    run_shutdown_command_with(file_process, name, program, args).await
 }
 
 async fn run_shutdown_command_with(
@@ -22,12 +17,7 @@ async fn run_shutdown_command_with(
     args: &[&str],
 ) -> Result<std::process::Output> {
     runner
-        .run(
-            crate::task_supervisor::TaskCategory::File,
-            name,
-            program,
-            args,
-        )
+        .run(klights_supervisor::TaskCategory::File, name, program, args)
         .await
 }
 
@@ -50,6 +40,7 @@ fn require_success<'a>(
 
 /// Stop and remove all pod sandboxes on shutdown.
 pub async fn cleanup_pod_sandboxes(
+    file_process: &klights_supervisor::FileProcessExecutor,
     cri: &mut crate::kubelet::CriClient,
     db: &dyn crate::datastore::DatastoreBackend,
     network: &dyn klights_network_api::Datapath,
@@ -62,6 +53,7 @@ pub async fn cleanup_pod_sandboxes(
     for sb in sandboxes {
         sandbox_ids.insert(sb.sandbox_id.clone());
         cleanup_one_pod_sandbox(
+            file_process,
             cri,
             db,
             network,
@@ -77,6 +69,7 @@ pub async fn cleanup_pod_sandboxes(
             for sandbox in runtime_sandboxes {
                 if sandbox_ids.insert(sandbox.id.clone()) {
                     cleanup_one_pod_sandbox(
+                        file_process,
                         cri,
                         db,
                         network,
@@ -101,6 +94,7 @@ pub async fn cleanup_pod_sandboxes(
 }
 
 async fn cleanup_one_pod_sandbox(
+    file_process: &klights_supervisor::FileProcessExecutor,
     cri: &mut crate::kubelet::CriClient,
     db: &dyn crate::datastore::DatastoreBackend,
     network: &dyn klights_network_api::Datapath,
@@ -131,8 +125,12 @@ async fn cleanup_one_pod_sandbox(
         Ok(_) => {
             if let Some((_, _, pod_uid)) = owner
                 && !pod_uid.trim().is_empty()
-                && let Err(e) =
-                    crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup(containerd_ns, pod_uid).await
+                && let Err(e) = crate::kubelet::cgroup_cleanup::cleanup_pod_cgroup(
+                    file_process,
+                    containerd_ns,
+                    pod_uid,
+                )
+                .await
             {
                 tracing::warn!(
                     "Failed to cleanup pod cgroup for sandbox {}: {}",
@@ -225,13 +223,12 @@ fn find_mount_points_under_roots(mount_output: &str, roots: &[&str]) -> Vec<Stri
     mount_points
 }
 
-async fn unmount_mount_points(mount_points: &[String], label: &str) -> Result<()> {
-    unmount_mount_points_with_runner(
-        mount_points,
-        label,
-        &crate::kubelet::file_blocking::SupervisedProcessOutputRunner,
-    )
-    .await
+async fn unmount_mount_points(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    mount_points: &[String],
+    label: &str,
+) -> Result<()> {
+    unmount_mount_points_with_runner(mount_points, label, file_process).await
 }
 
 async fn unmount_mount_points_with_runner(
@@ -322,30 +319,36 @@ fn find_overlay_rootfs_mount_points(mount_output: &str, containerd_base: &str) -
 /// Unmount orphan overlay rootfs mounts left behind by containerd.
 /// These are at `{containerd_base}/*/io.containerd.runtime.v2.task/k8s.io/*/rootfs`
 /// and must be unmounted before containerd data/state directories can be removed.
-pub async fn cleanup_overlay_rootfs_mounts(containerd_base: &str) -> Result<()> {
+pub async fn cleanup_overlay_rootfs_mounts(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    containerd_base: &str,
+) -> Result<()> {
     let args = ["-t", "overlay"];
-    let output = run_shutdown_command("shutdown_list_overlay_mounts", "mount", &args)
+    let output = run_shutdown_command(file_process, "shutdown_list_overlay_mounts", "mount", &args)
         .await
         .context("Failed to run mount")?;
     require_success("mount", &args, &output)?;
 
     let mount_output = String::from_utf8_lossy(&output.stdout);
     let mount_points = find_overlay_rootfs_mount_points(&mount_output, containerd_base);
-    unmount_mount_points(&mount_points, "orphan overlay rootfs").await
+    unmount_mount_points(file_process, &mount_points, "orphan overlay rootfs").await
 }
 
 /// Unmount container shm tmpfs mounts left behind by containerd sandboxes.
 /// These are at {state_dir}/io.containerd.grpc.v1.cri/sandboxes/*/shm
 /// and must be unmounted before containerd can cleanly shut down.
-pub async fn cleanup_shm_mounts(state_dir: &str) -> Result<()> {
-    let output = run_shutdown_command("shutdown_list_shm_mounts", "mount", &[])
+pub async fn cleanup_shm_mounts(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    state_dir: &str,
+) -> Result<()> {
+    let output = run_shutdown_command(file_process, "shutdown_list_shm_mounts", "mount", &[])
         .await
         .context("Failed to run mount")?;
     require_success("mount", &[], &output)?;
 
     let mount_output = String::from_utf8_lossy(&output.stdout);
     let mount_points = find_shm_mount_points(&mount_output, state_dir);
-    unmount_mount_points(&mount_points, "container shm").await
+    unmount_mount_points(file_process, &mount_points, "container shm").await
 }
 
 /// Unmount remaining sandbox/container-related mounts that may remain after
@@ -355,12 +358,18 @@ pub async fn cleanup_shm_mounts(state_dir: &str) -> Result<()> {
 /// namespace-specific state/data paths and should be removed before removing
 /// namespace directories.
 pub async fn cleanup_containerd_sandbox_mounts(
+    file_process: &klights_supervisor::FileProcessExecutor,
     containerd_state_dir: &str,
     containerd_base_dir: &str,
 ) -> Result<()> {
-    let output = run_shutdown_command("shutdown_list_containerd_mounts", "mount", &[])
-        .await
-        .context("Failed to run mount")?;
+    let output = run_shutdown_command(
+        file_process,
+        "shutdown_list_containerd_mounts",
+        "mount",
+        &[],
+    )
+    .await
+    .context("Failed to run mount")?;
     require_success("mount", &[], &output)?;
 
     let mount_output = String::from_utf8_lossy(&output.stdout);
@@ -378,14 +387,17 @@ pub async fn cleanup_containerd_sandbox_mounts(
     );
     let mount_roots = vec![sandbox_state_root.as_str(), task_root.as_str()];
     let mount_points = find_mount_points_under_roots(&mount_output, &mount_roots);
-    unmount_mount_points(&mount_points, "containerd sandbox").await
+    unmount_mount_points(file_process, &mount_points, "containerd sandbox").await
 }
 
 /// Remove CNI config files created by containerd_manager.
 /// Config is namespace-scoped under KLIGHTS_DATA_ROOT.
-pub async fn cleanup_cni_config_dir(namespace: &str) -> Result<()> {
+pub async fn cleanup_cni_config_dir(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    namespace: &str,
+) -> Result<()> {
     let cni_dir = crate::paths::cni_conf_dir_path(namespace);
-    if crate::utils::remove_dir_all_if_exists_async(&cni_dir)
+    if crate::utils::remove_dir_all_if_exists_async(file_process, &cni_dir)
         .await
         .context(format!(
             "Failed to remove CNI config dir {}",
@@ -398,9 +410,12 @@ pub async fn cleanup_cni_config_dir(namespace: &str) -> Result<()> {
 }
 
 /// Remove containerd state directory.
-pub async fn cleanup_containerd_state_dir(namespace: &str) -> Result<()> {
+pub async fn cleanup_containerd_state_dir(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    namespace: &str,
+) -> Result<()> {
     let state_dir = crate::paths::containerd_state_dir_path(namespace);
-    if crate::utils::remove_dir_all_if_exists_async(&state_dir)
+    if crate::utils::remove_dir_all_if_exists_async(file_process, &state_dir)
         .await
         .context(format!(
             "Failed to remove containerd state dir {}",
@@ -411,10 +426,10 @@ pub async fn cleanup_containerd_state_dir(namespace: &str) -> Result<()> {
     }
     // Also remove the socket file in the state dir.
     let socket_path = crate::paths::containerd_socket_path(namespace);
-    let _ = crate::utils::remove_file_if_exists_async(&socket_path).await;
+    let _ = crate::utils::remove_file_if_exists_async(file_process, &socket_path).await;
     // Remove parent if empty.
     if let Some(parent) = state_dir.parent() {
-        let _ = crate::utils::remove_dir_if_exists_async(parent).await;
+        let _ = crate::utils::remove_dir_if_exists_async(file_process, parent).await;
     }
     Ok(())
 }
@@ -425,14 +440,15 @@ pub async fn cleanup_containerd_state_dir(namespace: &str) -> Result<()> {
 /// previous embedded containerd cannot be contacted, its data metadata may no
 /// longer be trustworthy. Persistent klights state (`state.db`, certs, volumes)
 /// lives outside this root and is preserved.
-pub async fn cleanup_containerd_root_dir(namespace: &str) -> Result<()> {
+pub async fn cleanup_containerd_root_dir(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    namespace: &str,
+) -> Result<()> {
     let root = crate::paths::containerd_root_dir_path(namespace);
     let socket_path = crate::paths::containerd_socket_path(namespace);
     let key = root.to_string_lossy().into_owned();
-    crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "cleanup_containerd_root_dir",
-        key,
-        move || {
+    file_process
+        .run_blocking_file_keyed("cleanup_containerd_root_dir", key, move || {
             match std::fs::remove_file(&socket_path) {
                 Ok(()) => {
                     tracing::info!("Removed containerd socket: {}", socket_path.display());
@@ -454,15 +470,17 @@ pub async fn cleanup_containerd_root_dir(namespace: &str) -> Result<()> {
                 }
             }
             Ok(())
-        },
-    )
-    .await
+        })
+        .await
 }
 
 /// Remove containerd directories that live outside the data/state roots.
-pub async fn cleanup_containerd_auxiliary_dirs(namespace: &str) -> Result<()> {
+pub async fn cleanup_containerd_auxiliary_dirs(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    namespace: &str,
+) -> Result<()> {
     for dir in containerd_auxiliary_dir_paths(namespace) {
-        if crate::utils::remove_dir_all_if_exists_async(&dir)
+        if crate::utils::remove_dir_all_if_exists_async(file_process, &dir)
             .await
             .context(format!(
                 "Failed to remove containerd auxiliary dir {}",
@@ -474,14 +492,17 @@ pub async fn cleanup_containerd_auxiliary_dirs(namespace: &str) -> Result<()> {
     }
 
     let root = crate::paths::containerd_root_dir_path(namespace);
-    let _ = crate::utils::remove_dir_if_exists_async(&root).await;
+    let _ = crate::utils::remove_dir_if_exists_async(file_process, &root).await;
     Ok(())
 }
 
 /// Remove namespace-specific log directory.
-pub async fn cleanup_log_dir(namespace: &str) -> Result<()> {
+pub async fn cleanup_log_dir(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    namespace: &str,
+) -> Result<()> {
     let log_dir = crate::paths::pod_logs_root_path(namespace);
-    if crate::utils::remove_dir_all_if_exists_async(&log_dir)
+    if crate::utils::remove_dir_all_if_exists_async(file_process, &log_dir)
         .await
         .context(format!("Failed to remove log dir {}", log_dir.display()))?
     {
@@ -500,13 +521,12 @@ fn volume_cleanup_roots(namespace: &str) -> Vec<std::path::PathBuf> {
 }
 
 /// Remove pod volume directories for the given containerd namespace.
-pub async fn cleanup_volume_dirs(namespace: &str) -> Result<()> {
+pub async fn cleanup_volume_dirs(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    namespace: &str,
+) -> Result<()> {
     for volumes_root in volume_cleanup_roots(namespace) {
-        cleanup_volume_root_with_runner(
-            &volumes_root,
-            &crate::kubelet::file_blocking::SupervisedProcessOutputRunner,
-        )
-        .await?;
+        cleanup_volume_root_with_runner(&volumes_root, file_process, file_process).await?;
     }
     Ok(())
 }
@@ -514,13 +534,14 @@ pub async fn cleanup_volume_dirs(namespace: &str) -> Result<()> {
 async fn cleanup_volume_root_with_runner(
     volumes_root: &std::path::Path,
     runner: &dyn crate::kubelet::file_blocking::ProcessOutputRunner,
+    file_process: &klights_supervisor::FileProcessExecutor,
 ) -> Result<()> {
-    if !crate::utils::path_exists_async(volumes_root).await? {
+    if !crate::utils::path_exists_async(file_process, volumes_root).await? {
         return Ok(());
     }
 
     let mut roots = vec![volumes_root.to_string_lossy().into_owned()];
-    if let Ok(canonical) = crate::utils::canonicalize_async(volumes_root).await {
+    if let Ok(canonical) = crate::utils::canonicalize_async(file_process, volumes_root).await {
         roots.push(canonical.to_string_lossy().into_owned());
     }
     let root_refs: Vec<&str> = roots.iter().map(String::as_str).collect();
@@ -532,7 +553,7 @@ async fn cleanup_volume_root_with_runner(
     let mount_points = find_mount_points_under_roots(&mount_output, &root_refs);
     unmount_mount_points_with_runner(&mount_points, "pod volume", runner).await?;
 
-    crate::utils::remove_dir_all_if_exists_async(volumes_root)
+    crate::utils::remove_dir_all_if_exists_async(file_process, volumes_root)
         .await
         .with_context(|| format!("Failed to remove volume dir {}", volumes_root.display()))?;
     tracing::info!("Removed volume dir: {}", volumes_root.display());
@@ -556,7 +577,12 @@ mod tests {
             Ok(output(32, b"", b"target is busy")),
         ]);
 
-        let result = cleanup_volume_root_with_runner(&volume_root, &runner).await;
+        let result = cleanup_volume_root_with_runner(
+            &volume_root,
+            &runner,
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+        )
+        .await;
 
         assert!(result.is_err(), "failed unmount must fail closed");
         assert!(
@@ -973,6 +999,7 @@ tmpfs on /data/klights/pods/pod-a/volumes/empty-dir/cache type tmpfs (rw,relatim
         let executable = std::env::current_exe().expect("test executable");
         let executable = executable.to_string_lossy();
         let output = run_shutdown_command(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
             "shutdown_test_process_output",
             &executable,
             &[

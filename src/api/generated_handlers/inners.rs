@@ -123,7 +123,7 @@ async fn schedule_foreground_owner_finalization(
     if let Err(err) = state
         .task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Background,
+            klights_supervisor::TaskCategory::Background,
             "foreground_owner_finalization_dispatch",
             async move {
                 let worker_state = dispatch_state.clone();
@@ -134,7 +134,7 @@ async fn schedule_foreground_owner_finalization(
                 let worker_metrics = dispatch_state.metrics.clone();
                 if let Err(err) = worker_supervisor
                     .spawn_async(
-                        crate::task_supervisor::TaskCategory::PodDeleteWorkqueue,
+                        klights_supervisor::TaskCategory::PodDeleteWorkqueue,
                         "foreground_owner_finalization",
                         async move {
                             if let Err(err) = controllers::gc::finalize_foreground_owner_if_ready(
@@ -1408,7 +1408,8 @@ pub async fn create_inner(
 
                     let ca_cert_path =
                         crate::paths::ca_cert_path(&state.config.containerd_namespace);
-                    if let Ok(ca_cert_pem) = crate::utils::read_utf8_file_async(&ca_cert_path).await
+                    if let Ok(ca_cert_pem) =
+                        crate::utils::read_utf8_file_async(&state.file_process, &ca_cert_path).await
                     {
                         if let Err(e) =
                             crate::controllers::namespace::create_kube_root_ca_configmap(
@@ -1541,6 +1542,7 @@ pub async fn update_inner(
                     .is_none_or(|s| s.is_empty());
                 if ca_crt_empty
                     && let Err(e) = crate::controllers::namespace::reconcile_kube_root_ca_data(
+                        &state.file_process,
                         state.db.as_ref(),
                         namespace,
                     )
@@ -1586,7 +1588,7 @@ fn metadata_resource_version(body: &Value) -> Option<i64> {
 async fn run_owner_cascade_sweeps(
     db: crate::datastore::DatastoreHandle,
     pod_repository: Arc<crate::kubelet::pod_repository::PodRepository>,
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
     metrics: Arc<crate::side_effects::SideEffectMetrics>,
     api_version: String,
     owner_uid: String,
@@ -1828,7 +1830,7 @@ pub async fn delete_inner(
         if let Err(err) = state
             .task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::PodDeleteWorkqueue,
+                klights_supervisor::TaskCategory::PodDeleteWorkqueue,
                 "owner_cascade_sweeps",
                 run_owner_cascade_sweeps(
                     state.db.clone(),
@@ -1853,9 +1855,12 @@ pub async fn delete_inner(
     if kind == "ConfigMap"
         && name == "kube-root-ca.crt"
         && let Some(namespace) = ns
-        && let Err(e) =
-            crate::controllers::namespace::reconcile_kube_root_ca(state.db.as_ref(), namespace)
-                .await
+        && let Err(e) = crate::controllers::namespace::reconcile_kube_root_ca(
+            &state.file_process,
+            state.db.as_ref(),
+            namespace,
+        )
+        .await
     {
         tracing::warn!(
             namespace = %namespace,
@@ -2495,15 +2500,15 @@ mod tests {
     async fn foreground_delete_returns_after_marking_owner_without_synchronous_pod_cascade() {
         let mut app_state = crate::api::test_support::build_test_app_state().await;
         let release_workqueue = Arc::new(tokio::sync::Notify::new());
-        let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig {
+        let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig {
                 pod_delete_workqueue: 1,
-                ..crate::task_supervisor::TaskCategoryConfig::default()
+                ..klights_supervisor::TaskCategoryConfig::default()
             },
         ));
         let held_workqueue = task_supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::PodDeleteWorkqueue,
+                klights_supervisor::TaskCategory::PodDeleteWorkqueue,
                 "hold_foreground_delete_workqueue_for_test",
                 {
                     let release_workqueue = release_workqueue.clone();

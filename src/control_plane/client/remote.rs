@@ -32,7 +32,7 @@ use crate::control_plane::client::{
 };
 use crate::datastore::{Resource, ResourceList};
 use crate::replication::grpc::client::ReplicationGrpcClient;
-use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
+use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 /// bug-grpc: a worker watch stream that delivers neither an event nor a
 /// heartbeat BOOKMARK within this window is treated as wedged and dropped, so
@@ -751,8 +751,8 @@ mod tests {
     };
     use crate::replication::protocol::JoinRole;
     use crate::replication::service::ReplicationService;
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use klights_leader_api::{LeaderOutboxDelivery, OutboxDeliveryRequest};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use klights_types::ResourceKey;
 
     fn dataplane() -> JoinDataplaneMetadata {

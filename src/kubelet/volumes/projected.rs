@@ -27,6 +27,7 @@ struct ProjectedRenderPlanRequest<'a> {
 }
 
 struct ProjectedVolumePathRequest<'a> {
+    file_process: &'a klights_supervisor::FileProcessExecutor,
     volumes_root: &'a str,
     source_reader: &'a dyn VolumeSourceReader,
     namespace: &'a str,
@@ -40,6 +41,7 @@ struct ProjectedVolumePathRequest<'a> {
 }
 
 pub struct ProjectedVolumeNsRequest<'a> {
+    pub file_process: &'a klights_supervisor::FileProcessExecutor,
     pub source_reader: &'a dyn VolumeSourceReader,
     pub namespace: &'a str,
     pub pod_dir_id: &'a str,
@@ -52,6 +54,7 @@ pub struct ProjectedVolumeNsRequest<'a> {
 }
 
 pub(crate) struct ProjectedVolumeRootRequest<'a> {
+    pub file_process: &'a klights_supervisor::FileProcessExecutor,
     pub volumes_root: &'a str,
     pub source_reader: &'a dyn VolumeSourceReader,
     pub namespace: &'a str,
@@ -66,6 +69,7 @@ pub(crate) struct ProjectedVolumeRootRequest<'a> {
 
 #[cfg(test)]
 pub struct ProjectedVolumeAtRequest<'a> {
+    pub file_process: &'a klights_supervisor::FileProcessExecutor,
     pub volumes_root: &'a str,
     pub source_reader: &'a dyn VolumeSourceReader,
     pub namespace: &'a str,
@@ -91,6 +95,7 @@ fn render_projected_volume_blocking(
 }
 
 async fn render_projected_volume_keyed(
+    file_process: &klights_supervisor::FileProcessExecutor,
     task_label: &'static str,
     volume_path: &str,
     writes: Vec<ProjectionFileWrite>,
@@ -98,7 +103,7 @@ async fn render_projected_volume_keyed(
 ) -> Result<()> {
     let key = volume_path.to_string();
     let volume_path = volume_path.to_string();
-    run_blocking_fs_keyed(task_label, &key, move || {
+    run_blocking_fs_keyed(file_process, task_label, &key, move || {
         render_projected_volume_blocking(volume_path, writes, desired_paths)
     })
     .await
@@ -378,6 +383,7 @@ async fn create_projected_volume_at_impl(
     request: ProjectedVolumePathRequest<'_>,
 ) -> Result<String> {
     let ProjectedVolumePathRequest {
+        file_process,
         volumes_root,
         source_reader,
         namespace,
@@ -404,6 +410,7 @@ async fn create_projected_volume_at_impl(
     })
     .await?;
     render_projected_volume_keyed(
+        file_process,
         "create_projected_volume_render",
         &volume_path,
         writes,
@@ -418,6 +425,7 @@ async fn create_projected_volume_at_impl(
 pub async fn create_projected_volume_ns(request: ProjectedVolumeNsRequest<'_>) -> Result<String> {
     let volumes_root = volumes_root();
     create_projected_volume_under_root(ProjectedVolumeRootRequest {
+        file_process: request.file_process,
         volumes_root: &volumes_root,
         source_reader: request.source_reader,
         namespace: request.namespace,
@@ -436,6 +444,7 @@ pub(crate) async fn create_projected_volume_under_root(
     request: ProjectedVolumeRootRequest<'_>,
 ) -> Result<String> {
     create_projected_volume_at_impl(ProjectedVolumePathRequest {
+        file_process: request.file_process,
         volumes_root: request.volumes_root,
         source_reader: request.source_reader,
         namespace: request.namespace,
@@ -453,6 +462,7 @@ pub(crate) async fn create_projected_volume_under_root(
 #[cfg(test)]
 pub async fn create_projected_volume_at(request: ProjectedVolumeAtRequest<'_>) -> Result<String> {
     create_projected_volume_at_impl(ProjectedVolumePathRequest {
+        file_process: request.file_process,
         volumes_root: request.volumes_root,
         source_reader: request.source_reader,
         namespace: request.namespace,

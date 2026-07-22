@@ -20,7 +20,7 @@ const CLEANUP_RPC_MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub struct CniRpcState {
     pub containerd_namespace: String,
     pub network: std::sync::Arc<crate::networking::Network>,
-    pub task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -63,7 +63,8 @@ pub fn rpc_socket_path(namespace: &str) -> String {
 pub struct CleanupRpcServer {
     socket_path: String,
     listener: tokio::net::UnixListener,
-    task_supervisor: crate::task_supervisor::TaskSupervisor,
+    task_supervisor: klights_supervisor::TaskSupervisor,
+    file_process: klights_supervisor::FileProcessExecutor,
 }
 
 impl CleanupRpcServer {
@@ -76,6 +77,7 @@ impl CleanupRpcServer {
             socket_path,
             listener,
             task_supervisor,
+            file_process,
         } = self;
 
         loop {
@@ -93,7 +95,7 @@ impl CleanupRpcServer {
                     };
                     let spawn_result = task_supervisor
                         .spawn_async(
-                            crate::task_supervisor::TaskCategory::Others,
+                            klights_supervisor::TaskCategory::Others,
                             "cleanup_cni_rpc_connection",
                             async move {
                                 if let Err(e) = handle_cleanup_rpc_stream(stream).await {
@@ -109,22 +111,25 @@ impl CleanupRpcServer {
             }
         }
 
-        let _ = crate::utils::remove_file_if_exists_async(&socket_path).await;
+        let _ = crate::utils::remove_file_if_exists_async(&file_process, &socket_path).await;
         Ok(())
     }
 }
 
 pub async fn bind_cleanup_rpc_server(
     namespace: &str,
-    task_supervisor: crate::task_supervisor::TaskSupervisor,
+    task_supervisor: klights_supervisor::TaskSupervisor,
 ) -> Result<CleanupRpcServer> {
     let socket_path = rpc_socket_path(namespace);
-    let listener = bind_rpc_listener(&socket_path).await?;
+    let file_process =
+        klights_supervisor::FileProcessExecutor::new(std::sync::Arc::new(task_supervisor.clone()));
+    let listener = bind_rpc_listener(&file_process, &socket_path).await?;
     tracing::info!("cleanup-cni-rpc: listening on {}", socket_path);
     Ok(CleanupRpcServer {
         socket_path,
         listener,
         task_supervisor,
+        file_process,
     })
 }
 
@@ -284,7 +289,8 @@ pub async fn run_rpc_server(
     cancel: CancellationToken,
 ) -> Result<()> {
     let socket_path = rpc_socket_path(&state.containerd_namespace);
-    let listener = bind_rpc_listener(&socket_path).await?;
+    let file_process = klights_supervisor::FileProcessExecutor::new(state.task_supervisor.clone());
+    let listener = bind_rpc_listener(&file_process, &socket_path).await?;
     tracing::info!("cni-rpc: listening on {}", socket_path);
 
     loop {
@@ -305,13 +311,13 @@ pub async fn run_rpc_server(
                 let task_supervisor_for_conn = task_supervisor.clone();
                 if let Err(err) = task_supervisor
                     .spawn_async(
-                        crate::task_supervisor::TaskCategory::Others,
+                        klights_supervisor::TaskCategory::Others,
                         "cni_rpc_connection",
                         async move {
                             let stream_fd = stream.as_raw_fd();
                             let recv = task_supervisor_for_conn
                                 .run_blocking(
-                                    crate::task_supervisor::TaskCategory::Others,
+                                    klights_supervisor::TaskCategory::Others,
                                     "cni_rpc_recv_request",
                                     move || recv_request_blocking(stream_fd),
                                 )
@@ -384,17 +390,20 @@ pub async fn run_rpc_server(
         }
     }
 
-    let _ = crate::utils::remove_file_if_exists_async(&socket_path).await;
+    let _ = crate::utils::remove_file_if_exists_async(&file_process, &socket_path).await;
     Ok(())
 }
 
-async fn bind_rpc_listener(socket_path: &str) -> Result<tokio::net::UnixListener> {
+async fn bind_rpc_listener(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    socket_path: &str,
+) -> Result<tokio::net::UnixListener> {
     if let Some(parent) = std::path::Path::new(&socket_path).parent() {
-        crate::utils::create_dir_all_async(parent)
+        crate::utils::create_dir_all_async(file_process, parent)
             .await
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    let _ = crate::utils::remove_file_if_exists_async(socket_path).await;
+    let _ = crate::utils::remove_file_if_exists_async(file_process, socket_path).await;
     let listener = tokio::net::UnixListener::bind(socket_path)
         .with_context(|| format!("failed to bind {}", socket_path))?;
     Ok(listener)
@@ -853,12 +862,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket_path = tmp.path().join("cleanup.sock");
         let socket_path = socket_path.to_string_lossy().into_owned();
-        let listener = bind_rpc_listener(&socket_path).await.unwrap();
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let listener = bind_rpc_listener(&file_process, &socket_path)
+            .await
+            .unwrap();
         let server = CleanupRpcServer {
             socket_path: socket_path.clone(),
             listener,
-            task_supervisor: crate::task_supervisor::TaskSupervisor::new(
-                crate::task_supervisor::TaskCategoryConfig::default(),
+            file_process,
+            task_supervisor: klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
             ),
         };
         let cancel = CancellationToken::new();

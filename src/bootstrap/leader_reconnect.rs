@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 /// Per-attempt connect timeout (5 s) chosen so that the worst case of
 /// `rounds * endpoints * timeout` stays inside the K8s `node-monitor-
@@ -170,7 +170,7 @@ fn host_port_for_endpoint(endpoint: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task_supervisor::TaskCategoryConfig;
+    use klights_supervisor::TaskCategoryConfig;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

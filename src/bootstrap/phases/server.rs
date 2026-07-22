@@ -9,7 +9,7 @@ use crate::KlightsConfig;
 use crate::bootstrap::init::host::print_ready_message;
 use crate::bootstrap::init::predicates::runs_api_server;
 use crate::bootstrap::init::tls::serve_https;
-use crate::task_supervisor::{SupervisedJoinHandle, TaskSupervisor};
+use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 
 pub struct ServeArgs<'a> {
     pub config: &'a Arc<KlightsConfig>,

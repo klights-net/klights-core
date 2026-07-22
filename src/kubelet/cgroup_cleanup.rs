@@ -38,39 +38,47 @@ fn namespace_cgroup_relative_path(containerd_ns: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(namespace))
 }
 
-pub async fn cleanup_pod_cgroup(containerd_ns: &str, pod_uid: &str) -> Result<usize> {
+pub async fn cleanup_pod_cgroup(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    containerd_ns: &str,
+    pod_uid: &str,
+) -> Result<usize> {
     let relative = pod_cgroup_relative_path(containerd_ns, pod_uid)?;
-    cleanup_cgroup_tree(relative, "cleanup_pod_cgroup").await
+    cleanup_cgroup_tree(file_process, relative, "cleanup_pod_cgroup").await
 }
 
-pub async fn cleanup_namespace_cgroup_tree(containerd_ns: &str) -> Result<usize> {
+pub async fn cleanup_namespace_cgroup_tree(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    containerd_ns: &str,
+) -> Result<usize> {
     let relative = namespace_cgroup_relative_path(containerd_ns)?;
-    cleanup_cgroup_tree(relative, "cleanup_namespace_cgroup_tree").await
+    cleanup_cgroup_tree(file_process, relative, "cleanup_namespace_cgroup_tree").await
 }
 
 pub async fn kill_namespace_cgroup_processes(
     containerd_ns: &str,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
+    file_process: &klights_supervisor::FileProcessExecutor,
 ) -> Result<usize> {
     let relative = namespace_cgroup_relative_path(containerd_ns)?;
     let path = PathBuf::from(CGROUP_ROOT).join(relative);
     let key = path.display().to_string();
-    let mut pids = crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "kill_namespace_cgroup_processes_collect",
-        key,
-        move || collect_cgroup_pids(&path),
-    )
-    .await?;
+    let mut pids = file_process
+        .run_blocking_file_keyed("kill_namespace_cgroup_processes_collect", key, move || {
+            collect_cgroup_pids(&path)
+        })
+        .await?;
 
     if pids.is_empty() {
         let namespace = containerd_ns.to_string();
         let fallback_key = namespace.clone();
-        pids = crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "kill_namespace_cgroup_processes_fallback_collect",
-            fallback_key,
-            move || collect_namespace_cgroup_pids(&namespace),
-        )
-        .await?;
+        pids = file_process
+            .run_blocking_file_keyed(
+                "kill_namespace_cgroup_processes_fallback_collect",
+                fallback_key,
+                move || collect_namespace_cgroup_pids(&namespace),
+            )
+            .await?;
     }
 
     if pids.is_empty() {
@@ -107,13 +115,16 @@ pub async fn kill_namespace_cgroup_processes(
     Ok(pids.len())
 }
 
-async fn cleanup_cgroup_tree(relative: PathBuf, label: &'static str) -> Result<usize> {
+async fn cleanup_cgroup_tree(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    relative: PathBuf,
+    label: &'static str,
+) -> Result<usize> {
     let path = PathBuf::from(CGROUP_ROOT).join(relative);
     let key = path.display().to_string();
-    crate::kubelet::file_blocking::run_blocking_file_keyed(label, key, move || {
-        remove_empty_cgroup_tree(&path)
-    })
-    .await
+    file_process
+        .run_blocking_file_keyed(label, key, move || remove_empty_cgroup_tree(&path))
+        .await
 }
 
 pub fn remove_empty_cgroup_tree(root: &Path) -> Result<usize> {

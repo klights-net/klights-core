@@ -515,9 +515,12 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
 
         // Bootstrap needs kube-system namespace
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_coredns(
             &db,
@@ -573,9 +576,12 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_coredns_creates_serviceaccount_and_rbac() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_coredns(
             &db,
@@ -689,9 +695,12 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_coredns_idempotent() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_coredns(
             &db,
@@ -735,9 +744,12 @@ mod tests {
     #[tokio::test]
     async fn test_bootstrap_coredns_repairs_legacy_node_local_kubeconfig_resources() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         db.create_resource(
             "v1",
@@ -875,9 +887,12 @@ mod tests {
     #[tokio::test]
     async fn test_coredns_service_uses_derived_ip_from_custom_cidr() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         let custom_service_cidr = "10.50.128.0/17";
         let expected_dns_ip = "10.50.128.10";
@@ -908,9 +923,12 @@ mod tests {
     #[tokio::test]
     async fn test_coredns_deployment_has_dns_policy_default() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_coredns(
             &db,
@@ -943,9 +961,12 @@ mod tests {
     #[tokio::test]
     async fn test_coredns_deployment_template_is_not_pinned_to_bootstrap_node() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_coredns(
             &db,
@@ -976,9 +997,12 @@ mod tests {
     #[tokio::test]
     async fn test_coredns_deployment_volume_mounts() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_coredns(
             &db,
@@ -1028,9 +1052,12 @@ mod tests {
     #[tokio::test]
     async fn test_coredns_deployment_labels() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_coredns(
             &db,
@@ -1068,9 +1095,12 @@ mod tests {
     #[tokio::test]
     async fn test_coredns_service_cluster_ips_array() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_coredns(
             &db,
@@ -1103,9 +1133,12 @@ mod tests {
     #[tokio::test]
     async fn test_coredns_service_ports() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         bootstrap_coredns(
             &db,
@@ -1139,9 +1172,12 @@ mod tests {
     #[tokio::test]
     async fn test_coredns_configmap_namespace_in_corefile() {
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
 
         // Use a custom containerd namespace
         bootstrap_coredns(

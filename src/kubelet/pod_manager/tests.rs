@@ -11,8 +11,8 @@ mod tests_phase_and_recovery;
 pub(super) fn fixture_pod_repository(
     db: &crate::datastore::sqlite::Datastore,
 ) -> std::sync::Arc<crate::kubelet::pod_repository::PodRepository> {
-    let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let db_handle: crate::datastore::DatastoreHandle = std::sync::Arc::new(db.clone());

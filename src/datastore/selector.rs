@@ -12,7 +12,7 @@ use crate::datastore::backend::DatastoreHandle;
 use crate::datastore::backend_kind::BackendKind;
 use crate::datastore::replicated::{ReplicatedDatastore, ReplicationMode, ReplicationObserver};
 use crate::datastore::sqlite;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 /// Open the cluster datastore. Dispatches on `config.in_memory` and
 /// `config.datastore_backend`.

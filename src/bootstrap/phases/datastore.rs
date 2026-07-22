@@ -13,7 +13,7 @@ use crate::bootstrap::NodeRole;
 use crate::bootstrap::credential_store::BootstrapCredentialStore;
 use crate::datastore::DatastoreHandle;
 use crate::datastore::replicated::RaftProposer;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 pub struct OpenLeaderArgs<'a> {
     pub config: &'a Arc<KlightsConfig>,
@@ -116,12 +116,13 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
     // leader writes (defense in depth alongside the switching proxy
     // below).
     let local_api_client = Arc::new(
-        crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_containerd_namespace(
+        crate::control_plane::client::local::LocalApiClient::new_with_node_lease_tracker_and_containerd_namespace_and_file_process(
             db_handle.clone(),
             config.node_name.clone(),
             config.containerd_namespace.clone(),
             node_lease_tracker.clone(),
             is_leader_rx.clone(),
+            klights_supervisor::FileProcessExecutor::from_supervisor(supervisor.as_ref()),
         ),
     );
     // T6 step 4: every leader-class boot's `cluster_api` is the
@@ -412,6 +413,9 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
                 };
                 let join_node_registration =
                     crate::kubelet::node::NodeRegistrationSnapshot::capture_local(
+                        &klights_supervisor::FileProcessExecutor::from_supervisor(
+                            supervisor.as_ref(),
+                        ),
                         &config.node_name,
                         node_mode,
                         r,
@@ -622,7 +626,7 @@ pub async fn open_leader(args: OpenLeaderArgs<'_>) -> Result<DatastorePhase> {
         let shutdown_token_for_retry = shutdown_token.clone();
         match supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "outbox_dispatcher_bootstrap_retry",
                 async move {
                     let mut delay = std::time::Duration::from_millis(500);
@@ -913,7 +917,7 @@ async fn controlplane_join_client_identity_for_token(
     token: &str,
     namespace: &str,
     node_name: &str,
-    supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> anyhow::Result<ControlplaneJoinClientIdentity> {
     use crate::bootstrap::worker_identity::{
         CredentialSource, SupervisedFilesystemWorkerCredentialStore, resolve_credential_async,
@@ -1296,9 +1300,9 @@ mod tests {
         std::sync::Arc::new(crate::KlightsConfig::test_default())
     }
 
-    fn test_supervisor() -> std::sync::Arc<crate::task_supervisor::TaskSupervisor> {
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+    fn test_supervisor() -> std::sync::Arc<klights_supervisor::TaskSupervisor> {
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ))
     }
 

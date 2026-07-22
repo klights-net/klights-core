@@ -10,7 +10,7 @@ pub async fn local_join_dataplane_metadata(
     config: &KlightsConfig,
     node_mode: &NodeMode,
     node_ip: &str,
-    supervisor: &crate::task_supervisor::TaskSupervisor,
+    supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<crate::replication::grpc::client::JoinDataplaneMetadata> {
     let _ = node_ip;
     let identity = local_dataplane_identity(config, node_mode, supervisor).await?;
@@ -32,7 +32,7 @@ pub async fn local_dataplane_peer_metadata_with_endpoint(
     config: &KlightsConfig,
     node_mode: &NodeMode,
     endpoint: &str,
-    supervisor: &crate::task_supervisor::TaskSupervisor,
+    supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<crate::networking::wireguard::DataplanePeerMetadata> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
@@ -61,7 +61,7 @@ struct LocalDataplaneIdentity {
 async fn local_dataplane_identity(
     config: &KlightsConfig,
     node_mode: &NodeMode,
-    supervisor: &crate::task_supervisor::TaskSupervisor,
+    supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<LocalDataplaneIdentity> {
     let mode = match node_mode {
         NodeMode::Root => crate::networking::wireguard::DataplaneMode::Root,
@@ -151,7 +151,7 @@ pub async fn ensure_node_dataplane_published(
     config: &KlightsConfig,
     node_mode: &NodeMode,
     endpoint: &str,
-    supervisor: &crate::task_supervisor::TaskSupervisor,
+    supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<bool> {
     if db.get_node_dataplane(&config.node_name).await?.is_some() {
         return Ok(false);
@@ -179,7 +179,7 @@ pub async fn publish_local_dataplane_metadata_self_heal(
     db: &dyn datastore::DatastoreBackend,
     config: &KlightsConfig,
     node_mode: &NodeMode,
-    supervisor: &crate::task_supervisor::TaskSupervisor,
+    supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<bool> {
     let Some(endpoint) = resolve_local_external_endpoint(db, config).await? else {
         return Ok(false);
@@ -238,8 +238,8 @@ mod tests {
         config.node_name = "mn-worker".to_string();
         config.external_endpoint = None;
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
 
         let metadata = local_join_dataplane_metadata(
@@ -264,8 +264,8 @@ mod tests {
         config.node_name = "mn-controlplane1".to_string();
         config.external_endpoint = None;
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
 
         // An empty endpoint must be rejected — there is no internal-IP fallback
@@ -375,8 +375,8 @@ mod tests {
         config.node_name = "leader-a".to_string();
         config.external_endpoint = None;
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
 
         db.create_resource(
@@ -422,8 +422,8 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
 
         let wrote = ensure_node_dataplane_published(
@@ -451,8 +451,8 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.dataplane_encryption = crate::networking::wireguard::DataplaneEncryption::Disabled;
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
 
         // Pre-existing row written from an authoritative endpoint.
@@ -499,8 +499,8 @@ mod tests {
         let mut config = crate::KlightsConfig::test_default();
         config.node_name = "leader-a".to_string();
         config.external_endpoint = None;
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
 
         let published =

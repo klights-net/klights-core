@@ -1532,8 +1532,8 @@ mod tests {
         std::sync::Arc<crate::kubelet::pod_lifecycle_router::PodLifecycleRouter>,
         std::sync::Arc<crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor>,
     ) {
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let recorder = crate::kubelet::pod_lifecycle_router::executor::RecordingExecutor::new();
         let executor: std::sync::Arc<

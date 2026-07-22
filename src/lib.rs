@@ -34,7 +34,6 @@ pub mod scheduler;
 pub mod shutdown;
 pub mod side_effects;
 pub mod spdy;
-pub mod task_supervisor;
 pub mod utils;
 pub mod version;
 pub mod watch;

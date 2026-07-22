@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::KlightsConfig;
 use crate::bootstrap::NodeMode;
 use crate::networking::{self, NetworkCleanup};
-use crate::task_supervisor::{SupervisedJoinHandle, TaskSupervisor};
+use klights_supervisor::{SupervisedJoinHandle, TaskSupervisor};
 
 pub struct NetworkPhase {
     pub network: Arc<networking::Network>,
@@ -186,7 +186,7 @@ pub async fn boot(args: NetworkBootArgs<'_>) -> Result<NetworkPhase> {
         let cancel = cni_rpc_token.clone();
         supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Background,
+                klights_supervisor::TaskCategory::Background,
                 "runtime_cni_rpc_server",
                 async move {
                     if let Err(e) = crate::cni_plugin::run_rpc_server(state, cancel).await {

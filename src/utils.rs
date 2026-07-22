@@ -213,115 +213,133 @@ pub fn set_unix_mode(path: impl AsRef<std::path::Path>, mode: u32) -> std::io::R
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
-pub async fn read_utf8_file_async(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+pub async fn read_utf8_file_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    path: impl AsRef<std::path::Path>,
+) -> std::io::Result<String> {
     let path_buf = path.as_ref().to_path_buf();
     let key = path_buf.to_string_lossy().into_owned();
-    crate::kubelet::file_blocking::run_blocking_file_keyed("utils_read_utf8_file", key, move || {
-        read_utf8_file(path_buf).map_err(anyhow::Error::from)
-    })
-    .await
-    .map_err(|e| {
-        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-            std::io::Error::new(io_err.kind(), io_err.to_string())
-        } else {
-            std::io::Error::other(e.to_string())
-        }
-    })
+    file_process
+        .run_blocking_file_keyed("utils_read_utf8_file", key, move || {
+            read_utf8_file(path_buf).map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(|e| {
+            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                std::io::Error::new(io_err.kind(), io_err.to_string())
+            } else {
+                std::io::Error::other(e.to_string())
+            }
+        })
 }
 
-pub async fn create_dir_all_async(path: impl AsRef<std::path::Path>) -> anyhow::Result<()> {
+pub async fn create_dir_all_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    path: impl AsRef<std::path::Path>,
+) -> anyhow::Result<()> {
     let path_buf = path.as_ref().to_path_buf();
     let key = path_buf.to_string_lossy().into_owned();
-    crate::kubelet::file_blocking::run_blocking_file_keyed("utils_create_dir_all", key, move || {
-        std::fs::create_dir_all(path_buf).map_err(anyhow::Error::from)
-    })
-    .await
+    file_process
+        .run_blocking_file_keyed("utils_create_dir_all", key, move || {
+            std::fs::create_dir_all(path_buf).map_err(anyhow::Error::from)
+        })
+        .await
 }
 
 pub async fn write_file_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
     contents: impl AsRef<[u8]>,
 ) -> anyhow::Result<()> {
     let path_buf = path.as_ref().to_path_buf();
     let bytes = contents.as_ref().to_vec();
     let key = path_buf.to_string_lossy().into_owned();
-    crate::kubelet::file_blocking::run_blocking_file_keyed("utils_write_file", key, move || {
-        std::fs::write(path_buf, bytes).map_err(anyhow::Error::from)
-    })
-    .await
+    file_process
+        .run_blocking_file_keyed("utils_write_file", key, move || {
+            std::fs::write(path_buf, bytes).map_err(anyhow::Error::from)
+        })
+        .await
 }
 
-pub async fn path_exists_async(path: impl AsRef<std::path::Path>) -> anyhow::Result<bool> {
+pub async fn path_exists_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    path: impl AsRef<std::path::Path>,
+) -> anyhow::Result<bool> {
     let path_buf = path.as_ref().to_path_buf();
     let key = path_buf.to_string_lossy().into_owned();
-    crate::kubelet::file_blocking::run_blocking_file_keyed("utils_path_exists", key, move || {
-        match std::fs::metadata(path_buf) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(anyhow::Error::from(e)),
-        }
-    })
-    .await
+    file_process
+        .run_blocking_file_keyed("utils_path_exists", key, move || {
+            match std::fs::metadata(path_buf) {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(anyhow::Error::from(e)),
+            }
+        })
+        .await
 }
 
 pub async fn canonicalize_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<std::path::PathBuf> {
     let path_buf = path.as_ref().to_path_buf();
     let key = path_buf.to_string_lossy().into_owned();
-    crate::kubelet::file_blocking::run_blocking_file_keyed("utils_canonicalize", key, move || {
-        std::fs::canonicalize(path_buf).map_err(anyhow::Error::from)
-    })
-    .await
+    file_process
+        .run_blocking_file_keyed("utils_canonicalize", key, move || {
+            std::fs::canonicalize(path_buf).map_err(anyhow::Error::from)
+        })
+        .await
 }
 
 pub async fn remove_file_if_exists_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<bool> {
     let path_buf = path.as_ref().to_path_buf();
     let key = path_buf.to_string_lossy().into_owned();
-    crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "utils_remove_file_if_exists",
-        key,
-        move || match std::fs::remove_file(path_buf) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(anyhow::Error::from(e)),
-        },
-    )
-    .await
+    file_process
+        .run_blocking_file_keyed("utils_remove_file_if_exists", key, move || {
+            match std::fs::remove_file(path_buf) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(anyhow::Error::from(e)),
+            }
+        })
+        .await
 }
 
-pub async fn remove_dir_if_exists_async(path: impl AsRef<std::path::Path>) -> anyhow::Result<bool> {
+pub async fn remove_dir_if_exists_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    path: impl AsRef<std::path::Path>,
+) -> anyhow::Result<bool> {
     let path_buf = path.as_ref().to_path_buf();
     let key = path_buf.to_string_lossy().into_owned();
-    crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "utils_remove_dir_if_exists",
-        key,
-        move || match std::fs::remove_dir(path_buf) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(anyhow::Error::from(e)),
-        },
-    )
-    .await
+    file_process
+        .run_blocking_file_keyed("utils_remove_dir_if_exists", key, move || {
+            match std::fs::remove_dir(path_buf) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(anyhow::Error::from(e)),
+            }
+        })
+        .await
 }
 
 pub async fn remove_dir_all_if_exists_async(
+    file_process: &klights_supervisor::FileProcessExecutor,
     path: impl AsRef<std::path::Path>,
 ) -> anyhow::Result<bool> {
     let path_buf = path.as_ref().to_path_buf();
     let key = path_buf.to_string_lossy().into_owned();
-    crate::kubelet::file_blocking::run_blocking_file_keyed(
-        "utils_remove_dir_all_if_exists",
-        key,
-        move || match std::fs::remove_dir_all(path_buf) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(anyhow::Error::from(e)),
-        },
-    )
-    .await
+    file_process
+        .run_blocking_file_keyed("utils_remove_dir_all_if_exists", key, move || {
+            match std::fs::remove_dir_all(path_buf) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(anyhow::Error::from(e)),
+            }
+        })
+        .await
 }
 /// Extract resourceVersion from a K8s `metadata` sub-object as i64.
 ///

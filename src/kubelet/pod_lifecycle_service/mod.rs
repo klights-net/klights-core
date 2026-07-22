@@ -66,7 +66,7 @@ mod tests {
     use crate::kubelet::pod_lifecycle_actor::config::PodLifecycleConcurrencyConfig;
     use crate::kubelet::pod_lifecycle_actor::registry::PodLifecycleRegistry;
     use crate::kubelet::pod_lifecycle_router::executor::NoopExecutor;
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     fn test_supervisor() -> Arc<TaskSupervisor> {
         Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()))

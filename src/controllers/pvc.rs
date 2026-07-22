@@ -34,7 +34,11 @@ async fn write_pvc_status(
 /// Provision a PV for a PVC that has a storageClassName matching a known provisioner.
 /// Currently supports "local-path" (hostPath under KLIGHTS_DATA_ROOT/local-path-provisioner/).
 /// Returns the created PV name, or None if storageClassName is not provisioned.
-async fn provision_pv_for_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Option<String>> {
+async fn provision_pv_for_pvc(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    db: &dyn DatastoreBackend,
+    pvc: &Value,
+) -> Result<Option<String>> {
     let metadata = pvc
         .get("metadata")
         .ok_or_else(|| anyhow::anyhow!("PVC missing metadata"))?;
@@ -87,7 +91,7 @@ async fn provision_pv_for_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<
         .join(pvc_name)
         .to_string_lossy()
         .into_owned();
-    crate::utils::create_dir_all_async(&host_path)
+    crate::utils::create_dir_all_async(file_process, &host_path)
         .await
         .with_context(|| format!("Failed to create directory {}", host_path))?;
 
@@ -129,7 +133,11 @@ async fn provision_pv_for_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<
 
 /// Reconcile a PersistentVolumeClaim - bind to matching PersistentVolume
 /// Returns the updated PVC resource
-pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Value> {
+pub async fn reconcile_pvc(
+    file_process: &klights_supervisor::FileProcessExecutor,
+    db: &dyn DatastoreBackend,
+    pvc: &Value,
+) -> Result<Value> {
     let input_metadata = pvc
         .get("metadata")
         .ok_or_else(|| anyhow::anyhow!("Missing metadata"))?;
@@ -406,7 +414,7 @@ pub async fn reconcile_pvc(db: &dyn DatastoreBackend, pvc: &Value) -> Result<Val
     }
 
     // No matching PV found - try to provision a PV
-    if let Some(provisioned_pv_name) = provision_pv_for_pvc(db, &pvc).await? {
+    if let Some(provisioned_pv_name) = provision_pv_for_pvc(file_process, db, &pvc).await? {
         // PV was provisioned, now bind PVC to it
         let provisioned_pv = db
             .get_resource("v1", "PersistentVolume", None, &provisioned_pv_name)

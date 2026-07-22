@@ -278,7 +278,7 @@ pub async fn wait_until_datastore_fresh(
     db: &DatastoreHandle,
     target_rv: i64,
     topic: WatchTopic,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) {
     if target_rv <= 0 {
         return;
@@ -617,7 +617,7 @@ fn serialize_watch_catch_up_failure_status_line() -> Vec<u8> {
 }
 
 pub async fn spawn_bookmark_tick_stream(
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     task_name: impl Into<String>,
 ) -> mpsc::Receiver<()> {
     let task_name = task_name.into();
@@ -626,7 +626,7 @@ pub async fn spawn_bookmark_tick_stream(
     let task_supervisor_for_wait = task_supervisor.clone();
     if let Err(err) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Timer,
+            klights_supervisor::TaskCategory::Timer,
             task_name.clone(),
             async move {
                 loop {
@@ -659,7 +659,7 @@ pub async fn spawn_bookmark_tick_stream(
 /// permit are created — `recv_bookmark_tick` parks forever via `pending()`.
 pub async fn maybe_spawn_bookmark_tick_stream(
     enabled: bool,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     task_name: impl Into<String>,
 ) -> Option<mpsc::Receiver<()>> {
     if !enabled {
@@ -796,7 +796,7 @@ pub(crate) async fn resolve_periodic_bookmark_rv(ctx: PeriodicBookmarkContext<'_
 
 pub async fn maybe_spawn_watch_timeout_stream(
     timeout_seconds: Option<u64>,
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     task_name: impl Into<String>,
 ) -> Option<mpsc::Receiver<()>> {
     let timeout_seconds = timeout_seconds?;
@@ -806,7 +806,7 @@ pub async fn maybe_spawn_watch_timeout_stream(
     let sleep_name = format!("{task_name}_sleep");
     if let Err(err) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Timer,
+            klights_supervisor::TaskCategory::Timer,
             task_name.clone(),
             async move {
                 tokio::select! {
@@ -838,7 +838,7 @@ pub async fn recv_watch_timeout(rx: &mut Option<mpsc::Receiver<()>>) -> Option<(
 
 pub struct LabelSelectorWatchStreamRequest<'a> {
     pub db: DatastoreHandle,
-    pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub api_version: &'a str,
     pub kind: String,
     pub watch_namespace: Option<String>,
@@ -859,7 +859,7 @@ pub struct LegacyLabelSelectorWatchStreamRequest<'a> {
     pub watch_anchor: Arc<dyn WatchReplayAnchorStore>,
     pub signal_rx: WatchSignalReceiver,
     pub replay_start_position: WatchReplayPosition,
-    pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub api_version: &'a str,
     pub kind: String,
     pub watch_namespace: Option<String>,
@@ -1672,11 +1672,11 @@ pub fn legacy_build_label_selector_watch_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::task_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
     use crate::watch::SelectorMembership;
     use async_trait::async_trait;
     use bytes::Bytes;
     use futures::StreamExt;
+    use klights_supervisor::{TaskCategory, TaskCategoryConfig, TaskSupervisor};
     use klights_watch::WatchSignal;
     use prost::Message;
     use std::sync::Arc;

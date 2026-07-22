@@ -15,12 +15,12 @@ async fn make_scheduler() -> (
     crate::datastore::sqlite::Datastore,
     crate::datastore::DatastoreHandle,
     Arc<crate::controller_dispatcher::ControllerDispatcher>,
-    Arc<crate::task_supervisor::TaskSupervisor>,
+    Arc<klights_supervisor::TaskSupervisor>,
     Arc<CronJobScheduler>,
 ) {
     let (db, db_handle) = crate::datastore::test_support::in_memory_with_handle().await;
-    let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let service_ipam = Arc::new(crate::controllers::service::ServiceIpam::new(
         "10.43.128.0/17",

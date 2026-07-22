@@ -94,7 +94,7 @@ impl RaftLeaderProxy {
 
 pub(crate) async fn load_proxy_client_identity(
     containerd_namespace: &str,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Option<reqwest::Identity> {
     match load_proxy_client_identity_from_namespace(containerd_namespace, task_supervisor).await {
         Ok(identity) => Some(identity),
@@ -107,7 +107,7 @@ pub(crate) async fn load_proxy_client_identity(
 
 async fn load_proxy_client_identity_from_namespace(
     containerd_namespace: &str,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> anyhow::Result<reqwest::Identity> {
     let cert_path = crate::paths::api_proxy_cert_path(containerd_namespace);
     let key_path = crate::paths::api_proxy_key_path(containerd_namespace);
@@ -126,7 +126,7 @@ async fn load_proxy_client_identity_from_namespace(
 }
 
 async fn read_proxy_client_identity_file(
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
     path: &Path,
     label: &'static str,
 ) -> anyhow::Result<Vec<u8>> {

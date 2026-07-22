@@ -60,7 +60,7 @@ pub(crate) fn port_channel_from_id(channel_id: u8) -> (usize, NodePortForwardCha
 
 /// Build the local control-plane port from its private TCP runtime adapter.
 pub(crate) fn local_node_port_forward(
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) -> Arc<dyn NodePortForward> {
     Arc::new(LocalNodePortForward {
         runtime: Arc::new(TcpNodePortForwardRuntime { task_supervisor }),
@@ -81,7 +81,7 @@ impl NodePortForward for LocalNodePortForward {
 }
 
 struct TcpNodePortForwardRuntime {
-    task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 struct TcpNodePortForwardSession {
@@ -309,7 +309,7 @@ impl NodePortForwardRuntime for TcpNodePortForwardRuntime {
                         if let Err(error) = self
                             .task_supervisor
                             .spawn_async(
-                                crate::task_supervisor::TaskCategory::Others,
+                                klights_supervisor::TaskCategory::Others,
                                 format!("pod_portforward_tcp_stream_{port_index}"),
                                 async move {
                                     let reader_cancel = stream_cancel.clone();
@@ -450,7 +450,7 @@ impl NodePortForwardRuntime for TcpNodePortForwardRuntime {
                 let setup_budget = budget.clone();
                 self.task_supervisor
                     .spawn_async(
-                        crate::task_supervisor::TaskCategory::Others,
+                        klights_supervisor::TaskCategory::Others,
                         "pod_portforward_setup_errors",
                         async move {
                             for frame in setup_errors {
@@ -582,8 +582,8 @@ mod tests {
 
     #[tokio::test]
     async fn sixty_five_failed_connects_return_a_session_without_setup_backpressure_deadlock() {
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let runtime = TcpNodePortForwardRuntime {
             task_supervisor: supervisor.clone(),
@@ -678,8 +678,8 @@ mod tests {
             stream.write_all(b"peer-response").await.unwrap();
             std::future::pending::<()>().await;
         });
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let runtime = TcpNodePortForwardRuntime {
             task_supervisor: supervisor.clone(),
@@ -738,8 +738,8 @@ mod tests {
             read_half.read_exact(&mut input).await.unwrap();
             input
         });
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let runtime = TcpNodePortForwardRuntime {
             task_supervisor: supervisor.clone(),

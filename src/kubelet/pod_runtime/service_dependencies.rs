@@ -14,7 +14,7 @@ use crate::kubelet::pod_runtime::repository::PodRuntimeRepository;
 use crate::kubelet::pod_runtime::service::RuntimeConfig;
 use crate::kubelet::pod_runtime::store::{PodRuntimeStore, PodSlotAdmission};
 use crate::kubelet::pod_runtime::volumes::PodVolumeRuntime;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 pub struct RealPodRuntimeServiceDependencies {
     pub cri: Arc<dyn CriRuntime>,

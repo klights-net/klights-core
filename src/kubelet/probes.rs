@@ -174,7 +174,7 @@ pub async fn check_tcp_probe(
     pod_ip: &str,
     probe: &TcpProbe,
     timeout: Duration,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<bool> {
     let addr = format!("{}:{}", pod_ip, probe.port);
     match task_supervisor
@@ -198,7 +198,7 @@ pub async fn check_grpc_probe(
     pod_ip: &str,
     probe: &GrpcProbe,
     timeout: Duration,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<bool> {
     const MAX_GRPC_PROBE_ATTEMPTS: usize = 3;
 
@@ -241,7 +241,7 @@ async fn check_grpc_probe_once(
     pod_ip: &str,
     probe: &GrpcProbe,
     timeout: Duration,
-    task_supervisor: &crate::task_supervisor::TaskSupervisor,
+    task_supervisor: &klights_supervisor::TaskSupervisor,
 ) -> Result<bool> {
     let addr = format!("{}:{}", pod_ip, probe.port);
     let tcp = match task_supervisor
@@ -714,15 +714,15 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_millis(200), h2.accept()).await;
         });
 
-        let config = crate::task_supervisor::TaskCategoryConfig {
+        let config = klights_supervisor::TaskCategoryConfig {
             others: 1,
             ..Default::default()
         };
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(config);
+        let supervisor = klights_supervisor::TaskSupervisor::new(config);
         let (release_tx, release_rx) = oneshot::channel::<()>();
         let _blocker = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Others,
+                klights_supervisor::TaskCategory::Others,
                 "saturate_others_for_grpc_probe_test",
                 async move {
                     let _ = release_rx.await;
@@ -802,8 +802,8 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_millis(200), h2.accept()).await;
         });
 
-        let supervisor = crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         );
         let probe = GrpcProbe {
             port,

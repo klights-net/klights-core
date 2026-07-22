@@ -444,6 +444,61 @@ fn category_status(
         .expect("category status must exist")
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_process_executor_uses_injected_supervisor_and_isolates_shutdown() {
+    let first_supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+    let second_supervisor = Arc::new(TaskSupervisor::new(TaskCategoryConfig::default()));
+    let first_executor = crate::FileProcessExecutor::new(first_supervisor.clone());
+    let second_executor = crate::FileProcessExecutor::new(second_supervisor.clone());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+    let first_work = tokio::spawn(async move {
+        first_executor
+            .run_blocking_file("injected-file-executor", move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, anyhow::Error>(7)
+            })
+            .await
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("injected file work did not start");
+
+    assert_eq!(
+        category_status(&first_supervisor, TaskCategory::File).active,
+        1
+    );
+    assert_eq!(
+        category_status(&second_supervisor, TaskCategory::File).active,
+        0
+    );
+
+    second_supervisor.shutdown(std::time::Duration::ZERO).await;
+    assert!(
+        second_executor
+            .run_blocking_file("rejected-after-second-shutdown", || Ok::<_, anyhow::Error>(
+                ()
+            ))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        category_status(&first_supervisor, TaskCategory::File).active,
+        1,
+        "shutting down another injected supervisor must not cancel this executor"
+    );
+
+    release_tx.send(()).unwrap();
+    assert_eq!(first_work.await.unwrap().unwrap(), 7);
+    assert_eq!(
+        category_status(&first_supervisor, TaskCategory::File).active,
+        0
+    );
+    first_supervisor.shutdown(std::time::Duration::ZERO).await;
+}
+
 fn wait_on_gate(gate: &Arc<(Mutex<usize>, Condvar)>) {
     let (lock, condvar) = &**gate;
     let mut permits = lock.lock().expect("gate lock poisoned");

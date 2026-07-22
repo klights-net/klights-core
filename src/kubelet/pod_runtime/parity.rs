@@ -301,8 +301,8 @@ impl ParityFixture {
     pub async fn new() -> Self {
         let (ds, handle) = crate::datastore::test_support::in_memory_with_handle().await;
         std::mem::forget(ds);
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
         let metrics: Arc<crate::side_effects::SideEffectMetrics> =

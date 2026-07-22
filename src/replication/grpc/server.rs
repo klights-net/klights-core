@@ -3303,8 +3303,8 @@ mod tests {
     };
     use crate::replication::protocol::ReplicationEntry;
     use crate::replication::service::ReplicationService;
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use async_trait::async_trait;
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio::sync::mpsc;
     use tonic_reflection::pb::v1::{
         ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
@@ -5958,6 +5958,7 @@ mod tests {
         let addresses =
             crate::kubelet::node::NodeRegistrationAddresses::new("172.31.10.2".to_string(), None);
         crate::kubelet::node::register_node_at_addresses(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
             &db,
             "leader-a",
             &crate::bootstrap::NodeMode::Root,
@@ -7188,9 +7189,12 @@ mod tests {
         // Build a fixture cluster with a couple of resources so the snapshot
         // emitter has real commits to stream.
         let db = crate::datastore::test_support::in_memory().await;
-        crate::controllers::namespace::init_default_namespaces(&db)
-            .await
-            .unwrap();
+        crate::controllers::namespace::init_default_namespaces(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            &db,
+        )
+        .await
+        .unwrap();
         db.create_resource(
             "v1",
             "ConfigMap",

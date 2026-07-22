@@ -6,8 +6,8 @@ use crate::control_plane::client::{
     legacy_node_subnet,
 };
 use crate::datastore::NodeSubnet;
-use crate::task_supervisor::TaskSupervisor;
 use anyhow::{Context, Result};
+use klights_supervisor::TaskSupervisor;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -165,7 +165,7 @@ mod tests {
     use super::*;
     use crate::datastore::NodeSubnet;
     use crate::networking::{NodeName, PodSubnet};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use std::collections::VecDeque;
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};

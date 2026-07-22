@@ -201,6 +201,7 @@ async fn test_configmap_volume_sets_0644_permissions_by_default() {
 
     // Create volume
     let path = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -242,6 +243,7 @@ async fn test_configmap_create_uses_keyed_blocking_boundary() {
 
     let before = blocking_fs_keyed_call_count();
     let _ = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -279,6 +281,7 @@ async fn test_configmap_volume_respects_default_mode() {
 
     // Create volume with custom defaultMode (0o400 = 256 decimal)
     let path = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -327,6 +330,7 @@ async fn test_configmap_volume_items_filters_keys() {
         {"key": "key3", "path": "key3"}
     ]);
     let path = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -374,6 +378,7 @@ async fn test_configmap_volume_items_renames_files() {
         {"key": "original-name", "path": "renamed-file"}
     ]);
     let path = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -426,6 +431,7 @@ async fn test_configmap_volume_items_per_file_mode() {
         {"key": "file2", "path": "file2", "mode": 384}   // 0o600
     ]);
     let path = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -481,6 +487,7 @@ async fn test_configmap_volume_replaces_stale_directory() {
 
     // Now create the ConfigMap volume — should replace the directory with a file
     let path = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -530,6 +537,7 @@ async fn test_configmap_volume_corefile_is_file_not_directory() {
 
     // No items filter — project all keys (same as CoreDNS deployment spec)
     let volume_path = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "kube-system",
@@ -588,6 +596,7 @@ async fn test_configmap_volume_binary_data_written_as_bytes() {
         .unwrap();
 
     let path = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -630,6 +639,7 @@ async fn test_configmap_volume_binary_data_and_data_combined() {
         .unwrap();
 
     let path = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -672,6 +682,7 @@ async fn test_configmap_volume_only_binary_data_no_data_field_succeeds() {
 
     // Must NOT fail with "ConfigMap has no data"
     let result = create_config_map_volume_at(ConfigMapVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -714,6 +725,7 @@ async fn test_secret_volume_sets_0644_permissions_by_default() {
         .unwrap();
 
     let path = create_secret_volume_at(SecretVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -758,6 +770,7 @@ async fn test_secret_volume_respects_default_mode() {
 
     // Create volume with read-only mode (0o400 = 256 decimal)
     let path = create_secret_volume_at(SecretVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -807,6 +820,7 @@ async fn test_secret_volume_items_filters_and_renames() {
         {"key": "password", "path": "db-password"}
     ]);
     let path = create_secret_volume_at(SecretVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",
@@ -861,6 +875,7 @@ async fn test_secret_create_uses_keyed_blocking_boundary() {
 
     let before = blocking_fs_keyed_call_count();
     let _ = create_secret_volume_at(SecretVolumeAtRequest {
+        file_process: &crate::kubelet::file_blocking::test_file_process_executor(),
         volumes_root: root,
         sources: &db,
         namespace: "default",

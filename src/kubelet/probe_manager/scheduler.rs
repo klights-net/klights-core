@@ -16,7 +16,7 @@ pub enum ProbeType {
 }
 
 pub struct ProbeTaskRuntime {
-    pub task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     pub pod_reader: Arc<dyn PodReader>,
     pub cri: Option<Arc<dyn crate::kubelet::pod_runtime::cri::CriRuntime>>,
     pub startup_completed: Arc<RwLock<HashSet<String>>>,
@@ -84,7 +84,7 @@ fn container_ready_status(statuses: &[serde_json::Value], container_name: &str) 
 pub async fn spawn_probe_task_with_params(
     runtime: ProbeTaskRuntime,
     spec: ProbeTaskSpec,
-) -> Result<crate::task_supervisor::SupervisedJoinHandle<()>> {
+) -> Result<klights_supervisor::SupervisedJoinHandle<()>> {
     let ProbeTaskRuntime {
         task_supervisor,
         pod_reader,
@@ -123,7 +123,7 @@ pub async fn spawn_probe_task_with_params(
     let task_supervisor_for_probe = task_supervisor.clone();
     task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::PodProbe,
+            klights_supervisor::TaskCategory::PodProbe,
             format!("probe_task_{probe_type:?}_{pod_key}_{container_name}"),
             async move {
                 let http_client = crate::kubelet::probes::build_probe_http_client().ok();
@@ -459,8 +459,8 @@ mod tests {
             Some("new-uid")
         );
 
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let startup_completed = Arc::new(RwLock::new(HashSet::new()));
         let (tx, mut rx) = mpsc::channel(4);
@@ -543,8 +543,8 @@ mod tests {
         .await
         .unwrap();
 
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let startup_completed = Arc::new(RwLock::new(HashSet::new()));
         let (tx, mut rx) = mpsc::channel(4);

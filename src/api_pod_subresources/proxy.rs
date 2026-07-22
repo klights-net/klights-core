@@ -330,7 +330,7 @@ async fn pod_proxy_request_with_readiness_retries(
     req: Request,
     target_url: &str,
     allow_fallback_8080: bool,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<Response, AppError> {
     // Gate readiness retries to idempotent methods, like the service-proxy path.
     // The route accepts POST/PUT/PATCH/DELETE; retrying a slow-but-successful
@@ -352,7 +352,7 @@ async fn pod_proxy_request_with_readiness_retries(
 async fn service_proxy_request_with_readiness_retries(
     req: Request,
     target_url: &str,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<Response, AppError> {
     let (max_attempts, retry_delay) = proxy_retry_policy(req.method());
 
@@ -376,7 +376,7 @@ async fn service_proxy_request_with_readiness_retries(
 pub async fn proxy_request(
     req: Request,
     target_url: &str,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<Response, AppError> {
     proxy_request_with_fallback(req, target_url, false, task_supervisor).await
 }
@@ -386,7 +386,7 @@ pub async fn proxy_request_with_fallback(
     req: Request,
     target_url: &str,
     allow_fallback_8080: bool,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<Response, AppError> {
     proxy_request_with_fallback_port(req, target_url, allow_fallback_8080, 8080, task_supervisor)
         .await
@@ -398,7 +398,7 @@ pub async fn proxy_request_with_fallback_port(
     target_url: &str,
     allow_fallback: bool,
     fallback_port: u16,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<Response, AppError> {
     proxy_request_with_fallback_port_and_retries(
         req,
@@ -419,7 +419,7 @@ pub async fn proxy_request_with_fallback_port_and_retries(
     fallback_port: u16,
     max_attempts: usize,
     retry_delay: std::time::Duration,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<Response, AppError> {
     proxy_request_with_fallback_port_and_retries_with_options(
         req,
@@ -449,7 +449,7 @@ async fn proxy_request_with_fallback_port_and_retries_with_options(
     req: Request,
     target_url: &str,
     options: ProxyRequestOptions,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<Response, AppError> {
     let uri: hyper::Uri = target_url
         .parse()
@@ -555,7 +555,7 @@ async fn send_proxy_request_with_fallback_attempt(
     req: ProxyUpstreamRequest<'_>,
     allow_fallback: bool,
     fallback_port: u16,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<Response, ProxyUpstreamError> {
     let ProxyUpstreamRequest {
         scheme,
@@ -656,7 +656,7 @@ struct ProxyUpstreamRequest<'a> {
 
 async fn send_proxy_request(
     req: ProxyUpstreamRequest<'_>,
-    task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<Response, ProxyUpstreamError> {
     let ProxyUpstreamRequest {
         scheme,
@@ -721,7 +721,7 @@ async fn send_proxy_request(
     // Spawn connection driver
     if let Err(err) = task_supervisor
         .spawn_async(
-            crate::task_supervisor::TaskCategory::Others,
+            klights_supervisor::TaskCategory::Others,
             "pod_proxy_connection_driver",
             async move {
                 if let Err(e) = conn.await {

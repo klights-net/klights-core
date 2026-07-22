@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use super::workqueue::PodWorkqueue;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 /// Services that must be started after repository construction.
 pub struct PodRepositoryBackground {

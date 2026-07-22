@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::api::{AppError, DeleteOptions};
 use crate::datastore::{Resource, ResourcePreconditions};
 use crate::side_effects::SideEffectMetrics;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 use super::store::PodStore;
 use super::workqueue::PodWorkqueue;

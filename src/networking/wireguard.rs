@@ -15,7 +15,7 @@ use netlink_packet_wireguard::{
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::task_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
+use klights_supervisor::{SupervisedJoinHandle, TaskCategory, TaskSupervisor};
 
 pub const DEFAULT_WIREGUARD_DEVICE: &str = "klights.wg";
 pub const DEFAULT_WIREGUARD_PORT: u16 = 7_679;
@@ -776,7 +776,7 @@ mod tests {
         DataplaneEncryption, DataplaneMode, DataplanePeerMetadata, WireGuardIdentity,
         WireGuardPublicKey, peer_route_from_metadata,
     };
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio::sync::Mutex as AsyncMutex;
 
     #[test]
@@ -934,7 +934,7 @@ mod tests {
         let task_cancel = owned_cancel.clone();
         let connection_task = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "test_wireguard_owned_generic_netlink_connection",
                 async move {
                     tokio::select! {
@@ -966,7 +966,7 @@ mod tests {
         let task_cancel = owned_cancel.clone();
         let connection_task = supervisor
             .spawn_async(
-                crate::task_supervisor::TaskCategory::Network,
+                klights_supervisor::TaskCategory::Network,
                 "test_wireguard_failed_open_generic_netlink_connection",
                 async move {
                     tokio::select! {

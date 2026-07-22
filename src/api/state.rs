@@ -63,7 +63,8 @@ pub struct AppState {
     /// APIService mutations; endpoint resolution stays per request so Service
     /// endpoint changes are observed without polling.
     pub apiservice_proxy_cache: std::sync::Arc<crate::api::apiservice_proxy::ApiServiceProxyCache>,
-    pub task_supervisor: std::sync::Arc<crate::task_supervisor::TaskSupervisor>,
+    pub task_supervisor: std::sync::Arc<klights_supervisor::TaskSupervisor>,
+    pub file_process: klights_supervisor::FileProcessExecutor,
     /// Single-instance pod persistence boundary owned by the process.
     /// Routes pod persistence through repository traits instead of ad-hoc
     /// `db.{create,update,update_status_only,...}` calls against

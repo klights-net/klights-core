@@ -74,6 +74,7 @@ pub struct ControllerDispatcher {
     /// (they fail-fast at reconcile time if it is missing).
     pod_repository: Arc<Mutex<Option<Arc<PodRepository>>>>,
     metrics_provider: Arc<Mutex<Option<Arc<dyn crate::metrics::MetricsProvider>>>>,
+    file_process: klights_supervisor::FileProcessExecutor,
     active_reconciles: Arc<Mutex<ActiveReconciles>>,
     active_reconciles_changed: Arc<Notify>,
 }
@@ -90,15 +91,15 @@ impl ControllerDispatcher {
     pub fn new(service_ipam: Arc<ServiceIpam>) -> Self {
         Self::with_task_supervisor(
             service_ipam,
-            Arc::new(crate::task_supervisor::TaskSupervisor::new(
-                crate::task_supervisor::TaskCategoryConfig::default(),
+            Arc::new(klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
             )),
         )
     }
 
     pub fn with_task_supervisor(
         service_ipam: Arc<ServiceIpam>,
-        task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self::new_with_nodeport(
             service_ipam,
@@ -111,7 +112,7 @@ impl ControllerDispatcher {
     pub fn new_with_nodeport(
         service_ipam: Arc<ServiceIpam>,
         nodeport_alloc: Arc<NodePortAllocator>,
-        task_supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        task_supervisor: Arc<klights_supervisor::TaskSupervisor>,
         csr_signer: Option<Arc<dyn crate::auth::csr_signer::CsrSigner>>,
     ) -> Self {
         let mut controllers: HashMap<(&'static str, &'static str), Arc<dyn Controller>> =
@@ -180,6 +181,7 @@ impl ControllerDispatcher {
             );
         }
 
+        let file_process = klights_supervisor::FileProcessExecutor::new(task_supervisor.clone());
         Self {
             controllers,
             queue: WorkQueue::with_task_supervisor(task_supervisor),
@@ -189,6 +191,7 @@ impl ControllerDispatcher {
             services: Arc::new(Mutex::new(None)),
             pod_repository: Arc::new(Mutex::new(None)),
             metrics_provider: Arc::new(Mutex::new(None)),
+            file_process,
             active_reconciles: Arc::new(Mutex::new(ActiveReconciles::default())),
             active_reconciles_changed: Arc::new(Notify::new()),
         }
@@ -587,10 +590,17 @@ impl ControllerDispatcher {
         // Look up controller for this resource type
         if let Some(controller) = self.controllers.get(&(api_version, kind)) {
             let ctx = match self.current_services().await {
-                Some(services) => {
-                    Context::with_services(db_handle.clone(), node_name.to_string(), services)
-                }
-                None => Context::new(db_handle.clone(), node_name.to_string()),
+                Some(services) => Context::with_services_and_file_process(
+                    db_handle.clone(),
+                    node_name.to_string(),
+                    services,
+                    self.file_process.clone(),
+                ),
+                None => Context::new_with_file_process(
+                    db_handle.clone(),
+                    node_name.to_string(),
+                    self.file_process.clone(),
+                ),
             };
             let ctx = match self.current_pod_repository().await {
                 Some(pod_repository) => ctx.with_pod_repository(pod_repository),
@@ -647,8 +657,8 @@ impl Default for ControllerDispatcher {
         let service_ipam = Arc::new(ServiceIpam::new("10.43.128.0/17"));
         Self::with_task_supervisor(
             service_ipam,
-            Arc::new(crate::task_supervisor::TaskSupervisor::new(
-                crate::task_supervisor::TaskCategoryConfig::default(),
+            Arc::new(klights_supervisor::TaskSupervisor::new(
+                klights_supervisor::TaskCategoryConfig::default(),
             )),
         )
     }
@@ -1247,8 +1257,8 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         let db_handle = handle_for(db.clone());
         let service_ipam = Arc::new(ServiceIpam::new("10.43.128.0/17"));
-        let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let dispatcher =
             ControllerDispatcher::with_task_supervisor(service_ipam, task_supervisor.clone());
@@ -1338,7 +1348,7 @@ mod tests {
             "future ttlSecondsAfterFinished must arm a timer instead of immediately requeueing"
         );
         let active_timers =
-            task_supervisor.active_tasks(Some(crate::task_supervisor::TaskCategory::Timer));
+            task_supervisor.active_tasks(Some(klights_supervisor::TaskCategory::Timer));
         assert!(
             active_timers
                 .iter()
@@ -1363,8 +1373,8 @@ mod tests {
         let db = crate::datastore::test_support::in_memory().await;
         let db_handle = handle_for(db.clone());
         let service_ipam = Arc::new(ServiceIpam::new("10.43.128.0/17"));
-        let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let dispatcher =
             ControllerDispatcher::with_task_supervisor(service_ipam, task_supervisor.clone());
@@ -1427,7 +1437,7 @@ mod tests {
             "TTL scheduler must not immediately requeue once foreground Job deletion has started"
         );
         let active_timers =
-            task_supervisor.active_tasks(Some(crate::task_supervisor::TaskCategory::Timer));
+            task_supervisor.active_tasks(Some(klights_supervisor::TaskCategory::Timer));
         assert!(
             !active_timers
                 .iter()

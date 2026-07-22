@@ -359,7 +359,7 @@ impl NodeMetricsRequestCoalescer {
     async fn get_or_spawn<F>(
         self: &Arc<Self>,
         node_name: String,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
         fetch: F,
     ) -> Result<NodeMetricsResult, NodeMetricsError>
     where
@@ -382,7 +382,7 @@ impl NodeMetricsRequestCoalescer {
             let sender = sender.expect("sender exists for newly spawned metrics request");
             let spawn_result = supervisor
                 .spawn_async(
-                    crate::task_supervisor::TaskCategory::Network,
+                    klights_supervisor::TaskCategory::Network,
                     "metrics_node_runtime_sample",
                     async move {
                         let response = fetch.await;
@@ -423,7 +423,7 @@ pub struct OnDemandMetricsProvider {
     local_node_name: String,
     cri: Option<Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
     node_metrics: Option<Arc<dyn NodeMetrics>>,
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
     coalescer: Arc<NodeMetricsRequestCoalescer>,
 }
 
@@ -432,7 +432,7 @@ impl OnDemandMetricsProvider {
         local_node_name: String,
         cri: Option<Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
         node_metrics: Option<Arc<dyn NodeMetrics>>,
-        supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+        supervisor: Arc<klights_supervisor::TaskSupervisor>,
     ) -> Self {
         Self {
             local_node_name,
@@ -493,7 +493,7 @@ impl MetricsProvider for OnDemandMetricsProvider {
 async fn collect_local_cri_node_metrics(
     cri: Option<Arc<tokio::sync::Mutex<crate::kubelet::cri::CriClient>>>,
     node_name: String,
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) -> Result<NodeMetricsResult, NodeMetricsError> {
     let target = NodeMetricsTarget::try_new(node_name)?;
     let request = NodeMetricsRequest::new(target.clone(), Vec::new());
@@ -561,11 +561,11 @@ pub trait NodeMetricsSampler: Send + Sync {
 }
 
 pub struct LinuxProcNodeMetricsSampler {
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 }
 
 impl LinuxProcNodeMetricsSampler {
-    pub fn new(supervisor: Arc<crate::task_supervisor::TaskSupervisor>) -> Self {
+    pub fn new(supervisor: Arc<klights_supervisor::TaskSupervisor>) -> Self {
         Self { supervisor }
     }
 }
@@ -610,7 +610,7 @@ struct ProcNodeUsage {
 }
 
 async fn read_proc_node_usage(
-    supervisor: Arc<crate::task_supervisor::TaskSupervisor>,
+    supervisor: Arc<klights_supervisor::TaskSupervisor>,
 ) -> anyhow::Result<ProcNodeUsage> {
     supervisor
         .run_blocking_file("node_metrics_read_proc", read_proc_node_usage_blocking)
@@ -1006,8 +1006,8 @@ mod tests {
 
     #[tokio::test]
     async fn coalesces_concurrent_node_metrics_fetches() {
-        let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let coalescer = Arc::new(NodeMetricsRequestCoalescer::default());
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));

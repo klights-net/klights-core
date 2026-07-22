@@ -35,8 +35,8 @@ pub async fn store_and_prepare(
 pub fn pod_repository_for_test(
     db: &crate::datastore::sqlite::Datastore,
 ) -> Arc<crate::kubelet::pod_repository::PodRepository> {
-    let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());
@@ -55,8 +55,8 @@ pub fn pod_repository_for_test(
 pub async fn deferred_outbox_pod_repository_for_test(
     db: &crate::datastore::sqlite::Datastore,
 ) -> Arc<crate::kubelet::pod_repository::PodRepository> {
-    let supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let metrics = crate::side_effects::SideEffectMetrics::new();
     let side_effects = Arc::new(crate::side_effects::SideEffectRegistry::new());

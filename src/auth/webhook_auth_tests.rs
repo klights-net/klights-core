@@ -568,9 +568,8 @@ async fn test_build_webhook_auth_from_config_reads_ca_bundle_path() {
     config.webhook_auth_url = Some("https://auth-webhook.example.com/token".to_string());
     config.webhook_auth_ca_bundle = Some(ca_path.to_string_lossy().into_owned());
 
-    let supervisor = crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
-    );
+    let supervisor =
+        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
     let auth = build_webhook_auth_from_config(&config, &supervisor)
         .await
         .unwrap();

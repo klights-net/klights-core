@@ -5,86 +5,103 @@ pub struct PodFs;
 
 impl PodFs {
     /// Write /etc/hosts content to a host directory (creates dir + `dir/hosts`).
-    pub async fn write_hosts_file(dir: PathBuf, content: String) -> Result<String> {
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "podfs_write_hosts_file",
-            dir.to_string_lossy().into_owned(),
-            move || {
-                std::fs::create_dir_all(&dir).context("Failed to create hosts directory")?;
-                let path = dir.join("hosts");
-                std::fs::write(&path, &content).context("Failed to write /etc/hosts file")?;
-                Ok(path.to_string_lossy().into_owned())
-            },
-        )
-        .await
+    pub async fn write_hosts_file(
+        file_process: &klights_supervisor::FileProcessExecutor,
+        dir: PathBuf,
+        content: String,
+    ) -> Result<String> {
+        file_process
+            .run_blocking_file_keyed(
+                "podfs_write_hosts_file",
+                dir.to_string_lossy().into_owned(),
+                move || {
+                    std::fs::create_dir_all(&dir).context("Failed to create hosts directory")?;
+                    let path = dir.join("hosts");
+                    std::fs::write(&path, &content).context("Failed to write /etc/hosts file")?;
+                    Ok(path.to_string_lossy().into_owned())
+                },
+            )
+            .await
     }
 
     /// List the immediate subdirectory names under `root` (supervised blocking
     /// fs read). Returns an empty vec when `root` does not exist. Used by the
     /// startup orphan-pod-artifact sweep to enumerate `<ns>_<name>` pod dirs.
-    pub async fn list_subdir_names(root: PathBuf) -> Result<Vec<String>> {
-        crate::kubelet::file_blocking::run_blocking_file("podfs_list_subdir_names", move || {
-            let mut names = Vec::new();
-            match std::fs::read_dir(&root) {
-                Ok(entries) => {
-                    for entry in entries.flatten() {
-                        if entry.path().is_dir()
-                            && let Some(name) = entry.file_name().to_str()
-                        {
-                            names.push(name.to_string());
+    pub async fn list_subdir_names(
+        file_process: &klights_supervisor::FileProcessExecutor,
+        root: PathBuf,
+    ) -> Result<Vec<String>> {
+        file_process
+            .run_blocking_file("podfs_list_subdir_names", move || {
+                let mut names = Vec::new();
+                match std::fs::read_dir(&root) {
+                    Ok(entries) => {
+                        for entry in entries.flatten() {
+                            if entry.path().is_dir()
+                                && let Some(name) = entry.file_name().to_str()
+                            {
+                                names.push(name.to_string());
+                            }
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(anyhow::anyhow!("read dir {}: {e}", root.display())),
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(anyhow::anyhow!("read dir {}: {e}", root.display())),
-            }
-            Ok(names)
-        })
-        .await
+                Ok(names)
+            })
+            .await
     }
 
     /// Ensure termination log file exists with mode 0o666. Always returns the path.
-    pub async fn ensure_termination_log(path: PathBuf) -> String {
+    pub async fn ensure_termination_log(
+        file_process: &klights_supervisor::FileProcessExecutor,
+        path: PathBuf,
+    ) -> String {
         let ret = path.to_string_lossy().into_owned();
         // safe-to-ignore: missing termination log file is non-fatal; container still runs
         let key = ret.clone();
-        let _ = crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "podfs_ensure_termination_log",
-            key,
-            move || {
+        let _ = file_process
+            .run_blocking_file_keyed("podfs_ensure_termination_log", key, move || {
                 ensure_termination_log_sync(&path);
                 Ok(())
-            },
-        )
-        .await;
+            })
+            .await;
         ret
     }
 
     /// Create pod log directory structure. Returns path to `0.log`.
-    pub async fn create_log_dir(container_log_dir: PathBuf) -> Result<String> {
-        crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "podfs_create_log_dir",
-            container_log_dir.to_string_lossy().into_owned(),
-            move || {
-                std::fs::create_dir_all(&container_log_dir).with_context(|| {
-                    format!(
-                        "Failed to create log directory {}",
-                        container_log_dir.display()
-                    )
-                })?;
-                Ok(container_log_dir
-                    .join("0.log")
-                    .to_string_lossy()
-                    .into_owned())
-            },
-        )
-        .await
+    pub async fn create_log_dir(
+        file_process: &klights_supervisor::FileProcessExecutor,
+        container_log_dir: PathBuf,
+    ) -> Result<String> {
+        file_process
+            .run_blocking_file_keyed(
+                "podfs_create_log_dir",
+                container_log_dir.to_string_lossy().into_owned(),
+                move || {
+                    std::fs::create_dir_all(&container_log_dir).with_context(|| {
+                        format!(
+                            "Failed to create log directory {}",
+                            container_log_dir.display()
+                        )
+                    })?;
+                    Ok(container_log_dir
+                        .join("0.log")
+                        .to_string_lossy()
+                        .into_owned())
+                },
+            )
+            .await
     }
 
     /// Apply fsGroup ownership to volume paths. Logs warnings per-volume.
-    pub async fn apply_fs_group(volume_paths: Vec<String>, gid: u32) {
-        let _ =
-            crate::kubelet::file_blocking::run_blocking_file("podfs_apply_fs_group", move || {
+    pub async fn apply_fs_group(
+        file_process: &klights_supervisor::FileProcessExecutor,
+        volume_paths: Vec<String>,
+        gid: u32,
+    ) {
+        let _ = file_process
+            .run_blocking_file("podfs_apply_fs_group", move || {
                 for path in &volume_paths {
                     if let Err(e) = apply_fs_group_sync(Path::new(path), gid) {
                         tracing::warn!("Failed to apply fsGroup {} to {}: {}", gid, path, e);
@@ -96,21 +113,30 @@ impl PodFs {
     }
 
     /// Rotate logs for all pods under the given root.
-    pub async fn rotate_logs(root: PathBuf, max_size: u64, max_files: usize) {
-        let _ = crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "podfs_rotate_logs",
-            root.to_string_lossy().into_owned(),
-            move || {
-                rotate_logs_sync(&root, max_size, max_files);
-                Ok(())
-            },
-        )
-        .await;
+    pub async fn rotate_logs(
+        file_process: &klights_supervisor::FileProcessExecutor,
+        root: PathBuf,
+        max_size: u64,
+        max_files: usize,
+    ) {
+        let _ = file_process
+            .run_blocking_file_keyed(
+                "podfs_rotate_logs",
+                root.to_string_lossy().into_owned(),
+                move || {
+                    rotate_logs_sync(&root, max_size, max_files);
+                    Ok(())
+                },
+            )
+            .await;
     }
 
     /// Ensure directories exist (for subPath materialization).
     #[cfg(test)]
-    pub async fn ensure_dirs(dirs: Vec<PathBuf>) {
+    pub async fn ensure_dirs(
+        file_process: &klights_supervisor::FileProcessExecutor,
+        dirs: Vec<PathBuf>,
+    ) {
         if dirs.is_empty() {
             return;
         }
@@ -118,10 +144,8 @@ impl PodFs {
             .first()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|| "podfs_ensure_dirs".to_string());
-        let _ = crate::kubelet::file_blocking::run_blocking_file_keyed(
-            "podfs_ensure_dirs",
-            key,
-            move || {
+        let _ = file_process
+            .run_blocking_file_keyed("podfs_ensure_dirs", key, move || {
                 for dir in &dirs {
                     if let Err(e) = std::fs::create_dir_all(dir) {
                         tracing::warn!(
@@ -132,9 +156,8 @@ impl PodFs {
                     }
                 }
                 Ok(())
-            },
-        )
-        .await;
+            })
+            .await;
     }
 }
 
@@ -303,9 +326,13 @@ mod tests {
         let hosts_dir = dir.path().join("hosts_dir");
         let content = "127.0.0.1\tlocalhost\n".to_string();
 
-        let path = PodFs::write_hosts_file(hosts_dir.clone(), content.clone())
-            .await
-            .unwrap();
+        let path = PodFs::write_hosts_file(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            hosts_dir.clone(),
+            content.clone(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(path, hosts_dir.join("hosts").to_string_lossy());
         assert_eq!(crate::utils::read_utf8_file(&path).unwrap(), content);
@@ -320,7 +347,11 @@ mod tests {
             .join("container")
             .join("termination-log");
 
-        let result = PodFs::ensure_termination_log(log_path.clone()).await;
+        let result = PodFs::ensure_termination_log(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            log_path.clone(),
+        )
+        .await;
 
         assert_eq!(result, log_path.to_string_lossy());
         assert!(log_path.exists());
@@ -335,7 +366,11 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_termination_log_returns_path_on_failure() {
         let path = PathBuf::from("/proc/nonexistent/deep/path/term-log");
-        let result = PodFs::ensure_termination_log(path.clone()).await;
+        let result = PodFs::ensure_termination_log(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            path.clone(),
+        )
+        .await;
         assert_eq!(result, path.to_string_lossy());
     }
 
@@ -344,9 +379,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let container_log_dir = dir.path().join("ns_pod_uid").join("container0");
 
-        let log_path = PodFs::create_log_dir(container_log_dir.clone())
-            .await
-            .unwrap();
+        let log_path = PodFs::create_log_dir(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            container_log_dir.clone(),
+        )
+        .await
+        .unwrap();
 
         assert!(container_log_dir.exists());
         assert_eq!(log_path, container_log_dir.join("0.log").to_string_lossy());
@@ -361,7 +399,13 @@ mod tests {
         let log_file = container_dir.join("0.log");
         std::fs::write(&log_file, vec![0u8; 11 * 1024 * 1024]).unwrap();
 
-        PodFs::rotate_logs(dir.path().to_path_buf(), 10 * 1024 * 1024, 5).await;
+        PodFs::rotate_logs(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            dir.path().to_path_buf(),
+            10 * 1024 * 1024,
+            5,
+        )
+        .await;
 
         assert!(!log_file.exists());
         assert!(container_dir.join("0.1.log").exists());
@@ -375,7 +419,13 @@ mod tests {
         let log_file = container_dir.join("0.log");
         std::fs::write(&log_file, vec![0u8; 1024]).unwrap();
 
-        PodFs::rotate_logs(dir.path().to_path_buf(), 10 * 1024 * 1024, 5).await;
+        PodFs::rotate_logs(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            dir.path().to_path_buf(),
+            10 * 1024 * 1024,
+            5,
+        )
+        .await;
 
         assert!(log_file.exists(), "small file must not be rotated");
         assert!(!container_dir.join("0.1.log").exists());
@@ -392,7 +442,13 @@ mod tests {
         }
         std::fs::write(&log_file, vec![0u8; 11 * 1024 * 1024]).unwrap();
 
-        PodFs::rotate_logs(dir.path().to_path_buf(), 10 * 1024 * 1024, 5).await;
+        PodFs::rotate_logs(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            dir.path().to_path_buf(),
+            10 * 1024 * 1024,
+            5,
+        )
+        .await;
 
         assert!(!log_file.exists());
         assert!(container_dir.join("0.1.log").exists());
@@ -412,7 +468,13 @@ mod tests {
         std::fs::create_dir_all(&container_dir).unwrap();
         // No 0.log present.
 
-        PodFs::rotate_logs(dir.path().to_path_buf(), 10 * 1024 * 1024, 5).await;
+        PodFs::rotate_logs(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            dir.path().to_path_buf(),
+            10 * 1024 * 1024,
+            5,
+        )
+        .await;
 
         assert!(!container_dir.join("0.1.log").exists());
     }
@@ -423,7 +485,11 @@ mod tests {
         let d1 = dir.path().join("a").join("b");
         let d2 = dir.path().join("c").join("d");
 
-        PodFs::ensure_dirs(vec![d1.clone(), d2.clone()]).await;
+        PodFs::ensure_dirs(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            vec![d1.clone(), d2.clone()],
+        )
+        .await;
 
         assert!(d1.exists());
         assert!(d2.exists());
@@ -431,7 +497,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_ensure_dirs_noop_on_empty() {
-        PodFs::ensure_dirs(vec![]).await;
+        PodFs::ensure_dirs(
+            &crate::kubelet::file_blocking::test_file_process_executor(),
+            vec![],
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -444,10 +514,12 @@ mod tests {
         }
 
         let paths = vec![base.to_string_lossy().into_owned()];
-        let (_, async_result) = tokio::join!(PodFs::apply_fs_group(paths, 0), async {
-            tokio::task::yield_now().await;
-            42
-        });
+        let file_process = crate::kubelet::file_blocking::test_file_process_executor();
+        let (_, async_result) =
+            tokio::join!(PodFs::apply_fs_group(&file_process, paths, 0), async {
+                tokio::task::yield_now().await;
+                42
+            });
 
         assert_eq!(async_result, 42);
     }

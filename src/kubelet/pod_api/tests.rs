@@ -9,7 +9,7 @@ use crate::kubelet::pod_repository::state_only_writer::StatusOnlyWriterService;
 use crate::kubelet::pod_repository::store::PodStore;
 use crate::kubelet::pod_repository::{PodApiDeleteOutcome, PodApiUpdateOutcome, PodReader};
 use crate::side_effects::{SideEffectMetrics, SideEffectRegistry};
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 use crate::kubelet::pod_repository::PodApiCreateRequest;
 
@@ -48,7 +48,7 @@ impl PodDeleteSleeperPort for NoopPodDeleteSleeper {
 
 fn fixture_supervisor() -> Arc<TaskSupervisor> {
     Arc::new(TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+        klights_supervisor::TaskCategoryConfig::default(),
     ))
 }
 

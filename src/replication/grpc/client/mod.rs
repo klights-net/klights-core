@@ -70,7 +70,7 @@ pub struct SignControlplaneCsrResponse {
 use crate::replication::protocol::{
     JoinResponse, JoinRole, RoutedNodeMetricsRequest, RoutedNodeMetricsResponse, StreamItem,
 };
-use crate::task_supervisor::{TaskCategory, TaskSupervisor};
+use klights_supervisor::{TaskCategory, TaskSupervisor};
 
 const CONNECT_CHANNEL_CAPACITY: usize = 64;
 const STREAM_ITEM_CHANNEL_CAPACITY: usize = 1024;

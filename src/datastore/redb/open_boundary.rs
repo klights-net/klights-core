@@ -6,7 +6,7 @@ use std::time::Duration;
 use ::redb::{Database, ReadableTable};
 
 use crate::datastore::errors::OpenError;
-use crate::task_supervisor::TaskSupervisor;
+use klights_supervisor::TaskSupervisor;
 
 use super::meta;
 use super::opener::RedbOpenOpts;

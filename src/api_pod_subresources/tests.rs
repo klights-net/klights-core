@@ -728,9 +728,8 @@ async fn test_build_log_output_waits_for_eventual_write() {
             .unwrap();
     });
 
-    let task_supervisor = crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
-    );
+    let task_supervisor =
+        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
     let content = build_log_output(
         &log_path_str,
         &LogQuery {
@@ -762,9 +761,8 @@ async fn test_build_log_output_bytes_preserves_non_utf8_cri_payload() {
     raw.extend_from_slice(b" payload\n");
     tokio::fs::write(&log_path, raw).await.unwrap();
 
-    let task_supervisor = crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
-    );
+    let task_supervisor =
+        klights_supervisor::TaskSupervisor::new(klights_supervisor::TaskCategoryConfig::default());
     let content = build_log_output_bytes(
         &log_path_str,
         &LogQuery {
@@ -817,8 +815,8 @@ async fn test_follow_log_file_with_initial_query_applies_tail_before_following()
             previous: None,
             insecure_skip_tls_verify_backend: false,
         },
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
     );
     futures::pin_mut!(stream);
@@ -879,8 +877,8 @@ async fn test_follow_log_file_waits_for_late_log_file_creation() {
             previous: None,
             insecure_skip_tls_verify_backend: false,
         },
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
     );
     futures::pin_mut!(stream);
@@ -934,8 +932,8 @@ async fn test_follow_log_file_closes_if_pod_deleted_before_log_file_exists() {
             previous: None,
             insecure_skip_tls_verify_backend: false,
         },
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
         PodLogFollowTermination::new_for_test(
             rx,
@@ -994,8 +992,8 @@ async fn test_follow_log_file_strips_cri_prefix_from_initial_and_live_lines() {
             previous: None,
             insecure_skip_tls_verify_backend: false,
         },
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
     );
     futures::pin_mut!(stream);
@@ -1046,8 +1044,8 @@ async fn test_follow_log_file_without_pod_watch_exits_after_close_write() {
             previous: None,
             insecure_skip_tls_verify_backend: false,
         },
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
     );
     futures::pin_mut!(stream);
@@ -1096,8 +1094,8 @@ async fn test_follow_log_file_exits_after_matching_pod_deleted_event() {
     .await
     .unwrap();
 
-    let task_supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let task_supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let watch_bus = crate::watch::WatchBus::new(8);
     let stream = follow_log_file_with_termination_watch(
@@ -1185,8 +1183,8 @@ async fn test_follow_log_file_since_time_then_follows_new_inotify_writes() {
             previous: None,
             insecure_skip_tls_verify_backend: false,
         },
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
     );
     futures::pin_mut!(stream);
@@ -1246,8 +1244,8 @@ async fn test_follow_log_file_since_time_respects_limit_bytes() {
             previous: None,
             insecure_skip_tls_verify_backend: false,
         },
-        std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         )),
     );
     futures::pin_mut!(stream);
@@ -1670,7 +1668,7 @@ async fn test_spdy_exec_streams_stdout_and_error_to_client_stream_ids() {
         SpdyExecStreamRequest, collect_spdy_client_streams, write_spdy_exec_channel_frame,
     };
     use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     let (mut server_io, mut client_io) = tokio::io::duplex(4096);
     let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
@@ -1786,7 +1784,7 @@ async fn test_spdy_exec_accepts_stdout_only_client_when_only_stdout_requested() 
         SpdyExecStreamRequest, collect_spdy_client_streams,
     };
     use crate::spdy::{SpdyExec, SpdyFrame, StreamType};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
 
     let (mut server_io, mut client_io) = tokio::io::duplex(4096);
     let supervisor = TaskSupervisor::new(TaskCategoryConfig::default());
@@ -1882,8 +1880,8 @@ async fn test_remote_exec_sync_websocket_closes_after_terminal_status_without_cl
 
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
     use crate::replication::protocol::{FollowerControlMessage, RoutedNodeExecSyncResponse};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use klights_node_api::{NodeExec, NodeExecSyncResult};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
@@ -1993,9 +1991,9 @@ async fn test_remote_exec_sync_websocket_waits_for_peer_close_reply() {
 
     use crate::networking::wireguard::{DataplaneEncryption, DataplaneMode, DataplanePeerMetadata};
     use crate::replication::protocol::{FollowerControlMessage, RoutedNodeExecSyncResponse};
-    use crate::task_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use futures::{SinkExt as _, StreamExt as _};
     use klights_node_api::{NodeExec, NodeExecSyncResult};
+    use klights_supervisor::{TaskCategoryConfig, TaskSupervisor};
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
@@ -2299,8 +2297,8 @@ async fn test_proxy_request_forwards_to_local_server() {
         .unwrap();
 
     let target_url = format!("http://127.0.0.1:{}/test", addr.port());
-    let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let resp = proxy_request(req, &target_url, task_supervisor)
         .await
@@ -2320,8 +2318,8 @@ async fn test_proxy_request_connection_refused_returns_bad_gateway() {
         .body(axum::body::Body::empty())
         .unwrap();
 
-    let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
     let result = proxy_request(req, "http://127.0.0.1:1/", task_supervisor).await;
     assert!(result.is_err());
@@ -2365,8 +2363,8 @@ async fn test_proxy_request_fallback_retries_on_502_response() {
         .body(axum::body::Body::empty())
         .unwrap();
     let target_url = format!("http://127.0.0.1:{}/proxy", primary_addr.port());
-    let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
 
     let resp = proxy_request_with_fallback_port(
@@ -2409,8 +2407,8 @@ async fn test_pod_proxy_request_retries_until_listener_accepts() {
         .body(axum::body::Body::empty())
         .unwrap();
     let target_url = format!("http://127.0.0.1:{}/", addr.port());
-    let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
 
     let resp = proxy_request_with_fallback_port_and_retries(
@@ -2462,8 +2460,8 @@ async fn test_proxy_request_timeout_retries_and_uses_fallback() {
         .body(axum::body::Body::empty())
         .unwrap();
     let target_url = format!("http://127.0.0.1:{}/results/name", primary_addr.port());
-    let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
 
     let resp = tokio::time::timeout(
@@ -2549,8 +2547,8 @@ async fn test_proxy_request_recomputes_content_length_after_buffering() {
         .body(axum::body::Body::empty())
         .unwrap();
     let target_url = format!("http://127.0.0.1:{}/", addr.port());
-    let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
 
     let resp = proxy_request(req, &target_url, task_supervisor)
@@ -2606,8 +2604,8 @@ async fn test_proxy_request_empty_post_uses_explicit_zero_content_length() {
         .body(axum::body::Body::empty())
         .unwrap();
     let target_url = format!("http://127.0.0.1:{}/", addr.port());
-    let task_supervisor = Arc::new(crate::task_supervisor::TaskSupervisor::new(
-        crate::task_supervisor::TaskCategoryConfig::default(),
+    let task_supervisor = Arc::new(klights_supervisor::TaskSupervisor::new(
+        klights_supervisor::TaskCategoryConfig::default(),
     ));
 
     let resp = proxy_request(req, &target_url, task_supervisor)

@@ -2192,8 +2192,8 @@ mod tests {
     async fn committed_apply_v1_stale_pod_status_stamp_replay_updates_only_outbox() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_root = dir.path().join("db");
-        let supervisor = std::sync::Arc::new(crate::task_supervisor::TaskSupervisor::new(
-            crate::task_supervisor::TaskCategoryConfig::default(),
+        let supervisor = std::sync::Arc::new(klights_supervisor::TaskSupervisor::new(
+            klights_supervisor::TaskCategoryConfig::default(),
         ));
         let db = Datastore::new_persistent(&db_root, supervisor.clone(), None)
             .await

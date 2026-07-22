@@ -10,8 +10,8 @@ use anyhow::{Result, anyhow};
 use tokio::sync::broadcast;
 
 use crate::datastore::types::*;
-use crate::task_supervisor::TaskSupervisor;
 use crate::watch::WatchBus;
+use klights_supervisor::TaskSupervisor;
 
 pub mod accessor;
 pub mod advance;
