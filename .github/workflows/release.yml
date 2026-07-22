@@ -72,8 +72,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain install 1.95.0 --profile minimal
-          rustup default 1.95.0
+          rustup toolchain install 1.96.1 --profile minimal
+          rustup default 1.96.1
           rustup target add "${{ matrix.rust_target }}"
 
       - name: Print release build diagnostics

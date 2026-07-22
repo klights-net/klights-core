@@ -2835,7 +2835,14 @@ async fn read_reqwest_body_limited_returns_bad_gateway_before_consuming_stream()
 
     // Make a reqwest request to the server
     let url = format!("http://127.0.0.1:{}/", addr.port());
-    let response = reqwest::get(&url).await.unwrap();
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(&url)
+        .send()
+        .await
+        .unwrap();
 
     // Call read_reqwest_body_limited with a limit small enough to be
     // exceeded after reading some but not all chunks

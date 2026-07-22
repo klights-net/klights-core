@@ -1302,7 +1302,7 @@ mod tests {
         });
 
         let client = HttpCsrBootstrapClient {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
             base_url,
             token: "bootstrap-token".to_string(),
         };
